@@ -2,9 +2,55 @@ import itertools
 import json
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import PreTrainedTokenizer
+
+
+class GRPODataset:
+    """
+    Dataset wrapper for GRPO training data.
+    Each example should have a 'prompt' and 'answer' field.
+    Returns data in (prompt_tokens, answer_tokens, prompt_str, answer_str) tuple format.
+    """
+    def __init__(
+        self,
+        data: List[Dict[str, str]],
+        tokenizer: PreTrainedTokenizer,
+        prompt_key: str = "prompt",
+        answer_key: str = "answer",
+        system_key: str = "system",
+        use_chat_template: bool = False,
+        use_prompt: bool = False
+    ):
+        self._data = []
+        for item in data:
+            prompt_str = str(item[prompt_key])
+            answer_str = str(item[answer_key])
+            if use_chat_template:
+                default_system_str = "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."
+                system_str = item.get(system_key, default_system_str)
+                prompt_tokens = tokenizer.apply_chat_template(
+                    [
+                        {'role': 'system', 'content': system_str},
+                        {'role': 'user', 'content': prompt_str}
+                    ],
+                    add_generation_prompt=True
+                )
+                answer_tokens = tokenizer.encode(answer_str)
+            else:
+                if use_prompt:
+                    prompt_tokens = tokenizer.encode(f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>. User: {prompt_str} Assistant: """)
+                else:
+                    prompt_tokens = tokenizer.encode(prompt_str)
+                answer_tokens = tokenizer.encode(answer_str)
+            self._data.append((prompt_tokens, answer_tokens, prompt_str, answer_str))
+
+    def __getitem__(self, idx: int) -> Tuple[List[int], List[int], str, str]:
+        return self._data[idx]
+
+    def __len__(self) -> int:
+        return len(self._data)
 
 
 class Dataset:
@@ -123,23 +169,37 @@ def create_dataset(
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
     chat_feature = getattr(config, "chat_feature", "messages")
+    training_mode = getattr(config, "training_mode", "normal")
+    use_chat_template = getattr(config, "use_chat_template", "normal")
+    use_prompt = getattr(config, "use_prompt", "normal")
     sample = data[0]
-    if prompt_feature in sample and completion_feature in sample:
-        return CompletionsDataset(
-            data, tokenizer, prompt_feature, completion_feature, mask_prompt
-        )
-    elif chat_feature in sample:
-        return ChatDataset(
-            data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
-        )
-    elif text_feature in sample:
-        if mask_prompt:
-            raise ValueError("Prompt masking not supported for text dataset.")
-        return Dataset(data, tokenizer, text_key=text_feature)
+
+    if training_mode == "normal":
+        if prompt_feature in sample and completion_feature in sample:
+            return CompletionsDataset(
+                data, tokenizer, prompt_feature, completion_feature, mask_prompt
+            )
+        elif chat_feature in sample:
+            return ChatDataset(
+                data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
+            )
+        elif text_feature in sample:
+            if mask_prompt:
+                raise ValueError("Prompt masking not supported for text dataset.")
+            return Dataset(data, tokenizer, text_key=text_feature)
+        else:
+            raise ValueError(
+                "Unsupported data format, check the supported formats here:\n"
+                "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
+            )
     else:
-        raise ValueError(
-            "Unsupported data format, check the supported formats here:\n"
-            "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
+        return GRPODataset(
+            data=data,
+            tokenizer=tokenizer,
+            prompt_key="prompt",
+            answer_key="answer",
+            use_chat_template=use_chat_template,
+            use_prompt=use_prompt
         )
 
 
