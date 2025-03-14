@@ -7,6 +7,9 @@ train: true
 # The fine-tuning method: "lora", "dora", or "full".
 fine_tune_type: lora
 
+# The training-mode: "normal", or "dpo"
+training_mode: normal 
+
 # The Optimizer with its possible inputs
 optimizer: adamw
 # optimizer_config:
