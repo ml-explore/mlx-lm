@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2025 Apple Inc.
 
 import argparse
 import json
@@ -19,6 +19,14 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+
+# Diffusion-specific defaults
+DEFAULT_STEPS = 32
+DEFAULT_GEN_LENGTH = 64
+DEFAULT_NOISE_TEMP = 0.0
+DEFAULT_CFG = 0.0
+DEFAULT_UNMASKING = "topk"
+DEFAULT_BLOCK_LENGTH = None
 
 
 def str2bool(string):
@@ -159,6 +167,44 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+
+    # Diffusion-specific arguments
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_STEPS,
+        help="Number of diffusion steps",
+    )
+    parser.add_argument(
+        "--gen-length",
+        type=int,
+        default=DEFAULT_GEN_LENGTH,
+        help="Length of generated sequence",
+    )
+    parser.add_argument(
+        "--noise-temp",
+        type=float,
+        default=DEFAULT_NOISE_TEMP,
+        help="Temperature for Gumbel noise in diffusion sampling",
+    )
+    parser.add_argument(
+        "--cfg",
+        type=float,
+        default=DEFAULT_CFG,
+        help="Classifier-Free Guidance scale",
+    )
+    parser.add_argument(
+        "--block-length",
+        type=int,
+        default=DEFAULT_BLOCK_LENGTH,
+        help="Length of semi-autoregressive blocks for diffusion",
+    )
+    parser.add_argument(
+        "--unmasking",
+        type=str,
+        default=DEFAULT_UNMASKING,
+        help="Unmasking strategy ('topk' or 'random')",
+    )
     return parser
 
 
@@ -263,22 +309,40 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
-    response = generate(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens=args.max_tokens,
-        verbose=args.verbose,
-        sampler=sampler,
-        max_kv_size=args.max_kv_size,
-        prompt_cache=prompt_cache if using_cache else None,
-        kv_bits=args.kv_bits,
-        kv_group_size=args.kv_group_size,
-        quantized_kv_start=args.quantized_kv_start,
-        draft_model=draft_model,
-        num_draft_tokens=args.num_draft_tokens,
-    )
+
+    if getattr(model.args, "model_type", None) == "llada":
+        # Add diffusion-specific arguments
+        response = generate(
+            model,
+            tokenizer,
+            prompt,
+            verbose=args.verbose,
+            steps=args.steps,
+            gen_length=args.gen_length,
+            noise_temp=args.noise_temp,
+            cfg=args.cfg,
+            block_length=args.block_length,
+            unmasking=args.unmasking,
+        )
+    
+    else:
+        # Add standard autoregressive arguments
+        sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
+        response = generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=args.max_tokens,
+            verbose=args.verbose,
+            sampler=sampler,
+            max_kv_size=args.max_kv_size,
+            prompt_cache=prompt_cache if using_cache else None,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            draft_model=draft_model,
+            num_draft_tokens=args.num_draft_tokens,
+        )
     if not args.verbose:
         print(response)
 
