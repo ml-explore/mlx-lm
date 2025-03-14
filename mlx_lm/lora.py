@@ -44,6 +44,7 @@ CONFIG_DEFAULTS = {
     "model": "mlx_model",
     "train": False,
     "fine_tune_type": "lora",
+    "training_mode": "normal",
     "optimizer": "adam",
     "optimizer_config": {
         "adam": {},
@@ -106,6 +107,12 @@ def build_parser():
         type=str,
         choices=["lora", "dora", "full"],
         help="Type of fine-tuning to perform: lora, dora, or full.",
+    )
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        choices=["normal", "dpo"],
+        help="Training mode: normal or DPO",
     )
     parser.add_argument(
         "--optimizer",
