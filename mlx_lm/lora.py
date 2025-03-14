@@ -199,6 +199,56 @@ def build_parser():
         default=None,
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+
+    # GRPO args
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        help="Number of generations.",
+        default=4,
+    )
+    parser.add_argument(
+        "--max-completion-length",
+        type=int,
+        help="Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left.",
+        default=512,
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        help="KL penalty coefficient.",
+        default=0.1,
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        help="The Epsilon for numerical stability.",
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="If the model is a Chat model, use the Chat template.",
+        default=None,
+    )
+    parser.add_argument(
+        "--use-prompt",
+        action="store_true",
+        help="Rather to use the prompt from the R1 paper.",
+        default=None,
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help="Temperature for sampling. The higher the temperature, the more random the completions.",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--reward-weights",
+        type=str,
+        help="Weights for each reward function. Must match the number of reward functions and be in this format [0.1, 0.2, 0.3, 0.4, 0.5]. If not given, all rewards are weighted equally with weight `1.0`.",
+        default=None,
+    )
     return parser
 
 
