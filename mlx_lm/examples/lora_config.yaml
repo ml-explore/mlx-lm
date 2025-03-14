@@ -7,6 +7,19 @@ train: true
 # The fine-tuning method: "lora", "dora", or "full".
 fine_tune_type: lora
 
+# Wether to use normal training or GRPO
+training_mode: "normal"
+
+# reference_model_path: "mlx_model"
+# group_size: 4
+# beta: 0.1
+# epsilon: 1e-4
+# max_completion_length: 512
+# use_chat_template: true
+# use_prompt: false
+# temperature: 0.8
+# reward_weights: 
+
 # The Optimizer with its possible inputs
 optimizer: adamw
 # optimizer_config:
