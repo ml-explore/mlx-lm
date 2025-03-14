@@ -2,7 +2,7 @@ import itertools
 import json
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Union
 
 from transformers import PreTrainedTokenizer
 
@@ -220,24 +220,34 @@ def create_dataset(
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
     chat_feature = getattr(config, "chat_feature", "messages")
+    training_mode = getattr(config, "training_mode", "normal")
     sample = data[0]
-    if prompt_feature in sample and completion_feature in sample:
-        return CompletionsDataset(
-            data, tokenizer, prompt_feature, completion_feature, mask_prompt
-        )
-    elif chat_feature in sample:
-        return ChatDataset(
-            data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
-        )
-    elif text_feature in sample:
-        if mask_prompt:
-            raise ValueError("Prompt masking not supported for text dataset.")
-        return Dataset(data, tokenizer, text_key=text_feature)
+    if training_mode == "normal":
+        if prompt_feature in sample and completion_feature in sample:
+            return CompletionsDataset(
+                data, tokenizer, prompt_feature, completion_feature, mask_prompt
+            )
+        elif chat_feature in sample:
+            return ChatDataset(
+                data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
+            )
+        elif text_feature in sample:
+            if mask_prompt:
+                raise ValueError("Prompt masking not supported for text dataset.")
+            return Dataset(data, tokenizer, text_key=text_feature)
+        else:
+            raise ValueError(
+                "Unsupported data format, check the supported formats here:\n"
+                "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
+            )
     else:
-        raise ValueError(
-            "Unsupported data format, check the supported formats here:\n"
-            "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
-        )
+        if "chosen" in sample and "rejected" in sample:
+            return ORPODataset(data, tokenizer)
+        else:
+            raise ValueError(
+                "Unsupported data format, check the supported formats here:\n"
+                "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
+            )
 
 
 def load_local_dataset(
