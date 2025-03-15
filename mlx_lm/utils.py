@@ -252,31 +252,25 @@ def generate_diffusion(
         unmasking: str, strategy for selecting tokens to unmask ('topk' or 'random')
     """
 
-    def sample_noise_or_greedy(logits, temp, key):
-        """Sample token indices from logits using Gumbel-Max trick."""
+    @mx.compile
+    def sample_noise_or_greedy(logits, temp):
+        """Sample token indices from logits using Gumbel-Max trick, relying on global PRNG."""
         if temp == 0.0:
             return mx.argmax(logits, axis=-1), None
-
-        # Generate standard Gumbel(0,1) noise
         uniform = mx.random.uniform(
-            low=1e-7, high=1 - 1e-7, shape=logits.shape, key=key
+            low=1e-7, high=1 - 1e-7, shape=logits.shape, dtype=model_dtype
         )
         gumbel_noise = -mx.log(-mx.log(uniform))
-
-        # Apply noise to logits (standard Gumbel-Max)
-        noisy_logits = logits + gumbel_noise * temp  # Scale noise by temperature
+        noisy_logits = logits + gumbel_noise * temp
         sampled_ids = mx.argmax(noisy_logits, axis=-1)
-
         return sampled_ids, gumbel_noise
 
-    # Model dtype handling
     model_dtype = (
-        mx.float16
-        if hasattr(model, "dtype") and model.dtype == mx.float16
+        model.dtype
+        if hasattr(model, "dtype")
+        and model.dtype in (mx.float16, mx.bfloat16, mx.float32)
         else mx.float32
     )
-
-    # Default mask token ID
     mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
 
     batch_size = 1
@@ -295,17 +289,10 @@ def generate_diffusion(
         base_steps + 1 if i < remainder else base_steps for i in range(num_blocks)
     ]
 
-    x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
-    x[:, :prompt_length] = prompt
-    full_mask = mx.zeros((1, 1, seq_len, seq_len), dtype=mx.float16)
+    x = mx.full((batch_size, seq_len), mask_token_id, dtype=mx.int32)
+    x[:, :prompt_length] = prompt.astype(mx.int32)
+    full_mask = mx.zeros((1, 1, seq_len, seq_len), dtype=model_dtype)
 
-    # Initialize random keys
-    master_key = (
-        mx.random.key(int(time.time_ns()))
-        if mx.random.seed is None
-        else mx.random.key(0)
-    )
-    block_keys = mx.random.split(master_key, num_blocks)
     max_unmask = max(block_sizes)
     index_buffer = mx.arange(max_unmask, dtype=mx.int32)
 
@@ -319,7 +306,6 @@ def generate_diffusion(
         block_mask = (seq_indices >= block_start) & (seq_indices < block_end)[None, :]
 
         timesteps = mx.linspace(1.0, 0.0, block_steps, dtype=mx.float32)
-        step_keys = mx.random.split(block_keys[block_idx], block_steps)
 
         for step, t in enumerate(timesteps):
             mask_condition = x == mask_token_id
@@ -339,34 +325,35 @@ def generate_diffusion(
                     x,
                 )
                 x_ = mx.concatenate([x, un_x], axis=0)
-                logits = model(x_, mask=full_mask).astype(model_dtype)
+                logits = model(x_, mask=full_mask)
                 logits, un_logits = mx.split(logits, 2, axis=0)
                 logits = un_logits + (cfg + 1) * (logits - un_logits)
             else:
-                logits = model(x, mask=full_mask).astype(model_dtype)
+                logits = model(x, mask=full_mask)
 
             # Sampling
-            x0, gumbel_noise = sample_noise_or_greedy(
-                logits, noise_temp, step_keys[step]
-            )
+            x0, gumbel_noise = sample_noise_or_greedy(logits, noise_temp)
 
             # unmasking logic
             if unmasking == "topk":
-                probs = mx.softmax(logits, axis=-1)
-                # Confidence is the probability of the sampled token
+                probs = mx.softmax(logits, axis=-1).astype(model_dtype)
                 confidence_scores = mx.take_along_axis(
                     probs, x0[..., None], axis=-1
                 ).squeeze(-1)
             elif unmasking == "random":
                 confidence_scores = mx.random.uniform(
-                    shape=(batch_size, seq_len), key=step_keys[step], dtype=model_dtype
+                    shape=(batch_size, seq_len), dtype=model_dtype
                 )
             else:
                 raise ValueError(
                     f"Invalid unmasking strategy: {unmasking}, must be 'topk' or 'random'"
                 )
 
-            masked_confidences = mx.where(block_mask_condition, confidence_scores, -1e9)
+            masked_confidences = mx.where(
+                block_mask_condition,
+                confidence_scores,
+                mx.full(block_mask_condition.shape, -1e9, dtype=model_dtype),
+            )
             target_unmasked = int(mx.round(block_size * (1 - t)).item())
             current_unmasked = block_size - num_masks_in_block
             num_to_unmask = (
@@ -424,18 +411,33 @@ def generate_diffusion(
     prompt_time = time.perf_counter() - tic
     generation_tokens = seq_len - prompt_length
 
-    yield GenerationResponse(
-        text=final_text,
-        token=0,
-        logprobs=mx.array([]),
-        from_draft=False,
-        prompt_tokens=prompt.size,
-        prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
-        generation_tokens=generation_tokens,
-        generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
-        peak_memory=mx.metal.get_peak_memory() / 1e9,
-        finish_reason="length",
-    )
+    if not verbose:
+        yield GenerationResponse(
+            text=final_text,
+            token=0,
+            logprobs=mx.array([]),
+            from_draft=False,
+            prompt_tokens=prompt.size,
+            prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
+            generation_tokens=generation_tokens,
+            generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
+            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            finish_reason="length",
+        )
+    elif verbose:
+        # In verbose mode, yield a final response with empty text to signal completion
+        yield GenerationResponse(
+            text="",  # Avoid duplicating final_text
+            token=0,
+            logprobs=mx.array([]),
+            from_draft=False,
+            prompt_tokens=prompt.size,
+            prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
+            generation_tokens=generation_tokens,
+            generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
+            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            finish_reason="length",
+        )
 
 
 def generate_step(
@@ -811,6 +813,7 @@ def stream_generate(
                 k: kwargs.get(k) for k in AUTOREGRESSIVE_ARGS if k in kwargs
             }
             if draft_model is None:
+                autoregressive_args.pop("num_draft_tokens", None)
                 token_generator = generate_step(prompt, model, **autoregressive_args)
                 token_generator = (
                     (token, logprobs, False) for token, logprobs in token_generator
@@ -891,10 +894,7 @@ def generate(
         model, tokenizer, prompt, verbose=verbose, **kwargs
     ):
         if verbose:
-            if getattr(model.args, "model_type", None) != "llada":
-                print(response.text, end="")  # Diffusion: replace in place
-            else:
-                print(response.text, end="", flush=True)  # Autoregressive: incremental
+            print(response.text, end="", flush=True)
         text += response.text
 
     if verbose:
@@ -902,7 +902,7 @@ def generate(
         print("=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return text
+            return
         print(
             f"Prompt: {response.prompt_tokens} tokens, "
             f"{response.prompt_tps:.3f} tokens-per-sec"

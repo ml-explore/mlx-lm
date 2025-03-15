@@ -141,6 +141,9 @@ class LLaDABlock(nn.Module):
             offset=0,
         )
 
+        if mask is not None:
+            mask = mask.astype(queries.dtype)
+
         attn_output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
