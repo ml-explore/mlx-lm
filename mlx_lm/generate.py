@@ -24,7 +24,7 @@ DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_STEPS = 32
 DEFAULT_GEN_LENGTH = 64
 DEFAULT_NOISE_TEMP = 0.0
-DEFAULT_CFG = 0.0
+DEFAULT_CFG = 1.0
 DEFAULT_UNMASKING = "topk"
 DEFAULT_BLOCK_LENGTH = None
 
@@ -81,13 +81,22 @@ def setup_arg_parser():
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
-        "--temp", type=float, default=DEFAULT_TEMP, help="Sampling temperature"
+        "--temp",
+        type=float,
+        default=DEFAULT_TEMP,
+        help="Sampling temperature",
     )
     parser.add_argument(
-        "--top-p", type=float, default=DEFAULT_TOP_P, help="Sampling top-p"
+        "--top-p",
+        type=float,
+        default=DEFAULT_TOP_P,
+        help="Sampling top-p",
     )
     parser.add_argument(
-        "--min-p", type=float, default=DEFAULT_MIN_P, help="Sampling min-p"
+        "--min-p",
+        type=float,
+        default=DEFAULT_MIN_P,
+        help="Sampling min-p",
     )
     parser.add_argument(
         "--min-tokens-to-keep",
@@ -167,7 +176,6 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
-
     # Diffusion-specific arguments
     parser.add_argument(
         "--steps",
@@ -309,40 +317,28 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-
-    if getattr(model.args, "model_type", None) == "llada":
-        # Add diffusion-specific arguments
-        response = generate(
-            model,
-            tokenizer,
-            prompt,
-            verbose=args.verbose,
-            steps=args.steps,
-            gen_length=args.gen_length,
-            noise_temp=args.noise_temp,
-            cfg=args.cfg,
-            block_length=args.block_length,
-            unmasking=args.unmasking,
-        )
-    
-    else:
-        # Add standard autoregressive arguments
-        sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
-        response = generate(
-            model,
-            tokenizer,
-            prompt,
-            max_tokens=args.max_tokens,
-            verbose=args.verbose,
-            sampler=sampler,
-            max_kv_size=args.max_kv_size,
-            prompt_cache=prompt_cache if using_cache else None,
-            kv_bits=args.kv_bits,
-            kv_group_size=args.kv_group_size,
-            quantized_kv_start=args.quantized_kv_start,
-            draft_model=draft_model,
-            num_draft_tokens=args.num_draft_tokens,
-        )
+    sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
+    response = generate(
+        model,
+        tokenizer,
+        prompt,
+        max_tokens=args.max_tokens,
+        verbose=args.verbose,
+        sampler=sampler,
+        max_kv_size=args.max_kv_size,
+        prompt_cache=prompt_cache if using_cache else None,
+        kv_bits=args.kv_bits,
+        kv_group_size=args.kv_group_size,
+        quantized_kv_start=args.quantized_kv_start,
+        draft_model=draft_model,
+        num_draft_tokens=args.num_draft_tokens,
+        steps=args.steps,
+        gen_length=args.gen_length,
+        noise_temp=args.noise_temp,
+        cfg=args.cfg,
+        block_length=args.block_length,
+        unmasking=args.unmasking,
+    )
     if not args.verbose:
         print(response)
 
