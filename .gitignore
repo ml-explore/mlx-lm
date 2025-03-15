@@ -9,8 +9,6 @@ __pycache__/
 # Vim
 *.swp
 
-LLaDA*/
-
 # Distribution / packaging
 .Python
 build/
