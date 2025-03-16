@@ -9,6 +9,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import socket
 from pathlib import Path
 from typing import (
     Any,
@@ -694,6 +695,10 @@ def run(
 ):
     server_address = (host, port)
     prompt_cache = PromptCache()
+    infos = socket.getaddrinfo(
+        *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )
+    server_class.address_family, _, _, _, server_address = next(iter(infos))
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(
