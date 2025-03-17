@@ -25,10 +25,10 @@ class ModelArgs(BaseModelArgs):
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     kv_lora_rank: int
-    attention_bias: bool
     scale_depth: float
     scale_emb: float
     max_position_embeddings: int
+    attention_bias: bool = False
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[str, float]]] = None
@@ -55,7 +55,7 @@ class Attention(nn.Module):
         self.qk_nope_head_dim = self.args.qk_nope_head_dim
         self.attention_bias = self.args.attention_bias
         self.kv_lora_rank = self.args.kv_lora_rank
-        self.num_heads = args.num_attention_heads
+        self.num_heads = self.args.num_attention_heads
         self.q_lora_rank = self.args.q_lora_rank
         self.hidden_size = self.args.hidden_size
 
@@ -63,13 +63,35 @@ class Attention(nn.Module):
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
-        self.q_a_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=self.attention_bias)
+        self.q_a_proj = nn.Linear(
+            self.hidden_size, self.q_lora_rank, bias=self.attention_bias
+        )
         self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank)
-        self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = nn.Linear(self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=self.attention_bias)
-        self.kv_a_layernorm = nn.RMSNorm(self.q_lora_rank)
-        self.kv_b_proj = nn.Linear(self.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=self.attention_bias)
+
+        self.q_b_proj = nn.Linear(
+            self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+        )
+
+        self.kv_a_proj_with_mqa = nn.Linear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=self.attention_bias,
+        )
+
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank)
+
+        self.kv_b_proj = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads
+            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
+            bias=False,
+        )
+
+        self.o_proj = nn.Linear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=self.attention_bias,
+        )
 
         self.rope = initialize_rope(
             args.qk_rope_head_dim,
@@ -109,21 +131,26 @@ class Attention(nn.Module):
         if cache is not None:
             q_pe = self.rope(q_pe, offset=cache.offset)
             k_pe = self.rope(k_pe, offset=cache.offset)
-            # Combine the cached keys and values with the new ones
-            keys, values = cache.update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), 
-                values
-            )
         else:
             q_pe = self.rope(q_pe)
             k_pe = self.rope(k_pe)
-            # Combine the position-embedded and non-position-embedded parts
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
 
-        # Combine the position-embedded and non-position-embedded parts for query
+        # Create the full query and key tensors by combining the parts
+        # Broadcast k_pe to all heads
+        k_pe_broadcasted = mx.broadcast_to(k_pe, (B, self.num_heads, L, self.qk_rope_head_dim))
+        
+        # Use concatenate for queries
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        
+        # Use concatenate for keys
+        keys = mx.concatenate([k_nope, k_pe_broadcasted], axis=-1)
 
-        output = scaled_dot_product_attention(queries, keys, values, cache=cache, scale=self.scale, mask=mask)
+        # Update cache if needed
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        # Perform attention
+        output = scaled_dot_product_attention(queries, keys, values, cache=cache, scale=self.softmax_scale, mask=mask)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -217,6 +244,28 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if "lm_head.weight" not in weights:
             weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+        
+        # Add missing scaling_factor and inv_freq for each RoPE layer
+        for i in range(len(self.model.layers)):
+            rope = self.model.layers[i].self_attn.rope
+            
+            # Check and add scaling_factor if missing
+            scaling_factor_key = f"model.layers.{i}.self_attn.rope.scaling_factor"
+            if scaling_factor_key not in weights:
+                scale = rope.max_position_embeddings / rope.original_max_position_embeddings
+                scaling_factor = mx.sqrt(
+                    1 + mx.log(scale) / mx.log(rope.original_max_position_embeddings)
+                )
+                weights[scaling_factor_key] = scaling_factor
+            
+            # Check and add inv_freq if missing
+            inv_freq_key = f"model.layers.{i}.self_attn.rope.inv_freq"
+            if inv_freq_key not in weights:
+                dims = rope.dim
+                base = rope.base
+                inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float16) / dims))
+                weights[inv_freq_key] = inv_freq
+        
         return weights
 
     @property

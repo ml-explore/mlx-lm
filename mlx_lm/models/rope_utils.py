@@ -131,7 +131,7 @@ def initialize_rope(
     if rope_type == "default" or rope_type == "linear":
         scale = 1 / scaling_config["factor"] if rope_type == "linear" else 1.0
         return nn.RoPE(dims, traditional=traditional, base=base, scale=scale)
-    elif rope_type == "long":
+    elif rope_type == "longrope":
         return MiniCPMLongRoPE(
             dims=dims,
             base=base,
