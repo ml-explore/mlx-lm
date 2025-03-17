@@ -242,14 +242,10 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
-        if "lm_head.weight" not in weights:
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
-        
-        # Add missing scaling_factor and inv_freq for each RoPE layer
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
         for i in range(len(self.model.layers)):
             rope = self.model.layers[i].self_attn.rope
-            
-            # Check and add scaling_factor if missing
             scaling_factor_key = f"model.layers.{i}.self_attn.rope.scaling_factor"
             if scaling_factor_key not in weights:
                 scale = rope.max_position_embeddings / rope.original_max_position_embeddings
@@ -257,15 +253,12 @@ class Model(nn.Module):
                     1 + mx.log(scale) / mx.log(rope.original_max_position_embeddings)
                 )
                 weights[scaling_factor_key] = scaling_factor
-            
-            # Check and add inv_freq if missing
             inv_freq_key = f"model.layers.{i}.self_attn.rope.inv_freq"
             if inv_freq_key not in weights:
                 dims = rope.dim
                 base = rope.base
                 inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float16) / dims))
                 weights[inv_freq_key] = inv_freq
-        
         return weights
 
     @property
