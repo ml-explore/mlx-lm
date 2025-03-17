@@ -196,6 +196,11 @@ def linear_to_lora_layers(
             "mixer.dt_proj",
             "mixer.out_proj",
         }
+    elif model.model_type == "mamba2":
+        keys = {
+            "mixer.in_proj",
+            "mixer.out_proj",
+        }
     elif model.model_type == "exaone":
         keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
     elif model.model_type == "bailing_moe":
