@@ -241,11 +241,12 @@ class ResidualBlock(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size)
 
     def __call__(self, x: mx.array, cache):
+        residual = x
         normed = self.norm(x)
         if self.residual_in_fp32:
-            x = x.astype(mx.float32)
+            residual = residual.astype(mx.float32)
         output = self.mixer(normed, cache)
-        return output + x
+        return output + residual
 
 
 class Mamba2(nn.Module):
