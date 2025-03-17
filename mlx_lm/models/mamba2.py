@@ -271,7 +271,6 @@ class Mamba2Mixer(nn.Module):
         # Handle the convolution weights differently in MLX
         # Instead of squeezing, reshape the weights to match the expected operation
         weight = self.conv1d.weight
-        # Assuming weight shape is [out_channels, in_channels_per_group, kernel_size]
         # For a depthwise conv this would typically be [out_channels, 1, kernel_size]
         # Reshape to the appropriate form for element-wise multiplication
         weight_reshaped = mx.reshape(weight, (self.conv_dim, -1))
