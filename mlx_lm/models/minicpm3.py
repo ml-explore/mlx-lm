@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
+from .su_rope import SuScaledRotaryEmbedding
 
 
 @dataclass
@@ -33,17 +33,6 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[str, float]]] = None
     tie_word_embeddings: bool = False
-
-
-class MLP(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-
-    def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Attention(nn.Module):
@@ -93,12 +82,13 @@ class Attention(nn.Module):
             bias=self.attention_bias,
         )
 
-        self.rope = initialize_rope(
-            args.qk_rope_head_dim,
-            args.rope_theta,
-            args.rope_traditional,
-            args.rope_scaling,
-            args.max_position_embeddings,
+        self.rope = SuScaledRotaryEmbedding(
+            dims=args.qk_rope_head_dim,
+            base=args.rope_theta,
+            max_position_embeddings=args.max_position_embeddings,
+            original_max_position_embeddings=args.rope_scaling.get("original_max_position_embeddings", 4096),
+            short_factor=args.rope_scaling.get("short_factor", 1.0),
+            long_factor=args.rope_scaling.get("long_factor", 1.0),
         )
 
     def __call__(
@@ -151,6 +141,17 @@ class Attention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
+
+class MLP(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+    def __call__(self, x):
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+    
 
 class DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -241,21 +242,6 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if "lm_head.weight" not in weights:
             weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
-        for i in range(len(self.model.layers)):
-            rope = self.model.layers[i].self_attn.rope
-            scaling_factor_key = f"model.layers.{i}.self_attn.rope.scaling_factor"
-            if scaling_factor_key not in weights:
-                scale = rope.max_position_embeddings / rope.original_max_position_embeddings
-                scaling_factor = mx.sqrt(
-                    1 + mx.log(scale) / mx.log(rope.original_max_position_embeddings)
-                )
-                weights[scaling_factor_key] = scaling_factor
-            inv_freq_key = f"model.layers.{i}.self_attn.rope.inv_freq"
-            if inv_freq_key not in weights:
-                dims = rope.dim
-                base = rope.base
-                inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float16) / dims))
-                weights[inv_freq_key] = inv_freq
         return weights
 
     @property
