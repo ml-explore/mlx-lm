@@ -9,7 +9,7 @@ MLX LM was developed with contributions from the following individuals:
 
 - Shunta Saito: Added support for PLaMo models.
 - Gökdeniz Gülmez: Added support for the following architectures: OpenBMB's
-  `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's`Mamba v1`, Z.ai &
+  `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's `Mamba v1`, `Mamba v2`, Z.ai &
    THUKEG's `GLM`, `GLM4`, Rednote `dots.llm1`, Baisu's `Ernie4.5 MoE`, inclusionAI's
    `Bailing MoE e.g. Ling-family`, Klear team - Kuaishou Technology's `Klear`,
    IBM's `Granite MoE`, Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's
