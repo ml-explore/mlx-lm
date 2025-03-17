@@ -1016,19 +1016,48 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-def mixed_quant_predicate_builder(
-    low_bits: int = 4, high_bits: int = 4, group_size: int = 64
-) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
-    def mixed_quant_predicate(
+class MixedQuantPredicate:
+    """
+    Class that implements mixed quantization strategies with configurable parameters.
+
+    This class mimics the behavior of llama.cpp's mixed quantization schemes
+    like Q4_K_M but allows for customization through arbitrary attributes.
+
+    Attributes:
+        low_bits (int): Number of bits for most layers.
+        high_bits (int): Number of bits for attention and important layers.
+        group_size (int): Group size for quantization.
+    """
+
+    def __init__(self, low_bits: int = 4, high_bits: int = 4, group_size: int = 64, **kwargs):
+        """
+        Initialize the mixed quantization predicate.
+
+        Args:
+            low_bits: Number of bits for most layers
+            high_bits: Number of bits for attention and important layers
+            group_size: Group size for quantization
+            **kwargs: Additional attributes to set on the instance
+        """
+        self.low_bits = low_bits
+        self.high_bits = high_bits
+        self.group_size = group_size
+
+        # Allow setting arbitrary attributes
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __call__(
+        self,
         path: str,
         module: nn.Module,
         config: dict,
     ) -> Union[bool, dict]:
-        """Implements mixed quantization predicates with similar choices to, for example, llama.cpp's Q4_K_M.
+        """
+        Implements mixed quantization predicates with similar choices to, for example, llama.cpp's Q4_K_M.
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
         By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
         """
-
         if not hasattr(module, "to_quantized"):
             return False
 
@@ -1041,19 +1070,18 @@ def mixed_quant_predicate_builder(
             or (index - num_layers // 8) % 3 == 2
         )
         if "v_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": self.group_size, "bits": self.high_bits}
         if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": self.group_size, "bits": self.high_bits}
         if "lm_head" in path:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": self.group_size, "bits": self.high_bits}
 
-        return {"group_size": group_size, "bits": low_bits}
-
-    return mixed_quant_predicate
+        return {"group_size": self.group_size, "bits": self.low_bits}
 
 
-mixed_3_6 = mixed_quant_predicate_builder(low_bits=3, high_bits=6)
-mixed_2_6 = mixed_quant_predicate_builder(low_bits=2, high_bits=6)
+# Pre-defined instances for common quantization schemes
+mixed_3_6 = MixedQuantPredicate(low_bits=3, high_bits=6)
+mixed_2_6 = MixedQuantPredicate(low_bits=2, high_bits=6)
 
 
 def convert(
