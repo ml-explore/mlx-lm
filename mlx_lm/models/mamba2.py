@@ -1,10 +1,11 @@
 import math
 from dataclasses import dataclass
-from typing import Tuple, Union, Optional
+from typing import Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
+from .cache import Mamba2Cache
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -42,89 +43,6 @@ class ModelArgs(BaseModelArgs):
             self.time_step_rank = math.ceil(self.hidden_size / 16)
 
 
-class Mamba2Cache:
-    """
-    Arguments:
-        config: Mamba2Config
-        batch_size: int
-        dtype: mlx.core.dtype
-
-    Attributes:
-        dtype: (`mlx.core.dtype`):
-            The default `dtype` used to initializing the cache.
-        conv_kernel_size: (`int`):
-            Model's convolution kernel size taken from config.
-        n_groups: (`int`):
-            Model's number of groups taken from the config - similar to tensor parallel in Transformer.
-        state_size: (`int`):
-            Model's SSM state size taken from config.
-        num_heads: (`int`):
-            The number of heads used in the linear attention / SSM.
-        head_dim: (`int`):
-            The respective dimension of the heads used in the linear attention / SSM.
-        intermediate_size: (`int`):
-            Model's intermediate_size based on (expand * hidden_dim) from config.
-        conv_states: (`mlx.array`):
-            A tensor of shape `[num_layers, batch_size, intermediate_size + 2 * n_groups * state_size, conv_kernel_size]` that holds convolutional states.
-        ssm_states: (`mlx.array`):
-            A tensor of shape `[num_layers, batch_size, num_heads, head_dim, state_size]` that holds ssm states.
-    """
-
-    def __init__(
-        self, config: ModelArgs, batch_size: int, dtype=None
-    ):
-        # MLX dtype handling
-        self.dtype = dtype if dtype is not None else mx.float16
-        self.conv_kernel_size = config.conv_kernel
-        self.n_groups = config.n_groups
-        self.state_size = config.state_size
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-        self.intermediate_size = int(config.expand * config.hidden_size)
-
-        # Create arrays using mx.zeros
-        self.conv_states = mx.zeros(
-            (config.num_hidden_layers,
-            batch_size,
-            self.intermediate_size + 2 * self.n_groups * self.state_size,
-            self.conv_kernel_size),
-            dtype=self.dtype
-        )
-        self.ssm_states = mx.zeros(
-            (config.num_hidden_layers,
-            batch_size,
-            self.num_heads,
-            self.head_dim,
-            self.state_size),
-            dtype=self.dtype
-        )
-
-    def update_conv_state(
-        self, layer_idx: int, new_conv_state: mx.array, cache_init: bool = False
-    ) -> mx.array:
-        if cache_init:
-            # For initialization, replace the entire layer's state
-            self.conv_states[layer_idx] = new_conv_state
-        else:
-            # Roll the states and update
-            rolled = mx.roll(self.conv_states[layer_idx], shift=-1, axis=-1)
-            # Update the last position
-            rolled[:, :, -1] = new_conv_state[:, 0, :]
-            self.conv_states[layer_idx] = rolled
-        
-        return self.conv_states[layer_idx]
-
-    def update_ssm_state(self, layer_idx: int, new_ssm_state: mx.array):
-        # Update the layer with the new state
-        self.ssm_states[layer_idx] = new_ssm_state
-        return self.ssm_states[layer_idx]
-
-    def reset(self):
-        # Zero out the arrays
-        self.conv_states = mx.zeros_like(self.conv_states)
-        self.ssm_states = mx.zeros_like(self.ssm_states)
-
-
 class MambaRMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
@@ -134,63 +52,41 @@ class MambaRMSNormGated(nn.Module):
     def __call__(self, hidden_states, gate=None):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(mx.float32)
-
         if gate is not None:
             # Apply SiLU activation to gate
             gate = gate.astype(mx.float32)
             silu_gate = gate * mx.sigmoid(gate)
             hidden_states = hidden_states * silu_gate
-            
         # Compute variance along last dimension
         variance = mx.mean(mx.power(hidden_states, 2), axis=-1, keepdims=True)
         hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
-
         # Cast back to original dtype and apply weight
         return self.weight * hidden_states.astype(input_dtype)
 
 
 def segsum(input_tensor):
-    """
-    More stable segment sum calculation. Uses cumulative sums and masking instead of direct subtractions.
-    """
     chunk_size = input_tensor.shape[-1]
     # 1. expand input tensor to have an additional dimension and repeat along that dimension
     # [..., chunk_size] -> [..., chunk_size, chunk_size]
     input_tensor = mx.expand_dims(input_tensor, -1)
     input_tensor = mx.broadcast_to(input_tensor, (*input_tensor.shape[:-1], chunk_size, chunk_size))
-    
     # 2. create a lower triangular mask with the diagonal set to 0 to 0 out elements above diag
     mask = mx.tril(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), diagonal=-1)
     input_tensor = input_tensor * mask
-    
     # 3. compute actual cumsum
     tensor_segsum = mx.cumsum(input_tensor, axis=-2)
-
     # 4. apply mask to keep only the lower triangular part of the cumulative sum result (incl diagonal this time)
     mask = mx.tril(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), diagonal=0)
-    tensor_segsum = mx.where(mask, tensor_segsum, mx.full_like(tensor_segsum, -float('inf')))
-    
-    return tensor_segsum
+    return mx.where(mask, tensor_segsum, mx.full_like(tensor_segsum, -float('inf')))
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
-    """
-    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
-    """
     if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
         dtype = hidden_states.dtype
         hidden_states = mx.array(hidden_states * attention_mask[:, :, None], dtype=dtype)
-
     return hidden_states
 
 
 class Mamba2Mixer(nn.Module):
-    """
-    Compute ∆, A, B, C, and D the state space parameters and compute the `contextualized_states`.
-    A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
-    ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
-    and is why Mamba is called **selective** state spaces)
-    """
-
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.num_heads = args.num_heads
@@ -201,14 +97,11 @@ class Mamba2Mixer(nn.Module):
         self.time_step_rank = int(args.time_step_rank)
         self.layer_idx = layer_idx
         self.use_conv_bias = args.use_conv_bias
-
         self.layer_norm_epsilon = args.layer_norm_epsilon
         self.rms_norm = args.rms_norm
-
         self.n_groups = args.n_groups
         self.head_dim = args.head_dim
         self.chunk_size = args.chunk_size
-
         self.time_step_limit = args.time_step_limit
         self.time_step_min = args.time_step_min
         self.time_step_max = args.time_step_max
@@ -222,27 +115,17 @@ class Mamba2Mixer(nn.Module):
             groups=self.conv_dim,
             padding=args.conv_kernel - 1,
         )
-
-        # projection of the input hidden states
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
         self.in_proj = nn.Linear(
             self.hidden_size,
             projection_size,
             bias=args.use_bias,
         )
-        # selective projection used to make dt, B and C input dependant
-
-        # time step projection (discretization)
-        # instantiate once and copy inv_dt in init_weights of PretrainedModel
         self.dt_bias = mx.zeros(self.num_heads) + 1.0
-
-        # S4D real initialization. These are not discretized!
-        # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
         A = mx.arange(1, self.num_heads + 1)
         self.A_log = mx.log(A)
         self.norm = MambaRMSNormGated(self.intermediate_size, eps=self.layer_norm_epsilon)
         self.D = mx.zeros(self.num_heads) + 1.0
-
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.use_bias)
         self.use_bias = args.use_bias
 
@@ -264,15 +147,16 @@ class Mamba2Mixer(nn.Module):
         _, _, gate, hidden_states_B_C, dt = parts
         
         # 2. Convolution sequence transformation
-        cache_params.update_conv_state(layer_idx=self.layer_idx, new_conv_state=hidden_states_B_C, cache_init=False)
+        # Update conv state without batch dimension
+        cache_params.update_conv_state(layer_idx=self.layer_idx, new_conv_state=hidden_states_B_C[0], cache_init=False)
         
+        # Get conv states and expand for batch processing
         conv_states = cache_params.conv_states[self.layer_idx]
+        # Expand to match batch size
+        conv_states = mx.broadcast_to(conv_states[None, ...], (batch_size, *conv_states.shape))
         
-        # Handle the convolution weights differently in MLX
-        # Instead of squeezing, reshape the weights to match the expected operation
+        # Handle the convolution operation
         weight = self.conv1d.weight
-        # For a depthwise conv this would typically be [out_channels, 1, kernel_size]
-        # Reshape to the appropriate form for element-wise multiplication
         weight_reshaped = mx.reshape(weight, (self.conv_dim, -1))
         hidden_states_B_C = mx.sum(conv_states * weight_reshaped, axis=-1)
         
@@ -280,7 +164,7 @@ class Mamba2Mixer(nn.Module):
             hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
         
         # Activation function (SiLU/Swish)
-        hidden_states_B_C = hidden_states_B_C * mx.sigmoid(hidden_states_B_C)  # SiLU activation
+        hidden_states_B_C = hidden_states_B_C * mx.sigmoid(hidden_states_B_C)
         
         hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
         
@@ -294,7 +178,7 @@ class Mamba2Mixer(nn.Module):
         
         # Handle dt
         dt = dt[:, 0, :][:, None, ...]
-        dt = mx.transpose(dt, (0, 2, 1))  # equivalent to dt.transpose(1, 2)
+        dt = mx.transpose(dt, (0, 2, 1))
         dt = mx.broadcast_to(dt, (batch_size, dt.shape[1], self.head_dim))
         
         # Expand dt_bias
@@ -321,18 +205,25 @@ class Mamba2Mixer(nn.Module):
         hidden_states = mx.reshape(hidden_states, (batch_size, -1, self.head_dim))
         dBx = dB * hidden_states[..., None]
         
-        # State calculation
+        # Get SSM states and expand for batch processing
+        ssm_states = cache_params.ssm_states[self.layer_idx]
+        # Expand to match batch size
+        ssm_states = mx.broadcast_to(ssm_states[None, ...], (batch_size, *ssm_states.shape))
+        
+        # Update state - we'll only update the state for the first batch element
+        new_ssm_state = ssm_states[0] * dA[0] + dBx[0]
         cache_params.update_ssm_state(
             layer_idx=self.layer_idx,
-            new_ssm_state=cache_params.ssm_states[self.layer_idx] * dA + dBx
+            new_ssm_state=new_ssm_state
         )
+        
+        # For all batch items calculate their output using the updated state formula
+        ssm_states = ssm_states * dA + dBx
         
         # Subsequent output
         C = mx.reshape(C, (batch_size, self.n_groups, -1))[..., None, :]
         C = mx.broadcast_to(C, (batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1]))
         C = mx.reshape(C, (batch_size, -1, C.shape[-1]))
-        
-        ssm_states = cache_params.ssm_states[self.layer_idx]
         
         # Reshape for batched matrix multiplication
         ssm_states_reshaped = mx.reshape(ssm_states, (batch_size * self.num_heads, self.head_dim, self.ssm_state_size))
@@ -413,7 +304,7 @@ class Model(nn.Module):
         return logits
 
     def make_cache(self):
-        return [Mamba2Cache(self.args, 1) for _ in range(len(self.layers))]
+        return [Mamba2Cache(self.args) for _ in range(len(self.layers))]
 
     @property
     def layers(self):
