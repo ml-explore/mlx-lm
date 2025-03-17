@@ -66,18 +66,14 @@ class MambaRMSNormGated(nn.Module):
 
 def segsum(input_tensor):
     chunk_size = input_tensor.shape[-1]
-    # 1. expand input tensor to have an additional dimension and repeat along that dimension
-    # [..., chunk_size] -> [..., chunk_size, chunk_size]
     input_tensor = mx.expand_dims(input_tensor, -1)
     input_tensor = mx.broadcast_to(input_tensor, (*input_tensor.shape[:-1], chunk_size, chunk_size))
-    # 2. create a lower triangular mask with the diagonal set to 0 to 0 out elements above diag
     mask = mx.tril(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), diagonal=-1)
     input_tensor = input_tensor * mask
-    # 3. compute actual cumsum
     tensor_segsum = mx.cumsum(input_tensor, axis=-2)
-    # 4. apply mask to keep only the lower triangular part of the cumulative sum result (incl diagonal this time)
     mask = mx.tril(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), diagonal=0)
     return mx.where(mask, tensor_segsum, mx.full_like(tensor_segsum, -float('inf')))
+
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
     if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
@@ -97,11 +93,14 @@ class Mamba2Mixer(nn.Module):
         self.time_step_rank = int(args.time_step_rank)
         self.layer_idx = layer_idx
         self.use_conv_bias = args.use_conv_bias
+
         self.layer_norm_epsilon = args.layer_norm_epsilon
         self.rms_norm = args.rms_norm
+
         self.n_groups = args.n_groups
         self.head_dim = args.head_dim
         self.chunk_size = args.chunk_size
+
         self.time_step_limit = args.time_step_limit
         self.time_step_min = args.time_step_min
         self.time_step_max = args.time_step_max
@@ -113,8 +112,9 @@ class Mamba2Mixer(nn.Module):
             bias=args.use_conv_bias,
             kernel_size=args.conv_kernel,
             groups=self.conv_dim,
-            padding=args.conv_kernel - 1,
+            padding=args.conv_kernel - 1
         )
+
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
         self.in_proj = nn.Linear(
             self.hidden_size,
@@ -131,7 +131,6 @@ class Mamba2Mixer(nn.Module):
 
     def __call__(self, input_states, cache_params=None, attention_mask=None):
         batch_size, seq_len, _ = input_states.shape
-        dtype = input_states.dtype
 
         # 1. Gated MLP's linear projection
         input_states = apply_mask_to_padding_states(input_states, attention_mask)
@@ -147,15 +146,10 @@ class Mamba2Mixer(nn.Module):
         _, _, gate, hidden_states_B_C, dt = parts
         
         # 2. Convolution sequence transformation
-        # Update conv state without batch dimension
-        cache_params.update_conv_state(layer_idx=self.layer_idx, new_conv_state=hidden_states_B_C[0], cache_init=False)
+        cache_params.update_conv_state(layer_idx=self.layer_idx, new_conv_state=hidden_states_B_C, cache_init=False)
         
-        # Get conv states and expand for batch processing
         conv_states = cache_params.conv_states[self.layer_idx]
-        # Expand to match batch size
-        conv_states = mx.broadcast_to(conv_states[None, ...], (batch_size, *conv_states.shape))
         
-        # Handle the convolution operation
         weight = self.conv1d.weight
         weight_reshaped = mx.reshape(weight, (self.conv_dim, -1))
         hidden_states_B_C = mx.sum(conv_states * weight_reshaped, axis=-1)
@@ -163,8 +157,7 @@ class Mamba2Mixer(nn.Module):
         if self.use_conv_bias:
             hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
         
-        # Activation function (SiLU/Swish)
-        hidden_states_B_C = hidden_states_B_C * mx.sigmoid(hidden_states_B_C)
+        hidden_states_B_C = nn.silu(hidden_states_B_C)
         
         hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
         
@@ -178,7 +171,7 @@ class Mamba2Mixer(nn.Module):
         
         # Handle dt
         dt = dt[:, 0, :][:, None, ...]
-        dt = mx.transpose(dt, (0, 2, 1))
+        dt = mx.transpose(dt, (0, 2, 1))  # equivalent to dt.transpose(1, 2)
         dt = mx.broadcast_to(dt, (batch_size, dt.shape[1], self.head_dim))
         
         # Expand dt_bias
@@ -205,25 +198,18 @@ class Mamba2Mixer(nn.Module):
         hidden_states = mx.reshape(hidden_states, (batch_size, -1, self.head_dim))
         dBx = dB * hidden_states[..., None]
         
-        # Get SSM states and expand for batch processing
-        ssm_states = cache_params.ssm_states[self.layer_idx]
-        # Expand to match batch size
-        ssm_states = mx.broadcast_to(ssm_states[None, ...], (batch_size, *ssm_states.shape))
-        
-        # Update state - we'll only update the state for the first batch element
-        new_ssm_state = ssm_states[0] * dA[0] + dBx[0]
+        # State calculation
         cache_params.update_ssm_state(
             layer_idx=self.layer_idx,
-            new_ssm_state=new_ssm_state
+            new_ssm_state=cache_params.ssm_states[self.layer_idx] * dA + dBx
         )
-        
-        # For all batch items calculate their output using the updated state formula
-        ssm_states = ssm_states * dA + dBx
         
         # Subsequent output
         C = mx.reshape(C, (batch_size, self.n_groups, -1))[..., None, :]
         C = mx.broadcast_to(C, (batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1]))
         C = mx.reshape(C, (batch_size, -1, C.shape[-1]))
+        
+        ssm_states = cache_params.ssm_states[self.layer_idx]
         
         # Reshape for batched matrix multiplication
         ssm_states_reshaped = mx.reshape(ssm_states, (batch_size * self.num_heads, self.head_dim, self.ssm_state_size))
@@ -244,9 +230,7 @@ class Mamba2Mixer(nn.Module):
         scan_output = self.norm(y, gate)
         
         # 4. Final linear projection
-        contextualized_states = self.out_proj(scan_output)
-        
-        return contextualized_states
+        return self.out_proj(scan_output)
 
 
 class ResidualBlock(nn.Module):

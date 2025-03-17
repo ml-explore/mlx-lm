@@ -1,58 +1,36 @@
-import math
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+from dataclasses import dataclass
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
-
-from ...activations import ACT2FN
-from ...generation import GenerationMixin
-from ...modeling_utils import PreTrainedModel
-from ...utils import (
-    ModelOutput,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-)
-from .configuration_mamba2 import Mamba2Config
-
-mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, selective_state_update = None, None, None
-
-causal_conv1d_update, causal_conv1d_fn = None, None
 
 
-
-def pad_tensor_by_size(input_tensor: torch.Tensor, pad_size: int):
-    """
-    Padding x tensor with `pad_size` on the seq_len dim (dim=1)
-
-    Assumes that we only have tensors of either size 4 or 3
-    """
-    pad_shape = (0, 0, 0, 0, 0, pad_size, 0, 0) if len(input_tensor.shape) == 4 else (0, 0, 0, pad_size, 0, 0)
-
-    return torch.nn.functional.pad(input_tensor, pad_shape, mode="constant", value=0)
-
-
-def reshape_into_chunks(input_tensor, pad_size, chunk_size):
-    """
-    Padding input_tensor with `pad_size` on the seq_len dim (dim=1) and
-    simultaneously splitting it into chunk sequences.
-
-    Assumes that we only have tensors of either size 4 or 3
-    """
-    # [bsz, seq_len, ...] -> [bsz, seq_len multiple of chunk_size, ...]
-    input_tensor = pad_tensor_by_size(input_tensor, pad_size)
-
-    if len(input_tensor.shape) == 3:
-        # [bsz, seq_len multiple of chunk_size, num_heads] -> [bsz, -1, chunk_size, num_heads]
-        return input_tensor.reshape(input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2])
-    else:
-        # [bsz, seq_len multiple of chunk_size, num_heads, head_dim or state_size] -> [bsz, -1, chunk_size, num_heads, head_dim or state_size]
-        return input_tensor.reshape(
-            input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2], input_tensor.shape[3]
-        )
+@dataclass
+class Mamba2Config():
+    model_type: str
+    num_heads: int
+    head_dim: int
+    vocab_size: int
+    hidden_size: int
+    state_size: int
+    num_hidden_layers: int
+    layer_norm_epsilon: float
+    expand: int
+    conv_kernel: int
+    n_groups: int
+    use_bias: bool
+    use_conv_bias: bool
+    initializer_range: float
+    residual_in_fp32: bool
+    chunk_size: int
+    tie_word_embeddings: bool
+    time_step_limit: Tuple[float, float]
+    time_step_rank: Union[int, str]
+    time_step_min: float
+    time_step_max: float
+    time_step_floor: float
+    norm_before_gate: bool = True
+    rms_norm: bool = True
 
 
 def segment_sum(input_tensor):
@@ -87,34 +65,6 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
 
 
 class Mamba2Cache:
-    """
-    Arguments:
-        config: Mamba2Config
-        batch_size: int
-        dtype: torch.dtype
-        device: torch.device
-
-    Attributes:
-        dtype: (`torch.dtype`):
-            The default `dtype` used to initializing the cache.
-        conv_kernel_size: (`int`):
-            Model's convolution kernel size taken from config.
-        n_groups: (`int`):
-            Model's number of groups taken from the config - similar to tensor parallel in Transformer.
-        state_size: (`int`):
-            Model's SSM state size taken from config.
-        num_heads: (`int`):
-            The number of heads used in the linear attention / SSM.
-        head_dim: (`int`):
-            The respective dimension of the heads used in the linear attention / SSM.
-        intermediate_size: (`int`):
-            Model's intermediate_size based on (expand * hidden_dim) from config.
-        conv_states: (`torch.Tensor`):
-            A tensor of shape `[num_layers, batch_size, conv_kernel_size, intermediate_size + 2 * n_groups * state_size]` that holds convolutional states.
-        ssm_states: (`torch.Tensor`):
-            A tensor of shape `[num_layers, batch_size, num_heads, head_dim, state_size]` that holds ssm states.
-    """
-
     def __init__(
         self, config: Mamba2Config, batch_size: int, dtype: torch.dtype = torch.float16, device: Optional[str] = None
     ):
@@ -216,8 +166,6 @@ class Mamba2Mixer(nn.Module):
         self.time_step_rank = int(config.time_step_rank)
         self.layer_idx = layer_idx
         self.use_conv_bias = config.use_conv_bias
-        self.activation = config.hidden_act
-        self.act = ACT2FN[config.hidden_act]
 
         self.layer_norm_epsilon = config.layer_norm_epsilon
         self.rms_norm = config.rms_norm
@@ -288,7 +236,7 @@ class Mamba2Mixer(nn.Module):
         )
         if self.use_conv_bias:
             hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
-        hidden_states_B_C = self.act(hidden_states_B_C)
+        hidden_states_B_C = nn.SiLU(hidden_states_B_C)
 
         hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
         hidden_states, B, C = torch.split(
@@ -298,7 +246,7 @@ class Mamba2Mixer(nn.Module):
         )
 
         # 3. SSM transformation
-        A = -torch.exp(self.A_log.float())                            # [num_heads]
+        A = -torch.exp(self.A_log) # [num_heads]
 
         # We need to guarantee that anything regarding the cache is on the same device
         cache_device = cache_params.ssm_states.device
@@ -310,7 +258,7 @@ class Mamba2Mixer(nn.Module):
         # [num_heads] -> [num_heads, head_dim]
         dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
 
-        dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
+        dt = torch.nn.functional.softplus(dt + dt_bias)
         dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
         A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
         # [bsz, num_heads, head_dim, state_size]
@@ -359,8 +307,6 @@ class Mamba2Mixer(nn.Module):
         y = y.reshape(batch_size, -1)[:, None, ...]
 
         scan_output = self.norm(y, gate)
-
-        # end ssd
 
         # 4. Final linear projection
         contextualized_states = self.out_proj(scan_output.to(dtype))  # [batch, seq_len, hidden_size]
@@ -441,20 +387,10 @@ class Mamba2ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
         cache_params: Optional[Mamba2Cache] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
-            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
-        """
         mamba2_outputs = self.backbone(
             input_ids,
             cache_params=cache_params,
