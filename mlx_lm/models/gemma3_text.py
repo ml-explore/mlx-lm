@@ -213,11 +213,10 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
+        weights = dict(weights)
         if "lm_head.weight" not in weights:
             weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        return weights
 
     @property
     def layers(self):
