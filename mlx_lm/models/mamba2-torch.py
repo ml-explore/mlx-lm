@@ -326,7 +326,6 @@ class Mamba2Block(nn.Module):
         self,
         hidden_states,
         cache_params: Optional[Mamba2Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
         residual = hidden_states
@@ -335,7 +334,7 @@ class Mamba2Block(nn.Module):
             residual = residual.to(torch.float32)
 
         hidden_states = self.mixer(
-            hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask
+            hidden_states, cache_params=cache_params, attention_mask=attention_mask
         )
         hidden_states = residual + hidden_states
         return hidden_states
@@ -345,18 +344,14 @@ class Mamba2Block(nn.Module):
 class Mamba2Model(nn.Module):
     def __init__(self, config):
         super().__init__(config)
-
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Mamba2Block(config, layer_idx=idx) for idx in range(config.num_hidden_layers)])
-
-        self.gradient_checkpointing = False
         self.norm_f = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[Mamba2Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
         inputs_embeds = self.embeddings(input_ids)
@@ -365,13 +360,11 @@ class Mamba2Model(nn.Module):
             cache_params = Mamba2Cache(
                 self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
             )
-            cache_position = torch.arange(0, self.config.conv_kernel, device=inputs_embeds.device)
 
         for mixer_block in self.layers:
             hidden_states = mixer_block(
                 inputs_embeds,
                 cache_params=cache_params,
-                cache_position=cache_position,
                 attention_mask=attention_mask,
             )
 

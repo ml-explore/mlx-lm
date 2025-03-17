@@ -51,16 +51,11 @@ class MambaRMSNormGated(nn.Module):
 
     def __call__(self, hidden_states, gate=None):
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(mx.float32)
         if gate is not None:
-            # Apply SiLU activation to gate
-            gate = gate.astype(mx.float32)
-            silu_gate = gate * mx.sigmoid(gate)
+            silu_gate = nn.silu(gate)
             hidden_states = hidden_states * silu_gate
-        # Compute variance along last dimension
         variance = mx.mean(mx.power(hidden_states, 2), axis=-1, keepdims=True)
         hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
-        # Cast back to original dtype and apply weight
         return self.weight * hidden_states.astype(input_dtype)
 
 
@@ -75,10 +70,10 @@ def segsum(input_tensor):
     return mx.where(mask, tensor_segsum, mx.full_like(tensor_segsum, -float('inf')))
 
 
-def apply_mask_to_padding_states(hidden_states, attention_mask):
-    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+def apply_mask_to_padding_states(hidden_states, mask):
+    if mask is not None and mask.shape[1] > 1 and mask.shape[0] > 1:
         dtype = hidden_states.dtype
-        hidden_states = mx.array(hidden_states * attention_mask[:, :, None], dtype=dtype)
+        hidden_states = mx.array(hidden_states * mask[:, :, None], dtype=dtype)
     return hidden_states
 
 
@@ -129,11 +124,11 @@ class Mamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.use_bias)
         self.use_bias = args.use_bias
 
-    def __call__(self, input_states, cache_params=None, attention_mask=None):
+    def __call__(self, input_states, cache=None, mask=None):
         batch_size, seq_len, _ = input_states.shape
 
         # 1. Gated MLP's linear projection
-        input_states = apply_mask_to_padding_states(input_states, attention_mask)
+        input_states = apply_mask_to_padding_states(input_states, mask)
         projected_states = self.in_proj(input_states)
         d_mlp = (projected_states.shape[-1] - 2 * self.intermediate_size - 2 * self.n_groups * self.ssm_state_size - self.num_heads) // 2
         
@@ -146,9 +141,9 @@ class Mamba2Mixer(nn.Module):
         _, _, gate, hidden_states_B_C, dt = parts
         
         # 2. Convolution sequence transformation
-        cache_params.update_conv_state(layer_idx=self.layer_idx, new_conv_state=hidden_states_B_C, cache_init=False)
+        cache.update_conv_state(layer_idx=self.layer_idx, new_conv_state=hidden_states_B_C)
         
-        conv_states = cache_params.conv_states[self.layer_idx]
+        conv_states = cache.conv_states[self.layer_idx]
         
         weight = self.conv1d.weight
         weight_reshaped = mx.reshape(weight, (self.conv_dim, -1))
@@ -159,7 +154,7 @@ class Mamba2Mixer(nn.Module):
         
         hidden_states_B_C = nn.silu(hidden_states_B_C)
         
-        hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
+        hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, mask)
         
         # Split hidden_states_B_C
         hidden_states = hidden_states_B_C[..., :self.intermediate_size]
@@ -171,7 +166,7 @@ class Mamba2Mixer(nn.Module):
         
         # Handle dt
         dt = dt[:, 0, :][:, None, ...]
-        dt = mx.transpose(dt, (0, 2, 1))  # equivalent to dt.transpose(1, 2)
+        dt = mx.transpose(dt, (0, 2, 1))
         dt = mx.broadcast_to(dt, (batch_size, dt.shape[1], self.head_dim))
         
         # Expand dt_bias
@@ -199,9 +194,9 @@ class Mamba2Mixer(nn.Module):
         dBx = dB * hidden_states[..., None]
         
         # State calculation
-        cache_params.update_ssm_state(
+        cache.update_ssm_state(
             layer_idx=self.layer_idx,
-            new_ssm_state=cache_params.ssm_states[self.layer_idx] * dA + dBx
+            new_ssm_state=cache.ssm_states[self.layer_idx] * dA + dBx
         )
         
         # Subsequent output
@@ -209,7 +204,7 @@ class Mamba2Mixer(nn.Module):
         C = mx.broadcast_to(C, (batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1]))
         C = mx.reshape(C, (batch_size, -1, C.shape[-1]))
         
-        ssm_states = cache_params.ssm_states[self.layer_idx]
+        ssm_states = cache.ssm_states[self.layer_idx]
         
         # Reshape for batched matrix multiplication
         ssm_states_reshaped = mx.reshape(ssm_states, (batch_size * self.num_heads, self.head_dim, self.ssm_state_size))
@@ -233,39 +228,53 @@ class Mamba2Mixer(nn.Module):
         return self.out_proj(scan_output)
 
 
-class ResidualBlock(nn.Module):
+class Mamba2Block(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.residual_in_fp32 = args.residual_in_fp32
         self.mixer = Mamba2Mixer(args, layer_idx)
         self.norm = nn.RMSNorm(args.hidden_size)
 
-    def __call__(self, x: mx.array, cache):
+    def __call__(
+        self,
+        x: mx.array,
+        mask: mx.array = None,
+        cache=None,
+    ):
         residual = x
         normed = self.norm(x)
         if self.residual_in_fp32:
             residual = residual.astype(mx.float32)
-        output = self.mixer(normed, cache)
+        output = self.mixer(input_states=normed, cache=cache, mask=mask)
         return output + residual
 
 
-class Mamba2(nn.Module):
+class Mamba2Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [ResidualBlock(args, indx) for indx in range(args.num_hidden_layers)]
+        self.layers = [Mamba2Block(args, indx) for indx in range(args.num_hidden_layers)]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
 
-    def __call__(self, x: mx.array, cache):
-        x = self.embeddings(x)
+    def __call__(
+        self,
+        x: mx.array,
+        mask: mx.array = None,
+        cache=None,
+    ):
+        batch_size, seq_len = x.shape
+        h = self.embeddings(x)
+
+        if mask is None:
+            mask = mx.ones((batch_size, seq_len))
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = Mamba2Cache(self.args)
         
-        hidden = x
         for layer, c in zip(self.layers, cache):
-            hidden = layer(hidden, c)
-        return self.norm_f(hidden)
+            h = layer(h, mask, cache=c)
+        return self.norm_f(h)
 
 
 class Model(nn.Module):
@@ -273,19 +282,22 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.backbone = Mamba2(args)
+        self.backbone = Mamba2Model(args)
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache=None):
-        hidden = self.backbone(inputs, cache)
-        
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None
+    ):
+        out = self.backbone(inputs, mask, cache)
         if self.args.tie_word_embeddings:
-            logits = self.backbone.embeddings.as_linear(hidden)
+            logits = self.backbone.embeddings.as_linear(out)
         else:
-            logits = self.lm_head(hidden)
-        
+            logits = self.lm_head(out)
         return logits
 
     def make_cache(self):
