@@ -436,3 +436,49 @@ class MambaCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.cache = v
+
+
+class Mamba2Cache:
+    def __init__(
+        self, args, batch_size: int = 1
+    ):
+        self.conv_kernel_size = args.conv_kernel
+        self.n_groups = args.n_groups
+        self.state_size = args.state_size
+        self.num_heads = args.num_heads
+        self.head_dim = args.head_dim
+        self.intermediate_size = int(args.expand * args.hidden_size)
+        self.conv_states = mx.zeros(
+            (args.num_hidden_layers,
+            batch_size,
+            self.intermediate_size + 2 * self.n_groups * self.state_size,
+            self.conv_kernel_size)
+        )
+        self.ssm_states = mx.zeros(
+            (args.num_hidden_layers,
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+            self.state_size)
+        )
+        self.offset = 0
+
+    def update_conv_state(
+        self, layer_idx: int, new_conv_state: mx.array, cache_init: bool = False
+    ) -> mx.array:
+        if cache_init:
+            self.conv_states[layer_idx] = new_conv_state
+        else:
+            rolled = mx.roll(self.conv_states[layer_idx], shift=-1, axis=-1)
+            rolled[:, :, -1] = new_conv_state[:, 0, :]
+            self.conv_states[layer_idx] = rolled
+        
+        return self.conv_states[layer_idx]
+
+    def update_ssm_state(self, layer_idx: int, new_ssm_state: mx.array):
+        self.ssm_states[layer_idx] = new_ssm_state
+        return self.ssm_states[layer_idx]
+
+    def reset(self):
+        self.conv_states = mx.zeros_like(self.conv_states)
+        self.ssm_states = mx.zeros_like(self.ssm_states)
