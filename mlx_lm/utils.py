@@ -118,7 +118,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
             f"[WARNING] Generating with a model that requires {model_mb} MB "
             f"which is close to the maximum recommended size of {max_rec_mb} "
             "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main/llms#large-models"
+            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
         )
     old_limit = mx.metal.set_wired_limit(max_rec_size)
     try:
