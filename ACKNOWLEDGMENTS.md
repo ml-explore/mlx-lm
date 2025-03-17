@@ -9,4 +9,4 @@ MLX LM was developed with contributions from the following individuals:
 
 - Shunta Saito: Added support for PLaMo models.
 - Prince Canuma: Helped add support for `Starcoder2` models.
-- Gökdeniz Gülmez: Added support for `MiniCPM`, `Helium`, `Mamba version 1`, `OLMoE` archtectures and support for `full-fine-tuning`.
+- - Gökdeniz Gülmez: Added support for the following architectures: OpenBMB's `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's`Mamba v1`, and Allenai's `OLMoE`; added support for the following training algorithms: `full-fine-tuning`.
