@@ -96,6 +96,7 @@ def linear_to_lora_layers(
         "cohere",
         "cohere2",
         "minicpm",
+        "minicpm3",
         "deepseek",
         "olmo2",
         "olmoe",
