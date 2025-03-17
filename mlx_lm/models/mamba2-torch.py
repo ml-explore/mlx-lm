@@ -260,7 +260,7 @@ class Mamba2Mixer(nn.Module):
 
         dt = torch.nn.functional.softplus(dt + dt_bias)
         dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
-        A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+        A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size)
         # [bsz, num_heads, head_dim, state_size]
         dA = (torch.exp(dt[..., None] * A)).to(device=cache_device)
 
@@ -268,7 +268,7 @@ class Mamba2Mixer(nn.Module):
         # [bsz, n_groups * state_size] -> [bsz, n_groups, 1, state_size] ->
         # -> [bsz, n_groups, group to head repetition factor, state_size] -> [bsz, num_heads, state_size]
         B = B.reshape(batch_size, self.n_groups, -1)[..., None, :]
-        B = B.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, B.shape[-1]).contiguous()
+        B = B.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, B.shape[-1])
         B = B.reshape(batch_size, -1, B.shape[-1])
         # [bsz, num_heads, head_dim, state_size]
         dB = dt[..., None] * B[..., None, :]
@@ -287,11 +287,11 @@ class Mamba2Mixer(nn.Module):
         # Subsequent output
         # [bsz, n_groups * state_size] -> [bsz, num_heads, state_size]
         C = C.reshape(batch_size, self.n_groups, -1)[..., None, :]
-        C = C.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1]).contiguous()
+        C = C.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1])
         C = C.reshape(batch_size, -1, C.shape[-1])
         # [bsz, num_heads, head_dim]
 
-        ssm_states = cache_params.ssm_states[self.layer_idx].to(device=C.device, dtype=C.dtype)  # Shape: [b, h, d, n]
+        ssm_states = cache_params.ssm_states[self.layer_idx] # Shape: [b, h, d, n]
         # Reshape ssm_states to merge the first two dimensions
         ssm_states_reshaped = ssm_states.view(batch_size * self.num_heads, self.head_dim, self.ssm_state_size)  # Shape: [b*h, d, n]
         C_reshaped = C.view(batch_size * self.num_heads, self.ssm_state_size, 1)  # Shape: [b*h, n, 1]

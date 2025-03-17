@@ -20,17 +20,17 @@ class ModelArgs(BaseModelArgs):
     expand: int
     conv_kernel: int
     n_groups: int
-    use_bias: bool
-    use_conv_bias: bool
-    initializer_range: float
-    residual_in_fp32: bool
-    chunk_size: int
-    tie_word_embeddings: bool
-    time_step_limit: Tuple[float, float]
-    time_step_rank: Union[int, str]
-    time_step_min: float
-    time_step_max: float
-    time_step_floor: float
+    use_bias: bool = False
+    use_conv_bias: bool = True
+    initializer_range: float = 0.1
+    residual_in_fp32: bool = True
+    chunk_size: int = 256
+    tie_word_embeddings: bool = False
+    time_step_limit: Tuple[float, float] = (0.0, float("inf"))
+    time_step_rank: Union[int, str] = "auto"
+    time_step_min: float = 0.001
+    time_step_max: float = 0.1
+    time_step_floor: float = 1e-4
     norm_before_gate: bool = True
     rms_norm: bool = True
 
@@ -40,7 +40,7 @@ class ModelArgs(BaseModelArgs):
         if not hasattr(self, "head_dim"):
             self.head_dim = self.hidden_size // self.num_heads
         if self.time_step_rank == "auto":
-            self.time_step_rank = math.ceil(self.hidden_size / 16)
+            self.time_step_rank = math.ceil(self.hidden_size / 16) if self.time_step_rank == "auto" else self.time_step_rank
 
 
 class MambaRMSNormGated(nn.Module):
