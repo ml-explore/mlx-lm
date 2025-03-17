@@ -242,8 +242,8 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
+        if "lm_head.weight" not in weights:
+            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
         for i in range(len(self.model.layers)):
             rope = self.model.layers[i].self_attn.rope
             scaling_factor_key = f"model.layers.{i}.self_attn.rope.scaling_factor"
