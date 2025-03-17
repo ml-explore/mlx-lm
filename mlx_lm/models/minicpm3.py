@@ -111,19 +111,16 @@ class Attention(nn.Module):
 
         # Project query
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
-        q = q.reshape(B, L, self.num_heads, self.q_head_dim)
-        q = mx.transpose(q, (0, 2, 1, 3))  # [B, num_heads, L, q_head_dim]
+        q = q.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
         # Project key and value
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
-        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim)
-        k_pe = mx.transpose(k_pe, (0, 2, 1, 3))  # [B, 1, L, qk_rope_head_dim]
+        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         
         kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        kv = mx.transpose(kv, (0, 2, 1, 3))  # [B, num_heads, L, qk_nope_head_dim + v_head_dim]
+        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
         
         k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
 
