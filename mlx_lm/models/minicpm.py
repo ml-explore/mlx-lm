@@ -137,9 +137,9 @@ class DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r * (self.scale_depth / mx.sqrt(self.num_hidden_layers))
+        h = x + r * (self.scale_depth / self.num_hidden_layers**0.5)
         r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r * (self.scale_depth / mx.sqrt(self.num_hidden_layers))
+        out = h + r * (self.scale_depth / self.num_hidden_layers**0.5)
         return out
 
 

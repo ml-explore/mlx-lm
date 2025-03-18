@@ -86,7 +86,9 @@ class Attention(nn.Module):
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
             max_position_embeddings=args.max_position_embeddings,
-            original_max_position_embeddings=args.rope_scaling.get("original_max_position_embeddings", 4096),
+            original_max_position_embeddings=args.rope_scaling.get(
+                "original_max_position_embeddings", 4096
+            ),
             short_factor=args.rope_scaling.get("short_factor", 1.0),
             long_factor=args.rope_scaling.get("long_factor", 1.0),
         )
@@ -95,7 +97,7 @@ class Attention(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Dict[str, mx.array]] = None
+        cache: Optional[Dict[str, mx.array]] = None,
     ):
         B, L, _ = x.shape
 
@@ -108,10 +110,10 @@ class Attention(nn.Module):
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        
+
         kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
         kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-        
+
         k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
 
         # Apply RoPE to the query and key parts that need position embedding
@@ -124,11 +126,13 @@ class Attention(nn.Module):
 
         # Create the full query and key tensors by combining the parts
         # Broadcast k_pe to all heads
-        k_pe_broadcasted = mx.broadcast_to(k_pe, (B, self.num_heads, L, self.qk_rope_head_dim))
-        
+        k_pe_broadcasted = mx.broadcast_to(
+            k_pe, (B, self.num_heads, L, self.qk_rope_head_dim)
+        )
+
         # Use concatenate for queries
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
-        
+
         # Use concatenate for keys
         keys = mx.concatenate([k_nope, k_pe_broadcasted], axis=-1)
 
@@ -137,7 +141,9 @@ class Attention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         # Perform attention
-        output = scaled_dot_product_attention(queries, keys, values, cache=cache, scale=self.softmax_scale, mask=mask)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.softmax_scale, mask=mask
+        )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -151,7 +157,7 @@ class MLP(nn.Module):
 
     def __call__(self, x):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-    
+
 
 class DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -177,9 +183,9 @@ class DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r * (self.scale_depth / mx.sqrt(self.num_hidden_layers))
+        h = x + r * (self.scale_depth / (self.num_hidden_layers**0.5))
         r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r * (self.scale_depth / mx.sqrt(self.num_hidden_layers))
+        out = h + r * (self.scale_depth / (self.num_hidden_layers**0.5))
         return out
 
 
@@ -235,14 +241,9 @@ class Model(nn.Module):
         if not self.args.tie_word_embeddings:
             out = self.lm_head(out / (self.args.hidden_size / self.args.dim_model_base))
         else:
-            out = out @ self.model.embed_tokens.weight.T
+            out = self.model.embed_tokens.as_linear(out)
 
         return out
-
-    def sanitize(self, weights):
-        if "lm_head.weight" not in weights:
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
-        return weights
 
     @property
     def layers(self):
