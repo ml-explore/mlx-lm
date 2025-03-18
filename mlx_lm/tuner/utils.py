@@ -90,6 +90,8 @@ def linear_to_lora_layers(
         "phimoe",
         "gemma",
         "gemma2",
+        "gemma3",
+        "gemma3_text",
         "granite",
         "helium",
         "starcoder2",
