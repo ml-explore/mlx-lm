@@ -15,36 +15,39 @@ class DPODataset:
     """
 
     def __init__(
-            self,
-            data: List[Dict[str, str]],
-            tokenizer: PreTrainedTokenizer,
-            prompt_key: str = "prompt",
-            chosen_key: str = "chosen",
-            rejected_key: str = "rejected",
-            system_key: str = "system"
-        ):
+        self,
+        data: List[Dict[str, str]],
+        tokenizer: PreTrainedTokenizer,
+        prompt_key: str = "prompt",
+        chosen_key: str = "chosen",
+        rejected_key: str = "rejected",
+        system_key: str = "system",
+    ):
         self._chosen_data = []
         self._rejected_data = []
-        
+
         for d in data:
             messages = (
-                [{"role": "system", "content": d[system_key]}] if system_key and system_key in d else []
+                [{"role": "system", "content": d[system_key]}]
+                if system_key and system_key in d
+                else []
             )
             messages.append({"role": "user", "content": d[prompt_key]})
-            
+
             # Apply template once for each response type
             base_messages = messages.copy()
-            chosen_messages = base_messages + [{"role": "assistant", "content": d[chosen_key]}]
-            rejected_messages = base_messages + [{"role": "assistant", "content": d[rejected_key]}]
-            
+            chosen_messages = base_messages + [
+                {"role": "assistant", "content": d[chosen_key]}
+            ]
+            rejected_messages = base_messages + [
+                {"role": "assistant", "content": d[rejected_key]}
+            ]
+
             self._chosen_data.append(tokenizer.apply_chat_template(chosen_messages))
             self._rejected_data.append(tokenizer.apply_chat_template(rejected_messages))
 
     def __getitem__(self, idx: int):
-        return {
-            "chosen": self._chosen_data[idx],
-            "rejected": self._rejected_data[idx]
-        }
+        return {"chosen": self._chosen_data[idx], "rejected": self._rejected_data[idx]}
 
     def __len__(self):
         return len(self._chosen_data)

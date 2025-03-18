@@ -14,8 +14,8 @@ import yaml
 
 from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.dpo_trainer import DPOTrainingArgs, evaluate_dpo, train_dpo
+from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -70,7 +70,6 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "alpha": 16, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
-
     # DPO args
     "beta": 0.1,
     "dpo_loss_type": "sigmoid",
@@ -200,26 +199,23 @@ def build_parser():
         "--beta",
         type=float,
         help="Temperature parameter for DPO training.",
-        default=0.1
+        default=0.1,
     )
     parser.add_argument(
         "--dpo-loss-type",
         type=str,
         help="DPO loss type: 'sigmoid', 'hinge', 'ipo', or 'dpop'.",
         choices=["sigmoid", "hinge", "ipo", "dpop"],
-        default="sigmoid"
+        default="sigmoid",
     )
     parser.add_argument(
-        "--delta",
-        type=float,
-        help="Delta parameter for DPOP loss type.",
-        default=50.0
+        "--delta", type=float, help="Delta parameter for DPOP loss type.", default=50.0
     )
     parser.add_argument(
         "--reference-model-path",
         type=str,
         help="Path to reference model weights. If None, uses the same model.",
-        default=None
+        default=None,
     )
     return parser
 
@@ -297,14 +293,14 @@ def train_model(
             beta=args.beta,
             loss_type=args.dpo_loss_type,
             delta=args.delta,
-            reference_model_path=args.reference_model_path
+            reference_model_path=args.reference_model_path,
         )
-        
+
         if args.reference_model_path:
             reference_model, _ = load(args.reference_model_path)
         else:
             reference_model, _ = load(args.model)
-            
+
         train_dpo(
             model=model,
             ref_model=reference_model.freeze(),
@@ -325,7 +321,7 @@ def train_model(
             steps_per_save=args.save_every,
             adapter_file=adapter_file,
             max_seq_length=args.max_seq_length,
-            grad_checkpoint=args.grad_checkpoint
+            grad_checkpoint=args.grad_checkpoint,
         )
 
         # Train model
