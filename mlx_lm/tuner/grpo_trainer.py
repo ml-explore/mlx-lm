@@ -3,7 +3,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generator, List, Optional, Tuple
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,7 +11,7 @@ import numpy as np
 from mlx.utils import tree_flatten
 
 from ..models import cache
-from ..utils import generation_stream
+from ..utils import generate_step
 from .grpo_reward_functions import (
     RewardFunctions,
     r1_accuracy_reward_func,
@@ -73,46 +73,6 @@ def get_per_token_logps(model: nn.Module, inputs, lengths):
         per_token_logps.append(token_log_probs)
     mx.eval(logits)
     return per_token_logps
-
-
-def generate_step(
-    prompt: mx.array,
-    model: nn.Module,
-    max_tokens: int = 256,
-    sampler: Optional[Callable] = None,
-    logits_processors: Optional[List[Callable]] = None,
-    max_kv_size: Optional[int] = None,
-    prompt_cache: Optional[Any] = None,
-) -> Generator[Tuple[mx.array, mx.array], None, None]:
-    tokens = None
-    y = prompt
-    if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(model, max_kv_size=max_kv_size)
-    def _step(y):
-        with mx.stream(generation_stream):
-            logits = model(y[None], cache=prompt_cache)
-            logits = logits[:, -1, :]
-            if logits_processors:
-                nonlocal tokens
-                tokens = mx.concat([tokens, y]) if tokens is not None else y
-                for processor in logits_processors:
-                    logits = processor(tokens, logits)
-            logprobs = logits - mx.logsumexp(logits, keepdims=True)
-            next_token = sampler(logprobs)
-            return mx.stop_gradient(next_token), mx.stop_gradient(logprobs.squeeze(0))
-    try:
-        with mx.stream(generation_stream):
-            y, logprobs = _step(y)
-        mx.eval(y, logprobs)
-        for n in range(max_tokens):
-            yield y.item(), logprobs
-            next_y, next_logprobs = _step(y)
-            mx.eval(next_y, next_logprobs)
-            y, logprobs = next_y, next_logprobs
-            if (n + 1) % 32 == 0:
-                mx.metal.clear_cache()
-    finally:
-        mx.metal.clear_cache()
 
 
 def generate_grpo(
