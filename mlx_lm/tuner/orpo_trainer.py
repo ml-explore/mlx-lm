@@ -1,45 +1,50 @@
 import time
-from pathlib import Path
 from dataclasses import dataclass, field
+from pathlib import Path
 
-import mlx.nn as nn
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten
 from mlx.nn.utils import average_gradients
-from .trainer import TrainingArgs, grad_checkpoint, TrainingCallback
+from mlx.utils import tree_flatten
+
+from .trainer import TrainingArgs, TrainingCallback, grad_checkpoint
 
 
 @dataclass
 class ORPOTrainingArgs(TrainingArgs):
     beta: float = field(
-        default=0.1,
-        metadata={"help": "Temperature parameter for ORPO training."}
+        default=0.1, metadata={"help": "Temperature parameter for ORPO training."}
     )
     reward_scaling: float = field(
         default=1.0,
-        metadata={"help": "Reward scaling factor for ORPO training, not implemented."}
+        metadata={"help": "Reward scaling factor for ORPO training, not implemented."},
     )
 
 
-def orpo_loss(model, chosen, rejected, chosen_masks, rejected_masks, preference_scores, beta=0.1):
+def orpo_loss(
+    model, chosen, rejected, chosen_masks, rejected_masks, preference_scores, beta=0.1
+):
     def get_logps(model, x, mask):
         inputs = x[:, :-1]
         targets = x[:, 1:]
         logits = model(inputs)
-        logp = -nn.losses.cross_entropy(logits, targets, reduction='none')
+        logp = -nn.losses.cross_entropy(logits, targets, reduction="none")
         seq_lengths = mask[:, :-1].sum(-1)
         logp_sum = (logp * mask[:, :-1]).sum(-1) / seq_lengths
         logits_mean = (logits * mask[:, :-1, None]).sum() / mask[:, :-1].sum()
         return logp_sum, logits_mean
 
     policy_chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
-    policy_rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
+    policy_rejected_logps, rejected_logits_mean = get_logps(
+        model, rejected, rejected_masks
+    )
 
     policy_chosen_logps = policy_chosen_logps * preference_scores
 
     log_odds = (policy_chosen_logps - policy_rejected_logps) - (
-        mx.log1p(-mx.exp(policy_chosen_logps)) - mx.log1p(-mx.exp(policy_rejected_logps))
+        mx.log1p(-mx.exp(policy_chosen_logps))
+        - mx.log1p(-mx.exp(policy_rejected_logps))
     )
 
     ratio = nn.log_sigmoid(log_odds)
@@ -52,12 +57,12 @@ def orpo_loss(model, chosen, rejected, chosen_masks, rejected_masks, preference_
     num_tokens = chosen_masks.sum() + rejected_masks.sum()
 
     metrics = {
-        'accuracies': mx.mean((chosen_reward > rejected_reward).astype(mx.float32)),
-        'margins': mx.mean(chosen_reward - rejected_reward),
-        'policy_rejected_logps': mx.mean(policy_rejected_logps),
-        'policy_chosen_logps': mx.mean(policy_chosen_logps),
-        'rejected_logits_mean': mx.mean(rejected_logits_mean),
-        'chosen_logits_mean': mx.mean(chosen_logits_mean)
+        "accuracies": mx.mean((chosen_reward > rejected_reward).astype(mx.float32)),
+        "margins": mx.mean(chosen_reward - rejected_reward),
+        "policy_rejected_logps": mx.mean(policy_rejected_logps),
+        "policy_chosen_logps": mx.mean(policy_chosen_logps),
+        "rejected_logits_mean": mx.mean(rejected_logits_mean),
+        "chosen_logits_mean": mx.mean(chosen_logits_mean),
     }
 
     return mx.mean(loss), reward, num_tokens, metrics
@@ -65,66 +70,87 @@ def orpo_loss(model, chosen, rejected, chosen_masks, rejected_masks, preference_
 
 def iterate_orpo_batches(dataset, batch_size, max_seq_length, train=False):
     """Batch iterator for ORPO with preference scores"""
-    idx = sorted(range(len(dataset)), key=lambda idx: len(dataset[idx]['chosen']))
-    
+    idx = sorted(range(len(dataset)), key=lambda idx: len(dataset[idx]["chosen"]))
+
     if len(dataset) < batch_size:
         raise ValueError(
             f"Dataset must have at least batch_size={batch_size}"
             f" examples but only has {len(dataset)}."
         )
-    
+
     step = mx.distributed.init().size()
     if batch_size % step != 0:
         raise ValueError("Batch size must be divisible by number of workers")
-    
-    batch_idx = [idx[i:i + batch_size:step] for i in range(0, len(idx) - batch_size + 1, batch_size)]
-    
+
+    batch_idx = [
+        idx[i : i + batch_size : step]
+        for i in range(0, len(idx) - batch_size + 1, batch_size)
+    ]
+
     while True:
-        indices = np.random.permutation(len(batch_idx)) if train else range(len(batch_idx))
+        indices = (
+            np.random.permutation(len(batch_idx)) if train else range(len(batch_idx))
+        )
         for i in indices:
             batch = [dataset[j] for j in batch_idx[i]]
-            
-            chosen_lengths = [len(x['chosen']) for x in batch]
-            rejected_lengths = [len(x['rejected']) for x in batch]
-            max_length = min(max(max(chosen_lengths), max(rejected_lengths)), max_seq_length)
+
+            chosen_lengths = [len(x["chosen"]) for x in batch]
+            rejected_lengths = [len(x["rejected"]) for x in batch]
+            max_length = min(
+                max(max(chosen_lengths), max(rejected_lengths)), max_seq_length
+            )
             pad_to = 8
             max_length_in_batch = pad_to * ((max_length + pad_to - 1) // pad_to)
-            
+
             batch_size_per_device = batch_size // step
-            chosen_arr = np.zeros((batch_size_per_device, max_length_in_batch), np.int32)
-            rejected_arr = np.zeros((batch_size_per_device, max_length_in_batch), np.int32)
-            chosen_masks = np.zeros((batch_size_per_device, max_length_in_batch), np.float32)
-            rejected_masks = np.zeros((batch_size_per_device, max_length_in_batch), np.float32)
-            
-            preference_scores = np.array([x.get('preference_score', 1.0) for x in batch], np.float32)
-            
+            chosen_arr = np.zeros(
+                (batch_size_per_device, max_length_in_batch), np.int32
+            )
+            rejected_arr = np.zeros(
+                (batch_size_per_device, max_length_in_batch), np.int32
+            )
+            chosen_masks = np.zeros(
+                (batch_size_per_device, max_length_in_batch), np.float32
+            )
+            rejected_masks = np.zeros(
+                (batch_size_per_device, max_length_in_batch), np.float32
+            )
+
+            preference_scores = np.array(
+                [x.get("preference_score", 1.0) for x in batch], np.float32
+            )
+
             for j in range(batch_size_per_device):
                 chosen_length = min(chosen_lengths[j], max_length_in_batch)
                 rejected_length = min(rejected_lengths[j], max_length_in_batch)
-                
-                chosen_arr[j, :chosen_length] = batch[j]['chosen'][:chosen_length]
+
+                chosen_arr[j, :chosen_length] = batch[j]["chosen"][:chosen_length]
                 chosen_masks[j, :chosen_length] = 1.0
-                rejected_arr[j, :rejected_length] = batch[j]['rejected'][:rejected_length]
+                rejected_arr[j, :rejected_length] = batch[j]["rejected"][
+                    :rejected_length
+                ]
                 rejected_masks[j, :rejected_length] = 1.0
-            
+
             yield (
                 mx.array(chosen_arr),
                 mx.array(rejected_arr),
                 mx.array(chosen_masks),
                 mx.array(rejected_masks),
-                mx.array(preference_scores)
+                mx.array(preference_scores),
             )
-            
+
         if not train:
             break
 
 
-def evaluate_orpo(model, dataset, batch_size, num_batches, beta: float, max_seq_length=2048):
+def evaluate_orpo(
+    model, dataset, batch_size, num_batches, beta: float, max_seq_length=2048
+):
     all_losses = 0
     all_rewards = mx.zeros((2,))
     all_metrics = None
     ntokens = 0
-    
+
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
     for _, batch in zip(
         index_iterator,
@@ -142,12 +168,12 @@ def evaluate_orpo(model, dataset, batch_size, num_batches, beta: float, max_seq_
             chosen_masks=chosen_masks,
             rejected_masks=rejected_masks,
             preference_scores=preference_scores,
-            beta=beta
+            beta=beta,
         )
         all_losses += lvalue * toks
         all_rewards += reward * toks
         ntokens += toks
-        
+
         if all_metrics is None:
             all_metrics = {k: v * toks for k, v in metrics.items()}
         else:
@@ -159,11 +185,11 @@ def evaluate_orpo(model, dataset, batch_size, num_batches, beta: float, max_seq_
     all_rewards = mx.distributed.all_sum(all_rewards)
     ntokens = mx.distributed.all_sum(ntokens)
     all_metrics = {k: mx.distributed.all_sum(v) for k, v in all_metrics.items()}
-    
+
     avg_metrics = {k: (v / ntokens).item() for k, v in all_metrics.items()}
     avg_rewards = (all_rewards / ntokens).tolist()
     avg_loss = (all_losses / ntokens).item()
-    
+
     return avg_loss, avg_rewards, ntokens, avg_metrics
 
 
@@ -181,7 +207,7 @@ def train_orpo(
     world = mx.distributed.init()
     world_size = world.size()
     rank = world.rank()
-    
+
     if world_size > 1:
         print(f"Node {rank} of {world_size}")
 
@@ -192,12 +218,12 @@ def train_orpo(
 
     def step(batch):
         chosen, rejected, chosen_masks, rejected_masks, preference_scores = batch
-        
+
         (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
-            model, 
-            chosen, 
-            rejected, 
-            chosen_masks, 
+            model,
+            chosen,
+            rejected,
+            chosen_masks,
             rejected_masks,
             preference_scores=preference_scores,
         )
@@ -207,7 +233,9 @@ def train_orpo(
 
         return lvalue, reward, toks, metrics
 
-    def loss_wrapper(model, chosen, rejected, chosen_masks, rejected_masks, preference_scores):
+    def loss_wrapper(
+        model, chosen, rejected, chosen_masks, rejected_masks, preference_scores
+    ):
         return loss(
             model=model,
             chosen=chosen,
@@ -215,9 +243,9 @@ def train_orpo(
             chosen_masks=chosen_masks,
             rejected_masks=rejected_masks,
             preference_scores=preference_scores,
-            beta=args.beta
+            beta=args.beta,
         )
-    
+
     loss_value_and_grad = nn.value_and_grad(model, loss_wrapper)
 
     # Training loop with progress tracking
@@ -227,14 +255,14 @@ def train_orpo(
     steps = 0
     trained_tokens = 0
     accumulated_metrics = {
-        'accuracies': 0,
-        'margins': 0,
-        'policy_rejected_logps': 0,
-        'policy_chosen_logps': 0,
-        'rejected_logits_mean': 0,
-        'chosen_logits_mean': 0
+        "accuracies": 0,
+        "margins": 0,
+        "policy_rejected_logps": 0,
+        "policy_chosen_logps": 0,
+        "rejected_logits_mean": 0,
+        "chosen_logits_mean": 0,
     }
-    
+
     start = time.perf_counter()
     for it, batch in zip(
         range(1, args.iters + 1),
@@ -253,7 +281,7 @@ def train_orpo(
                 batch_size=args.batch_size,
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,
-                beta=args.beta
+                beta=args.beta,
             )
             val_time = time.perf_counter() - stop
             if rank == 0:
@@ -269,14 +297,16 @@ def train_orpo(
                 )
 
             if training_callback is not None:
-                training_callback.on_val_loss_report({
-                    "iteration": it,
-                    "val_loss": val_loss,
-                    "val_chosen_reward": val_rewards[0],
-                    "val_rejected_reward": val_rewards[1],
-                    **{f"val_{k}": v for k, v in val_metrics.items()},
-                    "val_time": val_time,
-                })
+                training_callback.on_val_loss_report(
+                    {
+                        "iteration": it,
+                        "val_loss": val_loss,
+                        "val_chosen_reward": val_rewards[0],
+                        "val_rejected_reward": val_rewards[1],
+                        **{f"val_{k}": v for k, v in val_metrics.items()},
+                        "val_time": val_time,
+                    }
+                )
 
             start = time.perf_counter()
 
@@ -296,15 +326,20 @@ def train_orpo(
             stop = time.perf_counter()
 
             train_loss = mx.distributed.all_sum(losses).item() / (steps * world_size)
-            train_rewards = [r / (steps * world_size) for r in mx.distributed.all_sum(rewards).tolist()]
-            avg_metrics = {k: v / (steps * world_size) for k, v in accumulated_metrics.items()}
+            train_rewards = [
+                r / (steps * world_size)
+                for r in mx.distributed.all_sum(rewards).tolist()
+            ]
+            avg_metrics = {
+                k: v / (steps * world_size) for k, v in accumulated_metrics.items()
+            }
             n_tokens = mx.distributed.all_sum(n_tokens).item()
             learning_rate = optimizer.learning_rate.item()
             it_sec = args.steps_per_report / (stop - start)
             tokens_sec = float(n_tokens) / (stop - start)
             trained_tokens += n_tokens
             peak_mem = mx.metal.get_peak_memory() / 1e9
-            
+
             if rank == 0:
                 print(
                     f"Iter {it}: Train loss {train_loss:.3f}, "
@@ -320,18 +355,20 @@ def train_orpo(
                 )
 
             if training_callback is not None:
-                training_callback.on_train_loss_report({
-                    "iteration": it,
-                    "train_loss": train_loss,
-                    "train_chosen_reward": train_rewards[0],
-                    "train_rejected_reward": train_rewards[1],
-                    **{f"train_{k}": v for k, v in avg_metrics.items()},
-                    "learning_rate": learning_rate,
-                    "iterations_per_second": it_sec,
-                    "tokens_per_second": tokens_sec,
-                    "trained_tokens": trained_tokens,
-                    "peak_memory": peak_mem,
-                })
+                training_callback.on_train_loss_report(
+                    {
+                        "iteration": it,
+                        "train_loss": train_loss,
+                        "train_chosen_reward": train_rewards[0],
+                        "train_rejected_reward": train_rewards[1],
+                        **{f"train_{k}": v for k, v in avg_metrics.items()},
+                        "learning_rate": learning_rate,
+                        "iterations_per_second": it_sec,
+                        "tokens_per_second": tokens_sec,
+                        "trained_tokens": trained_tokens,
+                        "peak_memory": peak_mem,
+                    }
+                )
 
             losses = 0
             rewards = mx.zeros((2,))

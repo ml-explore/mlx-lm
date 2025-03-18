@@ -14,8 +14,8 @@ import yaml
 
 from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.orpo_trainer import ORPOTrainingArgs, evaluate_orpo, train_orpo
+from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -70,7 +70,6 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "alpha": 16, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
-
     # ORPO args
     "beta": 0.1,
     "reference_model_path": None,
@@ -199,13 +198,13 @@ def build_parser():
         "--beta",
         type=float,
         help="Temperature parameter for ORPO training.",
-        default=0.1
+        default=0.1,
     )
     parser.add_argument(
         "--reward-scaling",
         type=float,
         help="Reward scaling factor for ORPO training, not implemented.",
-        default=1.0
+        default=1.0,
     )
     return parser
 
@@ -282,9 +281,9 @@ def train_model(
             max_seq_length=args.max_seq_length,
             grad_checkpoint=args.grad_checkpoint,
             beta=args.beta,
-            reward_scaling=args.reward_scaling
+            reward_scaling=args.reward_scaling,
         )
-            
+
         train_orpo(
             model=model,
             tokenizer=tokenizer,
@@ -292,7 +291,7 @@ def train_model(
             train_dataset=train_set,
             val_dataset=valid_set,
             args=training_args,
-            training_callback=training_callback
+            training_callback=training_callback,
         )
     else:
         training_args = TrainingArgs(
@@ -304,7 +303,7 @@ def train_model(
             steps_per_save=args.save_every,
             adapter_file=adapter_file,
             max_seq_length=args.max_seq_length,
-            grad_checkpoint=args.grad_checkpoint
+            grad_checkpoint=args.grad_checkpoint,
         )
 
         # Train model using SFT
@@ -329,10 +328,12 @@ def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set
             batch_size=args.batch_size,
             num_batches=args.test_batches,
             max_seq_length=args.max_seq_length,
-            beta=args.beta
+            beta=args.beta,
         )
         test_ppl = math.exp(test_loss)
-        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}, Rewards: {test_rewards[0]:.3f}, {test_rewards[1]:.3f}")
+        print(
+            f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}, Rewards: {test_rewards[0]:.3f}, {test_rewards[1]:.3f}"
+        )
 
         print("ORPO Test Metrics:")
         for metric_name, metric_value in test_metrics.items():

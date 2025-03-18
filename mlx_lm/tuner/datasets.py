@@ -16,64 +16,86 @@ class ORPODataset:
         chosen_key: str = "chosen",
         rejected_key: str = "rejected",
         preference_score_key: str = "preference_score",
-        system_key: str = None
+        system_key: str = None,
     ):
         self._chosen_data = []
         self._rejected_data = []
         self._scores = []
-        
+
         for d in data:
             prompt_content = d.get(prompt_key, d.get("question", ""))
-            
+
             if system_key and system_key in d:
                 base_messages = [{"role": "system", "content": d[system_key]}]
-                chosen_messages = base_messages + [{"role": "user", "content": prompt_content}]
-                rejected_messages = base_messages + [{"role": "user", "content": prompt_content}]
-                
+                chosen_messages = base_messages + [
+                    {"role": "user", "content": prompt_content}
+                ]
+                rejected_messages = base_messages + [
+                    {"role": "user", "content": prompt_content}
+                ]
+
                 if isinstance(d[chosen_key], str):
-                    chosen_messages.append({"role": "assistant", "content": d[chosen_key]})
+                    chosen_messages.append(
+                        {"role": "assistant", "content": d[chosen_key]}
+                    )
                 elif isinstance(d[chosen_key], dict):
                     if "messages" in d[chosen_key]:
                         chosen_messages.extend(d[chosen_key]["messages"])
                     else:
-                        chosen_messages.append({"role": "assistant", "content": d[chosen_key].get("content", "")})
+                        chosen_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": d[chosen_key].get("content", ""),
+                            }
+                        )
                 elif isinstance(d[chosen_key], list):
                     chosen_messages.extend(d[chosen_key])
-                
+
                 if isinstance(d[rejected_key], str):
-                    rejected_messages.append({"role": "assistant", "content": d[rejected_key]})
+                    rejected_messages.append(
+                        {"role": "assistant", "content": d[rejected_key]}
+                    )
                 elif isinstance(d[rejected_key], dict):
                     if "messages" in d[rejected_key]:
                         rejected_messages.extend(d[rejected_key]["messages"])
                     else:
-                        rejected_messages.append({"role": "assistant", "content": d[rejected_key].get("content", "")})
+                        rejected_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": d[rejected_key].get("content", ""),
+                            }
+                        )
                 elif isinstance(d[rejected_key], list):
                     rejected_messages.extend(d[rejected_key])
-                
+
                 chosen_text = tokenizer.apply_chat_template(chosen_messages)
                 rejected_text = tokenizer.apply_chat_template(rejected_messages)
-            
+
             else:
                 chosen_content = self._extract_content(d[chosen_key])
                 rejected_content = self._extract_content(d[rejected_key])
-                
-                chosen_text = tokenizer.apply_chat_template([
-                    {"role": "user", "content": prompt_content},
-                    {"role": "assistant", "content": chosen_content},
-                ])
-                rejected_text = tokenizer.apply_chat_template([
-                    {"role": "user", "content": prompt_content},
-                    {"role": "assistant", "content": rejected_content},
-                ])
-            
+
+                chosen_text = tokenizer.apply_chat_template(
+                    [
+                        {"role": "user", "content": prompt_content},
+                        {"role": "assistant", "content": chosen_content},
+                    ]
+                )
+                rejected_text = tokenizer.apply_chat_template(
+                    [
+                        {"role": "user", "content": prompt_content},
+                        {"role": "assistant", "content": rejected_content},
+                    ]
+                )
+
             self._chosen_data.append(chosen_text)
             self._rejected_data.append(rejected_text)
-            
+
             if preference_score_key in d:
                 self._scores.append(float(d[preference_score_key]))
             else:
                 self._scores.append(1.0)
-    
+
     def _extract_content(self, data):
         """Helper method to extract content from various data formats."""
         if isinstance(data, str):
@@ -100,7 +122,7 @@ class ORPODataset:
         return {
             "chosen": self._chosen_data[idx],
             "rejected": self._rejected_data[idx],
-            "preference_score": self._scores[idx]
+            "preference_score": self._scores[idx],
         }
 
 
