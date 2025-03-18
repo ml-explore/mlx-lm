@@ -483,6 +483,35 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
+        def dequant(weight, scale_inv):
+            bs = 128  # block size
+            m, n = weight.shape
+            pad_bottom = (-m) % bs
+            pad_side = (-n) % bs
+            weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+            weight = weight.reshape(
+                ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
+            )
+            scale_inv = scale_inv.astype(weight.dtype)
+            weight = (weight * scale_inv[:, None, :, None]).reshape(
+                m + pad_bottom, n + pad_side
+            )
+            return weight[:m, :n]
+
+        # Dequantize
+        new_weights = {}
+        for k, v in weights.items():
+            if "weight_scale_inv" in k:
+                scale_inv = v
+                wk = k.replace("_scale_inv", "")
+                weight = weights[wk]
+                weight = dequant(weight, scale_inv)
+                new_weights[wk] = weight
+            elif k not in new_weights:
+                new_weights[k] = v
+        weights = new_weights
+
+        # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:

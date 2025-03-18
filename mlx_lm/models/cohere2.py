@@ -88,10 +88,17 @@ class Attention(nn.Module):
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 
+        # TODO: maybe remove cast once fused mask is supported since attention
+        # may be in higher precision
+        sdpa_type = mx.float32 if queries.dtype == mx.float16 else queries.dtype
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-
+            queries.astype(sdpa_type),
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        ).astype(queries.dtype)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -126,9 +133,11 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
+
         h = self.input_layernorm(x)
         attn_h = self.self_attn(h, mask, cache)
         ff_h = self.mlp(h)
+
         return attn_h + ff_h + x
 
 

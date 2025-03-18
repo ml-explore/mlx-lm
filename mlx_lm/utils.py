@@ -843,13 +843,18 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
     from . import __version__
 
     card = ModelCard.load(hf_path)
-    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
+    card.data.library_name = "mlx"
+    card.data.pipeline_tag = "text-generation"
+    if card.data.tags is None:
+        card.data.tags = ["mlx"]
+    elif "mlx" not in card.data.tags:
+        card.data.tags += ["mlx"]
     card.data.base_model = hf_path
     card.text = dedent(
         f"""
         # {upload_repo}
 
-        The Model [{upload_repo}](https://huggingface.co/{upload_repo}) was
+        This model [{upload_repo}](https://huggingface.co/{upload_repo}) was
         converted to MLX format from [{hf_path}](https://huggingface.co/{hf_path})
         using mlx-lm version **{__version__}**.
 

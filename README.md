@@ -220,7 +220,7 @@ The cached prompt is treated as a prefix to the supplied prompt. Also notice
 when using a cached prompt, the model to use is read from the cache and need
 not be supplied explicitly.
 
-Prompt caching can also be used in the Python API in order to to avoid
+Prompt caching can also be used in the Python API in order to avoid
 recomputing the prompt. This is useful in multi-turn dialogues or across
 requests that use the same context. See the
 [example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
