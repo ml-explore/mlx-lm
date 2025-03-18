@@ -94,7 +94,12 @@ class Attention(nn.Module):
         scores *= self.attn_logit_softcapping
 
         if mask is not None:
-            scores = scores + mask
+            if mask.dtype == mx.bool_:
+                scores = mx.where(
+                    mask, scores, mx.array(mx.finfo(scores.dtype).min, scores.dtype)
+                )
+            else:
+                scores = scores + mask
         scores = mx.softmax(scores, precise=True, axis=-1)
         output = scores @ values
         if self.repeats > 1:
