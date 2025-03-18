@@ -807,6 +807,7 @@ def train_grpo(
             losses = 0
             n_tokens = 0
             steps = 0
+            accumulated_metrics = {k: 0 for k in accumulated_metrics}
             start = time.perf_counter()
 
         if it % args.steps_per_save == 0:
