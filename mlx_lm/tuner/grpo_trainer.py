@@ -83,7 +83,7 @@ def generate_grpo(
     group_size: int,
     temperature: float,
     batch_size: int,
-    end_token: str = "</answer>"
+    end_token: str = "</answer>",
 ):
     try:
         end_sequence = mx.array(tokenizer.encode(end_token))
@@ -91,35 +91,35 @@ def generate_grpo(
         all_completions = []
         all_completion_texts = []
         batch_indices = []
-        
+
         def temp_sampler(logits):
             return mx.random.categorical(logits / temperature)
-        
+
         for i in range(0, total_samples, batch_size):
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i : i + current_batch_size]
-            
+
             max_prompt_len = max(len(p) for p in batch_prompts)
             padded_prompts = []
             for prompt in batch_prompts:
                 padding = [tokenizer.pad_token_id] * (max_prompt_len - len(prompt))
                 padded_prompts.append(prompt + padding)
-                
+
             prompt_tensor = mx.stop_gradient(mx.array(padded_prompts))
-            
+
             if len(prompt_tensor.shape) == 1:
                 prompt_tensor = prompt_tensor[None, :]
             if prompt_tensor.shape[1] == 0:
                 continue
-                
+
             expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
             batch_results = []
-            
+
             total_prompt_samples = expanded_prompts.shape[0]
             for prompt_idx in range(total_prompt_samples):
                 current_tokens = []
                 prompt_cache = cache.make_prompt_cache(model)
-                
+
                 for token, _ in generate_step(
                     expanded_prompts[prompt_idx],
                     model,
@@ -129,17 +129,17 @@ def generate_grpo(
                 ):
                     if token == tokenizer.eos_token_id:
                         break
-                        
+
                     current_tokens.append(token)
 
                     if len(current_tokens) >= len(end_sequence) and mx.array_equal(
-                        mx.array(current_tokens[-len(end_sequence):]), end_sequence
+                        mx.array(current_tokens[-len(end_sequence) :]), end_sequence
                     ):
                         break
-                
+
                 if current_tokens:
                     batch_results.append(mx.array(current_tokens))
-            
+
             if batch_results:
                 for j, completion_ids in enumerate(batch_results):
                     prompt_idx = i + (j // group_size)
@@ -148,12 +148,12 @@ def generate_grpo(
                         completion_text = tokenizer.decode(completion_ids.tolist())
                         all_completions.append(mx.stop_gradient(completion_ids))
                         all_completion_texts.append(completion_text)
-            
+
             mx.metal.clear_cache()
-    
+
     finally:
         mx.metal.clear_cache()
-    
+
     return all_completions, all_completion_texts, batch_indices
 
 
@@ -173,11 +173,15 @@ def grpo_loss(
     temperature: float = 0.8,
     reward_weights: Optional[List[float]] = None,
     batch_size: int = 1,
-    is_validation: bool = False
+    is_validation: bool = False,
 ):
     prompt_tokens, _, prompt_text, answer_text = batch
-    
-    if completions is not None and completion_texts is not None and batch_indices is not None:
+
+    if (
+        completions is not None
+        and completion_texts is not None
+        and batch_indices is not None
+    ):
         all_completions = completions
         all_completion_texts = completion_texts
         batch_indices = batch_indices
@@ -189,7 +193,7 @@ def grpo_loss(
             max_tokens=max_tokens,
             group_size=group_size,
             temperature=temperature,
-            batch_size=batch_size
+            batch_size=batch_size,
         )
 
     if not all_completions:
@@ -227,7 +231,7 @@ def grpo_loss(
 
     for completion_ids in all_completions:
         completion_tensor = mx.array(completion_ids.tolist())
-        
+
         padding_length = max_length - completion_tensor.shape[0]
         if padding_length > 0:
             padding = mx.zeros((padding_length,), dtype=completion_tensor.dtype)
@@ -349,11 +353,12 @@ def grpo_loss(
     if beta != 0.0:
         per_token_loss = per_token_loss + beta * kl_div
 
-
     per_token_loss = per_token_loss * length_mask
 
     # Average over tokens
-    loss = (per_token_loss * length_mask).sum() / length_mask.sum() # Matches the pytorch implementaiton
+    loss = (
+        per_token_loss * length_mask
+    ).sum() / length_mask.sum()  # Matches the pytorch implementaiton
 
     # Calculate mean KL divergence for metrics
     mean_kl = ((kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)).mean()
@@ -527,7 +532,7 @@ def evaluate_grpo(
             ref_model=ref_model,
             temperature=temperature,
             max_tokens=max_tokens,
-            is_validation=True
+            is_validation=True,
         )
 
         all_losses += losses * toks
@@ -586,7 +591,7 @@ def train_grpo(
 
     def step(batch):
         prompt_tokens, targets, prompt_lens, target_lens = batch
-        
+
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
             tokenizer=tokenizer,
@@ -594,7 +599,7 @@ def train_grpo(
             max_tokens=args.max_completion_length,
             group_size=args.group_size,
             temperature=args.temperature,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
         )
 
         (loss, toks, metrics), grad = loss_value_and_grad(

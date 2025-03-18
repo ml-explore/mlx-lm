@@ -14,8 +14,8 @@ import yaml
 
 from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.grpo_trainer import GRPOTrainingArgs, evaluate_grpo, train_grpo
+from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -70,7 +70,6 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "alpha": 16, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
-
     # GRPO args
     "reference_model_path": None,
     "group_size": 4,
@@ -328,7 +327,11 @@ def train_model(
             epsilon=args.epsilon,
             reference_model_path=args.reference_model_path,
             temperature=args.temperature,
-            reward_weights=[float(x) for x in args.reward_weights.strip('[]').split(',')] if args.reward_weights else None
+            reward_weights=(
+                [float(x) for x in args.reward_weights.strip("[]").split(",")]
+                if args.reward_weights
+                else None
+            ),
         )
 
         if args.reference_model_path:
@@ -356,7 +359,7 @@ def train_model(
             steps_per_save=args.save_every,
             adapter_file=adapter_file,
             max_seq_length=args.max_seq_length,
-            grad_checkpoint=args.grad_checkpoint
+            grad_checkpoint=args.grad_checkpoint,
         )
         # Train model
         train(
@@ -391,13 +394,15 @@ def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set
             group_size=args.group_size,
             epsilon=args.epsilon,
             temperature=args.temperature,
-            max_tokens=args.max_seq_length
+            max_tokens=args.max_seq_length,
         )
 
         test_ppl = math.exp(test_loss)
 
         rewards_str = ", ".join([f"{k}: {v:.3f}" for k, v in test_rewards.items()])
-        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}, Rewards: {rewards_str}")
+        print(
+            f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}, Rewards: {rewards_str}"
+        )
     else:
         test_loss = evaluate(
             model=model,
