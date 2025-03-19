@@ -195,13 +195,9 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
 
         self.experts = nn.ModuleList([MiniMaxText01BlockSparseTop2MLP(config) for _ in range(self.num_experts)])
 
-        # Jitter parameters
-        self.jitter_noise = config.router_jitter_noise
-
     def forward(self, hidden_states: torch.Tensor):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        if self.training and self.jitter_noise > 0:
-            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+        
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
@@ -244,9 +240,9 @@ class MiniMaxText01DecoderLayer(nn.Module):
         self.config = config
 
         if attention_type == 0:
-             self.self_attn = MiniMaxText01AttentionType0
+             self.self_attn = MiniMaxText01AttentionType0(config)
         else:
-             self.self_attn = MiniMaxText01AttentionType1
+             self.self_attn = MiniMaxText01AttentionType1(config)
 
         self.block_sparse_moe = MiniMaxText01SparseMoeBlock(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -311,6 +307,29 @@ class MiniMaxText01Model(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.slopes = self._build_slope_tensor(config.num_attention_heads)
+    
+    def _build_slope_tensor(n_attention_heads: int):
+
+        def get_slopes(n):
+
+            def get_slopes_power_of_2(n):
+                start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+                ratio = start
+                return [start * ratio ** i for i in range(n)]
+
+            if math.log2(n).is_integer():
+                return get_slopes_power_of_2(
+                    n)  # In the paper, we only train models that have 2^a heads for some a. This function has
+            else:  # some good properties that only occur when the input is a power of 2. To maintain that even
+                closest_power_of_2 = 2 ** math.floor(
+                    math.log2(n))  # when the number of heads is not a power of 2, we use this workaround.
+                return (get_slopes_power_of_2(closest_power_of_2)
+                        + get_slopes(2 * closest_power_of_2)[0::2][:n - closest_power_of_2])
+
+        # h, 1, 1
+        slopes = torch.tensor(get_slopes(n_attention_heads), dtype=torch.float32).reshape(n_attention_heads, 1, 1)
+
+        return slopes
 
     def forward(self, input_ids: torch.LongTensor = None):
         inputs_embeds = self.embed_tokens(input_ids)
@@ -326,11 +345,7 @@ class MiniMaxText01ForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__(config)
         self.model = MiniMaxText01Model(config)
-        self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.num_local_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
 
     def forward(self, input_ids: torch.LongTensor = None):
         return self.lm_head(self.model(input_ids))
