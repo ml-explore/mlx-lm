@@ -170,10 +170,21 @@ class CohereModel(nn.Module):
 
         if mask is None:
             j = self.args.sliding_window_pattern
-            mask = create_attention_mask(h, cache[j - 1 : j])
+            full_mask = create_attention_mask(h, cache[j - 1 : j])
+            sliding_window_mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            is_global = (
+                i % self.args.sliding_window_pattern
+                == self.args.sliding_window_pattern - 1
+            )
+
+            if mask is None and is_global:
+                local_mask = full_mask
+            elif mask is None:
+                local_mask = sliding_window_mask
+
+            h = layer(h, local_mask, c)
 
         return self.norm(h)
 
