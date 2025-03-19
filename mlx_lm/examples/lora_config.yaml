@@ -89,4 +89,9 @@ lora_parameters:
 #  valid_split: "train[-100:]"
 #  prompt_feature: "text"
 #  completion_feature: "summary"
-
+# For ORPO training
+#  prompt_feature: "prompt"
+#  system_feature: "system"
+#  chosen_feature: "chosen"
+#  rejected_feature: "rejected"
+#  preference_score_feature: "preference_score"

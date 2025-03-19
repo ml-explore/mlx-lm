@@ -239,6 +239,10 @@ def create_dataset(
 ):
     mask_prompt = getattr(config, "mask_prompt", False)
     prompt_feature = getattr(config, "prompt_feature", "prompt")
+    system_feature = getattr(config, "system_feature", "system")
+    chosen_feature = getattr(config, "chosen_feature", "chosen")
+    rejected_feature = getattr(config, "rejected_feature", "rejected")
+    preference_score_feature = getattr(config, "preference_score_feature", "preference_score")
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
     chat_feature = getattr(config, "chat_feature", "messages")
@@ -263,8 +267,16 @@ def create_dataset(
                 "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
             )
     else:
-        if "chosen" in sample and "rejected" in sample:
-            return ORPODataset(data, tokenizer)
+        if chosen_feature in sample and rejected_feature in sample:
+            return ORPODataset(
+                data=data,
+                tokenizer=tokenizer,
+                system_key=system_feature,
+                prompt_key=prompt_feature,
+                chosen_key=chosen_feature,
+                rejected_key=rejected_feature,
+                preference_score_key=preference_score_feature
+            )
         else:
             raise ValueError(
                 "Unsupported data format, check the supported formats here:\n"
