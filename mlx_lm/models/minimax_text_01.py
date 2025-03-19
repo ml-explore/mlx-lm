@@ -108,7 +108,7 @@ class MiniMaxText01AttentionType1(nn.Module):
         # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rotary_emb(queries, offset=cache.offset)
