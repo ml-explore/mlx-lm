@@ -184,6 +184,7 @@ class Gemma3Model(nn.Module):
                 == self.args.sliding_window_pattern - 1
             )
 
+            local_mask = mask
             if mask is None and is_global:
                 local_mask = full_mask
             elif mask is None:
