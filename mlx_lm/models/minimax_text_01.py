@@ -45,6 +45,7 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool
     vocab_size: int
     BLOCK: int = 256
+    mlp_bias: bool = False
 
 
 class MiniMaxText01AttentionType0(nn.Module):
@@ -71,17 +72,17 @@ class MiniMaxText01AttentionType0(nn.Module):
 class MiniMaxText01AttentionType1(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.hidden_size = args.hidden_size
         self.num_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
 
         self.head_dim = args.head_dim or args.hidden_size // args.num_attention_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(args.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, args.hidden_size, bias=False)
 
         self.rotary_emb = initialize_rope(
             dims=args.rotary_dim or self.head_dim,
@@ -105,12 +106,12 @@ class MiniMaxText01AttentionType1(nn.Module):
         values = values.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            queries = self.rotary_emb(queries, offset=cache.offset)
+            keys = self.rotary_emb(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            queries = self.rotary_emb(queries)
+            keys = self.rotary_emb(keys)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -118,3 +119,32 @@ class MiniMaxText01AttentionType1(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
+
+
+class MiniMaxText01SharedMLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+    
+
+class MiniMaxText01BlockSparseTop2MLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.w1 = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+        self.w2 = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
+        self.w3 = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+
+    def forward(self, x: mx.array) -> mx.array:
+        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+    
+
+class MiniMaxText01SparseMoeBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+    def __call__(self, x: mx.array) -> mx.array:
+        return x
