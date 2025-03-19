@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Literal
+from typing import Any, List, Optional, Literal, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -45,31 +45,153 @@ class ModelArgs(BaseModelArgs):
     layernorm_linear_attention_beta: float = 1
     layernorm_mlp_alpha: float = 1
     layernorm_mlp_beta: float = 1
-    BLOCK: int = 256
     mlp_bias: bool = False
     postnorm: bool = False
+
+
+BLOCK: int = 256
 
 
 class MiniMaxText01AttentionType0(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.head_dim = args.head_dim or args.hidden_size // args.num_attention_heads
         self.num_heads = args.num_attention_heads
-        self.offset = 0
+        self.head_dim = getattr(args, 'head_dim', args.hidden_size // self.num_heads)
+        self.hidden_size = args.hidden_size
 
         self.qkv_proj = nn.Linear(args.hidden_size, 3 * self.head_dim * self.num_heads, bias=False)
-        self.norm = nn.RMSNorm(self.head_dim * self.num_heads)
         self.output_gate = nn.Linear(args.hidden_size, self.head_dim * self.num_heads, bias=False)
+        self.norm = nn.RMSNorm(self.head_dim * self.num_heads)
         self.out_proj = nn.Linear(self.head_dim * self.num_heads, args.hidden_size, bias=False)
+
+        # for inference only
+        self.offset = 0
 
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,  # (b, n)
         cache: Optional[Any] = None,
-        slope_rate: Optional[mx.array] = None
-    ) -> mx.array:
-        return x
+        slope_rate: Optional[mx.array] = None,  # (h, 1, 1)
+    ):
+        b, n, d = x.shape
+        
+        # linear map
+        qkv = nn.silu(self.qkv_proj(x))
+        new_shape = qkv.shape[:-1] + (self.num_heads, -1)
+        qkv = qkv.reshape(*new_shape)
+        q, k, v = mx.split(qkv, 3, axis=-1)
+        q = mx.transpose(q, (0, 2, 1, 3))
+        k = mx.transpose(k, (0, 2, 1, 3))
+        v = mx.transpose(v, (0, 2, 1, 3))
+
+        # For inference (autoregressive generation)
+        if cache is not None:
+            # Update the KV cache with new keys and values
+            keys, values = cache.update_and_fetch(k, v)
+            
+            # Calculate ratio for decay
+            ratio = mx.exp(-slope_rate)
+            
+            # Initialize output array for accumulating results
+            output_parts = []
+            
+            # Process each token position
+            for i in range(n):
+                # Get the query for the current position
+                q_i = q[:, :, i:i+1]
+                
+                # Calculate attention for the current position
+                pos = cache.offset - n + i
+                if pos > 0:
+                    # Get keys and values up to current position
+                    k_past = keys[:, :, :pos]
+                    v_past = values[:, :, :pos]
+                    
+                    # Calculate attention
+                    attn_weights = mx.matmul(q_i, mx.transpose(k_past, (0, 1, 3, 2)))
+                    attn_output = mx.matmul(attn_weights, v_past)
+                    
+                    # Store result
+                    output_parts.append(attn_output)
+                else:
+                    # If no previous context, use zeros
+                    output_parts.append(mx.zeros((b, self.num_heads, 1, self.head_dim), dtype=q.dtype))
+            
+            # Concatenate all outputs
+            output = mx.concatenate(output_parts, axis=2)
+            
+            # Reshape output for further processing
+            output = output.transpose(0, 2, 1, 3).reshape(b, n, -1)
+            
+        # For the first pass (full sequence processing)
+        else:
+            # Convert slope_rate to float32 for numerical stability
+            slope_rate = slope_rate.astype(mx.float32)
+            
+            # Apply mask if provided
+            if mask is not None:
+                v = mx.where((1 - mask).reshape(b, 1, n, 1), mx.zeros_like(v), v)
+            
+            # Calculate number of blocks needed
+            NUM_BLOCK = (n + BLOCK - 1) // BLOCK
+            
+            # Prepare decay factors
+            array = mx.arange(BLOCK) + 1
+            q_decay = mx.exp(-slope_rate * array.reshape(-1, 1))
+            k_decay = mx.exp(-slope_rate * (BLOCK - array.reshape(-1, 1)))
+            
+            # Calculate position-based decay matrix
+            index = array[:, None] - array[None, :]
+            s_index = slope_rate * index[None, None, :]
+            s_index = mx.where(index >= 0, -s_index, float("-inf"))
+            diag_decay = mx.exp(s_index)
+
+            # Initialize accumulated key-value state and output
+            kv = mx.zeros((b, self.num_heads, self.head_dim, self.head_dim), dtype=mx.float32)
+            output = mx.zeros((b, self.num_heads, n, self.head_dim), dtype=q.dtype)
+            
+            # Process each block
+            for i in range(NUM_BLOCK):
+                si = i * BLOCK
+                ei = min(si + BLOCK, n)
+                m = ei - si
+                
+                # Get query, key, value for current block
+                qi = q[:, :, si:ei]
+                ki = k[:, :, si:ei]
+                vi = v[:, :, si:ei]
+                
+                # Calculate attention with previous blocks (non-diagonal part)
+                qkv_none_diag = mx.matmul(qi * q_decay[:, :m], kv).astype(mx.float32)
+
+                # Calculate attention within the current block (diagonal part)
+                qk = mx.matmul(qi, mx.transpose(ki, (0, 1, 3, 2))).astype(mx.float32) * diag_decay[:, :, :m, :m]
+                qkv_diag = mx.matmul(qk, vi.astype(mx.float32))
+                
+                # Apply decay factor for the next block
+                block_decay = mx.exp(-slope_rate * m)
+                
+                # Update output with combined attention
+                output = output.at[:, :, si:ei].set(qkv_none_diag + qkv_diag)
+                
+                # Update accumulated key-value state
+                kv = block_decay * kv + mx.matmul(
+                    mx.transpose(ki * k_decay[:, -m:], (0, 1, 3, 2)).astype(vi.dtype), 
+                    vi
+                )
+            
+            # Reshape output for further processing
+            output = output.transpose(0, 2, 1, 3).reshape(b, n, -1)
+
+        # Normalize output
+        output = self.norm(output)
+        
+        # Apply gating mechanism
+        output = mx.sigmoid(self.output_gate(x)) * output
+
+        # Apply output projection
+        return self.out_proj(output)
 
 
 class MiniMaxText01AttentionType1(nn.Module):
@@ -200,8 +322,8 @@ class MiniMaxText01DecoderLayer(nn.Module):
         h = self.input_layernorm(x)
         if self.postnorm:
             h = h
-        h = self.self_attn(x=x, mask=mask, cache=cache, slope_rate=slope_rate)
-        h = r * self.layernorm_attention_alpha  + h * self.layernorm_attention_beta
+        attn_output = self.self_attn(x=h, mask=mask, cache=cache, slope_rate=slope_rate)
+        h = r * self.layernorm_attention_alpha + attn_output * self.layernorm_attention_beta
         r = h
         h = self.post_attention_layernorm(h)
         if self.postnorm:
