@@ -98,4 +98,8 @@ lora_parameters:
 #  valid_split: "train[-100:]"
 #  prompt_feature: "text"
 #  completion_feature: "summary"
-
+# for DPO training
+#  prompt_feature: "text"
+#  system_feature: "system"
+#  chosen_feature: "chosen"
+#  rejected_feature: "rejected"
