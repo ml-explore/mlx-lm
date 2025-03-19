@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Literal, Tuple
+from typing import Any, List, Optional, Literal
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -64,15 +64,14 @@ class MiniMaxText01AttentionType0(nn.Module):
         self.norm = nn.RMSNorm(self.head_dim * self.num_heads)
         self.out_proj = nn.Linear(self.head_dim * self.num_heads, args.hidden_size, bias=False)
 
-        # for inference only
         self.offset = 0
 
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,  # (b, n)
+        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        slope_rate: Optional[mx.array] = None,  # (h, 1, 1)
+        slope_rate: Optional[mx.array] = None
     ):
         b, n, d = x.shape
         
