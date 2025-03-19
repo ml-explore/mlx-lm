@@ -91,10 +91,6 @@ def generate_grpo(
         all_completions = []
         all_completion_texts = []
         batch_indices = []
-
-        def temp_sampler(logits):
-            return mx.random.categorical(logits / temperature)
-
         for i in range(0, total_samples, batch_size):
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i : i + current_batch_size]
@@ -124,7 +120,7 @@ def generate_grpo(
                     expanded_prompts[prompt_idx],
                     model,
                     max_tokens=max_tokens,
-                    sampler=temp_sampler,
+                    sampler=lambda x: mx.random.categorical(x / temperature),
                     prompt_cache=prompt_cache,
                 ):
                     if token == tokenizer.eos_token_id:
