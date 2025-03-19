@@ -168,6 +168,8 @@ def create_dataset(
     prompt_feature = getattr(config, "prompt_feature", "prompt")
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
+    answer_feature = getattr(config, "answer_feature", "answer")
+    system__feature = getattr(config, "system__feature", "system")
     chat_feature = getattr(config, "chat_feature", "messages")
     training_mode = getattr(config, "training_mode", "normal")
     use_chat_template = getattr(config, "use_chat_template", "normal")
@@ -196,8 +198,9 @@ def create_dataset(
         return GRPODataset(
             data=data,
             tokenizer=tokenizer,
-            prompt_key="prompt",
-            answer_key="answer",
+            prompt_key=prompt_feature,
+            answer_key=answer_feature,
+            system_key=system__feature,
             use_chat_template=use_chat_template,
             use_prompt=use_prompt
         )

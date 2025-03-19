@@ -99,4 +99,6 @@ lora_parameters:
 #  valid_split: "train[-100:]"
 #  prompt_feature: "text"
 #  completion_feature: "summary"
-
+# If you chose GRPO, then completion_feature is replaced with answer_feature, and if you have a custom system message, you can set that too
+# system_feature: "system"
+# prompt_feature: "answer"
