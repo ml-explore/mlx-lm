@@ -17,8 +17,8 @@ class GRPODataset:
         self,
         data: List[Dict[str, str]],
         tokenizer: PreTrainedTokenizer,
-        prompt_key: str = "text",
-        answer_key: str = "label",
+        prompt_key: str = "prompt",
+        answer_key: str = "answer",
         system_key: str = "system",
         use_chat_template: bool = False,
         use_prompt: bool = False
@@ -165,10 +165,10 @@ def create_dataset(
     config,
 ):
     mask_prompt = getattr(config, "mask_prompt", False)
-    prompt_feature = getattr(config, "prompt_feature", "text")
+    prompt_feature = getattr(config, "prompt_feature", "prompt")
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
-    answer_feature = getattr(config, "answer_feature", "label")
+    answer_feature = getattr(config, "answer_feature", "answer")
     system__feature = getattr(config, "system__feature", "system")
     chat_feature = getattr(config, "chat_feature", "messages")
     training_mode = getattr(config, "training_mode", "normal")
