@@ -17,8 +17,8 @@ class GRPODataset:
         self,
         data: List[Dict[str, str]],
         tokenizer: PreTrainedTokenizer,
-        prompt_key: str = "prompt",
-        answer_key: str = "answer",
+        prompt_key: str = "text",
+        answer_key: str = "label",
         system_key: str = "system",
         use_chat_template: bool = False,
         use_prompt: bool = False
@@ -165,10 +165,10 @@ def create_dataset(
     config,
 ):
     mask_prompt = getattr(config, "mask_prompt", False)
-    prompt_feature = getattr(config, "prompt_feature", "prompt")
+    prompt_feature = getattr(config, "prompt_feature", "text")
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
-    answer_feature = getattr(config, "answer_feature", "answer")
+    answer_feature = getattr(config, "answer_feature", "label")
     system__feature = getattr(config, "system__feature", "system")
     chat_feature = getattr(config, "chat_feature", "messages")
     training_mode = getattr(config, "training_mode", "normal")
@@ -269,7 +269,7 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
     for ds in dataset_collection:
         ds_name = ds["name"]
         print(f"Loading Hugging Face dataset {ds_name}.")
-        ds["mask_prompt"] = getattr(args, "mask_prompt", False)
+        ds["mask_prompt"] = getattr(args, "mask_prompt", False) if config.training_mode == 'normal' else False
         config = types.SimpleNamespace(**ds)
         hf_config = ds.get("config", {})
         if args.train:
