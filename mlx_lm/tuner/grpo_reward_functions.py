@@ -15,7 +15,7 @@ def r1_extract_xml_answer(text: str) -> str:
 
 
 def r1_int_reward_func(
-    prompts: list, completions: list, answer: list, **kwargs
+    prompts: list, completions: list, answer: list, types: list
 ) -> list[float]:
     if not completions:
         return [0.0] * len(prompts)
@@ -24,7 +24,7 @@ def r1_int_reward_func(
 
 
 def r1_accuracy_reward_func(
-    prompts: list, completions: list, answer: list, **kwargs
+    prompts: list, completions: list, answer: list, types: list
 ) -> list[float]:
     if not completions or not answer:
         return [0.0] * len(prompts)
@@ -35,7 +35,7 @@ def r1_accuracy_reward_func(
 
 
 def r1_soft_format_reward_func(
-    prompts: list, completions: list, answer: list, **kwargs
+    prompts: list, completions: list, answer: list, types: list
 ) -> list[float]:
     if not completions:
         return [0.0] * len(prompts)
@@ -68,7 +68,7 @@ def r1_soft_format_reward_func(
 
 
 def r1_strict_format_reward_func(
-    prompts: list, completions: list, answer: list, **kwargs
+    prompts: list, completions: list, answer: list, types: list
 ) -> list[float]:
     if not completions:
         return [0.0] * len(prompts)
@@ -78,7 +78,7 @@ def r1_strict_format_reward_func(
 
 
 def r1_count_xml(
-    prompts: list, completions: list, answer: list, **kwargs
+    prompts: list, completions: list, answer: list, types: list
 ) -> list[float]:
     if not completions:
         return [0.0] * len(prompts)

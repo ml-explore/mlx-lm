@@ -171,7 +171,7 @@ def grpo_loss(
     batch_size: int = 1,
     is_validation: bool = False,
 ):
-    prompt_tokens, _, prompt_text, answer_text = batch
+    prompt_tokens, _, prompt_text, answer_text, type_info = batch
 
     if (
         completions is not None
@@ -199,6 +199,7 @@ def grpo_loss(
 
     expanded_answers = []
     expanded_prompts = []
+    expanded_types = []
     unique_prompt_indices = sorted(set(batch_indices))
     grouped_completions = {idx: [] for idx in unique_prompt_indices}
 
@@ -215,8 +216,9 @@ def grpo_loss(
             ordered_completions.append(all_completions[idx])
             ordered_completion_texts.append(all_completion_texts[idx])
             ordered_batch_indices.append(prompt_idx)
-            expanded_prompts.append(prompt_text[prompt_idx])
             expanded_answers.append(answer_text[prompt_idx])
+            expanded_prompts.append(prompt_text[prompt_idx])
+            expanded_types.append(type_info[prompt_idx])
 
     all_completions = ordered_completions
     all_completion_texts = ordered_completion_texts
@@ -274,6 +276,7 @@ def grpo_loss(
             prompts=expanded_prompts,
             completions=all_completion_texts,
             answer=expanded_answers,
+            types=expanded_types
         )
         if raw_rewards is None:
             processed_rewards = [float('nan')] * len(all_completion_texts)
