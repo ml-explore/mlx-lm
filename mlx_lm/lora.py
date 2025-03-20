@@ -78,7 +78,7 @@ CONFIG_DEFAULTS = {
     "max_completion_length": 512,
     "use_chat_template": False,
     "use_prompt": False,
-    "temperature": 1.0,
+    "temperature": 0.8,
     "reward_weights": None,
 }
 
