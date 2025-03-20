@@ -269,18 +269,31 @@ def grpo_loss(
     ref_token_log_probs = mx.stack(padded_ref_log_probs)
 
     all_func_rewards = []
-
     for reward_func in reward_funcs:
-        func_rewards = mx.array(
-            reward_func(
-                prompts=expanded_prompts,
-                completions=all_completion_texts,
-                answer=expanded_answers,
-            )
+        raw_rewards = reward_func(
+            prompts=expanded_prompts,
+            completions=all_completion_texts,
+            answer=expanded_answers,
         )
+        if raw_rewards is None:
+            processed_rewards = [float('nan')] * len(all_completion_texts)
+        else:
+            processed_rewards = [float(r) if r is not None else float('nan') for r in raw_rewards]
+        func_rewards = mx.array(processed_rewards)
         all_func_rewards.append(func_rewards)
 
     rewards = mx.stack(all_func_rewards, axis=1)
+
+    all_nan_rows = mx.all(mx.isnan(rewards), axis=1)
+    if mx.any(all_nan_rows):
+        nan_row_idx = mx.argmax(all_nan_rows).item()
+        warning_msg = (
+            f"All reward functions returned None for prompt: {expanded_prompts[nan_row_idx]}, "
+            f"completion: {all_completion_texts[nan_row_idx]}, "
+            f"answer: {expanded_answers[nan_row_idx]}. "
+            "Please ensure that at least one reward function returns a valid reward."
+        )
+        raise RuntimeError(warning_msg)
 
     if reward_weights is not None:
         if len(reward_weights) != len(reward_funcs):
@@ -292,7 +305,11 @@ def grpo_loss(
     else:
         reward_weights = mx.ones(len(reward_funcs), dtype=mx.float32)
 
-    rewards = (rewards * mx.expand_dims(reward_weights, 0)).sum(axis=1)
+    valid_reward_mask = ~mx.isnan(rewards)
+    rewards_no_nan = mx.where(valid_reward_mask, rewards, mx.zeros_like(rewards))
+    rewards = (rewards_no_nan * mx.expand_dims(reward_weights, 0)).sum(axis=1)
+
+    # rewards = (rewards * mx.expand_dims(reward_weights, 0)).sum(axis=1)
 
     num_unique_prompts = len(unique_prompt_indices)
 
@@ -359,19 +376,24 @@ def grpo_loss(
     # Calculate mean KL divergence for metrics
     mean_kl = ((kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)).mean()
 
-    # Collect reward metrics
     reward_metrics = {}
     for i, reward_func in enumerate(reward_funcs):
         func_name = reward_func.__name__
-        func_rewards = mx.array(
-            reward_func(
-                prompts=expanded_prompts,
-                completions=all_completion_texts,
-                answer=expanded_answers,
-            )
+        raw_rewards = reward_func(
+            prompts=expanded_prompts,
+            completions=all_completion_texts,
+            answer=expanded_answers,
         )
-        reward_metrics[f"{func_name}_mean"] = mx.mean(func_rewards)
-        reward_metrics[f"{func_name}_std"] = mx.std(func_rewards)
+        valid_mask = ~mx.isnan(mx.array([reward if reward is not None else float('nan') for reward in raw_rewards]))
+        valid_rewards = mx.array([reward for reward in raw_rewards if reward is not None and not mx.isnan(reward)])
+        if len(valid_rewards) > 0:
+            reward_metrics[f"{func_name}_mean"] = mx.mean(valid_rewards)
+            reward_metrics[f"{func_name}_std"] = mx.std(valid_rewards) if len(valid_rewards) > 1 else mx.zeros(1)
+            reward_metrics[f"{func_name}_coverage"] = valid_mask.sum() / len(raw_rewards)
+        else:
+            reward_metrics[f"{func_name}_mean"] = float('nan')
+            reward_metrics[f"{func_name}_std"] = float('nan')
+            reward_metrics[f"{func_name}_coverage"] = 0.0
 
     grouped_rewards_mean = mx.array(
         [mx.mean(mx.array(rewards)) for rewards in rewards_by_prompt]
