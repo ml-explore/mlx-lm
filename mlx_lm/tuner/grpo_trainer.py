@@ -44,7 +44,7 @@ class GRPOTrainingArgs(TrainingArgs):
         },
     )
     temperature: float = field(
-        default=1.0,
+        default=0.8,
         metadata={
             "help": "Temperature for sampling. The higher the temperature, the more random the completions."
         },
