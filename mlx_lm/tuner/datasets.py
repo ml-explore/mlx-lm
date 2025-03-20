@@ -20,6 +20,7 @@ class GRPODataset:
         prompt_key: str = "prompt",
         answer_key: str = "answer",
         system_key: str = "system",
+        type_key: str = "type",
         use_chat_template: bool = False,
         use_prompt: bool = False
     ):
@@ -27,6 +28,7 @@ class GRPODataset:
         for item in data:
             prompt_str = str(item[prompt_key])
             answer_str = str(item[answer_key])
+            type_info = item.get(type_key, None)
             if use_chat_template:
                 default_system_str = "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."
                 system_str = item.get(system_key, default_system_str)
@@ -44,7 +46,7 @@ class GRPODataset:
                 else:
                     prompt_tokens = tokenizer.encode(prompt_str)
                 answer_tokens = tokenizer.encode(answer_str)
-            self._data.append((prompt_tokens, answer_tokens, prompt_str, answer_str))
+            self._data.append((prompt_tokens, answer_tokens, prompt_str, answer_str, type_info))
 
     def __getitem__(self, idx: int) -> Tuple[List[int], List[int], str, str]:
         return self._data[idx]
@@ -165,8 +167,9 @@ def create_dataset(
     config,
 ):
     mask_prompt = getattr(config, "mask_prompt", False)
-    prompt_feature = getattr(config, "prompt_feature", "prompt")
     text_feature = getattr(config, "text_feature", "text")
+    prompt_feature = getattr(config, "prompt_feature", "prompt")
+    type_feature = getattr(config, "type_feature", "type")
     completion_feature = getattr(config, "completion_feature", "completion")
     answer_feature = getattr(config, "answer_feature", "answer")
     system__feature = getattr(config, "system__feature", "system")
@@ -201,6 +204,7 @@ def create_dataset(
             prompt_key=prompt_feature,
             answer_key=answer_feature,
             system_key=system__feature,
+            type_key=type_feature,
             use_chat_template=use_chat_template,
             use_prompt=use_prompt
         )
