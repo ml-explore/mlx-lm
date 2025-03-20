@@ -218,7 +218,7 @@ def grpo_loss(
             ordered_batch_indices.append(prompt_idx)
             expanded_answers.append(answer_text[prompt_idx])
             expanded_prompts.append(prompt_text[prompt_idx])
-            expanded_types.append(type_info[prompt_idx])
+            expanded_types.append(type_info[prompt_idx] if type_info is not None else None)
 
     all_completions = ordered_completions
     all_completion_texts = ordered_completion_texts
