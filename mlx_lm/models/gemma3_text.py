@@ -86,7 +86,7 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         # Sliding window
-        if mask is not None and mask.shape[-1] != keys.shape[-2]:
+        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
             mask = mask[..., -keys.shape[-2] :]
 
         output = mx.fast.scaled_dot_product_attention(

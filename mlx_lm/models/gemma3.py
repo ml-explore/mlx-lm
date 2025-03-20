@@ -1,15 +1,14 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from . import gemma3_text
-from .base import BaseModelArgs, create_attention_mask
-from .cache import KVCache, RotatingKVCache
+from .base import BaseModelArgs
 
 
 @dataclass

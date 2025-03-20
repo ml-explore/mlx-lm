@@ -45,16 +45,14 @@ def create_causal_mask(
 def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
     T = h.shape[1]
     if T > 1:
-        window_size = None
-        offset = 0
         if cache is not None and cache[0] is not None:
             c = cache[0]
             if hasattr(c, "max_size"):
-                offset = min(c.max_size, c.offset)
                 window_size = c.max_size
-            else:
-                offset = c.offset
-        mask = create_causal_mask(T, offset, window_size=window_size)
+                offset = min(window_size, c.offset)
+                if offset + T > window_size:
+                    return create_causal_mask(T, offset, window_size=window_size)
+        return "causal"
     else:
         mask = None
     return mask
