@@ -72,7 +72,6 @@ CONFIG_DEFAULTS = {
     "mask_prompt": False,
     # ORPO args
     "beta": 0.1,
-    "reference_model_path": None,
     "reward_scaling": 1.0,
 }
 
