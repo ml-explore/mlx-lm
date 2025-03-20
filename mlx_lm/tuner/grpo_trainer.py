@@ -454,9 +454,11 @@ def grpo_loss(
 
 
 def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
-    if not dataset or not isinstance(dataset[0], tuple) or len(dataset[0]) != 4:
+    has_types = isinstance(dataset[0], tuple) and len(dataset[0]) == 5
+
+    if not dataset or not isinstance(dataset[0], tuple) or (not has_types and len(dataset[0]) != 4):
         raise ValueError(
-            "Dataset must be list of (prompt_tokens, answer_tokens, prompt_str, answer_str) tuples"
+            "Dataset must be list of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type]) tuples"
         )
 
     def length_key(i):
@@ -492,6 +494,7 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
             answers_tokens = [item[1] for item in current_batch]
             prompts_text = [item[2] for item in current_batch]
             answers_text = [item[3] for item in current_batch]
+            types = [item[4] for item in current_batch] if has_types else None
 
             if any(len(p) > max_seq_length for p in prompts_tokens):
                 print(
@@ -499,7 +502,7 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
                     "Long prompts will be truncated."
                 )
 
-            yield prompts_tokens, answers_tokens, prompts_text, answers_text
+            yield prompts_tokens, answers_tokens, prompts_text, answers_text, types
 
         if not train:
             break
