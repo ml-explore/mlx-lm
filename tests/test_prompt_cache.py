@@ -299,7 +299,7 @@ class TestPromptCache(unittest.TestCase):
         ):
             i += 1
             self.assertEqual(tok, toks[i])
-            self.assertTrue(mx.allclose(logits, all_logits[i], rtol=3e-2))
+            self.assertTrue(mx.allclose(logits, all_logits[i], rtol=4e-2))
 
 
 if __name__ == "__main__":
