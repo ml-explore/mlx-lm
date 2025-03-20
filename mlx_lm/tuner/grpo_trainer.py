@@ -614,7 +614,7 @@ def train_grpo(
     state = [model.state, optimizer.state]
 
     def step(batch):
-        prompt_tokens, targets, prompt_lens, target_lens = batch
+        prompt_tokens, targets, prompt_lens, target_lens, type_info = batch
 
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
@@ -629,7 +629,7 @@ def train_grpo(
         (loss, toks, metrics), grad = loss_value_and_grad(
             model,
             tokenizer=tokenizer,
-            batch=(prompt_tokens, targets, prompt_lens, target_lens),
+            batch=(prompt_tokens, targets, prompt_lens, target_lens, type_info),
             completions=all_completions,
             completion_texts=all_completion_texts,
             batch_indices=batch_indices,
