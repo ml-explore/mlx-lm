@@ -99,6 +99,7 @@ def linear_to_lora_layers(
         "cohere2",
         "minicpm",
         "minicpm3",
+        "minimax_text_01",
         "deepseek",
         "olmo2",
         "olmoe",
@@ -110,6 +111,8 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
+        if model.model_type == "minimax_text_01":
+            keys.add("block_sparse_moe.gate")
         if model.model_type == "olmoe":
             keys.add("mlp.gate")
 

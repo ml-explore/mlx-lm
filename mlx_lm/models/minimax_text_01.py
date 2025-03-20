@@ -91,7 +91,7 @@ class MiniMaxText01AttentionType0(nn.Module):
             
             # Calculate ratio for decay
             ratio = mx.exp(-slope_rate)
-            
+
             # Initialize output array for accumulating results
             output_parts = []
             
@@ -127,11 +127,7 @@ class MiniMaxText01AttentionType0(nn.Module):
         else:
             # Convert slope_rate to float32 for numerical stability
             slope_rate = slope_rate.astype(mx.float32)
-            
-            # Apply mask if provided
-            if mask is not None:
-                v = mx.where((1 - mask).reshape(b, 1, n, 1), mx.zeros_like(v), v)
-            
+
             # Calculate number of blocks needed
             NUM_BLOCK = (n + BLOCK - 1) // BLOCK
             
