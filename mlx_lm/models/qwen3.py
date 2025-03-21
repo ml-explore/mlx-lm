@@ -23,6 +23,7 @@ class ModelArgs(BaseModelArgs):
     head_dim: int
     sliding_window: int
     max_window_layers: int
+    vocab_size: int
     rms_norm_eps: float
     rope_theta: float
     rope_traditional: bool = False
@@ -123,3 +124,32 @@ class Qwen3Block(nn.Module):
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
         return out
+    
+
+class Qwen3Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [
+            Qwen3Block(args=args) for _ in range(args.num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None
+    ):
+        h = self.embed_tokens(inputs)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c)
+
+        return self.norm(h)
