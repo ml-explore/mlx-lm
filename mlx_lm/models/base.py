@@ -103,29 +103,18 @@ def quantized_scaled_dot_product_attention(
 
 
 def _chunk(hidden_states, window_overlap):
-    """Convert into overlapping chunks. Chunk size = 2 * window_overlap, overlap = window_overlap"""
-    batch_size, seq_len, num_heads, head_dim = hidden_states.shape
-
-    # Adjust window_overlap to be reasonable
-    window_overlap = min(window_overlap, seq_len // 2)
-    window_overlap = max(window_overlap, 1)
-
-    chunk_size = 2 * window_overlap
+    B, seq_len, num_heads, head_dim = hidden_states.shape
+    chunk_size = window_overlap * 2
     step = window_overlap
     n_chunks = max((seq_len - window_overlap) // step, 1)
 
-    chunk_shape = (batch_size, n_chunks, chunk_size, num_heads, head_dim)
-    chunks = mx.zeros(chunk_shape, dtype=hidden_states.dtype)
+    chunks = mx.zeros((B, n_chunks, chunk_size, num_heads, head_dim), dtype=hidden_states.dtype)
 
     for i in range(n_chunks):
-        start_idx = i * step
-        end_idx = min(start_idx + chunk_size, seq_len)
-        actual_chunk_len = end_idx - start_idx
-
-        chunk_data = hidden_states[:, start_idx:end_idx, :, :]
-        
-        # Assign directly (no `.at[...].update()` method)
-        chunks[:, i, :actual_chunk_len, :, :] = chunk_data
+        start = i * step
+        end = min(start + chunk_size, seq_len)
+        actual_len = end - start
+        chunks[:, i, :actual_len, :, :] = hidden_states[:, start:end, :, :]
 
     return chunks
 
@@ -138,63 +127,91 @@ def sliding_window_scaled_dot_product_attention(
         sliding_window: int
     ):
     """
-    Computes sliding window attention using efficient chunking. adapted from https://amaarora.github.io/posts/2024-07-04%20SWA.html#sliding-window-attention-in-pytorch
+    Computes sliding window attention using efficient chunking.
     
     Args:
-        queries: Query tensor of shape [batch_size, seq_len_q, num_heads, head_dim]
-        keys: Key tensor of shape [batch_size, seq_len_k, num_heads, head_dim]
-        values: Value tensor of shape [batch_size, seq_len_v, num_heads, head_dim]
-        scale: Scaling factor for the attention scores (default: 1/sqrt(head_dim))
+        queries: Query tensor of shape [batch_size, num_heads, seq_len_q, head_dim]
+        keys: Key tensor of shape [batch_size, num_kv_heads, seq_len_k, head_dim]
+        values: Value tensor of shape [batch_size, num_kv_heads, seq_len_v, head_dim]
+        scale: Scaling factor for the attention scores
         mask: Optional mask tensor
         sliding_window: Size of the attention window (must be odd)
         
     Returns:
-        Output tensor of shape [batch_size, seq_len_q, num_heads, head_dim]
+        Output tensor of shape [batch_size, num_heads, seq_len_q, head_dim]
     """
-    batch_size, seq_len, num_heads, head_dim = queries.shape
-    
-    # Default scale
-    if scale is None:
-        scale = 1.0 / math.sqrt(head_dim)
+    B, num_heads, seq_len, head_dim = queries.shape
+    _, num_kv_heads, _, _ = keys.shape
 
-    # Automatically adjust sliding window size
-    if sliding_window > seq_len:
-        sliding_window = seq_len if seq_len % 2 == 1 else seq_len - 1
-
-    # Ensure sliding_window is odd
+    # Adjust sliding window size
+    sliding_window = min(sliding_window, seq_len)
     if sliding_window % 2 == 0:
         sliding_window += 1
-
     window_overlap = sliding_window // 2
 
-    # Debugging print
-    print(f"seq_len: {seq_len}, window_overlap: {window_overlap}, n_chunks: {seq_len // window_overlap - 1}")
-
-    # Chunk queries, keys, and values
-    query_chunks = _chunk(queries, window_overlap)
-    key_chunks = _chunk(keys, window_overlap)
-    value_chunks = _chunk(values, window_overlap)
-
-    query_chunks *= scale
-
+    # First transpose to [B, seq_len, num_heads, head_dim] for chunking
+    queries_t = queries.transpose(0, 2, 1, 3)  # [B, seq_len, num_heads, head_dim]
+    keys_t = keys.transpose(0, 2, 1, 3)        # [B, seq_len, num_kv_heads, head_dim]
+    values_t = values.transpose(0, 2, 1, 3)    # [B, seq_len, num_kv_heads, head_dim]
+    
+    # Chunk the sequences
+    query_chunks = _chunk(queries_t, window_overlap)  # [B, n_chunks, chunk_size, num_heads, head_dim]
+    key_chunks = _chunk(keys_t, window_overlap)       # [B, n_chunks, chunk_size, num_kv_heads, head_dim]
+    value_chunks = _chunk(values_t, window_overlap)   # [B, n_chunks, chunk_size, num_kv_heads, head_dim]
+    
+    # Handle num_heads != num_kv_heads case
+    if num_heads != num_kv_heads:
+        assert num_heads % num_kv_heads == 0
+        repeat_factor = num_heads // num_kv_heads
+        key_chunks = mx.repeat(key_chunks, repeat_factor, axis=3)
+        value_chunks = mx.repeat(value_chunks, repeat_factor, axis=3)
+    
+    # Apply scale to queries
+    query_chunks_scaled = query_chunks * scale
+    
     # Compute attention scores
-    attention_scores = mx.einsum("bcqhd,bckhd->bcqhk", query_chunks, key_chunks) * scale
-
+    attention_scores = mx.einsum("bcqhd,bckhd->bcqhk", query_chunks_scaled, key_chunks)
+    
+    # Apply mask if provided
     if mask is not None:
-        chunked_mask = _chunk(mask[:, :, None, :], window_overlap)  # Ensure correct shape
-        attention_scores += chunked_mask
-
-    # Apply mask if needed
-    if mask is not None:
-        attention_scores += _chunk(mask[:, :, None, None], window_overlap)
-
-    # Softmax
+        # Ensure mask has the right shape for chunking
+        if mask.ndim == 2:  # [B, seq_len]
+            mask = mask[:, :, None, None]  # [B, seq_len, 1, 1]
+        mask_chunks = _chunk(mask, window_overlap)
+        attention_scores = attention_scores + mask_chunks
+    
+    # Compute attention probabilities
     attention_probs = mx.softmax(attention_scores, axis=-1)
-
-    # Compute output
+    
+    # Apply attention to values
     attention_output = mx.einsum("bcqhk,bckhd->bcqhd", attention_probs, value_chunks)
+    
+    # Recombine chunks
+    B_out = attention_output.shape[0]
+    n_chunks = attention_output.shape[1]
+    chunk_size = attention_output.shape[2]
+    
+    # Create output tensor and count tensor for averaging
+    output = mx.zeros((B_out, seq_len, num_heads, head_dim), dtype=queries.dtype)
+    counts = mx.zeros((seq_len,), dtype=mx.float32)
+    
+    # Accumulate chunks into output
+    for i in range(n_chunks):
+        start_idx = i * window_overlap
+        end_idx = min(start_idx + chunk_size, seq_len)
+        chunk_len = end_idx - start_idx
+        
+        # Add the chunk to the output
+        output[:, start_idx:end_idx, :, :] += attention_output[:, i, :chunk_len, :, :]
+        counts[start_idx:end_idx] += 1.0
+    
+    # Normalize by counts (avoiding division by zero)
+    counts = mx.maximum(counts, 1.0)
+    output = output / counts.reshape(1, -1, 1, 1)
+    
+    # Transpose back to original format [B, num_heads, seq_len, head_dim]
+    return output.transpose(0, 2, 1, 3)
 
-    return attention_output.reshape(batch_size, seq_len, num_heads, head_dim)
 
 
 def scaled_dot_product_attention(
