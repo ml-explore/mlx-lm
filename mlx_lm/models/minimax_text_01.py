@@ -88,9 +88,6 @@ class MiniMaxText01AttentionType0(nn.Module):
         if cache is not None:
             # Update the KV cache with new keys and values
             keys, values = cache.update_and_fetch(k, v)
-            
-            # Calculate ratio for decay
-            ratio = mx.exp(-slope_rate)
 
             # Initialize output array for accumulating results
             output_parts = []
@@ -168,7 +165,12 @@ class MiniMaxText01AttentionType0(nn.Module):
                 block_decay = mx.exp(-slope_rate * m)
                 
                 # Update output with combined attention
-                output = output.at[:, :, si:ei].set(qkv_none_diag + qkv_diag)
+                output_slice = qkv_none_diag + qkv_diag
+                output = mx.concatenate([
+                    output[:, :, :si],
+                    output_slice,
+                    output[:, :, ei:]
+                ], axis=2)
                 
                 # Update accumulated key-value state
                 kv = block_decay * kv + mx.matmul(

@@ -111,8 +111,7 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type == "minimax_text_01":
-            keys.add("block_sparse_moe.gate")
+
         if model.model_type == "olmoe":
             keys.add("mlp.gate")
 
@@ -126,6 +125,21 @@ def linear_to_lora_layers(
         keys = set(["att_proj"])
     elif model.model_type == "openelm":
         keys = set(["attn.qkv_proj"])
+
+    elif model.model_type == "minimax_text_01":
+        keys = set([
+            "self_attn.qkv_proj", 
+            "self_attn.output_gate", 
+            "self_attn.out_proj",
+            # For Type 1 attention
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            # For MoE
+            "block_sparse_moe.gate"
+        ])
+
     elif model.model_type == "phi3":
         keys = set(["self_attn.qkv_proj"])
     elif model.model_type == "phi-msft":
