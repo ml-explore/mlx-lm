@@ -16,6 +16,7 @@ class ModelArgs(BaseModelArgs):
     hidden_size: int
     num_hidden_layers: int
     intermediate_size: int
+    use_sliding_window: bool
 
 
 class Qwen3MLP(nn.Module):
