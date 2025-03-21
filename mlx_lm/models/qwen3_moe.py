@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
@@ -7,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
+from .switch_layers import SwitchGLU
 
 
 @dataclass
@@ -17,15 +18,30 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
+    num_experts_per_tok: int
+    num_experts: int
+    moe_intermediate_size: int
+    shared_expert_intermediate_size: int
     rms_norm_eps: float
     vocab_size: int
-    num_key_value_heads: int
-    max_position_embeddings: int = 32768
+    num_key_value_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     rope_theta: float = 1000000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    head_dim: Optional[int] = None
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
+
+    def __post_init__(self):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+
+        if self.rope_scaling:
+            required_keys = {"factor", "type"}
+            if not all(key in self.rope_scaling for key in required_keys):
+                raise ValueError(f"rope_scaling must contain keys {required_keys}")
+
+            if self.rope_scaling["type"] != "linear":
+                raise ValueError("rope_scaling 'type' currently only supports 'linear'")
 
 
 class Attention(nn.Module):
@@ -40,19 +56,18 @@ class Attention(nn.Module):
         head_dim = args.hidden_size // n_heads if not args.head_dim else args.head_dim
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-        self.rope = initialize_rope(
+
+        self.rope = nn.RoPE(
             head_dim,
-            base=args.rope_theta,
             traditional=args.rope_traditional,
-            scaling_config=args.rope_scaling,
-            max_position_embeddings=args.max_position_embeddings,
+            base=args.rope_theta,
         )
 
     def __call__(
@@ -99,13 +114,51 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class TransformerBlock(nn.Module):
+class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
+        dim = args.hidden_size
+        intermediate_size = args.moe_intermediate_size
+        shared_expert_intermediate_size = args.shared_expert_intermediate_size
+
+        self.num_experts = num_experts = args.num_experts
+        self.top_k = args.num_experts_per_tok
+
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+
+        self.shared_expert = MLP(dim, shared_expert_intermediate_size)
+        self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
+
+    def __call__(
+        self,
+        x: mx.array,
+    ):
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+
+        k = self.top_k
+        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+
+        shared_expert_output = self.shared_expert(x)
+        shared_expert_output = (
+            mx.sigmoid(self.shared_expert_gate(x)) * shared_expert_output
+        )
+
+        return y + shared_expert_output
+
+
+class Qwen3MoeDecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        self.mlp = Qwen3MoeSparseMoeBlock(args)
+
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
@@ -125,7 +178,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Qwen3Model(nn.Module):
+class Qwen3MoeModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -134,7 +187,7 @@ class Qwen3Model(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            Qwen3MoeDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -163,9 +216,8 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen3Model(args)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model = Qwen3MoeModel(args)
+        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -174,19 +226,22 @@ class Model(nn.Module):
         cache=None,
     ):
         out = self.model(inputs, mask, cache)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-        return out
+        return self.lm_head(out)
 
     def sanitize(self, weights):
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        # Remove unused precomputed rotary freqs
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+            return weights
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}"
+            for n in ["up_proj", "down_proj", "gate_proj"]:
+                for k in ["weight", "scales", "biases"]:
+                    if f"{prefix}.mlp.experts.0.{n}.{k}" in weights:
+                        to_join = [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.{n}.{k}")
+                            for e in range(self.args.num_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{n}.{k}"] = mx.stack(to_join)
+        return weights
 
     @property
     def layers(self):
