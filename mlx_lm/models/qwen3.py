@@ -77,20 +77,15 @@ class Qwen3Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None
     ) -> mx.array:
-        B, L, D = x.shape
+        input_shape = x.shape[:-1]  # Gets all dimensions except the last one
+        hidden_shape = (*input_shape, -1, self.head_dim)  # Shape for heads and head_dim
 
-        queries = self.q_proj(x)
-        keys = self.k_proj(x)
-        values = self.v_proj(x)
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Reshape and apply normalization
-        queries = queries.reshape(B, L, self.n_heads, self.head_dim)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)  # [B, n_heads, L, head_dim]
-        
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim)
-        keys = self.k_norm(keys).transpose(0, 2, 1, 3)  # [B, n_kv_heads, L, head_dim]
-        
-        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)  # [B, n_kv_heads, L, head_dim]
+        # Reshape and apply normalization - matching the PyTorch implementation
+        queries = self.q_norm(queries.reshape(hidden_shape)).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(hidden_shape[:2] + (self.n_kv_heads, self.head_dim))).transpose(0, 2, 1, 3)
+        values = values.reshape(hidden_shape[:2] + (self.n_kv_heads, self.head_dim)).transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -105,5 +100,26 @@ class Qwen3Attention(nn.Module):
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask, sliding_window=sliding_window
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        output = output.transpose(0, 2, 1, 3).reshape(*input_shape, -1)
         return self.o_proj(output)
+    
+
+class Qwen3Block(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.self_attn = Qwen3Attention(args)
+        self.mlp = Qwen3MLP(args.hidden_size, args.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        r = self.mlp(self.post_attention_layernorm(h))
+        out = h + r
+        return out
