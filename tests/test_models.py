@@ -343,6 +343,25 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
+    def test_qwen3(self):
+        from mlx_lm.models import qwen3
+
+        args = qwen3.ModelArgs(
+            model_type="qwen3",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+            head_dim=128,
+        )
+        model = qwen3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
