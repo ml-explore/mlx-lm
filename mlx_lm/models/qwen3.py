@@ -16,7 +16,21 @@ class ModelArgs(BaseModelArgs):
     hidden_size: int
     num_hidden_layers: int
     intermediate_size: int
-    use_sliding_window: bool
+    max_position_embeddings: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    attention_dropout: float
+    head_dim: int
+    sliding_window: int
+    max_window_layers: int
+    rms_norm_eps: float
+    rope_theta: float
+    rope_traditional: bool = False
+    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    use_sliding_window: bool = False
+    tie_word_embeddings: bool = False
+    attention_bias: bool = False
+
 
 
 class Qwen3MLP(nn.Module):
