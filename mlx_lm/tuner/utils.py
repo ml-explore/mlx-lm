@@ -87,6 +87,7 @@ def linear_to_lora_layers(
         "hunyuan",
         "qwen2",
         "qwen2_moe",
+        "qwen3",
         "phimoe",
         "gemma",
         "gemma2",
