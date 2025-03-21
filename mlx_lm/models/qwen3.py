@@ -6,8 +6,8 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
+from base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from rope_utils import initialize_rope
 
 
 @dataclass
@@ -46,30 +46,31 @@ class Qwen3MLP(nn.Module):
     
 
 class Qwen3Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self):
         super().__init__()
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.use_sliding_window = args.use_sliding_window
-        self.sliding_window = args.sliding_window
+        self.n_heads = 2
+        self.n_kv_heads = 1
+        self.use_sliding_window = True
+        self.sliding_window = 12
+        self.rms_norm_eps = 0.001
+        self.hidden_size = 32
 
-        head_dim = args.hidden_size // n_heads
-        self.scale = head_dim**-0.5
+        self.head_dim = 32 // 2
+        self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(args.hidden_size, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(args.hidden_size, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(args.hidden_size, n_kv_heads * head_dim, bias=True)
-        self.o_proj = nn.Linear(n_heads * head_dim, args.hidden_size, bias=False)
+        self.q_proj = nn.Linear(self.hidden_size, self.n_heads * self.head_dim, bias=True)
+        self.k_proj = nn.Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=self.rms_norm_eps)
 
         self.rope = initialize_rope(
-            head_dim,
-            base=args.rope_theta,
-            traditional=args.rope_traditional,
-            scaling_config=args.rope_scaling,
-            max_position_embeddings=args.max_position_embeddings,
+            self.head_dim,
+            base=100000,
+            traditional=True,
+            max_position_embeddings=512,
         )
 
     def __call__(
@@ -78,16 +79,25 @@ class Qwen3Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None
     ) -> mx.array:
-        input_shape = x.shape[:-1]  # Gets all dimensions except the last one
-        hidden_shape = (*input_shape, -1, self.head_dim)  # Shape for heads and head_dim
-
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-
-        # Reshape and apply normalization - matching the PyTorch implementation
-        queries = self.q_norm(queries.reshape(hidden_shape)).transpose(0, 2, 1, 3)
-        keys = self.k_norm(keys.reshape(hidden_shape[:2] + (self.n_kv_heads, self.head_dim))).transpose(0, 2, 1, 3)
-        values = values.reshape(hidden_shape[:2] + (self.n_kv_heads, self.head_dim)).transpose(0, 2, 1, 3)
-
+        print(x.shape)
+        input_shape = x.shape[:-1]  # [batch_size, seq_len]
+        
+        # Project the inputs
+        queries = self.q_proj(x)  # [batch_size, seq_len, n_heads*head_dim]
+        keys = self.k_proj(x)     # [batch_size, seq_len, n_kv_heads*head_dim]
+        values = self.v_proj(x)   # [batch_size, seq_len, n_kv_heads*head_dim]
+        
+        # Calculate the actual dimensions for reshaping
+        q_shape = (*input_shape, self.n_heads, self.head_dim)
+        kv_shape = (*input_shape, self.n_kv_heads, self.head_dim)
+        print(q_shape)
+        print(kv_shape)
+        
+        # Reshape and apply normalization
+        queries = self.q_norm(queries.reshape(q_shape)).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(kv_shape)).transpose(0, 2, 1, 3)
+        values = values.reshape(kv_shape).transpose(0, 2, 1, 3)
+        
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
@@ -95,15 +105,23 @@ class Qwen3Attention(nn.Module):
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
-
+        
         sliding_window = None if not self.use_sliding_window else self.sliding_window
-
+        
+        # For sliding window attention, we need to transpose back
+        queries_for_attn = queries.transpose(0, 2, 1, 3)
+        keys_for_attn = keys.transpose(0, 2, 1, 3)
+        values_for_attn = values.transpose(0, 2, 1, 3)
+        
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask, sliding_window=sliding_window
+            queries_for_attn, keys_for_attn, values_for_attn,
+            scale=self.scale, mask=mask, sliding_window=sliding_window, cache=cache
         )
-        output = output.transpose(0, 2, 1, 3).reshape(*input_shape, -1)
+        
+        # Reshape back to original dimensions
+        output = output.transpose(0, 2, 1, 3).reshape(*input_shape, self.n_heads * self.head_dim)
         return self.o_proj(output)
-    
+        
 
 class Qwen3Block(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -153,3 +171,57 @@ class Qwen3Model(nn.Module):
             h = layer(h, mask, c)
 
         return self.norm(h)
+    
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.model = Qwen3Model(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
+    ):
+        out = self.model(inputs, mask, cache)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
+
+    def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        # Remove unused precomputed rotary freqs
+        return {
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+        }
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+
+
+
+batch_size = 2
+seq_length = 10
+hidden_size = 32
+
+# Create dummy input tensor
+dummy_tensor = mx.random.normal(shape=(batch_size, seq_length, hidden_size))
+
+
+attn = Qwen3Attention()
+
+print(dummy_tensor.shape)
+
+out = attn(dummy_tensor)
+
+print(out.shape)

@@ -4,10 +4,11 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import math
 import mlx.core as mx
 from mlx.utils import tree_map
 
-from .cache import QuantizedKVCache
+from cache import QuantizedKVCache
 
 
 @dataclass
@@ -100,9 +101,6 @@ def quantized_scaled_dot_product_attention(
 
     return out
 
-
-import mlx.core as mx
-import math
 
 def sliding_window_scaled_dot_product_attention(
     queries, keys, values, scale=None, mask=None, sliding_window=None
