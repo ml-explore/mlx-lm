@@ -60,6 +60,9 @@ class Qwen3Attention(nn.Module):
         self.v_proj = nn.Linear(args.hidden_size, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, args.hidden_size, bias=False)
 
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+
         self.rope = initialize_rope(
             head_dim,
             base=args.rope_theta,
@@ -76,12 +79,18 @@ class Qwen3Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        # Reshape and apply normalization
+        queries = queries.reshape(B, L, self.n_heads, self.head_dim)
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)  # [B, n_heads, L, head_dim]
+        
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim)
+        keys = self.k_norm(keys).transpose(0, 2, 1, 3)  # [B, n_kv_heads, L, head_dim]
+        
+        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)  # [B, n_kv_heads, L, head_dim]
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -91,7 +100,7 @@ class Qwen3Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        sliding_window = None if self.use_sliding_window == False else self.sliding_window
+        sliding_window = None if not self.use_sliding_window else self.sliding_window
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask, sliding_window=sliding_window
