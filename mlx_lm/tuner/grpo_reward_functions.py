@@ -26,7 +26,6 @@ def r1_int_reward_func(
 def r1_accuracy_reward_func(
     prompts: list, completions: list, answer: list, types: Optional[list] = None
 ) -> list[float]:
-    print(types)
     if not completions or not answer:
         return [0.0] * len(prompts)
     extracted_responses = [r1_extract_xml_answer(r) for r in completions]

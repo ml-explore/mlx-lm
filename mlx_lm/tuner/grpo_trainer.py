@@ -83,7 +83,7 @@ def generate_grpo(
     group_size: int,
     temperature: float,
     batch_size: int,
-    end_token: str = "</answer>",
+    end_token: str = "</answer>"
 ):
     try:
         end_sequence = mx.array(tokenizer.encode(end_token))
@@ -94,7 +94,6 @@ def generate_grpo(
         for i in range(0, total_samples, batch_size):
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i : i + current_batch_size]
-
             max_prompt_len = max(len(p) for p in batch_prompts)
             padded_prompts = []
             for prompt in batch_prompts:
@@ -102,7 +101,6 @@ def generate_grpo(
                 padded_prompts.append(prompt + padding)
 
             prompt_tensor = mx.stop_gradient(mx.array(padded_prompts))
-
             if len(prompt_tensor.shape) == 1:
                 prompt_tensor = prompt_tensor[None, :]
             if prompt_tensor.shape[1] == 0:
@@ -110,12 +108,10 @@ def generate_grpo(
 
             expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
             batch_results = []
-
             total_prompt_samples = expanded_prompts.shape[0]
             for prompt_idx in range(total_prompt_samples):
                 current_tokens = []
                 prompt_cache = cache.make_prompt_cache(model)
-
                 for token, _ in generate_step(
                     expanded_prompts[prompt_idx],
                     model,
@@ -127,7 +123,6 @@ def generate_grpo(
                         break
 
                     current_tokens.append(token)
-
                     if len(current_tokens) >= len(end_sequence) and mx.array_equal(
                         mx.array(current_tokens[-len(end_sequence) :]), end_sequence
                     ):
@@ -144,8 +139,6 @@ def generate_grpo(
                         completion_text = tokenizer.decode(completion_ids.tolist())
                         all_completions.append(mx.stop_gradient(completion_ids))
                         all_completion_texts.append(completion_text)
-
-            mx.metal.clear_cache()
 
     finally:
         mx.metal.clear_cache()
@@ -229,7 +222,6 @@ def grpo_loss(
 
     for completion_ids in all_completions:
         completion_tensor = mx.array(completion_ids.tolist())
-
         padding_length = max_length - completion_tensor.shape[0]
         if padding_length > 0:
             padding = mx.zeros((padding_length,), dtype=completion_tensor.dtype)
@@ -312,8 +304,6 @@ def grpo_loss(
     rewards_no_nan = mx.where(valid_reward_mask, rewards, mx.zeros_like(rewards))
     rewards = (rewards_no_nan * mx.expand_dims(reward_weights, 0)).sum(axis=1)
 
-    # rewards = (rewards * mx.expand_dims(reward_weights, 0)).sum(axis=1)
-
     num_unique_prompts = len(unique_prompt_indices)
 
     rewards_by_prompt = [[] for _ in range(num_unique_prompts)]
@@ -374,7 +364,7 @@ def grpo_loss(
     # Average over tokens
     loss = (
         per_token_loss * length_mask
-    ).sum() / length_mask.sum()  # Matches the pytorch implementaiton
+    ).sum() / length_mask.sum()
 
     # Calculate mean KL divergence for metrics
     mean_kl = ((kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)).mean()
@@ -414,34 +404,25 @@ def grpo_loss(
         "grouped_rewards_mean": mx.mean(grouped_rewards_mean),
         "grouped_rewards_std": mx.mean(grouped_rewards_std),
         "kl": mean_kl,
+        "average_generated_tokens": len(all_completion_texts[-1]) // len(batch_indices),
         **reward_metrics,
     }
 
     if is_validation and all_completion_texts:
         print("\n=== Validation Sample Details ===")
-
-        # Print the input context (prompt)
         last_prompt_idx = batch_indices[-1] if batch_indices else 0
-
         if last_prompt_idx < len(prompt_text):
             print(f"\n📋 Raw Prompt:\n{prompt_text[last_prompt_idx]}")
             print("\n" + "=" * 10 + "\n")
-
-            # Get the actual tokenized prompt that was fed to the model
             if last_prompt_idx < len(prompt_tokens):
                 actual_prompt = tokenizer.decode(prompt_tokens[last_prompt_idx])
                 print(f"\n🔄 Model Input:\n{actual_prompt}")
                 print("\n" + "=" * 10 + "\n")
-
         print(f"\n📝 Generation:\n{all_completion_texts[-1]}")
         print("\n" + "=" * 10 + "\n")
-
-        # Make sure we have a valid index for answer_text
         if last_prompt_idx < len(answer_text):
             print(f"\n✅ Answer:\n{answer_text[last_prompt_idx]}")
             print("\n" + "=" * 10 + "\n")
-
-        # Only try to extract if r1_extract_xml_answer is defined
         if "r1_extract_xml_answer" in globals():
             print(
                 f"\n🔍 Extracted Answer:\n{r1_extract_xml_answer(all_completion_texts[-1])}"
@@ -657,11 +638,13 @@ def train_grpo(
         "grouped_rewards_mean": 0,
         "grouped_rewards_std": 0,
         "kl": 0,
+        'average_generated_tokens': 0
     }
     for reward_func in reward_funcs:
         func_name = reward_func.__name__
         accumulated_metrics[f"{func_name}_mean"] = 0
         accumulated_metrics[f"{func_name}_std"] = 0
+        accumulated_metrics[f"{func_name}_coverage"] = 0
 
     start = time.perf_counter()
     for it, batch in zip(
@@ -700,6 +683,7 @@ def train_grpo(
                     f"Val total_rewards_std {val_metrics['total_rewards_std']:.3f}, "
                     f"Val grouped_rewards_mean {val_metrics['grouped_rewards_mean']:.3f}, "
                     f"Val grouped_rewards_std {val_metrics['grouped_rewards_std']:.3f}, "
+                    f"Val Average Generated Tokens {val_metrics['average_generated_tokens']}, "
                     f"Val kl {val_metrics['kl']:.3f}"
                 )
 
@@ -755,19 +739,20 @@ def train_grpo(
 
             if rank == 0:
                 train_metrics_str = (
-                    f"Train loss {train_loss:.3f}, "
-                    f"Total rewards mean {avg_metrics['total_rewards_mean']:.3f}, "
-                    f"Total rewards std {avg_metrics['total_rewards_std']:.3f}, "
-                    f"Grouped rewards mean {avg_metrics['grouped_rewards_mean']:.3f}, "
-                    f"Grouped rewards std {avg_metrics['grouped_rewards_std']:.3f}, "
-                    f"KL {avg_metrics['kl']:.3f}"
+                    f"Train loss {float(train_loss):.3f}, "
+                    f"Total rewards mean {float(avg_metrics['total_rewards_mean']):.3f}, "
+                    f"Total rewards std {float(avg_metrics['total_rewards_std']):.3f}, "
+                    f"Grouped rewards mean {float(avg_metrics['grouped_rewards_mean']):.3f}, "
+                    f"Grouped rewards std {float(avg_metrics['grouped_rewards_std']):.3f}, "
+                    f"Average Generated Tokens {float(avg_metrics['average_generated_tokens'])}, "
+                    f"KL {float(avg_metrics['kl']):.3f}"
                 )
 
                 for i, reward_func in enumerate(reward_funcs):
                     func_name = reward_func.__name__
                     train_metrics_str += (
-                        f", {func_name} mean {avg_metrics[f'{func_name}_mean']:.3f}, "
-                        f"{func_name} std {avg_metrics[f'{func_name}_std']:.3f}"
+                        f", {func_name} mean {float(avg_metrics[f'{func_name}_mean']):.3f}, "
+                        f"{func_name} std {float(avg_metrics[f'{func_name}_std']):.3f}"
                     )
 
                 print(
