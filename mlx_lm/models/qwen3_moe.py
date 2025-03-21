@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -20,6 +20,9 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     num_experts_per_tok: int
     num_experts: int
+    num_experts_per_tok: int
+    decoder_sparse_step: int
+    mlp_only_layers: List[int]
     moe_intermediate_size: int
     shared_expert_intermediate_size: int
     rms_norm_eps: float
@@ -45,7 +48,7 @@ class ModelArgs(BaseModelArgs):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
 
         dim = args.hidden_size
@@ -56,9 +59,9 @@ class Attention(nn.Module):
         head_dim = args.hidden_size // n_heads if not args.head_dim else args.head_dim
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
@@ -93,9 +96,6 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[..., -keys.shape[-2] :]
-
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
@@ -119,16 +119,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         super().__init__()
         dim = args.hidden_size
         intermediate_size = args.moe_intermediate_size
-        shared_expert_intermediate_size = args.shared_expert_intermediate_size
 
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
-
-        self.shared_expert = MLP(dim, shared_expert_intermediate_size)
-        self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
     def __call__(
         self,
@@ -144,26 +140,27 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
-        shared_expert_output = self.shared_expert(x)
-        shared_expert_output = (
-            mx.sigmoid(self.shared_expert_gate(x)) * shared_expert_output
-        )
-
-        return y + shared_expert_output
+        return y
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = Qwen3MoeSparseMoeBlock(args)
+        self.self_attn = Attention(args, layer_idx)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
+
+        if (layer_idx not in args.mlp_only_layers) and (
+            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(args)
+        else:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -187,7 +184,8 @@ class Qwen3MoeModel(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen3MoeDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            Qwen3MoeDecoderLayer(args=args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
