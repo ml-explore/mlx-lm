@@ -147,7 +147,7 @@ class Qwen2Model(nn.Module):
         h = self.embed_tokens(inputs)
 
         if mask is None:
-            mask = create_attention_mask(h, cache, True)
+            mask = create_attention_mask(h=h, cache=cache, sliding_window=self.args.sliding_window, return_array=True)
 
         if cache is None:
             cache = [None] * len(self.layers)
