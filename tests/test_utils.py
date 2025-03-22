@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_lm import utils
+from mlx_lm import convert, utils
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
@@ -77,14 +77,14 @@ class TestUtils(unittest.TestCase):
     def test_convert(self):
         mlx_path = os.path.join(self.test_dir, "mlx_model")
 
-        utils.convert(HF_MODEL_PATH, mlx_path=mlx_path, quantize=True)
+        convert(HF_MODEL_PATH, mlx_path=mlx_path, quantize=True)
         model, _ = utils.load(mlx_path)
         self.assertTrue(isinstance(model.layers[0].mlp.up_proj, nn.QuantizedLinear))
         self.assertTrue(isinstance(model.layers[-1].mlp.up_proj, nn.QuantizedLinear))
 
         # Check model weights have right type
         mlx_path = os.path.join(self.test_dir, "mlx_model_bf16")
-        utils.convert(HF_MODEL_PATH, mlx_path=mlx_path, dtype="bfloat16")
+        convert(HF_MODEL_PATH, mlx_path=mlx_path, dtype="bfloat16")
         model, _ = utils.load(mlx_path)
 
         self.assertEqual(model.layers[0].mlp.up_proj.weight.dtype, mx.bfloat16)

@@ -4,12 +4,12 @@ import argparse
 import json
 import logging
 import platform
+import socket
 import time
 import uuid
 import warnings
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import socket
 from pathlib import Path
 from typing import (
     Any,
@@ -27,9 +27,10 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load, stream_generate
+from .utils import load
 
 
 def get_system_fingerprint():
