@@ -193,9 +193,9 @@ def main():
     convert(**vars(args))
 
 
-# if __name__ == "__main__":
-#    print(
-#        "Calling `python -m mlx_lm.convert ...` directly is deprecated."
-#        " Use `mlx_lm.convert ...` or `python -m mlx_lm convert ...` instead."
-#    )
-#    main()
+if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.convert ...` directly is deprecated."
+        " Use `mlx_lm.convert ...` or `python -m mlx_lm convert ...` instead."
+    )
+    main()
