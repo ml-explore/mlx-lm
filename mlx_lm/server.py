@@ -4,12 +4,12 @@ import argparse
 import json
 import logging
 import platform
+import socket
 import time
 import uuid
 import warnings
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import socket
 from pathlib import Path
 from typing import (
     Any,
