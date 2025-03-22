@@ -20,13 +20,12 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
-    sliding_window: int
     max_position_embeddings: int = 32768
     rope_theta: float = 1000000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    head_dim: Optional[int] = None
     tie_word_embeddings: bool = True
-    use_sliding_window: bool = True
 
 
 class Attention(nn.Module):
@@ -37,19 +36,19 @@ class Attention(nn.Module):
         self.n_heads = n_heads = args.num_attention_heads
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.use_sliding_window = args.use_sliding_window
-        self.sliding_window = args.sliding_window
 
-        self.head_dim = args.hidden_size // n_heads
-        self.scale = self.head_dim**-0.5
+        head_dim = args.hidden_size // n_heads if not args.head_dim else args.head_dim
+        self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
+        self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.rope = initialize_rope(
-            self.head_dim,
+            head_dim,
             base=args.rope_theta,
             traditional=args.rope_traditional,
             scaling_config=args.rope_scaling,
@@ -67,8 +66,8 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
@@ -79,10 +78,11 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        sliding_window = None if self.use_sliding_window == False else self.sliding_window
+        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
+            mask = mask[..., -keys.shape[-2] :]
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask, sliding_window=sliding_window
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -125,7 +125,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Qwen2Model(nn.Module):
+class Qwen3Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -147,7 +147,7 @@ class Qwen2Model(nn.Module):
         h = self.embed_tokens(inputs)
 
         if mask is None:
-            mask = create_attention_mask(h=h, cache=cache, sliding_window=self.args.sliding_window, return_array=True)
+            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -163,7 +163,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen2Model(args)
+        self.model = Qwen3Model(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 

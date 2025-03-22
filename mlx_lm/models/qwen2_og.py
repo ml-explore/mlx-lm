@@ -20,13 +20,11 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
-    sliding_window: int
     max_position_embeddings: int = 32768
     rope_theta: float = 1000000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
-    use_sliding_window: bool = True
 
 
 class Attention(nn.Module):
@@ -37,19 +35,17 @@ class Attention(nn.Module):
         self.n_heads = n_heads = args.num_attention_heads
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.use_sliding_window = args.use_sliding_window
-        self.sliding_window = args.sliding_window
 
-        self.head_dim = args.hidden_size // n_heads
-        self.scale = self.head_dim**-0.5
+        head_dim = args.hidden_size // n_heads
+        self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.rope = initialize_rope(
-            self.head_dim,
+            head_dim,
             base=args.rope_theta,
             traditional=args.rope_traditional,
             scaling_config=args.rope_scaling,
@@ -79,10 +75,8 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        sliding_window = None if self.use_sliding_window == False else self.sliding_window
-
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask, sliding_window=sliding_window
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -147,7 +141,7 @@ class Qwen2Model(nn.Module):
         h = self.embed_tokens(inputs)
 
         if mask is None:
-            mask = create_attention_mask(h=h, cache=cache, sliding_window=self.args.sliding_window, return_array=True)
+            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
