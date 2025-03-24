@@ -141,7 +141,14 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
-def sliding_window_attention(queries, keys, values, scale: float, mask=None, sliding_window=512):
+def sliding_window_attention(
+    queries: mx.array,
+    keys: tuple[mx.array, mx.array, mx.array],
+    values: tuple[mx.array, mx.array, mx.array],
+    scale: float,
+    mask: Optional[mx.array],
+    sliding_window: int = 512
+):
     """
     Computes sliding window self-attention in MLX.
 
@@ -189,11 +196,11 @@ def sliding_window_attention(queries, keys, values, scale: float, mask=None, sli
 
 
 def quantized_sliding_window_attention(
-    queries,
-    keys,
-    values,
+    queries: mx.array,
+    keys: tuple[mx.array, mx.array, mx.array],
+    values: tuple[mx.array, mx.array, mx.array],
     scale: float,
-    mask=None,
+    mask: Optional[mx.array],
     sliding_window: int = 512,
     group_size: int = 64,
     bits: int = 8
