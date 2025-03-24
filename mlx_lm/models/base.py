@@ -141,7 +141,7 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
-def sliding_window_attention(queries, keys, values, scale: int, mask=None, sliding_window=512):
+def sliding_window_attention(queries, keys, values, scale: float, mask=None, sliding_window=512):
     """
     Computes sliding window self-attention in MLX.
 
@@ -188,7 +188,16 @@ def sliding_window_attention(queries, keys, values, scale: int, mask=None, slidi
     return attn_output
 
 
-def quantized_sliding_window_attention(queries, keys, values, scale: int, mask=None, sliding_window=512):
+def quantized_sliding_window_attention(
+    queries,
+    keys,
+    values,
+    scale: float,
+    mask=None,
+    sliding_window: int = 512,
+    group_size: int = 64,
+    bits: int = 8
+):
     B, Hq, L, D = queries.shape
     Hkv = keys.shape[1]  # Number of KV heads
 
@@ -228,7 +237,7 @@ def quantized_sliding_window_attention(queries, keys, values, scale: int, mask=N
     attn_flat = mx.reshape(attn_weights, (B * Hq, L, L))
     
     # Compute attention outputs using quantized matmul
-    output = mx.quantized_matmul(attn_flat, v_flat)
+    output = mx.quantized_matmul(attn_flat, v_flat, transpose=False, group_size=group_size, bits=bits)
     output = mx.reshape(output, (B, Hq, L, D))
     
     return output
