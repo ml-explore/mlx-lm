@@ -37,7 +37,9 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = getattr(args, "head_dim", args.hidden_size // args.num_attention_heads)
+        head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -66,8 +68,12 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
-        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
