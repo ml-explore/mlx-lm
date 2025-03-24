@@ -8,5 +8,5 @@ with a short description of your contribution(s) below. For example:
 MLX LM was developed with contributions from the following individuals:
 
 - Shunta Saito: Added support for PLaMo models.
-- Prince Canuma: Helped add support for `Starcoder2` models.
+- Prince Canuma: Helped add support for `Starcoder2`, `Qwen3`, and `Qwen3MoE` models.
 - Gökdeniz Gülmez: Added support for the following architectures: OpenBMB's `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's`Mamba v1`, and Allenai's `OLMoE`; Added support for the following training algorithms: `full-fine-tuning`; Added support for the following algorythms: `Sliding Window Attention`.
