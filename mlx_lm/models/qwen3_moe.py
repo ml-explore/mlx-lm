@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -33,6 +34,8 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
+    max_position_embeddings: int = 4096
+    norm_topk_prob: bool = True
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -56,7 +59,7 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads if not args.head_dim else args.head_dim
+        head_dim = getattr(args, "head_dim", args.hidden_size // args.num_attention_heads)
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -122,6 +125,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
+        self.norm_topk_prob = args.norm_topk_prob
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
@@ -136,6 +140,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         k = self.top_k
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores /= mx.sum(scores, axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
