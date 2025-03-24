@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from base import BaseModelArgs, sliding_window_attention_mlx, create_attention_mask
+from base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask
 from rope_utils import initialize_rope
 
 
@@ -74,8 +74,8 @@ class Attention(nn.Module):
 
         sliding_window = None if self.use_sliding_window == False else self.sliding_window
 
-        output = sliding_window_attention_mlx(
-            queries, keys, values, mask=mask, window_size=sliding_window, scale=self.scale
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=None, mask=mask, sliding_window=sliding_window, scale=self.scale
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)

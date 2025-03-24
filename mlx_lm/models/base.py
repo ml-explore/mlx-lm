@@ -141,7 +141,7 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
-def sliding_window_attention_mlx(q, k, v, scale: int, mask=None, window_size=512):
+def sliding_window_attention(queries, keys, values, scale: int, mask=None, sliding_window=512):
     """
     Computes sliding window self-attention in MLX.
 
@@ -157,21 +157,23 @@ def sliding_window_attention_mlx(q, k, v, scale: int, mask=None, window_size=512
     Returns:
         attn_output: Tensor of shape (B, Hq, L, D)
     """
-    B, Hq, L, D = q.shape
-    Hkv = k.shape[1]  # Number of KV heads
+    B, Hq, L, D = queries.shape
+    Hkv = keys.shape[1]  # Number of KV heads
+
+    queries *= scale
 
     # If using GQA (Hq > Hkv), expand KV heads
     if Hq != Hkv:
         factor = Hq // Hkv
-        k = mx.repeat(k, factor, axis=1)  # (B, Hq, L, D)
-        v = mx.repeat(v, factor, axis=1)  # (B, Hq, L, D)
+        keys = mx.repeat(keys, factor, axis=1)  # (B, Hq, L, D)
+        values = mx.repeat(values, factor, axis=1)  # (B, Hq, L, D)
 
     # Compute scaled dot-product attention
-    scores = mx.einsum('bhid,bhjd->bhij', q, k) * scale
+    scores = mx.einsum('bhid,bhjd->bhij', queries, keys)
 
     # Apply sliding window mask
     idx = mx.arange(L)
-    local_mask = mx.abs(idx[:, None] - idx[None, :]) > window_size
+    local_mask = mx.abs(idx[:, None] - idx[None, :]) > sliding_window
     scores = mx.where(local_mask[None, None, :, :], -mx.inf, scores)
 
     # Apply causal mask if provided
@@ -182,9 +184,54 @@ def sliding_window_attention_mlx(q, k, v, scale: int, mask=None, window_size=512
     attn_weights = mx.softmax(scores, axis=-1)
 
     # Compute attention output
-    attn_output = mx.einsum('bhij,bhjd->bhid', attn_weights, v)
-    
+    attn_output = mx.einsum('bhij,bhjd->bhid', attn_weights, values)
     return attn_output
+
+
+def quantized_sliding_window_attention(queries, keys, values, scale: int, mask=None, sliding_window=512):
+    B, Hq, L, D = queries.shape
+    Hkv = keys.shape[1]  # Number of KV heads
+
+    queries *= scale
+
+    # If using GQA (Hq > Hkv), expand KV heads
+    if Hq != Hkv:
+        factor = Hq // Hkv
+        keys = mx.repeat(keys, factor, axis=1)  # (B, Hq, L, D)
+        values = mx.repeat(values, factor, axis=1)  # (B, Hq, L, D)
+
+    # Reshape for quantized matmul
+    q_flat = mx.reshape(queries, (B * Hq, L, D))
+    k_flat = mx.reshape(keys, (B * Hq, L, D))
+    v_flat = mx.reshape(values, (B * Hq, L, D))
+    
+    # Transpose k for matrix multiplication
+    k_flat_t = mx.transpose(k_flat, (0, 2, 1))  # (B*Hq, D, L)
+    
+    # QK attention using quantized matmul
+    scores = mx.quantized_matmul(q_flat, k_flat_t)
+    scores = mx.reshape(scores, (B, Hq, L, L))
+    
+    # Apply sliding window mask
+    idx = mx.arange(L)
+    local_mask = mx.abs(idx[:, None] - idx[None, :]) > sliding_window
+    scores = mx.where(local_mask[None, None, :, :], -mx.inf, scores)
+
+    # Apply causal mask if provided
+    if mask is not None:
+        scores += mask
+
+    # Compute attention weights
+    attn_weights = mx.softmax(scores, axis=-1)  # (B, Hq, L, L)
+    
+    # Reshape attention weights for second matmul
+    attn_flat = mx.reshape(attn_weights, (B * Hq, L, L))
+    
+    # Compute attention outputs using quantized matmul
+    output = mx.quantized_matmul(attn_flat, v_flat)
+    output = mx.reshape(output, (B, Hq, L, D))
+    
+    return output
 
 
 def scaled_dot_product_attention(
@@ -197,18 +244,23 @@ def scaled_dot_product_attention(
     sliding_window: Optional[int] = None
 ) -> mx.array:
     if isinstance(cache, QuantizedKVCache):
-        return quantized_scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=scale,
-            mask=mask,
-            group_size=cache.group_size,
-            bits=cache.bits,
-        )
+        if sliding_window is not None:
+            return quantized_sliding_window_attention(
+                queries=queries, keys=keys, values=values, scale=scale, mask=mask, sliding_window=sliding_window
+            )
+        else:
+            return quantized_scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=scale,
+                mask=mask,
+                group_size=cache.group_size,
+                bits=cache.bits,
+            )
     else:
         if sliding_window is not None:
-            return sliding_window_attention_mlx(
+            return sliding_window_attention(
                 queries=queries, keys=keys, values=values, scale=scale, mask=mask, sliding_window=sliding_window
             )
         else:
