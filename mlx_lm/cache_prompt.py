@@ -7,8 +7,9 @@ import time
 
 import mlx.core as mx
 
+from .generate import generate_step
 from .models.cache import make_prompt_cache, save_prompt_cache
-from .utils import generate_step, load
+from .utils import load
 
 DEFAULT_QUANTIZED_KV_START = 5000
 
