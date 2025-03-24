@@ -4,11 +4,11 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import math
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_map
 
-from .cache import QuantizedKVCache
+from cache import QuantizedKVCache
 
 
 @dataclass
@@ -210,101 +210,51 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
-def _chunk_bshd(hidden_states, window_overlap):
+def sliding_window_attention_mlx(q, k, v, mask=None, window_size=512):
     """
-    Chunks input tensor of shape [B, H, L, D] into overlapping chunks.
-    Returns [B, H, n_chunks, chunk_size, D].
+    Computes sliding window self-attention in MLX.
+
+    Supports both Multi-Head Attention (MHA) and Grouped Query Attention (GQA).
+
+    Args:
+        q: Query tensor of shape (B, Hq, L, D)
+        k: Key tensor of shape (B, Hkv, L, D)
+        v: Value tensor of shape (B, Hkv, L, D)
+        mask: Optional causal mask of shape (B, L)
+        window_size: The local attention window size.
+
+    Returns:
+        attn_output: Tensor of shape (B, Hq, L, D)
     """
-    B, H, L, D = hidden_states.shape
-    chunk_size = window_overlap * 2
-    step = window_overlap
-    n_chunks = max((L - window_overlap + step - 1) // step, 1)
-    chunks = mx.zeros((B, H, n_chunks, chunk_size, D), dtype=hidden_states.dtype)
-    for i in range(n_chunks):
-        start = i * step
-        end = min(start + chunk_size, L)
-        actual_chunk_len = end - start
-        chunks[:, :, i, :actual_chunk_len, :] = hidden_states[:, :, start:end, :]
-    return chunks
+    B, Hq, L, D = q.shape
+    Hkv = k.shape[1]  # Number of KV heads
 
+    # If using GQA (Hq > Hkv), expand KV heads
+    if Hq != Hkv:
+        factor = Hq // Hkv
+        k = mx.repeat(k, factor, axis=1)  # (B, Hq, L, D)
+        v = mx.repeat(v, factor, axis=1)  # (B, Hq, L, D)
 
-def sliding_window_scaled_dot_product_attention(
-        queries: mx.array,
-        keys: mx.array,
-        values: mx.array,
-        scale: Optional[float],
-        mask: Optional[mx.array],
-        sliding_window: int,
-        cache: Optional[Any] = None):
-    """
-    Sliding window attention implementation for mlx arrays.
+    # Compute scaled dot-product attention
+    scale = mx.rsqrt(mx.array(D, dtype=mx.float32))  # Equivalent to 1 / sqrt(D)
+    scores = mx.einsum('bhid,bhjd->bhij', q, k) * scale
 
-    Inputs:
-      queries: [B, num_heads, seq_len, head_dim]
-      keys: [B, num_kv_heads, seq_len, head_dim]
-      values: [B, num_kv_heads, seq_len, head_dim]
-      mask: [B, seq_len] or None
-    """
-    B, num_heads, seq_len, head_dim = queries.shape
-    _, num_kv_heads, _, _ = keys.shape
+    # Apply sliding window mask
+    idx = mx.arange(L)
+    local_mask = mx.abs(idx[:, None] - idx[None, :]) > window_size
+    scores = mx.where(local_mask[None, None, :, :], -mx.inf, scores)
 
-    if scale is None:
-        scale = 1 / math.sqrt(head_dim)
-
-    # Adjust sliding window size and overlap
-    sliding_window = min(sliding_window, seq_len)
-    if sliding_window % 2 == 0:
-        sliding_window += 1
-    window_overlap = sliding_window // 2
-    chunk_size = window_overlap * 2
-
-    # Chunk q,k,v
-    query_chunks = _chunk_bshd(queries, window_overlap)  # [B,H,n_chunks,chunk,dim]
-    key_chunks = _chunk_bshd(keys, window_overlap)       # [B,H_kv,n_chunks,chunk,dim]
-    value_chunks = _chunk_bshd(values, window_overlap)   # [B,H_kv,n_chunks,chunk,dim]
-
-    # Handle num_heads != num_kv_heads case:
-    if num_heads != num_kv_heads:
-        assert num_heads % num_kv_heads == 0
-        repeat_factor = num_heads // num_kv_heads
-        key_chunks = mx.repeat(key_chunks, repeats=repeat_factor, axis=1)
-        value_chunks = mx.repeat(value_chunks, repeats=repeat_factor, axis=1)
-
-    # Scaled attention scores
-    query_chunks_scaled = query_chunks * scale
-    attention_scores = mx.einsum("bhcqd,bhckd->bhcqk", query_chunks_scaled, key_chunks)
-
-    # Apply mask if provided
+    # Apply causal mask if provided
     if mask is not None:
-        if mask.ndim == 2:
-            mask = mask[:, None, :, None]  # (B,1,seq_len,1) broadcastable
-        mask_chunks = _chunk_bshd(mask, window_overlap)  # [B,1,n_chunks,chunk,1]
-        attention_scores += mask_chunks
+        scores = mx.where(mask[:, None, None, :], -mx.inf, scores)
 
-    attention_probs = mx.softmax(attention_scores, axis=-1)
+    # Compute attention weights
+    attn_weights = mx.softmax(scores, axis=-1)
+
+    # Compute attention output
+    attn_output = mx.einsum('bhij,bhjd->bhid', attn_weights, v)
     
-    # Compute attention outputs
-    attention_output = mx.einsum("bhcqk,bhckd->bhcqd", attention_probs, value_chunks) # [B,H,n_chunks,chunk,D]
-
-    # Initialize recombined output tensor and count tensor for averaging overlap
-    output = mx.zeros((B, num_heads, seq_len, head_dim), dtype=queries.dtype)
-    counts = mx.zeros((seq_len,), dtype=mx.float32)
-
-    n_chunks = attention_output.shape[2]
-    for i in range(n_chunks):
-        start_idx = i * window_overlap
-        end_idx = min(start_idx + chunk_size, seq_len)
-        actual_chunk_len = end_idx - start_idx
-
-        # Accumulate and average overlapping chunks
-        output[:, :, start_idx:end_idx, :] += attention_output[:, :, i, :actual_chunk_len, :]
-        counts[start_idx:end_idx] += 1.0
-
-    # Avoid division by zero, normalize overlaps
-    counts = mx.maximum(counts, 1.0)
-    output /= counts.reshape(1, 1, -1, 1)
-
-    return output
+    return attn_output
 
 
 def scaled_dot_product_attention(
@@ -328,7 +278,7 @@ def scaled_dot_product_attention(
         )
     else:
         if sliding_window is not None:
-            return sliding_window_scaled_dot_product_attention(
+            return sliding_window_attention_mlx(
                 queries=queries, keys=keys, values=values, scale=scale, mask=mask, sliding_window=sliding_window
             )
         else:
