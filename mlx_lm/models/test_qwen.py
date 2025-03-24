@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from base import BaseModelArgs, sliding_window_attention_mlx
+from base import BaseModelArgs, sliding_window_attention_mlx, create_attention_mask
 from rope_utils import initialize_rope
 
 
@@ -75,8 +75,9 @@ class Attention(nn.Module):
         sliding_window = None if self.use_sliding_window == False else self.sliding_window
 
         output = sliding_window_attention_mlx(
-            queries, keys, values, mask=mask, window_size=sliding_window
+            queries, keys, values, mask=mask, window_size=sliding_window, scale=self.scale
         )
+        print(output.shape)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -98,27 +99,14 @@ args = ModelArgs(
 
 attention = Attention(args)
 
-def create_attention_mask(seq_len: int, sliding_window: int) -> mx.array:
-    """
-    Creates a binary attention mask for sliding window attention.
-    
-    Args:
-        seq_len (int): Sequence length.
-        sliding_window (int): Window size for local attention.
-        
-    Returns:
-        mx.array: Attention mask of shape (1, 1, seq_len, seq_len), where True = masked.
-    """
-    idx = mx.arange(seq_len)
-    mask = mx.abs(idx[:, None] - idx[None, :]) > sliding_window
-    return mask[None, None, :, :]  # Shape (1, 1, seq_len, seq_len)
-
 # Create input for the attention module
 x = mx.random.normal((batch_size, seq_len, hidden_dim))
 
 B, L, D = x.shape
 
-attn_mask = create_attention_mask(seq_len=L, sliding_window=12)
+attn_mask = create_attention_mask(x, cache=None, return_array=True, sliding_window=12)
+
+print(attn_mask.shape)
 
 # Call the attention module
 output_module = attention(x, mask=attn_mask)

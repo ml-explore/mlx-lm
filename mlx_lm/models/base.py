@@ -71,9 +71,6 @@ def create_sliding_window_mask(
         padding_mask = expanded_col_indices < lengths
         # Expand mask to [B, seq_len, seq_len]
         mask = mask[None, :, :] & padding_mask
-    
-    print(mask.shape)
-    
     return mask
 
 
@@ -94,51 +91,6 @@ def create_causal_mask(
         lengths = lengths[:, None, None, None]
         mask = mask & (rinds < lengths)
     return mask
-
-
-def create_sliding_window_causal_mask(seq_len: int, window_size: int, batch_size: int = 1):
-    """
-    Creates a causal mask with sliding window attention for transformer models.
-    
-    Args:
-        seq_len: Length of the sequence
-        window_size: Size of the attention window (will be made odd if even)
-        batch_size: Batch size
-        
-    Returns:
-        A mask tensor of shape [batch_size, 1, seq_len, seq_len] where:
-        - 0.0 means a token can attend to another token
-        - -inf (or a large negative value) means a token cannot attend to another token
-    """
-    # Ensure window size is odd
-    if window_size % 2 == 0:
-        window_size += 1
-    
-    # Create a causal mask (upper triangular)
-    indices = mx.arange(seq_len)
-    causal_mask = indices[:, None] < indices[None, :]  # Shape: [seq_len, seq_len]
-    
-    # Create a window mask to limit attention to nearby tokens
-    window_mask = mx.abs(indices[:, None] - indices[None, :]) > window_size // 2
-    
-    # Combine masks: a position is masked (True) if it's in the future OR outside the window
-    combined_mask = causal_mask | window_mask
-    
-    # Convert boolean mask to float mask (-inf for masked positions, 0 for unmasked)
-    float_mask = mx.zeros((seq_len, seq_len), dtype=mx.float32)
-    # Use large negative value for masked positions
-    neg_inf = mx.array(-1e9, dtype=mx.float32)
-    float_mask = mx.where(combined_mask, neg_inf, float_mask)
-    
-    # Reshape to [1, 1, seq_len, seq_len]
-    float_mask = mx.expand_dims(float_mask, axis=0)
-    float_mask = mx.expand_dims(float_mask, axis=0)
-    
-    # Expand for batch dimension if needed
-    if batch_size > 1:
-        float_mask = mx.broadcast_to(float_mask, (batch_size, 1, seq_len, seq_len))
-    
-    return float_mask
 
 
 def create_attention_mask(
@@ -163,7 +115,7 @@ def create_attention_mask(
         
         if return_array or sliding_window is not None:
             if sliding_window is not None:
-                return create_sliding_window_causal_mask(T, sliding_window)
+                return create_sliding_window_mask(T, sliding_window)
             else:
                 return create_causal_mask(T, offset, window_size=window_size)
         else:
@@ -210,7 +162,7 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
-def sliding_window_attention_mlx(q, k, v, mask=None, window_size=512):
+def sliding_window_attention_mlx(q, k, v, scale: int, mask=None, window_size=512):
     """
     Computes sliding window self-attention in MLX.
 
@@ -236,7 +188,6 @@ def sliding_window_attention_mlx(q, k, v, mask=None, window_size=512):
         v = mx.repeat(v, factor, axis=1)  # (B, Hq, L, D)
 
     # Compute scaled dot-product attention
-    scale = mx.rsqrt(mx.array(D, dtype=mx.float32))  # Equivalent to 1 / sqrt(D)
     scores = mx.einsum('bhid,bhjd->bhij', q, k) * scale
 
     # Apply sliding window mask
@@ -246,7 +197,7 @@ def sliding_window_attention_mlx(q, k, v, mask=None, window_size=512):
 
     # Apply causal mask if provided
     if mask is not None:
-        scores = mx.where(mask[:, None, None, :], -mx.inf, scores)
+        scores += mask
 
     # Compute attention weights
     attn_weights = mx.softmax(scores, axis=-1)
