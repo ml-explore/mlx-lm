@@ -28,38 +28,17 @@ def create_sliding_window_mask(
     seq_len: int,
     sliding_window: int,
     offset: int = 0,
-    lengths: Optional[mx.array] = None,
+    lengths: Optional[mx.array] = None
 ):
-    """
-    Creates a causal mask with sliding window constraint.
-    
-    Args:
-        seq_len: Length of the sequence
-        sliding_window: Size of the sliding window
-        offset: Offset for the sequence (for caching)
-        lengths: Optional tensor of sequence lengths for padding mask
-        
-    Returns:
-        A boolean mask of shape [seq_len, seq_len] or [B, seq_len, seq_len] if lengths provided
-    """
-    # Ensure sliding window is odd
     if sliding_window % 2 == 0:
         sliding_window += 1
-    
-    # Create position indices
-    row_indices = mx.arange(offset, offset + seq_len)[:, None]  # [seq_len, 1]
-    col_indices = mx.arange(offset + seq_len)[None, :]         # [1, seq_len]
-    
-    # Causal mask: can only attend to positions up to current position
+
+    row_indices = mx.arange(offset, offset + seq_len)[:, None]
+    col_indices = mx.arange(offset + seq_len)[None, :]
+
     causal_mask = row_indices >= col_indices
-    
-    # Window constraint: can only attend to positions within sliding window
     window_mask = row_indices >= (col_indices - sliding_window + 1)
-    
-    # Combine masks: must satisfy both causal and window constraints
     mask = causal_mask & window_mask
-    
-    # Apply sequence length mask if provided
     if lengths is not None:
         # lengths: [B]
         batch_size = lengths.shape[0]

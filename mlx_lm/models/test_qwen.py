@@ -77,7 +77,6 @@ class Attention(nn.Module):
         output = sliding_window_attention_mlx(
             queries, keys, values, mask=mask, window_size=sliding_window, scale=self.scale
         )
-        print(output.shape)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
