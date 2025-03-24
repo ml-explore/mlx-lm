@@ -83,15 +83,22 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        if self.use_sliding_window and mask is not None:
+        if self.use_sliding_window and isinstance(mask, mx.array):
             key_len = keys.shape[-2]
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 
+        # TODO: maybe remove cast once fused mask is supported since attention
+        # may be in higher precision
+        sdpa_type = mx.float32 if queries.dtype == mx.float16 else queries.dtype
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-
+            queries.astype(sdpa_type),
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        ).astype(queries.dtype)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -126,9 +133,11 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
+
         h = self.input_layernorm(x)
         attn_h = self.self_attn(h, mask, cache)
         ff_h = self.mlp(h)
+
         return attn_h + ff_h + x
 
 
@@ -161,10 +170,22 @@ class CohereModel(nn.Module):
 
         if mask is None:
             j = self.args.sliding_window_pattern
-            mask = create_attention_mask(h, cache[j - 1 : j])
+            full_mask = create_attention_mask(h, cache[j - 1 : j])
+            sliding_window_mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            is_global = (
+                i % self.args.sliding_window_pattern
+                == self.args.sliding_window_pattern - 1
+            )
+
+            local_mask = mask
+            if mask is None and is_global:
+                local_mask = full_mask
+            elif mask is None:
+                local_mask = sliding_window_mask
+
+            h = layer(h, local_mask, c)
 
         return self.norm(h)
 

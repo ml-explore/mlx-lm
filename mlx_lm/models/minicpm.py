@@ -1,11 +1,10 @@
 # Copyright © 2023-2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
@@ -138,9 +137,9 @@ class DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r * (self.scale_depth / np.sqrt(self.num_hidden_layers))
+        h = x + r * (self.scale_depth / self.num_hidden_layers**0.5)
         r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r * (self.scale_depth / np.sqrt(self.num_hidden_layers))
+        out = h + r * (self.scale_depth / self.num_hidden_layers**0.5)
         return out
 
 

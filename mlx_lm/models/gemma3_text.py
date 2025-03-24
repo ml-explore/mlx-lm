@@ -86,7 +86,7 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         # Sliding window
-        if mask is not None and mask.shape[-1] != keys.shape[-2]:
+        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
             mask = mask[..., -keys.shape[-2] :]
 
         output = mx.fast.scaled_dot_product_attention(
@@ -179,17 +179,18 @@ class Gemma3Model(nn.Module):
             sliding_window_mask = create_attention_mask(h, cache)
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
-            is_sliding = (
+            is_global = (
                 i % self.args.sliding_window_pattern
                 == self.args.sliding_window_pattern - 1
             )
 
-            if mask is None and is_sliding:
-                mask = sliding_window_mask
+            local_mask = mask
+            if mask is None and is_global:
+                local_mask = full_mask
             elif mask is None:
-                mask = full_mask
+                local_mask = sliding_window_mask
 
-            h = layer(h, mask, c)
+            h = layer(h, local_mask, c)
 
         return self.norm(h)
 

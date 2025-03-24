@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import platform
+import socket
 import time
 import uuid
 import warnings
@@ -26,9 +27,10 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .models.cache import make_prompt_cache
+from .generate import stream_generate
+from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load, stream_generate
+from .utils import load
 
 
 def get_system_fingerprint():
@@ -452,14 +454,30 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def get_prompt_cache(self, prompt):
         cache_len = len(self.prompt_cache.tokens)
+        prompt_len = len(prompt)
+        prefix_len = min(cache_len, prompt_len)
         if (
             self.prompt_cache.model_key != self.model_provider.model_key
-            or cache_len >= len(prompt)
-            or self.prompt_cache.tokens != prompt[:cache_len]
+            or prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
         ):
             self.prompt_cache.model_key = self.model_provider.model_key
             self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+            self.prompt_cache.tokens = []
+        elif cache_len >= prompt_len:
+            # Trim the cache if it contains the prompt as a prefix. This case
+            # is useful for reusing the cache for multiple queries with a long
+            # prompt
+            if can_trim_prompt_cache(self.prompt_cache.cache):
+                num_to_trim = cache_len - prompt_len + 1
+                trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
+                self.prompt_cache.tokens = self.prompt_cache.tokens[:-num_to_trim]
+                prompt = prompt[-1:]
+            else:
+                self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+                self.prompt_cache.tokens = []
         else:
+            # Trim the prompt if it contains the cache as a prefix. This case
+            # is to avoid recomputing the cache in multi-turn chats.
             prompt = prompt[cache_len:]
         self.prompt_cache.tokens.extend(prompt)
         return prompt
@@ -694,6 +712,10 @@ def run(
 ):
     server_address = (host, port)
     prompt_cache = PromptCache()
+    infos = socket.getaddrinfo(
+        *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )
+    server_class.address_family, _, _, _, server_address = next(iter(infos))
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(

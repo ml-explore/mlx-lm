@@ -20,7 +20,7 @@ class SuScaledRotaryEmbedding(nn.Module):
         long_mscale: float = None,
     ):
         """
-        Phi3Su Scaled Rotary Embedding layer for Phi-3 models.
+        Su Scaled Rotary Embedding layer.
 
         Args:
             dims (int): The feature dimensions to be rotated.
