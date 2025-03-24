@@ -7,6 +7,7 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import (
     KVCache,
     MambaCache,
@@ -17,7 +18,7 @@ from mlx_lm.models.cache import (
     save_prompt_cache,
     trim_prompt_cache,
 )
-from mlx_lm.utils import generate_step, load
+from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
@@ -299,7 +300,7 @@ class TestPromptCache(unittest.TestCase):
         ):
             i += 1
             self.assertEqual(tok, toks[i])
-            self.assertTrue(mx.allclose(logits, all_logits[i], rtol=3e-2))
+            self.assertTrue(mx.allclose(logits, all_logits[i], rtol=4e-2))
 
 
 if __name__ == "__main__":

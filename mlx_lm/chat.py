@@ -5,9 +5,10 @@ import json
 
 import mlx.core as mx
 
+from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
-from .utils import load, stream_generate
+from .utils import load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
