@@ -172,7 +172,7 @@ class GemmaModel(nn.Module):
         h = h * (self.args.hidden_size**0.5)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(h, cache, return_array=True)
 
         if cache is None:
             cache = [None] * len(self.layers)

@@ -3,14 +3,13 @@
 import unittest
 from typing import List
 
-from mlx_lm.sample_utils import make_logits_processors
-from mlx_lm.utils import (
+from mlx_lm.generate import (
     GenerationResponse,
     generate,
-    load,
-    make_sampler,
     stream_generate,
 )
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.utils import load
 
 
 class TestGenerate(unittest.TestCase):
