@@ -6,6 +6,21 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def _gather_sort(x, indices):
+    *_, M = indices.shape
+    indices = indices.flatten()
+    order = mx.argsort(indices)
+    inv_order = mx.argsort(order)
+    return x.flatten(0, -3)[order // M], indices[order], inv_order
+
+
+def _scatter_unsort(x, inv_order, shape=None):
+    x = x[inv_order]
+    if shape is not None:
+        x = mx.unflatten(x, 0, shape)
+    return x
+
+
 class QuantizedSwitchLinear(nn.Module):
     def __init__(
         self,
@@ -135,9 +150,18 @@ class SwitchGLU(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        x_up = self.up_proj(x, indices)
-        x_gate = self.gate_proj(x, indices)
-        x = self.down_proj(self.activation(x_gate) * x_up, indices)
+        should_sort = (x.size // x.shape[-1]) >= 128
+        idx = indices
+        inv_order = None
+        if should_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+
+        x_up = self.up_proj(x, idx)
+        x_gate = self.gate_proj(x, idx)
+        x = self.down_proj(self.activation(x_gate) * x_up, idx)
+
+        if should_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
 
@@ -160,8 +184,17 @@ class SwitchMLP(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        x = self.fc1(x, indices)
+        should_sort = (x.size // x.shape[-1]) >= 128
+        idx = indices
+        inv_order = None
+        if should_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+
+        x = self.fc1(x, idx)
         x = self.activation(x)
-        x = self.fc2(x, indices)
+        x = self.fc2(x, idx)
+
+        if should_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
