@@ -122,6 +122,7 @@ def dpo_loss(
         "chosen_logits_mean": mx.mean(policy_chosen_score),
     }
 
+    mx.metal.clear_cache()
     return mx.mean(losses), reward, num_tokens, metrics
 
 
