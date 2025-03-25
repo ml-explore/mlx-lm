@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import platform
+import socket
 import time
 import uuid
 import warnings
@@ -26,9 +27,10 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load, stream_generate
+from .utils import load
 
 
 def get_system_fingerprint():
@@ -710,6 +712,10 @@ def run(
 ):
     server_address = (host, port)
     prompt_cache = PromptCache()
+    infos = socket.getaddrinfo(
+        *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )
+    server_class.address_family, _, _, _, server_address = next(iter(infos))
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(
@@ -765,13 +771,6 @@ def main():
         help="Set the logging level (default: INFO)",
     )
     parser.add_argument(
-        "--cache-limit-gb",
-        type=int,
-        default=None,
-        help="Set the MLX cache limit in GB",
-        required=False,
-    )
-    parser.add_argument(
         "--chat-template",
         type=str,
         default="",
@@ -789,11 +788,6 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-
-    if args.cache_limit_gb is not None:
-        logging.debug(f"Setting cache limit to {args.cache_limit_gb} GB")
-        mx.metal.set_cache_limit(args.cache_limit_gb * 1024 * 1024 * 1024)
-
     run(args.host, args.port, ModelProvider(args))
 
 

@@ -1,2 +1,2 @@
-include mlx_lm/requirements.txt
+include requirements.txt
 recursive-include mlx_lm/ *.py

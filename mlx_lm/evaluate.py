@@ -20,8 +20,9 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from tqdm import tqdm
 
+from .generate import stream_generate
 from .models.cache import make_prompt_cache
-from .utils import load, stream_generate
+from .utils import load
 
 PAD = 0
 
@@ -111,7 +112,7 @@ class MLXLM(LM):
             )
 
             mx.eval(score, ig)
-            mx.metal.clear_cache()
+            mx.clear_cache()
 
             is_greedy.append(ig)
             scores.append(score)
