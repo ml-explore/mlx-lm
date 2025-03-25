@@ -295,7 +295,7 @@ def train(
             it_sec = args.steps_per_report / train_time
             tokens_sec = float(n_tokens) / train_time
             trained_tokens += n_tokens
-            peak_mem = mx.metal.get_peak_memory() / 1e9
+            peak_mem = mx.get_peak_memory() / 1e9
             if rank == 0:
                 print(
                     f"Iter {it}: Train loss {train_loss:.3f}, "
