@@ -771,13 +771,6 @@ def main():
         help="Set the logging level (default: INFO)",
     )
     parser.add_argument(
-        "--cache-limit-gb",
-        type=int,
-        default=None,
-        help="Set the MLX cache limit in GB",
-        required=False,
-    )
-    parser.add_argument(
         "--chat-template",
         type=str,
         default="",
@@ -795,11 +788,6 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-
-    if args.cache_limit_gb is not None:
-        logging.debug(f"Setting cache limit to {args.cache_limit_gb} GB")
-        mx.metal.set_cache_limit(args.cache_limit_gb * 1024 * 1024 * 1024)
-
     run(args.host, args.port, ModelProvider(args))
 
 
