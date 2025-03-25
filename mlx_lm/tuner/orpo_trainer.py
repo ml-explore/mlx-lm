@@ -71,7 +71,7 @@ def orpo_loss(
         "chosen_logits_mean": mx.mean(chosen_logits_mean),
     }
 
-    mx.metal.clear_cache()
+    mx.clear_cache()
     return mx.mean(loss), reward, num_tokens, metrics
 
 
