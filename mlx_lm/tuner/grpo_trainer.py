@@ -141,7 +141,7 @@ def generate_grpo(
                         all_completion_texts.append(completion_text)
 
     finally:
-        mx.clear_cache()
+        mx.metal.clear_cache()
 
     return all_completions, all_completion_texts, batch_indices
 
@@ -429,7 +429,7 @@ def grpo_loss(
             )
         print("\n" + "=" * 35 + "\n")
 
-    mx.clear_cache()
+    mx.metal.clear_cache()
 
     return loss, length_mask.sum(axis=1).sum(), metrics
 
@@ -715,7 +715,7 @@ def train_grpo(
         n_tokens += toks
         steps += 1
 
-        mx.clear_cache()
+        mx.metal.clear_cache()
 
         for k, v in metrics.items():
             accumulated_metrics[k] += v
