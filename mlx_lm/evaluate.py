@@ -112,7 +112,7 @@ class MLXLM(LM):
             )
 
             mx.eval(score, ig)
-            mx.metal.clear_cache()
+            mx.clear_cache()
 
             is_greedy.append(ig)
             scores.append(score)
