@@ -23,7 +23,13 @@ class ORPOTrainingArgs(TrainingArgs):
 
 
 def orpo_loss(
-    model, chosen, rejected, chosen_masks, rejected_masks, preference_scores, beta=0.1
+    model: nn.Module,
+    chosen,
+    rejected,
+    chosen_masks,
+    rejected_masks,
+    preference_scores,
+    beta: float = 0.1
 ):
     def get_logps(model, x, mask):
         inputs = x[:, :-1]
@@ -65,6 +71,7 @@ def orpo_loss(
         "chosen_logits_mean": mx.mean(chosen_logits_mean),
     }
 
+    mx.clear_cache()
     return mx.mean(loss), reward, num_tokens, metrics
 
 
