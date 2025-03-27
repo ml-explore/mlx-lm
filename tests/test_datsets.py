@@ -44,7 +44,7 @@ class TestDatasets(unittest.TestCase):
         self.assertEqual(len(test), 0)
         self.assertTrue(len(train[0]) > 0)
         self.assertTrue(len(valid[0]) > 0)
-        self.assertTrue(isinstance(train, datasets.Dataset))
+        self.assertTrue(isinstance(train, datasets.TextDataset))
 
     def test_completions(self):
         data = {"prompt": "What is the capital of France?", "completion": "Paris."}
@@ -80,7 +80,7 @@ class TestDatasets(unittest.TestCase):
 
     def test_hf(self):
         hf_args = {
-            "name": "billsum",
+            "path": "billsum",
             "prompt_feature": "text",
             "completion_feature": "summary",
             "train_split": "train[:2%]",

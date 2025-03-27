@@ -7,6 +7,7 @@ import re
 import types
 from pathlib import Path
 
+import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
@@ -228,6 +229,7 @@ def train_model(
     valid_set,
     training_callback: TrainingCallback = None,
 ):
+    mx.random.seed(args.seed)
     model.freeze()
     if args.num_layers > len(model.layers):
         raise ValueError(
