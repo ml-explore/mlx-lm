@@ -252,6 +252,8 @@ def train_model(
     adapter_file = adapter_path / "adapters.safetensors"
     save_config(vars(args), adapter_path / "adapter_config.json")
 
+    model.train()
+
     # Initialize the selected optimizer
     lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
 
