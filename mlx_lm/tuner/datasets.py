@@ -63,9 +63,6 @@ class ChatDataset:
         else:
             return tokens
 
-    def itemlen(self, idx: int):
-        return len(self._data[idx])
-
     def __getitem__(self, idx: int):
         return self._data[idx]
 
