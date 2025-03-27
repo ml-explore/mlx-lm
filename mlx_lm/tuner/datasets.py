@@ -6,6 +6,52 @@ from typing import Any, Dict, List, Optional
 from transformers import PreTrainedTokenizer
 
 
+class DPODataset:
+    """
+    A dataset for DPO (Direct Preference Optimization) training that handles
+    prompt-chosen-rejected triplets in the format:
+    {"system": ..., "prompt": ..., "chosen": ..., "rejected": ...}
+    """
+
+    def __init__(
+        self,
+        data: List[Dict[str, str]],
+        tokenizer: PreTrainedTokenizer,
+        prompt_key: str = "prompt",
+        chosen_key: str = "chosen",
+        rejected_key: str = "rejected",
+        system_key: str = "system",
+    ):
+        self._chosen_data = []
+        self._rejected_data = []
+
+        for d in data:
+            messages = (
+                [{"role": "system", "content": d[system_key]}]
+                if system_key and system_key in d
+                else []
+            )
+            messages.append({"role": "user", "content": d[prompt_key]})
+
+            # Apply template once for each response type
+            base_messages = messages.copy()
+            chosen_messages = base_messages + [
+                {"role": "assistant", "content": d[chosen_key]}
+            ]
+            rejected_messages = base_messages + [
+                {"role": "assistant", "content": d[rejected_key]}
+            ]
+
+            self._chosen_data.append(tokenizer.apply_chat_template(chosen_messages))
+            self._rejected_data.append(tokenizer.apply_chat_template(rejected_messages))
+
+    def __getitem__(self, idx: int):
+        return {"chosen": self._chosen_data[idx], "rejected": self._rejected_data[idx]}
+
+    def __len__(self):
+        return len(self._chosen_data)
+
+
 class TextDataset:
     """
     Light-weight wrapper to hold a dataset.
@@ -58,12 +104,12 @@ class ChatDataset:
         tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
         if self.mask_prompt:
             messages = messages[:-1]
-            offset = len(tokenizer.apply_chat_template(messages, tools=tools))
+            offset = len(self.tokenizer.apply_chat_template(messages, tools=tools))
             return (tokens, offset)
         else:
             return tokens
 
-    def itemlen(idx: int):
+    def itemlen(self, idx: int):
         return len(self._data[idx])
 
     def __getitem__(self, idx: int):
@@ -159,27 +205,48 @@ def create_dataset(
 ):
     mask_prompt = getattr(config, "mask_prompt", False)
     prompt_feature = getattr(config, "prompt_feature", "prompt")
+    system_feature = getattr(config, "system_feature", "system")
+    rejected_feature = getattr(config, "rejected_feature", "rejected")
+    chosen_feature = getattr(config, "chosen_feature", "chosen")
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
     chat_feature = getattr(config, "chat_feature", "messages")
+    training_mode = getattr(config, "training_mode", "normal")
     sample = data[0]
-    if prompt_feature in sample and completion_feature in sample:
-        return CompletionsDataset(
-            data, tokenizer, prompt_feature, completion_feature, mask_prompt
-        )
-    elif chat_feature in sample:
-        return ChatDataset(
-            data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
-        )
-    elif text_feature in sample:
-        if mask_prompt:
-            raise ValueError("Prompt masking not supported for text dataset.")
-        return TextDataset(data, tokenizer, text_key=text_feature)
+
+    if training_mode == "normal":
+        if prompt_feature in sample and completion_feature in sample:
+            return CompletionsDataset(
+                data, tokenizer, prompt_feature, completion_feature, mask_prompt
+            )
+        elif chat_feature in sample:
+            return ChatDataset(
+                data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
+            )
+        elif text_feature in sample:
+            if mask_prompt:
+                raise ValueError("Prompt masking not supported for text dataset.")
+            return TextDataset(data, tokenizer, text_key=text_feature)
+        else:
+            raise ValueError(
+                "Unsupported data format, check the supported formats here:\n"
+                "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
+            )
     else:
-        raise ValueError(
-            "Unsupported data format, check the supported formats here:\n"
-            "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
-        )
+        if chosen_feature in sample and rejected_feature in sample:
+            return DPODataset(
+                data=data,
+                tokenizer=tokenizer,
+                prompt_key=prompt_feature,
+                system_key=system_feature,
+                chosen_key=chosen_feature,
+                rejected_key=rejected_feature
+                )
+        else:
+            raise ValueError(
+                "Unsupported data format, check the supported formats here:\n"
+                "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
+            )
 
 
 def load_local_dataset(
