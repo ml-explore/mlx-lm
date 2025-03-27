@@ -58,12 +58,12 @@ class ChatDataset:
         tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
         if self.mask_prompt:
             messages = messages[:-1]
-            offset = len(tokenizer.apply_chat_template(messages, tools=tools))
+            offset = len(self.tokenizer.apply_chat_template(messages, tools=tools))
             return (tokens, offset)
         else:
             return tokens
 
-    def itemlen(idx: int):
+    def itemlen(self, idx: int):
         return len(self._data[idx])
 
     def __getitem__(self, idx: int):
