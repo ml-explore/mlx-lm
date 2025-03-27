@@ -1,4 +1,3 @@
-import itertools
 import json
 import types
 from pathlib import Path
@@ -55,7 +54,7 @@ class GRPODataset:
         return len(self._data)
 
 
-class Dataset:
+class TextDataset:
     """
     Light-weight wrapper to hold a dataset.
     """
@@ -66,10 +65,15 @@ class Dataset:
         tokenizer: PreTrainedTokenizer,
         text_key: str = "text",
     ):
-        self._data = [tokenizer.encode(d[text_key]) for d in data]
-        for d in self._data:
-            if d[-1] != tokenizer.eos_token_id:
-                d.append(tokenizer.eos_token_id)
+        self._data = [d for d in data]
+        self.tokenizer = tokenizer
+        self.text_key = text_key
+
+    def process(self, d):
+        d = self.tokenizer.encode(d[self.text_key])
+        if d[-1] != self.tokenizer.eos_token_id:
+            d.append(self.tokenizer.eos_token_id)
+        return d
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -91,17 +95,24 @@ class ChatDataset:
         chat_key: str = "messages",
         mask_prompt: bool = False,
     ):
-        self._data = []
-        for d in data:
-            messages = d[chat_key]
-            tools = d.get("tools", None)
-            tokens = tokenizer.apply_chat_template(messages, tools=tools)
-            if mask_prompt:
-                messages = messages[:-1]
-                offset = len(tokenizer.apply_chat_template(messages, tools=tools))
-                self._data.append((tokens, offset))
-            else:
-                self._data.append(tokens)
+        self._data = [d for d in data]
+        self.chat_key = chat_key
+        self.mask_prompt = mask_prompt
+        self.tokenizer = tokenizer
+
+    def process(self, d):
+        messages = d[self.chat_key]
+        tools = d.get("tools", None)
+        tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
+        if self.mask_prompt:
+            messages = messages[:-1]
+            offset = len(tokenizer.apply_chat_template(messages, tools=tools))
+            return (tokens, offset)
+        else:
+            return tokens
+
+    def itemlen(idx: int):
+        return len(self._data[idx])
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -125,23 +136,28 @@ class CompletionsDataset:
         completion_key: str,
         mask_prompt: bool,
     ):
-        self._data = []
-        for d in data:
-            tokens = tokenizer.apply_chat_template(
-                [
-                    {"role": "user", "content": d[prompt_key]},
-                    {"role": "assistant", "content": d[completion_key]},
-                ],
-            )
-            if mask_prompt:
-                offset = len(
-                    tokenizer.apply_chat_template(
-                        [{"role": "user", "content": d[prompt_key]}]
-                    )
+        self._data = [d for d in data]
+        self.prompt_key = prompt_key
+        self.completion_key = completion_key
+        self.mask_prompt = mask_prompt
+        self.tokenizer = tokenizer
+
+    def process(self, d):
+        tokens = self.tokenizer.apply_chat_template(
+            [
+                {"role": "user", "content": d[self.prompt_key]},
+                {"role": "assistant", "content": d[self.completion_key]},
+            ],
+        )
+        if self.mask_prompt:
+            offset = len(
+                self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": d[self.prompt_key]}]
                 )
-                self._data.append((tokens, offset))
-            else:
-                self._data.append(tokens)
+            )
+            return (tokens, offset)
+
+        return tokens
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -152,10 +168,33 @@ class CompletionsDataset:
 
 class ConcatenatedDataset:
     def __init__(self, data: List[Any]):
-        self._data = list(itertools.chain(*data))
+        self._data = data
+        self._len = sum(len(d) for d in self._data)
 
     def __getitem__(self, idx: int):
-        return self._data[idx]
+        for data in self._data:
+            j = idx - len(data)
+            if j < 0:
+                break
+            idx = j
+        return data[idx]
+
+    def __len__(self):
+        return self._len
+
+
+class CacheDataset:
+    def __init__(self, data: Any):
+        self._data = data
+        self._proc_data = [None] * len(data)
+
+    def itemlen(self, idx: int):
+        return len(self._data[idx])
+
+    def __getitem__(self, idx: int):
+        if self._proc_data[idx] is None:
+            self._proc_data[idx] = self._data.process(self._data[idx])
+        return self._proc_data[idx]
 
     def __len__(self):
         return len(self._data)
@@ -191,7 +230,7 @@ def create_dataset(
         elif text_feature in sample:
             if mask_prompt:
                 raise ValueError("Prompt masking not supported for text dataset.")
-            return Dataset(data, tokenizer, text_key=text_feature)
+            return TextDataset(data, tokenizer, text_key=text_feature)
         else:
             raise ValueError(
                 "Unsupported data format, check the supported formats here:\n"
@@ -271,8 +310,8 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
 
     collection = []
     for ds in dataset_collection:
-        ds_name = ds["name"]
-        print(f"Loading Hugging Face dataset {ds_name}.")
+        ds_path = ds["path"]
+        print(f"Loading Hugging Face dataset {ds_path}.")
         ds["mask_prompt"] = getattr(args, "mask_prompt", False) if config.training_mode == 'normal' else False
         config = types.SimpleNamespace(**ds)
         hf_config = ds.get("config", {})
@@ -280,13 +319,13 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
             train_split = ds.get("train_split", "train[:80%]")
             valid_split = ds.get("valid_split", "train[-10%:]")
             train = create_hf_dataset(
-                ds_name,
+                ds_path,
                 config,
                 train_split,
                 hf_config,
             )
             valid = create_hf_dataset(
-                ds_name,
+                ds_path,
                 config,
                 valid_split,
                 hf_config,
@@ -297,7 +336,7 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
         if args.test:
             test_split = ds.get("test_split")
             test = create_hf_dataset(
-                ds_name,
+                ds_path,
                 config,
                 test_split,
                 hf_config,
