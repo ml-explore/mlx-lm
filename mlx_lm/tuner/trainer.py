@@ -4,6 +4,7 @@ import glob
 import shutil
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -156,6 +157,7 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
 ):
+    mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     all_losses = mx.array(0.0)
     ntokens = mx.array(0)
 
@@ -213,8 +215,9 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
-    state = [model.state, optimizer.state]
+    state = [model.state, optimizer.state, mx.random.state]
 
+    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
         # Forward and backward pass
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
