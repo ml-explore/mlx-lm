@@ -104,12 +104,12 @@ class ChatDataset:
         tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
         if self.mask_prompt:
             messages = messages[:-1]
-            offset = len(tokenizer.apply_chat_template(messages, tools=tools))
+            offset = len(self.tokenizer.apply_chat_template(messages, tools=tools))
             return (tokens, offset)
         else:
             return tokens
 
-    def itemlen(idx: int):
+    def itemlen(self, idx: int):
         return len(self._data[idx])
 
     def __getitem__(self, idx: int):
@@ -226,7 +226,7 @@ def create_dataset(
         elif text_feature in sample:
             if mask_prompt:
                 raise ValueError("Prompt masking not supported for text dataset.")
-            return Dataset(data, tokenizer, text_key=text_feature)
+            return TextDataset(data, tokenizer, text_key=text_feature)
         else:
             raise ValueError(
                 "Unsupported data format, check the supported formats here:\n"
