@@ -370,11 +370,10 @@ class TestScheduleConfig(unittest.TestCase):
         mock_iterate_batches = MagicMock()
 
         mock_iterate_batches.return_value = [
-            (MagicMock(), MagicMock()),
-            (MagicMock(), MagicMock()),
-            (MagicMock(), MagicMock()),
-            (MagicMock(), MagicMock()),
-            (MagicMock(), MagicMock()),
+            (mx.ones((2, 8), mx.int32), mx.ones((2, 2), mx.int32)),
+            (mx.ones((2, 8), mx.int32), mx.ones((2, 2), mx.int32)),
+            (mx.ones((2, 8), mx.int32), mx.ones((2, 2), mx.int32)),
+            (mx.ones((2, 8), mx.int32), mx.ones((2, 2), mx.int32)),
         ]
 
         mock_default_loss.side_effect = [
@@ -412,9 +411,9 @@ class TestScheduleConfig(unittest.TestCase):
         mock_iterate_batches = MagicMock()
 
         mock_iterate_batches.return_value = [
-            (MagicMock(), MagicMock()),
-            (MagicMock(), MagicMock()),
-            (MagicMock(), MagicMock()),
+            (mx.ones((2, 8), mx.int32), mx.ones((2, 2), mx.int32)),
+            (mx.ones((2, 8), mx.int32), mx.ones((2, 2), mx.int32)),
+            (mx.ones((2, 8), mx.int32), mx.ones((2, 2), mx.int32)),
         ]
 
         mock_default_loss.side_effect = [
