@@ -45,12 +45,10 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         metadata (Dict[str, str]): Optional metadata to save along with model
             state.
     """
-    cache_data = [c.state for c in cache]
+    cache_data: Dict[Any, Any] = dict(tree_flatten([c.state for c in cache])) 
     cache_info = [c.meta_state for c in cache]
-    cache_data = dict(tree_flatten(cache_data))
     cache_classes = [type(c).__name__ for c in cache]
-    cache_metadata = [cache_info, metadata, cache_classes]
-    cache_metadata = dict(tree_flatten(cache_metadata))
+    cache_metadata: Dict[Any, Any] = dict(tree_flatten([cache_info, metadata, cache_classes]))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
 
 
@@ -102,7 +100,7 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
         (int): The number of tokens that were trimmed.
     """
     if not can_trim_prompt_cache(cache) or len(cache) == 0:
-        return 0
+        return []
     return [c.trim(num_tokens) for c in cache][0]
 
 
