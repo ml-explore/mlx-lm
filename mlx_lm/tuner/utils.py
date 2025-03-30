@@ -110,7 +110,7 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe"]:
+        if model.model_type == "olmoe":
             keys.add("mlp.gate")
 
     elif model.model_type == "gpt_bigcode":
