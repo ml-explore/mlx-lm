@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 
-from cache import QuantizedKVCache
+from .cache import QuantizedKVCache
 
 
 @dataclass
