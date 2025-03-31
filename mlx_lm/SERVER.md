@@ -41,6 +41,19 @@ curl localhost:8080/v1/chat/completions \
    }'
 ```
 
+## Speculative Decoding
+
+The server supports speculative decoding to accelerate text generation by using a smaller, faster "draft" model to predict tokens that are then verified by the main model. To enable this feature, use:
+
+```shell
+mlx_lm.server --model mlx-community/Llama-3.2-8B-Instruct-4bit --draft-model mlx-community/Llama-3.2-1B-Instruct-4bit
+```
+
+- `--draft-model`: Specifies a smaller model to use for speculative decoding.
+- `--num-draft-tokens`: Sets how many tokens the draft model should predict at once (default: 3). This is an optional parameter.
+
+The draft model should ideally use the same tokenizer as the main model for best results.
+
 ### Request Fields
 
 - `messages`: An array of message objects representing the conversation
