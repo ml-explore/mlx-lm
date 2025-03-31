@@ -299,19 +299,18 @@ def run(args, training_callback: TrainingCallback = None):
 
         wandb.init(project="mlx-finetuning", config=vars(args))
 
-        # Create a simple wandb callback that wraps the existing one
         original_callback = training_callback
 
         class WandBCallback(TrainingCallback):
             def on_train_loss_report(self, train_info: dict):
                 wandb.log(train_info)
                 if original_callback:
-                    original_callback.on_train_loss_report(train_info)
+                    training_callback.on_train_loss_report(train_info)
 
             def on_val_loss_report(self, val_info: dict):
                 wandb.log(val_info)
                 if original_callback:
-                    original_callback.on_val_loss_report(val_info)
+                    training_callback.on_val_loss_report(val_info)
 
         training_callback = WandBCallback()
 
