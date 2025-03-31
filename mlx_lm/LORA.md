@@ -324,7 +324,7 @@ example:
 
 ```yaml
 hf_dataset:
-  name: "billsum"
+  path: "billsum"
   prompt_feature: "text"
   completion_feature: "summary"
 ```
@@ -341,12 +341,12 @@ with the same structure as above. For example:
 
 ```yaml
 hf_dataset:
-  - name: "Open-Orca/OpenOrca"
+  - path: "Open-Orca/OpenOrca"
     train_split: "train[:90%]"
     valid_split: "train[-10%:]"
     prompt_feature: "question"
     completion_feature: "response"
-  - name: "trl-lib/ultrafeedback_binarized"
+  - path: "trl-lib/ultrafeedback_binarized"
     train_split: "train[:90%]"
     valid_split: "train[-10%:]"
     chat_feature: "chosen"
