@@ -119,32 +119,19 @@ class ConcatenatedDataset:
     def __init__(self, data: List[Any]):
         self._data = data
         self._len = sum(len(d) for d in self._data)
-        # Calculate offsets for each dataset for efficient indexing
-        self._offsets = [0]
-        for d in self._data:
-            self._offsets.append(self._offsets[-1] + len(d))
 
     def __getitem__(self, idx: int):
-        if idx < 0 or idx >= self._len:
-            raise IndexError(f"Index {idx} out of range for dataset of length {self._len}")
-        
-        dataset_idx = 0
-        while dataset_idx < len(self._offsets) - 1 and idx >= self._offsets[dataset_idx + 1]:
-            dataset_idx += 1
-        
-        item_idx = idx - self._offsets[dataset_idx]
-        return self._data[dataset_idx][item_idx]
-    
-    def get_dataset_and_idx(self, idx: int):
-        if idx < 0 or idx >= self._len:
-            raise IndexError(f"Index {idx} out of range for dataset of length {self._len}")
-        
-        dataset_idx = 0
-        while dataset_idx < len(self._offsets) - 1 and idx >= self._offsets[dataset_idx + 1]:
-            dataset_idx += 1
-        
-        item_idx = idx - self._offsets[dataset_idx]
-        return self._data[dataset_idx], item_idx
+        for data_idx, data in enumerate(self._data):
+            j = idx - len(data)
+            if j < 0:
+                break
+            idx = j
+        datum = data[idx]
+        datum["_dataset"] = data_idx
+        return datum
+
+    def process(self, d):
+        return self._data[d["_dataset"]].process(d)
 
     def __len__(self):
         return self._len
@@ -160,12 +147,7 @@ class CacheDataset:
 
     def __getitem__(self, idx: int):
         if self._proc_data[idx] is None:
-            if isinstance(self._data, ConcatenatedDataset):
-                dataset, item_idx = self._data.get_dataset_and_idx(idx)
-                item = dataset[item_idx]
-                self._proc_data[idx] = dataset.process(item)
-            else:
-                self._proc_data[idx] = self._data.process(self._data[idx])
+            self._proc_data[idx] = self._data.process(self._data[idx])
         return self._proc_data[idx]
 
     def __len__(self):
