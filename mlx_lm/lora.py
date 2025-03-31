@@ -7,6 +7,7 @@ import re
 import types
 from pathlib import Path
 
+import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
@@ -198,6 +199,7 @@ def train_model(
     valid_set,
     training_callback: TrainingCallback = None,
 ):
+    mx.random.seed(args.seed)
     model.freeze()
     if args.num_layers > len(model.layers):
         raise ValueError(
@@ -245,8 +247,6 @@ def train_model(
         grad_checkpoint=args.grad_checkpoint,
     )
 
-    model.train()
-
     # Initialize the selected optimizer
     lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
 
@@ -275,8 +275,6 @@ def train_model(
 
 
 def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set):
-    model.eval()
-
     test_loss = evaluate(
         model=model,
         dataset=test_set,
