@@ -20,7 +20,7 @@ class ModelArgs(BaseModelArgs):
     n_positions: int
     layer_norm_epsilon: float
     vocab_size: int
-    num_key_value_heads: int = None
+    num_key_value_heads: Optional[int] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
