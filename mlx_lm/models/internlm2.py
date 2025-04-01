@@ -20,7 +20,7 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     bias: bool = True
     max_position_embeddings: int = 32768
-    num_key_value_heads: int = None
+    num_key_value_heads: Optional[int] = None
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -87,8 +87,8 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.n_kv_groups = n_heads // args.num_key_value_heads
+        self.n_kv_heads = n_kv_heads = args.num_key_value_heads or args.num_attention_heads
+        self.n_kv_groups = n_heads // n_kv_heads
 
         self.head_dim = head_dim = args.hidden_size // n_heads
         self.scale = head_dim**-0.5
@@ -99,7 +99,7 @@ class Attention(nn.Module):
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=args.bias)
 
         rope_scale = (
-            1 / args.rope_scaling["factor"]
+            1 / float(args.rope_scaling["factor"])
             if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
             else 2.0
         )

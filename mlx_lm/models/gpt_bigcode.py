@@ -20,7 +20,7 @@ class ModelArgs(BaseModelArgs):
     n_positions: int
     layer_norm_epsilon: float
     vocab_size: int
-    num_key_value_heads: int = None
+    num_key_value_heads: Optional[int] = None
     multi_query: bool = True
     attention_bias: bool = True
     mlp_bias: bool = True
