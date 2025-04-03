@@ -514,10 +514,12 @@ def speculative_generate_step(
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    speculation = 0  # count the calls to the draft model
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
             draft_tokens = _draft_generate(draft_y, num_draft)
+            speculation += 1
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
@@ -532,12 +534,12 @@ def speculative_generate_step(
                     break
                 n += 1
                 ntoks += 1
-                yield tn, lpn, True
+                yield tn, lpn, True, speculation, num_draft
                 if ntoks == max_tokens:
                     break
             if ntoks < max_tokens:
                 ntoks += 1
-                yield tokens[n], logprobs[n], False
+                yield tokens[n], logprobs[n], False, speculation, num_draft
 
             if ntoks == max_tokens:
                 break
@@ -604,7 +606,7 @@ def stream_generate(
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
+            (token, logprobs, False, 0, 0) for token, logprobs in token_generator
         )
     else:
         kwargs.pop("max_kv_size", None)
@@ -614,7 +616,12 @@ def stream_generate(
     with wired_limit(model, [generation_stream]):
         detokenizer.reset()
         tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
+        num_accepted = 0
+        num_drafted = 0
+        prev_speculation = -1
+        for n, (token, logprobs, from_draft, speculation, num_draft) in enumerate(
+            token_generator
+        ):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
@@ -623,6 +630,12 @@ def stream_generate(
                 break
 
             detokenizer.add_token(token)
+
+            if speculation != prev_speculation:
+                prev_speculation = speculation
+                num_drafted += num_draft
+            if from_draft:
+                num_accepted += 1
 
             yield GenerationResponse(
                 text=detokenizer.last_segment,
@@ -649,6 +662,14 @@ def stream_generate(
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
             finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
+        )
+
+    if draft_model is not None:
+        print(
+            f"num_accepted: {num_accepted}",
+            f"num_drafted: {num_drafted}",
+            f"num_speculations: {prev_speculation}",
+            f"acceptance rate: {num_accepted / num_drafted}",
         )
 
 
@@ -680,25 +701,15 @@ def generate(
     if verbose:
         print("=" * 10)
 
-    num_from_draft = 0
-    num_response = 0
     text = ""
     for response in stream_generate(model, tokenizer, prompt, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
-            if response.from_draft:
-                num_from_draft += 1
-            num_response += 1
         text += response.text
 
-    if verbose:
+    if True:
         print()
         print("=" * 10)
-        print(
-            f"num_from_draft: {num_from_draft}, "
-            f"num_response: {num_response}, "
-            f"accept rate: {num_from_draft / num_response}"
-        )
         if len(text) == 0:
             print("No text generated for this prompt")
             return
