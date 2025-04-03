@@ -1,12 +1,13 @@
 import mlx_lm
 
-main_model, tokenizer = mlx_lm.load("mlx-community/Qwen2.5-Coder-32B-Instruct-3bit")
+MAIN_MODEL = "mlx-community/Qwen2.5-Coder-32B-Instruct-3bit"
+main_model, tokenizer = mlx_lm.load(MAIN_MODEL)
 
 prompt = "Write a Python program to sum up the Fibonacci series"
 messages = [{"role": "user", "content": prompt}]
 prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
-print(f"\n Autoregression")
+print(f"\nAutoregression: {MAIN_MODEL}")
 mlx_lm.generate(
     model=main_model,
     tokenizer=tokenizer,
@@ -21,7 +22,7 @@ DRAFT_MODELS = [
 ]
 
 for DM in DRAFT_MODELS:
-    print(f"\n Draft Model: {DM}")
+    print(f"\nDraft Model: {DM}")
     draft_model, _ = mlx_lm.load(DM)
     assert draft_model
 

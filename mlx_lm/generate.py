@@ -694,6 +694,8 @@ def generate(
           See :func:`stream_generate` for more details.
     """
     if formatter is not None:
+        print()
+        print("=" * 10)
         print(
             "[Warning] Text formatting is deprecated and no longer used. "
             "The argument will be removed in a future version."
