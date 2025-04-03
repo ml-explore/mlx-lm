@@ -169,6 +169,12 @@ def build_parser():
         help="Maximum sequence length.",
     )
     parser.add_argument(
+        "--seq-step-size",
+        type=int,
+        default=None,
+        help="",
+    )
+    parser.add_argument(
         "-c",
         "--config",
         type=str,
@@ -238,6 +244,7 @@ def train_model(
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
+        seq_step_size=args.seq_step_size,
     )
 
     # Initialize the selected optimizer

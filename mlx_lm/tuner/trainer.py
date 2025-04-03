@@ -12,10 +12,19 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from transformers import PreTrainedTokenizer
 
+from ..models.cache import KVCache, make_prompt_cache
 from .datasets import CacheDataset
+
+
+def reset_prompt_cache(cache):
+    for e, c in enumerate(cache):
+        if isinstance(c, KVCache):
+            cache[e] = KVCache()
+        else:
+            raise ValueError("Unsupported cache")
 
 
 def grad_checkpoint(layer):
@@ -65,16 +74,21 @@ class TrainingArgs:
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
     )
+    seq_step_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "The examples are processsed in seq_step_size chunks."},
+    )
 
 
-def default_loss(model, batch, lengths):
+def default_loss(model, batch, lengths, cache=None):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
 
-    logits = model(inputs)
+    offset = cache[0].offset if cache is not None else 0
+    logits = model(inputs, cache=cache)
     logits = logits.astype(mx.float32)
 
-    steps = mx.arange(1, targets.shape[1] + 1)
+    steps = mx.arange(1, targets.shape[1] + 1) + offset
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
 
     ce = nn.losses.cross_entropy(logits, targets) * mask
@@ -160,6 +174,7 @@ def evaluate(
     max_seq_length=2048,
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
+    seq_step_size: Optional[int] = None,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -167,6 +182,9 @@ def evaluate(
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
+    seq_step_size = seq_step_size or max_seq_length
+
+    cache = make_prompt_cache(model)
     for _, batch in zip(
         index_iterator,
         iterate_batches(
@@ -176,10 +194,15 @@ def evaluate(
             max_seq_length=max_seq_length,
         ),
     ):
-        losses, toks = loss(model, *batch)
-        all_losses += losses * toks
-        ntokens += toks
-        mx.eval(all_losses, ntokens)
+        seq_length = batch[0].shape[1]
+        for s in range(0, seq_length, seq_step_size):
+            local_batch = (batch[0][:, s : s + seq_step_size], batch[1])
+            losses, toks = loss(model, *local_batch, cache)
+            all_losses += losses * toks
+            ntokens += toks
+            if s + seq_step_size >= seq_length:
+                reset_prompt_cache(cache)
+            mx.eval(all_losses, ntokens)
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
@@ -220,6 +243,8 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
+    seq_step_size = args.seq_step_size or args.max_seq_length
+    cache = make_prompt_cache(model)
     state = [model.state, optimizer.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
@@ -241,6 +266,40 @@ def train(
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
     model.train()
+    seq_step_size = args.seq_step_size or args.max_seq_length
+
+    def seq_split_step(batch):
+        losses = mx.array(0.0)
+        n_tokens = mx.array(0.0)
+        seq_length = batch[0].shape[1]
+        grad_accum = None
+        for s in range(0, seq_length, seq_step_size):
+            local_batch = (batch[0][:, s : s + seq_step_size], batch[1])
+            (lvalue, toks), grad = loss_value_and_grad(model, *local_batch, cache)
+            prev_n_tokens = n_tokens
+            losses += toks * lvalue
+            n_tokens += toks
+
+            if grad_accum is None:
+                grad_accum = grad
+            else:
+                scale_g = toks / n_tokens
+                scale_acc = prev_n_tokens / n_tokens
+                grad_accum = tree_map(
+                    lambda g, acc: scale_g * g + scale_acc * acc, grad, grad_accum
+                )
+
+            # Let go of the prompt cache before the last eval
+            if s + seq_step_size >= seq_length:
+                reset_prompt_cache(cache)
+            mx.eval(grad_accum, losses, n_tokens)
+
+        grad_accum = average_gradients(grad_accum)
+        optimizer.update(model, grad_accum)
+        return losses / n_tokens, n_tokens
+
+    loss_value_and_grad = nn.value_and_grad(model, loss)
+
     losses = 0
     n_tokens = 0
     steps = 0
@@ -271,6 +330,7 @@ def train(
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,
                 iterate_batches=iterate_batches,
+                seq_step_size=seq_step_size,
             )
             model.train()
             val_time = time.perf_counter() - tic
@@ -292,11 +352,16 @@ def train(
 
             tic = time.perf_counter()
 
-        lvalue, toks = step(batch)
+        if batch[0].shape[1] > seq_step_size:
+            lvalue, toks = seq_split_step(batch)
+        else:
+            lvalue, toks = step(batch)
+
         losses += lvalue
         n_tokens += toks
         steps += 1
         mx.eval(state, losses, n_tokens)
+
         train_time += time.perf_counter() - tic
 
         # Report training loss if needed
