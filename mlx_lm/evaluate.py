@@ -66,9 +66,9 @@ class MLXLM(LM):
         self._batch_size = batch_size
         self._model, self.tokenizer = load(path_or_hf_repo)
         self._max_tokens = max_tokens or self.tokenizer.model_max_length
-        self.use_chat_template = use_chat_template and (
-            self.tokenizer.chat_template is not None
-        )
+        self.use_chat_template = use_chat_template
+        if use_chat_template is None:
+            self.use_chat_template = self.tokenizer.chat_template is not None
 
     def _score_fn(self, inputs, step_size: int = 64):
         inputs, lengths = _pad_inputs(inputs)
@@ -83,7 +83,6 @@ class MLXLM(LM):
 
             offset = cache[0].offset
             mask = create_causal_mask(T, offset, lengths=lengths)
-            mask = mask == 0
 
             logits = self._model(inp, cache=cache, mask=mask)
             log_probs = nn.log_softmax(logits.astype(mx.float32))
@@ -362,8 +361,11 @@ def main():
     )
     parser.add_argument(
         "--apply-chat-template",
-        action="store_true",
-        help="Specifies whether to apply a chat template to the prompt.",
+        action=argparse.BooleanOptionalAction,
+        help="Specifies whether to apply a chat template to the prompt. If "
+        "the model has a chat template, this defaults to `True`, "
+        "otherwise `False`.",
+        default=None,
     )
     args = parser.parse_args()
 
