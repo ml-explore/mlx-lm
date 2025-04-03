@@ -102,7 +102,13 @@ def convert(
 
     weights = dict(tree_flatten(model.parameters()))
     dtype = getattr(mx, dtype)
-    weights = {k: v.astype(dtype) for k, v in weights.items()}
+    if hasattr(model, "cast_predicate"):
+        cast_predicate = model.cast_predicate()
+    else:
+        cast_predicate = lambda _: True
+    weights = {
+        k: v.astype(dtype) if cast_predicate(k) else v for k, v in weights.items()
+    }
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")

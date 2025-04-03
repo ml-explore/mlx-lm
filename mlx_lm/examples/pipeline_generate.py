@@ -18,8 +18,6 @@ https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
 
 import argparse
 import json
-
-# Needed for 8 bit model
 import resource
 from pathlib import Path
 
@@ -30,9 +28,8 @@ from mlx.utils import tree_flatten
 from mlx_lm import load, stream_generate
 from mlx_lm.utils import load_model, load_tokenizer
 
-soft_limit = 2048
-ard_limit = 4096
-resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+# Needed for 8 bit model
+resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
 
 def download(repo: str, allow_patterns: list[str]) -> Path:
