@@ -5,8 +5,7 @@ Run with:
 
 ```
 mlx.launch \
- --hostfile /path/to/hosts.txt \
- --backend mpi \
+ --hostfile /path/to/hosts.json \
  /path/to/pipeline_generate.py \
  --prompt "hello world"
 ```
@@ -19,6 +18,9 @@ https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
 
 import argparse
 import json
+
+# Needed for 8 bit model
+import resource
 from pathlib import Path
 
 import mlx.core as mx
@@ -27,6 +29,10 @@ from mlx.utils import tree_flatten
 
 from mlx_lm import load, stream_generate
 from mlx_lm.utils import load_model, load_tokenizer
+
+soft_limit = 2048
+ard_limit = 4096
+resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
 
 
 def download(repo: str, allow_patterns: list[str]) -> Path:
@@ -49,7 +55,7 @@ def shard_and_load(repo):
     # which weights we need
     model, _ = load_model(model_path, lazy=True, strict=False)
 
-    group = mx.distributed.init(backend="mpi")
+    group = mx.distributed.init()
     rank = group.rank()
     model.model.pipeline(group)
 
@@ -98,7 +104,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    group = mx.distributed.init(backend="mpi")
+    group = mx.distributed.init()
     rank = group.rank()
 
     def rprint(*args, **kwargs):
