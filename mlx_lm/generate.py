@@ -271,6 +271,7 @@ def generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
+    temp: float = 1.0,
     sampler: Optional[Callable[mx.array, mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     max_kv_size: Optional[int] = None,
@@ -289,6 +290,7 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
+        temp (float): The temperature for sampling. Default: ``1.0``.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
@@ -347,6 +349,7 @@ def generate_step(
                     logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
+            logits = logits / temp
 
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             y = sampler(logprobs)
