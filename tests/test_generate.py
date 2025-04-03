@@ -67,7 +67,9 @@ class TestGenerate(unittest.TestCase):
         # make a determinate sampler
         sampler = make_sampler(temp=0.0)
         messages = [{"role": "user", "content": "hello"}]
-        prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True
+        )
 
         for generation_result in stream_generate(
             model=self.model,
