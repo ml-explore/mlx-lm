@@ -153,8 +153,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--kv-bits",
         type=int,
-        help="Number of bits for KV cache quantization. "
-        "Defaults to no quantization.",
+        help="Number of bits for KV cache quantization. Defaults to no quantization.",
         default=None,
     )
     parser.add_argument(
@@ -681,15 +680,25 @@ def generate(
     if verbose:
         print("=" * 10)
 
+    num_from_draft = 0
+    num_response = 0
     text = ""
     for response in stream_generate(model, tokenizer, prompt, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
+            if response.from_draft:
+                num_from_draft += 1
+            num_response += 1
         text += response.text
 
     if verbose:
         print()
         print("=" * 10)
+        print(
+            f"num_from_draft: {num_from_draft}, "
+            f"num_response: {num_response}, "
+            f"accept rate: {num_from_draft / num_response}"
+        )
         if len(text) == 0:
             print("No text generated for this prompt")
             return
