@@ -51,7 +51,6 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
     cache_metadata: Dict[Any, Any] = dict(tree_flatten([cache_info, metadata, cache_classes]))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
 
-
 def load_prompt_cache(file_name, return_metadata=False):
     """
     Load a prompt cache from a file.
@@ -85,7 +84,7 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
     return all(c.is_trimmable() for c in cache)
 
 
-def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
+def trim_prompt_cache(cache: List[Any], num_tokens: int) -> int:
     """
     Trim the model's cache by the given number of tokens.
 
@@ -100,7 +99,7 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
         (int): The number of tokens that were trimmed.
     """
     if not can_trim_prompt_cache(cache) or len(cache) == 0:
-        return []
+        return 0
     return [c.trim(num_tokens) for c in cache][0]
 
 
