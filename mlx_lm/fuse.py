@@ -127,4 +127,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.fuse...` directly is deprecated."
+        " Use `mlx_lm.fuse...` or `python -m mlx_lm fuse ...` instead."
+    )
     main()
