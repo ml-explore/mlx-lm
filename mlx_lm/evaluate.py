@@ -225,6 +225,7 @@ class MLXLM(LM):
             is_greedy = mx.pad(is_greedy, ((0, per_group - len(is_greedy))))
             scores = mx.distributed.all_gather(scores[mx.newaxis], stream=mx.cpu)
             is_greedy = mx.distributed.all_gather(is_greedy[mx.newaxis], stream=mx.cpu)
+            mx.eval(scores, is_greedy)
             scores = scores.T.reshape(-1)
             is_greedy = is_greedy.T.reshape(-1)
 
