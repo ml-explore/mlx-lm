@@ -238,15 +238,7 @@ class MLXLM(LM):
         return results
 
     tokenizer_name = lm_eval.models.huggingface.HFLM.tokenizer_name
-
-    def apply_chat_template(
-        self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True
-    ) -> str:
-        if len(chat_history) == 0:
-            return ""
-        return lm_eval.models.huggingface.HFLM.apply_chat_template(
-            chat_history, add_generation_prompt
-        )
+    apply_chat_template = lm_eval.models.huggingface.HFLM.apply_chat_template
 
     def loglikelihood_rolling(self, requests) -> list[float]:
         """Compute full log-likelihood of a string, with no truncation, for perplexity computation
