@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 import argparse
 import math
 import os
@@ -23,6 +21,7 @@ from .tuner.utils import (
     print_trainable_parameters,
 )
 from .utils import load, save_config
+from .tuner.callbacks import WandBCallback
 
 yaml_loader = yaml.SafeLoader
 yaml_loader.add_implicit_resolver(
@@ -69,6 +68,7 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
+    "wandb": None,
 }
 
 
@@ -180,6 +180,12 @@ def build_parser():
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
     )
+    parser.add_argument(
+        "--wandb",
+        type=str,
+        default=None,
+        help="WandB project name to report training metrics. Disabled if None.",
+    )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
 
@@ -284,6 +290,14 @@ def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set
 
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
+
+    if args.wandb is not None:
+        training_callback = WandBCallback(
+            project_name=args.wandb,
+            log_dir=args.adapter_path,
+            config=vars(args),
+            wrapped_callback=training_callback
+        )
 
     print("Loading pretrained model")
     model, tokenizer = load(args.model)
