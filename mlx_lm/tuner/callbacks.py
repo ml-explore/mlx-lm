@@ -1,3 +1,9 @@
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+
 class TrainingCallback:
 
     def on_train_loss_report(self, train_info: dict):
@@ -7,12 +13,6 @@ class TrainingCallback:
     def on_val_loss_report(self, val_info: dict):
         """Called to report validation loss at specified intervals or the beginning."""
         pass
-
-
-try:
-    import wandb
-except ImportError:
-    wandb = None
 
 
 class WandBCallback(TrainingCallback):
