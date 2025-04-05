@@ -294,6 +294,7 @@ def run(args, training_callback: TrainingCallback = None):
     if args.wandb is not None:
         training_callback = WandBCallback(
             project_name=args.wandb,
+            log_dir=args.adapter_path,
             config=vars(args),
             wrapped_callback=training_callback
         )
