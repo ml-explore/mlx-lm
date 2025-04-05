@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 import argparse
 import math
 import os
@@ -23,6 +21,7 @@ from .tuner.utils import (
     print_trainable_parameters,
 )
 from .utils import load, save_config
+from .tuner.callbacks import WandBCallback
 
 yaml_loader = yaml.SafeLoader
 yaml_loader.add_implicit_resolver(
@@ -69,7 +68,7 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "alpha": 16, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
-    "report_to_wandb": False,
+    "wandb": None,
 }
 
 
@@ -182,10 +181,10 @@ def build_parser():
         default=None,
     )
     parser.add_argument(
-        "--report-to-wandb",
-        action="store_true",
-        help="Report the training args to WandB.",
+        "--wandb",
+        type=str,
         default=None,
+        help="WandB project name to report training metrics. Disabled if None.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
@@ -292,25 +291,12 @@ def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
 
-    if args.report_to_wandb:
-        import wandb
-
-        wandb.init(project="mlx-finetuning", config=vars(args))
-
-        original_callback = training_callback
-
-        class WandBCallback(TrainingCallback):
-            def on_train_loss_report(self, train_info: dict):
-                wandb.log(train_info)
-                if original_callback:
-                    training_callback.on_train_loss_report(train_info)
-
-            def on_val_loss_report(self, val_info: dict):
-                wandb.log(val_info)
-                if original_callback:
-                    training_callback.on_val_loss_report(val_info)
-
-        training_callback = WandBCallback()
+    if args.wandb is not None:
+        training_callback = WandBCallback(
+            project_name=args.wandb,
+            config=vars(args),
+            wrapped_callback=training_callback
+        )
 
     print("Loading pretrained model")
     model, tokenizer = load(args.model)

@@ -1,21 +1,19 @@
 # Copyright © 2024 Apple Inc.
 
-import glob
-import shutil
+
 import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten
-from transformers import PreTrainedTokenizer
 
 from .datasets import CacheDataset
+from .callbacks import TrainingCallback
 
 
 def grad_checkpoint(layer):
@@ -185,17 +183,6 @@ def evaluate(
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
 
     return (all_losses / ntokens).item()
-
-
-class TrainingCallback:
-
-    def on_train_loss_report(self, train_info: dict):
-        """Called to report training loss at specified intervals."""
-        pass
-
-    def on_val_loss_report(self, val_info: dict):
-        """Called to report validation loss at specified intervals or the beginning."""
-        pass
 
 
 def train(
