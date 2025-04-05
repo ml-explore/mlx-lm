@@ -55,6 +55,10 @@ def _pad_inputs(inputs):
 
 @register_model("mlxlm")
 class MLXLM(LM):
+
+    tokenizer_name = lm_eval.models.huggingface.HFLM.tokenizer_name
+    apply_chat_template = lm_eval.models.huggingface.HFLM.apply_chat_template
+
     def __init__(
         self,
         path_or_hf_repo: str,
@@ -236,9 +240,6 @@ class MLXLM(LM):
         inv_sort = np.argsort(sorted_indices)
         results = [results[inv_sort[i]] for i in range(len(inv_sort))]
         return results
-
-    tokenizer_name = lm_eval.models.huggingface.HFLM.tokenizer_name
-    apply_chat_template = lm_eval.models.huggingface.HFLM.apply_chat_template
 
     def loglikelihood_rolling(self, requests) -> list[float]:
         """Compute full log-likelihood of a string, with no truncation, for perplexity computation
