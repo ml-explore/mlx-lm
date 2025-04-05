@@ -15,6 +15,7 @@ import yaml
 
 from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
+from .tuner.grpo_trainer import GRPOTrainingArgs, evaluate_grpo, train_grpo
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -44,6 +45,7 @@ CONFIG_DEFAULTS = {
     "model": "mlx_model",
     "train": False,
     "fine_tune_type": "lora",
+    "training_mode": "normal",
     "optimizer": "adam",
     "optimizer_config": {
         "adam": {},
@@ -69,6 +71,16 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
+    # GRPO args
+    "reference_model_path": None,
+    "group_size": 4,
+    "beta": 0.1,
+    "epsilon": 1e-4,
+    "max_completion_length": 512,
+    "use_chat_template": False,
+    "use_prompt": False,
+    "temperature": 0.8,
+    "reward_weights": None,
 }
 
 
@@ -100,6 +112,12 @@ def build_parser():
         type=str,
         choices=["lora", "dora", "full"],
         help="Type of fine-tuning to perform: lora, dora, or full.",
+    )
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        choices=["normal", "grpo"],
+        help="Training mode: normal or GRPO",
     )
     parser.add_argument(
         "--optimizer",
@@ -181,6 +199,56 @@ def build_parser():
         default=None,
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+
+    # GRPO args
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        help="Number of generations.",
+        default=4,
+    )
+    parser.add_argument(
+        "--max-completion-length",
+        type=int,
+        help="Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left.",
+        default=512,
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        help="KL penalty coefficient.",
+        default=0.1,
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        help="The Epsilon for numerical stability.",
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="If the model is a Chat model, use the Chat template.",
+        default=None,
+    )
+    parser.add_argument(
+        "--use-prompt",
+        action="store_true",
+        help="Rather to use the prompt from the R1 paper.",
+        default=None,
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help="Temperature for sampling. The higher the temperature, the more random the completions.",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--reward-weights",
+        type=str,
+        help="Weights for each reward function. Must match the number of reward functions and be in this format [0.1, 0.2, 0.3, 0.4, 0.5]. If not given, all rewards are weighted equally with weight `1.0`.",
+        default=None,
+    )
     return parser
 
 
@@ -227,18 +295,7 @@ def train_model(
     adapter_file = adapter_path / "adapters.safetensors"
     save_config(vars(args), adapter_path / "adapter_config.json")
 
-    # init training args
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=args.iters,
-        val_batches=args.val_batches,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.save_every,
-        adapter_file=adapter_file,
-        max_seq_length=args.max_seq_length,
-        grad_checkpoint=args.grad_checkpoint,
-    )
+    model.train()
 
     # Initialize the selected optimizer
     lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
@@ -255,31 +312,112 @@ def train_model(
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
-    # Train model
-    train(
-        model=model,
-        tokenizer=tokenizer,
-        args=training_args,
-        optimizer=opt,
-        train_dataset=train_set,
-        val_dataset=valid_set,
-        training_callback=training_callback,
-    )
+    if args.training_mode == "grpo":
+        training_args = GRPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=args.val_batches,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=adapter_file,
+            max_seq_length=args.max_seq_length,
+            max_completion_length=args.max_completion_length,
+            grad_checkpoint=args.grad_checkpoint,
+            beta=args.beta,
+            group_size=args.group_size,
+            epsilon=args.epsilon,
+            reference_model_path=args.reference_model_path,
+            temperature=args.temperature,
+            reward_weights=(
+                [float(x) for x in args.reward_weights.strip("[]").split(",")]
+                if args.reward_weights
+                else None
+            ),
+        )
+
+        if args.reference_model_path:
+            reference_model, _ = load(args.reference_model_path)
+        else:
+            reference_model, _ = load(args.model)
+
+        train_grpo(
+            model=model,
+            ref_model=reference_model.freeze(),
+            tokenizer=tokenizer,
+            optimizer=opt,
+            train_dataset=train_set,
+            val_dataset=valid_set,
+            args=training_args,
+            training_callback=training_callback,
+        )
+    else:
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=args.val_batches,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=adapter_file,
+            max_seq_length=args.max_seq_length,
+            grad_checkpoint=args.grad_checkpoint,
+        )
+        # Train model
+        train(
+            model=model,
+            tokenizer=tokenizer,
+            args=training_args,
+            optimizer=opt,
+            train_dataset=train_set,
+            val_dataset=valid_set,
+            training_callback=training_callback,
+        )
 
 
 def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set):
-    test_loss = evaluate(
-        model=model,
-        dataset=test_set,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        num_batches=args.test_batches,
-        max_seq_length=args.max_seq_length,
-    )
+    model.eval()
 
-    test_ppl = math.exp(test_loss)
+    if args.training_mode == "grpo":
+        if args.reference_model_path:
+            reference_model, _ = load(args.reference_model_path)
+        else:
+            reference_model, _ = load(args.model)
 
-    print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
+        test_loss, _, test_rewards = evaluate_grpo(
+            model=model,
+            ref_model=reference_model.freeze(),
+            dataset=test_set,
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            num_batches=args.test_batches,
+            max_seq_length=args.max_seq_length,
+            beta=args.beta,
+            group_size=args.group_size,
+            epsilon=args.epsilon,
+            temperature=args.temperature,
+            max_tokens=args.max_seq_length,
+        )
+
+        test_ppl = math.exp(test_loss)
+
+        rewards_str = ", ".join([f"{k}: {v:.3f}" for k, v in test_rewards.items()])
+        print(
+            f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}, Rewards: {rewards_str}"
+        )
+    else:
+        test_loss = evaluate(
+            model=model,
+            dataset=test_set,
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            num_batches=args.test_batches,
+            max_seq_length=args.max_seq_length,
+        )
+
+        test_ppl = math.exp(test_loss)
+
+        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
 
 def run(args, training_callback: TrainingCallback = None):
