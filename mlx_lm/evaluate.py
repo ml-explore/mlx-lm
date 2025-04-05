@@ -394,8 +394,9 @@ def main():
     task_names = "_".join(args.tasks)
     ver = version("lm_eval")
     filename = f"eval_{model_name}_{task_names}_{args.num_shots:02d}_v_{ver}.json"
-    output_path = output_dir / filename
-    output_path.write_text(json.dumps(results["results"], indent=4))
-    print("Results:")
-    for result in results["results"].values():
-        print(json.dumps(result, indent=4))
+    if mx.distributed.init().rank() == 0:
+        output_path = output_dir / filename
+        output_path.write_text(json.dumps(results["results"], indent=4))
+        print("Results:")
+        for result in results["results"].values():
+            print(json.dumps(result, indent=4))
