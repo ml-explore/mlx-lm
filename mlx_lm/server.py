@@ -147,7 +147,9 @@ def process_message_content(messages):
 class PromptCache:
     cache: List[Any] = field(default_factory=list)
     model_key: Tuple[str, Optional[str]] = ("", None)
+    draft_model_key: Optional[str] = None  # Add draft model key to track changes
     tokens: List[int] = field(default_factory=list)
+    has_draft_cache: bool = False  # Flag to track if cache includes draft model layers
 
 
 class ModelProvider:
@@ -157,6 +159,8 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.draft_model = None
+        self.draft_model_key = None
 
         # Preload the default model if it is provided
         if self.cli_args.model is not None:
@@ -178,6 +182,8 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.model_key = None
+        self.draft_model = None
+        self.draft_model_key = None
 
         # Building tokenizer_config
         tokenizer_config = {
@@ -207,6 +213,18 @@ class ModelProvider:
         self.model_key = (model_path, adapter_path)
         self.model = model
         self.tokenizer = tokenizer
+        
+        # Load draft model if specified
+        if self.cli_args.draft_model is not None:
+            self._validate_model_path(self.cli_args.draft_model)
+            draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+            
+            # Check if tokenizers are compatible
+            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                logging.warning("Draft model tokenizer does not match model tokenizer. Speculative decoding may not work as expected.")
+                
+            self.draft_model = draft_model
+            self.draft_model_key = self.cli_args.draft_model
 
         return self.model, self.tokenizer
 
@@ -456,29 +474,55 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
         prefix_len = min(cache_len, prompt_len)
-        if (
-            self.prompt_cache.model_key != self.model_provider.model_key
-            or prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
-        ):
+        
+        # Check if we need to create a new cache
+        need_new_cache = (
+            self.prompt_cache.model_key != self.model_provider.model_key or
+            self.prompt_cache.draft_model_key != self.model_provider.draft_model_key or
+            prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
+        )
+        
+        if need_new_cache:
+            # Create new cache for the main model
             self.prompt_cache.model_key = self.model_provider.model_key
-            self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+            self.prompt_cache.draft_model_key = self.model_provider.draft_model_key
+            
+            # Create a fresh cache for the main model
+            main_cache = make_prompt_cache(self.model_provider.model)
+            
+            # If we're using a draft model, create and combine the caches
+            if self.model_provider.draft_model is not None:
+                draft_cache = make_prompt_cache(self.model_provider.draft_model)
+                # Combine the caches for speculative decoding
+                self.prompt_cache.cache = main_cache + draft_cache
+                self.prompt_cache.has_draft_cache = True
+            else:
+                self.prompt_cache.cache = main_cache
+                self.prompt_cache.has_draft_cache = False
+                
             self.prompt_cache.tokens = []
         elif cache_len >= prompt_len:
-            # Trim the cache if it contains the prompt as a prefix. This case
-            # is useful for reusing the cache for multiple queries with a long
-            # prompt
+            # Trim the cache if it contains the prompt as a prefix
             if can_trim_prompt_cache(self.prompt_cache.cache):
                 num_to_trim = cache_len - prompt_len + 1
                 trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
                 self.prompt_cache.tokens = self.prompt_cache.tokens[:-num_to_trim]
                 prompt = prompt[-1:]
             else:
-                self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+                # Create a new cache if we can't trim
+                main_cache = make_prompt_cache(self.model_provider.model)
+                if self.model_provider.draft_model is not None:
+                    draft_cache = make_prompt_cache(self.model_provider.draft_model)
+                    self.prompt_cache.cache = main_cache + draft_cache
+                    self.prompt_cache.has_draft_cache = True
+                else:
+                    self.prompt_cache.cache = main_cache
+                    self.prompt_cache.has_draft_cache = False
                 self.prompt_cache.tokens = []
         else:
-            # Trim the prompt if it contains the cache as a prefix. This case
-            # is to avoid recomputing the cache in multi-turn chats.
+            # Trim the prompt if it contains the cache as a prefix
             prompt = prompt[cache_len:]
+            
         self.prompt_cache.tokens.extend(prompt)
         return prompt
 
@@ -514,6 +558,11 @@ class APIHandler(BaseHTTPRequestHandler):
         logits_processors = make_logits_processors(
             self.logit_bias, self.repetition_penalty, self.repetition_context_size
         )
+        
+        # Check if we should use speculative decoding with a draft model
+        draft_model = self.model_provider.draft_model
+        num_draft_tokens = self.model_provider.cli_args.num_draft_tokens if draft_model else None
+        
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -522,12 +571,15 @@ class APIHandler(BaseHTTPRequestHandler):
             sampler=sampler,
             logits_processors=logits_processors,
             prompt_cache=self.prompt_cache.cache,
+            draft_model=draft_model,
+            num_draft_tokens=num_draft_tokens,
         ):
             segment = gen_response.text
             text += segment
             logging.debug(text)
             token = gen_response.token
             logprobs = gen_response.logprobs
+            from_draft = getattr(gen_response, 'from_draft', False)
             tokens.append(token)
 
             if self.logprobs > 0:
@@ -757,6 +809,18 @@ def main():
         type=int,
         default=8080,
         help="Port for the HTTP server (default: 8080)",
+    )
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        help="A model to be used for speculative decoding.",
+        default=None,
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        help="Number of tokens to draft when using speculative decoding.",
+        default=3,
     )
     parser.add_argument(
         "--trust-remote-code",
