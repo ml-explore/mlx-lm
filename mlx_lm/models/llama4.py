@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache
+from .cache import ChunkedKVCache, KVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -234,7 +234,7 @@ class LlamaModel(nn.Module):
         if cache is not None:
             for idx, c in enumerate(cache):
                 if (idx + 1) % 4 != 0:
-                    c.update()
+                    c.maybe_trim_front()
 
         if mask is None:
             mask = create_attention_mask(h, cache)
@@ -286,50 +286,6 @@ class LanguageModel(nn.Module):
     ):
         out = self.model(inputs, mask, cache)
         return self.lm_head(out)
-
-
-class ChunkedKVCache(KVCache):
-    def __init__(self, chunk_size):
-        super().__init__()
-        self.chunk_size = chunk_size
-        self.start_position = 0
-
-    def update(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.keys = self.keys[..., self.chunk_size :, :]
-            self.values = self.values[..., self.chunk_size :, :]
-            self.start_position += self.chunk_size
-
-    def update_and_fetch(self, keys, values):
-        prev = self.offset - self.start_position
-        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = keys.shape
-            v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
-            new_k = mx.zeros(k_shape, keys.dtype)
-            new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
-            else:
-                self.keys, self.values = new_k, new_v
-
-        self.offset += keys.shape[2]
-        end = self.offset - self.start_position
-        self.keys[..., prev:end, :] = keys
-        self.values[..., prev:end, :] = values
-        return self.keys[..., :end, :], self.values[..., :end, :]
-
-    def trim(self, n):
-        n = min(self.offset - self.start_position, n)
-        self.offset -= n
-        return n
 
 
 class Model(nn.Module):
