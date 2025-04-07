@@ -87,7 +87,9 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads or args.num_attention_heads
+        self.n_kv_heads = n_kv_heads = (
+            args.num_key_value_heads or args.num_attention_heads
+        )
         self.n_kv_groups = n_heads // n_kv_heads
 
         self.head_dim = head_dim = args.hidden_size // n_heads
