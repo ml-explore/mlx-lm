@@ -235,24 +235,24 @@ class LlamaModel(nn.Module):
             for idx, c in enumerate(cache):
                 if (idx + 1) % 4 != 0:
                     c.maybe_trim_front()
+            start = cache[0].start_position
+            offset = cache[0].offset
+        else:
+            start = 0
+            offset = 0
+        end = offset + h.shape[1]
+        linds = mx.arange(start, end)
+        rinds = mx.arange(offset, end)[:, None]
+        block_pos = mx.abs(
+            (linds // self.attention_chunk_size) - (rinds // self.attention_chunk_size)
+        )
+        token_pos = linds <= rinds
+        chunk_mask = (block_pos == 0) & token_pos
 
         if mask is None:
             mask = create_attention_mask(h, cache)
-            if cache is not None:
-                start = cache[0].start_position
-                offset = cache[0].offset
-            else:
-                start = 0
-                offset = 0
-            end = offset + h.shape[1]
-            linds = mx.arange(start, end)
-            rinds = mx.arange(offset, end)[:, None]
-            block_pos = mx.abs(
-                (linds // self.attention_chunk_size)
-                - (rinds // self.attention_chunk_size)
-            )
-            token_pos = linds <= rinds
-            chunk_mask = (block_pos == 0) & token_pos
+        else:
+            chunk_mask &= mask
 
         if cache is None:
             cache = [None] * len(self.layers)
