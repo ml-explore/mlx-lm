@@ -307,6 +307,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
+        self.num_draft_tokens = self.body.get("num_draft_tokens", 3)
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
@@ -553,9 +554,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self.logit_bias, self.repetition_penalty, self.repetition_context_size
         )
 
-        draft_model = self.model_provider.draft_model
-        num_draft_tokens = self.model_provider.cli_args.num_draft_tokens
-
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -564,8 +562,8 @@ class APIHandler(BaseHTTPRequestHandler):
             sampler=sampler,
             logits_processors=logits_processors,
             prompt_cache=self.prompt_cache.cache,
-            draft_model=draft_model,
-            num_draft_tokens=num_draft_tokens,
+            draft_model=self.model_provider.draft_model,
+            num_draft_tokens=self.num_draft_tokens,
         ):
             segment = gen_response.text
             text += segment
@@ -807,12 +805,6 @@ def main():
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
-    )
-    parser.add_argument(
-        "--num-draft-tokens",
-        type=int,
-        help="Number of tokens to draft when using speculative decoding.",
-        default=3,
     )
     parser.add_argument(
         "--trust-remote-code",

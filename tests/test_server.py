@@ -24,7 +24,6 @@ class DummyModelProvider:
             "obj",
             (object,),
             {
-                "num_draft_tokens": 2 if with_draft else None,
                 "adapter_path": None,
                 "chat_template": None,
                 "use_default_chat_template": False,
