@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -158,8 +158,8 @@ def evaluate(
     batch_size,
     num_batches,
     max_seq_length=2048,
-    loss: callable = default_loss,
-    iterate_batches: callable = iterate_batches,
+    loss: Callable = default_loss,
+    iterate_batches: Callable = iterate_batches,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -205,9 +205,9 @@ def train(
     train_dataset,
     val_dataset,
     args: TrainingArgs = TrainingArgs(),
-    loss: callable = default_loss,
-    iterate_batches: callable = iterate_batches,
-    training_callback: TrainingCallback = None,
+    loss: Callable = default_loss,
+    iterate_batches: Callable = iterate_batches,
+    training_callback: Optional[TrainingCallback] = None,
 ):
     mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     print(f"Starting training..., iters: {args.iters}")
@@ -245,7 +245,7 @@ def train(
     n_tokens = 0
     steps = 0
     trained_tokens = 0
-    train_time = 0
+    train_time = 0.0
     # Main training loop
     for it, batch in zip(
         range(1, args.iters + 1),
