@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import List, Optional, Tuple, Callable
+from typing import Callable, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn

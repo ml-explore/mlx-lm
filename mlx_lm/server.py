@@ -496,7 +496,7 @@ class APIHandler(BaseHTTPRequestHandler):
               to the stopping_criteria function
         """
         tokens = []
-        finish_reason : Union[Literal["length", "stop"], None] = "length"
+        finish_reason: Union[Literal["length", "stop"], None] = "length"
         stop_sequence_suffix = None
         if self.stream:
             self.end_headers()
@@ -534,7 +534,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
                 top_indices = sorted_indices[: self.logprobs]
                 top_logprobs = logprobs[top_indices]
-                top_tokens.append({int(idx) : float(prob) for idx, prob in zip(top_indices, top_logprobs)})
+                top_tokens.append(
+                    {
+                        int(idx): float(prob)
+                        for idx, prob in zip(top_indices, top_logprobs)
+                    }
+                )
 
             token_logprobs.append(logprobs[token].item())
 
@@ -616,7 +621,8 @@ class APIHandler(BaseHTTPRequestHandler):
             "usage": {
                 "prompt_tokens": prompt_token_count or 0,
                 "completion_tokens": completion_token_count or 0,
-                "total_tokens": (prompt_token_count or 0) + (completion_token_count or 0),
+                "total_tokens": (prompt_token_count or 0)
+                + (completion_token_count or 0),
             },
         }
         return response
@@ -715,7 +721,7 @@ def run(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
     server_class.address_family, _, _, _, server_address_full = next(iter(infos))
-    server_address = server_address_full[:2] 
+    server_address = server_address_full[:2]
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(
