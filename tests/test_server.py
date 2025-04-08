@@ -16,24 +16,28 @@ class DummyModelProvider:
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
-        
+
         # Add draft model support
         self.draft_model = None
         self.draft_model_key = None
-        self.cli_args = type('obj', (object,), {
-            'num_draft_tokens': 2 if with_draft else None,
-            'adapter_path': None,
-            'chat_template': None,
-            'use_default_chat_template': False,
-            'trust_remote_code': False,
-        })
-        
+        self.cli_args = type(
+            "obj",
+            (object,),
+            {
+                "num_draft_tokens": 2 if with_draft else None,
+                "adapter_path": None,
+                "chat_template": None,
+                "use_default_chat_template": False,
+                "trust_remote_code": False,
+            },
+        )
+
         if with_draft:
             # Use the same model as the draft model for testing
             self.draft_model, _ = load(HF_MODEL_PATH)
             self.draft_model_key = HF_MODEL_PATH
 
-    def load(self, model, adapter=None):
+    def load(self, model, adapter=None, draft_model=None):
         assert model in ["default_model", "chat_model"]
         return self.model, self.tokenizer
 
@@ -173,80 +177,79 @@ class TestServerWithDraftModel(unittest.TestCase):
             "model": "default_model",
             "prompt": "Once upon a time",
             "max_tokens": 10,
-            "temperature": 0.0,  # Use deterministic sampling for consistent results
+            "temperature": 0.0,
             "top_p": 1.0,
         }
 
         response = requests.post(url, json=post_data)
         self.assertEqual(response.status_code, 200)
-        
+
         response_body = json.loads(response.text)
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
         self.assertIn("usage", response_body)
-        
+
         # Check that tokens were generated
         self.assertTrue(response_body["usage"]["completion_tokens"] > 0)
 
     def test_handle_chat_completions_with_draft_model(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
-        
+
         chat_post_data = {
             "model": "chat_model",
             "max_tokens": 10,
-            "temperature": 0.0,  # Use deterministic sampling for consistent results
+            "temperature": 0.0,
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Hello!"},
             ],
         }
-        
+
         response = requests.post(url, json=chat_post_data)
         self.assertEqual(response.status_code, 200)
-        
+
         response_body = json.loads(response.text)
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
         self.assertIn("usage", response_body)
-        
+
         # Check that tokens were generated
         self.assertTrue(response_body["usage"]["completion_tokens"] > 0)
 
     def test_streaming_with_draft_model(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
-        
+
         chat_post_data = {
             "model": "chat_model",
             "max_tokens": 10,
-            "temperature": 0.0,  # Use deterministic sampling for consistent results
+            "temperature": 0.0,
             "stream": True,
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Hello!"},
             ],
         }
-        
+
         response = requests.post(url, json=chat_post_data, stream=True)
         self.assertEqual(response.status_code, 200)
-        
+
         chunk_count = 0
         for chunk in response.iter_lines():
             if chunk:
-                data = chunk.decode('utf-8')
-                if data.startswith('data: ') and data != 'data: [DONE]':
+                data = chunk.decode("utf-8")
+                if data.startswith("data: ") and data != "data: [DONE]":
                     chunk_data = json.loads(data[6:])  # Skip the "data: " prefix
-                    self.assertIn('choices', chunk_data)
-                    self.assertEqual(len(chunk_data['choices']), 1)
-                    self.assertIn('delta', chunk_data['choices'][0])
+                    self.assertIn("choices", chunk_data)
+                    self.assertEqual(len(chunk_data["choices"]), 1)
+                    self.assertIn("delta", chunk_data["choices"][0])
                     chunk_count += 1
-        
+
         # Make sure we got some streaming chunks
         self.assertGreater(chunk_count, 0)
 
     def test_prompt_cache_with_draft_model(self):
-        """Test that the prompt cache works correctly with a draft model."""
         url = f"http://localhost:{self.port}/v1/chat/completions"
-        
+
         # First request to initialize cache
         chat_post_data = {
             "model": "chat_model",
@@ -257,10 +260,10 @@ class TestServerWithDraftModel(unittest.TestCase):
                 {"role": "user", "content": "Tell me a story about"},
             ],
         }
-        
+
         first_response = requests.post(url, json=chat_post_data)
         self.assertEqual(first_response.status_code, 200)
-        
+
         # Second request with same prefix should use cache
         chat_post_data = {
             "model": "chat_model",
@@ -271,21 +274,21 @@ class TestServerWithDraftModel(unittest.TestCase):
                 {"role": "user", "content": "Tell me a story about dragons."},
             ],
         }
-        
+
         second_response = requests.post(url, json=chat_post_data)
         self.assertEqual(second_response.status_code, 200)
-        
+
         # Both responses should have content
         first_response_body = json.loads(first_response.text)
         second_response_body = json.loads(second_response.text)
-        
+
         self.assertIn("choices", first_response_body)
         self.assertIn("choices", second_response_body)
         self.assertIn("message", first_response_body["choices"][0])
         self.assertIn("message", second_response_body["choices"][0])
         self.assertIn("content", first_response_body["choices"][0]["message"])
         self.assertIn("content", second_response_body["choices"][0]["message"])
-        
+
         # Ensure both generated content
         self.assertIsNotNone(first_response_body["choices"][0]["message"]["content"])
         self.assertIsNotNone(second_response_body["choices"][0]["message"]["content"])

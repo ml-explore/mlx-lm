@@ -146,10 +146,8 @@ def process_message_content(messages):
 @dataclass
 class PromptCache:
     cache: List[Any] = field(default_factory=list)
-    model_key: Tuple[str, Optional[str]] = ("", None)
-    draft_model_key: Optional[str] = None  # Add draft model key to track changes
+    model_key: Tuple[str, Optional[str]] = ("", None, None)
     tokens: List[int] = field(default_factory=list)
-    has_draft_cache: bool = False  # Flag to track if cache includes draft model layers
 
 
 class ModelProvider:
@@ -160,11 +158,10 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
-        self.draft_model_key = None
 
         # Preload the default model if it is provided
         if self.cli_args.model is not None:
-            self.load("default_model")
+            self.load("default_model", draft_model_path="default_model")
 
     def _validate_model_path(self, model_path: str):
         model_path = Path(model_path)
@@ -174,8 +171,8 @@ class ModelProvider:
             )
 
     # Added in adapter_path to load dynamically
-    def load(self, model_path, adapter_path=None):
-        if self.model_key == (model_path, adapter_path):
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
 
         # Remove the old model if it exists.
@@ -183,7 +180,6 @@ class ModelProvider:
         self.tokenizer = None
         self.model_key = None
         self.draft_model = None
-        self.draft_model_key = None
 
         # Building tokenizer_config
         tokenizer_config = {
@@ -192,7 +188,12 @@ class ModelProvider:
         if self.cli_args.chat_template:
             tokenizer_config["chat_template"] = self.cli_args.chat_template
 
-        if model_path == "default_model" and self.cli_args.model is not None:
+        if model_path == "default_model":
+            if self.cli_args.model is None:
+                raise ValueError(
+                    "A model path has to be given as a CLI "
+                    "argument or in the HTTP request"
+                )
             model, tokenizer = load(
                 self.cli_args.model,
                 adapter_path=(
@@ -210,22 +211,30 @@ class ModelProvider:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model_key = (model_path, adapter_path)
+        self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
-        
-        # Load draft model if specified
-        if self.cli_args.draft_model is not None:
-            self._validate_model_path(self.cli_args.draft_model)
-            draft_model, draft_tokenizer = load(self.cli_args.draft_model)
-            
+
+        def validate_draft_tokenizer(draft_tokenizer):
             # Check if tokenizers are compatible
             if draft_tokenizer.vocab_size != tokenizer.vocab_size:
-                logging.warning("Draft model tokenizer does not match model tokenizer. Speculative decoding may not work as expected.")
-                
-            self.draft_model = draft_model
-            self.draft_model_key = self.cli_args.draft_model
+                logging.warning(
+                    "Draft model tokenizer does not match model tokenizer. "
+                    "Speculative decoding may not work as expected."
+                )
 
+        # Load draft model if specified
+        if (
+            draft_model_path == "default_model"
+            and self.cli_args.draft_model is not None
+        ):
+            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+            validate_draft_tokenizer(draft_tokenizer)
+
+        elif draft_model_path is not None and draft_model_path != "default_model":
+            self._validate_model_path(draft_model_path)
+            self.draft_model, draft_tokenizer = load(draft_model_path)
+            validate_draft_tokenizer(draft_tokenizer)
         return self.model, self.tokenizer
 
 
@@ -297,6 +306,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
+        self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
@@ -312,7 +322,9 @@ class APIHandler(BaseHTTPRequestHandler):
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(
-                self.requested_model, self.adapter
+                self.requested_model,
+                self.adapter,
+                self.requested_draft_model,
             )
         except:
             self._set_completion_headers(404)
@@ -474,32 +486,18 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
         prefix_len = min(cache_len, prompt_len)
-        
-        # Check if we need to create a new cache
-        need_new_cache = (
-            self.prompt_cache.model_key != self.model_provider.model_key or
-            self.prompt_cache.draft_model_key != self.model_provider.draft_model_key or
-            prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
-        )
-        
-        if need_new_cache:
-            # Create new cache for the main model
+
+        if (
+            self.prompt_cache.model_key != self.model_provider.model_key
+            or prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
+        ):
             self.prompt_cache.model_key = self.model_provider.model_key
-            self.prompt_cache.draft_model_key = self.model_provider.draft_model_key
-            
-            # Create a fresh cache for the main model
-            main_cache = make_prompt_cache(self.model_provider.model)
-            
-            # If we're using a draft model, create and combine the caches
+            self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
             if self.model_provider.draft_model is not None:
-                draft_cache = make_prompt_cache(self.model_provider.draft_model)
-                # Combine the caches for speculative decoding
-                self.prompt_cache.cache = main_cache + draft_cache
-                self.prompt_cache.has_draft_cache = True
-            else:
-                self.prompt_cache.cache = main_cache
-                self.prompt_cache.has_draft_cache = False
-                
+                self.prompt_cache.cache += make_prompt_cache(
+                    self.model_provider.draft_model
+                )
+
             self.prompt_cache.tokens = []
         elif cache_len >= prompt_len:
             # Trim the cache if it contains the prompt as a prefix
@@ -509,20 +507,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.prompt_cache.tokens = self.prompt_cache.tokens[:-num_to_trim]
                 prompt = prompt[-1:]
             else:
-                # Create a new cache if we can't trim
-                main_cache = make_prompt_cache(self.model_provider.model)
+                self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
-                    draft_cache = make_prompt_cache(self.model_provider.draft_model)
-                    self.prompt_cache.cache = main_cache + draft_cache
-                    self.prompt_cache.has_draft_cache = True
-                else:
-                    self.prompt_cache.cache = main_cache
-                    self.prompt_cache.has_draft_cache = False
+                    self.prompt_cache.cache += make_prompt_cache(
+                        self.model_provider.draft_model
+                    )
                 self.prompt_cache.tokens = []
         else:
             # Trim the prompt if it contains the cache as a prefix
             prompt = prompt[cache_len:]
-            
+
         self.prompt_cache.tokens.extend(prompt)
         return prompt
 
@@ -558,11 +552,10 @@ class APIHandler(BaseHTTPRequestHandler):
         logits_processors = make_logits_processors(
             self.logit_bias, self.repetition_penalty, self.repetition_context_size
         )
-        
-        # Check if we should use speculative decoding with a draft model
+
         draft_model = self.model_provider.draft_model
-        num_draft_tokens = self.model_provider.cli_args.num_draft_tokens if draft_model else None
-        
+        num_draft_tokens = self.model_provider.cli_args.num_draft_tokens
+
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -579,7 +572,6 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.debug(text)
             token = gen_response.token
             logprobs = gen_response.logprobs
-            from_draft = getattr(gen_response, 'from_draft', False)
             tokens.append(token)
 
             if self.logprobs > 0:
