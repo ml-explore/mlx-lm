@@ -12,6 +12,7 @@ import numpy as np
 import yaml
 
 from .tokenizer_utils import TokenizerWrapper
+from .tuner.callbacks import WandBCallback
 from .tuner.datasets import load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -21,7 +22,6 @@ from .tuner.utils import (
     print_trainable_parameters,
 )
 from .utils import load, save_config
-from .tuner.callbacks import WandBCallback
 
 yaml_loader = yaml.SafeLoader
 yaml_loader.add_implicit_resolver(
@@ -296,7 +296,7 @@ def run(args, training_callback: TrainingCallback = None):
             project_name=args.wandb,
             log_dir=args.adapter_path,
             config=vars(args),
-            wrapped_callback=training_callback
+            wrapped_callback=training_callback,
         )
 
     print("Loading pretrained model")

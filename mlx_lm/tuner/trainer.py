@@ -12,8 +12,8 @@ import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten
 
-from .datasets import CacheDataset
 from .callbacks import TrainingCallback
+from .datasets import CacheDataset
 
 
 def grad_checkpoint(layer):

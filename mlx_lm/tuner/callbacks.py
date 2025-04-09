@@ -16,9 +16,17 @@ class TrainingCallback:
 
 
 class WandBCallback(TrainingCallback):
-    def __init__(self, project_name: str, log_dir: str, config: dict, wrapped_callback: TrainingCallback = None):
+    def __init__(
+        self,
+        project_name: str,
+        log_dir: str,
+        config: dict,
+        wrapped_callback: TrainingCallback = None,
+    ):
         if wandb is None:
-            raise ImportError("wandb is not installed. Please install it to use WandBCallback.")
+            raise ImportError(
+                "wandb is not installed. Please install it to use WandBCallback."
+            )
         self.wrapped_callback = wrapped_callback
         wandb.init(project=project_name, dir=log_dir, config=config)
 
