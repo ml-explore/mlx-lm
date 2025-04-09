@@ -9,7 +9,8 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
-from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+
 from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
@@ -165,7 +166,7 @@ def linear_to_lora_layers(
         model.update_modules(tree_unflatten(lora_modules))
 
 
-def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
+def load_adapters(model: nn.Module, adapter_path: Path) -> nn.Module:
     """
     Load any fine-tuned adapters / layers.
 
