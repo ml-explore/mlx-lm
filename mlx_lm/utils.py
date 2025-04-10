@@ -483,6 +483,7 @@ def save_config(
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
+    config.pop("vision_config", None)
 
     # sort the config for better readability
     config = dict(sorted(config.items()))

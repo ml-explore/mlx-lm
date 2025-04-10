@@ -40,19 +40,12 @@ class TextArgs(BaseModelArgs):
 
 
 @dataclass
-class VisionArgs(BaseModelArgs):
-    model_type: str
-
-
-@dataclass
 class ModelArgs(BaseModelArgs):
     text_config: Union[TextArgs, dict]
-    vision_config: Union[VisionArgs, dict]
     model_type: str
 
     def __post_init__(self):
         self.text_config = TextArgs.from_dict(self.text_config)
-        self.vision_config = VisionArgs.from_dict(self.vision_config)
 
 
 class Attention(nn.Module):
