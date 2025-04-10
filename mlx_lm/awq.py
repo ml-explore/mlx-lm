@@ -31,10 +31,10 @@ from mlx_lm.utils import (
 SUPPORTED_MODEL_TYPES = {
     "llama",
     "llama4",
-    "deepseek_v3",
     "qwen2",
     "gemma3",
-    "gemma3_text" "gemma2",
+    "gemma3_text",
+    "gemma2",
 }
 
 
@@ -468,6 +468,7 @@ def save_model(
 
     tokenizer.save_pretrained(mlx_path)
 
+    # dummy
     config["quantization"] = {"group_size": 64, "bits": 4}
 
     def update_config(path, module):
