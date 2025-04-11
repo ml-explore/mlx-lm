@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -29,7 +29,7 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     rope_theta: float
     use_cla: bool
-    cla_share_factor: 2
+    cla_share_factor: Literal[2]
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
 

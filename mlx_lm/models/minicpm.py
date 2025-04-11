@@ -68,7 +68,7 @@ class Attention(nn.Module):
         )
 
         rope_scale = (
-            1 / args.rope_scaling["factor"]
+            1 / float(args.rope_scaling["factor"])
             if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
             else 1
         )

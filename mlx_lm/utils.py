@@ -12,6 +12,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    List,
     Optional,
     Tuple,
     Type,
@@ -35,9 +36,9 @@ from mlx.utils import tree_flatten, tree_reduce
 from transformers import PreTrainedTokenizer
 
 # Local imports
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
-from .tuner.utils import dequantize as dequantize_model
-from .tuner.utils import load_adapters, nparams
+from mlx_lm.tokenizer_utils import TokenizerWrapper, load_tokenizer
+from mlx_lm.tuner.utils import dequantize as dequantize_model
+from mlx_lm.tuner.utils import load_adapters, nparams
 
 # Constants
 MODEL_REMAPPING = {
@@ -188,9 +189,9 @@ def load_model(
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_args_class = get_model_classes(config=config)
+    model_class, model_args_class = get_model_classes(config)
 
-    model_args = model_args_class.from_dict(config)
+    model_args = model_args_class.from_dict(config=config)
     model = model_class(model_args)
 
     if hasattr(model, "sanitize"):
@@ -274,24 +275,28 @@ def fetch_from_hub(
     return model, config, tokenizer
 
 
-def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
+def make_shards(
+    weights: Dict[str, mx.array], max_file_size_gb: int = MAX_FILE_SIZE_GB
+) -> List[Dict[str, mx.array]]:
     """
     Splits the weights into smaller shards.
 
     Args:
-        weights (dict): Model weights.
+        weights (Dict[str, mx.array]): Model weights.
         max_file_size_gb (int): Maximum size of each shard in gigabytes.
 
     Returns:
-        list: List of weight shards.
+        List[Dict[str, mx.array]]: List of weight shards.
     """
-    max_file_size_bytes = max_file_size_gb << 30
-    shards = []
-    shard, shard_size = {}, 0
+    max_file_size_bytes: int = max_file_size_gb << 30
+    shards: List[Dict[str, mx.array]] = []
+    shard: Dict[str, mx.array] = {}
+    shard_size: int = 0
     for k, v in weights.items():
         if shard_size + v.nbytes > max_file_size_bytes:
             shards.append(shard)
-            shard, shard_size = {}, 0
+            shard = {}
+            shard_size = 0
         shard[k] = v
         shard_size += v.nbytes
     shards.append(shard)
@@ -311,7 +316,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     from huggingface_hub import HfApi, ModelCard, logging
 
-    from . import __version__
+    from mlx_lm import __version__
 
     card = ModelCard.load(hf_path)
     card.data.library_name = "mlx"
@@ -372,33 +377,33 @@ def save_weights(
     *,
     donate_weights: bool = False,
 ) -> None:
-    """Save model weights into specified directory."""
     if isinstance(save_path, str):
         save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    shards = make_shards(weights)
-    shards_count = len(shards)
-    shard_file_format = (
+    shards: List[Dict[str, Any]] = make_shards(weights)
+    shards_count: int = len(shards)
+    shard_file_format: str = (
         "model-{:05d}-of-{:05d}.safetensors"
         if shards_count > 1
         else "model.safetensors"
     )
 
-    total_size = sum(v.nbytes for v in weights.values())
-    index_data = {"metadata": {"total_size": total_size}, "weight_map": {}}
+    total_size: int = sum(v.nbytes for v in weights.values())
+    index_data: Dict[str, Any] = {
+        "metadata": {"total_size": total_size},
+        "weight_map": {},
+    }
 
-    # Write the weights and make sure no references are kept other than the
-    # necessary ones
     if donate_weights:
         weights.clear()
         del weights
 
     for i in range(len(shards)):
-        shard = shards[i]
-        shards[i] = None
-        shard_name = shard_file_format.format(i + 1, shards_count)
-        shard_path = save_path / shard_name
+        shard: Dict[str, Any] = shards[i]
+        # Remove shards[i] = None
+        shard_name: str = shard_file_format.format(i + 1, shards_count)
+        shard_path: Path = save_path / shard_name
 
         mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 
@@ -411,11 +416,7 @@ def save_weights(
     }
 
     with open(save_path / "model.safetensors.index.json", "w") as f:
-        json.dump(
-            index_data,
-            f,
-            indent=4,
-        )
+        json.dump(index_data, f, indent=4)
 
 
 def quantize_model(

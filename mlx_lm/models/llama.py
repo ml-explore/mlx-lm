@@ -21,7 +21,7 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
-    num_key_value_heads: Optional[int] = None
+    num_key_value_heads: int = -1
     attention_bias: bool = False
     mlp_bias: bool = False
     rope_theta: float = 10000
@@ -31,7 +31,7 @@ class ModelArgs(BaseModelArgs):
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
+            self.num_key_value_heads = self.num_attention_heads  # Help mypy
 
 
 class Attention(nn.Module):

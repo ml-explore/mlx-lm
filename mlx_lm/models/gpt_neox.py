@@ -24,7 +24,7 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     rotary_emb_base: int
     rotary_pct: float
-    num_key_value_heads: int = None
+    num_key_value_heads: Optional[int] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
