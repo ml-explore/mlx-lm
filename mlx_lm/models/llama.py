@@ -31,7 +31,7 @@ class ModelArgs(BaseModelArgs):
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads  # Help mypy
+            self.num_key_value_heads = self.num_attention_heads
 
 
 class Attention(nn.Module):

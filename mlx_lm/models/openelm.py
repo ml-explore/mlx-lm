@@ -29,7 +29,7 @@ class ModelArgs(BaseModelArgs):
 
 def make_divisible(
     v: Union[float, int],
-    divisor: Optional[int] = 8,
+    divisor: int = 8,
     min_value: Optional[Union[float, int]] = None,
 ) -> Union[float, int]:
     """
@@ -44,8 +44,6 @@ def make_divisible(
     Returns:
         new_v: new divisible value
     """
-    if divisor is None:
-        raise ValueError("divisor must not be None")
     if min_value is None:
         min_value = divisor
     new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)

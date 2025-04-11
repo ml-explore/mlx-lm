@@ -20,7 +20,7 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     bias: bool = True
     max_position_embeddings: int = 32768
-    num_key_value_heads: Optional[int] = None
+    num_key_value_heads: int
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -87,9 +87,7 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = (
-            args.num_key_value_heads or args.num_attention_heads
-        )
+        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
         self.n_kv_groups = n_heads // n_kv_heads
 
         self.head_dim = head_dim = args.hidden_size // n_heads

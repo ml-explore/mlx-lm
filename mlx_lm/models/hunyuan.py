@@ -29,7 +29,7 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     rope_theta: float
     use_cla: bool
-    cla_share_factor: Literal[2]
+    cla_share_factor: int = 2
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
 
@@ -90,10 +90,11 @@ class Attention(nn.Module):
             self.query_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
             self.key_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
 
+        scaling_alpha = float(args.rope_scaling["alpha"]) if args.rope_scaling else 1.0
         self.rope = DynamicNTKAlphaRoPE(
             head_dim,
             base=args.rope_theta,
-            scaling_alpha=args.rope_scaling["alpha"],
+            scaling_alpha=scaling_alpha,
         )
 
     def __call__(
