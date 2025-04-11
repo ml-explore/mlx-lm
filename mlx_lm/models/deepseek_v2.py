@@ -38,7 +38,7 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
-    rope_scaling: Dict = None
+    rope_scaling: Optional[Dict[Any, Any]] = None
     attention_bias: bool = False
 
 
@@ -172,23 +172,27 @@ class DeepseekV2Attention(nn.Module):
             bias=config.attention_bias,
         )
 
-        mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-        scaling_factor = self.config.rope_scaling["factor"]
-        if mscale_all_dim:
-            mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-            self.scale = self.scale * mscale * mscale
+        if self.config.rope_scaling is not None:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.scale = self.scale * mscale * mscale
 
-        rope_kwargs = {
-            key: self.config.rope_scaling[key]
-            for key in [
-                "original_max_position_embeddings",
-                "beta_fast",
-                "beta_slow",
-                "mscale",
-                "mscale_all_dim",
-            ]
-            if key in self.config.rope_scaling
-        }
+            rope_kwargs = {
+                key: self.config.rope_scaling[key]
+                for key in [
+                    "original_max_position_embeddings",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                ]
+                if key in self.config.rope_scaling
+            }
+        else:
+            scaling_factor = 1.0
+            rope_kwargs = {}
         self.rope = DeepseekV2YarnRotaryEmbedding(
             dim=self.qk_rope_head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -244,7 +248,10 @@ class DeepseekV2Attention(nn.Module):
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
