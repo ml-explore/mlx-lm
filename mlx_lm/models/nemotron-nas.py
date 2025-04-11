@@ -1,8 +1,8 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -155,9 +155,6 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-
-        # Calculate num_kv_heads based on the layer's specific config
-        # Validation is done in ModelArgs.__post_init__ and AttentionConfig.__post_init__
         self.n_kv_heads = n_kv_heads = n_heads // attention_config.n_heads_in_group
 
         self.head_dim = head_dim = args.hidden_size // n_heads
@@ -190,10 +187,8 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        # Project Q, K, V
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Reshape for attention calculation
         queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -202,24 +197,17 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        # Apply RoPE, update cache if used
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
-            # update_and_fetch modifies cache in-place and returns full K/V sequence
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            # Apply RoPE without cache offset
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        # Compute scaled dot-product attention
-        # Pass cache object for potential optimizations (like quantization handling)
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
-
-        # Reshape output and apply final projection
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -244,7 +232,6 @@ class MLP(nn.Module):
             raise ValueError(f"Unknown activation function: {args.hidden_act}")
 
     def __call__(self, x) -> mx.array:
-        # Standard SwiGLU activation
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -309,26 +296,22 @@ class TransformerBlock(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,  # Expects the cache object for *this* layer
+        cache: Optional[Any] = None,
     ) -> mx.array:
 
         # Attention part (Input Norm -> Attention -> Residual)
         if self.self_attn is not None:
             residual = x
-            # Norm is always present if attention block is active (standard or linear)
             h = self.input_layernorm(x)
             attn_out = self.self_attn(h, mask=mask, cache=cache)
             x = residual + attn_out
-        # If self_attn is None (no_op), x remains unchanged
 
         # MLP part (Post-Attention Norm -> MLP -> Residual)
         if self.mlp is not None:
             residual = x
-            # Norm is always present if MLP block is active (standard or linear)
             h = self.post_attention_layernorm(x)
             mlp_out = self.mlp(h)
             x = residual + mlp_out
-        # If mlp is None (no_op), x remains unchanged
 
         return x
 
@@ -341,8 +324,6 @@ class NemotronNASModel(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
-        if not self.vocab_size > 0:
-            raise ValueError("vocab_size must be positive")
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             TransformerBlock(args=args, layer_idx=i)
@@ -353,84 +334,24 @@ class NemotronNASModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache: Optional[List[Any]] = None,  # Expects a list of caches, one per layer
+        mask: Optional[mx.array] = None,
+        cache: Optional[List[Any]] = None,
     ):
         h = self.embed_tokens(inputs)
 
-        # Mask creation needs a reference cache for offset/window size.
-        # Find the first non-None cache object in the list.
-        mask_cache_ref = next((c for c in (cache or []) if c is not None), None)
-        # Pass it as a list containing just that reference cache, or None if no caches exist.
-        mask = create_attention_mask(h, [mask_cache_ref] if mask_cache_ref else None)
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
-        # Handle cache initialization or validation
         if cache is None:
-            # Note: This creates a new cache on every call if cache is initially None.
-            # Consider if this behavior is desired or if cache should always be passed externally.
-            # cache = self.make_cache() # Option: create if None
-            cache = [None] * len(self.layers)  # Option: default to None list
-        elif not isinstance(cache, list) or len(cache) != len(self.layers):
-            raise ValueError(
-                f"Cache must be a list of length {len(self.layers)}, got {len(cache) if isinstance(cache, list) else type(cache)}"
-            )
+            cache = [None] * len(self.layers)
 
-        # Process layers, passing the corresponding cache object
         for i, layer in enumerate(self.layers):
             h = layer(h, mask, cache=cache[i])
 
-        # Apply final layer norm
         return self.norm(h)
-
-    @property
-    def n_kv_heads(self):
-        """Maximum n_kv_heads across layers. Used for potential compatibility
-        or estimating maximum cache size if needed externally.
-        Per-layer caching handles variable sizes internally."""
-        max_kv_heads = 0
-        for i, block_conf in enumerate(self.args.block_configs):
-            attn_conf = block_conf.attention
-            if not attn_conf.no_op and not attn_conf.replace_with_linear:
-                # Validation happens in ModelArgs.__post_init__
-                n_kv = self.args.num_attention_heads // attn_conf.n_heads_in_group
-                max_kv_heads = max(max_kv_heads, n_kv)
-        # Return 0 if no standard attention layers exist
-        return max_kv_heads
-
-    # Override make_cache to create per-layer caches correctly
-    def make_cache(self, max_kv_size: Optional[int] = None):
-        """Creates a list of KV caches, one for each layer, respecting layer-specific needs.
-        Cache quantization will be handled later by the generation utilities if requested.
-
-        Args:
-            max_kv_size: If provided, uses RotatingKVCache with this maximum size.
-        """
-        # Import locally to avoid potential circular dependency if cache.py were to import Model
-        from ..models.cache import KVCache, RotatingKVCache
-
-        caches = []
-        # Determine cache class based only on max_kv_size
-        cache_class = RotatingKVCache if max_kv_size else KVCache
-
-        # Set initialization arguments based on the chosen class
-        init_kwargs = {}
-        if max_kv_size:
-            # Default settings for RotatingKVCache (adjust keep if needed)
-            init_kwargs = {"max_size": max_kv_size, "keep": 4}
-        # No specific args needed for KVCache here
-
-        for block_conf in self.args.block_configs:
-            attn_conf = block_conf.attention
-            if not attn_conf.no_op and not attn_conf.replace_with_linear:
-                # Instantiate the non-quantized cache type
-                caches.append(cache_class(**init_kwargs))
-            else:
-                # Layer doesn't need a cache
-                caches.append(None)
-        return caches
 
 
 class Model(nn.Module):
-    """Top-level wrapper model, compatible with mlx-lm loading."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -440,43 +361,26 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         else:
-            self.lm_head = None  # Explicitly set to None if tied
+            self.lm_head = None
 
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,  # Accepts the list of caches
+        mask=None,
+        cache=None,
     ):
-        # Pass inputs and cache list to the core model
-        out = self.model(inputs, cache)
-        # Apply LM head or use tied embeddings
+        out = self.model(inputs, mask=mask, cache=cache)
         if self.args.tie_word_embeddings:
-            # Use the same embedding matrix for the final projection
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
         return out
 
     def sanitize(self, weights):
-        """Remove unnecessary weights, e.g., LM head if tied."""
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         return weights
 
-    def make_cache(self, max_kv_size: Optional[int] = None):
-        """Delegates cache creation to the underlying NemotronNASModel."""
-        return self.model.make_cache(max_kv_size=max_kv_size)
-
     @property
     def layers(self):
-        """Expose layers for potential external use (e.g., analysis, quantization)."""
         return self.model.layers
-
-    @property
-    def head_dim(self):
-        return self.args.hidden_size // self.args.num_attention_heads
-
-    @property
-    def n_kv_heads(self):
-        """Expose the *maximum* n_kv_heads for compatibility."""
-        return self.model.n_kv_heads
