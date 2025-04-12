@@ -621,8 +621,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "usage": {
                 "prompt_tokens": prompt_token_count,
                 "completion_tokens": completion_token_count,
-                "total_tokens": prompt_token_count
-                + completion_token_count,
+                "total_tokens": prompt_token_count + completion_token_count,
             },
         }
         return response

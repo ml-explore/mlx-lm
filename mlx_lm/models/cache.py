@@ -48,9 +48,7 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
     cache_data = dict(tree_flatten([c.state for c in cache]))
     cache_info = [c.meta_state for c in cache]
     cache_classes = [type(c).__name__ for c in cache]
-    cache_metadata = dict(
-        tree_flatten([cache_info, metadata, cache_classes])
-    )
+    cache_metadata = dict(tree_flatten([cache_info, metadata, cache_classes]))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
 
 
