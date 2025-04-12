@@ -74,12 +74,12 @@ def quant_args(arg):
 
 def convert(
     hf_path: str,
-    mlx_path: str = "mlx_model",
+    mlx_path: Union[str, Path] = "mlx_model",
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
     dtype: str = "float16",
-    upload_repo: str = None,
+    upload_repo: Optional[str] = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
     quant_predicate: Optional[

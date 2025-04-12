@@ -67,7 +67,7 @@ class HfVocab:
     def get_token_type(
         self, token_id: int, token_text: bytes, special_ids: Set[int]
     ) -> TokenType:
-        if re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", token_text):
+        if re.fullmatch(b"<0x[0-9A-Fa-f]{2}>", token_text):
             return TokenType.BYTE
         return TokenType.CONTROL if token_id in special_ids else TokenType.NORMAL
 
@@ -77,12 +77,14 @@ class HfVocab:
     def added_tokens(self) -> Iterable[Tuple[bytes, float, TokenType]]:
         for text in self.added_tokens_list:
             if text in self.specials:
-                toktype = self.get_token_type(self.specials[text], "", self.special_ids)
+                toktype = self.get_token_type(
+                    self.specials[text], text.encode("utf-8"), self.special_ids
+                )
                 score = self.get_token_score(self.specials[text])
             else:
                 toktype = TokenType.USER_DEFINED
                 score = -1000.0
-            yield text, score, toktype
+            yield text.encode("utf-8"), score, toktype
 
     def has_newline_token(self):
         return "<0x0A>" in self.tokenizer.vocab or "\n" in self.tokenizer.vocab
