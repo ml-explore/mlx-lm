@@ -359,8 +359,6 @@ def grpo_loss(
     if beta != 0.0:
         per_token_loss = per_token_loss + beta * kl_div
 
-    per_token_loss = per_token_loss * length_mask
-
     # Average over tokens
     loss = (
         per_token_loss * length_mask
@@ -404,7 +402,7 @@ def grpo_loss(
         "grouped_rewards_mean": mx.mean(grouped_rewards_mean),
         "grouped_rewards_std": mx.mean(grouped_rewards_std),
         "kl": mean_kl,
-        "average_generated_tokens": len(all_completion_texts[-1]) // len(batch_indices),
+        "average_generated_tokens": len(all_completion_texts) // len(batch_indices),
         **reward_metrics,
     }
 
