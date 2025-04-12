@@ -608,8 +608,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def completion_usage_response(
         self,
-        prompt_token_count: Optional[int] = None,
-        completion_token_count: Optional[int] = None,
+        prompt_token_count: int,
+        completion_token_count: int,
     ):
         response = {
             "id": self.request_id,
@@ -619,10 +619,10 @@ class APIHandler(BaseHTTPRequestHandler):
             "created": self.created,
             "choices": [],
             "usage": {
-                "prompt_tokens": prompt_token_count or 0,
-                "completion_tokens": completion_token_count or 0,
-                "total_tokens": (prompt_token_count or 0)
-                + (completion_token_count or 0),
+                "prompt_tokens": prompt_token_count,
+                "completion_tokens": completion_token_count,
+                "total_tokens": prompt_token_count
+                + completion_token_count,
             },
         }
         return response
