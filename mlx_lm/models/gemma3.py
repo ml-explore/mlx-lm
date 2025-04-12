@@ -8,7 +8,6 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from . import gemma3_text
-
 from .base import BaseModelArgs
 
 
