@@ -169,4 +169,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.merge...` directly is deprecated."
+        " Use `mlx_lm.merge...` or `python -m mlx_lm merge ...` instead."
+    )
     main()

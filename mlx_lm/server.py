@@ -797,4 +797,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.server...` directly is deprecated."
+        " Use `mlx_lm.server...` or `python -m mlx_lm server ...` instead."
+    )
     main()

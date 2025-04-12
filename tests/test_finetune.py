@@ -67,7 +67,7 @@ class TestLora(unittest.TestCase):
             )
             self.assertEqual(trainable_params, expected_trainable_parameters)
 
-        params = {"rank": 8, "alpha": 16, "dropout": 0.0, "scale": 10.0}
+        params = {"rank": 8, "dropout": 0.0, "scale": 10.0}
         check_config(params)
 
         params["rank"] = 1
@@ -108,7 +108,7 @@ class TestLora(unittest.TestCase):
         )
 
         num_lora_layers = 4
-        params = {"rank": 8, "alpha": 16, "dropout": 0.0, "scale": 10.0}
+        params = {"rank": 8, "dropout": 0.0, "scale": 10.0}
 
         model = gpt_neox.Model(args)
         model.freeze()

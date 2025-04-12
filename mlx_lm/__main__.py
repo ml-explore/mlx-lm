@@ -4,7 +4,18 @@ import importlib
 import sys
 
 if __name__ == "__main__":
-    subcommands = {"convert"}
+    subcommands = {
+        "cache_prompt",
+        "chat",
+        "convert",
+        "evaluate",
+        "fuse",
+        "generate",
+        "lora",
+        "merge",
+        "server",
+        "manage",
+    }
     if len(sys.argv) < 2:
         raise ValueError(f"CLI requires a subcommand in {subcommands}")
     subcommand = sys.argv.pop(1)

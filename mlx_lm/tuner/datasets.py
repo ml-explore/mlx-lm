@@ -121,12 +121,17 @@ class ConcatenatedDataset:
         self._len = sum(len(d) for d in self._data)
 
     def __getitem__(self, idx: int):
-        for data in self._data:
+        for data_idx, data in enumerate(self._data):
             j = idx - len(data)
             if j < 0:
                 break
             idx = j
-        return data[idx]
+        datum = data[idx]
+        datum["_dataset"] = data_idx
+        return datum
+
+    def process(self, d):
+        return self._data[d["_dataset"]].process(d)
 
     def __len__(self):
         return self._len
