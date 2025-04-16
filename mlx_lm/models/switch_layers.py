@@ -71,7 +71,7 @@ class QuantizedSwitchLinear(nn.Module):
     def num_experts(self):
         return self.weight.shape[0]
 
-    def __call__(self, x, indices):
+    def __call__(self, x, indices, sorted_indices=False):
         x = mx.gather_qmm(
             x,
             self["weight"],
@@ -81,6 +81,7 @@ class QuantizedSwitchLinear(nn.Module):
             transpose=True,
             group_size=self.group_size,
             bits=self.bits,
+            sorted_indices=sorted_indices,
         )
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
@@ -114,8 +115,13 @@ class SwitchLinear(nn.Module):
     def num_experts(self):
         return self.weight.shape[0]
 
-    def __call__(self, x, indices):
-        x = mx.gather_mm(x, self["weight"].swapaxes(-1, -2), rhs_indices=indices)
+    def __call__(self, x, indices, sorted_indices=False):
+        x = mx.gather_mm(
+            x,
+            self["weight"].swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
@@ -156,9 +162,11 @@ class SwitchGLU(nn.Module):
         if should_sort:
             x, idx, inv_order = _gather_sort(x, indices)
 
-        x_up = self.up_proj(x, idx)
-        x_gate = self.gate_proj(x, idx)
-        x = self.down_proj(self.activation(x_gate) * x_up, idx)
+        x_up = self.up_proj(x, idx, sorted_indices=should_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=should_sort)
+        x = self.down_proj(
+            self.activation(x_gate) * x_up, idx, sorted_indices=should_sort
+        )
 
         if should_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
@@ -190,9 +198,9 @@ class SwitchMLP(nn.Module):
         if should_sort:
             x, idx, inv_order = _gather_sort(x, indices)
 
-        x = self.fc1(x, idx)
+        x = self.fc1(x, idx, sorted_indices=should_sort)
         x = self.activation(x)
-        x = self.fc2(x, idx)
+        x = self.fc2(x, idx, sorted_indices=should_sort)
 
         if should_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
