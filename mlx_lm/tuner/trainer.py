@@ -207,6 +207,7 @@ def train(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
     training_callback: TrainingCallback = None,
+    start_step: int = 1,
 ):
     mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     print(f"Starting training..., iters: {args.iters}")
@@ -247,7 +248,7 @@ def train(
     train_time = 0
     # Main training loop
     for it, batch in zip(
-        range(1, args.iters + 1),
+        range(start_step, args.iters + 1),
         iterate_batches(
             dataset=train_dataset,
             tokenizer=tokenizer,
@@ -259,7 +260,7 @@ def train(
         tic = time.perf_counter()
         # Report validation loss if needed, the first validation loss
         # is always measured before any training.
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+        if it == start_step or it % args.steps_per_eval == 0 or it == args.iters:
             tic = time.perf_counter()
             val_loss = evaluate(
                 model=model,
@@ -339,11 +340,22 @@ def train(
         # Save adapter weights
         if it % args.steps_per_save == 0 and rank == 0:
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-            mx.save_safetensors(str(args.adapter_file), adapter_weights)
+
+            metadata = {
+                "iteration": str(it),
+                "trained_tokens": str(trained_tokens),
+                "loss": f"{train_loss:.6f}",
+            }
+
+            mx.save_safetensors(
+                str(args.adapter_file),
+                adapter_weights,
+                metadata=metadata,
+            )
             checkpoint = (
                 Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
             )
-            mx.save_safetensors(str(checkpoint), adapter_weights)
+            mx.save_safetensors(str(checkpoint), adapter_weights, metadata=metadata)
             print(
                 f"Iter {it}: Saved adapter weights to "
                 f"{args.adapter_file} and {checkpoint}."
@@ -352,5 +364,10 @@ def train(
     # Save final weights
     if rank == 0:
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-        mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        metadata = {
+            "iteration": str(args.iters),
+            "trained_tokens": str(trained_tokens),
+            "final": "true",
+        }
+        mx.save_safetensors(str(args.adapter_file), adapter_weights, metadata=metadata)
         print(f"Saved final weights to {args.adapter_file}.")
