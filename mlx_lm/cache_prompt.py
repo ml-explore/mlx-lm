@@ -159,4 +159,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.cache_prompt...` directly is deprecated."
+        " Use `mlx_lm.cache_prompt...` or `python -m mlx_lm cache_prompt ...` instead."
+    )
     main()

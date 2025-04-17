@@ -136,4 +136,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.manage...` directly is deprecated."
+        " Use `mlx_lm.manage...` or `python -m mlx_lm manage ...` instead."
+    )
     main()
