@@ -157,22 +157,20 @@ class SwitchGLU(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        # Decide whether it is worth sorting x to normalize the acces over the
-        # expert weights. If we also have many indices to multiply with inform
-        # the gather_qmm that the indices are sorted so it may route to a
-        # better kernel.
-        # TODO: This check should be in the gather_qmm
-        do_sort = x.size >= 64
-        batched_qmm = do_sort and indices.size // self.num_experts >= 8
+        # When we have many tokens, then sort them to make sure that the access
+        # of different experts is in order.
+        do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
 
-        x_up = self.up_proj(x, idx, sorted_indices=batched_qmm)
-        x_gate = self.gate_proj(x, idx, sorted_indices=batched_qmm)
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
-            self.activation(x_gate) * x_up, idx, sorted_indices=batched_qmm
+            self.activation(x_gate) * x_up,
+            idx,
+            sorted_indices=do_sort,
         )
 
         if do_sort:
@@ -200,21 +198,17 @@ class SwitchMLP(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        # Decide whether it is worth sorting x to normalize the acces over the
-        # expert weights. If we also have many indices to multiply with inform
-        # the gather_qmm that the indices are sorted so it may route to a
-        # better kernel.
-        # TODO: This check should be in the gather_qmm
-        do_sort = x.size >= 64
-        batched_qmm = do_sort and indices.size // self.num_experts >= 8
+        # When we have many tokens, then sort them to make sure that the access
+        # of different experts is in order.
+        do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
 
-        x = self.fc1(x, idx, sorted_indices=batched_qmm)
+        x = self.fc1(x, idx, sorted_indices=do_sort)
         x = self.activation(x)
-        x = self.fc2(x, idx, sorted_indices=batched_qmm)
+        x = self.fc2(x, idx, sorted_indices=do_sort)
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
