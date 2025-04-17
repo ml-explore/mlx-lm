@@ -22,8 +22,30 @@ from .utils import (
 
 
 def mixed_quant_predicate_builder(
-    low_bits: int = 4, high_bits: int = 4, group_size: int = 64
+    recipe: str, model: nn.Module
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
+
+    if recipe == "mixed_2_6":
+        low_bits = 2
+    elif recipe == "mixed_3_6":
+        low_bits = 3
+    elif recipe == "mixed_4_6":
+        low_bits = 4
+    else:
+        raise ValueError("Invalid quant recipe {recipe}")
+    high_bits = 6
+    group_size = 64
+
+    down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
+    if len(down_keys) == 0:
+        raise ValueError("Model does not have expected keys for mixed quant.")
+
+    # Look for the layer index location in the path:
+    for layer_location, k in enumerate(down_keys[0].split(".")):
+        if k.isdigit():
+            break
+    num_layers = len(model.layers)
+
     def mixed_quant_predicate(
         path: str,
         module: nn.Module,
@@ -37,9 +59,11 @@ def mixed_quant_predicate_builder(
         if not hasattr(module, "to_quantized"):
             return False
 
-        index = int(path.split(".")[2]) if len(path.split(".")) > 2 else 0
-
-        num_layers = config["num_hidden_layers"]
+        index = (
+            int(path.split(".")[layer_location])
+            if len(path.split(".")) > layer_location
+            else 0
+        )
         use_more_bits = (
             index < num_layers // 8
             or index >= 7 * num_layers // 8
@@ -57,19 +81,7 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-QUANT_RECIPES = {
-    "mixed_2_6": mixed_quant_predicate_builder(low_bits=3, high_bits=6),
-    "mixed_3_6": mixed_quant_predicate_builder(low_bits=2, high_bits=6),
-}
-
-
-def quant_args(arg):
-    if arg not in QUANT_RECIPES:
-        raise argparse.ArgumentTypeError(
-            f"Invalid q-recipe {arg!r}. Choose from: {list(QUANT_RECIPES.keys())}"
-        )
-    else:
-        return QUANT_RECIPES[arg]
+QUANT_RECIPES = ["mixed_2_6", "mixed_3_6", "mixed_4_6"]
 
 
 def convert(
@@ -83,7 +95,7 @@ def convert(
     revision: Optional[str] = None,
     dequantize: bool = False,
     quant_predicate: Optional[
-        Callable[[str, nn.Module, dict], Union[bool, dict]]
+        Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
 ):
     # Check the save path is empty
@@ -100,9 +112,18 @@ def convert(
     model_path = get_model_path(hf_path, revision=revision)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
+    if isinstance(quant_predicate, str):
+        quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
+
     weights = dict(tree_flatten(model.parameters()))
     dtype = getattr(mx, dtype)
-    weights = {k: v.astype(dtype) for k, v in weights.items()}
+    if hasattr(model, "cast_predicate"):
+        cast_predicate = model.cast_predicate()
+    else:
+        cast_predicate = lambda _: True
+    weights = {
+        k: v.astype(dtype) if cast_predicate(k) else v for k, v in weights.items()
+    }
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -160,8 +181,9 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe. Choices: {list(QUANT_RECIPES.keys())}",
-        type=quant_args,
+        help=f"Mixed-bit quantization recipe.",
+        choices=QUANT_RECIPES,
+        type=str,
         required=False,
     )
     parser.add_argument(

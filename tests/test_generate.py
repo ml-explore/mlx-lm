@@ -66,11 +66,15 @@ class TestGenerate(unittest.TestCase):
 
         # make a determinate sampler
         sampler = make_sampler(temp=0.0)
+        messages = [{"role": "user", "content": "hello"}]
+        prompt = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True
+        )
 
         for generation_result in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
-            prompt="hello",
+            prompt=prompt,
             max_tokens=5,
             draft_model=draft_model,
             num_draft_tokens=2,
@@ -79,7 +83,8 @@ class TestGenerate(unittest.TestCase):
             drafted.append(generation_result.from_draft)
             results.append(generation_result)
 
-        self.assertEqual(len(results), 5)
+        self.assertEqual(len(results), 6)
+        drafted.pop()
         # since num_draft_tokens is 2 and draft model is the same, the
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts

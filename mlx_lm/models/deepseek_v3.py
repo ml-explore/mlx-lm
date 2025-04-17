@@ -97,9 +97,7 @@ class DeepseekV3YarnRotaryEmbedding(nn.Module):
             scaling_factor, mscale_all_dim
         )
         freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-        freq_inter = scaling_factor * base ** (
-            mx.arange(0, dim, 2, dtype=mx.float32) / dim
-        )
+        freq_inter = scaling_factor * freq_extra
         low, high = yarn_find_correction_range(
             beta_fast,
             beta_slow,
@@ -157,7 +155,7 @@ class DeepseekV3Attention(nn.Module):
             self.q_a_proj = nn.Linear(
                 self.hidden_size, self.q_lora_rank, bias=config.attention_bias
             )
-            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
@@ -167,7 +165,7 @@ class DeepseekV3Attention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank)
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads
@@ -291,6 +289,7 @@ def group_expert_select(
 
     k = top_k
     scores = mx.sigmoid(gates.astype(mx.float32))
+    orig_scores = scores
     scores = scores + e_score_correction_bias
     scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
     group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
@@ -301,9 +300,9 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    scores = mx.take_along_axis(scores, inds, axis=-1)
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
+        denominator = scores.sum(axis=-1, keepdims=True)
         scores = scores / denominator
     scores = scores * routed_scaling_factor
 
@@ -437,8 +436,6 @@ class DeepseekV3Model(nn.Module):
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
-        # Hack to avoid time-outs during prompt-processing
-        dist_stream = mx.cpu if h.shape[1] > 1 else mx.gpu
         if mask is None:
             mask = create_attention_mask(h, cache)
 
@@ -448,19 +445,17 @@ class DeepseekV3Model(nn.Module):
         # Receive from the previous process in the pipeline
 
         if pipeline_rank < pipeline_size - 1:
-            h = mx.distributed.recv_like(h, (pipeline_rank + 1), stream=dist_stream)
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for i in range(self.num_layers):
             h = self.layers[self.start_idx + i](h, mask, cache[i])
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
-            h = mx.distributed.send(
-                h, (pipeline_rank - 1) % pipeline_size, stream=dist_stream
-            )
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
 
         # Broadcast h while keeping it in the graph
-        h = mx.distributed.all_gather(h, stream=dist_stream)[: h.shape[0]]
+        h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -484,6 +479,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):
+            dtype = weight.dtype
             bs = 128  # block size
             m, n = weight.shape
             pad_bottom = (-m) % bs
@@ -492,11 +488,10 @@ class Model(nn.Module):
             weight = weight.reshape(
                 ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
             )
-            scale_inv = scale_inv.astype(weight.dtype)
             weight = (weight * scale_inv[:, None, :, None]).reshape(
                 m + pad_bottom, n + pad_side
             )
-            return weight[:m, :n]
+            return weight[:m, :n].astype(dtype)
 
         # Dequantize
         new_weights = {}
@@ -533,3 +528,9 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers[self.model.start_idx : self.model.end_idx]
+
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate

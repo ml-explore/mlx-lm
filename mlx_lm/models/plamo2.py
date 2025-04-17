@@ -53,16 +53,6 @@ class RMSNorm(nn.Module):
         )
 
 
-def _rms_norm(hidden_states: mx.array, eps: float) -> mx.array:
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.astype(mx.float32)
-    variance = mx.power(hidden_states, 2).mean(-1, keepdims=True)
-    hidden_states = hidden_states * mx.rsqrt(variance + eps)
-    hidden_states = hidden_states.astype(input_dtype)
-
-    return hidden_states
-
-
 def get_initial_dt_bias(num_heads: int) -> mx.array:
     dt_min = 0.001
     dt_max = 0.1
@@ -401,8 +391,8 @@ class Attention(nn.Module):
         k = k.reshape(B, T, self.k_num_heads, self.qk_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.v_num_heads, self.v_dim).transpose(0, 2, 1, 3)
 
-        q = _rms_norm(q, 1e-6) * self.q_weight[:, None]
-        k = _rms_norm(k, 1e-6) * self.k_weight[:, None]
+        q = mx.fast.rms_norm(q, weight=None, eps=1e-6) * self.q_weight[:, None]
+        k = mx.fast.rms_norm(k, weight=None, eps=1e-6) * self.k_weight[:, None]
 
         if cache is not None:
             q = self.rope(q, offset=cache.offset)
