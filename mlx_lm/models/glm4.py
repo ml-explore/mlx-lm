@@ -31,7 +31,9 @@ class ModelArgs(BaseModelArgs):
 class Glm4MLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_up_proj = nn.Linear(args.hidden_size, 2 * args.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(
+            args.hidden_size, 2 * args.intermediate_size, bias=False
+        )
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
     def __call__(self, x) -> mx.array:
@@ -44,33 +46,38 @@ class Glm4Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
-        self.head_dim = getattr(args, "head_dim", args.hidden_size // args.num_attention_heads)
+        self.head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
         self.n_heads = args.num_attention_heads
         self.n_kv_heads = args.num_key_value_heads
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
-            args.hidden_size, args.num_attention_heads * self.head_dim, bias=args.attention_bias
+            args.hidden_size,
+            args.num_attention_heads * self.head_dim,
+            bias=args.attention_bias,
         )
         self.k_proj = nn.Linear(
-            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=args.attention_bias
+            args.hidden_size,
+            args.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
         )
         self.v_proj = nn.Linear(
-            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=args.attention_bias
+            args.hidden_size,
+            args.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
         )
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
 
         self.rope = nn.RoPE(
-            dims=self.head_dim,
-            base=args.rope_theta,
-            traditional=args.rope_traditional
+            dims=self.head_dim, base=args.rope_theta, traditional=args.rope_traditional
         )
 
     def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None
+        self, x: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -95,7 +102,7 @@ class Glm4Attention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-    
+
 
 class Glm4DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -104,17 +111,20 @@ class Glm4DecoderLayer(nn.Module):
 
         self.mlp = Glm4MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_self_attn_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_self_attn_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         self.post_mlp_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None
+        self, x: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None
     ) -> mx.array:
-        x = x + self.post_self_attn_layernorm(self.self_attn(self.input_layernorm(x), mask, cache))
+        x = x + self.post_self_attn_layernorm(
+            self.self_attn(self.input_layernorm(x), mask, cache)
+        )
         residual = x
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
@@ -136,7 +146,7 @@ class Glm4Model(nn.Module):
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None
+        cache: Optional[Any] = None,
     ):
         h = self.embed_tokens(inputs)
 
@@ -150,7 +160,7 @@ class Glm4Model(nn.Module):
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
-    
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -164,7 +174,7 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None
+        cache: Optional[Any] = None,
     ):
         out = self.model(inputs, mask, cache)
         return self.lm_head(out)
