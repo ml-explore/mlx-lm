@@ -7,7 +7,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 
 
 @dataclass
@@ -45,7 +44,6 @@ class Glm4MLP(nn.Module):
 class Glm4Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = args
         self.head_dim = getattr(
             args, "head_dim", args.hidden_size // args.num_attention_heads
         )
@@ -83,7 +81,6 @@ class Glm4Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -178,12 +175,6 @@ class Model(nn.Module):
     ):
         out = self.model(inputs, mask, cache)
         return self.lm_head(out)
-
-    # def sanitize(self, weights):
-    #     weights = {
-    #         k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-    #     }
-    #     return weights
 
     @property
     def layers(self):
