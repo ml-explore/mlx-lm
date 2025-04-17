@@ -1,5 +1,4 @@
 # Copyright © 2023-2024 Apple Inc.
-
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
@@ -24,7 +23,7 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
-    rope_theta: float = 10000
+    rope_theta: float = 50000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
@@ -33,12 +32,6 @@ class ModelArgs(BaseModelArgs):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
-
-import mlx.core as mx
-import mlx.nn as nn
-import logging
-
-logger = logging.getLogger(__name__)
 
 # the weights are ternary so can be represented with 2 bits, and they are packed in uint8 tensors, hence the number of values per item is 4
 VALUES_PER_ITEM = 4
@@ -327,6 +320,8 @@ class Attention(nn.Module):
 
         return output
 
+def relu2(x):
+    return mx.square(nn.relu(x))
 
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -345,7 +340,7 @@ class MLP(nn.Module):
         self.ffn_sub_norm = nn.RMSNorm(args.intermediate_size, eps=args.rms_norm_eps)
 
     def __call__(self, x) -> mx.array:
-        x = nn.silu(self.gate_proj(x)) * self.up_proj(x)
+        x = relu2(self.gate_proj(x)) * self.up_proj(x)
         x = self.ffn_sub_norm(x)
         x = self.down_proj(x)
         return x
@@ -370,6 +365,7 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
