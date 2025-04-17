@@ -33,10 +33,10 @@ class ModelArgs(BaseModelArgs):
 
 
 class Glm4MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_up_proj = nn.Linear(dim, 2 * hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.gate_up_proj = nn.Linear(args.hidden_size, 2 * args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
     def __call__(self, x) -> mx.array:
         x = self.gate_up_proj(x)
@@ -49,8 +49,9 @@ class Glm4Attention(nn.Module):
         super().__init__()
         self.args = args
         self.head_dim = getattr(args, "head_dim", args.hidden_size // args.num_attention_heads)
-        self.num_key_value_groups = args.num_attention_heads // args.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
+        self.n_heads = args.num_attention_heads
+        self.n_kv_heads = args.num_key_value_heads
+        self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
             args.hidden_size, args.num_attention_heads * self.head_dim, bias=args.attention_bias
@@ -67,6 +68,7 @@ class Glm4Attention(nn.Module):
             self.head_dim,
             args.rope_theta,
             args.rope_traditional,
+            None,
             args.max_position_embeddings,
         )
 
