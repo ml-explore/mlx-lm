@@ -468,4 +468,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.lora...` directly is deprecated."
+        " Use `mlx_lm.lora...` or `python -m mlx_lm lora ...` instead."
+    )
     main()
