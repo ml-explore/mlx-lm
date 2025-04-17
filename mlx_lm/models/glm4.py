@@ -13,23 +13,19 @@ from .rope_utils import initialize_rope
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
-    hidden_size: int = 6144
-    num_hidden_layers: int = 61
-    intermediate_size: int = 23040
-    num_attention_heads: int = 48
-    head_dim: int = 128
-    rms_norm_eps: float = 1e-05
-    vocab_size: int = 151552
-    num_key_value_heads: int = 2
-    partial_rotary_factor: float = 0.5
-    rope_traditional: bool = False
-    rope_theta: float = 10000.0
-    query_pre_attn_scalar: float = 256
-    sliding_window: int = 512
-    sliding_window_pattern: int = 6
+    hidden_size: int
+    num_hidden_layers: int
+    intermediate_size: int
+    num_attention_heads: int
+    attention_bias: bool
+    head_dim: int
+    rms_norm_eps: float
+    vocab_size: int
+    num_key_value_heads: int
+    partial_rotary_factor: float
+    rope_theta: float
+    rope_traditional: bool = True
     max_position_embeddings: int = 32768
-    tie_word_embeddings: bool = False
-    attention_bias: bool = False
 
 
 class Glm4MLP(nn.Module):
@@ -40,8 +36,8 @@ class Glm4MLP(nn.Module):
 
     def __call__(self, x) -> mx.array:
         x = self.gate_up_proj(x)
-        gate, x = mx.split(x, 2, axis=-1)
-        return self.down_proj(nn.silu(gate) * x)
+        gate, up_states = mx.split(x, 2, axis=-1)
+        return self.down_proj(nn.silu(gate) * up_states)
 
 
 class Glm4Attention(nn.Module):
@@ -64,12 +60,10 @@ class Glm4Attention(nn.Module):
         )
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
 
-        self.rope = initialize_rope(
-            self.head_dim,
-            args.rope_theta,
-            args.rope_traditional,
-            None,
-            args.max_position_embeddings,
+        self.rope = nn.RoPE(
+            dims=self.head_dim,
+            base=args.rope_theta,
+            traditional=args.rope_traditional
         )
 
     def __call__(
@@ -121,7 +115,11 @@ class Glm4DecoderLayer(nn.Module):
         cache: Optional[Any] = None
     ) -> mx.array:
         x = x + self.post_self_attn_layernorm(self.self_attn(self.input_layernorm(x), mask, cache))
-        x = x + self.post_mlp_layernorm(self.mlp(self.post_attention_layernorm(x)))
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = self.post_mlp_layernorm(x)
+        x = x + residual
         return x
 
 
@@ -171,11 +169,11 @@ class Model(nn.Module):
         out = self.model(inputs, mask, cache)
         return self.lm_head(out)
 
-    def sanitize(self, weights):
-        weights = {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
-        return weights
+    # def sanitize(self, weights):
+    #     weights = {
+    #         k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+    #     }
+    #     return weights
 
     @property
     def layers(self):
