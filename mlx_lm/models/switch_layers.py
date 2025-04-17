@@ -152,7 +152,6 @@ class SwitchGLU(nn.Module):
         self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
-        self.num_experts = num_experts
 
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
@@ -193,7 +192,6 @@ class SwitchMLP(nn.Module):
         self.fc1 = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
         self.fc2 = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
-        self.num_experts = num_experts
 
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
