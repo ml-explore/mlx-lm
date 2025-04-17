@@ -70,14 +70,13 @@ def default_loss(model, batch, lengths):
     targets = batch[:, 1:]
 
     logits = model(inputs)
-    logits = logits.astype(mx.float32)
 
     steps = mx.arange(1, targets.shape[1] + 1)
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
 
     ce = nn.losses.cross_entropy(logits, targets) * mask
     ntoks = mask.sum()
-    ce = ce.sum() / ntoks
+    ce = ce.astype(mx.float32).sum() / ntoks
 
     return ce, ntoks
 
