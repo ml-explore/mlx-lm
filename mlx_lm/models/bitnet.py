@@ -1,4 +1,5 @@
 # Copyright © 2023-2024 Apple Inc.
+
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
@@ -23,7 +24,7 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
-    rope_theta: float = 50000
+    rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
@@ -32,6 +33,12 @@ class ModelArgs(BaseModelArgs):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
+
+import mlx.core as mx
+import mlx.nn as nn
+import logging
+
+logger = logging.getLogger(__name__)
 
 # the weights are ternary so can be represented with 2 bits, and they are packed in uint8 tensors, hence the number of values per item is 4
 VALUES_PER_ITEM = 4
@@ -238,17 +245,18 @@ class BitLinear(nn.Module):
         # Unpack the quantized weights
         w_quant = unpack_weights(self.weight, dtype=self.dtype)
 
-        # Quantize the input
-        input_quant, input_scale = self.activation_quant(x)
+        # # Quantize the input
+        # input_quant, input_scale = self.activation_quant(x)
 
-        # Convert to same dtype for matrix multiplication
-        input_quant = input_quant.astype(self.dtype)
+        # # # Convert to same dtype for matrix multiplication
+        # input_quant = input_quant.astype(self.dtype)
 
         # Perform the linear transformation
-        y = mx.matmul(input_quant, w_quant.T)
+        # y = mx.matmul(input_quant, w_quant.T)
+        y = mx.matmul(x, w_quant.T)
 
         # Rescale the output
-        y = self.post_quant_process(y, self.weight_scale, input_scale)
+        # y = self.post_quant_process(y, self.weight_scale, input_scale)
 
         # Add bias if present
         if self.bias is not None:
