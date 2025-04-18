@@ -9,6 +9,7 @@ import mlx.core as mx
 
 from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import (
+    ChunkedKVCache,
     KVCache,
     MambaCache,
     QuantizedKVCache,
@@ -95,7 +96,13 @@ class TestPromptCache(unittest.TestCase):
     def test_save_load_mixed_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
-        cache = [MambaCache(), KVCache(), RotatingKVCache(8), MambaCache()]
+        cache = [
+            MambaCache(),
+            KVCache(),
+            RotatingKVCache(8),
+            MambaCache(),
+            ChunkedKVCache(256),
+        ]
         for c in cache:
             if isinstance(c, MambaCache):
                 c[0] = mx.random.uniform(shape=(4, 4, 4))

@@ -148,7 +148,7 @@ class DeepseekV2Attention(nn.Module):
             self.q_a_proj = nn.Linear(
                 self.hidden_size, self.q_lora_rank, bias=config.attention_bias
             )
-            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
@@ -158,7 +158,7 @@ class DeepseekV2Attention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank)
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads
@@ -360,8 +360,6 @@ class DeepseekV2Model(nn.Module):
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
-        # Hack to avoid time-outs during prompt-processing
-        dist_stream = mx.cpu if h.shape[1] > 1 else mx.gpu
         if mask is None:
             mask = create_attention_mask(h, cache)
 
@@ -370,19 +368,17 @@ class DeepseekV2Model(nn.Module):
 
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
-            h = mx.distributed.recv_like(h, (pipeline_rank + 1), stream=dist_stream)
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for i in range(self.num_layers):
             h = self.layers[self.start_idx + i](h, mask, cache[i])
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
-            h = mx.distributed.send(
-                h, (pipeline_rank - 1) % pipeline_size, stream=dist_stream
-            )
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
 
         # Broadcast h while keeping it in the graph
-        h = mx.distributed.all_gather(h, stream=dist_stream)[: h.shape[0]]
+        h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
