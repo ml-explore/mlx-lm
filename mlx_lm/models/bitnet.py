@@ -34,12 +34,6 @@ class ModelArgs(BaseModelArgs):
             self.num_key_value_heads = self.num_attention_heads
 
 
-import mlx.core as mx
-import mlx.nn as nn
-import logging
-
-logger = logging.getLogger(__name__)
-
 # the weights are ternary so can be represented with 2 bits, and they are packed in uint8 tensors, hence the number of values per item is 4
 VALUES_PER_ITEM = 4
 
