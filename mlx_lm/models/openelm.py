@@ -29,7 +29,7 @@ class ModelArgs(BaseModelArgs):
 
 def make_divisible(
     v: Union[float, int],
-    divisor: Optional[int] = 8,
+    divisor: int = 8,
     min_value: Optional[Union[float, int]] = None,
 ) -> Union[float, int]:
     """
