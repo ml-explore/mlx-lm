@@ -215,9 +215,34 @@ def train_model(
         raise ValueError(f"Received unknown fine-tune-type {args.fine_tune_type}")
 
     # Resume from weights if provided
+    start_iteration = 1
     if args.resume_adapter_file is not None:
-        print(f"Loading fine-tuned weights from {args.resume_adapter_file}")
+        adapter_file = Path(args.resume_adapter_file)
+        if adapter_file.is_dir():
+            safetensor_files = sorted(
+                adapter_file.glob("*_adapters.safetensors"),
+                key=lambda f: int(f.name.split("_")[0]),
+                reverse=True,
+            )
+            if not safetensor_files:
+                raise ValueError("No adapter files found to resume from.")
+            latest = safetensor_files[0]
+            print(f"Auto-resuming from latest adapter file: {latest}")
+            args.resume_adapter_file = str(latest)
+        else:
+            print(f"Resuming from: {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
+
+        # Log resume state and extract iteration
+        from safetensors.numpy import safe_open
+
+        with safe_open(args.resume_adapter_file, framework="numpy") as f:
+            metadata = dict(f.metadata())
+            print("✅ Resuming from checkpoint:")
+            print("  Metadata:", metadata)
+            if "iteration" in metadata:
+                start_iteration = int(metadata["iteration"]) + 1
+                print(f"  Continuing from iteration {start_iteration}")
 
     print_trainable_parameters(model)
 
@@ -264,6 +289,7 @@ def train_model(
         train_dataset=train_set,
         val_dataset=valid_set,
         training_callback=training_callback,
+        start_step=start_iteration,
     )
 
 
