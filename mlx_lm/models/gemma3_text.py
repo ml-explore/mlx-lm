@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -117,6 +118,16 @@ class MLP(nn.Module):
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
 
 
+@partial(mx.compile, shapeless=True)
+def clip_residual(x, y):
+    if x.dtype != mx.float16:
+        return x + y
+    bound = mx.finfo(mx.float16).max
+    return mx.clip(x.astype(mx.float32) + y.astype(mx.float32), -bound, bound).astype(
+        mx.float16
+    )
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -140,9 +151,9 @@ class TransformerBlock(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + self.post_attention_layernorm(r)
+        h = clip_residual(x, self.post_attention_layernorm(r))
         r = self.mlp(self.pre_feedforward_layernorm(h))
-        out = h + self.post_feedforward_layernorm(r)
+        out = clip_residual(h, self.post_feedforward_layernorm(r))
         return out
 
 
