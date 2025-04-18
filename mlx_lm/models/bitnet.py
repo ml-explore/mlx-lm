@@ -201,7 +201,7 @@ class BitLinear(nn.Module):
 
         return result.astype(mx.int8), scale
 
-    def post_quant_process(self, x, weight_scale, input_scale):
+    def post_quant_process(self, x, input_scale, weight_scale=None):
         """
         Rescales the output after quantized matrix multiplication.
 
@@ -219,7 +219,8 @@ class BitLinear(nn.Module):
         mx.array
             Rescaled output.
         """
-        return x / (input_scale * weight_scale)
+        scale = input_scale * weight_scale if weight_scale is not None else input_scale
+        return x / scale
 
     def __call__(self, x):
         """
@@ -239,17 +240,16 @@ class BitLinear(nn.Module):
         w_quant = unpack_weights(self.weight, dtype=self.dtype)
 
         # # Quantize the input
-        # input_quant, input_scale = self.activation_quant(x)
+        input_quant, input_scale = self.activation_quant(x)
 
         # # # Convert to same dtype for matrix multiplication
-        # input_quant = input_quant.astype(self.dtype)
+        input_quant = input_quant.astype(self.dtype)
 
         # Perform the linear transformation
-        # y = mx.matmul(input_quant, w_quant.T)
-        y = mx.matmul(x, w_quant.T)
+        y = mx.matmul(input_quant, w_quant.T)
 
         # Rescale the output
-        # y = self.post_quant_process(y, self.weight_scale, input_scale)
+        y = self.post_quant_process(y, input_scale=input_scale)
 
         # Add bias if present
         if self.bias is not None:
