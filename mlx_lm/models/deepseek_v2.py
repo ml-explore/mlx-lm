@@ -38,7 +38,7 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
-    rope_scaling: Optional[Dict[Any, Any]] = None
+    rope_scaling: Dict[Any, Any] = {}
     attention_bias: bool = False
 
 
@@ -172,27 +172,24 @@ class DeepseekV2Attention(nn.Module):
             bias=config.attention_bias,
         )
 
-        if self.config.rope_scaling is not None:
-            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = self.config.rope_scaling["factor"]
-            if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.scale = self.scale * mscale * mscale
+        mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+        scaling_factor = self.config.rope_scaling["factor"]
+        if mscale_all_dim:
+            mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+            self.scale = self.scale * mscale * mscale
 
-            rope_kwargs = {
-                key: self.config.rope_scaling[key]
-                for key in [
-                    "original_max_position_embeddings",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                ]
-                if key in self.config.rope_scaling
-            }
-        else:
-            scaling_factor = 1.0
-            rope_kwargs = {}
+        rope_kwargs = {
+            key: self.config.rope_scaling[key]
+            for key in [
+                "original_max_position_embeddings",
+                "beta_fast",
+                "beta_slow",
+                "mscale",
+                "mscale_all_dim",
+            ]
+            if key in self.config.rope_scaling
+        }
+
         self.rope = DeepseekV2YarnRotaryEmbedding(
             dim=self.qk_rope_head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -200,50 +197,6 @@ class DeepseekV2Attention(nn.Module):
             base=self.rope_theta,
             **rope_kwargs,
         )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, D = x.shape
-
-        if self.q_lora_rank is None:
-            q = self.q_proj(x)
-        else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
-
-        q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-        q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
-        compressed_kv = self.kv_a_proj_with_mqa(x)
-        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
-        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
-
-        if cache is not None:
-            q_pe = self.rope(q_pe, cache.offset)
-            k_pe = self.rope(k_pe, cache.offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache.update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), values
-            )
-        else:
-            q_pe = self.rope(q_pe)
-            k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
-
-        queries = mx.concatenate([q_nope, q_pe], axis=-1)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
 
 
 class DeepseekV2MLP(nn.Module):

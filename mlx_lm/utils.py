@@ -291,7 +291,8 @@ def make_shards(
     max_file_size_bytes = max_file_size_gb << 30
     shards = []
     shard = {}
-    shard_size: int = 0
+    shard_size = 0
+
     for k, v in weights.items():
         if shard_size + v.nbytes > max_file_size_bytes:
             shards.append(shard)
@@ -389,6 +390,8 @@ def save_weights(
         else "model.safetensors"
     )
 
+    # Write the weights and make sure no references are kept other than the
+    # necessary ones
     total_size = sum(v.nbytes for v in weights.values())
     index_data = {
         "metadata": {"total_size": total_size},
@@ -401,6 +404,7 @@ def save_weights(
 
     for i in range(len(shards)):
         shard = shards[i]
+        shards[i] = None
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
 

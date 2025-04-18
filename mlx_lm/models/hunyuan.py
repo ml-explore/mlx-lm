@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,7 +30,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     use_cla: bool
     cla_share_factor: int = 2
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_scaling: Dict[str, Union[float, str]] = {}
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
@@ -71,7 +71,6 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
         head_dim = args.hidden_size // n_heads
@@ -90,7 +89,8 @@ class Attention(nn.Module):
             self.query_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
             self.key_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
 
-        scaling_alpha = float(args.rope_scaling["alpha"]) if args.rope_scaling else 1.0
+        # Since rope_scaling is required, no need for a conditional check
+        scaling_alpha = float(args.rope_scaling["alpha"])
         self.rope = DynamicNTKAlphaRoPE(
             head_dim,
             base=args.rope_theta,

@@ -57,9 +57,9 @@ def make_sampler(
 
 
 def make_logits_processors(
-    logit_bias: Optional[Dict[int, float]] = None,
-    repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = 20,
+    logit_bias: Dict[int, float] = None,
+    repetition_penalty: float = None,
+    repetition_context_size: int = 20,  # No longer optional
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -67,7 +67,7 @@ def make_logits_processors(
     Args:
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
-        repetition_context_size (int, optional): The number of tokens to
+        repetition_context_size (int): The number of tokens to
           consider for repetition penalty. Default: ``20``.
         logit_bias (dictionary, optional): Additive logit bias.
 
@@ -89,11 +89,8 @@ def make_logits_processors(
         logits_processors.append(logit_bias_processor)
 
     if repetition_penalty and repetition_penalty != 0.0:
-        context_size = (
-            repetition_context_size if repetition_context_size is not None else 20
-        )
         logits_processors.append(
-            make_repetition_penalty(repetition_penalty, context_size)
+            make_repetition_penalty(repetition_penalty, repetition_context_size)
         )
     return logits_processors
 

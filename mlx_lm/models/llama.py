@@ -21,12 +21,12 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
-    num_key_value_heads: int = -1
+    num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
     rope_theta: float = 10000
     rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_scaling: Dict[str, Union[float, str]] = {}
     tie_word_embeddings: bool = True
 
     def __post_init__(self):

@@ -532,12 +532,16 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
-                top_indices = sorted_indices[: self.logprobs]
-                top_logprobs = logprobs[top_indices]
+                top_indices = sorted_indices[
+                    : self.logprobs
+                ].tolist()  # Convert to Python list
+                top_logprobs = logprobs[top_indices].tolist()  # Convert to Python list
                 top_tokens.append(
                     {
                         int(idx): float(prob)
-                        for idx, prob in zip(top_indices, top_logprobs)
+                        for idx, prob in zip(
+                            top_indices, top_logprobs
+                        )  # Iterate over Python lists
                     }
                 )
 
@@ -719,8 +723,8 @@ def run(
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
-    server_class.address_family, _, _, _, server_address_full = next(iter(infos))
-    server_address = server_address_full[:2]
+    server_class.address_family, _, _, _, server_address = next(iter(infos))
+    server_address = server_address[:2]
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(
