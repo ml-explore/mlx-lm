@@ -123,10 +123,9 @@ class Glm4DecoderLayer(nn.Module):
             self.self_attn(self.input_layernorm(x), mask, cache)
         )
         residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
-        x = self.post_mlp_layernorm(x)
-        x = x + residual
+        x = self.post_mlp_layernorm(
+            self.mlp(self.post_attention_layernorm(x))
+        ) + residual
         return x
 
 
