@@ -71,7 +71,9 @@ class Glm4Attention(nn.Module):
         )
 
         self.rope = nn.RoPE(
-            dims=int(self.head_dim * args.partial_rotary_factor), base=args.rope_theta, traditional=args.rope_traditional
+            dims=int(self.head_dim * args.partial_rotary_factor),
+            base=args.rope_theta,
+            traditional=args.rope_traditional,
         )
 
     def __call__(
@@ -123,9 +125,10 @@ class Glm4DecoderLayer(nn.Module):
             self.self_attn(self.input_layernorm(x), mask, cache)
         )
         residual = x
-        x = self.post_mlp_layernorm(
-            self.mlp(self.post_attention_layernorm(x))
-        ) + residual
+        x = (
+            self.post_mlp_layernorm(self.mlp(self.post_attention_layernorm(x)))
+            + residual
+        )
         return x
 
 
