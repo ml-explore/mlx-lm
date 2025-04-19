@@ -1,4 +1,5 @@
 import json
+from json import JSONDecodeError
 from functools import partial
 from typing import List
 
@@ -353,7 +354,11 @@ def load_tokenizer(model_path, tokenizer_config_extra={}, return_tokenizer=True,
     tokenizer_file = model_path / "tokenizer.json"
     if tokenizer_file.exists():
         with open(tokenizer_file, "r", encoding="utf-8") as fid:
-            tokenizer_content = json.load(fid)
+            try:
+                tokenizer_content = json.load(fid)
+            except JSONDecodeError as e:
+                raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
+
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = SPMStreamingDetokenizer
