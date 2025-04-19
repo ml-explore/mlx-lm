@@ -341,7 +341,7 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def load_tokenizer(model_path, tokenizer_config_extra={}, eos_token_ids=None):
+def load_tokenizer(model_path, tokenizer_config_extra={}, return_tokenizer=True, eos_token_ids=None):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
@@ -364,11 +364,15 @@ def load_tokenizer(model_path, tokenizer_config_extra={}, eos_token_ids=None):
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
-    return TokenizerWrapper(
-        AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
-        detokenizer_class,
-        eos_token_ids=eos_token_ids,
-    )
+
+    if return_tokenizer:
+        return TokenizerWrapper(
+            AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
+            detokenizer_class,
+            eos_token_ids=eos_token_ids,
+        )
+    else:
+        return detokenizer_class
 
 
 def no_bos_or_eos(sequence: List, bos: int, eos: int) -> List:
