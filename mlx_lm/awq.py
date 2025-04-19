@@ -21,7 +21,6 @@ from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.utils import (
-    MODEL_REMAPPING,
     fetch_from_hub,
     get_model_path,
     save_config,
@@ -31,6 +30,7 @@ from mlx_lm.utils import (
 SUPPORTED_MODEL_TYPES = {
     "llama",
     "llama4",
+    "mistral",
     "qwen2",
     "gemma3",
     "gemma3_text",
@@ -374,7 +374,7 @@ def awq_quantize(
 
         return Catcher()
 
-    for block in tqdm(model.model.layers):
+    for block in tqdm(model.layers):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)
@@ -423,7 +423,7 @@ def awq_quantize(
         inputs = outputs
 
         mx.eval(block)
-        mx.metal.clear_cache()
+        mx.clear_cache()
 
     if hasattr(model, "lm_head"):
         model.lm_head = model.lm_head.to_quantized(
@@ -513,7 +513,6 @@ def main():
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     model_type = config["model_type"]
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
     if model_type not in SUPPORTED_MODEL_TYPES:
         raise NotImplementedError(f"AWQ support for {config['model_type']} models NYI.")
 
