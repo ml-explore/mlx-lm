@@ -86,6 +86,13 @@ curl localhost:8080/v1/chat/completions \
 - `adapters`: (Optional) A string path to low-rank adapters. The path must be
   relative to the directory the server was started in.
 
+- `draft_model`: (Optional) Specifies a smaller model to use for speculative
+  decoding. Set to `null` to unload.
+
+- `num_draft_tokens`: (Optional) The number of draft tokens the draft model
+  should predict at once. Defaults to `3`.
+
+
 ### Response Fields
 
 - `id`: A unique identifier for the chat.
