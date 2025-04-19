@@ -71,7 +71,7 @@ class Glm4Attention(nn.Module):
         )
 
         self.rope = nn.RoPE(
-            dims=self.head_dim, base=args.rope_theta, traditional=args.rope_traditional
+            dims=int(self.head_dim * args.partial_rotary_factor), base=args.rope_theta, traditional=args.rope_traditional
         )
 
     def __call__(
