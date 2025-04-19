@@ -1,6 +1,6 @@
 import json
-from json import JSONDecodeError
 from functools import partial
+from json import JSONDecodeError
 from typing import List
 
 from transformers import AutoTokenizer
@@ -342,7 +342,9 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def load_tokenizer(model_path, tokenizer_config_extra={}, return_tokenizer=True, eos_token_ids=None):
+def load_tokenizer(
+    model_path, tokenizer_config_extra={}, return_tokenizer=True, eos_token_ids=None
+):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
