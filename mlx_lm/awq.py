@@ -21,7 +21,6 @@ from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.utils import (
-    MODEL_REMAPPING,
     fetch_from_hub,
     get_model_path,
     save_config,
@@ -31,6 +30,7 @@ from mlx_lm.utils import (
 SUPPORTED_MODEL_TYPES = {
     "llama",
     "llama4",
+    "mistral",
     "qwen2",
     "gemma3",
     "gemma3_text",
@@ -99,7 +99,7 @@ def search_best_scale(
     # Search across different scaling ratios
     # and take the best loss.
     for ratio in range(n_grid):
-        ratio = ratio * 1 / n_grid
+        ratio = ratio / n_grid
         scales = mx.maximum(x_max**ratio, 1e-4).reshape(-1)
         scales = scales / (scales.max() * scales.min()).sqrt()
         for layer in layers:
@@ -108,12 +108,11 @@ def search_best_scale(
         out_q = run_layer(block, x, **layer_kwargs)
         loss = mse(out, out_q).sum()
         if group is not None:
-            loss = mx.distributed.all_sum(loss, stream=mx.cpu) / group.size()
+            loss = mx.distributed.all_sum(loss) / group.size()
         loss /= out.size
         mx.eval(loss)
-        is_best = loss < best_error
-        if is_best:
-            best_error = loss
+        if loss.item() < best_error:
+            best_error = loss.item()
             best_scales = scales
 
         # reload the original weights
@@ -282,7 +281,7 @@ def search_best_clip(
             # Take the mean across the input batch
             loss = mse(out, out_q).sum(axis=(0, 1))
             if group is not None:
-                loss = mx.distributed.all_sum(loss, stream=mx.cpu) / group.size()
+                loss = mx.distributed.all_sum(loss) / group.size()
             loss /= out.shape[0] * out.shape[1]
             best_indices = loss < best_error
             best_error = mx.where(best_indices, loss, best_error)
@@ -374,7 +373,7 @@ def awq_quantize(
 
         return Catcher()
 
-    for block in tqdm(model.model.layers):
+    for block in tqdm(model.layers):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)
@@ -388,9 +387,7 @@ def awq_quantize(
         outputs_q = run_layer(block, inputs, mask=mask)
         before_loss = mse(outputs, outputs_q).sum()
         if group is not None:
-            before_loss = (
-                mx.distributed.all_sum(before_loss, stream=mx.cpu) / group.size()
-            )
+            before_loss = mx.distributed.all_sum(before_loss) / group.size()
         before_loss /= outputs.size
         block.update_modules(orig_leaves)
         del orig_leaves
@@ -414,16 +411,14 @@ def awq_quantize(
         outputs_q = run_layer(block, inputs, mask=mask)
         after_loss = mse(outputs, outputs_q).sum()
         if group is not None:
-            after_loss = (
-                mx.distributed.all_sum(after_loss, stream=mx.cpu) / group.size()
-            )
+            after_loss = mx.distributed.all_sum(after_loss) / group.size()
         after_loss /= outputs.size
         tqdm.write(f"Loss reduction: {after_loss / before_loss}")
 
         inputs = outputs
 
         mx.eval(block)
-        mx.metal.clear_cache()
+        mx.clear_cache()
 
     if hasattr(model, "lm_head"):
         model.lm_head = model.lm_head.to_quantized(
@@ -513,7 +508,6 @@ def main():
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     model_type = config["model_type"]
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
     if model_type not in SUPPORTED_MODEL_TYPES:
         raise NotImplementedError(f"AWQ support for {config['model_type']} models NYI.")
 
