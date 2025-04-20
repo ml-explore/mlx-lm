@@ -287,6 +287,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_p = self.body.get("top_p", 1.0)
         self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.xtc_probability = self.body.get("xtc_probability", 0.0)
+        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
         self.validate_model_parameters()
@@ -363,7 +365,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.logit_bias = {int(k): v for k, v in self.logit_bias.items()}
             except ValueError:
                 raise ValueError("logit_bias must be a dict of int to float")
-
+        if not (
+            isinstance(self.xtc_probability, float)
+            and 0.00 < self.xtc_probability <= 1.00
+        ):
+            raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
+        if not (
+            isinstance(self.xtc_threshold, float) and 0.00 < self.xtc_threshold <= 1.00
+        ):
+            raise ValueError(f"xtc_threshold must be a float between 0.00 and 1.00")
         if not isinstance(self.requested_model, str):
             raise ValueError("model must be a string")
         if self.adapter is not None and not isinstance(self.adapter, str):
@@ -512,7 +522,11 @@ class APIHandler(BaseHTTPRequestHandler):
         tic = time.perf_counter()
         sampler = make_sampler(self.temperature, top_p=self.top_p)
         logits_processors = make_logits_processors(
-            self.logit_bias, self.repetition_penalty, self.repetition_context_size
+            self.logit_bias,
+            self.repetition_penalty,
+            self.repetition_context_size,
+            self.xtc_probability,
+            self.xtc_threshold,
         )
         for gen_response in stream_generate(
             model=self.model,

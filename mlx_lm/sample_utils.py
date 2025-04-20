@@ -60,6 +60,8 @@ def make_logits_processors(
     logit_bias: Optional[Dict[int, float]] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
+    xtc_probability: Optional[float] = 0.0,
+    xtc_threshold: Optional[float] = 0.0,
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -70,6 +72,9 @@ def make_logits_processors(
         repetition_context_size (int, optional): The number of tokens to
           consider for repetition penalty. Default: ``20``.
         logit_bias (dictionary, optional): Additive logit bias.
+        xtc_probability (float, optional): The probability of applying XTC
+          sampling.
+        xtc_threshold (float, optional): The threshold for XTC sampling.
 
     Returns:
         List[Callable[[mx.array, mx.array], mx.array]]:
@@ -92,6 +97,8 @@ def make_logits_processors(
         logits_processors.append(
             make_repetition_penalty(repetition_penalty, repetition_context_size)
         )
+    if xtc_probability > 0.0:
+        logits_processors.append(make_xtc(xtc_probability, xtc_threshold))
     return logits_processors
 
 
@@ -255,3 +262,45 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return repetition_penalty_processor
+
+
+def make_xtc(xtc_probability, xtc_threshold):
+    """
+    Apply XTC sampling to the logits.
+    Source : https://github.com/oobabooga/text-generation-webui/pull/6335
+
+    Args:
+        xtc_probability :  Probability of XTC sampling to happen for each token
+        xtc_threshold (float): The threshold the probs need to reach for being sampled.
+    """
+
+    def apply_xtc(_, logits) -> mx.array:
+
+        if not (0 <= xtc_threshold <= 1.0):
+            raise ValueError(
+                f"`threshold` has to be a float in the [0, 1] interval, but is {xtc_threshold}"
+            )
+        if not (0 <= xtc_probability <= 1.0):
+            raise ValueError(
+                f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
+            )
+
+        # Converting logits to probs then get sorted probs
+        probs = mx.softmax(logits, axis=-1)
+
+        sorted_indices = mx.argsort(-probs, axis=-1)
+
+        sorted_p = mx.take_along_axis(probs, sorted_indices, axis=-1)
+
+        sorted_indice_to_remove = mx.full(sorted_p.shape, False, getattr(mx, "bool_"))
+        sorted_indice_to_remove[..., :-1] = sorted_p[..., 1:] >= xtc_threshold
+        indices_to_remove = mx.take_along_axis(
+            sorted_indice_to_remove, mx.argsort(sorted_indices, axis=-1), axis=-1
+        )
+
+        logits_edited = mx.where(indices_to_remove, -float("inf"), logits)
+        return mx.where(
+            mx.random.uniform(0, 1) >= xtc_probability, logits, logits_edited
+        )
+
+    return apply_xtc
