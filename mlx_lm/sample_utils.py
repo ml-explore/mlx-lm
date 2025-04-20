@@ -307,9 +307,11 @@ def make_xtc(
         )
         # Like in the original implementation, we exclude EOS/newline characters from being
         # removed by XTC sampling
-        for stop_ids in special_tokens_ids:
-            if indices_to_remove[:, stop_ids].any():
-                return logits
+        special_tokens_mask = mx.zeros(indices_to_remove.shape[1], getattr(mx, "bool_"))
+        special_tokens_mask[special_tokens_ids] = True
+        indices_to_remove = mx.logical_and(
+            indices_to_remove, mx.logical_not(special_tokens_mask)
+        )
 
         logits_edited = mx.where(indices_to_remove, -float("inf"), logits)
 
