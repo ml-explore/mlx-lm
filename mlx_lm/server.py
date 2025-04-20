@@ -527,6 +527,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self.repetition_context_size,
             self.xtc_probability,
             self.xtc_threshold,
+            [self.tokenizer.eos_token_id, self.tokenizer.encode("\n")[-1]],
         )
         for gen_response in stream_generate(
             model=self.model,

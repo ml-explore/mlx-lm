@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
@@ -62,6 +62,7 @@ def make_logits_processors(
     repetition_context_size: Optional[int] = 20,
     xtc_probability: Optional[float] = 0.0,
     xtc_threshold: Optional[float] = 0.0,
+    special_tokens_ids: Optional[List[int]] = None,
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -75,6 +76,8 @@ def make_logits_processors(
         xtc_probability (float, optional): The probability of applying XTC
           sampling.
         xtc_threshold (float, optional): The threshold for XTC sampling.
+        special_tokens_ids (list(int), optional): The special tokens IDs to
+          consider for XTC sampling.
 
     Returns:
         List[Callable[[mx.array, mx.array], mx.array]]:
@@ -98,7 +101,9 @@ def make_logits_processors(
             make_repetition_penalty(repetition_penalty, repetition_context_size)
         )
     if xtc_probability > 0.0:
-        logits_processors.append(make_xtc(xtc_probability, xtc_threshold))
+        logits_processors.append(
+            make_xtc(xtc_probability, xtc_threshold, special_tokens_ids)
+        )
     return logits_processors
 
 
@@ -264,14 +269,17 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
     return repetition_penalty_processor
 
 
-def make_xtc(xtc_probability, xtc_threshold):
+def make_xtc(
+    xtc_probability: float, xtc_threshold: float, special_tokens_ids: List[int]
+):
     """
     Apply XTC sampling to the logits.
     Source : https://github.com/oobabooga/text-generation-webui/pull/6335
 
     Args:
-        xtc_probability :  Probability of XTC sampling to happen for each token
+        xtc_probability (float): Probability of XTC sampling to happen for each token
         xtc_threshold (float): The threshold the probs need to reach for being sampled.
+        special_tokens_ids (list(int)): List of special tokens IDs to be excluded from XTC sampling.
     """
 
     def apply_xtc(_, logits) -> mx.array:
@@ -297,8 +305,14 @@ def make_xtc(xtc_probability, xtc_threshold):
         indices_to_remove = mx.take_along_axis(
             sorted_indice_to_remove, mx.argsort(sorted_indices, axis=-1), axis=-1
         )
+        # Like in the original implementation, we exclude EOS/newline characters from being
+        # removed by XTC sampling
+        for stop_ids in special_tokens_ids:
+            if indices_to_remove[:, stop_ids].any():
+                return logits
 
         logits_edited = mx.where(indices_to_remove, -float("inf"), logits)
+
         return mx.where(
             mx.random.uniform(0, 1) >= xtc_probability, logits, logits_edited
         )
