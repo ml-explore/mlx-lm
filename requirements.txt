@@ -1,4 +1,4 @@
-mlx>=0.24.2
+mlx>=0.25.0
 numpy
 transformers[sentencepiece]>=4.39.3
 protobuf
