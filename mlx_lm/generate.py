@@ -38,6 +38,8 @@ DEFAULT_MAX_TOKENS = 100
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MIN_P = 0.0
+DEFAULT_XTC_PROBABILITY = 0.0
+DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
@@ -103,6 +105,18 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--min-p", type=float, default=DEFAULT_MIN_P, help="Sampling min-p"
+    )
+    parser.add_argument(
+        "--xtc-probability",
+        type=float,
+        default=DEFAULT_XTC_PROBABILITY,
+        help="Probability of XTC sampling to happen each next token",
+    )
+    parser.add_argument(
+        "--xtc-threshold",
+        type=float,
+        default=0.0,
+        help="Thresold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
         "--min-tokens-to-keep",
@@ -806,7 +820,16 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
+    special_tokens_ids = [id for id in tokenizer.eos_token_ids] + tokenizer.encode("\n")
+    sampler = make_sampler(
+        args.temp,
+        args.top_p,
+        args.min_p,
+        args.min_tokens_to_keep,
+        xtc_probability=args.xtc_probability,
+        xtc_threshold=args.xtc_threshold,
+        special_tokens_ids=special_tokens_ids,
+    )
     response = generate(
         model,
         tokenizer,
