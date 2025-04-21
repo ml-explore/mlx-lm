@@ -58,14 +58,14 @@ class MiniMaxText01AttentionType0(nn.Module):
         self.hidden_size = args.hidden_size
 
         self.qkv_proj = nn.Linear(
-            args.hidden_size, 3 * self.head_dim * self.num_heads, bias=False
+            args.hidden_size, 3 * self.head_dim * self.num_heads, bias=args.mlp_bias
         )
         self.output_gate = nn.Linear(
-            args.hidden_size, self.head_dim * self.num_heads, bias=False
+            args.hidden_size, self.head_dim * self.num_heads, bias=args.mlp_bias
         )
         self.norm = nn.RMSNorm(self.head_dim * self.num_heads)
         self.out_proj = nn.Linear(
-            self.head_dim * self.num_heads, args.hidden_size, bias=False
+            self.head_dim * self.num_heads, args.hidden_size, bias=args.mlp_bias
         )
 
         self.offset = 0
