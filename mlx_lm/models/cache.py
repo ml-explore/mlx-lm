@@ -447,9 +447,9 @@ class ChunkedKVCache(KVCache):
     def maybe_trim_front(self):
         # Maintain the cache below the chunk size
         if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.keys = self.keys[..., self.chunk_size :, :]
-            self.values = self.values[..., self.chunk_size :, :]
-            self.start_position += self.chunk_size
+            self.start_position += self.keys.shape[2] - self.chunk_size
+            self.keys = self.keys[..., -self.chunk_size :, :]
+            self.values = self.values[..., -self.chunk_size :, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position

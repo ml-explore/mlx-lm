@@ -1,5 +1,6 @@
 import json
 from functools import partial
+from json import JSONDecodeError
 from typing import List
 
 from transformers import AutoTokenizer
@@ -341,7 +342,9 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def load_tokenizer(model_path, tokenizer_config_extra={}, eos_token_ids=None):
+def load_tokenizer(
+    model_path, tokenizer_config_extra={}, return_tokenizer=True, eos_token_ids=None
+):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
@@ -353,7 +356,11 @@ def load_tokenizer(model_path, tokenizer_config_extra={}, eos_token_ids=None):
     tokenizer_file = model_path / "tokenizer.json"
     if tokenizer_file.exists():
         with open(tokenizer_file, "r", encoding="utf-8") as fid:
-            tokenizer_content = json.load(fid)
+            try:
+                tokenizer_content = json.load(fid)
+            except JSONDecodeError as e:
+                raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
+
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = SPMStreamingDetokenizer
@@ -364,11 +371,15 @@ def load_tokenizer(model_path, tokenizer_config_extra={}, eos_token_ids=None):
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
-    return TokenizerWrapper(
-        AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
-        detokenizer_class,
-        eos_token_ids=eos_token_ids,
-    )
+
+    if return_tokenizer:
+        return TokenizerWrapper(
+            AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
+            detokenizer_class,
+            eos_token_ids=eos_token_ids,
+        )
+    else:
+        return detokenizer_class
 
 
 def no_bos_or_eos(sequence: List, bos: int, eos: int) -> List:
