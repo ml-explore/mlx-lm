@@ -15,7 +15,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten
 from transformers import PreTrainedTokenizer
 
-from .datasets import CompletionsDataset
+from .datasets import CacheDataset
 
 
 def grad_checkpoint(layer):
@@ -72,14 +72,13 @@ def default_loss(model, batch, lengths):
     targets = batch[:, 1:]
 
     logits = model(inputs)
-    logits = logits.astype(mx.float32)
 
     steps = mx.arange(1, targets.shape[1] + 1)
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
 
     ce = nn.losses.cross_entropy(logits, targets) * mask
     ntoks = mask.sum()
-    ce = ce.sum() / ntoks
+    ce = ce.astype(mx.float32).sum() / ntoks
 
     return ce, ntoks
 
@@ -92,7 +91,11 @@ def iterate_batches(
     train=False,
 ):
     # Sort by length:
-    idx = sorted(range(len(dataset)), key=lambda idx: len(dataset[idx]))
+    if isinstance(dataset, CacheDataset):
+        len_fn = lambda idx: dataset.itemlen(idx)
+    else:
+        len_fn = lambda idx: len(dataset[idx])
+    idx = sorted(range(len(dataset)), key=len_fn)
     if len(dataset) < batch_size:
         raise ValueError(
             f"Dataset must have at least batch_size={batch_size}"
@@ -127,9 +130,9 @@ def iterate_batches(
                     "Consider pre-splitting your data to save memory."
                 )
 
-            # Pad to the nearest multiple of 8 or the maximum length
-            pad_to = 8
-            max_length_in_batch = pad_to * ((max(lengths) + pad_to - 1) // pad_to)
+            # Pad to one plus nearest multiple of pad_to or the maximum length
+            pad_to = 32
+            max_length_in_batch = 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to)
             max_length_in_batch = min(max_length_in_batch, max_seq_length)
 
             batch_arr = np.zeros((batch_size // step, max_length_in_batch), np.int32)
@@ -157,7 +160,7 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
 ):
-    mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+    model.eval()
     all_losses = mx.array(0.0)
     ntokens = mx.array(0)
 
@@ -205,6 +208,7 @@ def train(
     iterate_batches: callable = iterate_batches,
     training_callback: TrainingCallback = None,
 ):
+    mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     print(f"Starting training..., iters: {args.iters}")
     world = mx.distributed.init()
     world_size = world.size()
@@ -230,8 +234,12 @@ def train(
 
         return lvalue, toks
 
+    train_dataset = CacheDataset(train_dataset)
+    val_dataset = CacheDataset(val_dataset)
+
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
+    model.train()
     losses = 0
     n_tokens = 0
     steps = 0
@@ -263,6 +271,7 @@ def train(
                 max_seq_length=args.max_seq_length,
                 iterate_batches=iterate_batches,
             )
+            model.train()
             val_time = time.perf_counter() - tic
             if rank == 0:
                 print(
@@ -292,7 +301,7 @@ def train(
         # Report training loss if needed
         if it % args.steps_per_report == 0 or it == args.iters:
             train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
-            train_loss /= steps * mx.distributed.init().size()
+            train_loss /= steps * world_size
             n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
             learning_rate = optimizer.learning_rate.item()
             it_sec = args.steps_per_report / train_time
@@ -328,7 +337,7 @@ def train(
             train_time = 0
 
         # Save adapter weights
-        if it % args.steps_per_save == 0:
+        if it % args.steps_per_save == 0 and rank == 0:
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
             mx.save_safetensors(str(args.adapter_file), adapter_weights)
             checkpoint = (
@@ -341,6 +350,7 @@ def train(
             )
 
     # Save final weights
-    adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-    mx.save_safetensors(str(args.adapter_file), adapter_weights)
-    print(f"Saved final weights to {args.adapter_file}.")
+    if rank == 0:
+        adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+        mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        print(f"Saved final weights to {args.adapter_file}.")

@@ -106,4 +106,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.chat...` directly is deprecated."
+        " Use `mlx_lm.chat...` or `python -m mlx_lm chat ...` instead."
+    )
     main()

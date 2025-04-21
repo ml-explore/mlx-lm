@@ -104,6 +104,7 @@ def linear_to_lora_layers(
         "olmo2",
         "olmoe",
         "internlm3",
+        "glm4",
     ]:
         keys = set(["self_attn.q_proj", "self_attn.v_proj"])
         if model.model_type in ["mixtral", "phimoe"]:

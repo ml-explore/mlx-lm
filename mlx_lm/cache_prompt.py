@@ -148,7 +148,7 @@ def main():
         pass
 
     print()
-    print(f"Peak memory: {mx.metal.get_peak_memory() / 1e9:.3f} GB")
+    print(f"Peak memory: {mx.get_peak_memory() / 1e9:.3f} GB")
 
     print("Saving...")
     metadata = {}
@@ -159,4 +159,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_lm.cache_prompt...` directly is deprecated."
+        " Use `mlx_lm.cache_prompt...` or `python -m mlx_lm cache_prompt ...` instead."
+    )
     main()
