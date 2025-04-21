@@ -13,6 +13,9 @@ def make_sampler(
     min_p: float = 0.0,
     min_tokens_to_keep: int = 1,
     top_k: int = -1,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    special_tokens_ids: Optional[List[int]] = None,
 ) -> Callable[mx.array, mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
@@ -28,6 +31,13 @@ def make_sampler(
           be filtered by min_p sampling.
         top_k (int, optional): The top k tokens ranked by probability to constrain
           the sampling to.
+        xtc_probability (float, optional): The probability of applying XTC
+            sampling.
+        xtc_threshold (float, optional): The threshold the probs need to reach
+            for being sampled.
+        special_tokens_ids (list(int), optional): List of special tokens IDs to
+            be excluded from XTC sampling.
+
 
     Returns:
         Callable[mx.array, mx.array]:
@@ -44,6 +54,10 @@ def make_sampler(
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
+    if xtc_probability > 0.0:
+        sampling_methods.append(
+            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, special_tokens_ids)
+        )
 
     # Apply the sampling methods
     def sampler(logits):
@@ -60,9 +74,6 @@ def make_logits_processors(
     logit_bias: Optional[Dict[int, float]] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
-    xtc_probability: Optional[float] = 0.0,
-    xtc_threshold: Optional[float] = 0.0,
-    special_tokens_ids: Optional[List[int]] = None,
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -73,11 +84,6 @@ def make_logits_processors(
         repetition_context_size (int, optional): The number of tokens to
           consider for repetition penalty. Default: ``20``.
         logit_bias (dictionary, optional): Additive logit bias.
-        xtc_probability (float, optional): The probability of applying XTC
-          sampling.
-        xtc_threshold (float, optional): The threshold for XTC sampling.
-        special_tokens_ids (list(int), optional): The special tokens IDs to
-          consider for XTC sampling.
 
     Returns:
         List[Callable[[mx.array, mx.array], mx.array]]:
@@ -99,10 +105,6 @@ def make_logits_processors(
     if repetition_penalty and repetition_penalty != 0.0:
         logits_processors.append(
             make_repetition_penalty(repetition_penalty, repetition_context_size)
-        )
-    if xtc_probability > 0.0:
-        logits_processors.append(
-            make_xtc(xtc_probability, xtc_threshold, special_tokens_ids)
         )
     return logits_processors
 
@@ -206,7 +208,6 @@ def apply_top_p(logits: mx.array, top_p: float) -> mx.array:
     """
     # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L449-L460
     probs = mx.softmax(logits, axis=-1)
-
     # sort probs in ascending order
     sorted_indices = mx.argsort(probs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
@@ -229,6 +230,55 @@ def apply_top_p(logits: mx.array, top_p: float) -> mx.array:
 
     # Convert back to logits and return
     return mx.log(original_order_probs)
+
+
+@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+def apply_xtc(
+    logits: mx.array,
+    xtc_probability: float,
+    xtc_threshold: float,
+    special_tokens_ids: List[int],
+) -> mx.array:
+    """
+    Apply XTC sampling to the logits.
+
+    Args:
+        logits: The logits from the model's output.
+        xtc_probability (float): Probability of XTC sampling to happen for each token
+        xtc_threshold (float): The threshold the probs need to reach for being sampled.
+        special_tokens_ids (list(int)): List of special tokens IDs to be excluded from XTC sampling.
+    """
+    if not (0 <= xtc_threshold <= 0.5):
+        raise ValueError(
+            f"`threshold` has to be a float in the [0, 0.5] interval, but is {xtc_threshold}"
+        )
+    if not (0 <= xtc_probability <= 1.0):
+        raise ValueError(
+            f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
+        )
+
+    # Converting logits to probs then get sorted probs
+    probs = mx.softmax(logits, axis=-1)
+    sorted_indices = mx.argsort(-probs, axis=-1)
+
+    sorted_p = mx.take_along_axis(probs, sorted_indices, axis=-1)
+
+    sorted_indice_to_remove = mx.full(sorted_p.shape, False, getattr(mx, "bool_"))
+    sorted_indice_to_remove[..., :-1] = sorted_p[..., 1:] >= xtc_threshold
+    indices_to_remove = mx.take_along_axis(
+        sorted_indice_to_remove, mx.argsort(sorted_indices, axis=-1), axis=-1
+    )
+    # Like in the original implementation, we exclude EOS/newline characters from being
+    # removed by XTC sampling
+    special_tokens_mask = mx.zeros(indices_to_remove.shape[1], getattr(mx, "bool_"))
+    special_tokens_mask[special_tokens_ids] = True
+    indices_to_remove = mx.logical_and(
+        indices_to_remove, mx.logical_not(special_tokens_mask)
+    )
+
+    logits_edited = mx.where(indices_to_remove, -float("inf"), logits)
+
+    return mx.where(mx.random.uniform(0, 1) >= xtc_probability, logits, logits_edited)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
@@ -267,56 +317,3 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return repetition_penalty_processor
-
-
-def make_xtc(
-    xtc_probability: float, xtc_threshold: float, special_tokens_ids: List[int]
-):
-    """
-    Apply XTC sampling to the logits.
-    Source : https://github.com/oobabooga/text-generation-webui/pull/6335
-
-    Args:
-        xtc_probability (float): Probability of XTC sampling to happen for each token
-        xtc_threshold (float): The threshold the probs need to reach for being sampled.
-        special_tokens_ids (list(int)): List of special tokens IDs to be excluded from XTC sampling.
-    """
-
-    def apply_xtc(_, logits) -> mx.array:
-
-        if not (0 <= xtc_threshold <= 1.0):
-            raise ValueError(
-                f"`threshold` has to be a float in the [0, 1] interval, but is {xtc_threshold}"
-            )
-        if not (0 <= xtc_probability <= 1.0):
-            raise ValueError(
-                f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
-            )
-
-        # Converting logits to probs then get sorted probs
-        probs = mx.softmax(logits, axis=-1)
-
-        sorted_indices = mx.argsort(-probs, axis=-1)
-
-        sorted_p = mx.take_along_axis(probs, sorted_indices, axis=-1)
-
-        sorted_indice_to_remove = mx.full(sorted_p.shape, False, getattr(mx, "bool_"))
-        sorted_indice_to_remove[..., :-1] = sorted_p[..., 1:] >= xtc_threshold
-        indices_to_remove = mx.take_along_axis(
-            sorted_indice_to_remove, mx.argsort(sorted_indices, axis=-1), axis=-1
-        )
-        # Like in the original implementation, we exclude EOS/newline characters from being
-        # removed by XTC sampling
-        special_tokens_mask = mx.zeros(indices_to_remove.shape[1], getattr(mx, "bool_"))
-        special_tokens_mask[special_tokens_ids] = True
-        indices_to_remove = mx.logical_and(
-            indices_to_remove, mx.logical_not(special_tokens_mask)
-        )
-
-        logits_edited = mx.where(indices_to_remove, -float("inf"), logits)
-
-        return mx.where(
-            mx.random.uniform(0, 1) >= xtc_probability, logits, logits_edited
-        )
-
-    return apply_xtc

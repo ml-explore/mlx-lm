@@ -292,7 +292,6 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
         self.validate_model_parameters()
-
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(
@@ -371,9 +370,9 @@ class APIHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
         if not (
-            isinstance(self.xtc_threshold, float) and 0.00 < self.xtc_threshold <= 1.00
+            isinstance(self.xtc_threshold, float) and 0.00 < self.xtc_threshold <= 0.50
         ):
-            raise ValueError(f"xtc_threshold must be a float between 0.00 and 1.00")
+            raise ValueError(f"xtc_threshold must be a float between 0.00 and 0.5")
         if not isinstance(self.requested_model, str):
             raise ValueError("model must be a string")
         if self.adapter is not None and not isinstance(self.adapter, str):
@@ -520,14 +519,20 @@ class APIHandler(BaseHTTPRequestHandler):
 
         text = ""
         tic = time.perf_counter()
-        sampler = make_sampler(self.temperature, top_p=self.top_p)
+        sampler = make_sampler(
+            self.temperature,
+            top_p=self.top_p,
+            xtc_probability=self.xtc_probability,
+            xtc_threshold=self.xtc_threshold,
+            special_tokens_ids=[
+                self.tokenizer.eos_token_id,
+                self.tokenizer.encode("\n"),
+            ],
+        )
         logits_processors = make_logits_processors(
             self.logit_bias,
             self.repetition_penalty,
             self.repetition_context_size,
-            self.xtc_probability,
-            self.xtc_threshold,
-            [self.tokenizer.eos_token_id, self.tokenizer.encode("\n")[-1]],
         )
         for gen_response in stream_generate(
             model=self.model,
