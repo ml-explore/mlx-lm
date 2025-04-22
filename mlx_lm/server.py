@@ -680,10 +680,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
 
+        files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+
+        def probably_mlx_lm(repo):
+            if repo.repo_type != "model":
+                return False
+            file_names = {f.file_path.name for f in repo.refs["main"].files}
+            return all(f in file_names for f in files)
+
         # Scan the cache directory for downloaded mlx models
         hf_cache_info = scan_cache_dir()
         downloaded_models = [
-            repo for repo in hf_cache_info.repos if "mlx" in repo.repo_id
+            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
         ]
 
         # Create a list of available models
