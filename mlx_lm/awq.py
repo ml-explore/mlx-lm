@@ -209,7 +209,7 @@ def search_best_scale(
     layer_kwargs = layer_kwargs or {}
 
     x = layers[0].input_feat
-    if (indices := layers[0].indices) is not None:
+    if (indices := getattr(layers[0], "indices", None)) is not None:
         layer_kwargs["indices"] = indices
 
     block = block or layers[0]
@@ -433,10 +433,9 @@ def awq_quantize(
                     module.input_feat = x
 
                 # Also store the MOE indices if applicabale
-                module.indices = None
                 if isinstance(module, SwitchLinear):
                     indices = args[0]
-                    if module.indices is not None:
+                    if hasattr(module, "indices"):
                         module.indices = mx.concatenate(
                             [module.indices, indices], axis=0
                         )
