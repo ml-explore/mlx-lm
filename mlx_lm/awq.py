@@ -23,6 +23,7 @@ from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.utils import (
+    create_model_card,
     fetch_from_hub,
     get_model_path,
     save_config,
@@ -113,26 +114,9 @@ deepseek_v2_awq = AWQConfig(
             layers=["self_attn.kv_b_proj"],
         ),
         ScaleConfig(
-            block="mlp",
-            prev="post_attention_layernorm",
-            layers=["gate_proj", "up_proj"],
-            use_config=lambda block: not "switch_mlp" in block.mlp,
-        ),
-        ScaleConfig(
             prev="mlp.up_proj",
             layers=["mlp.down_proj"],
             use_config=lambda block: not "switch_mlp" in block.mlp,
-        ),
-        ScaleConfig(
-            block="mlp",
-            prev="post_attention_layernorm",
-            layers=[
-                "shared_experts.gate_proj",
-                "shared_experts.up_proj",
-                "switch_mlp.gate_proj",
-                "switch_mlp.up_proj",
-            ],
-            use_config=lambda block: "switch_mlp" in block.mlp,
         ),
         ScaleConfig(
             prev="mlp.shared_experts.up_proj",
@@ -142,6 +126,25 @@ deepseek_v2_awq = AWQConfig(
         ScaleConfig(
             prev="mlp.switch_mlp.up_proj",
             layers=["mlp.switch_mlp.down_proj"],
+            use_config=lambda block: "switch_mlp" in block.mlp,
+            kwargs=["indices"],
+        ),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=["gate_proj", "up_proj"],
+            use_config=lambda block: not "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=[
+                "switch_mlp.gate_proj",
+                "switch_mlp.up_proj",
+                "shared_experts.gate_proj",
+                "shared_experts.up_proj",
+                "gate",  # not quantized, just scaled
+            ],
             use_config=lambda block: "switch_mlp" in block.mlp,
         ),
     ],
@@ -209,8 +212,6 @@ def search_best_scale(
     layer_kwargs = layer_kwargs or {}
 
     x = layers[0].input_feat
-    if (indices := getattr(layers[0], "indices", None)) is not None:
-        layer_kwargs["indices"] = indices
 
     block = block or layers[0]
     out = block(x, **layer_kwargs)
@@ -229,7 +230,8 @@ def search_best_scale(
         scales = mx.maximum(x_max**ratio, 1e-4).reshape(-1)
         scales = scales / (scales.max() * scales.min()).sqrt()
         for layer in layers:
-            layer.weight = quantize_func(layer.weight * scales) / scales
+            if isinstance(layer, (nn.Linear, SwitchLinear)):
+                layer.weight = quantize_func(layer.weight * scales) / scales
 
         out_q = run_layer(block, x, **layer_kwargs)
         loss = mse(out, out_q).sum()
@@ -256,7 +258,7 @@ def apply_scale(prev_op, layers, scales):
         prev_op.weight = prev_op.weight / scales[:, mx.newaxis]
         if hasattr(prev_op, "bias"):
             prev_op.bias = prev_op.bias / scales
-        layers[0].weight = layers[0].weight * scales[mx.newaxis]
+        layers[0].weight = layers[0].weight * scales
     elif isinstance(prev_op, (nn.LayerNorm, nn.RMSNorm)):
         prev_op.weight = prev_op.weight / scales
         if hasattr(prev_op, "bias"):
@@ -271,7 +273,8 @@ def apply_scale(prev_op, layers, scales):
         raise NotImplementedError(f"Could not apply scale to prev_op: {prev_op}")
 
     for layer in layers:
-        layer.input_feat = layer.input_feat / scales
+        if hasattr(layer, "input_feat"):
+            layer.input_feat = layer.input_feat / scales
 
 
 def scale_block(
@@ -281,7 +284,6 @@ def scale_block(
     layer_kwargs: dict,
     n_grid: int,
 ):
-
     for conf in configs:
         if conf.use_config is not None and not conf.use_config(block):
             continue
@@ -291,10 +293,15 @@ def scale_block(
         else:
             local_block = None
             layers = [submodule_from_key(block, l) for l in conf.layers]
+        local_kwargs = {k: layer_kwargs[k] for k in conf.kwargs if k in layer_kwargs}
+        for k in conf.kwargs:
+            if hasattr(layers[0], k):
+                local_kwargs[k] = getattr(layers[0], k)
+
         scales = search_best_scale(
             layers=layers,
             block=local_block,
-            layer_kwargs={k: layer_kwargs[k] for k in conf.kwargs},
+            layer_kwargs=local_kwargs,
             quantize_func=quantize_func,
             n_grid=n_grid,
         )
@@ -446,7 +453,7 @@ def awq_quantize(
 
         return Catcher()
 
-    for block in tqdm(model.layers):
+    for e, block in enumerate(tqdm(model.layers)):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)
@@ -495,8 +502,8 @@ def awq_quantize(
         mx.eval(block)
         mx.clear_cache()
 
-    if awq_config.lm_head in model:
-        model[conf.lm_head] = model[conf.lm_head].to_quantized(
+    if (lm_head := awq_config.lm_head) in model:
+        model[lm_head] = model[lm_head].to_quantized(
             group_size=embed_group_size, bits=embed_bits
         )
 
@@ -521,6 +528,7 @@ def save_model(
     config,
     model_path: Path,
     mlx_path: str,
+    hf_path: str,
 ):
     weights = dict(tree_flatten(model.parameters()))
 
@@ -548,6 +556,7 @@ def save_model(
     tree_map_with_path(update_config, model.leaf_modules(), is_leaf=nn.Module.is_module)
 
     save_config(config, config_path=mlx_path / "config.json")
+    create_model_card(mlx_path, hf_path)
 
 
 def main():
@@ -597,8 +606,4 @@ def main():
         n_grid=args.n_grid,
     )
 
-    save_model(model, tokenizer, config, model_path, args.mlx_path)
-
-
-if __name__ == "__main__":
-    main()
+    save_model(model, tokenizer, config, model_path, args.mlx_path, args.model)

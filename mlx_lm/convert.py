@@ -11,6 +11,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from .utils import (
+    create_model_card,
     dequantize_model,
     fetch_from_hub,
     get_model_path,
@@ -151,8 +152,10 @@ def convert(
 
     save_config(config, config_path=mlx_path / "config.json")
 
+    create_model_card(mlx_path, hf_path)
+
     if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo, hf_path)
+        upload_to_hub(mlx_path, upload_repo)
 
 
 def configure_parser() -> argparse.ArgumentParser:
