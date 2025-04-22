@@ -314,23 +314,26 @@ def search_best_clip(
     group_size: int,
     n_grid: int,
     max_shrink: float = 0.5,
-    subsample: int = 4,
     batch_size: int = 64,
+    n_frames: int = 4096,
 ):
     group = mx.distributed.init()
 
-    x = module.input_feat
+    # subsample the input features
+    x = module.input_feat.flatten(0, 1)
+    stride = (x.shape[0] + n_frames - 1) // n_frames
+    x = x[::stride]
+
     w = module.weight
+    x = x.reshape(x.shape[0], -1, group_size)
 
-    x = x[:, ::subsample]
-    x = x.reshape(*x.shape[:-1], -1, group_size)
-
-    w_all = w
+    w_init_shape = w.shape
+    w_all = mx.flatten(w, 0, w.ndim - 2)
     w_max_all = []
     w_min_all = []
 
     # batch across W to save memory
-    for b in range(0, w.shape[0], batch_size):
+    for b in range(0, w_all.shape[0], batch_size):
         w = w_all[b : b + batch_size]
 
         group_shape = (w.shape[0], w.shape[-1] // group_size)
@@ -341,7 +344,7 @@ def search_best_clip(
         w_shape = w.shape
 
         w = w.reshape(*w.shape[:-1], -1, group_size)
-        out = mx.einsum("btdg,odg->btod", x, w)
+        out = mx.einsum("bdg,odg->bod", x, w)
 
         # try a range of clips and pick the one with the smallest loss
         for i in range(int(max_shrink * n_grid)):
@@ -353,7 +356,7 @@ def search_best_clip(
             w_q = quantize_func(w_m)
 
             w_q = w_q.reshape(*w_q.shape[:-1], -1, group_size)
-            out_q = mx.einsum("btdg,odg->btod", x, w_q)
+            out_q = mx.einsum("bdg,odg->bod", x, w_q)
 
             # Take the mean across the input batch
             loss = mse(out, out_q).sum(axis=(0, 1))
@@ -374,7 +377,7 @@ def search_best_clip(
 
     w_r = w_all.reshape(*w_all.shape[:-1], -1, group_size)
     best_w = mx.clip(w_r, best_w_min, best_w_max)
-    best_w = best_w.reshape(w_all.shape)
+    best_w = best_w.reshape(w_init_shape)
 
     mx.eval(best_w)
     return best_w
@@ -388,7 +391,9 @@ def clip_block(
     n_grid: int = 20,
 ):
     def apply_clip(path, module):
-        if isinstance(module, nn.Linear) and all(k not in path for k in no_clip_keys):
+        if isinstance(module, (nn.Linear, SwitchLinear)) and all(
+            k not in path for k in no_clip_keys
+        ):
             best_weight = search_best_clip(
                 module,
                 quantize_func=quantize_func,
