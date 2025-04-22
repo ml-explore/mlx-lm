@@ -1,3 +1,4 @@
+# Copyright © 2025 Apple Inc.
 # Learned quantization using AWQ
 
 # References:
@@ -5,9 +6,10 @@
 # https://github.com/mit-han-lab/llm-awq
 
 import argparse
+import copy
 import glob
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -27,19 +29,143 @@ from mlx_lm.utils import (
     save_weights,
 )
 
-SUPPORTED_MODEL_TYPES = {
-    "llama",
-    "llama4",
-    "mistral",
-    "qwen2",
-    "gemma3",
-    "gemma3_text",
-    "gemma2",
+
+@dataclass
+class ScaleConfig:
+    prev: nn.Module
+    layers: list[nn.Module]
+    block: nn.Module | None = None
+    kwargs: list = field(default_factory=list)
+    use_config: Callable[[nn.Module], bool] | None = None
+
+
+@dataclass
+class AWQConfig:
+    embed: str
+    lm_head: str
+    no_clip: list[str]
+    scale_configs: list[ScaleConfig]
+    lm_key: str | None = None
+
+
+def update(cfg, **kwargs):
+    cfg = copy.deepcopy(cfg)
+    for k, v in kwargs.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+llama_awq = AWQConfig(
+    embed="embed_tokens",
+    lm_head="lm_head",
+    no_clip=["q_proj", "k_proj"],
+    scale_configs=[
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_proj", "k_proj", "v_proj"],
+            kwargs=["mask"],
+        ),
+        ScaleConfig(prev="mlp.up_proj", layers=["mlp.down_proj"]),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=["gate_proj", "up_proj"],
+        ),
+    ],
+)
+
+gemma3_text_awq = AWQConfig(
+    embed="embed_tokens",
+    lm_head="lm_head",
+    no_clip=["q_proj", "k_proj"],
+    scale_configs=[
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_proj", "k_proj", "v_proj"],
+            kwargs=["mask"],
+        ),
+        ScaleConfig(prev="mlp.up_proj", layers=["mlp.down_proj"]),
+        ScaleConfig(
+            block="mlp",
+            prev="pre_feedforward_layernorm",
+            layers=["gate_proj", "up_proj"],
+        ),
+    ],
+)
+
+gemma3_awq = update(gemma3_text_awq, lm_key="language_model")
+
+deepseek_v2_awq = AWQConfig(
+    embed="embed_tokens",
+    lm_head="lm_head",
+    no_clip=["q_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"],
+    scale_configs=[
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_proj", "kv_a_proj_with_mqa"],
+            kwargs=["mask"],
+        ),
+        ScaleConfig(
+            prev="self_attn.kv_a_layernorm",
+            layers=["self_attn.kv_b_proj"],
+        ),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=["gate_proj", "up_proj"],
+            use_config=lambda block: not "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            prev="mlp.up_proj",
+            layers=["mlp.down_proj"],
+            use_config=lambda block: not "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=[
+                "shared_experts.gate_proj",
+                "shared_experts.up_proj",
+                "switch_mlp.gate_proj",
+                "switch_mlp.up_proj",
+            ],
+            use_config=lambda block: "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            prev="mlp.shared_experts.up_proj",
+            layers=["mlp.shared_experts.down_proj"],
+            use_config=lambda block: "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            prev="mlp.switch_mlp.up_proj",
+            layers=["mlp.switch_mlp.down_proj"],
+            use_config=lambda block: "switch_mlp" in block.mlp,
+        ),
+    ],
+)
+
+AWQ_MODEL_CONFIGS = {
+    "llama": llama_awq,
+    "mistral": llama_awq,
+    "qwen2": llama_awq,
+    "gemma3_text": gemma3_text_awq,
+    "gemma3": update(gemma3_text_awq, lm_key="language_model"),
+    "deepseek_v2": deepseek_v2_awq,
 }
 
 
 def mse(x, y):
     return ((x - y).astype(mx.float32)) ** 2
+
+
+def submodule_from_key(module, key):
+    keys = key.split(".")
+    for k in keys:
+        module = module[k]
+    return module
 
 
 def run_layer(
@@ -74,9 +200,9 @@ def dist_split(x: mx.array, group: mx.distributed.Group):
 def search_best_scale(
     layers: list[nn.Module],
     quantize_func: Callable,
-    block: nn.Module | None = None,
-    layer_kwargs: dict | None = None,
-    n_grid: int = 20,
+    block: nn.Module | None,
+    layer_kwargs: dict,
+    n_grid: int,
 ):
     group = mx.distributed.init()
 
@@ -148,94 +274,38 @@ def apply_scale(prev_op, layers, scales):
         layer.input_feat = layer.input_feat / scales
 
 
-@dataclass
-class LayerConfig:
-    prev_op: nn.Module
-    layers: list[nn.Module]
-    block: nn.Module | None = None
-    layer_kwargs: dict | None = None
-
-
 def scale_block(
-    block: nn.Module, mask: mx.array, quantize_func: Callable, n_grid: int = 20
+    block: nn.Module,
+    configs: list[ScaleConfig],
+    quantize_func: Callable,
+    layer_kwargs: dict,
+    n_grid: int,
 ):
-    # Layers which have the same inputs (within an elementwise multiplication)
-    # can be scaled together.
-    mlp_norm = getattr(
-        block, "pre_feedforward_layernorm", block.post_attention_layernorm
-    )
-    config = [
-        LayerConfig(
-            block=block.self_attn,
-            prev_op=block.input_layernorm,
-            layers=[
-                block.self_attn.q_proj,
-                block.self_attn.k_proj,
-                block.self_attn.v_proj,
-            ],
-            layer_kwargs={"mask": mask},
-        )
-    ]
-    # Llama 4 MOE layer
-    if hasattr(block, "feed_forward") and block.is_moe_layer:
-        config += [
-            LayerConfig(
-                block=block.feed_forward,
-                prev_op=block.post_attention_layernorm,
-                layers=[
-                    block.feed_forward.shared_expert.gate_proj,
-                    block.feed_forward.shared_expert.up_proj,
-                    block.feed_forward.experts.gate_proj,
-                    block.feed_forward.experts.up_proj,
-                    block.feed_forward.router,
-                ],
-            ),
-            LayerConfig(
-                prev_op=block.feed_forward.experts.up_proj,
-                layers=[
-                    block.feed_forward.experts.down_proj,
-                ],
-            ),
-            LayerConfig(
-                prev_op=block.feed_forward.shared_expert.up_proj,
-                layers=[
-                    block.feed_forward.shared_expert.down_proj,
-                ],
-            ),
-        ]
-    else:
-        config += [
-            LayerConfig(
-                block=block.mlp,
-                prev_op=mlp_norm,
-                layers=[
-                    block.mlp.gate_proj,
-                    block.mlp.up_proj,
-                ],
-            ),
-            LayerConfig(
-                prev_op=block.mlp.up_proj,
-                layers=[
-                    block.mlp.down_proj,
-                ],
-            ),
-        ]
-    for conf in config:
+
+    for conf in configs:
+        if conf.use_config is not None and not conf.use_config(block):
+            continue
+        if conf.block is not None:
+            local_block = block[conf.block]
+            layers = [submodule_from_key(local_block, l) for l in conf.layers]
+        else:
+            local_block = None
+            layers = [submodule_from_key(block, l) for l in conf.layers]
         scales = search_best_scale(
-            layers=conf.layers,
-            block=conf.block,
-            layer_kwargs=conf.layer_kwargs,
+            layers=layers,
+            block=local_block,
+            layer_kwargs={k: layer_kwargs[k] for k in conf.kwargs},
             quantize_func=quantize_func,
             n_grid=n_grid,
         )
-        apply_scale(conf.prev_op, conf.layers, scales)
+        apply_scale(submodule_from_key(block, conf.prev), layers, scales)
 
 
 def search_best_clip(
     module: nn.Module,
     quantize_func: Callable,
     group_size: int,
-    n_grid: int = 20,
+    n_grid: int,
     max_shrink: float = 0.5,
     subsample: int = 4,
     batch_size: int = 64,
@@ -304,15 +374,14 @@ def search_best_clip(
 
 
 def clip_block(
-    block: nn.Module, quantize_func: Callable, group_size: int, n_grid: int = 20
+    block: nn.Module,
+    no_clip_keys: list[str],
+    quantize_func: Callable,
+    group_size: int,
+    n_grid: int = 20,
 ):
-
     def apply_clip(path, module):
-        if (
-            isinstance(module, nn.Linear)
-            and "q_proj" not in path
-            and "k_proj" not in path
-        ):
+        if isinstance(module, nn.Linear) and all(k not in path for k in no_clip_keys):
             best_weight = search_best_clip(
                 module,
                 quantize_func=quantize_func,
@@ -327,12 +396,16 @@ def clip_block(
 def awq_quantize(
     model,
     inputs: mx.array,
+    awq_config: AWQConfig,
     group_size: int = 64,
     bits: int = 3,
     embed_group_size: int = 32,
     embed_bits: int = 4,
     n_grid: int = 20,
 ):
+    if awq_config.lm_key is not None:
+        model = model[awq_config.lm_key]
+
     group = mx.distributed.init()
 
     def quantize_func(w):
@@ -341,10 +414,11 @@ def awq_quantize(
 
     mask = create_attention_mask(inputs)
 
-    model.model.embed_tokens = model.model.embed_tokens.to_quantized(
+    embed_key = awq_config.embed
+    model.model[embed_key] = model.model[embed_key].to_quantized(
         group_size=embed_group_size, bits=embed_bits
     )
-    inputs = model.model.embed_tokens(inputs)
+    inputs = model.model[embed_key](inputs)
 
     def capture(module):
         if not isinstance(module, (nn.Linear, SwitchLinear)):
@@ -394,13 +468,15 @@ def awq_quantize(
 
         scale_block(
             block=block,
-            mask=mask,
+            configs=awq_config.scale_configs,
             quantize_func=quantize_func,
             n_grid=n_grid,
+            layer_kwargs={"mask": mask},
         )
 
         clip_block(
             block=block,
+            no_clip_keys=awq_config.no_clip,
             quantize_func=quantize_func,
             group_size=group_size,
             n_grid=n_grid,
@@ -420,8 +496,8 @@ def awq_quantize(
         mx.eval(block)
         mx.clear_cache()
 
-    if hasattr(model, "lm_head"):
-        model.lm_head = model.lm_head.to_quantized(
+    if awq_config.lm_head in model:
+        model[conf.lm_head] = model[conf.lm_head].to_quantized(
             group_size=embed_group_size, bits=embed_bits
         )
 
@@ -437,12 +513,7 @@ def load_wikitext(
     starts = mx.random.randint(
         0, len(tokens) - sequence_length - 1, shape=(num_samples, 1)
     )
-    data = tokens[starts + mx.arange(sequence_length)]
-    if tokenizer.bos_token_id:
-        data = mx.concatenate(
-            [mx.full((*data.shape[:1], 1), tokenizer.bos_token_id), data], axis=-1
-        )
-    return data
+    return tokens[starts + mx.arange(sequence_length)]
 
 
 def save_model(
@@ -508,19 +579,18 @@ def main():
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     model_type = config["model_type"]
-    if model_type not in SUPPORTED_MODEL_TYPES:
-        raise NotImplementedError(f"AWQ support for {config['model_type']} models NYI.")
+    if (awq_config := AWQ_MODEL_CONFIGS.get(model_type, None)) is None:
+        raise NotImplementedError(f"AWQ support for {model_type} models NYI.")
 
     calibration_data = load_wikitext(tokenizer, args.num_samples, args.sequence_length)
 
     if group is not None:
         calibration_data = dist_split(calibration_data, group)
 
-    # For Gemma3 vision/text models
-    language_model = getattr(model, "language_model", model)
     awq_quantize(
-        language_model,
+        model,
         calibration_data,
+        awq_config,
         bits=args.bits,
         group_size=args.group_size,
         embed_bits=args.embed_bits,
