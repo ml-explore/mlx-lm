@@ -1,9 +1,4 @@
 # Copyright © 2025 Apple Inc.
-# Learned quantization using AWQ
-
-# References:
-# https://arxiv.org/abs/2306.00978
-# https://github.com/mit-han-lab/llm-awq
 
 import argparse
 import copy
