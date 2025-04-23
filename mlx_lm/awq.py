@@ -565,7 +565,7 @@ def main():
         "--model", "-m", default="mlx-community/Qwen2.5-7B-Instruct-bf16"
     )
     parser.add_argument("--mlx-path", default="mlx_model")
-    parser.add_argument("--bits", type=int, default=3)
+    parser.add_argument("--bits", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--embed-bits", type=int, default=4)
     parser.add_argument("--embed-group-size", type=int, default=32)
