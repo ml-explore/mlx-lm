@@ -74,18 +74,18 @@ class Attention(nn.Module):
         self.last_k = None
         self.last_v = None
 
-    def _custom_convolution(self, u, weights):
+    def _custom_convolution(self, u, weights, state=None):
         B, H, L, D = u.shape
-        W = self.conv_window
-        weights = weights.reshape((1, H, W, 1, 1))
-        u_padded = mx.pad(u, [(0, 0), (0, 0), (W - 1, 0), (0, 0)])
-        Lp = L + (W - 1)
-        u_unfolded = mx.as_strided(
-            u_padded,
-            (B, H, W, L, D),
-            (H * Lp * D, Lp * D, D, D, 1),
-        )
-        return mx.sum(u_unfolded * weights, axis=2)
+        weights = weights.reshape((1, H, self.conv_window, 1, 1))
+        w0 = weights[:, :, 0]
+        w1 = weights[:, :, 1]
+        if state is None:
+            state = mx.zeros((B, H, 1, D), u.dtype)
+        if L > 1:
+            u_prev = mx.concatenate([state, u[:, :, :-1]], axis=2)
+        else:
+            u_prev = state
+        return u_prev * w0 + u * w1
 
     def __call__(
         self, x: mx.array, mask: mx.array = None, cache: Any = None
@@ -100,85 +100,23 @@ class Attention(nn.Module):
         v = v.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         offset = cache.offset if cache is not None else 0
+
+        k_init = k
+        v_init = v
+        k = self._custom_convolution(k, self.conv_k, state=self.last_k)
+        v = self._custom_convolution(v, self.conv_v, state=self.last_v)
         q = self.rope(q, offset=offset)
-        k_rope = self.rope(k, offset=offset)
-        k_unrotated = k
-        v_unrotated = v
+        k = self.rope(k, offset=offset)
 
-        if cache is not None and cache.offset == 0:
-            if L > 0:
-                self.last_k = k_unrotated[:, :, -1:, :]
-                self.last_v = v_unrotated[:, :, -1:, :]
-            else:
-                self.last_k = mx.zeros(
-                    (B, self.num_kv_heads, 1, self.head_dim), dtype=k_unrotated.dtype
-                )
-                self.last_v = mx.zeros(
-                    (B, self.num_kv_heads, 1, self.head_dim), dtype=v_unrotated.dtype
-                )
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
 
-            k_conv = self._custom_convolution(k_unrotated, self.conv_k)
-            v_conv = self._custom_convolution(v_unrotated, self.conv_v)
-            k_rotated_conv = self.rope(k_conv, offset=offset)
-            k_final, v_final = cache.update_and_fetch(k_rotated_conv, v_conv)
-
-        elif cache is not None and cache.offset > 0:
-            if self.last_k is None or self.last_v is None:
-                raise ValueError("last_k or last_v is None. Ensure prefill occurred.")
-
-            # Need to handle L > 1 case (continuation prefill) iteratively
-            k_conv_list = []
-            v_conv_list = []
-            # Use temporary variables to hold the 'last' state during the loop
-            temp_last_k = self.last_k
-            temp_last_v = self.last_v
-
-            # Iterate through the input sequence (L tokens)
-            for i in range(L):
-                # Get current token's unrotated k/v
-                current_k_unrotated = k_unrotated[:, :, i : i + 1, :]
-                current_v_unrotated = v_unrotated[:, :, i : i + 1, :]
-
-                # Convolve using previous step's k/v (temp_last_k/v)
-                # Reshape weights for broadcasting: (1, H, 1, 1)
-                w0_k = self.conv_k[..., 0].reshape(1, self.num_kv_heads, 1, 1)
-                w1_k = self.conv_k[..., 1].reshape(1, self.num_kv_heads, 1, 1)
-                w0_v = self.conv_v[..., 0].reshape(1, self.num_kv_heads, 1, 1)
-                w1_v = self.conv_v[..., 1].reshape(1, self.num_kv_heads, 1, 1)
-
-                k_conv_token = w0_k * temp_last_k + w1_k * current_k_unrotated
-                v_conv_token = w0_v * temp_last_v + w1_v * current_v_unrotated
-
-                k_conv_list.append(k_conv_token)
-                v_conv_list.append(v_conv_token)
-
-                # Update the 'last' state for the *next* token in this loop
-                temp_last_k = current_k_unrotated
-                temp_last_v = current_v_unrotated
-
-            # Concatenate results for the whole sequence
-            k_conv = mx.concatenate(k_conv_list, axis=2)
-            v_conv = mx.concatenate(v_conv_list, axis=2)
-
-            # Apply RoPE *after* convolution for the value going into cache
-            k_rotated_conv = self.rope(k_conv, offset=offset)
-
-            # Update cache with the *convolved* and *rotated* current K/V sequence
-            k_final, v_final = cache.update_and_fetch(k_rotated_conv, v_conv)
-
-            # Update the instance's last K/V state for the *next* call to __call__
-            # Use the *last* unrotated values from the *input* sequence
-            self.last_k = k_unrotated[:, :, -1:, :]
-            self.last_v = v_unrotated[:, :, -1:, :]
-
-        else:
-            k_conv = self._custom_convolution(k_unrotated, self.conv_k)
-            v_conv = self._custom_convolution(v_unrotated, self.conv_v)
-            k_final = self.rope(k_conv, offset=offset)
-            v_final = v_conv
+        if L > 0:
+            self.last_k = k_init[:, :, -1:, :]
+            self.last_v = v_init[:, :, -1:, :]
 
         out = scaled_dot_product_attention(
-            q, k_final, v_final, cache=cache, scale=self.scale, mask=mask
+            q, k, v, cache=cache, scale=self.scale, mask=mask
         )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
