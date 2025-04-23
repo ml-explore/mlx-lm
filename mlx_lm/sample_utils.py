@@ -261,21 +261,14 @@ def apply_xtc(
     probs = mx.softmax(logits, -1)
 
     mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
-    mask_xtc_skip = mx.array(False)
     if special_tokens_ids:
-        special_ids_arr = mx.array(special_tokens_ids)
-        mask_xtc_skip  = mx.any(mask[..., special_ids_arr])
-
-    mask = mx.logical_and(mask,mx.logical_not(mask_xtc_skip))
-
+        mask[..., special_tokens_ids] = False
 
     return mx.where(
         mx.random.uniform(0, 1) > xtc_probability,
         logits,
         mx.where(mask, -mx.inf, logits),
-        )
-
-
+    )
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
