@@ -84,6 +84,8 @@ def mixed_quant_predicate_builder(
 
 QUANT_RECIPES = ["mixed_2_6", "mixed_3_6", "mixed_4_6"]
 
+MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+
 
 def convert(
     hf_path: str,
@@ -91,7 +93,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
-    dtype: str = "float16",
+    dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
@@ -116,15 +118,20 @@ def convert(
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
 
+    if dtype is None:
+        dtype = config.get("torch_dtype", None)
     weights = dict(tree_flatten(model.parameters()))
-    dtype = getattr(mx, dtype)
-    if hasattr(model, "cast_predicate"):
-        cast_predicate = model.cast_predicate()
-    else:
-        cast_predicate = lambda _: True
-    weights = {
-        k: v.astype(dtype) if cast_predicate(k) else v for k, v in weights.items()
-    }
+    if dtype in MODEL_CONVERSION_DTYPES:
+        print("[INFO] Using dtype:", dtype)
+        dtype = getattr(mx, dtype)
+
+        if hasattr(model, "cast_predicate"):
+            cast_predicate = model.cast_predicate()
+        else:
+            cast_predicate = lambda _: True
+        weights = {
+            k: v.astype(dtype) if cast_predicate(k) else v for k, v in weights.items()
+        }
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -191,10 +198,10 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        help="Type to save the non-quantized parameters.",
+        help="Type to save the non-quantized parameters. Defaults to config.json's `torch_dtype` or the current model weights dtype.",
         type=str,
-        choices=["float16", "bfloat16", "float32"],
-        default="float16",
+        choices=MODEL_CONVERSION_DTYPES,
+        default=None,
     )
     parser.add_argument(
         "--upload-repo",
