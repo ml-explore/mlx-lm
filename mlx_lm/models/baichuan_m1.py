@@ -1,14 +1,15 @@
 # Copyright © 2023-2024 Apple Inc.
 
-from dataclasses import dataclass
-from typing import List, Any, Optional
 import math
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -22,13 +23,12 @@ class ModelArgs(BaseModelArgs):
     sliding_window: int
     sliding_window_layers: List[int]
     conv_window: int
-    attention_dropout: float
     rms_norm_eps: float
-    pad_token_id: int
     model_type: str = "baichuan_m1"
     num_swa_attention_heads: Optional[int] = None
     num_swa_key_value_heads: Optional[int] = None
     tie_word_embeddings: bool = False
+
 
 class Attention(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: Optional[int] = None):
@@ -39,17 +39,31 @@ class Attention(nn.Module):
             raise ValueError("Layer index must be provided to Attention module.")
 
         self.is_swa = layer_idx in config.sliding_window_layers
-        self.num_heads = config.num_swa_attention_heads if self.is_swa and config.num_swa_attention_heads else config.num_attention_heads
-        self.num_kv_heads = config.num_swa_key_value_heads if self.is_swa and config.num_swa_key_value_heads else config.num_key_value_heads
+        self.num_heads = (
+            config.num_swa_attention_heads
+            if self.is_swa and config.num_swa_attention_heads
+            else config.num_attention_heads
+        )
+        self.num_kv_heads = (
+            config.num_swa_key_value_heads
+            if self.is_swa and config.num_swa_key_value_heads
+            else config.num_key_value_heads
+        )
 
         self.hidden_size = config.hidden_size
         self.head_dim = self.hidden_size // self.num_heads
         assert self.head_dim * self.num_heads == self.hidden_size
 
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
-        self.W_pack = nn.Linear(config.hidden_size, self.hidden_size + 2 * self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
+        self.W_pack = nn.Linear(
+            config.hidden_size,
+            self.hidden_size + 2 * self.num_kv_heads * self.head_dim,
+            bias=False,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=False
+        )
 
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=config.rope_theta)
 
@@ -60,25 +74,22 @@ class Attention(nn.Module):
         self.last_k = None
         self.last_v = None
 
-    def _custom_convolution(self, u, k_conv_weights):
-        if k_conv_weights is None:
-            raise ValueError("Convolution weights (conv_k or conv_v) not loaded.")
+    def _custom_convolution(self, u, weights):
         B, H, L, D = u.shape
         W = self.conv_window
-
+        weights = weights.reshape((1, H, W, 1, 1))
         u_padded = mx.pad(u, [(0, 0), (0, 0), (W - 1, 0), (0, 0)])
+        Lp = L + (W - 1)
+        u_unfolded = mx.as_strided(
+            u_padded,
+            (B, H, W, L, D),
+            (H * Lp * D, Lp * D, D, D, 1),
+        )
+        return mx.sum(u_unfolded * weights, axis=2)
 
-        outputs = []
-        for w in range(W):
-           u_slice = u_padded[:, :, w:w+L, :]
-           raw_weight_slice = k_conv_weights[..., w]
-           weight_slice = raw_weight_slice.squeeze(0).squeeze(-1).reshape(1, self.num_kv_heads, 1, 1)
-           outputs.append(u_slice * weight_slice)
-
-        v = mx.sum(mx.stack(outputs, axis=0), axis=0)
-        return v
-
-    def __call__(self, x: mx.array, mask: mx.array = None, cache: Any = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, mask: mx.array = None, cache: Any = None
+    ) -> mx.array:
         B, L, D = x.shape
 
         proj = self.W_pack(x)
@@ -100,11 +111,15 @@ class Attention(nn.Module):
 
         if cache is not None and cache.offset == 0:
             if L > 0:
-                 self.last_k = k_unrotated[:, :, -1:, :]
-                 self.last_v = v_unrotated[:, :, -1:, :]
+                self.last_k = k_unrotated[:, :, -1:, :]
+                self.last_v = v_unrotated[:, :, -1:, :]
             else:
-                 self.last_k = mx.zeros((B, self.num_kv_heads, 1, self.head_dim), dtype=k_unrotated.dtype)
-                 self.last_v = mx.zeros((B, self.num_kv_heads, 1, self.head_dim), dtype=v_unrotated.dtype)
+                self.last_k = mx.zeros(
+                    (B, self.num_kv_heads, 1, self.head_dim), dtype=k_unrotated.dtype
+                )
+                self.last_v = mx.zeros(
+                    (B, self.num_kv_heads, 1, self.head_dim), dtype=v_unrotated.dtype
+                )
 
             k_conv = self._custom_convolution(k_unrotated, self.conv_k)
             v_conv = self._custom_convolution(v_unrotated, self.conv_v)
@@ -125,8 +140,8 @@ class Attention(nn.Module):
             # Iterate through the input sequence (L tokens)
             for i in range(L):
                 # Get current token's unrotated k/v
-                current_k_unrotated = k_unrotated[:, :, i:i+1, :]
-                current_v_unrotated = v_unrotated[:, :, i:i+1, :]
+                current_k_unrotated = k_unrotated[:, :, i : i + 1, :]
+                current_v_unrotated = v_unrotated[:, :, i : i + 1, :]
 
                 # Convolve using previous step's k/v (temp_last_k/v)
                 # Reshape weights for broadcasting: (1, H, 1, 1)
@@ -161,24 +176,34 @@ class Attention(nn.Module):
             self.last_v = v_unrotated[:, :, -1:, :]
 
         else:
-             k_conv = self._custom_convolution(k_unrotated, self.conv_k)
-             v_conv = self._custom_convolution(v_unrotated, self.conv_v)
-             k_final = self.rope(k_conv, offset=offset)
-             v_final = v_conv
+            k_conv = self._custom_convolution(k_unrotated, self.conv_k)
+            v_conv = self._custom_convolution(v_unrotated, self.conv_v)
+            k_final = self.rope(k_conv, offset=offset)
+            v_final = v_conv
 
-        out = scaled_dot_product_attention(q, k_final, v_final, cache=cache, scale=self.scale, mask=mask)
+        out = scaled_dot_product_attention(
+            q, k_final, v_final, cache=cache, scale=self.scale, mask=mask
+        )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
+
 
 class MLP(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
 
 class DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
@@ -186,15 +211,18 @@ class DecoderLayer(nn.Module):
         self.self_attn = Attention(config, layer_idx)
         self.mlp = MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
-    def __call__(self, x: mx.array, mask: mx.array = None, cache: Any = None) -> mx.array:
-        h = self.input_layernorm(x)
-        r = self.self_attn(h, mask, cache)
+    def __call__(
+        self, x: mx.array, mask: mx.array = None, cache: Any = None
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
         x = x + r
-        h2 = self.post_attention_layernorm(x)
-        m = self.mlp(h2)
-        return x + m
+        r = self.mlp(self.post_attention_layernorm(x))
+        return x + r
+
 
 class BaichuanModel(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -204,7 +232,9 @@ class BaichuanModel(nn.Module):
         self.layers = [DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, inputs: mx.array, mask: mx.array = None, cache: Any = None) -> mx.array:
+    def __call__(
+        self, inputs: mx.array, mask: mx.array = None, cache: Any = None
+    ) -> mx.array:
         x = self.embed_tokens(inputs)
         if mask is None:
             mask = create_attention_mask(x, cache)
@@ -214,17 +244,6 @@ class BaichuanModel(nn.Module):
             x = layer(x, mask, c)
         return self.norm(x)
 
-class NormHead(nn.Module):
-    def __init__(self, hidden_size, vocab_size):
-        super().__init__()
-        self.weight = mx.random.normal((vocab_size, hidden_size))
-        scale = math.sqrt(6.0 / (vocab_size + hidden_size))
-        self.weight = self.weight * scale
-
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-        norm_factor = mx.linalg.norm(self.weight, axis=-1, keepdims=True)
-        norm_weight = self.weight / (norm_factor + 1e-7)
-        return hidden_states @ norm_weight.T
 
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -234,7 +253,7 @@ class Model(nn.Module):
         self.model = BaichuanModel(config)
         self.tie_word_embeddings = config.tie_word_embeddings
         if not config.tie_word_embeddings:
-            self.lm_head = NormHead(config.hidden_size, config.vocab_size)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def make_cache(self) -> List[Any]:
         caches = []
@@ -249,12 +268,19 @@ class Model(nn.Module):
     def sanitize(self, weights: dict) -> dict:
         if self.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+        else:
+            # Pre-normalize the lm_head
+            w = weights["lm_head.weight"]
+            w = w / (mx.linalg.norm(w, axis=-1, keepdims=True) + 1e-7)
+            weights["lm_head.weight"] = w
         return weights
 
-    def __call__(self, inputs: mx.array, mask: mx.array = None, cache: Any = None) -> mx.array:
+    def __call__(
+        self, inputs: mx.array, mask: mx.array = None, cache: Any = None
+    ) -> mx.array:
         outputs = self.model(inputs, mask, cache)
         return self.lm_head(outputs)
 
     @property
     def layers(self) -> List[nn.Module]:
-        return self.model.layers 
+        return self.model.layers
