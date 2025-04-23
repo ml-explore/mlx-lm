@@ -113,19 +113,52 @@ class Attention(nn.Module):
 
         elif cache is not None and cache.offset > 0:
             if self.last_k is None or self.last_v is None:
-                raise ValueError("last_k or last_v is None during decode step. Ensure prefill occurred.")
-            if L != 1:
-                raise ValueError(f"Decode step expected sequence length 1, but got {L}")
+                raise ValueError("last_k or last_v is None. Ensure prefill occurred.")
 
-            current_k_conv = self.conv_k[..., 0:1].squeeze(0).squeeze(-1)[:,:,None,:] * self.last_k + \
-                             self.conv_k[..., 1:2].squeeze(0).squeeze(-1)[:,:,None,:] * k_unrotated
-            current_v_conv = self.conv_v[..., 0:1].squeeze(0).squeeze(-1)[:,:,None,:] * self.last_v + \
-                             self.conv_v[..., 1:2].squeeze(0).squeeze(-1)[:,:,None,:] * v_unrotated
+            # Need to handle L > 1 case (continuation prefill) iteratively
+            k_conv_list = []
+            v_conv_list = []
+            # Use temporary variables to hold the 'last' state during the loop
+            temp_last_k = self.last_k
+            temp_last_v = self.last_v
 
-            current_k_rotated_conv = self.rope(current_k_conv, offset=offset)
-            k_final, v_final = cache.update_and_fetch(current_k_rotated_conv, current_v_conv)
-            self.last_k = k_unrotated
-            self.last_v = v_unrotated
+            # Iterate through the input sequence (L tokens)
+            for i in range(L):
+                # Get current token's unrotated k/v
+                current_k_unrotated = k_unrotated[:, :, i:i+1, :]
+                current_v_unrotated = v_unrotated[:, :, i:i+1, :]
+
+                # Convolve using previous step's k/v (temp_last_k/v)
+                # Reshape weights for broadcasting: (1, H, 1, 1)
+                w0_k = self.conv_k[..., 0].reshape(1, self.num_kv_heads, 1, 1)
+                w1_k = self.conv_k[..., 1].reshape(1, self.num_kv_heads, 1, 1)
+                w0_v = self.conv_v[..., 0].reshape(1, self.num_kv_heads, 1, 1)
+                w1_v = self.conv_v[..., 1].reshape(1, self.num_kv_heads, 1, 1)
+
+                k_conv_token = w0_k * temp_last_k + w1_k * current_k_unrotated
+                v_conv_token = w0_v * temp_last_v + w1_v * current_v_unrotated
+
+                k_conv_list.append(k_conv_token)
+                v_conv_list.append(v_conv_token)
+
+                # Update the 'last' state for the *next* token in this loop
+                temp_last_k = current_k_unrotated
+                temp_last_v = current_v_unrotated
+
+            # Concatenate results for the whole sequence
+            k_conv = mx.concatenate(k_conv_list, axis=2)
+            v_conv = mx.concatenate(v_conv_list, axis=2)
+
+            # Apply RoPE *after* convolution for the value going into cache
+            k_rotated_conv = self.rope(k_conv, offset=offset)
+
+            # Update cache with the *convolved* and *rotated* current K/V sequence
+            k_final, v_final = cache.update_and_fetch(k_rotated_conv, v_conv)
+
+            # Update the instance's last K/V state for the *next* call to __call__
+            # Use the *last* unrotated values from the *input* sequence
+            self.last_k = k_unrotated[:, :, -1:, :]
+            self.last_v = v_unrotated[:, :, -1:, :]
 
         else:
              k_conv = self._custom_convolution(k_unrotated, self.conv_k)
