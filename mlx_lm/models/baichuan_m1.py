@@ -1,6 +1,5 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -8,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, RotatingKVCache
+from .cache import CacheList, KVCache, MambaCache, RotatingKVCache
 
 
 @dataclass
@@ -71,8 +70,6 @@ class Attention(nn.Module):
         assert self.conv_window == 2
         self.conv_k = mx.zeros((1, 1, self.num_kv_heads, 1, self.conv_window))
         self.conv_v = mx.zeros((1, 1, self.num_kv_heads, 1, self.conv_window))
-        self.last_k = None
-        self.last_v = None
 
     def _custom_convolution(self, u, weights, state=None):
         B, H, L, D = u.shape
@@ -99,24 +96,28 @@ class Attention(nn.Module):
         k = k.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        offset = cache.offset if cache is not None else 0
+        if cache is not None:
+            offset = cache[1].offset
+            last_k, last_v = cache[0][0], cache[0][1]
+        else:
+            offset = 0
+            last_k, last_v = None, None
 
         k_init = k
         v_init = v
-        k = self._custom_convolution(k, self.conv_k, state=self.last_k)
-        v = self._custom_convolution(v, self.conv_v, state=self.last_v)
+        k = self._custom_convolution(k, self.conv_k, state=last_k)
+        v = self._custom_convolution(v, self.conv_v, state=last_v)
         q = self.rope(q, offset=offset)
         k = self.rope(k, offset=offset)
 
         if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-
-        if L > 0:
-            self.last_k = k_init[:, :, -1:, :]
-            self.last_v = v_init[:, :, -1:, :]
+            k, v = cache[1].update_and_fetch(k, v)
+            if L > 0:
+                cache[0][0] = k_init[:, :, -1:, :]
+                cache[0][1] = v_init[:, :, -1:, :]
 
         out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask
+            q, k, v, cache=cache[1], scale=self.scale, mask=mask
         )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
@@ -171,7 +172,9 @@ class BaichuanModel(nn.Module):
     ) -> mx.array:
         x = self.embed_tokens(inputs)
         if mask is None:
-            mask = create_attention_mask(x, cache)
+            if cache is not None:
+                c = [cache[0][1]]
+            mask = create_attention_mask(x, c)
         if cache is None:
             cache = [None] * len(self.layers)
         for layer, c in zip(self.layers, cache):
@@ -193,10 +196,12 @@ class Model(nn.Module):
         caches = []
         for i, layer in enumerate(self.model.layers):
             is_swa = i in self.config.sliding_window_layers
+            conv_cache = MambaCache()
             if is_swa:
-                caches.append(RotatingKVCache(max_size=self.config.sliding_window))
+                kv_cache = RotatingKVCache(max_size=self.config.sliding_window)
             else:
-                caches.append(KVCache())
+                kv_cache = KVCache()
+            caches.append(CacheList(conv_cache, kv_cache))
         return caches
 
     def sanitize(self, weights: dict) -> dict:
