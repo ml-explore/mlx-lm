@@ -366,11 +366,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise ValueError("logit_bias must be a dict of int to float")
         if not (
             isinstance(self.xtc_probability, float)
-            and 0.00 < self.xtc_probability <= 1.00
+            and 0.00 <= self.xtc_probability <= 1.00
         ):
             raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
         if not (
-            isinstance(self.xtc_threshold, float) and 0.00 < self.xtc_threshold <= 0.50
+            isinstance(self.xtc_threshold, float) and 0.00 <= self.xtc_threshold <= 0.50
         ):
             raise ValueError(f"xtc_threshold must be a float between 0.00 and 0.5")
         if not isinstance(self.requested_model, str):
