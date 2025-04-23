@@ -13,6 +13,12 @@ The script can take a while to run depending on the model size and the number
 of samples. Once it's finished, the model will be saved in the current
 directory under `mlx_model`.
 
+Main default options are 
+- --bits 3 (3bit quantization)
+- --group-size 64
+- --num-samples 32
+- --n-grid 10 
+
 For a full list of options run:
 
 ```bash
