@@ -15,7 +15,13 @@ import yaml
 
 from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
+from .tuner.trainer import (
+    TrainingArgs,
+    TrainingCallback,
+    evaluate,
+    load_checkpoint,
+    train,
+)
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -214,57 +220,6 @@ def train_model(
     else:
         raise ValueError(f"Received unknown fine-tune-type {args.fine_tune_type}")
 
-    # Resume from weights if provided
-    start_iteration = 1
-    if args.resume_adapter_file is not None:
-        adapter_file = Path(args.resume_adapter_file)
-        if adapter_file.is_dir():
-            safetensor_files = sorted(
-                adapter_file.glob("*_adapters.safetensors"),
-                key=lambda f: int(f.name.split("_")[0]),
-                reverse=True,
-            )
-            if not safetensor_files:
-                raise ValueError("No adapter files found to resume from.")
-            latest = safetensor_files[0]
-            print(f"Auto-resuming from latest adapter file: {latest}")
-            args.resume_adapter_file = str(latest)
-        else:
-            print(f"Resuming from: {args.resume_adapter_file}")
-        model.load_weights(args.resume_adapter_file, strict=False)
-
-        # Log resume state and extract iteration
-        from safetensors.numpy import safe_open
-
-        with safe_open(args.resume_adapter_file, framework="numpy") as f:
-            metadata = dict(f.metadata())
-            print("✅ Resuming from checkpoint:")
-            print("  Metadata:", metadata)
-            if "iteration" in metadata:
-                start_iteration = int(metadata["iteration"]) + 1
-                print(f"  Continuing from iteration {start_iteration}")
-
-    print_trainable_parameters(model)
-
-    adapter_path = Path(args.adapter_path)
-    adapter_path.mkdir(parents=True, exist_ok=True)
-
-    adapter_file = adapter_path / "adapters.safetensors"
-    save_config(vars(args), adapter_path / "adapter_config.json")
-
-    # init training args
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=args.iters,
-        val_batches=args.val_batches,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.save_every,
-        adapter_file=adapter_file,
-        max_seq_length=args.max_seq_length,
-        grad_checkpoint=args.grad_checkpoint,
-    )
-
     # Initialize the selected optimizer
     lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
 
@@ -278,14 +233,37 @@ def train_model(
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
-    opt = opt_class(learning_rate=lr, **optimizer_config)
+    optimizer = opt_class(learning_rate=lr, **optimizer_config)
+
+    # Load weights and optimizer state from checkpoint if applicable
+    start_iteration = load_checkpoint(model, optimizer, args.resume_adapter_file)
+
+    print_trainable_parameters(model)
+
+    adapter_path = Path(args.adapter_path)
+    adapter_path.mkdir(parents=True, exist_ok=True)
+
+    adapter_file = adapter_path / "adapters.safetensors"
+    save_config(vars(args), adapter_path / "adapter_config.json")
+
+    training_args = TrainingArgs(
+        batch_size=args.batch_size,
+        iters=args.iters,
+        val_batches=args.val_batches,
+        steps_per_report=args.steps_per_report,
+        steps_per_eval=args.steps_per_eval,
+        steps_per_save=args.save_every,
+        adapter_file=adapter_file,
+        max_seq_length=args.max_seq_length,
+        grad_checkpoint=args.grad_checkpoint,
+    )
 
     # Train model
     train(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        optimizer=opt,
+        optimizer=optimizer,
         train_dataset=train_set,
         val_dataset=valid_set,
         training_callback=training_callback,

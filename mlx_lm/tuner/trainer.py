@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten
@@ -337,28 +338,10 @@ def train(
             steps = 0
             train_time = 0
 
-        # Save adapter weights
+        # Save adapter weights and optimizer state
         if it % args.steps_per_save == 0 and rank == 0:
-            adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-
-            metadata = {
-                "iteration": str(it),
-                "trained_tokens": str(trained_tokens),
-                "loss": f"{train_loss:.6f}",
-            }
-
-            mx.save_safetensors(
-                str(args.adapter_file),
-                adapter_weights,
-                metadata=metadata,
-            )
-            checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
-            )
-            mx.save_safetensors(str(checkpoint), adapter_weights, metadata=metadata)
-            print(
-                f"Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}."
+            save_checkpoint(
+                model, optimizer, args.adapter_file, it, trained_tokens, train_loss
             )
 
     # Save final weights
@@ -371,3 +354,112 @@ def train(
         }
         mx.save_safetensors(str(args.adapter_file), adapter_weights, metadata=metadata)
         print(f"Saved final weights to {args.adapter_file}.")
+
+
+def save_checkpoint(model, optimizer, checkpoint_file, iteration, trained_tokens, loss):
+    """Save a checkpoint including model weights and optimizer state."""
+    adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+    optimizer_state = dict(tree_flatten(optimizer.state))
+
+    # Extract optimizer configuration
+    optimizer_config = {
+        "step": str(optimizer_state.get("step", 0).item()),
+        "betas": str(optimizer.betas),
+        "eps": str(optimizer.eps),
+        "learning_rate": str(optimizer.learning_rate.item()),
+        "optimizer_type": type(optimizer).__name__,
+    }
+
+    # Add weight_decay only for AdamW
+    if isinstance(optimizer, optim.AdamW):
+        optimizer_config["weight_decay"] = str(optimizer.weight_decay)
+
+    # For Adam/AdamW, save the estimates
+    if isinstance(optimizer, (optim.Adam, optim.AdamW)):
+
+        optimizer_config.update(
+            {
+                "m": str(
+                    {k: v.tolist() for k, v in optimizer_state.get("m", {}).items()}
+                ),
+                "v": str(
+                    {k: v.tolist() for k, v in optimizer_state.get("v", {}).items()}
+                ),
+            }
+        )
+
+    metadata = {
+        "iteration": str(iteration),
+        "trained_tokens": str(trained_tokens),
+        "loss": f"{loss:.6f}",
+        "optimizer": str(optimizer_config),
+    }
+
+    # Save main checkpoint
+    mx.save_safetensors(str(checkpoint_file), adapter_weights, metadata=metadata)
+
+    # Save numbered checkpoint
+    checkpoint = Path(checkpoint_file).parent / f"{iteration:07d}_adapters.safetensors"
+    mx.save_safetensors(str(checkpoint), adapter_weights, metadata=metadata)
+
+    print(f"Saved adapter weights to {checkpoint_file} and {checkpoint}")
+
+
+def load_checkpoint(model, optimizer, checkpoint_file):
+    """Load a checkpoint and return the start iteration."""
+    start_iteration = 1
+    if checkpoint_file is None:
+        return start_iteration
+
+    checkpoint_path = Path(checkpoint_file)
+    if checkpoint_path.is_dir():
+        safetensor_files = sorted(
+            checkpoint_path.glob("*_adapters.safetensors"),
+            key=lambda f: int(f.name.split("_")[0]),
+            reverse=True,
+        )
+        if not safetensor_files:
+            raise ValueError("No adapter files found to resume from.")
+        checkpoint_file = str(safetensor_files[0])
+        print(f"Auto-resuming from latest adapter file: {checkpoint_file}")
+    else:
+        checkpoint_file = str(checkpoint_path)
+
+    weights, metadata = mx.load(checkpoint_file, return_metadata=True)
+    model.load_weights(checkpoint_file, strict=False)
+
+    if metadata:
+        if "iteration" in metadata:
+            start_iteration = int(metadata["iteration"]) + 1
+            print(f"Continuing from iteration {start_iteration}")
+
+        if "optimizer" in metadata:
+
+            optimizer_config = eval(metadata["optimizer"])
+
+            # Restore optimizer state
+            if isinstance(optimizer, (optim.Adam, optim.AdamW)):
+
+                m = eval(optimizer_config["m"])
+                v = eval(optimizer_config["v"])
+                m = {k: mx.array(v) for k, v in m.items()}
+                v = {k: mx.array(v) for k, v in v.items()}
+                optimizer.state["m"] = m
+                optimizer.state["v"] = v
+                optimizer.state["step"] = mx.array(int(optimizer_config["step"]))
+
+                # Restore optimizer parameters
+                optimizer.betas = eval(optimizer_config["betas"])
+                optimizer.eps = float(optimizer_config["eps"])
+                optimizer.learning_rate = float(optimizer_config["learning_rate"])
+
+                # Restore weight_decay only for AdamW
+                if (
+                    isinstance(optimizer, optim.AdamW)
+                    and "weight_decay" in optimizer_config
+                ):
+                    optimizer.weight_decay = float(optimizer_config["weight_decay"])
+
+                print("Restored optimizer state from checkpoint")
+
+    return start_iteration
