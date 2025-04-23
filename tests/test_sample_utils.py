@@ -104,11 +104,11 @@ class TestSampleUtils(unittest.TestCase):
         new_probs_rounded = [round(p, 4) for p in new_probs.tolist()]
         self.assertEqual(new_probs_rounded, [0, 0.5, 0.25, 0.25])
 
-        # All but the last prob, which is the last one above the threshold, should be discarded
+        # All but the two last probs, which are the last ones above the threshold, should be discarded
         new_logits = apply_xtc(logprobs, 1, 0.15, [100])
         new_probs = mx.softmax(new_logits.squeeze())
         new_probs_rounded = [round(p, 4) for p in new_probs.tolist()]
-        self.assertEqual(new_probs_rounded, [0, 0, 0, 1])
+        self.assertEqual(new_probs_rounded, [0.0, 0.0, 0.5, 0.5])
 
         # If XTC probability = 0, the probs shouldn't change
         new_logits = apply_xtc(logprobs, 0.00, 0.2, [100])
