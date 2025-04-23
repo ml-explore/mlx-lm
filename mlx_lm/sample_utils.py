@@ -258,27 +258,24 @@ def apply_xtc(
         )
 
     # Converting logits to probs then get sorted probs
-    probs = mx.softmax(logits, axis=-1)
-    sorted_indices = mx.argsort(-probs, axis=-1)
+    probs = mx.softmax(logits, -1)
 
-    sorted_p = mx.take_along_axis(probs, sorted_indices, axis=-1)
+    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
+    mask_xtc_skip = mx.array(False)
+    if special_tokens_ids:
+        special_ids_arr = mx.array(special_tokens_ids)
+        mask_xtc_skip  = mx.any(mask[..., special_ids_arr])
 
-    sorted_indice_to_remove = mx.full(sorted_p.shape, False, getattr(mx, "bool_"))
-    sorted_indice_to_remove[..., :-1] = sorted_p[..., 1:] >= xtc_threshold
-    indices_to_remove = mx.take_along_axis(
-        sorted_indice_to_remove, mx.argsort(sorted_indices, axis=-1), axis=-1
-    )
-    # Like in the original implementation, we exclude EOS/newline characters from being
-    # removed by XTC sampling
-    special_tokens_mask = mx.zeros(indices_to_remove.shape[1], getattr(mx, "bool_"))
-    special_tokens_mask[special_tokens_ids] = True
-    indices_to_remove = mx.logical_and(
-        indices_to_remove, mx.logical_not(special_tokens_mask)
-    )
+    mask = mx.logical_and(mask,mx.logical_not(mask_xtc_skip))
 
-    logits_edited = mx.where(indices_to_remove, -float("inf"), logits)
 
-    return mx.where(mx.random.uniform(0, 1) >= xtc_probability, logits, logits_edited)
+    return mx.where(
+        mx.random.uniform(0, 1) > xtc_probability,
+        logits,
+        mx.where(mask, -mx.inf, logits),
+        )
+
+
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
