@@ -93,11 +93,7 @@ class Attention(nn.Module):
         B, L, D = x.shape
 
         proj = self.W_pack(x)
-        q_proj_end = self.hidden_size
-        k_proj_end = q_proj_end + self.num_kv_heads * self.head_dim
-        q = proj[:, :, :q_proj_end]
-        k = proj[:, :, q_proj_end:k_proj_end]
-        v = proj[:, :, k_proj_end:]
+        q, k, v = mx.split(proj, (D, D + self.num_kv_heads * self.head_dim), axis=-1)
 
         q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
