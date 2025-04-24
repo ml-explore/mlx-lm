@@ -15,7 +15,7 @@ def make_sampler(
     top_k: int = -1,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    special_tokens_ids: Optional[List[int]] = None,
+    xtc_special_tokens: List[int] = [],
 ) -> Callable[mx.array, mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
@@ -35,7 +35,7 @@ def make_sampler(
             sampling.
         xtc_threshold (float, optional): The threshold the probs need to reach
             for being sampled.
-        special_tokens_ids (list(int), optional): List of special tokens IDs to
+        xtc_special_tokens (list(int), optional): List of special tokens IDs to
             be excluded from XTC sampling.
 
 
@@ -56,7 +56,7 @@ def make_sampler(
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
     if xtc_probability > 0.0:
         sampling_methods.append(
-            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, special_tokens_ids)
+            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
         )
 
     # Apply the sampling methods
@@ -237,7 +237,7 @@ def apply_xtc(
     logits: mx.array,
     xtc_probability: float,
     xtc_threshold: float,
-    special_tokens_ids: List[int],
+    xtc_special_tokens: List[int],
 ) -> mx.array:
     """
     Apply XTC sampling to the logits.
@@ -259,8 +259,8 @@ def apply_xtc(
 
     probs = mx.softmax(logits, -1)
     mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
-    if special_tokens_ids:
-        mask[..., special_tokens_ids] = False
+    if xtc_special_tokens:
+        mask[..., xtc_special_tokens] = False
 
     return mx.where(
         mx.random.uniform(0, 1) > xtc_probability,

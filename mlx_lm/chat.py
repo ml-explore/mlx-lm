@@ -107,9 +107,6 @@ def main():
             continue
         messages = [{"role": "user", "content": query}]
         prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-        special_token_ids = [id for id in tokenizer.eos_token_ids] + tokenizer.encode(
-            "\n"
-        )
         for response in stream_generate(
             model,
             tokenizer,
@@ -120,7 +117,9 @@ def main():
                 args.top_p,
                 xtc_threshold=args.xtc_threshold,
                 xtc_probability=args.xtc_probability,
-                special_tokens_ids=special_token_ids,
+                xtc_special_tokens=(
+                    tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+                ),
             ),
             prompt_cache=prompt_cache,
         ):

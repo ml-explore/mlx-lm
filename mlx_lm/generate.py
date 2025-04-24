@@ -820,7 +820,6 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    special_tokens_ids = [id for id in tokenizer.eos_token_ids] + tokenizer.encode("\n")
     sampler = make_sampler(
         args.temp,
         args.top_p,
@@ -828,7 +827,7 @@ def main():
         args.min_tokens_to_keep,
         xtc_probability=args.xtc_probability,
         xtc_threshold=args.xtc_threshold,
-        special_tokens_ids=special_tokens_ids,
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
     response = generate(
         model,
