@@ -12,7 +12,7 @@ def make_sampler(
     top_p: float = 0.0,
     min_p: float = 0.0,
     min_tokens_to_keep: int = 1,
-    top_k: int = -1,
+    top_k: int = 0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: List[int] = [],
