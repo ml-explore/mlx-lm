@@ -257,9 +257,7 @@ def apply_xtc(
             f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
         )
 
-    # Converting logits to probs then get sorted probs
     probs = mx.softmax(logits, -1)
-
     mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
     if special_tokens_ids:
         mask[..., special_tokens_ids] = False
