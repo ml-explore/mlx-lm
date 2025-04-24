@@ -524,7 +524,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_p=self.top_p,
             xtc_probability=self.xtc_probability,
             xtc_threshold=self.xtc_threshold,
-            special_tokens_ids=[
+            xtc_special_tokens=[
                 self.tokenizer.eos_token_id,
                 self.tokenizer.encode("\n"),
             ],
