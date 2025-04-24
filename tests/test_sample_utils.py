@@ -95,9 +95,9 @@ class TestSampleUtils(unittest.TestCase):
         )
 
     def test_apply_xtc(self):
-        probs = mx.array([0.4, 0.3, 0.15, 0.15])[None]
 
         # XTC should discard only the first probability
+        probs = mx.array([0.4, 0.3, 0.15, 0.15])[None]
         logprobs = mx.log(probs)
         new_logits = apply_xtc(logprobs, 1, 0.2, [100])
         new_probs = mx.softmax(new_logits.squeeze())
@@ -105,12 +105,16 @@ class TestSampleUtils(unittest.TestCase):
         self.assertEqual(new_probs_rounded, [0, 0.5, 0.25, 0.25])
 
         # All but the two last probs, which are the last ones above the threshold, should be discarded
+        probs = mx.array([0.4, 0.3, 0.15, 0.15])[None]
+        logprobs = mx.log(probs)
         new_logits = apply_xtc(logprobs, 1, 0.15, [100])
         new_probs = mx.softmax(new_logits.squeeze())
         new_probs_rounded = [round(p, 4) for p in new_probs.tolist()]
         self.assertEqual(new_probs_rounded, [0.0, 0.0, 0.5, 0.5])
 
         # If XTC probability = 0, the probs shouldn't change
+        probs = mx.array([0.4, 0.3, 0.15, 0.15])[None]
+        logprobs = mx.log(probs)
         new_logits = apply_xtc(logprobs, 0.00, 0.2, [100])
         new_probs = mx.softmax(new_logits.squeeze())
         new_probs_rounded = [round(p, 4) for p in new_probs.tolist()]
