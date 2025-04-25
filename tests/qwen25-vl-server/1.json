@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {"role": "system", "content": "Describe the image using only single-syllable words."},
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What is this?"},
+        {"type": "image_url", "image_url": {"url": "https://huggingface.co/blog/assets/why-gradio-stands-out/thumbnail.png"}}
+      ]
+    }
+  ],
+  "max_tokens": 50,
+  "temperature": 0.1
+}

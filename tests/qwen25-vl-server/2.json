@@ -1,0 +1,15 @@
+{
+    "messages": [
+      {"role": "system", "content": "Compare the two images focusing only on the colors present."},
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "What are the differences?"},
+          {"type": "image_url", "image_url": {"url": "https://huggingface.co/blog/assets/why-gradio-stands-out/thumbnail.png"}},
+          {"type": "image_url", "image_url": {"url": "https://huggingface.co/blog/assets/why-gradio-stands-out/thumbnail.png"}}
+        ]
+      }
+    ],
+    "max_tokens": 70,
+     "temperature": 0.1
+  }
