@@ -747,6 +747,8 @@ class APIHandler(BaseHTTPRequestHandler):
         def probably_mlx_lm(repo):
             if repo.repo_type != "model":
                 return False
+            if "main" not in repo.refs:
+                return False
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)
 
