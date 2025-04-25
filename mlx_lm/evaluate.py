@@ -400,3 +400,5 @@ def main():
         print("Results:")
         for result in results["results"].values():
             print(json.dumps(result, indent=4))
+if __name__ == "__main__":
+    main()
