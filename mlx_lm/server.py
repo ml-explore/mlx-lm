@@ -598,14 +598,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     : self.logprobs
                 ].tolist()  # Convert to Python list
                 top_logprobs = logprobs[top_indices].tolist()  # Convert to Python list
-                top_tokens.append(
-                    {
-                        int(idx): float(prob)
-                        for idx, prob in zip(
-                            top_indices, top_logprobs
-                        )  # Iterate over Python lists
-                    }
-                )
+                top_tokens.append(tuple(zip(top_indices, top_logprobs)))
 
             token_logprobs.append(logprobs[token].item())
 
