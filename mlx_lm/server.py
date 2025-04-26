@@ -594,9 +594,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
-                top_indices = sorted_indices[
-                    : self.logprobs
-                ].tolist()
+                top_indices = sorted_indices[: self.logprobs].tolist()
                 top_logprobs = logprobs[top_indices].tolist()
                 top_tokens.append(
                     {
