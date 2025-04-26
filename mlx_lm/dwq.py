@@ -4,15 +4,19 @@ import argparse
 import copy
 import glob
 import shutil
+import time
+import types
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optimizers
-from datasets import load_dataset
+import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tuner.datasets import load_dataset
+from mlx_lm.tuner.trainer import iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
     create_model_card,
@@ -24,23 +28,15 @@ from mlx_lm.utils import (
 )
 
 
-def dist_split(x: mx.array, group: mx.distributed.Group):
-    B = x.shape[0]
-    N = group.size()
-    assert B % N == 0
-    r = group.rank()
-    local_B = (B + N - 1) // N
-    return x[r * local_B : (r + 1) * local_B]
-
-
 def dwq_quantize(
     model,
     q_model,
     opt,
-    inputs: mx.array,
+    data,
     group_size: int = 64,
     bits: int = 3,
     batch_size: int = 2,
+    max_seq_length: int = 2048,
     dtype: mx.Dtype = mx.bfloat16,
 ):
     group = mx.distributed.init()
@@ -51,16 +47,22 @@ def dwq_quantize(
     def log_norm(x):
         return x - mx.logsumexp(x, axis=-1, keepdims=True)
 
-    def loss_fn(params, x, targets):
+    def loss_fn(params, x, targets, lengths):
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
         logits = q_model(x).astype(mx.float32)
-        return nn.losses.kl_div_loss(log_norm(logits), targets, reduction="mean")
+        losses = nn.losses.kl_div_loss(log_norm(logits), targets, reduction="none")
+        mask = mx.arange(1, targets.shape[1] + 1) <= lengths[:, 1:]
+        ntoks = mask.sum()
+        loss = (mask * losses).sum() / ntoks
+        return loss, ntoks
 
     # TODO distributed support
-    def step(inputs, targets, params):
-        loss, grads = mx.value_and_grad(loss_fn)(params, inputs, targets)
+    def step(inputs, targets, lengths, params):
+        (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
+            params, inputs, targets, lengths
+        )
         params = opt.apply_gradients(grads, params)
-        return loss, params
+        return loss, ntoks, params
 
     # Accumulate learned weights in higher precision
     params = tree_map(
@@ -68,36 +70,22 @@ def dwq_quantize(
         q_model.trainable_parameters(),
     )
 
-    losses = []
-    it = 1
-    for i in range(0, inputs.shape[0], batch_size):
-        batch = inputs[i : i + batch_size]
+    avg_loss = None
+    tokens = 0
+    tic = time.time()
+    for it, (batch, lengths) in enumerate(
+        iterate_batches(data, batch_size, max_seq_length)
+    ):
         targets = log_norm(model(batch).astype(mx.float32))
         mx.eval(targets)
-        loss, params = step(batch, targets, params)
+        loss, ntoks, params = step(batch, targets, lengths, params)
         mx.eval(loss, params)
-        losses.append(loss.item())
-        print(f"Iter: {it}, Loss: {loss.item():.3f}")
-        if (it + 1) % 10 == 0:
-            loss_avg = sum(losses) / len(losses)
-            print(f"Average Loss {loss_avg:.3f}")
-            losses = []
-        it += 1
+        loss = loss.item()
+        tokens += ntoks.item()
+        toks_per_sec = tokens / (time.time() - tic)
+        avg_loss = 0.9 * (avg_loss or loss) + 0.1 * loss
+        print(f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=}, {toks_per_sec=:.3f}")
     q_model.update(tree_map(lambda x: x.astype(dtype), params))
-
-
-def load_wikitext(
-    tokenizer, num_samples: int = 32, sequence_length: int = 2048, split: str = "train"
-) -> mx.array:
-    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
-    texts = "\n\n".join(dataset["text"])
-    tokens = tokenizer.encode(texts, return_tensors="mlx")[0]
-
-    # Select random chunks
-    starts = mx.random.randint(
-        0, len(tokens) - sequence_length - 1, shape=(num_samples, 1)
-    )
-    return tokens[starts + mx.arange(sequence_length)]
 
 
 def save_model(
@@ -123,6 +111,20 @@ def save_model(
     create_model_card(mlx_path, hf_path)
 
 
+def load_data(tokenizer, num_samples: int):
+    args = types.SimpleNamespace(
+        hf_dataset={
+            "path": "allenai/tulu-3-sft-mixture",
+            "train_split": f"train[:{num_samples}]",
+            "valid_split": "train[:1]",
+        },
+        train=True,
+        test=False,
+    )
+    dataset = load_dataset(args, tokenizer)[0]
+    return [dataset.process(d) for d in dataset]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -131,11 +133,11 @@ def main():
     parser.add_argument("--mlx-path", default="mlx_model")
     parser.add_argument("--bits", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=64)
-    parser.add_argument("--num-samples", type=int, default=32)
-    parser.add_argument("--sequence-length", type=int, default=2048)
+    parser.add_argument("--num-samples", type=int, default=256)
+    parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--batch-size", type=float, default=8)
+    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -144,15 +146,13 @@ def main():
     if group is not None and num_samples % group.size() > 0:
         num_samples += group.size() - num_samples % group.size()
 
+    np.random.seed(args.seed)
     mx.random.seed(args.seed)
 
     model_path = get_model_path(args.model, revision=None)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
-    calibration_data = load_wikitext(tokenizer, args.num_samples, args.sequence_length)
-
-    if group is not None:
-        calibration_data = dist_split(calibration_data, group)
+    calibration_data = load_data(tokenizer, args.num_samples)
 
     q_model = copy.deepcopy(model)
     tree_flatten(q_model.parameters())
@@ -163,7 +163,7 @@ def main():
         q_bits=args.bits,
     )
 
-    opt = optimizers.SGD(learning_rate=args.learning_rate)
+    opt = optimizers.SGD(learning_rate=args.learning_rate, momentum=0.9)
     dwq_quantize(
         model,
         q_model,
@@ -172,9 +172,6 @@ def main():
         bits=args.bits,
         group_size=args.group_size,
         batch_size=args.batch_size,
+        max_seq_length=args.max_seq_length,
     )
     save_model(q_model, tokenizer, config, model_path, args.mlx_path, args.model)
-
-
-if __name__ == "__main__":
-    main()

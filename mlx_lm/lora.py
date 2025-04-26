@@ -13,7 +13,6 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -187,7 +186,6 @@ def build_parser():
 def train_model(
     args,
     model: nn.Module,
-    tokenizer: TokenizerWrapper,
     train_set,
     valid_set,
     training_callback: TrainingCallback = None,
@@ -258,7 +256,6 @@ def train_model(
     # Train model
     train(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
         optimizer=opt,
         train_dataset=train_set,
@@ -267,11 +264,10 @@ def train_model(
     )
 
 
-def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set):
+def evaluate_model(args, model: nn.Module, test_set):
     test_loss = evaluate(
         model=model,
         dataset=test_set,
-        tokenizer=tokenizer,
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
@@ -298,13 +294,13 @@ def run(args, training_callback: TrainingCallback = None):
 
     elif args.train:
         print("Training")
-        train_model(args, model, tokenizer, train_set, valid_set, training_callback)
+        train_model(args, model, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
         print("Testing")
-        evaluate_model(args, model, tokenizer, test_set)
+        evaluate_model(args, model, test_set)
 
 
 def main():
