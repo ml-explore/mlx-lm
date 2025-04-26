@@ -26,7 +26,7 @@ class ModelArgs(BaseModelArgs):
     mlp_bias: bool = False
     rope_theta: float = 10000
     rope_traditional: bool = False
-    rope_scaling: Dict[str, Union[float, str]] = {}
+    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
 
     def __post_init__(self):

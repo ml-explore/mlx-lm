@@ -71,8 +71,8 @@ def make_sampler(
 
 
 def make_logits_processors(
-    logit_bias: Dict[int, float] = None,
-    repetition_penalty: float = None,
+    logit_bias: Optional[Dict[int, float]] = None,
+    repetition_penalty: Optional[float] = None,
     repetition_context_size: int = 20,  # No longer optional
 ):
     """

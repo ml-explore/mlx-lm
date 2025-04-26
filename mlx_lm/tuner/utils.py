@@ -172,7 +172,7 @@ def load_adapters(model: nn.Module, adapter_path: Union[str, Path]) -> nn.Module
 
     Args:
         model (nn.Module): The neural network model.
-        adapter_path (Union[str, Path]): Path to the adapter configuration file. Can be a string or a Path object.
+        adapter_path (Union[str, Path]): Path to the adapter configuration file.
 
     Returns:
         nn.Module: The updated model with LoRA layers applied.
