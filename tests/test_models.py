@@ -6,7 +6,7 @@ import mlx.nn as nn
 from mlx.utils import tree_map
 
 from mlx_lm.models import rope_utils
-from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 
@@ -165,6 +165,42 @@ class TestModels(unittest.TestCase):
             scaling_config={"rope_type": "llama3", "factor": 2.0},
         )
         self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
+
+    def test_quantized_sdpa(self):
+        cache = KVCache()
+
+        k = 1e-1 * mx.random.normal(shape=(1, 1, 256, 32))
+        v = 1e-1 * mx.random.normal(shape=(1, 1, 256, 32))
+
+        cache.update_and_fetch(k, v)
+        quant_cache = cache.to_quantized(group_size=32, bits=8)
+
+        k = 1e-1 * mx.random.normal(shape=(1, 1, 1, 32))
+        v = 1e-1 * mx.random.normal(shape=(1, 1, 1, 32))
+
+        k_up, v_up = cache.update_and_fetch(k, v)
+        qk_up, qv_up = quant_cache.update_and_fetch(k, v)
+
+        q = 1e-1 * mx.random.normal(shape=(1, 4, 257, 32))
+
+        mask = "causal"
+        out = scaled_dot_product_attention(
+            q,
+            k_up,
+            v_up,
+            cache=cache,
+            mask=mask,
+            scale=1.0,
+        )
+        qout = scaled_dot_product_attention(
+            q,
+            qk_up,
+            qv_up,
+            cache=quant_cache,
+            mask=mask,
+            scale=1.0,
+        )
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
 

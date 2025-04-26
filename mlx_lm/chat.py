@@ -12,6 +12,8 @@ from .utils import load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
+DEFAULT_XTC_PROBABILITY = 0.0
+DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = None
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
@@ -36,6 +38,18 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--top-p", type=float, default=DEFAULT_TOP_P, help="Sampling top-p"
+    )
+    parser.add_argument(
+        "--xtc-probability",
+        type=float,
+        default=DEFAULT_XTC_PROBABILITY,
+        help="Probability of XTC sampling to happen each next token",
+    )
+    parser.add_argument(
+        "--xtc-threshold",
+        type=float,
+        default=0.0,
+        help="Thresold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
         "--seed",
@@ -98,7 +112,15 @@ def main():
             tokenizer,
             prompt,
             max_tokens=args.max_tokens,
-            sampler=make_sampler(args.temp, args.top_p),
+            sampler=make_sampler(
+                args.temp,
+                args.top_p,
+                xtc_threshold=args.xtc_threshold,
+                xtc_probability=args.xtc_probability,
+                xtc_special_tokens=(
+                    tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+                ),
+            ),
             prompt_cache=prompt_cache,
         ):
             print(response.text, flush=True, end="")

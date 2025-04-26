@@ -304,20 +304,15 @@ def make_shards(
     return shards
 
 
-def upload_to_hub(path: str, upload_repo: str, hf_path: str):
+def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
-        path (str): Local path to the model.
-        upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
+        path (Union[str, Path]): Local path to the model.
+        hf_path (Union[str, Path]): Path to the original Hugging Face model.
     """
-    import os
-
-    from huggingface_hub import HfApi, ModelCard, logging
-
-    from . import __version__
+    from huggingface_hub import ModelCard
 
     card = ModelCard.load(hf_path)
     card.data.library_name = "mlx"
@@ -326,7 +321,26 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         card.data.tags = ["mlx"]
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
-    card.data.base_model = hf_path
+    card.data.base_model = str(hf_path)
+    card.save(os.path.join(path, "README.md"))
+
+
+def upload_to_hub(path: str, upload_repo: str):
+    """
+    Uploads the model to Hugging Face hub.
+
+    Args:
+        path (str): Local path to the model.
+        upload_repo (str): Name of the HF repo to upload to.
+    """
+    from huggingface_hub import HfApi, ModelCard, logging
+
+    from . import __version__
+
+    logging.set_verbosity_info()
+    card_path = Path(path) / "README.md"
+    card = ModelCard.load(card_path)
+    hf_path = card.data.base_model
     card.text = dedent(
         f"""
         # {upload_repo}
@@ -358,9 +372,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
         """
     )
-    card.save(os.path.join(path, "README.md"))
-
-    logging.set_verbosity_info()
+    card.save(card_path)
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
