@@ -204,10 +204,17 @@ class Model(nn.Module):
             caches.append(CacheList(conv_cache, kv_cache))
         return caches
 
-    def sanitize(self, weights):
-        weights = dict(weights)
-        if "lm_head.weight" not in weights:
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+    def sanitize(self, weights: dict) -> dict:
+        is_quantized = "lm_head.scales" in weights
+
+        if not is_quantized:
+            if "lm_head.weight" in weights:
+                w = weights["lm_head.weight"]
+                dtype = w.dtype
+                w = w.astype(mx.float32)
+                norm = mx.linalg.norm(w, axis=-1, keepdims=True)
+                w = (w / (norm + 1e-7)).astype(dtype)
+                weights["lm_head.weight"] = w
         return weights
 
     def __call__(
