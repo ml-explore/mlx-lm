@@ -204,14 +204,10 @@ class Model(nn.Module):
             caches.append(CacheList(conv_cache, kv_cache))
         return caches
 
-    def sanitize(self, weights: dict) -> dict:
-        if self.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        else:
-            # Pre-normalize the lm_head
-            w = weights["lm_head.weight"]
-            w = w / (mx.linalg.norm(w, axis=-1, keepdims=True) + 1e-7)
-            weights["lm_head.weight"] = w
+    def sanitize(self, weights):
+        weights = dict(weights)
+        if "lm_head.weight" not in weights:
+            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
         return weights
 
     def __call__(
