@@ -30,7 +30,7 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import common_prefix_len, load
+from .utils import common_prefix_len, get_settings, load
 
 
 def get_system_fingerprint():
@@ -297,30 +297,62 @@ class APIHandler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(content_length)
         self.body = json.loads(raw_body.decode())
         indent = "\t"  # Backslashes can't be inside of f-strings
-        logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
         assert isinstance(
             self.body, dict
         ), f"Request should be dict, but got {type(self.body)}"
 
         # Extract request parameters from the body
-        self.stream = self.body.get("stream", False)
-        self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
-        self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get("num_draft_tokens", 3)
-        self.adapter = self.body.get("adapters", None)
-        self.max_tokens = self.body.get("max_completion_tokens", None)
-        if self.max_tokens is None:
-            self.max_tokens = self.body.get("max_tokens", 512)
-        self.temperature = self.body.get("temperature", 0.0)
-        self.top_p = self.body.get("top_p", 1.0)
-        self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
-        self.repetition_context_size = self.body.get("repetition_context_size", 20)
-        self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
-        self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", -1)
+
+        # Try to get default parameters from settings
+        server_settings = get_settings("server", {})
+        defaults = server_settings.get("parameters", {}).get("default", {})
+        if self.requested_model != "default_model":
+            model_defaults = server_settings.get("parameters", {}).get(
+                self.requested_model, {}
+            )
+            defaults = {**defaults, **model_defaults}
+
+        if defaults:
+            logging.debug(
+                f"Default Parameters from Settings: {json.dumps(defaults, indent=indent)}"
+            )
+        logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
+
+        # Apply defaults from settings if available, use hard-coded defaults otherwise
+        self.stream = self.body.get("stream", defaults.get("stream", False))
+        self.stream_options = self.body.get(
+            "stream_options", defaults.get("stream_options", None)
+        )
+        self.requested_draft_model = self.body.get(
+            "draft_model", defaults.get("draft_model", "default_model")
+        )
+        self.num_draft_tokens = self.body.get(
+            "num_draft_tokens", defaults.get("num_draft_tokens", 3)
+        )
+        self.adapter = self.body.get("adapter", defaults.get("adapter", None))
+        self.max_tokens = self.body.get("max_tokens", defaults.get("max_tokens", 512))
+        self.temperature = self.body.get(
+            "temperature", defaults.get("temperature", 0.0)
+        )
+        self.top_p = self.body.get("top_p", defaults.get("top_p", 1.0))
+        self.repetition_penalty = self.body.get(
+            "repetition_penalty", defaults.get("repetition_penalty", 1.0)
+        )
+        self.repetition_context_size = self.body.get(
+            "repetition_context_size", defaults.get("repetition_context_size", 20)
+        )
+        self.xtc_probability = self.body.get(
+            "xtc_probability", defaults.get("xtc_probability", 0.0)
+        )
+        self.xtc_threshold = self.body.get(
+            "xtc_threshold", defaults.get("xtc_threshold", 0.0)
+        )
+        self.logit_bias = self.body.get("logit_bias", defaults.get("logit_bias", None))
+        self.logprobs = self.body.get("logprobs", defaults.get("logprobs", -1))
+
         self.validate_model_parameters()
+
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(

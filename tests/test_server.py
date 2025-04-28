@@ -4,11 +4,12 @@ import http
 import json
 import threading
 import unittest
+from unittest.mock import patch
 
 import requests
 
 from mlx_lm.server import APIHandler
-from mlx_lm.utils import load
+from mlx_lm.utils import get_settings, load
 
 
 class DummyModelProvider:
@@ -54,6 +55,9 @@ class TestServer(unittest.TestCase):
         cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
         cls.server_thread.daemon = True
         cls.server_thread.start()
+        # Prevent user settings from being loaded and interfere with test runs
+        cls.get_settings_patcher = patch("mlx_lm.server.get_settings", return_value={})
+        cls.mock_get_settings = cls.get_settings_patcher.start()
 
     @classmethod
     def tearDownClass(cls):
