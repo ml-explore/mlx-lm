@@ -115,14 +115,14 @@ class TestUtils(unittest.TestCase):
             "default_value",
         )
 
-        # Test caching
-        # Modify the file to check if the cache is used
+        # Test refresh
+        # Modify the file to check if the change is picked up
         with open(settings_path, "w") as f:
             json.dump({"setting1": "new_value1"}, f)
 
         # The cached value should still be the old one
         self.assertEqual(
-            utils.get_settings("setting1", settings_path=settings_path), "value1"
+            utils.get_settings("setting1", settings_path=settings_path), "new_value1"
         )
 
 

@@ -137,7 +137,8 @@ example above `"max_tokens": 256` would be applied to even the
 `mlx-community/Qwen2.5-Coder-32B-Instruct-8bit` model if it would not have
 `"max_tokens": 16384` written under its own key.
 
-You have to restart the server for any changes in this file to take effect!
+Any changes in this file take effect for any subsequent requests without a need to
+restart the server.
 
 
 ### Response Fields

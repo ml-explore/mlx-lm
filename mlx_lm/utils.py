@@ -574,17 +574,11 @@ def get_settings(
     """
     settings_path = os.path.expanduser(settings_path)
 
-    if not hasattr(get_settings, "_settings_cache"):
-        get_settings._settings_cache = {}
+    try:
+        with open(settings_path, "r") as f:
+            settings = json.load(f)
+            logging.debug(f"Loaded settings from: {settings_path}")
+    except FileNotFoundError:
+        settings = {}
 
-    if settings_path not in get_settings._settings_cache:
-        try:
-            with open(settings_path, "r") as f:
-                get_settings._settings_cache[settings_path] = json.load(f)
-                logging.debug(
-                    f"Loaded settings from {settings_path}: {get_settings._settings_cache[settings_path]}"
-                )
-        except FileNotFoundError:
-            get_settings._settings_cache[settings_path] = {}
-
-    return get_settings._settings_cache[settings_path].get(key, default)
+    return settings.get(key, default)
