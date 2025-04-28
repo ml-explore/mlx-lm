@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 import math
 from dataclasses import dataclass
@@ -25,29 +25,15 @@ class ModelArgs(BaseModelArgs):
     decoder_sparse_step: int
     mlp_only_layers: List[int]
     moe_intermediate_size: int
-    shared_expert_intermediate_size: int
     rms_norm_eps: float
     vocab_size: int
-    num_key_value_heads: Optional[int] = None
-    head_dim: Optional[int] = None
-    rope_theta: float = 1000000
-    rope_traditional: bool = False
+    num_key_value_heads: int
+    head_dim: int
+    rope_theta: float
+    tie_word_embeddings: bool
+    max_position_embeddings: int
+    norm_topk_prob: bool
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = False
-    max_position_embeddings: int = 4096
-    norm_topk_prob: bool = True
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-        if self.rope_scaling:
-            required_keys = {"factor", "type"}
-            if not all(key in self.rope_scaling for key in required_keys):
-                raise ValueError(f"rope_scaling must contain keys {required_keys}")
-
-            if self.rope_scaling["type"] != "linear":
-                raise ValueError("rope_scaling 'type' currently only supports 'linear'")
 
 
 class Attention(nn.Module):
@@ -74,7 +60,7 @@ class Attention(nn.Module):
 
         self.rope = nn.RoPE(
             head_dim,
-            traditional=args.rope_traditional,
+            traditional=False,
             base=args.rope_theta,
         )
 
@@ -144,7 +130,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+        inds = mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k]
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -244,13 +230,12 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{n}.{k}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{n}.{k}")
-                            for e in range(self.args.num_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{n}.{k}"] = mx.stack(to_join)
+                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
+                        for e in range(self.args.num_experts)
+                    ]
+                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
         return weights
 
     @property

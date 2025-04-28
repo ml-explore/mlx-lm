@@ -316,6 +316,7 @@ def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
     card.data.base_model = str(hf_path)
+    card.text = ""
     card.save(os.path.join(path, "README.md"))
 
 

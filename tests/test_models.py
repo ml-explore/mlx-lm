@@ -352,6 +352,7 @@ class TestModels(unittest.TestCase):
             num_hidden_layers=4,
             intermediate_size=2048,
             num_attention_heads=4,
+            num_key_value_heads=4,
             rms_norm_eps=1e-5,
             head_dim=128,
             vocab_size=10_000,
@@ -360,7 +361,10 @@ class TestModels(unittest.TestCase):
             num_experts_per_tok=4,
             num_experts=16,
             moe_intermediate_size=1024,
-            shared_expert_intermediate_size=2048,
+            rope_theta=1000,
+            max_position_embeddings=4096,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
         )
         model = qwen3_moe.Model(args)
         self.model_test_runner(
@@ -380,6 +384,9 @@ class TestModels(unittest.TestCase):
             rms_norm_eps=1e-5,
             vocab_size=10_000,
             head_dim=128,
+            max_position_embeddings=4096,
+            tie_word_embeddings=False,
+            rope_theta=1000,
         )
         model = qwen3.Model(args)
         self.model_test_runner(

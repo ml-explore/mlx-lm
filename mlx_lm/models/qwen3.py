@@ -20,12 +20,11 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
-    max_position_embeddings: int = 32768
-    rope_theta: float = 1000000
-    rope_traditional: bool = False
+    max_position_embeddings: int
+    rope_theta: float
+    head_dim: int
+    tie_word_embeddings: bool
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    head_dim: Optional[int] = None
-    tie_word_embeddings: bool = True
 
 
 class Attention(nn.Module):
@@ -37,9 +36,7 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = getattr(
-            args, "head_dim", args.hidden_size // args.num_attention_heads
-        )
+        head_dim = args.head_dim
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -52,7 +49,7 @@ class Attention(nn.Module):
         self.rope = initialize_rope(
             head_dim,
             base=args.rope_theta,
-            traditional=args.rope_traditional,
+            traditional=False,
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
@@ -67,7 +64,6 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
         queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
             0, 2, 1, 3
         )
@@ -83,9 +79,6 @@ class Attention(nn.Module):
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
-
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[..., -keys.shape[-2] :]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -189,10 +182,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        # Remove unused precomputed rotary freqs
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        return weights
 
     @property
     def layers(self):
