@@ -488,3 +488,24 @@ class ChunkedKVCache(KVCache):
     @meta_state.setter
     def meta_state(self, v):
         self.chunk_size, self.start_position = map(int, v)
+
+
+class CacheList(KVCache):
+    def __init__(self, *caches):
+        self.caches = caches
+
+    def __getitem__(self, idx):
+        return self.caches[idx]
+
+    @property
+    def state(self):
+        return [s for c in self.caches for s in c.state]
+
+    @state.setter
+    def state(self, v):
+        state_lens = [len(c.state) for c in self.caches]
+        start = 0
+        for c in self.caches:
+            l = len(c.state)
+            c.state = v[start : start + l]
+            start += l

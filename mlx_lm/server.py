@@ -146,7 +146,7 @@ def process_message_content(messages):
 @dataclass
 class PromptCache:
     cache: List[Any] = field(default_factory=list)
-    model_key: Tuple[str, Optional[str]] = ("", None)
+    model_key: Tuple[str, Optional[str]] = ("", None, None)
     tokens: List[int] = field(default_factory=list)
 
 
@@ -157,10 +157,11 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.draft_model = None
 
         # Preload the default model if it is provided
         if self.cli_args.model is not None:
-            self.load("default_model")
+            self.load("default_model", draft_model_path="default_model")
 
     def _validate_model_path(self, model_path: str):
         model_path = Path(model_path)
@@ -170,14 +171,15 @@ class ModelProvider:
             )
 
     # Added in adapter_path to load dynamically
-    def load(self, model_path, adapter_path=None):
-        if self.model_key == (model_path, adapter_path):
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
 
         # Remove the old model if it exists.
         self.model = None
         self.tokenizer = None
         self.model_key = None
+        self.draft_model = None
 
         # Building tokenizer_config
         tokenizer_config = {
@@ -186,7 +188,12 @@ class ModelProvider:
         if self.cli_args.chat_template:
             tokenizer_config["chat_template"] = self.cli_args.chat_template
 
-        if model_path == "default_model" and self.cli_args.model is not None:
+        if model_path == "default_model":
+            if self.cli_args.model is None:
+                raise ValueError(
+                    "A model path has to be given as a CLI "
+                    "argument or in the HTTP request"
+                )
             model, tokenizer = load(
                 self.cli_args.model,
                 adapter_path=(
@@ -204,10 +211,30 @@ class ModelProvider:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model_key = (model_path, adapter_path)
+        self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
 
+        def validate_draft_tokenizer(draft_tokenizer):
+            # Check if tokenizers are compatible
+            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                logging.warning(
+                    "Draft model tokenizer does not match model tokenizer. "
+                    "Speculative decoding may not work as expected."
+                )
+
+        # Load draft model if specified
+        if (
+            draft_model_path == "default_model"
+            and self.cli_args.draft_model is not None
+        ):
+            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+            validate_draft_tokenizer(draft_tokenizer)
+
+        elif draft_model_path is not None and draft_model_path != "default_model":
+            self._validate_model_path(draft_model_path)
+            self.draft_model, draft_tokenizer = load(draft_model_path)
+            validate_draft_tokenizer(draft_tokenizer)
         return self.model, self.tokenizer
 
 
@@ -279,6 +306,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
+        self.requested_draft_model = self.body.get("draft_model", "default_model")
+        self.num_draft_tokens = self.body.get("num_draft_tokens", 3)
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
@@ -287,14 +316,17 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_p = self.body.get("top_p", 1.0)
         self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.xtc_probability = self.body.get("xtc_probability", 0.0)
+        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
         self.validate_model_parameters()
-
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(
-                self.requested_model, self.adapter
+                self.requested_model,
+                self.adapter,
+                self.requested_draft_model,
             )
         except:
             self._set_completion_headers(404)
@@ -363,7 +395,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.logit_bias = {int(k): v for k, v in self.logit_bias.items()}
             except ValueError:
                 raise ValueError("logit_bias must be a dict of int to float")
-
+        if not (
+            isinstance(self.xtc_probability, float)
+            and 0.00 <= self.xtc_probability <= 1.00
+        ):
+            raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
+        if not (
+            isinstance(self.xtc_threshold, float) and 0.00 <= self.xtc_threshold <= 0.50
+        ):
+            raise ValueError(f"xtc_threshold must be a float between 0.00 and 0.5")
         if not isinstance(self.requested_model, str):
             raise ValueError("model must be a string")
         if self.adapter is not None and not isinstance(self.adapter, str):
@@ -456,17 +496,21 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
         prefix_len = min(cache_len, prompt_len)
+
         if (
             self.prompt_cache.model_key != self.model_provider.model_key
             or prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
         ):
             self.prompt_cache.model_key = self.model_provider.model_key
             self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+            if self.model_provider.draft_model is not None:
+                self.prompt_cache.cache += make_prompt_cache(
+                    self.model_provider.draft_model
+                )
+
             self.prompt_cache.tokens = []
         elif cache_len >= prompt_len:
-            # Trim the cache if it contains the prompt as a prefix. This case
-            # is useful for reusing the cache for multiple queries with a long
-            # prompt
+            # Trim the cache if it contains the prompt as a prefix
             if can_trim_prompt_cache(self.prompt_cache.cache):
                 num_to_trim = cache_len - prompt_len + 1
                 trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
@@ -474,11 +518,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 prompt = prompt[-1:]
             else:
                 self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+                if self.model_provider.draft_model is not None:
+                    self.prompt_cache.cache += make_prompt_cache(
+                        self.model_provider.draft_model
+                    )
                 self.prompt_cache.tokens = []
         else:
-            # Trim the prompt if it contains the cache as a prefix. This case
-            # is to avoid recomputing the cache in multi-turn chats.
+            # Trim the prompt if it contains the cache as a prefix
             prompt = prompt[cache_len:]
+
         self.prompt_cache.tokens.extend(prompt)
         return prompt
 
@@ -510,10 +558,22 @@ class APIHandler(BaseHTTPRequestHandler):
 
         text = ""
         tic = time.perf_counter()
-        sampler = make_sampler(self.temperature, top_p=self.top_p)
-        logits_processors = make_logits_processors(
-            self.logit_bias, self.repetition_penalty, self.repetition_context_size
+        sampler = make_sampler(
+            self.temperature,
+            top_p=self.top_p,
+            xtc_probability=self.xtc_probability,
+            xtc_threshold=self.xtc_threshold,
+            xtc_special_tokens=[
+                self.tokenizer.eos_token_id,
+                self.tokenizer.encode("\n"),
+            ],
         )
+        logits_processors = make_logits_processors(
+            self.logit_bias,
+            self.repetition_penalty,
+            self.repetition_context_size,
+        )
+
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -522,6 +582,8 @@ class APIHandler(BaseHTTPRequestHandler):
             sampler=sampler,
             logits_processors=logits_processors,
             prompt_cache=self.prompt_cache.cache,
+            draft_model=self.model_provider.draft_model,
+            num_draft_tokens=self.num_draft_tokens,
         ):
             segment = gen_response.text
             text += segment
@@ -680,10 +742,20 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
 
+        files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+
+        def probably_mlx_lm(repo):
+            if repo.repo_type != "model":
+                return False
+            if "main" not in repo.refs:
+                return False
+            file_names = {f.file_path.name for f in repo.refs["main"].files}
+            return all(f in file_names for f in files)
+
         # Scan the cache directory for downloaded mlx models
         hf_cache_info = scan_cache_dir()
         downloaded_models = [
-            repo for repo in hf_cache_info.repos if "mlx" in repo.repo_id
+            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
         ]
 
         # Create a list of available models
@@ -757,6 +829,12 @@ def main():
         type=int,
         default=8080,
         help="Port for the HTTP server (default: 8080)",
+    )
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        help="A model to be used for speculative decoding.",
+        default=None,
     )
     parser.add_argument(
         "--trust-remote-code",

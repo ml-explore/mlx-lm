@@ -6,7 +6,7 @@ import mlx.nn as nn
 from mlx.utils import tree_map
 
 from mlx_lm.models import rope_utils
-from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 
@@ -166,6 +166,42 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
 
+    def test_quantized_sdpa(self):
+        cache = KVCache()
+
+        k = 1e-1 * mx.random.normal(shape=(1, 1, 256, 32))
+        v = 1e-1 * mx.random.normal(shape=(1, 1, 256, 32))
+
+        cache.update_and_fetch(k, v)
+        quant_cache = cache.to_quantized(group_size=32, bits=8)
+
+        k = 1e-1 * mx.random.normal(shape=(1, 1, 1, 32))
+        v = 1e-1 * mx.random.normal(shape=(1, 1, 1, 32))
+
+        k_up, v_up = cache.update_and_fetch(k, v)
+        qk_up, qv_up = quant_cache.update_and_fetch(k, v)
+
+        q = 1e-1 * mx.random.normal(shape=(1, 4, 257, 32))
+
+        mask = "causal"
+        out = scaled_dot_product_attention(
+            q,
+            k_up,
+            v_up,
+            cache=cache,
+            mask=mask,
+            scale=1.0,
+        )
+        qout = scaled_dot_product_attention(
+            q,
+            qk_up,
+            qv_up,
+            cache=quant_cache,
+            mask=mask,
+            scale=1.0,
+        )
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
 
         self.assertEqual(len(model.layers), num_layers)
@@ -305,6 +341,56 @@ class TestModels(unittest.TestCase):
             args.model_type,
             args.vocab_size,
             args.n_layers,
+        )
+
+    def test_qwen3_moe(self):
+        from mlx_lm.models import qwen3_moe
+
+        args = qwen3_moe.ModelArgs(
+            model_type="qwen3_moe",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            head_dim=128,
+            vocab_size=10_000,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            num_experts_per_tok=4,
+            num_experts=16,
+            moe_intermediate_size=1024,
+            rope_theta=1000,
+            max_position_embeddings=4096,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+        )
+        model = qwen3_moe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_qwen3(self):
+        from mlx_lm.models import qwen3
+
+        args = qwen3.ModelArgs(
+            model_type="qwen3",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+            head_dim=128,
+            max_position_embeddings=4096,
+            tie_word_embeddings=False,
+            rope_theta=1000,
+        )
+        model = qwen3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
     def test_qwen2_moe(self):
