@@ -92,6 +92,53 @@ curl localhost:8080/v1/chat/completions \
 - `num_draft_tokens`: (Optional) The number of draft tokens the draft model
   should predict at once. Defaults to `3`.
 
+#### Custom defaults
+You can set custom defaults for the server by `~/.mlx_lm.settings.json` in
+your home directory. In this file you can specify a different default value
+for all the request fields listed above.
+
+```json
+{
+  "server": {
+    "parameters": {
+      "default": {
+        "max_tokens": 256
+      }
+    }
+  }
+}
+```
+This will set the default `max_tokens` to `256` for all requests, which does not
+contain `max_tokens` in the request body.
+
+The default values can be overridden on a per-model basis as well. For example to
+force speculative decoding for the `mlx-community/Qwen2.5-Coder-32B-Instruct-8bit`,
+this can be added:
+
+```json
+{
+  "server": {
+    "parameters": {
+      "default": {
+        "max_tokens": 256
+      },
+      "mlx-community/Qwen2.5-Coder-32B-Instruct-8bit": {
+        "max_tokens": 16384,
+        "draft_model": "mlx-community/Qwen2.5-Coder-1.5B-Instruct-8bit"
+      }
+    }
+  }
+}
+```
+
+Please note that the parameters under the `default` key are used for event the named
+models, if the named model does not have a default for the same parameter. So in the
+example above `"max_tokens": 256` would be applied to even the
+`mlx-community/Qwen2.5-Coder-32B-Instruct-8bit` model if it would not have
+`"max_tokens": 16384` written under its own key.
+
+You have to restart the server for any changes in this file to take effect!
+
 
 ### Response Fields
 

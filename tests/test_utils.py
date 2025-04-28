@@ -1,8 +1,10 @@
 # Copyright © 2024 Apple Inc.
 
+import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -89,6 +91,39 @@ class TestUtils(unittest.TestCase):
 
         self.assertEqual(model.layers[0].mlp.up_proj.weight.dtype, mx.bfloat16)
         self.assertEqual(model.layers[-1].mlp.up_proj.weight.dtype, mx.bfloat16)
+
+    def test_get_settings(self):
+        # Create a temporary settings file
+        settings_path = os.path.join(self.test_dir, ".mlx_lm.settings.json")
+        settings_data = {"setting1": "value1", "setting2": 42}
+        with open(settings_path, "w") as f:
+            json.dump(settings_data, f)
+
+        # Test loading settings
+        self.assertEqual(
+            utils.get_settings("setting1", settings_path=settings_path), "value1"
+        )
+        self.assertEqual(
+            utils.get_settings("setting2", settings_path=settings_path), 42
+        )
+
+        # Test default value
+        self.assertEqual(
+            utils.get_settings(
+                "non_existent_key", default="default_value", settings_path=settings_path
+            ),
+            "default_value",
+        )
+
+        # Test caching
+        # Modify the file to check if the cache is used
+        with open(settings_path, "w") as f:
+            json.dump({"setting1": "new_value1"}, f)
+
+        # The cached value should still be the old one
+        self.assertEqual(
+            utils.get_settings("setting1", settings_path=settings_path), "value1"
+        )
 
 
 if __name__ == "__main__":

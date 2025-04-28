@@ -503,3 +503,37 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
+
+
+def get_settings(
+    key: str,
+    default: Optional[Any] = None,
+    settings_path: Union[str, Path] = "~/.mlx_lm.settings.json",
+) -> Any:
+    """
+    Get a setting value from the settings file.
+
+    Args:
+        key (str): The key of the setting to retrieve.
+        default (Any, optional): The default value to return if the key is not found.
+        settings_path (Union[str, Path], optional): The path to the settings file.
+
+    Returns:
+        Any: The value of the setting or the default value if not found.
+    """
+    settings_path = os.path.expanduser(settings_path)
+
+    if not hasattr(get_settings, "_settings_cache"):
+        get_settings._settings_cache = {}
+
+    if settings_path not in get_settings._settings_cache:
+        try:
+            with open(settings_path, "r") as f:
+                get_settings._settings_cache[settings_path] = json.load(f)
+                logging.debug(
+                    f"Loaded settings from {settings_path}: {get_settings._settings_cache[settings_path]}"
+                )
+        except FileNotFoundError:
+            get_settings._settings_cache[settings_path] = {}
+
+    return get_settings._settings_cache[settings_path].get(key, default)
