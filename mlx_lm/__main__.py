@@ -5,6 +5,7 @@ import sys
 
 if __name__ == "__main__":
     subcommands = {
+        "awq",
         "cache_prompt",
         "chat",
         "convert",
@@ -15,6 +16,7 @@ if __name__ == "__main__":
         "merge",
         "server",
         "manage",
+        "upload",
     }
     if len(sys.argv) < 2:
         raise ValueError(f"CLI requires a subcommand in {subcommands}")
