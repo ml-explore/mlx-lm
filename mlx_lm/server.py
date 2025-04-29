@@ -142,6 +142,15 @@ def process_message_content(messages):
                 raise ValueError("Only 'text' content type is supported.")
             message["content"] = "".join(text_fragments)
 
+def is_valid_model_dir(dir_path: Path) -> bool:
+            """Checks if a directory contains minimal files indicating a potential model."""
+            has_config = (dir_path / "config.json").is_file()
+            has_tokenizer_config = (dir_path / "tokenizer_config.json").is_file()
+            has_weights = any(dir_path.glob("*.safetensors")) or \
+                          (dir_path / "weights.npz").is_file() or \
+                          (dir_path / "model.safetensors.index.json").is_file()
+            return has_config and has_tokenizer_config and has_weights
+
 
 @dataclass
 class PromptCache:
@@ -169,10 +178,41 @@ class ModelProvider:
             raise RuntimeError(
                 "Local models must be relative to the current working dir."
             )
+        
+    def _resolve_model_path(self, model_identifier: str) -> Optional[Path]:
+        """
+        Tries to resolve a model identifier to a local path within --model-dir.
+        Returns the absolute Path if found, otherwise None.
+        """
+        if not model_identifier or model_identifier == "default_model":
+            return None
+
+        if self.cli_args.model_dir:
+            for base_dir_str in self.cli_args.model_dir:
+                base_dir = Path(base_dir_str).resolve()
+                potential_path = base_dir / model_identifier
+                if potential_path.is_dir() and is_valid_model_dir(potential_path):
+                    return potential_path # Return the absolute path
+
+        return None
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        if self.model_key == (model_path, adapter_path, draft_model_path):
+
+        effective_model_id = model_path if model_path != "default_model" else self.cli_args.model
+        effective_draft_id = draft_model_path if draft_model_path and draft_model_path != "default_model" else self.cli_args.draft_model
+
+        # Resolve paths: Check local --model-dir first, then treat as HF ID / direct path
+        resolved_model_path_obj = self._resolve_model_path(effective_model_id)
+        load_path_str = str(resolved_model_path_obj) if resolved_model_path_obj else effective_model_id
+
+        resolved_draft_path_obj = self._resolve_model_path(effective_draft_id) if effective_draft_id else None
+        load_draft_path_str = str(resolved_draft_path_obj) if resolved_draft_path_obj else effective_draft_id
+
+        # Use the string representation of the path to be loaded for the cache key
+        current_key = (load_path_str, adapter_path, load_draft_path_str)
+
+        if self.model_key == current_key:
             return self.model, self.tokenizer
 
         # Remove the old model if it exists.
@@ -188,30 +228,20 @@ class ModelProvider:
         if self.cli_args.chat_template:
             tokenizer_config["chat_template"] = self.cli_args.chat_template
 
-        if model_path == "default_model":
-            if self.cli_args.model is None:
-                raise ValueError(
-                    "A model path has to be given as a CLI "
-                    "argument or in the HTTP request"
-                )
-            model, tokenizer = load(
-                self.cli_args.model,
-                adapter_path=(
-                    adapter_path if adapter_path else self.cli_args.adapter_path
-                ),  # if the user doesn't change the model but adds an adapter path
-                tokenizer_config=tokenizer_config,
-            )
-        else:
-            self._validate_model_path(model_path)
-            model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
-            )
+        if not load_path_str:
+             raise ValueError("No model identifier provided via CLI or request.")
+
+        model, tokenizer = load(
+            load_path_str,
+            adapter_path=(adapter_path if adapter_path else self.cli_args.adapter_path),
+            tokenizer_config=tokenizer_config,
+        )
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model_key = (model_path, adapter_path, draft_model_path)
+        self.model_key = current_key
         self.model = model
         self.tokenizer = tokenizer
 
@@ -224,17 +254,16 @@ class ModelProvider:
                 )
 
         # Load draft model if specified
-        if (
-            draft_model_path == "default_model"
-            and self.cli_args.draft_model is not None
-        ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
-            validate_draft_tokenizer(draft_tokenizer)
+        if load_draft_path_str:
+            try:
+                self.draft_model, draft_tokenizer = load(load_draft_path_str)
+                validate_draft_tokenizer(draft_tokenizer)
+            except Exception as e:
+                 # Using warnings module as requested
+                 import warnings
+                 warnings.warn(f"Failed to load draft model from '{load_draft_path_str}': {e}. Proceeding without draft model.")
+                 self.draft_model = None # Ensure draft model is None if loading fails
 
-        elif draft_model_path is not None and draft_model_path != "default_model":
-            self._validate_model_path(draft_model_path)
-            self.draft_model, draft_tokenizer = load(draft_model_path)
-            validate_draft_tokenizer(draft_tokenizer)
         return self.model, self.tokenizer
 
 
@@ -742,6 +771,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
 
+        models = []
+        discovered_ids = set() 
+
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
         def probably_mlx_lm(repo):
@@ -752,21 +784,51 @@ class APIHandler(BaseHTTPRequestHandler):
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)
 
+
         # Scan the cache directory for downloaded mlx models
         hf_cache_info = scan_cache_dir()
         downloaded_models = [
             repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
         ]
 
-        # Create a list of available models
-        models = [
-            {
-                "id": repo.repo_id,
-                "object": "model",
-                "created": self.created,
-            }
-            for repo in downloaded_models
-        ]
+        for repo in downloaded_models:
+                 model_id = repo.repo_id
+                 if model_id not in discovered_ids:
+                     models.append({
+                        "id": model_id,
+                        "object": "model",
+                        "created": int(repo.last_accessed), # Or use self.created
+                        "owned_by": "huggingface", # Indicate source
+                     })
+                     discovered_ids.add(model_id)
+
+
+        local_model_dirs = self.model_provider.cli_args.model_dir
+        if local_model_dirs:
+            for base_dir_str in local_model_dirs:
+                base_dir = Path(base_dir_str).resolve()
+                if not base_dir.is_dir():
+                    logging.warning(f"Provided model directory does not exist or is not a directory: {base_dir}")
+                    continue
+
+                for item in base_dir.rglob('*'):
+                    if item.is_dir() and is_valid_model_dir(item):
+                        relative_path = item.relative_to(base_dir)
+                        model_id = str(relative_path)
+
+                        if model_id in discovered_ids:
+                             models = [m for m in models if m['id'] != model_id]
+                        elif model_id in discovered_ids :
+                             continue
+                        
+                        models.append({
+                            "id": model_id,
+                            "object": "model",
+                            "created": int(item.stat().st_ctime),
+                            "owned_by": "local",
+                        })
+                        discovered_ids.add(model_id)
+
 
         response = {"object": "list", "data": models}
 
@@ -859,6 +921,14 @@ def main():
         "--use-default-chat-template",
         action="store_true",
         help="Use the default chat template",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        nargs='*',
+        default=[],
+        help="One or more paths to directories containing local MLX models "
+        "to be discovered and prioritized for loading.",
     )
     args = parser.parse_args()
 
