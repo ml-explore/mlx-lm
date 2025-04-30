@@ -40,8 +40,14 @@ def dwq_quantize(
     dtype: mx.Dtype = mx.bfloat16,
 ):
     group = mx.distributed.init()
-    q_model.freeze()
-    q_model.unfreeze(keys=["scales", "biases"])
+    world_size = group.size()
+    rank = group.rank()
+
+    def unfreeze(_, m):
+        if hasattr(m, "bits") and hasattr(m, "group_size"):
+            m.unfreeze(keys=["scales", "biases"], recurse=False)
+
+    q_model.apply_to_modules(unfreeze)
     print_trainable_parameters(q_model)
 
     def log_norm(x):
@@ -51,16 +57,16 @@ def dwq_quantize(
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
         logits = q_model(x).astype(mx.float32)
         losses = nn.losses.kl_div_loss(log_norm(logits), targets, reduction="none")
-        mask = mx.arange(1, targets.shape[1] + 1) <= lengths[:, 1:]
+        mask = mx.arange(targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
         loss = (mask * losses).sum() / ntoks
         return loss, ntoks
 
-    # TODO distributed support
     def step(inputs, targets, lengths, params):
         (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
             params, inputs, targets, lengths
         )
+        grads = nn.average_gradients(grads)
         params = opt.apply_gradients(grads, params)
         return loss, ntoks, params
 
@@ -80,11 +86,16 @@ def dwq_quantize(
         mx.eval(targets)
         loss, ntoks, params = step(batch, targets, lengths, params)
         mx.eval(loss, params)
-        loss = loss.item()
-        tokens += ntoks.item()
+        loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
+        ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
+        tokens += ntoks
         toks_per_sec = tokens / (time.time() - tic)
-        avg_loss = 0.9 * (avg_loss or loss) + 0.1 * loss
-        print(f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=}, {toks_per_sec=:.3f}")
+        avg_loss = 0.95 * (avg_loss or loss) + 0.05 * loss
+        if rank == 0:
+            print(
+                f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=}, {toks_per_sec=:.3f}",
+                flush=True,
+            )
     q_model.update(tree_map(lambda x: x.astype(dtype), params))
 
 
@@ -127,9 +138,7 @@ def load_data(tokenizer, num_samples: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model", "-m", default="mlx-community/Qwen2.5-7B-Instruct-bf16"
-    )
+    parser.add_argument("--model", "-m", default="Qwen3/Qwen3-1.7B")
     parser.add_argument("--mlx-path", default="mlx_model")
     parser.add_argument("--bits", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=64)
@@ -163,7 +172,7 @@ def main():
         q_bits=args.bits,
     )
 
-    opt = optimizers.SGD(learning_rate=args.learning_rate, momentum=0.9)
+    opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)
     dwq_quantize(
         model,
         q_model,
