@@ -30,7 +30,7 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load
+from .utils import common_prefix_len, load
 
 
 def get_system_fingerprint():
@@ -493,42 +493,96 @@ class APIHandler(BaseHTTPRequestHandler):
         return response
 
     def get_prompt_cache(self, prompt):
+        """
+        Determines the portion of the prompt that needs processing by comparing
+        it to the cached prompt and attempting to reuse the common prefix.
+
+        This function updates the internal prompt cache state (tokens and model cache)
+        based on the comparison. If a common prefix exists, it attempts to trim
+        the model cache (if supported) to match the common prefix length, avoiding
+        recomputation.
+
+        Args:
+            prompt (List[int]): The tokenized new prompt.
+
+        Returns:
+            List[int]: The suffix of the prompt that actually needs to be processed
+                       by the model. This will be the full prompt if the cache is
+                       reset or cannot be effectively used.
+        """
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
-        prefix_len = min(cache_len, prompt_len)
+        com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
 
+        # Default: process the full prompt
+        prompt_to_process = prompt
+
+        # Condition 1: Model changed or no common prefix at all. Reset cache.
         if (
             self.prompt_cache.model_key != self.model_provider.model_key
-            or prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
+            or com_prefix_len == 0
         ):
+            logging.debug(
+                f"*** Resetting cache (model change or no common prefix). com_prefix_len: {com_prefix_len} ***"
+            )
             self.prompt_cache.model_key = self.model_provider.model_key
             self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
             if self.model_provider.draft_model is not None:
                 self.prompt_cache.cache += make_prompt_cache(
                     self.model_provider.draft_model
                 )
+            self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
 
-            self.prompt_cache.tokens = []
-        elif cache_len >= prompt_len:
-            # Trim the cache if it contains the prompt as a prefix
+        # Condition 2: Common prefix exists and matches cache length. Process suffix.
+        elif com_prefix_len == cache_len:
+            logging.debug(
+                f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
+            )
+            prompt_to_process = prompt[com_prefix_len:]
+            # Extend cache tokens with the new part
+            self.prompt_cache.tokens.extend(prompt_to_process)
+
+        # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
+        elif com_prefix_len < cache_len:
+            logging.debug(
+                f"*** Common prefix ({com_prefix_len}) shorter than cache ({cache_len}). Attempting trim. ***"
+            )
             if can_trim_prompt_cache(self.prompt_cache.cache):
-                num_to_trim = cache_len - prompt_len + 1
+                num_to_trim = cache_len - com_prefix_len
+                logging.debug(f"    Trimming {num_to_trim} tokens from cache.")
                 trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
-                self.prompt_cache.tokens = self.prompt_cache.tokens[:-num_to_trim]
-                prompt = prompt[-1:]
+                # Update cached tokens: keep only the common prefix initially
+                self.prompt_cache.tokens = self.prompt_cache.tokens[:com_prefix_len]
+                # Identify the part of the new prompt that needs to be processed
+                prompt_to_process = prompt[com_prefix_len:]
+                # Add the suffix to the now-trimmed cache tokens
+                self.prompt_cache.tokens.extend(prompt_to_process)
             else:
+                # Cannot trim, must reset cache
+                logging.debug(f"    Cache cannot be trimmed. Resetting cache.")
                 self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     self.prompt_cache.cache += make_prompt_cache(
                         self.model_provider.draft_model
                     )
-                self.prompt_cache.tokens = []
-        else:
-            # Trim the prompt if it contains the cache as a prefix
-            prompt = prompt[cache_len:]
+                self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
+                prompt_to_process = prompt  # Process the full prompt as cache was reset
 
-        self.prompt_cache.tokens.extend(prompt)
-        return prompt
+        # This case should logically not be reached if com_prefix_len <= cache_len
+        else:
+            logging.error(
+                f"Unexpected cache state: com_prefix_len ({com_prefix_len}) > cache_len ({cache_len}). Resetting cache."
+            )
+            self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+            if self.model_provider.draft_model is not None:
+                self.prompt_cache.cache += make_prompt_cache(
+                    self.model_provider.draft_model
+                )
+            self.prompt_cache.tokens = list(prompt)
+            prompt_to_process = prompt
+
+        logging.debug(f"Returning {len(prompt_to_process)} tokens for processing.")
+        return prompt_to_process
 
     def handle_completion(
         self,
