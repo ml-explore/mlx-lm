@@ -36,7 +36,7 @@ class Attention(nn.Module):
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
         head_dim = args.hidden_size // n_heads
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
@@ -52,10 +52,10 @@ class Attention(nn.Module):
         )
 
     def __call__(
-            self,
-            x: mx.array,
-            mask: Optional[mx.array] = None,
-            cache: Optional[Any] = None,
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -105,10 +105,10 @@ class TransformerBlock(nn.Module):
         self.args = args
 
     def __call__(
-            self,
-            x: mx.array,
-            mask: Optional[mx.array] = None,
-            cache: Optional[Any] = None,
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -121,7 +121,9 @@ class MiMoMTPLayers(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         self.token_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.hidden_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.input_proj = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
@@ -130,11 +132,11 @@ class MiMoMTPLayers(nn.Module):
         self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
-            self,
-            input_embeds: mx.array,
-            hidden_states: mx.array,
-            mask: Optional[mx.array] = None,
-            cache: Optional[Any] = None,
+        self,
+        input_embeds: mx.array,
+        hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         input_embeds = self.token_layernorm(input_embeds)
         previous_hidden_states = self.hidden_layernorm(hidden_states)
@@ -178,12 +180,12 @@ class MiMoModel(nn.Module):
         ]
 
     def __call__(
-            self,
-            inputs: mx.array,
-            mask: mx.array = None,
-            cache=None,
-            use_mtp: bool = False,
-            input_embeds=None,
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
+        use_mtp: bool = False,
+        input_embeds=None,
     ):
         h = self.embed_tokens(inputs)
 
@@ -218,19 +220,22 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
-            self,
-            inputs: mx.array,
-            mask: mx.array = None,
-            cache=None,
-            use_mtp: bool = False,
-            input_embeds=None,
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
+        use_mtp: bool = False,
+        input_embeds=None,
     ):
         if use_mtp and input_embeds is not None:
             out, mtp_outputs = self.model(inputs, mask, cache, use_mtp, input_embeds)
 
             if self.args.tie_word_embeddings:
                 out = self.model.embed_tokens.as_linear(out)
-                mtp_logits = [self.model.embed_tokens.as_linear(mtp_out) for mtp_out in mtp_outputs]
+                mtp_logits = [
+                    self.model.embed_tokens.as_linear(mtp_out)
+                    for mtp_out in mtp_outputs
+                ]
             else:
                 out = self.lm_head(out)
                 mtp_logits = [self.lm_head(mtp_out) for mtp_out in mtp_outputs]
