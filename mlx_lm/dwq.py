@@ -164,7 +164,10 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
-        "--temperature", type=int, default=0.5, help="Temperature scaling for the loss."
+        "--temperature",
+        type=float,
+        default=0.5,
+        help="Temperature scaling for the loss.",
     )
     args = parser.parse_args()
 

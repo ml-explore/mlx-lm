@@ -29,8 +29,7 @@ setup(
     extras_require={
         "test": ["datasets"],
         "evaluate": ["lm-eval", "tqdm"],
-        "awq": ["datasets"],
-        "dwq": ["datasets"],
+        "lwq": ["datasets"],
     },
     entry_points={
         "console_scripts": [
