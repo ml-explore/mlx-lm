@@ -37,6 +37,7 @@ def dwq_quantize(
     bits: int = 3,
     batch_size: int = 2,
     max_seq_length: int = 2048,
+    temperature: float = 0.5,
     dtype: mx.Dtype = mx.bfloat16,
 ):
     group = mx.distributed.init()
@@ -51,6 +52,7 @@ def dwq_quantize(
     print_trainable_parameters(q_model)
 
     def log_norm(x):
+        x = x * (1 / temperature)
         return x - mx.logsumexp(x, axis=-1, keepdims=True)
 
     def loss_fn(params, x, targets, lengths):
@@ -138,15 +140,32 @@ def load_data(tokenizer, num_samples: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", "-m", default="Qwen3/Qwen3-1.7B")
-    parser.add_argument("--mlx-path", default="mlx_model")
-    parser.add_argument("--bits", type=int, default=4)
-    parser.add_argument("--group-size", type=int, default=64)
-    parser.add_argument("--num-samples", type=int, default=256)
+    parser.add_argument("--model", "-m", default="Qwen/Qwen3-1.7B")
+    parser.add_argument(
+        "--mlx-path", default="mlx_model", help="Path to save the quantized model."
+    )
+    parser.add_argument(
+        "--bits",
+        type=int,
+        default=4,
+        help="Bits per weight for quantization.",
+    )
+    parser.add_argument(
+        "--group-size", type=int, default=64, help="Group size for quantization."
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=1024,
+        help="Number of samples to use for training.",
+    )
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--temperature", type=int, default=0.5, help="Temperature scaling for the loss."
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -182,5 +201,6 @@ def main():
         group_size=args.group_size,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
+        temperature=args.temperature,
     )
     save_model(q_model, tokenizer, config, model_path, args.mlx_path, args.model)
