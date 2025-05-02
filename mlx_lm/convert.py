@@ -1,8 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
-import glob
-import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -11,13 +9,11 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from .utils import (
-    create_model_card,
     dequantize_model,
     fetch_from_hub,
     get_model_path,
     quantize_model,
-    save_config,
-    save_weights,
+    save,
     upload_to_hub,
 )
 
@@ -153,17 +149,14 @@ def convert(
         weights = dict(tree_flatten(model.parameters()))
 
     del model
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
-
-    tokenizer.save_pretrained(mlx_path)
-
-    save_config(config, config_path=mlx_path / "config.json")
-
-    create_model_card(mlx_path, hf_path)
+    save(
+        mlx_path,
+        model_path,
+        weights,
+        tokenizer,
+        config,
+        hf_repo=hf_path,
+    )
 
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo)

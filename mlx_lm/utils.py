@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -504,6 +505,29 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
+
+
+def save(
+    dst_path: Union[str, Path],
+    src_path: Union[str, Path],
+    weights: Dict[str, mx.array],
+    tokenizer: TokenizerWrapper,
+    config: Dict[str, Any],
+    hf_repo: Optional[str] = None,
+    donate_weights: bool = True,
+):
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    save_weights(dst_path, weights, donate_weights=True)
+    save_config(config, config_path=dst_path / "config.json")
+    tokenizer.save_pretrained(dst_path)
+
+    for p in ["*.py", "generation_config.json"]:
+        for file in glob.glob(str(src_path / p)):
+            shutil.copy(file, dst_path)
+
+    if hf_repo is not None:
+        create_model_card(dst_path, hf_repo)
 
 
 def common_prefix_len(list1, list2):
