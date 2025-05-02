@@ -26,16 +26,20 @@ def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
 
+    high_bits = 6
+    group_size = 64
+
     if recipe == "mixed_2_6":
         low_bits = 2
+    elif recipe == "mixed_3_4":
+        low_bits = 3
+        high_bits = 4
     elif recipe == "mixed_3_6":
         low_bits = 3
     elif recipe == "mixed_4_6":
         low_bits = 4
     else:
         raise ValueError("Invalid quant recipe {recipe}")
-    high_bits = 6
-    group_size = 64
 
     down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
     if len(down_keys) == 0:
@@ -82,7 +86,7 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-QUANT_RECIPES = ["mixed_2_6", "mixed_3_6", "mixed_4_6"]
+QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
