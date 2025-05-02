@@ -117,49 +117,6 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class MiMoMTPLayers(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
-        )
-        self.token_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.hidden_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.input_proj = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
-        self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-
-    def __call__(
-        self,
-        input_embeds: mx.array,
-        hidden_states: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        input_embeds = self.token_layernorm(input_embeds)
-        previous_hidden_states = self.hidden_layernorm(hidden_states)
-
-        concatenated = mx.concatenate([previous_hidden_states, input_embeds], axis=-1)
-        hidden_states = self.input_proj(concatenated)
-
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, mask, cache)
-
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-
-        hidden_states = residual + hidden_states
-        hidden_states = self.final_layernorm(hidden_states)
-
-        return hidden_states
-
-
 class MiMoModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -175,17 +132,11 @@ class MiMoModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        self.mtp_layers = [
-            MiMoMTPLayers(args=args) for _ in range(args.num_nextn_predict_layers)
-        ]
-
     def __call__(
         self,
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
-        use_mtp: bool = False,
-        input_embeds=None,
     ):
         h = self.embed_tokens(inputs)
 
@@ -199,13 +150,6 @@ class MiMoModel(nn.Module):
             h = layer(h, mask, c)
 
         h = self.norm(h)
-
-        if use_mtp and input_embeds is not None:
-            mtp_outputs = []
-            for mtp_layer in self.mtp_layers:
-                mtp_out = mtp_layer(input_embeds, h, mask)
-                mtp_outputs.append(mtp_out)
-            return h, mtp_outputs
 
         return h
 
@@ -224,38 +168,25 @@ class Model(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
-        use_mtp: bool = False,
-        input_embeds=None,
     ):
-        if use_mtp and input_embeds is not None:
-            out, mtp_outputs = self.model(inputs, mask, cache, use_mtp, input_embeds)
+        out = self.model(inputs, mask, cache)
 
-            if self.args.tie_word_embeddings:
-                out = self.model.embed_tokens.as_linear(out)
-                mtp_logits = [
-                    self.model.embed_tokens.as_linear(mtp_out)
-                    for mtp_out in mtp_outputs
-                ]
-            else:
-                out = self.lm_head(out)
-                mtp_logits = [self.lm_head(mtp_out) for mtp_out in mtp_outputs]
-
-            return out, mtp_logits
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
         else:
-            out = self.model(inputs, mask, cache)
+            out = self.lm_head(out)
 
-            if self.args.tie_word_embeddings:
-                out = self.model.embed_tokens.as_linear(out)
-            else:
-                out = self.lm_head(out)
-
-            return out
+        return out
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+
         return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+            k: v
+            for k, v in weights.items()
+            if "self_attn.rotary_emb.inv_freq" not in k
+            and not k.startswith("model.mtp_layers.")
         }
 
     @property
