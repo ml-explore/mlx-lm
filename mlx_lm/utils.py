@@ -316,6 +316,7 @@ def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
     card.data.base_model = str(hf_path)
+    card.text = ""
     card.save(os.path.join(path, "README.md"))
 
 
@@ -503,6 +504,32 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
+
+
+def common_prefix_len(list1, list2):
+    """
+    Calculates the length of the common prefix of two lists.
+
+    Args:
+        list1: The first list of strings.
+        list2: The second list of strings.
+
+    Returns:
+        The length of the common prefix. Returns 0 if lists are empty
+        or do not match at the first element.
+    """
+    # Determine the maximum possible length of the common prefix
+    min_len = min(len(list1), len(list2))
+
+    # Iterate up to the length of the shorter list
+    for i in range(min_len):
+        if list1[i] != list2[i]:
+            # Mismatch found, the common prefix length is the current index
+            return i
+
+    # No mismatch found within the bounds of the shorter list,
+    # so the common prefix length is the length of the shorter list.
+    return min_len
 
 
 def get_settings(

@@ -149,6 +149,7 @@ AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
     "qwen2": llama_awq,
+    "qwen3": llama_awq,
     "gemma3_text": gemma3_text_awq,
     "gemma3": update(gemma3_text_awq, lm_key="language_model"),
     "deepseek_v2": deepseek_v2_awq,

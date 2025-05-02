@@ -43,15 +43,15 @@ downstream tasks using `mlx_lm.evaluate`. For example:
 ```bash
 mlx_lm.evaluate \
     --model mlx_model \
-    --tasks winogrande boolq arc_challenge arc_easy hellaswag openbookqa piqa social_iqa                      
+    --tasks winogrande boolq arc_challenge arc_easy hellaswag openbookqa piqa social_iqa                     
 ```
 
 To upload the AWQ model to the Hugging Face Hub, run:
 
 ```bash
 mlx_lm.upload \
-    --model mlx_model \
-    --upload-repo mlx-community/Mistral-7B-Instruct-v0.3-3bit-AWQ
+    --path mlx_model \
+    --upload-repo mlx-community/Mistral-7B-Instruct-v0.3-4bit-AWQ
 ```
 
 [^1]: Refer to the [paper](https://arxiv.org/abs/2306.00978)
