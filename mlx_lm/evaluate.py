@@ -23,16 +23,7 @@ from tqdm import tqdm
 from .generate import stream_generate
 from .models.base import create_causal_mask
 from .models.cache import make_prompt_cache
-from .utils import load
-
-
-def _len_longest_common_prefix(a, b):
-    l = 0
-    for item_a, item_b in zip(a, b):
-        if item_a != item_b:
-            break
-        l += 1
-    return l
+from .utils import common_prefix_len, load
 
 
 def _rstrip_until(s, untils):
@@ -174,7 +165,7 @@ class MLXLM(LM):
             max_completed_l, min_prefix_l = length_stats.get(prefix, (0, 1e8))
             length_stats[prefix] = (
                 max(max_completed_l, len(completed)),
-                min(min_prefix_l, _len_longest_common_prefix(prefix, completed)),
+                min(min_prefix_l, common_prefix_len(prefix, completed)),
             )
 
         # truncate requests for completed sequences longer than model context.

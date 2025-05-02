@@ -298,20 +298,15 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def upload_to_hub(path: str, upload_repo: str, hf_path: str):
+def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
-        path (str): Local path to the model.
-        upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
+        path (Union[str, Path]): Local path to the model.
+        hf_path (Union[str, Path]): Path to the original Hugging Face model.
     """
-    import os
-
-    from huggingface_hub import HfApi, ModelCard, logging
-
-    from . import __version__
+    from huggingface_hub import ModelCard
 
     card = ModelCard.load(hf_path)
     card.data.library_name = "mlx"
@@ -320,7 +315,27 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         card.data.tags = ["mlx"]
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
-    card.data.base_model = hf_path
+    card.data.base_model = str(hf_path)
+    card.text = ""
+    card.save(os.path.join(path, "README.md"))
+
+
+def upload_to_hub(path: str, upload_repo: str):
+    """
+    Uploads the model to Hugging Face hub.
+
+    Args:
+        path (str): Local path to the model.
+        upload_repo (str): Name of the HF repo to upload to.
+    """
+    from huggingface_hub import HfApi, ModelCard, logging
+
+    from . import __version__
+
+    logging.set_verbosity_info()
+    card_path = Path(path) / "README.md"
+    card = ModelCard.load(card_path)
+    hf_path = card.data.base_model
     card.text = dedent(
         f"""
         # {upload_repo}
@@ -352,9 +367,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
         """
     )
-    card.save(os.path.join(path, "README.md"))
-
-    logging.set_verbosity_info()
+    card.save(card_path)
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
@@ -491,3 +504,29 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
+
+
+def common_prefix_len(list1, list2):
+    """
+    Calculates the length of the common prefix of two lists.
+
+    Args:
+        list1: The first list of strings.
+        list2: The second list of strings.
+
+    Returns:
+        The length of the common prefix. Returns 0 if lists are empty
+        or do not match at the first element.
+    """
+    # Determine the maximum possible length of the common prefix
+    min_len = min(len(list1), len(list2))
+
+    # Iterate up to the length of the shorter list
+    for i in range(min_len):
+        if list1[i] != list2[i]:
+            # Mismatch found, the common prefix length is the current index
+            return i
+
+    # No mismatch found within the bounds of the shorter list,
+    # so the common prefix length is the length of the shorter list.
+    return min_len

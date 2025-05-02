@@ -2,7 +2,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
+from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, apply_xtc
 
 
 class TestSampleUtils(unittest.TestCase):
@@ -93,6 +93,28 @@ class TestSampleUtils(unittest.TestCase):
         self.assertEqual(
             actual_probs.tolist(), [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
         )
+
+    def test_apply_xtc(self):
+        # Test the threshold
+        probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
+        new_probs = mx.softmax(apply_xtc(mx.log(probs), 1, 0.2, []), -1)
+        expected = mx.array([[0, 0.5, 0.25, 0.25]])
+        self.assertTrue(mx.allclose(new_probs, expected))
+        probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
+        new_probs = mx.softmax(apply_xtc(mx.log(probs), 1, 0.1, []), -1)
+        expected = mx.array([[0, 0.0, 0.5, 0.5]])
+        self.assertTrue(mx.allclose(new_probs, expected))
+
+        # Test the special tokens
+        probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
+        new_probs = mx.softmax(apply_xtc(mx.log(probs), 1, 0.1, [0]), -1)
+        expected = mx.array([[4 / 7, 0.0, 1.5 / 7, 1.5 / 7]])
+        self.assertTrue(mx.allclose(new_probs, expected))
+
+        # Test that with probability 0 the probs don't change
+        probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
+        new_probs = mx.softmax(apply_xtc(mx.log(probs), 0, 0.1, [0]), -1)
+        self.assertTrue(mx.allclose(new_probs, probs))
 
 
 if __name__ == "__main__":
