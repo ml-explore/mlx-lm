@@ -124,10 +124,10 @@ def save_model(
     create_model_card(mlx_path, hf_path)
 
 
-def load_data(tokenizer, num_samples: int):
+def load_data(tokenizer, data_path: str, num_samples: int):
     args = types.SimpleNamespace(
         hf_dataset={
-            "path": "allenai/tulu-3-sft-mixture",
+            "path": data_path,
             "train_split": f"train[:{num_samples}]",
             "valid_split": "train[:1]",
         },
@@ -164,6 +164,12 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
+        "--data-path",
+        type=str,
+        default="allenai/tulu-3-sft-mixture",
+        help="A Hugging Face dataset which is compatible with an mlx-lm dataset format.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.5,
@@ -174,7 +180,7 @@ def main():
     group = mx.distributed.init()
 
     num_samples = args.num_samples
-    if group is not None and num_samples % group.size() > 0:
+    if num_samples % group.size() > 0:
         num_samples += group.size() - num_samples % group.size()
 
     np.random.seed(args.seed)
@@ -183,7 +189,7 @@ def main():
     model_path = get_model_path(args.model, revision=None)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
-    calibration_data = load_data(tokenizer, args.num_samples)
+    calibration_data = load_data(tokenizer, args.data_path, args.num_samples)
 
     q_model = copy.deepcopy(model)
     tree_flatten(q_model.parameters())

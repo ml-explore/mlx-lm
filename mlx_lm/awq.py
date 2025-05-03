@@ -182,8 +182,10 @@ def run_layer(
 
 
 def dist_split(x: mx.array, group: mx.distributed.Group):
-    B = x.shape[0]
     N = group.size()
+    if N == 1:
+        return x
+    B = x.shape[0]
     assert B % N == 0
     r = group.rank()
     local_B = (B + N - 1) // N
@@ -570,8 +572,7 @@ def main():
 
     calibration_data = load_wikitext(tokenizer, args.num_samples, args.sequence_length)
 
-    if group is not None:
-        calibration_data = dist_split(calibration_data, group)
+    calibration_data = dist_split(calibration_data, group)
 
     awq_quantize(
         model,
