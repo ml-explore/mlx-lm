@@ -137,14 +137,18 @@ list contains the following fields:
 - `id`: The Hugging Face repo id.
 - `created`: A time-stamp representing the model creation time.
 
-One can restrict a server to respond only with the specific model that was loaded during startup by using the `--limit-to-loaded-model` flag. This feature allows you to run multiple MLX LM servers on the same machine. This remove s the lazy loading from mlx and thus fixing endpoints to one given model.
+One can restrict a server to respond only with the specific model that was loaded during startup by using the `--limit-to-loaded-model` flag. This feature allows you to run multiple mlx-lm servers on the same machine. This remove s the lazy loading from mlx yet fixes one endpoints to one given model.
 
 For example, you can simultaneously run:
 
-`python -m mlx_lm.server --model mlx-community/Qwen3-4B-4bit --host 0.0.0.0 --port 8000 --limit-to-loaded-model`
+```shell
+python -m mlx_lm.server --model mlx-community/Qwen3-4B-4bit --host 0.0.0.0 --port 8000 --limit-to-loaded-model
+```
 
 and
 
-`python -m mlx_lm.server --model mlx-community/Qwen3-30B-A3B-8bit --host 0.0.0.0 --port 8001 --limit-to-loaded-model`
+```shell
+python -m mlx_lm.server --model mlx-community/Qwen3-30B-A3B-8bit --host 0.0.0.0 --port 8001 --limit-to-loaded-model
+```
 
 This flag is also helpful when connecting open-webui to the correct endpoint as users switch between models, and you can specify a smaller model for the interface.
