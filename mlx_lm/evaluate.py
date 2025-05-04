@@ -44,16 +44,32 @@ def _pad_inputs(inputs):
     return mx.array(padded), mx.array(lengths)
 
 
+def chat_template_fn(**extra_kwargs):
+    def apply_chat_template(self, chat_history, add_generation_prompt=True) -> str:
+        """
+        Method to apply a chat template to a list of chat history between user and model.
+        """
+        return self.tokenizer.apply_chat_template(
+            chat_history,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=not add_generation_prompt,
+            **extra_kwargs,
+        )
+
+    return apply_chat_template
+
+
 @register_model("mlxlm")
 class MLXLM(LM):
 
     tokenizer_name = lm_eval.models.huggingface.HFLM.tokenizer_name
-    apply_chat_template = lm_eval.models.huggingface.HFLM.apply_chat_template
+    apply_chat_template = chat_template_fn()
 
     def __init__(
         self,
         path_or_hf_repo: str,
-        batch_size: int = 16,
+        batch_size: int = 8,
         max_tokens: Optional[int] = None,
         use_chat_template: Optional[bool] = None,
     ) -> None:
@@ -65,7 +81,7 @@ class MLXLM(LM):
         if use_chat_template is None:
             self.use_chat_template = self.tokenizer.chat_template is not None
 
-    def _score_fn(self, inputs, step_size: int = 64):
+    def _score_fn(self, inputs, step_size: int = 256):
         inputs, lengths = _pad_inputs(inputs)
         inputs, targets = inputs[..., :-1], inputs[..., 1:]
 
@@ -116,7 +132,9 @@ class MLXLM(LM):
             else:
                 masks = ind[None] < lengths[:, None]
 
-            scores = (masks * scores).sum(axis=-1)
+            scores = mx.logsumexp(
+                mx.where(masks, scores, -mx.array(float("inf"))), axis=-1
+            )
             is_greedy = (masks * is_greedy).sum(axis=-1)
 
             all_scores[i : i + self._batch_size] = scores
@@ -187,7 +205,6 @@ class MLXLM(LM):
             shortened.append(completed)
             # scores do not include initial bos, substract 1 to span bounds
             completion_spans.append((prefix_l - 1, len(completed) - 1))
-
         if long_completions > 0:
             logging.info(
                 f"Prefix eliminated for {long_completions} requests with "
@@ -324,7 +341,7 @@ def main():
         "--output-dir", default=".", help="Output directory for result files."
     )
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    parser.add_argument("--num-shots", type=int, default=0, help="Number of shots")
+    parser.add_argument("--num-shots", type=int, default=None, help="Number of shots")
     parser.add_argument(
         "--max-tokens",
         type=int,
@@ -352,6 +369,7 @@ def main():
         "otherwise `False`.",
         default=None,
     )
+
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -368,6 +386,7 @@ def main():
         max_tokens=args.max_tokens,
         use_chat_template=args.apply_chat_template,
     )
+
     results = lm_eval.simple_evaluate(
         model=lm,
         tasks=args.tasks,
@@ -381,10 +400,11 @@ def main():
         fewshot_random_seed=args.seed,
     )
 
-    model_name = args.model.replace("/", "_")
-    task_names = "_".join(args.tasks)
-    ver = version("lm_eval")
-    filename = f"eval_{model_name}_{task_names}_{args.num_shots:02d}_v_{ver}.json"
+    file_keys = ["eval", args.model.replace("/", "_"), version("lm_eval")]
+    if args.num_shots is not None:
+        file_keys += [f"{args.num_shots:02d}"]
+    file_keys += args.tasks
+    filename = "_".join(file_keys)
     if mx.distributed.init().rank() == 0:
         output_path = output_dir / filename
         output_path.write_text(json.dumps(results["results"], indent=4))
