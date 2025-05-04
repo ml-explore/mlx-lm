@@ -33,8 +33,6 @@ def dwq_quantize(
     q_model,
     opt,
     data,
-    group_size: int = 64,
-    bits: int = 3,
     batch_size: int = 2,
     max_seq_length: int = 2048,
     temperature: float = 0.5,
@@ -141,6 +139,7 @@ def load_data(tokenizer, data_path: str, num_samples: int):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", "-m", default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--quantized-model", default=None)
     parser.add_argument(
         "--mlx-path", default="mlx_model", help="Path to save the quantized model."
     )
@@ -191,14 +190,17 @@ def main():
 
     calibration_data = load_data(tokenizer, args.data_path, args.num_samples)
 
-    q_model = copy.deepcopy(model)
-    tree_flatten(q_model.parameters())
-    _, config = quantize_model(
-        q_model,
-        config,
-        q_group_size=args.group_size,
-        q_bits=args.bits,
-    )
+    if args.quantized_model is not None:
+        q_model_path = get_model_path(args.quantized_model, revision=None)
+        q_model, config, _ = fetch_from_hub(q_model_path, lazy=True)
+    else:
+        q_model = copy.deepcopy(model)
+        _, config = quantize_model(
+            q_model,
+            config,
+            q_group_size=args.group_size,
+            q_bits=args.bits,
+        )
 
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)
     dwq_quantize(
@@ -206,8 +208,6 @@ def main():
         q_model,
         opt,
         calibration_data,
-        bits=args.bits,
-        group_size=args.group_size,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
         temperature=args.temperature,
