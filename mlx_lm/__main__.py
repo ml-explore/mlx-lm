@@ -6,6 +6,7 @@ import sys
 if __name__ == "__main__":
     subcommands = {
         "awq",
+        "dwq",
         "cache_prompt",
         "chat",
         "convert",

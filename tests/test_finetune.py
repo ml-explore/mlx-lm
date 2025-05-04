@@ -365,7 +365,6 @@ class TestScheduleConfig(unittest.TestCase):
     def test_evaluate_calls(self):
         mock_model = MagicMock()
         mock_dataset = MagicMock()
-        mock_tokenizer = MagicMock()
         mock_default_loss = MagicMock()
         mock_iterate_batches = MagicMock()
 
@@ -388,7 +387,6 @@ class TestScheduleConfig(unittest.TestCase):
             evaluate(
                 model=mock_model,
                 dataset=mock_dataset,
-                tokenizer=mock_tokenizer,
                 batch_size=2,
                 num_batches=2,
                 max_seq_length=2048,
@@ -398,7 +396,6 @@ class TestScheduleConfig(unittest.TestCase):
 
         mock_iterate_batches.assert_called_once_with(
             dataset=mock_dataset,
-            tokenizer=mock_tokenizer,
             batch_size=2,
             max_seq_length=2048,
         )
@@ -407,7 +404,6 @@ class TestScheduleConfig(unittest.TestCase):
     def test_evaluate_infinite_batches(self):
         mock_model = MagicMock()
         mock_dataset = MagicMock()
-        mock_tokenizer = MagicMock()
         mock_default_loss = MagicMock()
         mock_iterate_batches = MagicMock()
 
@@ -427,7 +423,6 @@ class TestScheduleConfig(unittest.TestCase):
             evaluate(
                 model=mock_model,
                 dataset=mock_dataset,
-                tokenizer=mock_tokenizer,
                 batch_size=2,
                 num_batches=-1,
                 max_seq_length=2048,
@@ -437,7 +432,6 @@ class TestScheduleConfig(unittest.TestCase):
 
         mock_iterate_batches.assert_called_once_with(
             dataset=mock_dataset,
-            tokenizer=mock_tokenizer,
             batch_size=2,
             max_seq_length=2048,
         )

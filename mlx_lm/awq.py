@@ -2,11 +2,8 @@
 
 import argparse
 import copy
-import glob
-import shutil
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,13 +13,10 @@ from tqdm import tqdm
 
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.switch_layers import SwitchLinear
-from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.utils import (
-    create_model_card,
     fetch_from_hub,
     get_model_path,
-    save_config,
-    save_weights,
+    save,
 )
 
 
@@ -149,6 +143,7 @@ AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
     "qwen2": llama_awq,
+    "qwen3": llama_awq,
     "gemma3_text": gemma3_text_awq,
     "gemma3": update(gemma3_text_awq, lm_key="language_model"),
     "deepseek_v2": deepseek_v2_awq,
@@ -187,8 +182,10 @@ def run_layer(
 
 
 def dist_split(x: mx.array, group: mx.distributed.Group):
-    B = x.shape[0]
     N = group.size()
+    if N == 1:
+        return x
+    B = x.shape[0]
     assert B % N == 0
     r = group.rank()
     local_B = (B + N - 1) // N
@@ -522,25 +519,10 @@ def load_wikitext(
     return tokens[starts + mx.arange(sequence_length)]
 
 
-def save_model(
+def update_config(
     model: nn.Module,
-    tokenizer: TokenizerWrapper,
-    config,
-    model_path: Path,
-    mlx_path: str,
-    hf_path: str,
+    config: Dict[str, Any],
 ):
-    weights = dict(tree_flatten(model.parameters()))
-
-    mlx_path = Path(mlx_path)
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
-
-    tokenizer.save_pretrained(mlx_path)
-
     # dummy
     config["quantization"] = {"group_size": 64, "bits": 4}
 
@@ -554,9 +536,7 @@ def save_model(
             config["quantization"][path] = False
 
     tree_map_with_path(update_config, model.leaf_modules(), is_leaf=nn.Module.is_module)
-
-    save_config(config, config_path=mlx_path / "config.json")
-    create_model_card(mlx_path, hf_path)
+    return config
 
 
 def main():
@@ -592,8 +572,7 @@ def main():
 
     calibration_data = load_wikitext(tokenizer, args.num_samples, args.sequence_length)
 
-    if group is not None:
-        calibration_data = dist_split(calibration_data, group)
+    calibration_data = dist_split(calibration_data, group)
 
     awq_quantize(
         model,
@@ -606,4 +585,13 @@ def main():
         n_grid=args.n_grid,
     )
 
-    save_model(model, tokenizer, config, model_path, args.mlx_path, args.model)
+    config = update_config(model, config)
+    weights = dict(tree_flatten(model.parameters()))
+    save(
+        args.mlx_path,
+        model_path,
+        weights,
+        tokenizer,
+        config,
+        hf_repo=args.model,
+    )
