@@ -46,9 +46,6 @@ def _pad_inputs(inputs):
 
 def chat_template_fn(**extra_kwargs):
     def apply_chat_template(self, chat_history, add_generation_prompt=True) -> str:
-        """
-        Method to apply a chat template to a list of chat history between user and model.
-        """
         return self.tokenizer.apply_chat_template(
             chat_history,
             tokenize=False,
@@ -132,9 +129,7 @@ class MLXLM(LM):
             else:
                 masks = ind[None] < lengths[:, None]
 
-            scores = mx.logsumexp(
-                mx.where(masks, scores, -mx.array(float("inf"))), axis=-1
-            )
+            scores = (masks * scores).sum(axis=-1)
             is_greedy = (masks * is_greedy).sum(axis=-1)
 
             all_scores[i : i + self._batch_size] = scores
@@ -369,6 +364,13 @@ def main():
         "otherwise `False`.",
         default=None,
     )
+    parser.add_argument(
+        "--chat-template-args",
+        type=json.loads,
+        help="""A JSON formatted string of arguments for the tokenizer's "
+        "apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        default="{}",
+    )
 
     args = parser.parse_args()
 
@@ -386,6 +388,7 @@ def main():
         max_tokens=args.max_tokens,
         use_chat_template=args.apply_chat_template,
     )
+    MLXLM.apply_chat_template = chat_template_fn(**args.chat_template_args)
 
     results = lm_eval.simple_evaluate(
         model=lm,
