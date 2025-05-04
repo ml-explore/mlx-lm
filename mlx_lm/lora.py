@@ -14,7 +14,13 @@ import numpy as np
 import yaml
 
 from .tuner.datasets import load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
+from .tuner.trainer import (
+    TrainingArgs,
+    TrainingCallback,
+    evaluate,
+    load_checkpoint,
+    train,
+)
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -212,32 +218,6 @@ def train_model(
     else:
         raise ValueError(f"Received unknown fine-tune-type {args.fine_tune_type}")
 
-    # Resume from weights if provided
-    if args.resume_adapter_file is not None:
-        print(f"Loading fine-tuned weights from {args.resume_adapter_file}")
-        model.load_weights(args.resume_adapter_file, strict=False)
-
-    print_trainable_parameters(model)
-
-    adapter_path = Path(args.adapter_path)
-    adapter_path.mkdir(parents=True, exist_ok=True)
-
-    adapter_file = adapter_path / "adapters.safetensors"
-    save_config(vars(args), adapter_path / "adapter_config.json")
-
-    # init training args
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=args.iters,
-        val_batches=args.val_batches,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.save_every,
-        adapter_file=adapter_file,
-        max_seq_length=args.max_seq_length,
-        grad_checkpoint=args.grad_checkpoint,
-    )
-
     # Initialize the selected optimizer
     lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
 
@@ -251,16 +231,40 @@ def train_model(
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
-    opt = opt_class(learning_rate=lr, **optimizer_config)
+    optimizer = opt_class(learning_rate=lr, **optimizer_config)
+
+    # Load weights and optimizer state from checkpoint if applicable
+    start_iteration = load_checkpoint(model, optimizer, args.resume_adapter_file)
+
+    print_trainable_parameters(model)
+
+    adapter_path = Path(args.adapter_path)
+    adapter_path.mkdir(parents=True, exist_ok=True)
+
+    adapter_file = adapter_path / "adapters.safetensors"
+    save_config(vars(args), adapter_path / "adapter_config.json")
+
+    training_args = TrainingArgs(
+        batch_size=args.batch_size,
+        iters=args.iters,
+        val_batches=args.val_batches,
+        steps_per_report=args.steps_per_report,
+        steps_per_eval=args.steps_per_eval,
+        steps_per_save=args.save_every,
+        adapter_file=adapter_file,
+        max_seq_length=args.max_seq_length,
+        grad_checkpoint=args.grad_checkpoint,
+    )
 
     # Train model
     train(
         model=model,
         args=training_args,
-        optimizer=opt,
+        optimizer=optimizer,
         train_dataset=train_set,
         val_dataset=valid_set,
         training_callback=training_callback,
+        start_step=start_iteration,
     )
 
 
