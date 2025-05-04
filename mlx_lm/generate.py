@@ -35,8 +35,8 @@ from .utils import load
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
-DEFAULT_TEMP = 0.0
-DEFAULT_TOP_P = 1.0
+DEFAULT_TEMP = 0.6
+DEFAULT_TOP_P = 0.95
 DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_K = 0
 DEFAULT_XTC_PROBABILITY = 0.0
@@ -349,8 +349,11 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
     )
-
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    default_sampler=make_sampler(
+        temp=DEFAULT_TEMP,
+        top_p=DEFAULT_TOP_P
+    )
+    sampler = sampler or default_sampler
 
     def _step(y):
         with mx.stream(generation_stream):
@@ -460,7 +463,11 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    default_sampler=make_sampler(
+        temp=DEFAULT_TEMP,
+        top_p=DEFAULT_TOP_P
+    )
+    sampler = sampler or default_sampler
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
