@@ -801,14 +801,20 @@ class APIHandler(BaseHTTPRequestHandler):
         ]
 
         # Create a list of available models
-        models = [
-            {
-                "id": repo.repo_id,
-                "object": "model",
-                "created": self.created,
-            }
-            for repo in downloaded_models
-        ]
+        models = []
+        for repo in downloaded_models:
+            if (
+                self.model_provider.cli_args.limit_to_loaded_model
+                and self.model_provider.cli_args.model != repo.repo_id
+            ):
+                continue
+            models.append(
+                {
+                    "id": repo.repo_id,
+                    "object": "model",
+                    "created": self.created,
+                }
+            )
 
         response = {"object": "list", "data": models}
 
@@ -901,6 +907,11 @@ def main():
         "--use-default-chat-template",
         action="store_true",
         help="Use the default chat template",
+    )
+    parser.add_argument(
+        "--limit-to-loaded-model",
+        action="store_true",
+        help="/v1/models requests will only list loaded model.",
     )
     args = parser.parse_args()
 
