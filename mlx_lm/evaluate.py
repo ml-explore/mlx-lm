@@ -94,6 +94,7 @@ class MLXLM(LM):
         inputs, targets = inputs[..., :-1], inputs[..., 1:]
 
         cache = cache or make_prompt_cache(self._model)
+        lengths += cache[0].offset
 
         scores, is_greedy = [], []
         for i in range(0, inputs.shape[1], step_size):
@@ -173,7 +174,7 @@ class MLXLM(LM):
 
         long_completions = 0
         scores, is_greedy = [], []
-        for q, rs in zip(questions, responses):
+        for q, rs in tqdm(zip(questions, responses), total=len(questions)):
             prefix = self._tokenize([q])[0]
             full_sequences = self._tokenize([q + r for r in rs])
             max_completed_l = max(len(s) for s in full_sequences)
