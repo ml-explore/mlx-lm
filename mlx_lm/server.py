@@ -772,10 +772,22 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         if self.path == "/v1/models":
             self.handle_models_request()
+        elif self.path == "/health":
+            self.handle_health_check()
         else:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def handle_health_check(self):
+        """
+        Handle a GET request for the /health endpoint.
+        """
+        self._set_completion_headers(200)
+        self.end_headers()
+
+        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.flush()
 
     def handle_models_request(self):
         """
