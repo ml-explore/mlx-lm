@@ -293,8 +293,22 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
-        raw_body = self.rfile.read(content_length)
+        content_length = self.headers.get("Content-Length")
+        if content_length:
+            raw_body = self.rfile.read(int(content_length))
+        else:
+            chunks = []
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    break
+                size = int(line.strip(), 16)
+                if size == 0:
+                    self.rfile.readline() # Trailer CRLF
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2) # CR+LF
+            raw_body = b"".join(chunks)
         self.body = json.loads(raw_body.decode())
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
