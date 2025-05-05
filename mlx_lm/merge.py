@@ -114,7 +114,7 @@ def merge_models(base_model: nn.Module, model: nn.Module, config: dict):
 
 def merge(
     config: str,
-    mlx_path: str = "mlx_model",
+    mlx_path: Path = Path("mlx_model"),
     upload_repo: Optional[str] = None,
 ):
     with open(config, "r") as fid:

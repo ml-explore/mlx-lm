@@ -2,7 +2,7 @@
 import json
 import types
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -169,13 +169,13 @@ def linear_to_lora_layers(
         model.update_modules(tree_unflatten(lora_modules))
 
 
-def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
+def load_adapters(model: nn.Module, adapter_path: Union[str, Path]) -> nn.Module:
     """
     Load any fine-tuned adapters / layers.
 
     Args:
         model (nn.Module): The neural network model.
-        adapter_path (str): Path to the adapter configuration file.
+        adapter_path (Union[str, Path]): Path to the adapter configuration file.
 
     Returns:
         nn.Module: The updated model with LoRA layers applied.

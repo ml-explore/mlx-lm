@@ -10,7 +10,7 @@ import logging
 import os
 from importlib.metadata import version
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple, Union
 
 import lm_eval
 import mlx.core as mx
@@ -160,7 +160,7 @@ class MLXLM(LM):
         )
 
         # max length (prefix + completion) and longest common prefix per question.
-        length_stats = {}
+        length_stats: Dict[Tuple[int, ...], Tuple[int, float]] = {}
         for prefix, completed in zip(tokenized[0::2], tokenized[1::2]):
             max_completed_l, min_prefix_l = length_stats.get(prefix, (0, 1e8))
             length_stats[prefix] = (

@@ -38,7 +38,7 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
-    rope_scaling: Dict = None
+    rope_scaling: Dict[Any, Any] = {}
     attention_bias: bool = False
 
 
@@ -189,6 +189,7 @@ class DeepseekV2Attention(nn.Module):
             ]
             if key in self.config.rope_scaling
         }
+
         self.rope = DeepseekV2YarnRotaryEmbedding(
             dim=self.qk_rope_head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -244,7 +245,10 @@ class DeepseekV2Attention(nn.Module):
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config

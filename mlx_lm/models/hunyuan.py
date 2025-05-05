@@ -29,8 +29,8 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     rope_theta: float
     use_cla: bool
-    cla_share_factor: 2
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    cla_share_factor: int = 2
+    rope_scaling: Dict[str, Union[float, str]] = {}
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
@@ -71,7 +71,6 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
         head_dim = args.hidden_size // n_heads
@@ -90,10 +89,12 @@ class Attention(nn.Module):
             self.query_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
             self.key_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
 
+        # Since rope_scaling is required, no need for a conditional check
+        scaling_alpha = float(args.rope_scaling["alpha"])
         self.rope = DynamicNTKAlphaRoPE(
             head_dim,
             base=args.rope_theta,
-            scaling_alpha=args.rope_scaling["alpha"],
+            scaling_alpha=scaling_alpha,
         )
 
     def __call__(

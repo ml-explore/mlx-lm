@@ -163,7 +163,7 @@ class ModelProvider:
         if self.cli_args.model is not None:
             self.load("default_model", draft_model_path="default_model")
 
-    def _validate_model_path(self, model_path: str):
+    def _validate_model_path(self, model_path: Union[str, Path]):
         model_path = Path(model_path)
         if model_path.exists() and not model_path.is_relative_to(Path.cwd()):
             raise RuntimeError(
@@ -586,7 +586,7 @@ class APIHandler(BaseHTTPRequestHandler):
               to the stopping_criteria function
         """
         tokens = []
-        finish_reason = "length"
+        finish_reason: Union[Literal["length", "stop"], None] = "length"
         stop_sequence_suffix = None
         if self.stream:
             self.end_headers()
@@ -636,10 +636,16 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
-                top_indices = sorted_indices[: self.logprobs]
-                top_logprobs = logprobs[top_indices]
-                top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                top_tokens.append(tuple(top_token_info))
+                top_indices = sorted_indices[: self.logprobs].tolist()
+                top_logprobs = logprobs[top_indices].tolist()
+                top_tokens.append(
+                    {
+                        int(idx): float(prob)
+                        for idx, prob in zip(
+                            top_indices, top_logprobs
+                        )  # Iterate over Python lists
+                    }
+                )
 
             token_logprobs.append(logprobs[token].item())
 
@@ -708,8 +714,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def completion_usage_response(
         self,
-        prompt_token_count: Optional[int] = None,
-        completion_token_count: Optional[int] = None,
+        prompt_token_count: int,
+        completion_token_count: int,
     ):
         response = {
             "id": self.request_id,
@@ -830,6 +836,7 @@ def run(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
     server_class.address_family, _, _, _, server_address = next(iter(infos))
+    server_address = server_address[:2]
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(

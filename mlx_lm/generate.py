@@ -289,7 +289,7 @@ def generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
-    sampler: Optional[Callable[mx.array, mx.array]] = None,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
@@ -297,7 +297,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
-    prompt_progress_callback: Optional[Callable[int, int]] = None,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -409,7 +409,7 @@ def speculative_generate_step(
     *,
     num_draft_tokens=2,
     max_tokens: int = 256,
-    sampler: Optional[Callable[mx.array, mx.array]] = None,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 512,

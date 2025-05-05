@@ -89,7 +89,7 @@ MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 def convert(
     hf_path: str,
-    mlx_path: str = "mlx_model",
+    mlx_path: Union[str, Path] = "mlx_model",
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
