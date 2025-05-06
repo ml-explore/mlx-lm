@@ -156,6 +156,7 @@ def evaluate(
     max_seq_length=2048,
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
+    display_progress: bool = False,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -173,6 +174,7 @@ def evaluate(
         ),
     ),
             unit="examples",
+            disable=not display_progress,
             unit_scale=batch_size,
             desc="Calculating loss...",
             total=min(len(dataset)//batch_size, num_batches)):

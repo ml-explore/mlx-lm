@@ -277,6 +277,7 @@ def evaluate_model(args, model: nn.Module, test_set):
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
+        display_progress=True
     )
 
     test_ppl = math.exp(test_loss)
