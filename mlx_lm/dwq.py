@@ -126,14 +126,15 @@ def load_data(tokenizer, data_path: str, num_samples: int):
     args = types.SimpleNamespace(
         hf_dataset={
             "path": data_path,
-            "train_split": f"train[:{num_samples}]",
+            "train_split": f"train",
             "valid_split": "train[:1]",
         },
         train=True,
         test=False,
     )
     dataset = load_dataset(args, tokenizer)[0]
-    return [dataset.process(d) for d in dataset]
+    perm = np.random.permutation(len(dataset))[:num_samples].tolist()
+    return [dataset.process(dataset[i]) for i in perm]
 
 
 def main():
