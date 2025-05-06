@@ -258,7 +258,10 @@ def apply_scale(prev_op, layers, scales):
         for layer in layers:
             layer.weight = layer.weight * scales
     elif prev_op.__class__.__name__ == "RMSNorm":  # For gemma models
-        prev_op.weight = (1.0 + prev_op.weight) / scales - 1.0
+        dt = prev_op.weight.dtype
+        prev_op.weight = (
+            (1.0 + prev_op.weight.astype(mx.float32)) / scales - 1.0
+        ).astype(dt)
         for layer in layers:
             layer.weight = layer.weight * scales
     else:
@@ -307,7 +310,7 @@ def search_best_clip(
     n_grid: int,
     max_shrink: float = 0.5,
     batch_size: int = 64,
-    n_frames: int = 4096,
+    n_frames: int = 512,
 ):
     group = mx.distributed.init()
 
@@ -322,7 +325,6 @@ def search_best_clip(
     w_init_shape = w.shape
     w_all = mx.flatten(w, 0, w.ndim - 2)
     w_max_all = []
-    w_min_all = []
 
     # batch across W to save memory
     for b in range(0, w_all.shape[0], batch_size):
@@ -331,19 +333,18 @@ def search_best_clip(
         group_shape = (w.shape[0], w.shape[-1] // group_size)
         best_error = mx.full(group_shape, float("inf"))
         best_w_max = mx.zeros((*group_shape, 1), dtype=x.dtype)
-        best_w_min = mx.zeros((*group_shape, 1), dtype=x.dtype)
 
         w_shape = w.shape
 
         w = w.reshape(*w.shape[:-1], -1, group_size)
         out = mx.einsum("bdg,odg->bod", x, w)
+        init_max = w.abs().max(axis=-1, keepdims=True)
 
         # try a range of clips and pick the one with the smallest loss
         for i in range(int(max_shrink * n_grid)):
             p = 1 - i / n_grid
-            w_max = p * w.max(axis=-1, keepdims=True)
-            w_min = p * w.min(axis=-1, keepdims=True)
-            w_m = mx.clip(w, w_min, w_max).reshape(w_shape)
+            w_max = p * init_max
+            w_m = mx.clip(w, -w_max, w_max).reshape(w_shape)
 
             w_q = quantize_func(w_m)
 
@@ -351,24 +352,21 @@ def search_best_clip(
             out_q = mx.einsum("bdg,odg->bod", x, w_q)
 
             # Take the mean across the input batch
-            loss = mse(out, out_q).sum(axis=(0, 1))
+            loss = mse(out, out_q).sum(axis=0)
             if group is not None:
                 loss = mx.distributed.all_sum(loss) / group.size()
-            loss /= out.shape[0] * out.shape[1]
+            loss /= out.shape[0]
             best_indices = loss < best_error
             best_error = mx.where(best_indices, loss, best_error)
             best_w_max = mx.where(best_indices[..., mx.newaxis], w_max, best_w_max)
-            best_w_min = mx.where(best_indices[..., mx.newaxis], w_min, best_w_min)
-            mx.eval(best_w_max, best_w_min, best_error)
+            mx.eval(best_w_max, best_error)
 
         w_max_all.append(best_w_max)
-        w_min_all.append(best_w_min)
 
     best_w_max = mx.concatenate(w_max_all, axis=0)
-    best_w_min = mx.concatenate(w_min_all, axis=0)
 
     w_r = w_all.reshape(*w_all.shape[:-1], -1, group_size)
-    best_w = mx.clip(w_r, best_w_min, best_w_max)
+    best_w = mx.clip(w_r, -best_w_max, best_w_max)
     best_w = best_w.reshape(w_init_shape)
 
     mx.eval(best_w)
@@ -467,7 +465,7 @@ def awq_quantize(
             before_loss = mx.distributed.all_sum(before_loss) / group.size()
         before_loss /= outputs.size
         block.update_modules(orig_leaves)
-        del orig_leaves
+        orig_params = block.parameters()
 
         scale_block(
             block=block,
@@ -493,6 +491,12 @@ def awq_quantize(
             after_loss = mx.distributed.all_sum(after_loss) / group.size()
         after_loss /= outputs.size
         tqdm.write(f"Loss reduction: {after_loss / before_loss}")
+        if after_loss > before_loss:
+            # Reload original weights and quantize
+            block.update_modules(orig_leaves)
+            block.update(orig_params)
+            nn.quantize(block, group_size=group_size, bits=bits)
+            tqdm.write("Loss is not reduced, falling back to original weights.")
 
         inputs = outputs
 
@@ -549,9 +553,9 @@ def main():
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--embed-bits", type=int, default=4)
     parser.add_argument("--embed-group-size", type=int, default=32)
-    parser.add_argument("--num-samples", type=int, default=32)
-    parser.add_argument("--sequence-length", type=int, default=2048)
-    parser.add_argument("--n-grid", type=int, default=10)
+    parser.add_argument("--num-samples", type=int, default=128)
+    parser.add_argument("--sequence-length", type=int, default=512)
+    parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
 
