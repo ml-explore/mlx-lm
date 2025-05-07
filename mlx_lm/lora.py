@@ -76,6 +76,7 @@ CONFIG_DEFAULTS = {
     "group_size": 4,
     "beta": 0.1,
     "epsilon": 1e-4,
+    "epsilon_high": None,
     "max_completion_length": 512,
     "use_chat_template": False,
     "use_prompt": False,
@@ -226,6 +227,12 @@ def build_parser():
         default=1e-4,
     )
     parser.add_argument(
+        "--epsilon-high",
+        type=float,
+        help="Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound specified in argument epsilon.",
+        default=None,
+    )
+    parser.add_argument(
         "--use-chat-template",
         action="store_true",
         help="If the model is a Chat model, use the Chat template.",
@@ -327,6 +334,7 @@ def train_model(
             beta=args.beta,
             group_size=args.group_size,
             epsilon=args.epsilon,
+            epsilon_high=args.epsilon_high,
             reference_model_path=args.reference_model_path,
             temperature=args.temperature,
             reward_weights=(
@@ -338,12 +346,14 @@ def train_model(
 
         if args.reference_model_path:
             reference_model, _ = load(args.reference_model_path)
+        elif args.beta == 0:
+            reference_model = None
         else:
             reference_model, _ = load(args.model)
 
         train_grpo(
             model=model,
-            ref_model=reference_model.freeze(),
+            ref_model=reference_model.freeze() if reference_model else None,
             tokenizer=tokenizer,
             optimizer=opt,
             train_dataset=train_set,
@@ -395,6 +405,7 @@ def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set
             beta=args.beta,
             group_size=args.group_size,
             epsilon=args.epsilon,
+            epsilon_high=args.epsilon_high,
             temperature=args.temperature,
             max_tokens=args.max_seq_length,
         )
