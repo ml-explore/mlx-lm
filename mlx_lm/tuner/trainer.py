@@ -85,7 +85,6 @@ def default_loss(model, batch, lengths):
 
 def iterate_batches(
     dataset,
-    tokenizer,
     batch_size,
     max_seq_length,
     train=False,
@@ -153,7 +152,6 @@ def iterate_batches(
 def evaluate(
     model,
     dataset,
-    tokenizer,
     batch_size,
     num_batches,
     max_seq_length=2048,
@@ -170,7 +168,6 @@ def evaluate(
         index_iterator,
         iterate_batches(
             dataset=dataset,
-            tokenizer=tokenizer,
             batch_size=batch_size,
             max_seq_length=max_seq_length,
         ),
@@ -199,7 +196,6 @@ class TrainingCallback:
 
 def train(
     model,
-    tokenizer,
     optimizer,
     train_dataset,
     val_dataset,
@@ -234,9 +230,6 @@ def train(
 
         return lvalue, toks
 
-    train_dataset = CacheDataset(train_dataset)
-    val_dataset = CacheDataset(val_dataset)
-
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
     model.train()
@@ -250,7 +243,6 @@ def train(
         range(1, args.iters + 1),
         iterate_batches(
             dataset=train_dataset,
-            tokenizer=tokenizer,
             batch_size=args.batch_size,
             max_seq_length=args.max_seq_length,
             train=True,
@@ -265,7 +257,6 @@ def train(
                 model=model,
                 dataset=val_dataset,
                 loss=loss,
-                tokenizer=tokenizer,
                 batch_size=args.batch_size,
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,

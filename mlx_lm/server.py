@@ -30,7 +30,7 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load
+from .utils import common_prefix_len, load
 
 
 def get_system_fingerprint():
@@ -492,42 +492,84 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def reset_prompt_cache(self, prompt):
+        """Resets the prompt cache and associated state.
+
+        Args:
+            prompt (List[int]): The tokenized new prompt which will populate the
+                reset cache.
+        """
+        logging.debug(f"*** Resetting cache. ***")
+        self.prompt_cache.model_key = self.model_provider.model_key
+        self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+        if self.model_provider.draft_model is not None:
+            self.prompt_cache.cache += make_prompt_cache(
+                self.model_provider.draft_model
+            )
+        self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
+
     def get_prompt_cache(self, prompt):
+        """
+        Determines the portion of the prompt that needs processing by comparing
+        it to the cached prompt and attempting to reuse the common prefix.
+
+        This function updates the internal prompt cache state (tokens and model cache)
+        based on the comparison. If a common prefix exists, it attempts to trim
+        the model cache (if supported) to match the common prefix length, avoiding
+        recomputation.
+
+        Args:
+            prompt (List[int]): The tokenized new prompt.
+
+        Returns:
+            List[int]: The suffix of the prompt that actually needs to be processed
+                       by the model. This will be the full prompt if the cache is
+                       reset or cannot be effectively used.
+        """
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
-        prefix_len = min(cache_len, prompt_len)
+        com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
 
+        # Condition 1: Model changed or no common prefix at all. Reset cache.
         if (
             self.prompt_cache.model_key != self.model_provider.model_key
-            or prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
+            or com_prefix_len == 0
         ):
-            self.prompt_cache.model_key = self.model_provider.model_key
-            self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
-            if self.model_provider.draft_model is not None:
-                self.prompt_cache.cache += make_prompt_cache(
-                    self.model_provider.draft_model
-                )
+            self.reset_prompt_cache(prompt)
 
-            self.prompt_cache.tokens = []
-        elif cache_len >= prompt_len:
-            # Trim the cache if it contains the prompt as a prefix
+        # Condition 2: Common prefix exists and matches cache length. Process suffix.
+        elif com_prefix_len == cache_len:
+            logging.debug(
+                f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
+            )
+            prompt = prompt[com_prefix_len:]
+            self.prompt_cache.tokens.extend(prompt)
+
+        # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
+        elif com_prefix_len < cache_len:
+            logging.debug(
+                f"*** Common prefix ({com_prefix_len}) shorter than cache ({cache_len}). Attempting trim. ***"
+            )
+
             if can_trim_prompt_cache(self.prompt_cache.cache):
-                num_to_trim = cache_len - prompt_len + 1
+                num_to_trim = cache_len - com_prefix_len
+                logging.debug(f"    Trimming {num_to_trim} tokens from cache.")
                 trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
-                self.prompt_cache.tokens = self.prompt_cache.tokens[:-num_to_trim]
-                prompt = prompt[-1:]
+                self.prompt_cache.tokens = self.prompt_cache.tokens[:com_prefix_len]
+                prompt = prompt[com_prefix_len:]
+                self.prompt_cache.tokens.extend(prompt)
             else:
-                self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    self.prompt_cache.cache += make_prompt_cache(
-                        self.model_provider.draft_model
-                    )
-                self.prompt_cache.tokens = []
-        else:
-            # Trim the prompt if it contains the cache as a prefix
-            prompt = prompt[cache_len:]
+                logging.debug(f"    Cache cannot be trimmed. Resetting cache.")
+                self.reset_prompt_cache(prompt)
 
-        self.prompt_cache.tokens.extend(prompt)
+        # This case should logically not be reached if com_prefix_len <= cache_len
+        else:
+            logging.error(
+                f"Unexpected cache state: com_prefix_len ({com_prefix_len}) > cache_len ({cache_len}). Resetting cache."
+            )
+            self.reset_prompt_cache(prompt)
+
+        logging.debug(f"Returning {len(prompt)} tokens for processing.")
         return prompt
 
     def handle_completion(
@@ -730,10 +772,22 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         if self.path == "/v1/models":
             self.handle_models_request()
+        elif self.path == "/health":
+            self.handle_health_check()
         else:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def handle_health_check(self):
+        """
+        Handle a GET request for the /health endpoint.
+        """
+        self._set_completion_headers(200)
+        self.end_headers()
+
+        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.flush()
 
     def handle_models_request(self):
         """

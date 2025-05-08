@@ -1,8 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
-import glob
-import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -11,13 +9,11 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from .utils import (
-    create_model_card,
     dequantize_model,
     fetch_from_hub,
     get_model_path,
     quantize_model,
-    save_config,
-    save_weights,
+    save,
     upload_to_hub,
 )
 
@@ -26,16 +22,20 @@ def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
 
+    high_bits = 6
+    group_size = 64
+
     if recipe == "mixed_2_6":
         low_bits = 2
+    elif recipe == "mixed_3_4":
+        low_bits = 3
+        high_bits = 4
     elif recipe == "mixed_3_6":
         low_bits = 3
     elif recipe == "mixed_4_6":
         low_bits = 4
     else:
         raise ValueError("Invalid quant recipe {recipe}")
-    high_bits = 6
-    group_size = 64
 
     down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
     if len(down_keys) == 0:
@@ -82,7 +82,7 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-QUANT_RECIPES = ["mixed_2_6", "mixed_3_6", "mixed_4_6"]
+QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
@@ -149,17 +149,14 @@ def convert(
         weights = dict(tree_flatten(model.parameters()))
 
     del model
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
-
-    tokenizer.save_pretrained(mlx_path)
-
-    save_config(config, config_path=mlx_path / "config.json")
-
-    create_model_card(mlx_path, hf_path)
+    save(
+        mlx_path,
+        model_path,
+        weights,
+        tokenizer,
+        config,
+        hf_repo=hf_path,
+    )
 
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo)

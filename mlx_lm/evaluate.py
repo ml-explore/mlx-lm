@@ -5,12 +5,14 @@ Adapted from a PyTorch implementation by David Grangier
 """
 
 import argparse
+import collections
+import copy
 import json
 import logging
 import os
 from importlib.metadata import version
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import lm_eval
 import mlx.core as mx
@@ -23,16 +25,7 @@ from tqdm import tqdm
 from .generate import stream_generate
 from .models.base import create_causal_mask
 from .models.cache import make_prompt_cache
-from .utils import load
-
-
-def _len_longest_common_prefix(a, b):
-    l = 0
-    for item_a, item_b in zip(a, b):
-        if item_a != item_b:
-            break
-        l += 1
-    return l
+from .utils import common_prefix_len, load
 
 
 def _rstrip_until(s, untils):
@@ -53,32 +46,55 @@ def _pad_inputs(inputs):
     return mx.array(padded), mx.array(lengths)
 
 
+def chat_template_fn(**extra_kwargs):
+    def apply_chat_template(self, chat_history, add_generation_prompt=True) -> str:
+        return self.tokenizer.apply_chat_template(
+            chat_history,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=not add_generation_prompt,
+            **extra_kwargs,
+        )
+
+    return apply_chat_template
+
+
 @register_model("mlxlm")
 class MLXLM(LM):
 
     tokenizer_name = lm_eval.models.huggingface.HFLM.tokenizer_name
-    apply_chat_template = lm_eval.models.huggingface.HFLM.apply_chat_template
+    apply_chat_template = chat_template_fn()
 
     def __init__(
         self,
         path_or_hf_repo: str,
-        batch_size: int = 16,
         max_tokens: Optional[int] = None,
         use_chat_template: Optional[bool] = None,
     ) -> None:
         super().__init__()
-        self._batch_size = batch_size
         self._model, self.tokenizer = load(path_or_hf_repo)
         self._max_tokens = max_tokens or self.tokenizer.model_max_length
+        self._batch_size = 8
         self.use_chat_template = use_chat_template
         if use_chat_template is None:
             self.use_chat_template = self.tokenizer.chat_template is not None
 
-    def _score_fn(self, inputs, step_size: int = 64):
+    def _process_prompt(self, prompt, step_size: int = 2048):
+        prompt = mx.array(prompt)[None]
+        cache = make_prompt_cache(self._model)
+        for i in range(0, prompt.shape[1], step_size):
+            logits = self._model(prompt[:, i : i + step_size], cache=cache)
+            mx.eval([c.state for c in cache])
+            mx.clear_cache()
+        logprobs = nn.log_softmax(logits[:, -1, :].astype(mx.float32))
+        return logprobs, cache
+
+    def _score_fn(self, inputs, cache: Optional[Any] = None, step_size: int = 2048):
         inputs, lengths = _pad_inputs(inputs)
         inputs, targets = inputs[..., :-1], inputs[..., 1:]
 
-        cache = make_prompt_cache(self._model)
+        cache = cache or make_prompt_cache(self._model)
+        lengths += cache[0].offset
 
         scores, is_greedy = [], []
         for i in range(0, inputs.shape[1], step_size):
@@ -107,31 +123,6 @@ class MLXLM(LM):
         is_greedy = mx.concatenate(is_greedy, axis=1)
 
         return scores, lengths, is_greedy
-
-    def _loglikelihood(self, texts, score_spans=None):
-        all_scores = mx.zeros(len(texts))
-        all_is_greedy = mx.zeros(len(texts), dtype=mx.bool_)
-        for i in tqdm(range(0, len(texts), self._batch_size)):
-            batch = texts[i : i + self._batch_size]
-            scores, lengths, is_greedy = self._score_fn(batch)
-
-            ind = np.arange(scores.shape[-1])
-            if score_spans is not None:
-                spans = score_spans[i : i + self._batch_size]
-                lengths = [end - start for start, end in spans]
-                masks = mx.array(
-                    np.array([(ind >= start) & (ind < end) for start, end in spans])
-                )
-            else:
-                masks = ind[None] < lengths[:, None]
-
-            scores = (masks * scores).sum(axis=-1)
-            is_greedy = (masks * is_greedy).sum(axis=-1)
-
-            all_scores[i : i + self._batch_size] = scores
-            all_is_greedy[i : i + self._batch_size] = is_greedy == lengths
-
-        return all_scores, all_is_greedy
 
     def _tokenize(self, texts):
         return [
@@ -163,39 +154,65 @@ class MLXLM(LM):
         """
         logging.info("Estimating loglikelihood for %d pairs." % len(requests))
 
-        # tokenize prefix and prefix + completion for all requests.
-        tokenized = self._tokenize(
-            [t for r in requests for t in [r.args[0], r.args[0] + r.args[1]]]
-        )
+        group = mx.distributed.init()
 
-        # max length (prefix + completion) and longest common prefix per question.
-        length_stats = {}
-        for prefix, completed in zip(tokenized[0::2], tokenized[1::2]):
-            max_completed_l, min_prefix_l = length_stats.get(prefix, (0, 1e8))
-            length_stats[prefix] = (
-                max(max_completed_l, len(completed)),
-                min(min_prefix_l, _len_longest_common_prefix(prefix, completed)),
-            )
+        # Group by common prefix
+        group_reqs = collections.defaultdict(list)
+        for idx, req in enumerate(requests):
+            group_reqs[req.args[0]].append((idx, req.args[1]))
+        questions = list(group_reqs.keys())
+        responses = []
+        indices = []
+        for v in group_reqs.values():
+            idx, resp = zip(*v)
+            indices.extend(idx)
+            responses.append(resp)
 
-        # truncate requests for completed sequences longer than model context.
-        shortened = []
-        completion_spans = []
+        # split data accross ranks
+        questions = questions[group.rank() :: group.size()]
+        responses = responses[group.rank() :: group.size()]
+
         long_completions = 0
-        for prefix, completed in zip(tokenized[0::2], tokenized[1::2]):
-            max_completed_l, prefix_l = length_stats[prefix]
+        scores, is_greedy = [], []
+        for q, rs in tqdm(zip(questions, responses), total=len(questions)):
+            prefix = self._tokenize([q])[0]
+            full_sequences = self._tokenize([q + r for r in rs])
+            max_completed_l = max(len(s) for s in full_sequences)
+
             # compute truncation length
             truncation = max(0, max_completed_l - self._max_tokens - 1)
-            prefix_l = prefix_l - truncation
-            if prefix_l <= 0:
-                # completion too long, prefix is eliminated for some requests.
+            orig_prefix_l = len(prefix)
+            prefix_l = max(len(prefix) - truncation, 0)
+            prefix = prefix[len(prefix) - prefix_l :]
+
+            # If the entire prompt got truncated ignore the question
+            if prefix_l == 0:
                 long_completions += 1
-                truncation = max(0, len(completed) - self._max_tokens - 1)
-                prefix_l = 1
-            # truncate the completed sequence
-            completed = completed[truncation:]
-            shortened.append(completed)
-            # scores do not include initial bos, substract 1 to span bounds
-            completion_spans.append((prefix_l - 1, len(completed) - 1))
+                all_scores.extend([-float("inf")] * len(rs))
+                all_is_greedy.extend([False] * len(rs))
+                continue
+
+            # model scoring, returns num_requests x (logp, is_greedy, length).
+            logprobs, cache = self._process_prompt(prefix)
+            max_idx = mx.argmax(logprobs).item()
+
+            for s in full_sequences:
+                inputs = s[len(prefix) :]
+                # The logprobs from the last token of the prompt are
+                # for the first input token
+                scores.append(logprobs[0, inputs[0]].item())
+                is_greedy.append((inputs[0] == max_idx))
+
+                if len(inputs) == 1:
+                    continue
+                score, _, ig = self._score_fn(
+                    mx.array(inputs)[None, :], cache=copy.deepcopy(cache)
+                )
+                scores[-1] += mx.sum(score).item()
+                is_greedy[-1] &= mx.all(ig).item()
+
+        scores = mx.array(scores)
+        is_greedy = mx.array(is_greedy)
 
         if long_completions > 0:
             logging.info(
@@ -203,24 +220,7 @@ class MLXLM(LM):
                 + "completion longer than context."
             )
 
-        num_results = len(shortened)
-
-        # sort by length to get batches with little padding.
-        sorted_indices = sorted(range(len(shortened)), key=lambda i: -len(shortened[i]))
-        shortened = [shortened[i] for i in sorted_indices]
-        completion_spans = [completion_spans[i] for i in sorted_indices]
-
-        group = mx.distributed.init()
-
-        # split strided so we have approximately the same lengths on each node
-        shortened = shortened[group.rank() :: group.size()]
-        completion_spans = completion_spans[group.rank() :: group.size()]
-
-        # model scoring, returns num_requests x (logp, is_greedy, length).
-        scores, is_greedy = self._loglikelihood(
-            shortened,
-            score_spans=completion_spans,
-        )
+        num_results = len(requests)
 
         # all gather the results across groups
         if group.size() > 1:
@@ -233,13 +233,10 @@ class MLXLM(LM):
             scores = scores.T.reshape(-1)
             is_greedy = is_greedy.T.reshape(-1)
 
-        scores = np.array(scores[:num_results])
-        is_greedy = np.array(is_greedy[:num_results])
-
-        results = [(score, ig) for score, ig in zip(scores, is_greedy)]
-        inv_sort = np.argsort(sorted_indices)
-        results = [results[inv_sort[i]] for i in range(len(inv_sort))]
-        return results
+        inv_sort = mx.argsort(mx.array(indices))
+        scores = scores[:num_results][inv_sort]
+        is_greedy = is_greedy[:num_results][inv_sort]
+        return list(zip(scores.tolist(), is_greedy.tolist()))
 
     def loglikelihood_rolling(self, requests) -> list[float]:
         """Compute full log-likelihood of a string, with no truncation, for perplexity computation
@@ -277,8 +274,14 @@ class MLXLM(LM):
             "Estimating loglikelihood rolling for %d sequences." % len(requests)
         )
         inputs = self._tokenize([req.args[0] for req in requests])
-        scores, _ = self._loglikelihood(inputs)
-        return scores.tolist()
+        all_scores = []
+        for i in tqdm(range(0, len(texts), self._batch_size)):
+            batch = texts[i : i + self._batch_size]
+            scores, lengths, _ = self._score_fn(batch)
+            mask = mx.arange(scores.shape[-1]) < lengths[:, None]
+            all_scores.extend((mask * scores).sum(axis=-1).tolist())
+
+        return all_scores
 
     def generate_until(self, requests) -> list[str]:
         """Generate greedily until a stopping sequence
@@ -333,7 +336,7 @@ def main():
         "--output-dir", default=".", help="Output directory for result files."
     )
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    parser.add_argument("--num-shots", type=int, default=0, help="Number of shots")
+    parser.add_argument("--num-shots", type=int, default=None, help="Number of shots")
     parser.add_argument(
         "--max-tokens",
         type=int,
@@ -361,6 +364,14 @@ def main():
         "otherwise `False`.",
         default=None,
     )
+    parser.add_argument(
+        "--chat-template-args",
+        type=json.loads,
+        help="""A JSON formatted string of arguments for the tokenizer's "
+        "apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        default="{}",
+    )
+
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -373,10 +384,11 @@ def main():
 
     lm = MLXLM(
         args.model,
-        batch_size=args.batch_size,
         max_tokens=args.max_tokens,
         use_chat_template=args.apply_chat_template,
     )
+    MLXLM.apply_chat_template = chat_template_fn(**args.chat_template_args)
+
     results = lm_eval.simple_evaluate(
         model=lm,
         tasks=args.tasks,
@@ -390,10 +402,11 @@ def main():
         fewshot_random_seed=args.seed,
     )
 
-    model_name = args.model.replace("/", "_")
-    task_names = "_".join(args.tasks)
-    ver = version("lm_eval")
-    filename = f"eval_{model_name}_{task_names}_{args.num_shots:02d}_v_{ver}.json"
+    file_keys = ["eval", args.model.replace("/", "_"), version("lm_eval")]
+    if args.num_shots is not None:
+        file_keys += [f"{args.num_shots:02d}"]
+    file_keys += args.tasks
+    filename = "_".join(file_keys)
     if mx.distributed.init().rank() == 0:
         output_path = output_dir / filename
         output_path.write_text(json.dumps(results["results"], indent=4))

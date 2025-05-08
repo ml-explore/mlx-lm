@@ -14,8 +14,8 @@ import numpy as np
 import yaml
 
 from .tokenizer_utils import TokenizerWrapper
-from .tuner.datasets import load_dataset
 from .tuner.orpo_trainer import ORPOTrainingArgs, evaluate_orpo, train_orpo
+from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -212,7 +212,6 @@ def build_parser():
 def train_model(
     args,
     model: nn.Module,
-    tokenizer: TokenizerWrapper,
     train_set,
     valid_set,
     training_callback: TrainingCallback = None,
@@ -269,7 +268,6 @@ def train_model(
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
-    # Train model based on training mode
     if args.training_mode == "orpo":
         training_args = ORPOTrainingArgs(
             batch_size=args.batch_size,
@@ -307,7 +305,6 @@ def train_model(
             grad_checkpoint=args.grad_checkpoint,
         )
 
-        # Train model using SFT
         train(
             model=model,
             tokenizer=tokenizer,
@@ -370,13 +367,13 @@ def run(args, training_callback: TrainingCallback = None):
 
     elif args.train:
         print("Training")
-        train_model(args, model, tokenizer, train_set, valid_set, training_callback)
+        train_model(args, model, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
         print("Testing")
-        evaluate_model(args, model, tokenizer, test_set)
+        evaluate_model(args, model, test_set)
 
 
 def main():
