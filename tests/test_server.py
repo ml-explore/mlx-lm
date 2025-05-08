@@ -293,5 +293,180 @@ class TestServerWithDraftModel(unittest.TestCase):
         self.assertIsNotNone(second_response_body["choices"][0]["message"]["content"])
 
 
+# --- Tests for get_prompt_cache ---
+
+from unittest.mock import MagicMock, patch
+
+from mlx_lm.server import PromptCache
+
+
+class TestGetPromptCache(unittest.TestCase):
+
+    def setUp(self):
+        """Set up mocks and a handler instance for each test."""
+        self.mock_model_provider = MagicMock()
+        # Simulate tokenizer needed for decoding in original debug logs (though not strictly needed for cache logic)
+        self.mock_model_provider.tokenizer = MagicMock()
+        self.mock_model_provider.tokenizer.decode = lambda x: f"decoded({x})"
+        self.mock_model_provider.model_key = ("model_v1", None, None)
+        self.mock_model_provider.draft_model = None  # Start without draft model
+
+        # --- Prevent BaseHTTPRequestHandler.__init__ from running ---
+        # It tries to handle a request immediately, which fails with mocks.
+        # We only need the APIHandler instance with its attributes set.
+        with patch(
+            "http.server.BaseHTTPRequestHandler.__init__", lambda *args, **kwargs: None
+        ):
+            # APIHandler init still requires args for BaseHTTPRequestHandler signature,
+            # but they won't be used by the patched __init__.
+            mock_request = MagicMock()
+            mock_client_address = ("127.0.0.1", 8080)
+            mock_server = MagicMock()
+
+            self.prompt_cache_instance = PromptCache()
+            self.handler = APIHandler(
+                self.mock_model_provider,
+                mock_request,
+                mock_client_address,
+                mock_server,
+                prompt_cache=self.prompt_cache_instance,  # Inject our cache instance
+            )
+            # Manually set attributes usually set by APIHandler.__init__ if needed
+            # self.handler.created = MagicMock()
+            # self.handler.system_fingerprint = MagicMock()
+            # (Not strictly necessary for get_prompt_cache testing)
+
+    @patch("mlx_lm.server.make_prompt_cache")
+    def test_initial_request_empty_cache(self, mock_make_cache):
+        """Test first request when the cache is empty."""
+        mock_make_cache.return_value = "new_cache_obj"
+        prompt = [1, 2, 3]
+
+        processed_prompt = self.handler.get_prompt_cache(prompt)
+
+        self.assertEqual(processed_prompt, [1, 2, 3])
+        self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3])
+        self.assertEqual(self.handler.prompt_cache.cache, "new_cache_obj")
+        self.assertEqual(self.handler.prompt_cache.model_key, ("model_v1", None, None))
+        mock_make_cache.assert_called_once()
+
+    def test_identical_request_full_hit(self):
+        """Test when the new prompt is identical to the cached one."""
+        self.handler.prompt_cache.tokens = [1, 2, 3]
+        self.handler.prompt_cache.model_key = ("model_v1", None, None)
+        self.handler.prompt_cache.cache = "existing_cache_obj"
+        prompt = [1, 2, 3]
+
+        # Mock common_prefix_len to return the full length
+        with patch("mlx_lm.server.common_prefix_len", return_value=3):
+            processed_prompt = self.handler.get_prompt_cache(prompt)
+
+        # Should process nothing, cache remains unchanged
+        self.assertEqual(processed_prompt, [])
+        self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3])
+        self.assertEqual(self.handler.prompt_cache.cache, "existing_cache_obj")
+
+    def test_cache_is_prefix(self):
+        """Test when the cached prompt is a prefix of the new prompt."""
+        self.handler.prompt_cache.tokens = [1, 2, 3]
+        self.handler.prompt_cache.model_key = ("model_v1", None, None)
+        self.handler.prompt_cache.cache = "existing_cache_obj"
+        prompt = [1, 2, 3, 4, 5]
+
+        with patch("mlx_lm.server.common_prefix_len", return_value=3):
+            processed_prompt = self.handler.get_prompt_cache(prompt)
+
+        # Should process the suffix, cache tokens updated
+        self.assertEqual(processed_prompt, [4, 5])
+        self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3, 4, 5])
+        self.assertEqual(self.handler.prompt_cache.cache, "existing_cache_obj")
+
+    @patch("mlx_lm.server.trim_prompt_cache")
+    @patch("mlx_lm.server.can_trim_prompt_cache", return_value=True)
+    def test_partial_match_trim_success(self, mock_can_trim, mock_trim_cache):
+        """Test partial match where cache is longer and trimming succeeds."""
+        self.handler.prompt_cache.tokens = [1, 2, 3, 4, 5]
+        self.handler.prompt_cache.model_key = ("model_v1", None, None)
+        self.handler.prompt_cache.cache = "existing_cache_obj"
+        prompt = [1, 2, 3, 6, 7]  # Diverges after token 3
+
+        with patch("mlx_lm.server.common_prefix_len", return_value=3):
+            processed_prompt = self.handler.get_prompt_cache(prompt)
+
+        # Should process the new suffix, cache trimmed and updated
+        self.assertEqual(processed_prompt, [6, 7])
+        self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3, 6, 7])
+        mock_can_trim.assert_called_once_with("existing_cache_obj")
+        # Called with cache object and num_to_trim (5 - 3 = 2)
+        mock_trim_cache.assert_called_once_with("existing_cache_obj", 2)
+        self.assertEqual(
+            self.handler.prompt_cache.cache, "existing_cache_obj"
+        )  # Cache obj itself isn't changed by mock
+
+    @patch("mlx_lm.server.make_prompt_cache")
+    @patch("mlx_lm.server.trim_prompt_cache")
+    @patch("mlx_lm.server.can_trim_prompt_cache", return_value=False)
+    def test_partial_match_trim_fail(
+        self, mock_can_trim, mock_trim_cache, mock_make_cache
+    ):
+        """Test partial match where cache is longer but trimming fails."""
+        mock_make_cache.return_value = "new_cache_obj_on_reset"
+        self.handler.prompt_cache.tokens = [1, 2, 3, 4, 5]
+        self.handler.prompt_cache.model_key = ("model_v1", None, None)
+        self.handler.prompt_cache.cache = "existing_cache_obj"
+        prompt = [1, 2, 3, 6, 7]  # Diverges after token 3
+
+        with patch("mlx_lm.server.common_prefix_len", return_value=3):
+            processed_prompt = self.handler.get_prompt_cache(prompt)
+
+        # Should process the full prompt, cache reset
+        self.assertEqual(processed_prompt, [1, 2, 3, 6, 7])
+        self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3, 6, 7])
+        mock_can_trim.assert_called_once_with("existing_cache_obj")
+        mock_trim_cache.assert_not_called()
+        mock_make_cache.assert_called_once()  # Cache was reset
+        self.assertEqual(self.handler.prompt_cache.cache, "new_cache_obj_on_reset")
+
+    @patch("mlx_lm.server.make_prompt_cache")
+    def test_no_common_prefix(self, mock_make_cache):
+        """Test when there is no common prefix between cache and prompt."""
+        mock_make_cache.return_value = "new_cache_obj"
+        self.handler.prompt_cache.tokens = [1, 2, 3]
+        self.handler.prompt_cache.model_key = ("model_v1", None, None)
+        self.handler.prompt_cache.cache = "existing_cache_obj"
+        prompt = [4, 5, 6]
+
+        with patch("mlx_lm.server.common_prefix_len", return_value=0):
+            processed_prompt = self.handler.get_prompt_cache(prompt)
+
+        # Should process the full prompt, cache reset
+        self.assertEqual(processed_prompt, [4, 5, 6])
+        self.assertEqual(self.handler.prompt_cache.tokens, [4, 5, 6])
+        mock_make_cache.assert_called_once()
+        self.assertEqual(self.handler.prompt_cache.cache, "new_cache_obj")
+
+    @patch("mlx_lm.server.make_prompt_cache")
+    def test_model_changed(self, mock_make_cache):
+        """Test cache reset when the model key changes."""
+        mock_make_cache.return_value = "new_cache_obj_model_change"
+        self.handler.prompt_cache.tokens = [1, 2, 3]
+        self.handler.prompt_cache.model_key = ("model_v1", None, None)  # Original key
+        self.handler.prompt_cache.cache = "existing_cache_obj"
+
+        # Simulate model provider having a new key
+        self.mock_model_provider.model_key = ("model_v2", None, None)
+        prompt = [1, 2, 3, 4]
+
+        # No need to mock common_prefix_len, model check happens first
+        processed_prompt = self.handler.get_prompt_cache(prompt)
+
+        # Should process the full prompt, cache reset
+        self.assertEqual(processed_prompt, [1, 2, 3, 4])
+        self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3, 4])
+        mock_make_cache.assert_called_once()
+        self.assertEqual(self.handler.prompt_cache.cache, "new_cache_obj_model_change")
+        self.assertEqual(self.handler.prompt_cache.model_key, ("model_v2", None, None))
+
+
 if __name__ == "__main__":
     unittest.main()
