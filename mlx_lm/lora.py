@@ -285,7 +285,6 @@ def train_model(
 
         train_orpo(
             model=model,
-            tokenizer=tokenizer,
             optimizer=opt,
             train_dataset=train_set,
             val_dataset=valid_set,
@@ -307,7 +306,6 @@ def train_model(
 
         train(
             model=model,
-            tokenizer=tokenizer,
             args=training_args,
             optimizer=opt,
             train_dataset=train_set,

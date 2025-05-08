@@ -29,35 +29,33 @@ def orpo_loss(
     chosen_masks,
     rejected_masks,
     preference_scores,
-    beta: float = 0.1
+    beta: float = 0.1,
 ):
-    def get_logps(model, x, mask):
-        inputs = x[:, :-1]
-        targets = x[:, 1:]
+    def get_logps(model, tokens, mask):
+        inputs = tokens[:, :-1]
+        targets = tokens[:, 1:]
         logits = model(inputs)
-        logp = -nn.losses.cross_entropy(logits, targets, reduction="none")
-        seq_lengths = mask[:, :-1].sum(-1)
-        logp_sum = (logp * mask[:, :-1]).sum(-1) / seq_lengths
-        logits_mean = (logits * mask[:, :-1, None]).sum() / mask[:, :-1].sum()
-        return logp_sum, logits_mean
+        log_probs = -nn.losses.cross_entropy(logits, targets, reduction="none")
+        mask = mask[:, :-1]
+        seq_lengths = mask.sum(-1)
+        logp_seq_avg = (log_probs * mask).sum(-1) / seq_lengths
+        logits_mean = logits.sum() / mask.sum()
+        return logp_seq_avg, logits_mean
 
-    policy_chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
-    policy_rejected_logps, rejected_logits_mean = get_logps(
-        model, rejected, rejected_masks
-    )
+    chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
+    rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
 
-    policy_chosen_logps = policy_chosen_logps * preference_scores
+    # Apply preference weighting
+    chosen_logps = chosen_logps * preference_scores
 
-    log_odds = (policy_chosen_logps - policy_rejected_logps) - (
-        mx.log1p(-mx.exp(policy_chosen_logps))
-        - mx.log1p(-mx.exp(policy_rejected_logps))
-    )
-
+    # Stable log-odds computation
+    log_odds = chosen_logps - rejected_logps
     ratio = nn.log_sigmoid(log_odds)
     loss = -beta * ratio
 
-    chosen_reward = beta * policy_chosen_logps
-    rejected_reward = beta * policy_rejected_logps
+    # Reward estimation
+    chosen_reward = beta * chosen_logps
+    rejected_reward = beta * rejected_logps
     reward = mx.stack([mx.mean(chosen_reward), mx.mean(rejected_reward)])
 
     num_tokens = chosen_masks.sum() + rejected_masks.sum()
@@ -65,10 +63,10 @@ def orpo_loss(
     metrics = {
         "accuracies": mx.mean((chosen_reward > rejected_reward).astype(mx.float32)),
         "margins": mx.mean(chosen_reward - rejected_reward),
-        "policy_rejected_logps": mx.mean(policy_rejected_logps),
-        "policy_chosen_logps": mx.mean(policy_chosen_logps),
-        "rejected_logits_mean": mx.mean(rejected_logits_mean),
-        "chosen_logits_mean": mx.mean(chosen_logits_mean),
+        "policy_chosen_logps": mx.mean(chosen_logps),
+        "policy_rejected_logps": mx.mean(rejected_logps),
+        "chosen_logits_mean": chosen_logits_mean,
+        "rejected_logits_mean": rejected_logits_mean,
     }
 
     mx.clear_cache()
@@ -202,7 +200,6 @@ def evaluate_orpo(
 
 def train_orpo(
     model,
-    tokenizer,
     optimizer,
     train_dataset,
     val_dataset,
@@ -255,7 +252,6 @@ def train_orpo(
 
     loss_value_and_grad = nn.value_and_grad(model, loss_wrapper)
 
-    # Training loop with progress tracking
     losses = 0
     rewards = mx.zeros((2,))
     n_tokens = 0
@@ -345,7 +341,7 @@ def train_orpo(
             it_sec = args.steps_per_report / (stop - start)
             tokens_sec = float(n_tokens) / (stop - start)
             trained_tokens += n_tokens
-            peak_mem = mx.metal.get_peak_memory() / 1e9
+            peak_mem = mx.get_peak_memory() / 1e9
 
             if rank == 0:
                 print(
