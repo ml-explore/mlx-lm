@@ -12,7 +12,7 @@ import numpy as np
 import yaml
 
 from .tuner.callbacks import WandBCallback
-from .tuner.datasets import load_dataset
+from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -264,8 +264,8 @@ def train_model(
         model=model,
         args=training_args,
         optimizer=opt,
-        train_dataset=train_set,
-        val_dataset=valid_set,
+        train_dataset=CacheDataset(train_set),
+        val_dataset=CacheDataset(valid_set),
         training_callback=training_callback,
     )
 
@@ -273,7 +273,7 @@ def train_model(
 def evaluate_model(args, model: nn.Module, test_set):
     test_loss = evaluate(
         model=model,
-        dataset=test_set,
+        dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,

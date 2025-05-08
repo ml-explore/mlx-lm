@@ -3,11 +3,12 @@
 import argparse
 import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict
+from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
-from datasets import load_dataset
 from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 from tqdm import tqdm
 
@@ -258,7 +259,10 @@ def apply_scale(prev_op, layers, scales):
         for layer in layers:
             layer.weight = layer.weight * scales
     elif prev_op.__class__.__name__ == "RMSNorm":  # For gemma models
-        prev_op.weight = (1.0 + prev_op.weight) / scales - 1.0
+        dt = prev_op.weight.dtype
+        prev_op.weight = (
+            (1.0 + prev_op.weight.astype(mx.float32)) / scales - 1.0
+        ).astype(dt)
         for layer in layers:
             layer.weight = layer.weight * scales
     else:
@@ -307,7 +311,7 @@ def search_best_clip(
     n_grid: int,
     max_shrink: float = 0.5,
     batch_size: int = 64,
-    n_frames: int = 4096,
+    n_frames: int = 512,
 ):
     group = mx.distributed.init()
 
@@ -322,7 +326,6 @@ def search_best_clip(
     w_init_shape = w.shape
     w_all = mx.flatten(w, 0, w.ndim - 2)
     w_max_all = []
-    w_min_all = []
 
     # batch across W to save memory
     for b in range(0, w_all.shape[0], batch_size):
@@ -331,19 +334,18 @@ def search_best_clip(
         group_shape = (w.shape[0], w.shape[-1] // group_size)
         best_error = mx.full(group_shape, float("inf"))
         best_w_max = mx.zeros((*group_shape, 1), dtype=x.dtype)
-        best_w_min = mx.zeros((*group_shape, 1), dtype=x.dtype)
 
         w_shape = w.shape
 
         w = w.reshape(*w.shape[:-1], -1, group_size)
         out = mx.einsum("bdg,odg->bod", x, w)
+        init_max = w.abs().max(axis=-1, keepdims=True)
 
         # try a range of clips and pick the one with the smallest loss
         for i in range(int(max_shrink * n_grid)):
             p = 1 - i / n_grid
-            w_max = p * w.max(axis=-1, keepdims=True)
-            w_min = p * w.min(axis=-1, keepdims=True)
-            w_m = mx.clip(w, w_min, w_max).reshape(w_shape)
+            w_max = p * init_max
+            w_m = mx.clip(w, -w_max, w_max).reshape(w_shape)
 
             w_q = quantize_func(w_m)
 
@@ -351,24 +353,21 @@ def search_best_clip(
             out_q = mx.einsum("bdg,odg->bod", x, w_q)
 
             # Take the mean across the input batch
-            loss = mse(out, out_q).sum(axis=(0, 1))
+            loss = mse(out, out_q).sum(axis=0)
             if group is not None:
                 loss = mx.distributed.all_sum(loss) / group.size()
-            loss /= out.shape[0] * out.shape[1]
+            loss /= out.shape[0]
             best_indices = loss < best_error
             best_error = mx.where(best_indices, loss, best_error)
             best_w_max = mx.where(best_indices[..., mx.newaxis], w_max, best_w_max)
-            best_w_min = mx.where(best_indices[..., mx.newaxis], w_min, best_w_min)
-            mx.eval(best_w_max, best_w_min, best_error)
+            mx.eval(best_w_max, best_error)
 
         w_max_all.append(best_w_max)
-        w_min_all.append(best_w_min)
 
     best_w_max = mx.concatenate(w_max_all, axis=0)
-    best_w_min = mx.concatenate(w_min_all, axis=0)
 
     w_r = w_all.reshape(*w_all.shape[:-1], -1, group_size)
-    best_w = mx.clip(w_r, best_w_min, best_w_max)
+    best_w = mx.clip(w_r, -best_w_max, best_w_max)
     best_w = best_w.reshape(w_init_shape)
 
     mx.eval(best_w)
@@ -467,7 +466,7 @@ def awq_quantize(
             before_loss = mx.distributed.all_sum(before_loss) / group.size()
         before_loss /= outputs.size
         block.update_modules(orig_leaves)
-        del orig_leaves
+        orig_params = block.parameters()
 
         scale_block(
             block=block,
@@ -493,6 +492,12 @@ def awq_quantize(
             after_loss = mx.distributed.all_sum(after_loss) / group.size()
         after_loss /= outputs.size
         tqdm.write(f"Loss reduction: {after_loss / before_loss}")
+        if after_loss > before_loss:
+            # Reload original weights and quantize
+            block.update_modules(orig_leaves)
+            block.update(orig_params)
+            nn.quantize(block, group_size=group_size, bits=bits)
+            tqdm.write("Loss is not reduced, falling back to original weights.")
 
         inputs = outputs
 
@@ -505,18 +510,21 @@ def awq_quantize(
         )
 
 
-def load_wikitext(
-    tokenizer, num_samples: int = 32, sequence_length: int = 2048, split: str = "train"
-) -> mx.array:
-    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
-    texts = "\n\n".join(dataset["text"])
+def load_dataset(tokenizer, num_samples: int, sequence_length: int) -> mx.array:
+    save_dir = Path.home() / ".cache/mlx-lm/calibration_v5.txt"
+    if not save_dir.exists():
+        save_dir.parent.mkdir(parents=True, exist_ok=True)
+        url = "https://gist.githubusercontent.com/tristandruyen/9e207a95c7d75ddf37525d353e00659c/raw/571fda718462de863e5a0171078c175420c7649a/calibration_data_v5_rc.txt"
+        request.urlretrieve(url, save_dir)
+    with open(save_dir) as fid:
+        texts = fid.read()
     tokens = tokenizer.encode(texts, return_tensors="mlx")[0]
 
-    # Select random chunks
-    starts = mx.random.randint(
-        0, len(tokens) - sequence_length - 1, shape=(num_samples, 1)
-    )
-    return tokens[starts + mx.arange(sequence_length)]
+    # select random non-overlapping chunks
+    tokens = tokens[: (tokens.size // sequence_length) * sequence_length]
+    tokens = tokens.reshape(-1, sequence_length)
+    segments = mx.random.permutation(tokens.shape[0])[:num_samples]
+    return tokens[segments]
 
 
 def update_config(
@@ -549,9 +557,9 @@ def main():
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--embed-bits", type=int, default=4)
     parser.add_argument("--embed-group-size", type=int, default=32)
-    parser.add_argument("--num-samples", type=int, default=32)
-    parser.add_argument("--sequence-length", type=int, default=2048)
-    parser.add_argument("--n-grid", type=int, default=10)
+    parser.add_argument("--num-samples", type=int, default=128)
+    parser.add_argument("--sequence-length", type=int, default=512)
+    parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
 
@@ -570,7 +578,7 @@ def main():
     if (awq_config := AWQ_MODEL_CONFIGS.get(model_type, None)) is None:
         raise NotImplementedError(f"AWQ support for {model_type} models NYI.")
 
-    calibration_data = load_wikitext(tokenizer, args.num_samples, args.sequence_length)
+    calibration_data = load_dataset(tokenizer, args.num_samples, args.sequence_length)
 
     calibration_data = dist_split(calibration_data, group)
 

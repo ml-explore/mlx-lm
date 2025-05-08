@@ -217,9 +217,6 @@ def train(
 
         return lvalue, toks
 
-    train_dataset = CacheDataset(train_dataset)
-    val_dataset = CacheDataset(val_dataset)
-
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
     model.train()
