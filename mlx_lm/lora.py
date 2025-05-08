@@ -14,8 +14,8 @@ import numpy as np
 import yaml
 
 from .tokenizer_utils import TokenizerWrapper
-from .tuner.datasets import load_dataset
 from .tuner.dpo_trainer import DPOTrainingArgs, evaluate_dpo, train_dpo
+from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -224,7 +224,6 @@ def build_parser():
 def train_model(
     args,
     model: nn.Module,
-    tokenizer: TokenizerWrapper,
     train_set,
     valid_set,
     training_callback: TrainingCallback = None,
@@ -397,13 +396,13 @@ def run(args, training_callback: TrainingCallback = None):
 
     elif args.train:
         print("Training")
-        train_model(args, model, tokenizer, train_set, valid_set, training_callback)
+        train_model(args, model, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
         print("Testing")
-        evaluate_model(args, model, tokenizer, test_set)
+        evaluate_model(args, model, test_set)
 
 
 def main():

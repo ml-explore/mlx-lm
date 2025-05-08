@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -504,3 +505,52 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
+
+
+def save(
+    dst_path: Union[str, Path],
+    src_path: Union[str, Path],
+    weights: Dict[str, mx.array],
+    tokenizer: TokenizerWrapper,
+    config: Dict[str, Any],
+    hf_repo: Optional[str] = None,
+    donate_weights: bool = True,
+):
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    save_weights(dst_path, weights, donate_weights=True)
+    save_config(config, config_path=dst_path / "config.json")
+    tokenizer.save_pretrained(dst_path)
+
+    for p in ["*.py", "generation_config.json"]:
+        for file in glob.glob(str(src_path / p)):
+            shutil.copy(file, dst_path)
+
+    if hf_repo is not None:
+        create_model_card(dst_path, hf_repo)
+
+
+def common_prefix_len(list1, list2):
+    """
+    Calculates the length of the common prefix of two lists.
+
+    Args:
+        list1: The first list of strings.
+        list2: The second list of strings.
+
+    Returns:
+        The length of the common prefix. Returns 0 if lists are empty
+        or do not match at the first element.
+    """
+    # Determine the maximum possible length of the common prefix
+    min_len = min(len(list1), len(list2))
+
+    # Iterate up to the length of the shorter list
+    for i in range(min_len):
+        if list1[i] != list2[i]:
+            # Mismatch found, the common prefix length is the current index
+            return i
+
+    # No mismatch found within the bounds of the shorter list,
+    # so the common prefix length is the length of the shorter list.
+    return min_len
