@@ -335,7 +335,7 @@ def train_model(
         )
 
 
-def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set):
+def evaluate_model(args, model: nn.Module, test_set):
     model.eval()
 
     if args.training_mode == "dpo":
