@@ -34,6 +34,9 @@ class GRPOTrainingArgs(TrainingArgs):
     epsilon: float = field(
         default=1e-4, metadata={"help": "The Epsilon for numerical stability."}
     )
+    epsilon_high: float = field(
+        default=None, metadata={"help": "Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound specified in argument epsilon."}
+    )
     max_completion_length: int = field(
         default=512, metadata={"help": "Number of Generations."}
     )
@@ -158,6 +161,7 @@ def grpo_loss(
     beta: float = 0.1,
     group_size: int = 4,
     epsilon: float = 1e-4,
+    epsilon_high: float = None,
     max_tokens: int = 64,
     temperature: float = 0.8,
     reward_weights: Optional[List[float]] = None,
@@ -324,7 +328,7 @@ def grpo_loss(
             ]
             for j, idx in enumerate(indices):
                 advantages[idx] = (prompt_rewards[j] - mean_reward) / (
-                    std_reward + epsilon
+                    std_reward + 1e-4
                 )
         else:
             idx = batch_indices.index(unique_prompt_indices[i])
@@ -346,7 +350,16 @@ def grpo_loss(
     )
 
     # Apply PPO like clipping
-    policy_ratio_cliped = mx.clip(policy_ratio, 1 - epsilon, 1 + epsilon)
+    epsilon_high = epsilon_high if epsilon_high else epsilon
+    policy_ratio_cliped = mx.clip(policy_ratio, 1 - epsilon, 1 + epsilon_high)
+
+    # Track clipping metrics
+    is_low_clipped = (policy_ratio < 1 - epsilon) & (advantages.reshape(-1, 1) < 0)
+    is_high_clipped = (policy_ratio > 1 + epsilon_high) & (
+        advantages.reshape(-1, 1) > 0
+    )
+    is_region_clipped = is_low_clipped | is_high_clipped
+
 
     # Calculate both unclipped and clipped objectives
     unclipped_obj = policy_ratio * advantages.reshape(-1, 1)
@@ -403,6 +416,21 @@ def grpo_loss(
         "grouped_rewards_std": mx.mean(grouped_rewards_std),
         "kl": mean_kl,
         "average_generated_tokens": len(all_completion_texts) // len(batch_indices),
+        "clip_ratio_low": (
+            (is_low_clipped * length_mask).sum() / length_mask.sum()
+            if length_mask.sum() > 0
+            else mx.zeros(1)
+        ),
+        "clip_ratio_high": (
+            (is_high_clipped * length_mask).sum() / length_mask.sum()
+            if length_mask.sum() > 0
+            else mx.zeros(1)
+        ),
+        "clip_ratio_total": (
+            (is_region_clipped * length_mask).sum() / length_mask.sum()
+            if length_mask.sum() > 0
+            else mx.zeros(1)
+        ),
         **reward_metrics,
     }
 
@@ -496,6 +524,7 @@ def evaluate_grpo(
     num_batches,
     beta: float,
     epsilon: float,
+    epsilon_high: float,
     group_size: int,
     max_seq_length: int,
     max_tokens: int,
@@ -532,6 +561,7 @@ def evaluate_grpo(
             beta=beta,
             group_size=group_size,
             epsilon=epsilon,
+            epsilon_high=epsilon_high,
             ref_model=ref_model,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -616,6 +646,7 @@ def train_grpo(
             beta=args.beta,
             group_size=args.group_size,
             epsilon=args.epsilon,
+            epsilon_high=args.epsilon_high,
             ref_model=ref_model,
         )
 
@@ -636,7 +667,10 @@ def train_grpo(
         "grouped_rewards_mean": 0,
         "grouped_rewards_std": 0,
         "kl": 0,
-        'average_generated_tokens': 0
+        'average_generated_tokens': 0,
+        "clip_ratio_low": 0,
+        "clip_ratio_high": 0,
+        "clip_ratio_total": 0,
     }
     for reward_func in reward_funcs:
         func_name = reward_func.__name__
@@ -670,6 +704,7 @@ def train_grpo(
                 max_tokens=args.max_completion_length,
                 beta=args.beta,
                 epsilon=args.epsilon,
+                epsilon_high=args.epsilon_high,
                 temperature=args.temperature,
                 iterate_batches=iterate_batches,
             )
