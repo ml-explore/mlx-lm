@@ -305,7 +305,6 @@ def train_model(
         train_dpo(
             model=model,
             ref_model=reference_model.freeze(),
-            tokenizer=tokenizer,
             optimizer=opt,
             train_dataset=train_set,
             val_dataset=valid_set,
@@ -328,7 +327,6 @@ def train_model(
         # Train model
         train(
             model=model,
-            tokenizer=tokenizer,
             args=training_args,
             optimizer=opt,
             train_dataset=train_set,

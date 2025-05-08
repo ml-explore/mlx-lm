@@ -44,55 +44,37 @@ def dpo_loss(
     loss_type: str = "sigmoid",
     ref_model=None,
 ):
-    def make_predictions(model, x, mask):
-        inputs = x[:, :-1]
-        targets = x[:, 1:]
-
-        logits = model(inputs)
-        logits = logits.astype(mx.float32)
-
+    def get_token_scores(model, x, mask):
+        inputs, targets = x[:, :-1], x[:, 1:]
+        logits = model(inputs).astype(mx.float32)
         return -nn.losses.cross_entropy(logits, targets) * mask[:, :-1]
 
-    num_chosen_tokens = chosen_masks.sum(-1)
-    num_rejected_tokens = rejected_masks.sum(-1)
+    def compute_score(scores, mask, loss_type):
+        token_count = mask.sum(-1)
+        return scores.sum(-1) / token_count if loss_type == "ipo" else scores.sum(-1)
 
-    # Calculate log probabilities for policy model
-    policy_chosen_scores = make_predictions(model, chosen, chosen_masks)
-    policy_rejected_scores = make_predictions(model, rejected, rejected_masks)
-    if loss_type == "ipo":
-        # ipo uses average log probabilities
-        policy_chosen_score = policy_chosen_scores.sum(-1) / num_chosen_tokens
-        policy_rejected_score = policy_rejected_scores.sum(-1) / num_rejected_tokens
-    else:
-        policy_chosen_score = policy_chosen_scores.sum(-1)
-        policy_rejected_score = policy_rejected_scores.sum(-1)
+    # Compute scores for policy model
+    policy_chosen_scores = get_token_scores(model, chosen, chosen_masks)
+    policy_rejected_scores = get_token_scores(model, rejected, rejected_masks)
+    policy_chosen_score = compute_score(policy_chosen_scores, chosen_masks, loss_type)
+    policy_rejected_score = compute_score(policy_rejected_scores, rejected_masks, loss_type)
 
-    # Calculate log probabilities for reference model
+    # Compute scores for reference model
     if ref_model is None:
         reference_chosen_score = mx.zeros_like(policy_chosen_score)
         reference_rejected_score = mx.zeros_like(policy_rejected_score)
     else:
-        reference_chosen_scores = mx.stop_gradient(
-            make_predictions(ref_model, chosen, chosen_masks)
-        )
-        reference_rejected_scores = mx.stop_gradient(
-            make_predictions(ref_model, rejected, rejected_masks)
-        )
-        if loss_type == "ipo":
-            # ipo uses average log probabilities
-            reference_chosen_score = reference_chosen_scores.sum(-1) / num_chosen_tokens
-            reference_rejected_score = (
-                reference_rejected_scores.sum(-1) / num_rejected_tokens
-            )
-        else:
-            reference_chosen_score = reference_chosen_scores.sum(-1)
-            reference_rejected_score = reference_rejected_scores.sum(-1)
+        ref_chosen_scores = mx.stop_gradient(get_token_scores(ref_model, chosen, chosen_masks))
+        ref_rejected_scores = mx.stop_gradient(get_token_scores(ref_model, rejected, rejected_masks))
+        reference_chosen_score = compute_score(ref_chosen_scores, chosen_masks, loss_type)
+        reference_rejected_score = compute_score(ref_rejected_scores, rejected_masks, loss_type)
 
-    logits = (policy_chosen_score - policy_rejected_score) - (
-        reference_chosen_score - reference_rejected_score
-    )
+    # Preference logits
+    logits = (policy_chosen_score - policy_rejected_score) - \
+             (reference_chosen_score - reference_rejected_score)
 
-    if loss_type == "sigmoid":  # From the og paper
+    # Loss calculation
+    if loss_type == "sigmoid":
         losses = -nn.log_sigmoid(beta * logits)
     elif loss_type == "hinge":
         losses = nn.relu(1 - beta * logits)
@@ -107,12 +89,16 @@ def dpo_loss(
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
+    # Token counts and rewards
+    num_chosen_tokens = chosen_masks.sum(-1)
+    num_rejected_tokens = rejected_masks.sum(-1)
     num_tokens = (num_chosen_tokens + num_rejected_tokens).sum()
 
     chosen_reward = beta * mx.mean(policy_chosen_score - reference_chosen_score)
     rejected_reward = beta * mx.mean(policy_rejected_score - reference_rejected_score)
     reward = mx.stack([chosen_reward, rejected_reward])
 
+    # Metrics
     metrics = {
         "accuracies": mx.mean((chosen_reward > rejected_reward).astype(mx.float32)),
         "margins": mx.mean(chosen_reward - rejected_reward),
@@ -251,7 +237,6 @@ def evaluate_dpo(
 def train_dpo(
     model,
     ref_model,
-    tokenizer,
     optimizer,
     train_dataset,
     val_dataset,
