@@ -374,7 +374,7 @@ def train_dpo(
             it_sec = args.steps_per_report / (stop - start)
             tokens_sec = float(n_tokens) / (stop - start)
             trained_tokens += n_tokens
-            peak_mem = mx.metal.get_peak_memory() / 1e9
+            peak_mem = mx.get_peak_memory() / 1e9
 
             if rank == 0:
                 print(
