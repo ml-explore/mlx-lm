@@ -314,7 +314,7 @@ def train_model(
         )
 
 
-def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set):
+def evaluate_model(args, model: nn.Module, test_set):
     model.eval()
 
     if args.training_mode == "orpo":
@@ -338,7 +338,6 @@ def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set
         test_loss = evaluate(
             model=model,
             dataset=test_set,
-            tokenizer=tokenizer,
             batch_size=args.batch_size,
             num_batches=args.test_batches,
             max_seq_length=args.max_seq_length,
