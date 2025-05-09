@@ -3,11 +3,12 @@
 import argparse
 import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict
+from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
-from datasets import load_dataset
 from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 from tqdm import tqdm
 
@@ -509,18 +510,21 @@ def awq_quantize(
         )
 
 
-def load_wikitext(
-    tokenizer, num_samples: int = 32, sequence_length: int = 2048, split: str = "train"
-) -> mx.array:
-    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
-    texts = "\n\n".join(dataset["text"])
+def load_dataset(tokenizer, num_samples: int, sequence_length: int) -> mx.array:
+    save_dir = Path.home() / ".cache/mlx-lm/calibration_v5.txt"
+    if not save_dir.exists():
+        save_dir.parent.mkdir(parents=True, exist_ok=True)
+        url = "https://gist.githubusercontent.com/tristandruyen/9e207a95c7d75ddf37525d353e00659c/raw/571fda718462de863e5a0171078c175420c7649a/calibration_data_v5_rc.txt"
+        request.urlretrieve(url, save_dir)
+    with open(save_dir) as fid:
+        texts = fid.read()
     tokens = tokenizer.encode(texts, return_tensors="mlx")[0]
 
-    # Select random chunks
-    starts = mx.random.randint(
-        0, len(tokens) - sequence_length - 1, shape=(num_samples, 1)
-    )
-    return tokens[starts + mx.arange(sequence_length)]
+    # select random non-overlapping chunks
+    tokens = tokens[: (tokens.size // sequence_length) * sequence_length]
+    tokens = tokens.reshape(-1, sequence_length)
+    segments = mx.random.permutation(tokens.shape[0])[:num_samples]
+    return tokens[segments]
 
 
 def update_config(
@@ -574,7 +578,7 @@ def main():
     if (awq_config := AWQ_MODEL_CONFIGS.get(model_type, None)) is None:
         raise NotImplementedError(f"AWQ support for {model_type} models NYI.")
 
-    calibration_data = load_wikitext(tokenizer, args.num_samples, args.sequence_length)
+    calibration_data = load_dataset(tokenizer, args.num_samples, args.sequence_length)
 
     calibration_data = dist_split(calibration_data, group)
 
