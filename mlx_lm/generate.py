@@ -297,7 +297,7 @@ class SearchStrategy(ABC):
         prompt_cache: List[Any],
         quantize_cache_fn: Callable[[Any], None],
         total_prompt_tokens: int,
-    ) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    ) -> Generator[Tuple[int, mx.array], None, None]:
         """
         Generates a sequence of tokens from the model.
 
@@ -308,7 +308,7 @@ class SearchStrategy(ABC):
             total_prompt_tokens (int): The total number of tokens in the prompt.
 
         Yields:
-            Tuple[mx.array, mx.array]: A token and a vector of log probabilities.
+            Tuple[int, mx.array]: A token and a vector of log probabilities.
         """
         pass
 
@@ -328,7 +328,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     search_strategy: Optional[SearchStrategy] = None,
-) -> Generator[Tuple[mx.array, mx.array], None, None]:
+) -> Generator[Tuple[int, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
 
@@ -358,7 +358,7 @@ def generate_step(
             `LinearSearch`.
 
     Yields:
-        Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
+        Tuple[int, mx.array]: One token and a vector of log probabilities.
     """
 
     y = prompt
