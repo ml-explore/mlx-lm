@@ -76,6 +76,11 @@ You can specify the output location with `--adapter-path`.
 You can resume fine-tuning with an existing adapter with
 `--resume-adapter-file <path_to_adapters.safetensors>`.
 
+#### Logging
+
+You can log training metrics to Weights & Biases by passing a project name with
+the `--wandb` flag. Make sure to install wandb with `pip install wandb`.
+
 #### Prompt Masking
 
 The default training computes a loss for every token in the sample. You can
@@ -386,10 +391,6 @@ The above command on an M1 Max with 32 GB runs at about 250
 tokens-per-second, using the MLX Example
 [`wikisql`](https://github.com/ml-explore/mlx-examples/tree/main/lora/data)
 data set.
-
-## Logging
-
-You can log training metrics to Weights & Biases by adding the `--wandb` flag. This requires installing wandb manually with `pip install wandb`. When enabled, all training and validation metrics will be logged to your wandb account.
 
 [^lora]: Refer to the [arXiv paper](https://arxiv.org/abs/2106.09685) for more details on LoRA.
 
