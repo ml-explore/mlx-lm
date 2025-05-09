@@ -389,7 +389,7 @@ data set.
 
 ## Logging
 
-You can log training metrics to Weights & Biases by adding the `--report-to-wandb` flag. This requires installing wandb manually with `pip install wandb`. When enabled, all training and validation metrics will be logged to your wandb account.
+You can log training metrics to Weights & Biases by adding the `--wandb` flag. This requires installing wandb manually with `pip install wandb`. When enabled, all training and validation metrics will be logged to your wandb account.
 
 [^lora]: Refer to the [arXiv paper](https://arxiv.org/abs/2106.09685) for more details on LoRA.
 
