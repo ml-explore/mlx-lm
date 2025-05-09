@@ -554,3 +554,31 @@ def common_prefix_len(list1, list2):
     # No mismatch found within the bounds of the shorter list,
     # so the common prefix length is the length of the shorter list.
     return min_len
+
+
+def get_settings(
+    key: str,
+    default: Optional[Any] = None,
+    settings_path: Union[str, Path] = "~/.mlx_lm.settings.json",
+) -> Any:
+    """
+    Get a setting value from the settings file.
+
+    Args:
+        key (str): The key of the setting to retrieve.
+        default (Any, optional): The default value to return if the key is not found.
+        settings_path (Union[str, Path], optional): The path to the settings file.
+
+    Returns:
+        Any: The value of the setting or the default value if not found.
+    """
+    settings_path = os.path.expanduser(settings_path)
+
+    try:
+        with open(settings_path, "r") as f:
+            settings = json.load(f)
+            logging.debug(f"Loaded settings from: {settings_path}")
+    except FileNotFoundError:
+        settings = {}
+
+    return settings.get(key, default)
