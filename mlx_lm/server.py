@@ -307,12 +307,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get("num_draft_tokens", self.model_provider.cli_args.num_draft_tokens)
+        self.num_draft_tokens = self.body.get(
+            "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
+        )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
-            self.max_tokens = self.body.get("max_tokens", self.model_provider.cli_args.max_tokens)
-        self.temperature = self.body.get("temperature", self.model_provider.cli_args.temp)
+            self.max_tokens = self.body.get(
+                "max_tokens", self.model_provider.cli_args.max_tokens
+            )
+        self.temperature = self.body.get(
+            "temperature", self.model_provider.cli_args.temp
+        )
         self.top_p = self.body.get("top_p", self.model_provider.cli_args.top_p)
         self.top_k = self.body.get("top_k", self.model_provider.cli_args.top_k)
         self.min_p = self.body.get("min_p", self.model_provider.cli_args.min_p)
@@ -371,13 +377,13 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if not isinstance(self.top_p, (float, int)) or self.top_p < 0 or self.top_p > 1:
             raise ValueError("top_p must be a float between 0 and 1")
-        
+
         if not isinstance(self.top_k, int) or self.top_k < 0:
             raise ValueError("top_k must be a non-negative integer")
-    
+
         if not isinstance(self.min_p, (float, int)) or self.min_p < 0 or self.min_p > 1:
             raise ValueError("min_p must be a float between 0 and 1")
-        
+
         if not isinstance(self.num_draft_tokens, int) or self.num_draft_tokens < 0:
             raise ValueError("num_draft_tokens must be a non-negative integer")
 
@@ -759,7 +765,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 messages,
                 body.get("tools", None),
                 add_generation_prompt=True,
-                enable_thinking = False if self.model_provider.cli_args.disable_thinking else None,
+                enable_thinking=(
+                    False if self.model_provider.cli_args.disable_thinking else None
+                ),
             )
         else:
             prompt = convert_chat(body["messages"], body.get("role_mapping"))
