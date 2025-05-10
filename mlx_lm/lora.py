@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 import argparse
 import math
 import os
@@ -13,8 +11,8 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tokenizer_utils import TokenizerWrapper
 from .tuner.orpo_trainer import ORPOTrainingArgs, evaluate_orpo, train_orpo
+from .tuner.callbacks import WandBCallback
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -71,6 +69,8 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
+    "wandb": None,
+
     # ORPO args
     "beta": 0.1,
     "reward_scaling": 1.0,
@@ -190,6 +190,12 @@ def build_parser():
         action="store_true",
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
+    )
+    parser.add_argument(
+        "--wandb",
+        type=str,
+        default=None,
+        help="WandB project name to report training metrics. Disabled if None.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
 
@@ -350,6 +356,14 @@ def evaluate_model(args, model: nn.Module, test_set):
 
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
+
+    if args.wandb is not None:
+        training_callback = WandBCallback(
+            project_name=args.wandb,
+            log_dir=args.adapter_path,
+            config=vars(args),
+            wrapped_callback=training_callback,
+        )
 
     print("Loading pretrained model")
     model, tokenizer = load(args.model)
