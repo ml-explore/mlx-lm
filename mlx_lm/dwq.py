@@ -45,7 +45,7 @@ def dwq_quantize(
     data,
     batch_size: int = 2,
     max_seq_length: int = 2048,
-    temperature: float = 1.0,
+    temperature: float = 0.5,
     activation_layer_step: float = 0.25,
     activation_loss_weight: float = 1e-1,
     dtype: mx.Dtype = mx.bfloat16,
@@ -210,7 +210,7 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
+        default=0.5,
         help="Temperature scaling for the loss.",
     )
     args = parser.parse_args()
