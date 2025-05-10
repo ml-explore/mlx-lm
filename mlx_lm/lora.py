@@ -269,6 +269,7 @@ def build_parser():
 def train_model(
     args,
     model: nn.Module,
+    tokenizer,
     train_set,
     valid_set,
     training_callback: TrainingCallback = None,
@@ -360,8 +361,8 @@ def train_model(
         train_grpo(
             model=model,
             ref_model=reference_model.freeze() if reference_model else None,
-            tokenizer=tokenizer,
             optimizer=opt,
+            tokenizer=tokenizer,
             train_dataset=train_set,
             val_dataset=valid_set,
             args=training_args,
@@ -381,7 +382,6 @@ def train_model(
         )
         train(
             model=model,
-            tokenizer=tokenizer,
             args=training_args,
             optimizer=opt,
             train_dataset=train_set,
@@ -460,13 +460,13 @@ def run(args, training_callback: TrainingCallback = None):
 
     elif args.train:
         print("Training")
-        train_model(args, model, train_set, valid_set, training_callback)
+        train_model(args, model, tokenizer, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
         print("Testing")
-        evaluate_model(args, model, test_set)
+        evaluate_model(args, model, tokenizer, test_set)
 
 
 def main():
