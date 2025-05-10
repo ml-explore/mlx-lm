@@ -312,8 +312,8 @@ def train_model(
             model=model,
             ref_model=reference_model.freeze(),
             optimizer=opt,
-            train_dataset=train_set,
-            val_dataset=valid_set,
+            train_dataset=CacheDataset(train_set),
+            val_dataset=CacheDataset(valid_set),
             args=training_args,
             training_callback=training_callback,
         )
@@ -335,8 +335,8 @@ def train_model(
             model=model,
             args=training_args,
             optimizer=opt,
-            train_dataset=train_set,
-            val_dataset=valid_set,
+            train_dataset=CacheDataset(train_set),
+            val_dataset=CacheDataset(valid_set),
             training_callback=training_callback,
         )
 
