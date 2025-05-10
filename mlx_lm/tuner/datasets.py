@@ -321,7 +321,7 @@ def create_dataset(
         else:
             raise ValueError(
                 "Unsupported data format, check the supported formats here:\n"
-                "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
+                "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#GRPO-Training."
             )
 
 
