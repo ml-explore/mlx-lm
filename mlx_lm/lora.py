@@ -13,6 +13,8 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
+from .tokenizer_utils import TokenizerWrapper
+from .tuner.orpo_trainer import ORPOTrainingArgs, evaluate_orpo, train_orpo
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -43,6 +45,7 @@ CONFIG_DEFAULTS = {
     "model": "mlx_model",
     "train": False,
     "fine_tune_type": "lora",
+    "training_mode": "normal",
     "optimizer": "adam",
     "optimizer_config": {
         "adam": {},
@@ -68,6 +71,9 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
+    # ORPO args
+    "beta": 0.1,
+    "reward_scaling": 1.0,
 }
 
 
@@ -99,6 +105,12 @@ def build_parser():
         type=str,
         choices=["lora", "dora", "full"],
         help="Type of fine-tuning to perform: lora, dora, or full.",
+    )
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        choices=["normal", "dpo", "orpo"],
+        help="Training mode: normal, DPO or ORPO.",
     )
     parser.add_argument(
         "--optimizer",
@@ -180,6 +192,20 @@ def build_parser():
         default=None,
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+
+    # ORPO args
+    parser.add_argument(
+        "--beta",
+        type=float,
+        help="Temperature parameter for ORPO training.",
+        default=0.1,
+    )
+    parser.add_argument(
+        "--reward-scaling",
+        type=float,
+        help="Reward scaling factor for ORPO training, not implemented.",
+        default=1.0,
+    )
     return parser
 
 
@@ -225,18 +251,7 @@ def train_model(
     adapter_file = adapter_path / "adapters.safetensors"
     save_config(vars(args), adapter_path / "adapter_config.json")
 
-    # init training args
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=args.iters,
-        val_batches=args.val_batches,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.save_every,
-        adapter_file=adapter_file,
-        max_seq_length=args.max_seq_length,
-        grad_checkpoint=args.grad_checkpoint,
-    )
+    model.train()
 
     # Initialize the selected optimizer
     lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
@@ -253,29 +268,84 @@ def train_model(
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
-    # Train model
-    train(
-        model=model,
-        args=training_args,
-        optimizer=opt,
-        train_dataset=CacheDataset(train_set),
-        val_dataset=CacheDataset(valid_set),
-        training_callback=training_callback,
-    )
+    if args.training_mode == "orpo":
+        training_args = ORPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=args.val_batches,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=adapter_file,
+            max_seq_length=args.max_seq_length,
+            grad_checkpoint=args.grad_checkpoint,
+            beta=args.beta,
+            reward_scaling=args.reward_scaling,
+        )
+
+        train_orpo(
+            model=model,
+            optimizer=opt,
+            train_dataset=train_set,
+            val_dataset=valid_set,
+            args=training_args,
+            training_callback=training_callback,
+        )
+    else:
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=args.val_batches,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=adapter_file,
+            max_seq_length=args.max_seq_length,
+            grad_checkpoint=args.grad_checkpoint,
+        )
+
+        train(
+            model=model,
+            args=training_args,
+            optimizer=opt,
+            train_dataset=train_set,
+            val_dataset=valid_set,
+            training_callback=training_callback,
+        )
 
 
 def evaluate_model(args, model: nn.Module, test_set):
-    test_loss = evaluate(
-        model=model,
-        dataset=CacheDataset(test_set),
-        batch_size=args.batch_size,
-        num_batches=args.test_batches,
-        max_seq_length=args.max_seq_length,
-    )
+    model.eval()
 
-    test_ppl = math.exp(test_loss)
+    if args.training_mode == "orpo":
+        test_loss, test_rewards, _, test_metrics = evaluate_orpo(
+            model=model,
+            dataset=test_set,
+            batch_size=args.batch_size,
+            num_batches=args.test_batches,
+            max_seq_length=args.max_seq_length,
+            beta=args.beta,
+        )
+        test_ppl = math.exp(test_loss)
+        print(
+            f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}, Rewards: {test_rewards[0]:.3f}, {test_rewards[1]:.3f}"
+        )
 
-    print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
+        print("ORPO Test Metrics:")
+        for metric_name, metric_value in test_metrics.items():
+            print(f"  {metric_name}: {float(metric_value):.3f}")
+    else:
+        test_loss = evaluate(
+            model=model,
+            dataset=test_set,
+            batch_size=args.batch_size,
+            num_batches=args.test_batches,
+            max_seq_length=args.max_seq_length,
+        )
+
+        test_ppl = math.exp(test_loss)
+
+        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
 
 def run(args, training_callback: TrainingCallback = None):
