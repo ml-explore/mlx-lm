@@ -80,6 +80,20 @@ def load_prompt_cache(file_name, return_metadata=False):
     return cache
 
 
+def copy_prompt_cache(cache: List[Any]) -> List[Any]:
+    """
+    Copy the prompt cache.
+    """
+    cache_data = [c.state for c in cache]
+    cache_info = [c.meta_state for c in cache]
+    cache_classes = [type(c).__name__ for c in cache]
+    new_cache = [globals()[c]() for c in cache_classes]
+    for c, state, meta_state in zip(new_cache, cache_data, cache_info):
+        c.state = state
+        c.meta_state = meta_state
+    return new_cache
+
+
 def can_trim_prompt_cache(cache: List[Any]) -> bool:
     """
     Check if model's cache can be trimmed.
@@ -277,7 +291,6 @@ class KVCache(_BaseCache):
 
 
 class RotatingKVCache(_BaseCache):
-
     def __init__(self, max_size=None, keep=0, step=256):
         self.keep = keep
         self.keys = None
