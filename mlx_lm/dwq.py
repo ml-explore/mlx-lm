@@ -118,6 +118,7 @@ def dwq_quantize(
     for it, (batch, lengths) in enumerate(
         iterate_batches(data, batch_size, max_seq_length)
     ):
+        batch = batch[:, :-1]
         targets, extra_targets = forward(model, batch)
         mx.eval(targets, extra_targets)
         loss, ntoks, params = step(batch, targets, extra_targets, lengths, params)
@@ -197,7 +198,7 @@ def main():
         default=1024,
         help="Number of samples to use for training.",
     )
-    parser.add_argument("--max-seq-length", type=int, default=2048)
+    parser.add_argument("--max-seq-length", type=int, default=2049)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--batch-size", type=int, default=4)
