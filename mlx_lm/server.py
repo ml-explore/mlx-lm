@@ -765,9 +765,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 messages,
                 body.get("tools", None),
                 add_generation_prompt=True,
-                enable_thinking=(
-                    False if self.model_provider.cli_args.disable_thinking else None
-                ),
+                **self.model_provider.cli_args.chat_template_args,
             )
         else:
             prompt = convert_chat(body["messages"], body.get("role_mapping"))
@@ -973,9 +971,10 @@ def main():
         help="Default maximum number of tokens to generate (default: 512)",
     )
     parser.add_argument(
-        "--disable-thinking",
-        action="store_true",
-        help="Disable thinking mode (default: False)",
+        "--chat-template-args",
+        type=json.loads,
+        help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        default="{}",
     )
     args = parser.parse_args()
 

@@ -34,7 +34,6 @@ class DummyModelProvider:
                 "top_k": 0,
                 "min_p": 0.0,
                 "max_tokens": 512,
-                "disable_thinking": False,
             },
         )
 
