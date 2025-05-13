@@ -25,8 +25,6 @@ import mlx.nn as nn
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
-
-        requests.exceptions.HTTPError
     except ImportError:
         raise ImportError(
             "Please run `pip install modelscope` to activate the ModelScope."
@@ -50,12 +48,6 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
-
-
-class ModelNotFoundError(Exception):
-    def __init__(self, message):
-        self.message = message
-        super().__init__(self.message)
 
 
 def _get_classes(config: dict):
