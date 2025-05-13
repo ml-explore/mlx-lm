@@ -2,8 +2,6 @@
 
 import argparse
 import copy
-import glob
-import shutil
 import time
 import types
 from pathlib import Path
@@ -19,12 +17,10 @@ from mlx_lm.tuner.datasets import load_dataset
 from mlx_lm.tuner.trainer import iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
-    create_model_card,
     fetch_from_hub,
     get_model_path,
     quantize_model,
-    save_config,
-    save_weights,
+    save,
 )
 
 
@@ -129,36 +125,15 @@ def dwq_quantize(
         toks_per_sec = tokens / (time.time() - tic)
         avg_loss = 0.95 * (avg_loss or loss) + 0.05 * loss
         if rank == 0:
+            peak_memory_gb = mx.get_peak_memory() / 1e9
             print(
-                f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=}, {toks_per_sec=:.3f}",
+                f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=},"
+                f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
                 flush=True,
             )
     q_model.update(tree_map(lambda x: x.astype(dtype), params))
     for lid in layer_ids:
         q_model.layers[lid] = q_model.layers[lid].module
-
-
-def save_model(
-    model: nn.Module,
-    tokenizer: TokenizerWrapper,
-    config,
-    model_path: Path,
-    mlx_path: str,
-    hf_path: str,
-):
-    weights = dict(tree_flatten(model.parameters()))
-
-    mlx_path = Path(mlx_path)
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
-
-    tokenizer.save_pretrained(mlx_path)
-
-    save_config(config, config_path=mlx_path / "config.json")
-    create_model_card(mlx_path, hf_path)
 
 
 def load_data(tokenizer, data_path: str, num_samples: int):
@@ -252,4 +227,11 @@ def main():
         max_seq_length=args.max_seq_length,
         temperature=args.temperature,
     )
-    save_model(q_model, tokenizer, config, model_path, args.mlx_path, args.model)
+    save(
+        args.mlx_path,
+        model_path,
+        dict(tree_flatten(q_model.parameters())),
+        tokenizer,
+        config,
+        hf_repo=args.model,
+    )

@@ -443,6 +443,8 @@ def quantize_model(
     Returns:
         Tuple: Tuple containing quantized weights and config.
     """
+    if "quantization" in config:
+        raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
