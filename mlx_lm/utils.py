@@ -25,6 +25,8 @@ import mlx.nn as nn
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
+
+        requests.exceptions.HTTPError
     except ImportError:
         raise ImportError(
             "Please run `pip install modelscope` to activate the ModelScope."
@@ -104,31 +106,22 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        try:
-            model_path = Path(
-                snapshot_download(
-                    path_or_hf_repo,
-                    revision=revision,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                        "tiktoken.model",
-                        "*.txt",
-                        "*.jsonl",
-                    ],
-                )
+        model_path = Path(
+            snapshot_download(
+                path_or_hf_repo,
+                revision=revision,
+                allow_patterns=[
+                    "*.json",
+                    "*.safetensors",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                    "tiktoken.model",
+                    "*.txt",
+                    "*.jsonl",
+                ],
             )
-        except:
-            raise ModelNotFoundError(
-                f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
-                "Please make sure you specified the local path or Hugging Face"
-                " repo id correctly.\nIf you are trying to access a private or"
-                " gated Hugging Face repo, make sure you are authenticated:\n"
-                "https://huggingface.co/docs/huggingface_hub/en/guides/cli#huggingface-cli-login"
-            ) from None
+        )
     return model_path
 
 
