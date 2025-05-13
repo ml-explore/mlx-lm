@@ -384,7 +384,7 @@ mlx_lm.lora \
     --train \
     --batch-size 1 \
     --num-layers 4 \
-    --data wikisql
+    --data  mlx-community/wikisql
 ```
 
 The above command on an M1 Max with 32 GB runs at about 250
