@@ -7,8 +7,6 @@ from typing import Any, Optional
 import mlx.core as mx
 from mlx.utils import tree_map
 
-from .cache import QuantizedKVCache
-
 
 @dataclass
 class BaseModelArgs:
@@ -35,7 +33,7 @@ def create_causal_mask(
     rinds = rinds[None]
     mask = linds >= rinds
     if window_size is not None:
-        mask = mask & (linds <= rinds + window_size)
+        mask = mask & (linds < rinds + window_size)
     if lengths is not None:
         lengths = lengths[:, None, None, None]
         mask = mask & (rinds < lengths)
@@ -43,26 +41,33 @@ def create_causal_mask(
 
 
 def create_attention_mask(
-    h: mx.array, cache: Optional[Any] = None, return_array: bool = False
+    h: mx.array,
+    cache: Optional[Any] = None,
+    window_size: Optional[int] = None,
+    return_array: bool = False,
 ):
     T = h.shape[1]
     if T > 1:
         offset = 0
-        window_size = None
+        # window_size = None
+        mask = "causal"
         if cache is not None and cache[0] is not None:
             c = cache[0]
             offset = c.offset
-            if hasattr(c, "max_size"):
-                window_size = c.max_size
-                offset = min(window_size, offset)
-                return_array = return_array or offset + T > window_size
-        if return_array:
-            return create_causal_mask(T, offset, window_size=window_size)
+            if hasattr(c, "make_mask"):
+                mask = c.make_mask(T, window_size=window_size)
+        if return_array and isinstance(mask, str):
+            return create_causal_mask(T, offset)
         else:
-            return "causal"
+            return mask
     else:
-        mask = None
-    return mask
+        if (
+            cache is not None
+            and cache[0] is not None
+            and hasattr(cache[0], "make_mask")
+        ):
+            return cache[0].make_mask(T, window_size=window_size)
+        return None
 
 
 def quantized_scaled_dot_product_attention(
@@ -117,7 +122,7 @@ def scaled_dot_product_attention(
     scale: float,
     mask: Optional[mx.array],
 ) -> mx.array:
-    if isinstance(cache, QuantizedKVCache):
+    if hasattr(cache, "bits"):
         return quantized_scaled_dot_product_attention(
             queries,
             keys,

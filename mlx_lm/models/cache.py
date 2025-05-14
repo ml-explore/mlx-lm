@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
+from .base import create_causal_mask
+
 
 def make_prompt_cache(
     model: nn.Module,
@@ -418,6 +420,27 @@ class RotatingKVCache(_BaseCache):
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("RotatingKVCache Quantization NYI")
 
+    def make_mask(self, L: int, window_size: Optional[int] = None):
+        if L > 1:
+            window_size = window_size or self.max_size
+            offset = min(self.max_size, self.offset)
+            if offset + L > window_size:
+                return create_causal_mask(L, offset, window_size=window_size)
+            else:
+                return "causal"
+        else:
+            if window_size is None:
+                return None
+            # May need a mask for when window_size < max_size
+            if self.offset >= window_size and self.max_size > window_size:
+                idx = self._idx
+                if idx >= self.max_size:
+                    idx = 0
+                mask_size = min(self.max_size, self.offset)
+                mask = mx.arange(mask_size) >= (mask_size - window_size)
+                mask = mx.roll(mask, shift=idx + 1)
+                return mask[:, None]
+
 
 class MambaCache(_BaseCache):
     def __init__(self):
@@ -488,6 +511,18 @@ class ChunkedKVCache(KVCache):
     @meta_state.setter
     def meta_state(self, v):
         self.chunk_size, self.start_position = map(int, v)
+
+    def make_mask(self):
+        start = self.start_position
+        offset = self.offset
+        end = offset + h.shape[1]
+        linds = mx.arange(start, end)
+        rinds = mx.arange(offset, end)[:, None]
+        block_pos = mx.abs(
+            (linds // self.chunk_size) - (rinds // self.attention_chunk_size)
+        )
+        token_pos = linds <= rinds
+        chunk_mask = (block_pos == 0) & token_pos
 
 
 class CacheList(KVCache):
