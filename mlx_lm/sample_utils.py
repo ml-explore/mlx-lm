@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
@@ -12,7 +12,10 @@ def make_sampler(
     top_p: float = 0.0,
     min_p: float = 0.0,
     min_tokens_to_keep: int = 1,
-    top_k: int = -1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: List[int] = [],
 ) -> Callable[mx.array, mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
@@ -28,6 +31,13 @@ def make_sampler(
           be filtered by min_p sampling.
         top_k (int, optional): The top k tokens ranked by probability to constrain
           the sampling to.
+        xtc_probability (float, optional): The probability of applying XTC
+            sampling.
+        xtc_threshold (float, optional): The threshold the probs need to reach
+            for being sampled.
+        xtc_special_tokens (list(int), optional): List of special tokens IDs to
+            be excluded from XTC sampling.
+
 
     Returns:
         Callable[mx.array, mx.array]:
@@ -44,6 +54,10 @@ def make_sampler(
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
+    if xtc_probability > 0.0:
+        sampling_methods.append(
+            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
+        )
 
     # Apply the sampling methods
     def sampler(logits):
@@ -194,7 +208,6 @@ def apply_top_p(logits: mx.array, top_p: float) -> mx.array:
     """
     # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L449-L460
     probs = mx.softmax(logits, axis=-1)
-
     # sort probs in ascending order
     sorted_indices = mx.argsort(probs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
@@ -217,6 +230,43 @@ def apply_top_p(logits: mx.array, top_p: float) -> mx.array:
 
     # Convert back to logits and return
     return mx.log(original_order_probs)
+
+
+@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+def apply_xtc(
+    logits: mx.array,
+    xtc_probability: float,
+    xtc_threshold: float,
+    xtc_special_tokens: List[int],
+) -> mx.array:
+    """
+    Apply XTC sampling to the logits.
+
+    Args:
+        logits: The logits from the model's output.
+        xtc_probability (float): Probability of XTC sampling to happen for each token
+        xtc_threshold (float): The threshold the probs need to reach for being sampled.
+        special_tokens_ids (list(int)): List of special tokens IDs to be excluded from XTC sampling.
+    """
+    if not (0 <= xtc_threshold <= 0.5):
+        raise ValueError(
+            f"`threshold` has to be a float in the [0, 0.5] interval, but is {xtc_threshold}"
+        )
+    if not (0 <= xtc_probability <= 1.0):
+        raise ValueError(
+            f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
+        )
+
+    probs = mx.softmax(logits, -1)
+    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
+    if xtc_special_tokens:
+        mask[..., xtc_special_tokens] = False
+
+    return mx.where(
+        mx.random.uniform(0, 1) > xtc_probability,
+        logits,
+        mx.where(mask, -mx.inf, logits),
+    )
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)

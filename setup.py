@@ -29,9 +29,12 @@ setup(
     extras_require={
         "test": ["datasets"],
         "evaluate": ["lm-eval", "tqdm"],
+        "lwq": ["datasets"],
     },
     entry_points={
         "console_scripts": [
+            "mlx_lm.awq = mlx_lm.awq:main",
+            "mlx_lm.dwq = mlx_lm.dwq:main",
             "mlx_lm.cache_prompt = mlx_lm.cache_prompt:main",
             "mlx_lm.chat = mlx_lm.chat:main",
             "mlx_lm.convert = mlx_lm.convert:main",
@@ -42,6 +45,7 @@ setup(
             "mlx_lm.merge = mlx_lm.merge:main",
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.manage = mlx_lm.manage:main",
+            "mlx_lm.upload = mlx_lm.upload:main",
         ]
     },
 )

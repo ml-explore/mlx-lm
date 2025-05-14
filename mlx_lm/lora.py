@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 import argparse
 import math
 import os
@@ -13,8 +11,8 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tokenizer_utils import TokenizerWrapper
-from .tuner.datasets import load_dataset
+from .tuner.callbacks import WandBCallback
+from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -69,6 +67,7 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
+    "wandb": None,
 }
 
 
@@ -180,6 +179,12 @@ def build_parser():
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
     )
+    parser.add_argument(
+        "--wandb",
+        type=str,
+        default=None,
+        help="WandB project name to report training metrics. Disabled if None.",
+    )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
 
@@ -187,7 +192,6 @@ def build_parser():
 def train_model(
     args,
     model: nn.Module,
-    tokenizer: TokenizerWrapper,
     train_set,
     valid_set,
     training_callback: TrainingCallback = None,
@@ -258,20 +262,18 @@ def train_model(
     # Train model
     train(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
         optimizer=opt,
-        train_dataset=train_set,
-        val_dataset=valid_set,
+        train_dataset=CacheDataset(train_set),
+        val_dataset=CacheDataset(valid_set),
         training_callback=training_callback,
     )
 
 
-def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set):
+def evaluate_model(args, model: nn.Module, test_set):
     test_loss = evaluate(
         model=model,
-        dataset=test_set,
-        tokenizer=tokenizer,
+        dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
@@ -284,6 +286,14 @@ def evaluate_model(args, model: nn.Module, tokenizer: TokenizerWrapper, test_set
 
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
+
+    if args.wandb is not None:
+        training_callback = WandBCallback(
+            project_name=args.wandb,
+            log_dir=args.adapter_path,
+            config=vars(args),
+            wrapped_callback=training_callback,
+        )
 
     print("Loading pretrained model")
     model, tokenizer = load(args.model)
@@ -298,13 +308,13 @@ def run(args, training_callback: TrainingCallback = None):
 
     elif args.train:
         print("Training")
-        train_model(args, model, tokenizer, train_set, valid_set, training_callback)
+        train_model(args, model, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
         print("Testing")
-        evaluate_model(args, model, tokenizer, test_set)
+        evaluate_model(args, model, test_set)
 
 
 def main():

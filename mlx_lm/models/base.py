@@ -89,7 +89,15 @@ def quantized_scaled_dot_product_attention(
         queries, *q_keys, transpose=True, group_size=group_size, bits=bits
     )
     if mask is not None:
-        scores += mask
+        if isinstance(mask, str):
+            qL, kL = scores.shape[-2:]
+            q_indices = mx.arange(kL - qL, kL)
+            k_indices = mx.arange(kL)
+            mask = q_indices[:, None] >= k_indices[None]
+        if mask.dtype == mx.bool_:
+            scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+        else:
+            scores += mask
     scores = mx.softmax(scores, axis=-1, precise=True)
     out = mx.quantized_matmul(
         scores, *q_values, transpose=False, group_size=group_size, bits=bits

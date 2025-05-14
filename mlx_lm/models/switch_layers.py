@@ -143,7 +143,7 @@ class SwitchGLU(nn.Module):
         input_dims: int,
         hidden_dims: int,
         num_experts: int,
-        activation=nn.silu,
+        activation=nn.SiLU(),
         bias: bool = False,
     ):
         super().__init__()
@@ -184,7 +184,7 @@ class SwitchMLP(nn.Module):
         input_dims: int,
         hidden_dims: int,
         num_experts: int,
-        activation=nn.gelu_approx,
+        activation=nn.GELU(approx="precise"),
         bias: bool = False,
     ):
         super().__init__()

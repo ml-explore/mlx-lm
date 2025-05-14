@@ -3,9 +3,11 @@
 import copy
 import glob
 import importlib
+import inspect
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -47,12 +49,6 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
-
-
-class ModelNotFoundError(Exception):
-    def __init__(self, message):
-        self.message = message
-        super().__init__(self.message)
 
 
 def _get_classes(config: dict):
@@ -103,31 +99,22 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        try:
-            model_path = Path(
-                snapshot_download(
-                    path_or_hf_repo,
-                    revision=revision,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                        "tiktoken.model",
-                        "*.txt",
-                        "*.jsonl",
-                    ],
-                )
+        model_path = Path(
+            snapshot_download(
+                path_or_hf_repo,
+                revision=revision,
+                allow_patterns=[
+                    "*.json",
+                    "*.safetensors",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                    "tiktoken.model",
+                    "*.txt",
+                    "*.jsonl",
+                ],
             )
-        except:
-            raise ModelNotFoundError(
-                f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
-                "Please make sure you specified the local path or Hugging Face"
-                " repo id correctly.\nIf you are trying to access a private or"
-                " gated Hugging Face repo, make sure you are authenticated:\n"
-                "https://huggingface.co/docs/huggingface_hub/en/guides/cli#huggingface-cli-login"
-            ) from None
+        )
     return model_path
 
 
@@ -298,20 +285,15 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def upload_to_hub(path: str, upload_repo: str, hf_path: str):
+def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
-        path (str): Local path to the model.
-        upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
+        path (Union[str, Path]): Local path to the model.
+        hf_path (Union[str, Path]): Path to the original Hugging Face model.
     """
-    import os
-
-    from huggingface_hub import HfApi, ModelCard, logging
-
-    from . import __version__
+    from huggingface_hub import ModelCard
 
     card = ModelCard.load(hf_path)
     card.data.library_name = "mlx"
@@ -320,7 +302,27 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         card.data.tags = ["mlx"]
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
-    card.data.base_model = hf_path
+    card.data.base_model = str(hf_path)
+    card.text = ""
+    card.save(os.path.join(path, "README.md"))
+
+
+def upload_to_hub(path: str, upload_repo: str):
+    """
+    Uploads the model to Hugging Face hub.
+
+    Args:
+        path (str): Local path to the model.
+        upload_repo (str): Name of the HF repo to upload to.
+    """
+    from huggingface_hub import HfApi, ModelCard, logging
+
+    from . import __version__
+
+    logging.set_verbosity_info()
+    card_path = Path(path) / "README.md"
+    card = ModelCard.load(card_path)
+    hf_path = card.data.base_model
     card.text = dedent(
         f"""
         # {upload_repo}
@@ -352,9 +354,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
         """
     )
-    card.save(os.path.join(path, "README.md"))
-
-    logging.set_verbosity_info()
+    card.save(card_path)
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
@@ -444,6 +444,8 @@ def quantize_model(
     Returns:
         Tuple: Tuple containing quantized weights and config.
     """
+    if "quantization" in config:
+        raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
@@ -491,3 +493,67 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
+
+
+def save(
+    dst_path: Union[str, Path],
+    src_path: Union[str, Path],
+    weights: Dict[str, mx.array],
+    tokenizer: TokenizerWrapper,
+    config: Dict[str, Any],
+    hf_repo: Optional[str] = None,
+    donate_weights: bool = True,
+):
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    save_weights(dst_path, weights, donate_weights=True)
+    save_config(config, config_path=dst_path / "config.json")
+    tokenizer.save_pretrained(dst_path)
+
+    for p in ["*.py", "generation_config.json"]:
+        for file in glob.glob(str(src_path / p)):
+            shutil.copy(file, dst_path)
+
+    if hf_repo is not None:
+        create_model_card(dst_path, hf_repo)
+
+
+def common_prefix_len(list1, list2):
+    """
+    Calculates the length of the common prefix of two lists.
+
+    Args:
+        list1: The first list of strings.
+        list2: The second list of strings.
+
+    Returns:
+        The length of the common prefix. Returns 0 if lists are empty
+        or do not match at the first element.
+    """
+    # Determine the maximum possible length of the common prefix
+    min_len = min(len(list1), len(list2))
+
+    # Iterate up to the length of the shorter list
+    for i in range(min_len):
+        if list1[i] != list2[i]:
+            # Mismatch found, the common prefix length is the current index
+            return i
+
+    # No mismatch found within the bounds of the shorter list,
+    # so the common prefix length is the length of the shorter list.
+    return min_len
+
+
+def does_model_support_input_embeddings(model: nn.Module) -> bool:
+    """
+    Check if the model supports input_embeddings in its call signature.
+    Args:
+        model (nn.Module): The model to check.
+    Returns:
+        bool: True if the model supports input_embeddings, False otherwise.
+    """
+    try:
+        signature = inspect.signature(model.__call__)
+        return "input_embeddings" in signature.parameters
+    except (ValueError, TypeError):
+        return False

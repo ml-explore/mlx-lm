@@ -1,20 +1,18 @@
 # Copyright © 2024 Apple Inc.
 
-import glob
-import shutil
+
 import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten
-from transformers import PreTrainedTokenizer
 
+from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
 
@@ -85,7 +83,6 @@ def default_loss(model, batch, lengths):
 
 def iterate_batches(
     dataset,
-    tokenizer,
     batch_size,
     max_seq_length,
     train=False,
@@ -94,7 +91,7 @@ def iterate_batches(
     if isinstance(dataset, CacheDataset):
         len_fn = lambda idx: dataset.itemlen(idx)
     else:
-        len_fn = lambda idx: len(dataset[idx])
+        len_fn = lambda idx: dataset[idx][1]
     idx = sorted(range(len(dataset)), key=len_fn)
     if len(dataset) < batch_size:
         raise ValueError(
@@ -153,7 +150,6 @@ def iterate_batches(
 def evaluate(
     model,
     dataset,
-    tokenizer,
     batch_size,
     num_batches,
     max_seq_length=2048,
@@ -170,7 +166,6 @@ def evaluate(
         index_iterator,
         iterate_batches(
             dataset=dataset,
-            tokenizer=tokenizer,
             batch_size=batch_size,
             max_seq_length=max_seq_length,
         ),
@@ -186,20 +181,8 @@ def evaluate(
     return (all_losses / ntokens).item()
 
 
-class TrainingCallback:
-
-    def on_train_loss_report(self, train_info: dict):
-        """Called to report training loss at specified intervals."""
-        pass
-
-    def on_val_loss_report(self, val_info: dict):
-        """Called to report validation loss at specified intervals or the beginning."""
-        pass
-
-
 def train(
     model,
-    tokenizer,
     optimizer,
     train_dataset,
     val_dataset,
@@ -234,9 +217,6 @@ def train(
 
         return lvalue, toks
 
-    train_dataset = CacheDataset(train_dataset)
-    val_dataset = CacheDataset(val_dataset)
-
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
     model.train()
@@ -250,7 +230,6 @@ def train(
         range(1, args.iters + 1),
         iterate_batches(
             dataset=train_dataset,
-            tokenizer=tokenizer,
             batch_size=args.batch_size,
             max_seq_length=args.max_seq_length,
             train=True,
@@ -265,7 +244,6 @@ def train(
                 model=model,
                 dataset=val_dataset,
                 loss=loss,
-                tokenizer=tokenizer,
                 batch_size=args.batch_size,
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,

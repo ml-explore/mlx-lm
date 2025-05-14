@@ -30,7 +30,7 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load
+from .utils import common_prefix_len, load
 
 
 def get_system_fingerprint():
@@ -146,7 +146,7 @@ def process_message_content(messages):
 @dataclass
 class PromptCache:
     cache: List[Any] = field(default_factory=list)
-    model_key: Tuple[str, Optional[str]] = ("", None)
+    model_key: Tuple[str, Optional[str]] = ("", None, None)
     tokens: List[int] = field(default_factory=list)
 
 
@@ -157,10 +157,11 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.draft_model = None
 
         # Preload the default model if it is provided
         if self.cli_args.model is not None:
-            self.load("default_model")
+            self.load("default_model", draft_model_path="default_model")
 
     def _validate_model_path(self, model_path: str):
         model_path = Path(model_path)
@@ -170,14 +171,15 @@ class ModelProvider:
             )
 
     # Added in adapter_path to load dynamically
-    def load(self, model_path, adapter_path=None):
-        if self.model_key == (model_path, adapter_path):
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
 
         # Remove the old model if it exists.
         self.model = None
         self.tokenizer = None
         self.model_key = None
+        self.draft_model = None
 
         # Building tokenizer_config
         tokenizer_config = {
@@ -186,7 +188,12 @@ class ModelProvider:
         if self.cli_args.chat_template:
             tokenizer_config["chat_template"] = self.cli_args.chat_template
 
-        if model_path == "default_model" and self.cli_args.model is not None:
+        if model_path == "default_model":
+            if self.cli_args.model is None:
+                raise ValueError(
+                    "A model path has to be given as a CLI "
+                    "argument or in the HTTP request"
+                )
             model, tokenizer = load(
                 self.cli_args.model,
                 adapter_path=(
@@ -204,10 +211,30 @@ class ModelProvider:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model_key = (model_path, adapter_path)
+        self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
 
+        def validate_draft_tokenizer(draft_tokenizer):
+            # Check if tokenizers are compatible
+            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                logging.warning(
+                    "Draft model tokenizer does not match model tokenizer. "
+                    "Speculative decoding may not work as expected."
+                )
+
+        # Load draft model if specified
+        if (
+            draft_model_path == "default_model"
+            and self.cli_args.draft_model is not None
+        ):
+            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+            validate_draft_tokenizer(draft_tokenizer)
+
+        elif draft_model_path is not None and draft_model_path != "default_model":
+            self._validate_model_path(draft_model_path)
+            self.draft_model, draft_tokenizer = load(draft_model_path)
+            validate_draft_tokenizer(draft_tokenizer)
         return self.model, self.tokenizer
 
 
@@ -279,22 +306,35 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
+        self.requested_draft_model = self.body.get("draft_model", "default_model")
+        self.num_draft_tokens = self.body.get(
+            "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
+        )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
-            self.max_tokens = self.body.get("max_tokens", 512)
-        self.temperature = self.body.get("temperature", 0.0)
-        self.top_p = self.body.get("top_p", 1.0)
+            self.max_tokens = self.body.get(
+                "max_tokens", self.model_provider.cli_args.max_tokens
+            )
+        self.temperature = self.body.get(
+            "temperature", self.model_provider.cli_args.temp
+        )
+        self.top_p = self.body.get("top_p", self.model_provider.cli_args.top_p)
+        self.top_k = self.body.get("top_k", self.model_provider.cli_args.top_k)
+        self.min_p = self.body.get("min_p", self.model_provider.cli_args.min_p)
         self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.xtc_probability = self.body.get("xtc_probability", 0.0)
+        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
         self.validate_model_parameters()
-
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(
-                self.requested_model, self.adapter
+                self.requested_model,
+                self.adapter,
+                self.requested_draft_model,
             )
         except:
             self._set_completion_headers(404)
@@ -338,6 +378,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(self.top_p, (float, int)) or self.top_p < 0 or self.top_p > 1:
             raise ValueError("top_p must be a float between 0 and 1")
 
+        if not isinstance(self.top_k, int) or self.top_k < 0:
+            raise ValueError("top_k must be a non-negative integer")
+
+        if not isinstance(self.min_p, (float, int)) or self.min_p < 0 or self.min_p > 1:
+            raise ValueError("min_p must be a float between 0 and 1")
+
+        if not isinstance(self.num_draft_tokens, int) or self.num_draft_tokens < 0:
+            raise ValueError("num_draft_tokens must be a non-negative integer")
+
         if (
             not isinstance(self.repetition_penalty, (float, int))
             or self.repetition_penalty < 0
@@ -363,7 +412,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.logit_bias = {int(k): v for k, v in self.logit_bias.items()}
             except ValueError:
                 raise ValueError("logit_bias must be a dict of int to float")
-
+        if not (
+            isinstance(self.xtc_probability, float)
+            and 0.00 <= self.xtc_probability <= 1.00
+        ):
+            raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
+        if not (
+            isinstance(self.xtc_threshold, float) and 0.00 <= self.xtc_threshold <= 0.50
+        ):
+            raise ValueError(f"xtc_threshold must be a float between 0.00 and 0.5")
         if not isinstance(self.requested_model, str):
             raise ValueError("model must be a string")
         if self.adapter is not None and not isinstance(self.adapter, str):
@@ -452,34 +509,84 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def reset_prompt_cache(self, prompt):
+        """Resets the prompt cache and associated state.
+
+        Args:
+            prompt (List[int]): The tokenized new prompt which will populate the
+                reset cache.
+        """
+        logging.debug(f"*** Resetting cache. ***")
+        self.prompt_cache.model_key = self.model_provider.model_key
+        self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+        if self.model_provider.draft_model is not None:
+            self.prompt_cache.cache += make_prompt_cache(
+                self.model_provider.draft_model
+            )
+        self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
+
     def get_prompt_cache(self, prompt):
+        """
+        Determines the portion of the prompt that needs processing by comparing
+        it to the cached prompt and attempting to reuse the common prefix.
+
+        This function updates the internal prompt cache state (tokens and model cache)
+        based on the comparison. If a common prefix exists, it attempts to trim
+        the model cache (if supported) to match the common prefix length, avoiding
+        recomputation.
+
+        Args:
+            prompt (List[int]): The tokenized new prompt.
+
+        Returns:
+            List[int]: The suffix of the prompt that actually needs to be processed
+                       by the model. This will be the full prompt if the cache is
+                       reset or cannot be effectively used.
+        """
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
-        prefix_len = min(cache_len, prompt_len)
+        com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
+
+        # Condition 1: Model changed or no common prefix at all. Reset cache.
         if (
             self.prompt_cache.model_key != self.model_provider.model_key
-            or prompt[:prefix_len] != self.prompt_cache.tokens[:prefix_len]
+            or com_prefix_len == 0
         ):
-            self.prompt_cache.model_key = self.model_provider.model_key
-            self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
-            self.prompt_cache.tokens = []
-        elif cache_len >= prompt_len:
-            # Trim the cache if it contains the prompt as a prefix. This case
-            # is useful for reusing the cache for multiple queries with a long
-            # prompt
+            self.reset_prompt_cache(prompt)
+
+        # Condition 2: Common prefix exists and matches cache length. Process suffix.
+        elif com_prefix_len == cache_len:
+            logging.debug(
+                f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
+            )
+            prompt = prompt[com_prefix_len:]
+            self.prompt_cache.tokens.extend(prompt)
+
+        # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
+        elif com_prefix_len < cache_len:
+            logging.debug(
+                f"*** Common prefix ({com_prefix_len}) shorter than cache ({cache_len}). Attempting trim. ***"
+            )
+
             if can_trim_prompt_cache(self.prompt_cache.cache):
-                num_to_trim = cache_len - prompt_len + 1
+                num_to_trim = cache_len - com_prefix_len
+                logging.debug(f"    Trimming {num_to_trim} tokens from cache.")
                 trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
-                self.prompt_cache.tokens = self.prompt_cache.tokens[:-num_to_trim]
-                prompt = prompt[-1:]
+                self.prompt_cache.tokens = self.prompt_cache.tokens[:com_prefix_len]
+                prompt = prompt[com_prefix_len:]
+                self.prompt_cache.tokens.extend(prompt)
             else:
-                self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
-                self.prompt_cache.tokens = []
+                logging.debug(f"    Cache cannot be trimmed. Resetting cache.")
+                self.reset_prompt_cache(prompt)
+
+        # This case should logically not be reached if com_prefix_len <= cache_len
         else:
-            # Trim the prompt if it contains the cache as a prefix. This case
-            # is to avoid recomputing the cache in multi-turn chats.
-            prompt = prompt[cache_len:]
-        self.prompt_cache.tokens.extend(prompt)
+            logging.error(
+                f"Unexpected cache state: com_prefix_len ({com_prefix_len}) > cache_len ({cache_len}). Resetting cache."
+            )
+            self.reset_prompt_cache(prompt)
+
+        logging.debug(f"Returning {len(prompt)} tokens for processing.")
         return prompt
 
     def handle_completion(
@@ -510,10 +617,24 @@ class APIHandler(BaseHTTPRequestHandler):
 
         text = ""
         tic = time.perf_counter()
-        sampler = make_sampler(self.temperature, top_p=self.top_p)
-        logits_processors = make_logits_processors(
-            self.logit_bias, self.repetition_penalty, self.repetition_context_size
+        sampler = make_sampler(
+            self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
+            xtc_probability=self.xtc_probability,
+            xtc_threshold=self.xtc_threshold,
+            xtc_special_tokens=[
+                self.tokenizer.eos_token_id,
+                self.tokenizer.encode("\n"),
+            ],
         )
+        logits_processors = make_logits_processors(
+            self.logit_bias,
+            self.repetition_penalty,
+            self.repetition_context_size,
+        )
+
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -522,6 +643,8 @@ class APIHandler(BaseHTTPRequestHandler):
             sampler=sampler,
             logits_processors=logits_processors,
             prompt_cache=self.prompt_cache.cache,
+            draft_model=self.model_provider.draft_model,
+            num_draft_tokens=self.num_draft_tokens,
         ):
             segment = gen_response.text
             text += segment
@@ -640,8 +763,9 @@ class APIHandler(BaseHTTPRequestHandler):
             process_message_content(messages)
             prompt = self.tokenizer.apply_chat_template(
                 messages,
-                body.get("tools", None),
+                body.get("tools") or None,
                 add_generation_prompt=True,
+                **self.model_provider.cli_args.chat_template_args,
             )
         else:
             prompt = convert_chat(body["messages"], body.get("role_mapping"))
@@ -668,10 +792,22 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         if self.path == "/v1/models":
             self.handle_models_request()
+        elif self.path == "/health":
+            self.handle_health_check()
         else:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def handle_health_check(self):
+        """
+        Handle a GET request for the /health endpoint.
+        """
+        self._set_completion_headers(200)
+        self.end_headers()
+
+        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.flush()
 
     def handle_models_request(self):
         """
@@ -680,10 +816,20 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
 
+        files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+
+        def probably_mlx_lm(repo):
+            if repo.repo_type != "model":
+                return False
+            if "main" not in repo.refs:
+                return False
+            file_names = {f.file_path.name for f in repo.refs["main"].files}
+            return all(f in file_names for f in files)
+
         # Scan the cache directory for downloaded mlx models
         hf_cache_info = scan_cache_dir()
         downloaded_models = [
-            repo for repo in hf_cache_info.repos if "mlx" in repo.repo_id
+            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
         ]
 
         # Create a list of available models
@@ -759,6 +905,18 @@ def main():
         help="Port for the HTTP server (default: 8080)",
     )
     parser.add_argument(
+        "--draft-model",
+        type=str,
+        help="A model to be used for speculative decoding.",
+        default=None,
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        help="Number of tokens to draft when using speculative decoding.",
+        default=3,
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer",
@@ -781,6 +939,42 @@ def main():
         "--use-default-chat-template",
         action="store_true",
         help="Use the default chat template",
+    )
+    parser.add_argument(
+        "--temp",
+        type=float,
+        default=0.0,
+        help="Default sampling temperature (default: 0.0)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Default nucleus sampling top-p (default: 1.0)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="Default top-k sampling (default: 0, disables top-k)",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=0.0,
+        help="Default min-p sampling (default: 0.0, disables min-p)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--chat-template-args",
+        type=json.loads,
+        help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        default="{}",
     )
     args = parser.parse_args()
 

@@ -1,5 +1,3 @@
-# Copyright © 2023-2024 Apple Inc.
-
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
@@ -21,10 +19,11 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     num_key_value_heads: int
     max_position_embeddings: int = 32768
-    rope_theta: float = 1000000
+    rope_theta: float = 10000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
+    num_nextn_predict_layers: int = 2
 
 
 class Attention(nn.Module):
@@ -62,7 +61,6 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -119,12 +117,14 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Qwen2Model(nn.Module):
+class MiMoModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
+        self.num_nextn_predict_layers = args.num_nextn_predict_layers
+
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
@@ -137,12 +137,8 @@ class Qwen2Model(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
-        input_embeddings: Optional[mx.array] = None,
     ):
-        if input_embeddings is not None:
-            h = input_embeddings
-        else:
-            h = self.embed_tokens(inputs)
+        h = self.embed_tokens(inputs)
 
         if mask is None:
             mask = create_attention_mask(h, cache)
@@ -153,7 +149,9 @@ class Qwen2Model(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
-        return self.norm(h)
+        h = self.norm(h)
+
+        return h
 
 
 class Model(nn.Module):
@@ -161,7 +159,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen2Model(args)
+        self.model = MiMoModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -170,21 +168,25 @@ class Model(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
-        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache, input_embeddings)
+        out = self.model(inputs, mask, cache)
+
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+
         return out
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        # Remove unused precomputed rotary freqs
+
         return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+            k: v
+            for k, v in weights.items()
+            if "self_attn.rotary_emb.inv_freq" not in k
+            and not k.startswith("model.mtp_layers.")
         }
 
     @property

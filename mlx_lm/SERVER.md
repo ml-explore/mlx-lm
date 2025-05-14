@@ -54,17 +54,23 @@ curl localhost:8080/v1/chat/completions \
   sequences of tokens on which the generation should stop.
 
 - `max_tokens`: (Optional) An integer specifying the maximum number of tokens
-  to generate. Defaults to `100`.
+  to generate. Defaults to `512`.
 
 - `stream`: (Optional) A boolean indicating if the response should be
   streamed. If true, responses are sent as they are generated. Defaults to
   false.
 
 - `temperature`: (Optional) A float specifying the sampling temperature.
-  Defaults to `1.0`.
+  Defaults to `0.0`.
 
 - `top_p`: (Optional) A float specifying the nucleus sampling parameter.
   Defaults to `1.0`.
+
+- `top_k`: (Optional) An integer specifying the top-k sampling parameter.
+  Defaults to `0` (disabled).
+
+- `min_p`: (Optional) A float specifying the min-p sampling parameter.
+  Defaults to `0.0` (disabled).
 
 - `repetition_penalty`: (Optional) Applies a penalty to repeated tokens.
   Defaults to `1.0`.
@@ -85,6 +91,12 @@ curl localhost:8080/v1/chat/completions \
 
 - `adapters`: (Optional) A string path to low-rank adapters. The path must be
   relative to the directory the server was started in.
+
+- `draft_model`: (Optional) Specifies a smaller model to use for speculative
+  decoding. Set to `null` to unload.
+
+- `num_draft_tokens`: (Optional) The number of draft tokens the draft model
+  should predict at once. Defaults to `3`.
 
 ### Response Fields
 

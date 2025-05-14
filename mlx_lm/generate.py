@@ -31,13 +31,16 @@ from .models.cache import (
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
-from .utils import load
+from .utils import does_model_support_input_embeddings, load
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MIN_P = 0.0
+DEFAULT_TOP_K = 0
+DEFAULT_XTC_PROBABILITY = 0.0
+DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
@@ -103,6 +106,21 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--min-p", type=float, default=DEFAULT_MIN_P, help="Sampling min-p"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_TOP_K, help="Sampling top-k"
+    )
+    parser.add_argument(
+        "--xtc-probability",
+        type=float,
+        default=DEFAULT_XTC_PROBABILITY,
+        help="Probability of XTC sampling to happen each next token",
+    )
+    parser.add_argument(
+        "--xtc-threshold",
+        type=float,
+        default=0.0,
+        help="Thresold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
         "--min-tokens-to-keep",
@@ -280,6 +298,7 @@ def generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[int, int]] = None,
+    input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -304,14 +323,22 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
-        prompt_prorgress_callback (Callable[int, int]): A call-back which takes the
+        prompt_progress_callback (Callable[int, int]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
+        input_embeddings (mx.array, optional): Input embeddings to use in place of
+           prompt tokens. Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
     """
+    if input_embeddings is not None:
+        if not does_model_support_input_embeddings(model):
+            raise ValueError("Model does not support input embeddings.")
+        if len(prompt) != 0:
+            raise ValueError(
+                "If using input embeddings, prompt tokens must be an empty array."
+            )
 
-    y = prompt
     tokens = None
 
     # Create the KV cache for generation
@@ -334,15 +361,22 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
+    def _model_call(y):
+        if y.ndim == 3:
+            return model(None, cache=prompt_cache, input_embeddings=y)
+        else:
+            return model(y, cache=prompt_cache)
+
     def _step(y):
+        nonlocal tokens
+
         with mx.stream(generation_stream):
-            logits = model(y[None], cache=prompt_cache)
+            logits = _model_call(y[None])
+
             logits = logits[:, -1, :]
 
-            if logits_processors:
-                nonlocal tokens
+            if logits_processors and input_embeddings is None:
                 tokens = mx.concat([tokens, y]) if tokens is not None else y
-
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
@@ -352,11 +386,14 @@ def generate_step(
             y = sampler(logprobs)
             return y, logprobs.squeeze(0)
 
+    using_embeddings = input_embeddings is not None
+
+    y = input_embeddings if using_embeddings else prompt
     with mx.stream(generation_stream):
-        total_prompt_tokens = y.size
+        total_prompt_tokens = y.shape[0]
         prompt_processed_tokens = 0
-        while y.size > prefill_step_size:
-            model(y[:prefill_step_size][None], cache=prompt_cache)
+        while y.shape[0] > prefill_step_size:
+            _model_call(y[:prefill_step_size][None])
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
@@ -806,7 +843,16 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
+    sampler = make_sampler(
+        args.temp,
+        args.top_p,
+        args.min_p,
+        args.min_tokens_to_keep,
+        top_k=args.top_k,
+        xtc_probability=args.xtc_probability,
+        xtc_threshold=args.xtc_threshold,
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+    )
     response = generate(
         model,
         tokenizer,
