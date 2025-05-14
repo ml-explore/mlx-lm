@@ -326,7 +326,7 @@ def generate_step(
         prompt_progress_callback (Callable[int, int]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use in place of
-           prompt tokens, if provided. Default: ``None``.
+           prompt tokens. Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
