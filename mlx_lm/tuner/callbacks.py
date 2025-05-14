@@ -31,11 +31,11 @@ class WandBCallback(TrainingCallback):
         wandb.init(project=project_name, dir=log_dir, config=config)
 
     def on_train_loss_report(self, train_info: dict):
-        wandb.log(train_info)
+        wandb.log(train_info, step=train_info.get("iteration"))
         if self.wrapped_callback:
             self.wrapped_callback.on_train_loss_report(train_info)
 
     def on_val_loss_report(self, val_info: dict):
-        wandb.log(val_info)
+        wandb.log(val_info, step=val_info.get("iteration"))
         if self.wrapped_callback:
             self.wrapped_callback.on_val_loss_report(val_info)
