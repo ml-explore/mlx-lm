@@ -31,7 +31,7 @@ from .models.cache import (
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
-from .utils import load
+from .utils import does_model_support_input_embeddings, load
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -298,6 +298,7 @@ def generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[int, int]] = None,
+    input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -322,14 +323,17 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
-        prompt_prorgress_callback (Callable[int, int]): A call-back which takes the
+        prompt_progress_callback (Callable[int, int]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
+       input_embeddings (mx.array, optional): Input embeddings to use in place of
+           prompt tokens, if provided. Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
     """
+    if input_embeddings is not None and not does_model_support_input_embeddings(model):
+        raise ValueError("Model does not support input embeddings.")
 
-    y = prompt
     tokens = None
 
     # Create the KV cache for generation
@@ -352,15 +356,27 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    def _step(y):
+    def _step(token_ids=None, embeddings=None):
+        nonlocal tokens
+
         with mx.stream(generation_stream):
-            logits = model(y[None], cache=prompt_cache)
+            if embeddings is not None:
+                logits = model(
+                    None, cache=prompt_cache, input_embeddings=embeddings[None]
+                )
+            elif token_ids is not None:
+                logits = model(token_ids[None], cache=prompt_cache)
+            else:
+                raise ValueError(
+                    "Either token_ids or embeddings must be provided to _step."
+                )
+
             logits = logits[:, -1, :]
 
-            if logits_processors:
-                nonlocal tokens
-                tokens = mx.concat([tokens, y]) if tokens is not None else y
-
+            if logits_processors and token_ids is not None:
+                tokens = (
+                    mx.concat([tokens, token_ids]) if tokens is not None else token_ids
+                )
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
@@ -370,11 +386,21 @@ def generate_step(
             y = sampler(logprobs)
             return y, logprobs.squeeze(0)
 
+    using_embeddings = input_embeddings is not None
+
+    y = input_embeddings if using_embeddings else prompt
     with mx.stream(generation_stream):
-        total_prompt_tokens = y.size
+        total_prompt_tokens = y.shape[0]
         prompt_processed_tokens = 0
-        while y.size > prefill_step_size:
-            model(y[:prefill_step_size][None], cache=prompt_cache)
+        while y.shape[0] > prefill_step_size:
+            if using_embeddings:
+                model(
+                    None,
+                    cache=prompt_cache,
+                    input_embeddings=y[:prefill_step_size][None],
+                )
+            else:
+                model(y[:prefill_step_size][None], cache=prompt_cache)
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
@@ -382,13 +408,13 @@ def generate_step(
             y = y[prefill_step_size:]
             mx.clear_cache()
 
-        y, logprobs = _step(y)
+        y, logprobs = _step(embeddings=y) if using_embeddings else _step(token_ids=y)
 
     mx.async_eval(y, logprobs)
     n = 0
     while True:
         if n != max_tokens:
-            next_y, next_logprobs = _step(y)
+            next_y, next_logprobs = _step(token_ids=y)
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)

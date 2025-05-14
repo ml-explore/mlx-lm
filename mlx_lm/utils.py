@@ -3,6 +3,7 @@
 import copy
 import glob
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -541,3 +542,18 @@ def common_prefix_len(list1, list2):
     # No mismatch found within the bounds of the shorter list,
     # so the common prefix length is the length of the shorter list.
     return min_len
+
+
+def does_model_support_input_embeddings(model: nn.Module) -> bool:
+    """
+    Check if the model supports input_embeddings in its call signature.
+    Args:
+        model (nn.Module): The model to check.
+    Returns:
+        bool: True if the model supports input_embeddings, False otherwise.
+    """
+    try:
+        signature = inspect.signature(model.__call__)
+        return "input_embeddings" in signature.parameters
+    except (ValueError, TypeError):
+        return False

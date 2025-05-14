@@ -90,6 +90,67 @@ class TestGenerate(unittest.TestCase):
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
 
+    def test_stream_generate_input_embeddings(self):
+        sampler = make_sampler(temp=0.0)  # determinate sampler
+
+        # get prompt embeddings
+        messages = [{"role": "user", "content": "Say 'TEST' and nothing else"}]
+        prompt = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True
+        )
+        prompt_embeddings = self.model.model.embed_tokens(prompt)
+
+        response = ""
+        for generation_result in stream_generate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=[],  # no prompt tokens passed
+            max_tokens=5,
+            sampler=sampler,
+            input_embeddings=prompt_embeddings,
+        ):
+            response += generation_result.text
+
+        self.assertEqual("TEST", response)
+
+    def test_stream_generate_input_embeddings_prefill(self):
+        sampler = make_sampler(temp=0.0)  # determinate sampler
+
+        # get prompt embeddings
+        messages = [{"role": "user", "content": "Say 'TEST' and nothing else"}]
+        prompt = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True
+        )
+        prompt_embeddings = self.model.model.embed_tokens(prompt)
+
+        # setup prompt progress callback to track batched prefill
+        num_prompt_processing_callbacks = 0
+
+        def progress_callback(processed: int, total: int) -> None:
+            nonlocal num_prompt_processing_callbacks
+            num_prompt_processing_callbacks += 1
+
+        # generate
+        prefill_step_size = 5
+        response = ""
+        for generation_result in stream_generate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=[],  # no prompt tokens passed
+            max_tokens=5,
+            sampler=sampler,
+            input_embeddings=prompt_embeddings,
+            prefill_step_size=prefill_step_size,
+            prompt_progress_callback=progress_callback,
+        ):
+            response += generation_result.text
+
+        self.assertEqual("TEST", response)
+        num_embeddings = prompt_embeddings.shape[0]
+        self.assertEqual(
+            num_embeddings / prefill_step_size, num_prompt_processing_callbacks
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -137,8 +137,12 @@ class Qwen2Model(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        h = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
 
         if mask is None:
             mask = create_attention_mask(h, cache)
@@ -166,8 +170,9 @@ class Model(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, mask, cache, input_embeddings)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
