@@ -299,7 +299,7 @@ def train(
 
             if training_callback is not None:
                 train_info = {
-                    "iteration": it // args.steps_per_report,
+                    "iteration": it,
                     "train_loss": train_loss,
                     "learning_rate": learning_rate,
                     "iterations_per_second": it_sec,
