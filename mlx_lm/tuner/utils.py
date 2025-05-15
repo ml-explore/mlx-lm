@@ -79,6 +79,7 @@ def linear_to_lora_layers(
         keys = set(keys)
     elif model.model_type in [
         "mistral",
+        "mistral3",
         "llama",
         "phi",
         "mixtral",

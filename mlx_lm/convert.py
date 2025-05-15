@@ -130,7 +130,12 @@ def convert(
         else:
             cast_predicate = lambda _: True
         weights = {
-            k: v.astype(dtype) if cast_predicate(k) else v for k, v in weights.items()
+            k: (
+                v.astype(dtype)
+                if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating)
+                else v
+            )
+            for k, v in weights.items()
         }
 
     if quantize and dequantize:

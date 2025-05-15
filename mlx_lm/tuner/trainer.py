@@ -91,7 +91,7 @@ def iterate_batches(
     if isinstance(dataset, CacheDataset):
         len_fn = lambda idx: dataset.itemlen(idx)
     else:
-        len_fn = lambda idx: len(dataset[idx])
+        len_fn = lambda idx: dataset[idx][1]
     idx = sorted(range(len(dataset)), key=len_fn)
     if len(dataset) < batch_size:
         raise ValueError(
@@ -261,7 +261,7 @@ def train(
 
             if training_callback is not None:
                 val_info = {
-                    "iteration": it,
+                    "iteration": it - 1,
                     "val_loss": val_loss,
                     "val_time": val_time,
                 }

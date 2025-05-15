@@ -28,6 +28,13 @@ class DummyModelProvider:
                 "chat_template": None,
                 "use_default_chat_template": False,
                 "trust_remote_code": False,
+                "num_draft_tokens": 3,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "max_tokens": 512,
+                "chat_template_args": {},
             },
         )
 
