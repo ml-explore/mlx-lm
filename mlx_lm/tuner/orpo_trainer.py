@@ -1,12 +1,12 @@
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-import time
 
-from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.nn.utils import average_gradients
+from mlx.utils import tree_flatten
 
 from mlx_lm.tuner.callbacks import TrainingCallback
 
@@ -168,7 +168,9 @@ def evaluate_orpo(
         chosen, rejected, chosen_masks, rejected_masks, preference_scores = batch
 
         chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
-        rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
+        rejected_logps, rejected_logits_mean = get_logps(
+            model, rejected, rejected_masks
+        )
 
         lvalue, reward, toks, metrics = orpo_loss(
             chosen_logps,
@@ -229,7 +231,9 @@ def train_orpo(
         chosen, rejected, chosen_masks, rejected_masks, preference_scores = batch
 
         chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
-        rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
+        rejected_logps, rejected_logits_mean = get_logps(
+            model, rejected, rejected_masks
+        )
 
         (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
             chosen_logps,
@@ -247,7 +251,13 @@ def train_orpo(
         return lvalue, reward, toks, metrics
 
     def loss_wrapper(
-        chosen_logps, chosen_logits_mean, rejected_logps, rejected_logits_mean, chosen_masks, rejected_masks, preference_scores
+        chosen_logps,
+        chosen_logits_mean,
+        rejected_logps,
+        rejected_logits_mean,
+        chosen_masks,
+        rejected_masks,
+        preference_scores,
     ):
         return loss(
             chosen_logps=chosen_logps,

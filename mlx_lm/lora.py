@@ -11,9 +11,9 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tuner.orpo_trainer import ORPOTrainingArgs, evaluate_orpo, train_orpo
 from .tuner.callbacks import WandBCallback
 from .tuner.datasets import CacheDataset, load_dataset
+from .tuner.orpo_trainer import ORPOTrainingArgs, evaluate_orpo, train_orpo
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -70,7 +70,6 @@ CONFIG_DEFAULTS = {
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
     "wandb": None,
-
     # ORPO args
     "beta": 0.1,
     "reward_scaling": 1.0,

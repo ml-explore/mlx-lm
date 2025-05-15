@@ -286,7 +286,9 @@ def create_dataset(
     system_feature = getattr(config, "system_feature", "system")
     chosen_feature = getattr(config, "chosen_feature", "chosen")
     rejected_feature = getattr(config, "rejected_feature", "rejected")
-    preference_score_feature = getattr(config, "preference_score_feature", "preference_score")
+    preference_score_feature = getattr(
+        config, "preference_score_feature", "preference_score"
+    )
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
     chat_feature = getattr(config, "chat_feature", "messages")
@@ -319,7 +321,7 @@ def create_dataset(
                 prompt_key=prompt_feature,
                 chosen_key=chosen_feature,
                 rejected_key=rejected_feature,
-                preference_score_key=preference_score_feature
+                preference_score_key=preference_score_feature,
             )
         else:
             raise ValueError(
