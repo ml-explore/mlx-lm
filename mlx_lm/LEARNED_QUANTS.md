@@ -40,6 +40,33 @@ For a full list of options run:
 mlx_lm.dwq --help
 ```
 
+#### Tips
+
+- DWQ works best distilling to lower precision, anywhere from 2-bit to 4-bit
+  models.
+- Distilling 16-bit precision to 8-bit and even 6-bit often doesn't work well.
+  The loss starts out so low that it's difficult to reduce further.
+- Decreasing the quantization group size (e.g. `--group-size 32`) doubles the
+  number of tunable parameters and can work much better.
+- If the loss is oscillating and not going down consistently, try reducing the
+  learning rate. If it is decreasing but slowly, try increasing the learning
+  rate.
+- As a rule of thumb, lower precision can benefit from a higher learning rate
+  since the loss starts out higher. Conversely, higher precision needs a lower
+  learning rate.
+
+
+#### Memory Use
+
+A few options to reduce memory use for DWQ:
+
+- Distill from an 8-bit model instead of a 16-bit model. The 8-bit
+  models are usually as good as 16-bit precision models.
+- Use a shorter maximum sequence length. The default is 2048. Using
+  `--max-seq-length 512` reduces the memory and still gets good results.
+- Use a smaller batch size, e.g. `--batch-size 1`
+
+
 ### AWQ 
 
 Use `mlx_lm.awq` to run AWQ on a given model. For example:

@@ -307,13 +307,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get("num_draft_tokens", 3)
+        self.num_draft_tokens = self.body.get(
+            "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
+        )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
-            self.max_tokens = self.body.get("max_tokens", 512)
-        self.temperature = self.body.get("temperature", 0.0)
-        self.top_p = self.body.get("top_p", 1.0)
+            self.max_tokens = self.body.get(
+                "max_tokens", self.model_provider.cli_args.max_tokens
+            )
+        self.temperature = self.body.get(
+            "temperature", self.model_provider.cli_args.temp
+        )
+        self.top_p = self.body.get("top_p", self.model_provider.cli_args.top_p)
+        self.top_k = self.body.get("top_k", self.model_provider.cli_args.top_k)
+        self.min_p = self.body.get("min_p", self.model_provider.cli_args.min_p)
         self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
@@ -369,6 +377,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if not isinstance(self.top_p, (float, int)) or self.top_p < 0 or self.top_p > 1:
             raise ValueError("top_p must be a float between 0 and 1")
+
+        if not isinstance(self.top_k, int) or self.top_k < 0:
+            raise ValueError("top_k must be a non-negative integer")
+
+        if not isinstance(self.min_p, (float, int)) or self.min_p < 0 or self.min_p > 1:
+            raise ValueError("min_p must be a float between 0 and 1")
+
+        if not isinstance(self.num_draft_tokens, int) or self.num_draft_tokens < 0:
+            raise ValueError("num_draft_tokens must be a non-negative integer")
 
         if (
             not isinstance(self.repetition_penalty, (float, int))
@@ -603,6 +620,8 @@ class APIHandler(BaseHTTPRequestHandler):
         sampler = make_sampler(
             self.temperature,
             top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
             xtc_probability=self.xtc_probability,
             xtc_threshold=self.xtc_threshold,
             xtc_special_tokens=[
@@ -744,8 +763,9 @@ class APIHandler(BaseHTTPRequestHandler):
             process_message_content(messages)
             prompt = self.tokenizer.apply_chat_template(
                 messages,
-                body.get("tools", None),
+                body.get("tools") or None,
                 add_generation_prompt=True,
+                **self.model_provider.cli_args.chat_template_args,
             )
         else:
             prompt = convert_chat(body["messages"], body.get("role_mapping"))
@@ -891,6 +911,12 @@ def main():
         default=None,
     )
     parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        help="Number of tokens to draft when using speculative decoding.",
+        default=3,
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer",
@@ -913,6 +939,42 @@ def main():
         "--use-default-chat-template",
         action="store_true",
         help="Use the default chat template",
+    )
+    parser.add_argument(
+        "--temp",
+        type=float,
+        default=0.0,
+        help="Default sampling temperature (default: 0.0)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Default nucleus sampling top-p (default: 1.0)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="Default top-k sampling (default: 0, disables top-k)",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=0.0,
+        help="Default min-p sampling (default: 0.0, disables min-p)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--chat-template-args",
+        type=json.loads,
+        help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        default="{}",
     )
     args = parser.parse_args()
 

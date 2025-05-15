@@ -2,8 +2,6 @@
 
 import argparse
 import copy
-import glob
-import shutil
 import time
 import types
 from pathlib import Path
@@ -19,13 +17,21 @@ from mlx_lm.tuner.datasets import load_dataset
 from mlx_lm.tuner.trainer import iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
-    create_model_card,
     fetch_from_hub,
     get_model_path,
     quantize_model,
-    save_config,
-    save_weights,
+    save,
 )
+
+
+class Catcher(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def __call__(self, *args, **kwargs):
+        self.outputs = self.module(*args, **kwargs)
+        return self.outputs
 
 
 def dwq_quantize(
@@ -36,6 +42,8 @@ def dwq_quantize(
     batch_size: int = 2,
     max_seq_length: int = 2048,
     temperature: float = 0.5,
+    activation_layer_step: float = 0.25,
+    activation_loss_weight: float = 1e-1,
     dtype: mx.Dtype = mx.bfloat16,
 ):
     group = mx.distributed.init()
@@ -49,22 +57,46 @@ def dwq_quantize(
     q_model.apply_to_modules(unfreeze)
     print_trainable_parameters(q_model)
 
+    layer_id_step = int(activation_layer_step * len(model.layers))
+    layer_ids = list(range(len(model.layers)))[layer_id_step::layer_id_step]
+
+    for lid in layer_ids:
+        model.layers[lid] = Catcher(model.layers[lid])
+        q_model.layers[lid] = Catcher(q_model.layers[lid])
+
     def log_norm(x):
-        x = x * (1 / temperature)
+        if temperature != 1.0:
+            x = x * (1 / temperature)
         return x - mx.logsumexp(x, axis=-1, keepdims=True)
 
-    def loss_fn(params, x, targets, lengths):
+    def forward(model, inputs):
+        logprobs = log_norm(model(inputs).astype(mx.float32))
+        extra_targets = [
+            model.layers[lid].outputs.astype(mx.float32) for lid in layer_ids
+        ]
+        for lid in layer_ids:
+            model.layers[lid].outputs = None
+        return logprobs, extra_targets
+
+    def loss_fn(params, x, targets, extra_targets, lengths):
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
-        logits = q_model(x).astype(mx.float32)
-        losses = nn.losses.kl_div_loss(log_norm(logits), targets, reduction="none")
+        logprobs, q_extra_targets = forward(q_model, x)
+        losses = nn.losses.kl_div_loss(logprobs, targets, reduction="none")
         mask = mx.arange(targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
-        loss = (mask * losses).sum() / ntoks
+        kl_loss = (mask * losses).sum() / ntoks
+        act_loss = mx.stack(
+            [
+                (mask * (qe - e).abs().mean(axis=-1)).sum() / ntoks
+                for qe, e in zip(q_extra_targets, extra_targets)
+            ]
+        )
+        loss = kl_loss + activation_loss_weight * act_loss.mean()
         return loss, ntoks
 
-    def step(inputs, targets, lengths, params):
+    def step(inputs, targets, extra_targets, lengths, params):
         (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
-            params, inputs, targets, lengths
+            params, inputs, targets, extra_targets, lengths
         )
         grads = nn.average_gradients(grads)
         params = opt.apply_gradients(grads, params)
@@ -82,9 +114,10 @@ def dwq_quantize(
     for it, (batch, lengths) in enumerate(
         iterate_batches(data, batch_size, max_seq_length)
     ):
-        targets = log_norm(model(batch).astype(mx.float32))
-        mx.eval(targets)
-        loss, ntoks, params = step(batch, targets, lengths, params)
+        batch = batch[:, :-1]
+        targets, extra_targets = forward(model, batch)
+        mx.eval(targets, extra_targets)
+        loss, ntoks, params = step(batch, targets, extra_targets, lengths, params)
         mx.eval(loss, params)
         loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
         ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
@@ -92,34 +125,15 @@ def dwq_quantize(
         toks_per_sec = tokens / (time.time() - tic)
         avg_loss = 0.95 * (avg_loss or loss) + 0.05 * loss
         if rank == 0:
+            peak_memory_gb = mx.get_peak_memory() / 1e9
             print(
-                f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=}, {toks_per_sec=:.3f}",
+                f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=},"
+                f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
                 flush=True,
             )
     q_model.update(tree_map(lambda x: x.astype(dtype), params))
-
-
-def save_model(
-    model: nn.Module,
-    tokenizer: TokenizerWrapper,
-    config,
-    model_path: Path,
-    mlx_path: str,
-    hf_path: str,
-):
-    weights = dict(tree_flatten(model.parameters()))
-
-    mlx_path = Path(mlx_path)
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
-
-    tokenizer.save_pretrained(mlx_path)
-
-    save_config(config, config_path=mlx_path / "config.json")
-    create_model_card(mlx_path, hf_path)
+    for lid in layer_ids:
+        q_model.layers[lid] = q_model.layers[lid].module
 
 
 def load_data(tokenizer, data_path: str, num_samples: int):
@@ -139,7 +153,7 @@ def load_data(tokenizer, data_path: str, num_samples: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", "-m", default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--model", "-m", default="Qwen/Qwen3-4B")
     parser.add_argument("--quantized-model", default=None)
     parser.add_argument(
         "--mlx-path", default="mlx_model", help="Path to save the quantized model."
@@ -159,10 +173,10 @@ def main():
         default=1024,
         help="Number of samples to use for training.",
     )
-    parser.add_argument("--max-seq-length", type=int, default=2048)
+    parser.add_argument("--max-seq-length", type=int, default=2049)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
         "--data-path",
         type=str,
@@ -213,4 +227,11 @@ def main():
         max_seq_length=args.max_seq_length,
         temperature=args.temperature,
     )
-    save_model(q_model, tokenizer, config, model_path, args.mlx_path, args.model)
+    save(
+        args.mlx_path,
+        model_path,
+        dict(tree_flatten(q_model.parameters())),
+        tokenizer,
+        config,
+        hf_repo=args.model,
+    )

@@ -77,7 +77,7 @@ class TestUtils(unittest.TestCase):
     def test_convert(self):
         mlx_path = os.path.join(self.test_dir, "mlx_model")
 
-        convert(HF_MODEL_PATH, mlx_path=mlx_path, quantize=True)
+        convert(HF_MODEL_PATH, mlx_path=mlx_path, quantize=False)
         model, _ = utils.load(mlx_path)
         self.assertTrue(isinstance(model.layers[0].mlp.up_proj, nn.QuantizedLinear))
         self.assertTrue(isinstance(model.layers[-1].mlp.up_proj, nn.QuantizedLinear))
@@ -87,8 +87,8 @@ class TestUtils(unittest.TestCase):
         convert(HF_MODEL_PATH, mlx_path=mlx_path, dtype="bfloat16")
         model, _ = utils.load(mlx_path)
 
-        self.assertEqual(model.layers[0].mlp.up_proj.weight.dtype, mx.bfloat16)
-        self.assertEqual(model.layers[-1].mlp.up_proj.weight.dtype, mx.bfloat16)
+        self.assertEqual(model.layers[0].mlp.up_proj.scales.dtype, mx.bfloat16)
+        self.assertEqual(model.layers[-1].mlp.up_proj.scales.dtype, mx.bfloat16)
 
 
 if __name__ == "__main__":
