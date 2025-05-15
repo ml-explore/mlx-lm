@@ -117,6 +117,9 @@ class ORPODataset:
     def __len__(self):
         return len(self._chosen_data)
 
+    def process(self, d):
+        return d
+
     def __getitem__(self, idx: int):
         return {
             "chosen": self._chosen_data[idx],

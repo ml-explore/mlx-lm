@@ -1,14 +1,16 @@
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 
+from mlx.nn.utils import average_gradients
+from mlx.utils import tree_flatten
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten
 
-from .trainer import TrainingArgs, TrainingCallback, grad_checkpoint
+from mlx_lm.tuner.callbacks import TrainingCallback
+
+from .trainer import TrainingArgs, grad_checkpoint
 
 
 @dataclass
@@ -22,30 +24,28 @@ class ORPOTrainingArgs(TrainingArgs):
     )
 
 
+def get_logps(model, tokens, mask):
+    inputs = tokens[:, :-1]
+    targets = tokens[:, 1:]
+    logits = model(inputs)
+    log_probs = -nn.losses.cross_entropy(logits, targets, reduction="none")
+    mask = mask[:, :-1]
+    seq_lengths = mask.sum(-1)
+    logp_seq_avg = (log_probs * mask).sum(-1) / seq_lengths
+    logits_mean = logits.sum() / mask.sum()
+    return logp_seq_avg, logits_mean
+
+
 def orpo_loss(
-    model: nn.Module,
-    chosen,
-    rejected,
+    chosen_logps,
+    chosen_logits_mean,
+    rejected_logps,
+    rejected_logits_mean,
     chosen_masks,
     rejected_masks,
     preference_scores,
     beta: float = 0.1,
 ):
-    def get_logps(model, tokens, mask):
-        inputs = tokens[:, :-1]
-        targets = tokens[:, 1:]
-        logits = model(inputs)
-        log_probs = -nn.losses.cross_entropy(logits, targets, reduction="none")
-        mask = mask[:, :-1]
-        seq_lengths = mask.sum(-1)
-        logp_seq_avg = (log_probs * mask).sum(-1) / seq_lengths
-        logits_mean = logits.sum() / mask.sum()
-        return logp_seq_avg, logits_mean
-
-    chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
-    rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
-
-    # Apply preference weighting
     chosen_logps = chosen_logps * preference_scores
 
     # Stable log-odds computation
@@ -166,10 +166,15 @@ def evaluate_orpo(
         ),
     ):
         chosen, rejected, chosen_masks, rejected_masks, preference_scores = batch
+
+        chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
+        rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
+
         lvalue, reward, toks, metrics = orpo_loss(
-            model=model,
-            chosen=chosen,
-            rejected=rejected,
+            chosen_logps,
+            chosen_logits_mean,
+            rejected_logps,
+            rejected_logits_mean,
             chosen_masks=chosen_masks,
             rejected_masks=rejected_masks,
             preference_scores=preference_scores,
@@ -223,10 +228,14 @@ def train_orpo(
     def step(batch):
         chosen, rejected, chosen_masks, rejected_masks, preference_scores = batch
 
+        chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
+        rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
+
         (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
-            model,
-            chosen,
-            rejected,
+            chosen_logps,
+            chosen_logits_mean,
+            rejected_logps,
+            rejected_logits_mean,
             chosen_masks,
             rejected_masks,
             preference_scores=preference_scores,
@@ -238,12 +247,13 @@ def train_orpo(
         return lvalue, reward, toks, metrics
 
     def loss_wrapper(
-        model, chosen, rejected, chosen_masks, rejected_masks, preference_scores
+        chosen_logps, chosen_logits_mean, rejected_logps, rejected_logits_mean, chosen_masks, rejected_masks, preference_scores
     ):
         return loss(
-            model=model,
-            chosen=chosen,
-            rejected=rejected,
+            chosen_logps=chosen_logps,
+            chosen_logits_mean=chosen_logits_mean,
+            rejected_logps=rejected_logps,
+            rejected_logits_mean=rejected_logits_mean,
             chosen_masks=chosen_masks,
             rejected_masks=rejected_masks,
             preference_scores=preference_scores,
