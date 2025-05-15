@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +8,9 @@ import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten
 
-from .trainer import TrainingArgs, TrainingCallback, grad_checkpoint
+from mlx_lm.tuner.callbacks import TrainingCallback
+
+from .trainer import TrainingArgs, grad_checkpoint
 
 
 @dataclass
@@ -33,45 +33,32 @@ class DPOTrainingArgs(TrainingArgs):
     )
 
 
+def get_token_scores(model, x, mask):
+    inputs, targets = x[:, :-1], x[:, 1:]
+    logits = model(inputs).astype(mx.float32)
+    return -nn.losses.cross_entropy(logits, targets) * mask[:, :-1]
+
+
+def compute_score(scores, mask, loss_type):
+    token_count = mask.sum(-1)
+    return scores.sum(-1) / token_count if loss_type == "ipo" else scores.sum(-1)
+
+
 def dpo_loss(
-    model,
-    chosen: mx.array,
-    rejected: mx.array,
+    policy_chosen_score: mx.array,
+    policy_rejected_score: mx.array,
+    reference_chosen_score: mx.array,
+    reference_rejected_score: mx.array,
     chosen_masks: mx.array,
     rejected_masks: mx.array,
     beta: float,
     delta: float,
     loss_type: str = "sigmoid",
-    ref_model=None,
 ):
-    def get_token_scores(model, x, mask):
-        inputs, targets = x[:, :-1], x[:, 1:]
-        logits = model(inputs).astype(mx.float32)
-        return -nn.losses.cross_entropy(logits, targets) * mask[:, :-1]
-
-    def compute_score(scores, mask, loss_type):
-        token_count = mask.sum(-1)
-        return scores.sum(-1) / token_count if loss_type == "ipo" else scores.sum(-1)
-
-    # Compute scores for policy model
-    policy_chosen_scores = get_token_scores(model, chosen, chosen_masks)
-    policy_rejected_scores = get_token_scores(model, rejected, rejected_masks)
-    policy_chosen_score = compute_score(policy_chosen_scores, chosen_masks, loss_type)
-    policy_rejected_score = compute_score(policy_rejected_scores, rejected_masks, loss_type)
-
-    # Compute scores for reference model
-    if ref_model is None:
-        reference_chosen_score = mx.zeros_like(policy_chosen_score)
-        reference_rejected_score = mx.zeros_like(policy_rejected_score)
-    else:
-        ref_chosen_scores = mx.stop_gradient(get_token_scores(ref_model, chosen, chosen_masks))
-        ref_rejected_scores = mx.stop_gradient(get_token_scores(ref_model, rejected, rejected_masks))
-        reference_chosen_score = compute_score(ref_chosen_scores, chosen_masks, loss_type)
-        reference_rejected_score = compute_score(ref_rejected_scores, rejected_masks, loss_type)
-
     # Preference logits
-    logits = (policy_chosen_score - policy_rejected_score) - \
-             (reference_chosen_score - reference_rejected_score)
+    logits = (policy_chosen_score - policy_rejected_score) - (
+        reference_chosen_score - reference_rejected_score
+    )
 
     # Loss calculation
     if loss_type == "sigmoid":
@@ -181,7 +168,7 @@ def evaluate_dpo(
     delta: float,
     max_seq_length,
     loss_type,
-    loss: callable = dpo_loss,
+    loss_fn: callable = dpo_loss,
 ):
     all_losses = 0
     all_rewards = mx.zeros((2,))
@@ -200,18 +187,45 @@ def evaluate_dpo(
     ):
         chosen, rejected, chosen_masks, rejected_masks = batch
 
-        loss, reward, toks, metrics = loss(
-            model=model,
-            ref_model=ref_model,
-            chosen=chosen,
-            rejected=rejected,
+        policy_chosen_scores = get_token_scores(model, chosen, chosen_masks)
+        policy_rejected_scores = get_token_scores(model, rejected, rejected_masks)
+
+        policy_chosen_score = compute_score(
+            policy_chosen_scores, chosen_masks, loss_type
+        )
+        policy_rejected_score = compute_score(
+            policy_rejected_scores, rejected_masks, loss_type
+        )
+
+        if ref_model is None:
+            reference_chosen_score = mx.zeros_like(policy_chosen_score)
+            reference_rejected_score = mx.zeros_like(policy_rejected_score)
+        else:
+            ref_chosen_scores = mx.stop_gradient(
+                get_token_scores(ref_model, chosen, chosen_masks)
+            )
+            ref_rejected_scores = mx.stop_gradient(
+                get_token_scores(ref_model, rejected, rejected_masks)
+            )
+            reference_chosen_score = compute_score(
+                ref_chosen_scores, chosen_masks, loss_type
+            )
+            reference_rejected_score = compute_score(
+                ref_rejected_scores, rejected_masks, loss_type
+            )
+
+        loss_value, reward, toks, metrics = loss_fn(
+            policy_chosen_score=policy_chosen_score,
+            policy_rejected_score=policy_rejected_score,
+            reference_chosen_score=reference_chosen_score,
+            reference_rejected_score=reference_rejected_score,
             chosen_masks=chosen_masks,
             rejected_masks=rejected_masks,
             loss_type=loss_type,
             beta=beta,
             delta=delta,
         )
-        all_losses += loss * toks
+        all_losses += loss_value * toks
         all_rewards += reward
         ntokens += toks
 
@@ -241,7 +255,7 @@ def train_dpo(
     train_dataset,
     val_dataset,
     args: DPOTrainingArgs = DPOTrainingArgs(),
-    loss: callable = dpo_loss,
+    loss_fn: callable = dpo_loss,
     training_callback: TrainingCallback = None,
     loss_type="sigmoid",
 ):
@@ -260,8 +274,40 @@ def train_dpo(
     def step(batch):
         chosen, rejected, chosen_masks, rejected_masks = batch
 
+        policy_chosen_scores = get_token_scores(model, chosen, chosen_masks)
+        policy_rejected_scores = get_token_scores(model, rejected, rejected_masks)
+
+        policy_chosen_score = compute_score(
+            policy_chosen_scores, chosen_masks, loss_type
+        )
+        policy_rejected_score = compute_score(
+            policy_rejected_scores, rejected_masks, loss_type
+        )
+
+        if ref_model is None:
+            reference_chosen_score = mx.zeros_like(policy_chosen_score)
+            reference_rejected_score = mx.zeros_like(policy_rejected_score)
+        else:
+            ref_chosen_scores = mx.stop_gradient(
+                get_token_scores(ref_model, chosen, chosen_masks)
+            )
+            ref_rejected_scores = mx.stop_gradient(
+                get_token_scores(ref_model, rejected, rejected_masks)
+            )
+            reference_chosen_score = compute_score(
+                ref_chosen_scores, chosen_masks, loss_type
+            )
+            reference_rejected_score = compute_score(
+                ref_rejected_scores, rejected_masks, loss_type
+            )
+
         (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
-            model, ref_model, chosen, rejected, chosen_masks, rejected_masks
+            policy_chosen_score,
+            policy_rejected_score,
+            reference_chosen_score,
+            reference_rejected_score,
+            chosen_masks=chosen_masks,
+            rejected_masks=rejected_masks,
         )
 
         grad = average_gradients(grad)
@@ -269,12 +315,19 @@ def train_dpo(
 
         return lvalue, reward, toks, metrics
 
-    def loss_wrapper(model, ref_model, chosen, rejected, chosen_masks, rejected_masks):
-        return loss(
-            model=model,
-            ref_model=ref_model,
-            chosen=chosen,
-            rejected=rejected,
+    def loss_wrapper(
+        policy_chosen_score,
+        policy_rejected_score,
+        reference_chosen_score,
+        reference_rejected_score,
+        chosen_masks,
+        rejected_masks,
+    ):
+        return loss_fn(
+            policy_chosen_score=policy_chosen_score,
+            policy_rejected_score=policy_rejected_score,
+            reference_chosen_score=reference_chosen_score,
+            reference_rejected_score=reference_rejected_score,
             chosen_masks=chosen_masks,
             rejected_masks=rejected_masks,
             beta=args.beta,
@@ -317,7 +370,7 @@ def train_dpo(
                 batch_size=args.batch_size,
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,
-                loss=loss,
+                loss_fn=loss_fn,
                 beta=args.beta,
                 delta=args.delta,
                 loss_type=loss_type,

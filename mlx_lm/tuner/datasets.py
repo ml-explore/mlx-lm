@@ -7,12 +7,6 @@ from transformers import PreTrainedTokenizer
 
 
 class DPODataset:
-    """
-    A dataset for DPO (Direct Preference Optimization) training that handles
-    prompt-chosen-rejected triplets in the format:
-    {"system": ..., "prompt": ..., "chosen": ..., "rejected": ...}
-    """
-
     def __init__(
         self,
         data: List[Dict[str, str]],
@@ -33,7 +27,6 @@ class DPODataset:
             )
             messages.append({"role": "user", "content": d[prompt_key]})
 
-            # Apply template once for each response type
             base_messages = messages.copy()
             chosen_messages = base_messages + [
                 {"role": "assistant", "content": d[chosen_key]}
@@ -50,6 +43,9 @@ class DPODataset:
 
     def __len__(self):
         return len(self._chosen_data)
+
+    def process(self, d):
+        return d
 
 
 class TextDataset:
@@ -242,8 +238,8 @@ def create_dataset(
                 prompt_key=prompt_feature,
                 system_key=system_feature,
                 chosen_key=chosen_feature,
-                rejected_key=rejected_feature
-                )
+                rejected_key=rejected_feature,
+            )
         else:
             raise ValueError(
                 "Unsupported data format, check the supported formats here:\n"

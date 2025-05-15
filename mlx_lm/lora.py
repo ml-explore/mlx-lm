@@ -11,9 +11,9 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tuner.dpo_trainer import DPOTrainingArgs, evaluate_dpo, train_dpo
 from .tuner.callbacks import WandBCallback
 from .tuner.datasets import CacheDataset, load_dataset
+from .tuner.dpo_trainer import DPOTrainingArgs, evaluate_dpo, train_dpo
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -70,7 +70,6 @@ CONFIG_DEFAULTS = {
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
     "wandb": None,
- 
     # DPO args
     "beta": 0.1,
     "dpo_loss_type": "sigmoid",
