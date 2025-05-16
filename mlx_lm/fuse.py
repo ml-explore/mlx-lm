@@ -115,7 +115,7 @@ def main() -> None:
             raise ValueError(
                 "Must provide original Hugging Face repo to upload local model."
             )
-        upload_to_hub(args.save_path, args.upload_repo, hf_path)
+        upload_to_hub(args.save_path, args.upload_repo)
 
 
 if __name__ == "__main__":
