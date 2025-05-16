@@ -13,6 +13,7 @@ import yaml
 
 from .tuner.callbacks import WandBCallback
 from .tuner.datasets import CacheDataset, load_dataset
+from .tuner.dpo_trainer import DPOTrainingArgs, evaluate_dpo, train_dpo
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
@@ -42,6 +43,7 @@ CONFIG_DEFAULTS = {
     "model": "mlx_model",
     "train": False,
     "fine_tune_type": "lora",
+    "training_mode": "normal",
     "optimizer": "adam",
     "optimizer_config": {
         "adam": {},
@@ -68,6 +70,11 @@ CONFIG_DEFAULTS = {
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
     "wandb": None,
+    # DPO args
+    "beta": 0.1,
+    "dpo_loss_type": "sigmoid",
+    "delta": 50.0,
+    "reference_model_path": None,
 }
 
 
@@ -99,6 +106,12 @@ def build_parser():
         type=str,
         choices=["lora", "dora", "full"],
         help="Type of fine-tuning to perform: lora, dora, or full.",
+    )
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        choices=["normal", "dpo"],
+        help="Training mode: normal or DPO",
     )
     parser.add_argument(
         "--optimizer",
@@ -186,6 +199,30 @@ def build_parser():
         help="WandB project name to report training metrics. Disabled if None.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+
+    # DPO args
+    parser.add_argument(
+        "--beta",
+        type=float,
+        help="Temperature parameter for DPO training.",
+        default=0.1,
+    )
+    parser.add_argument(
+        "--dpo-loss-type",
+        type=str,
+        help="DPO loss type: 'sigmoid', 'hinge', 'ipo', or 'dpop'.",
+        choices=["sigmoid", "hinge", "ipo", "dpop"],
+        default="sigmoid",
+    )
+    parser.add_argument(
+        "--delta", type=float, help="Delta parameter for DPOP loss type.", default=50.0
+    )
+    parser.add_argument(
+        "--reference-model-path",
+        type=str,
+        help="Path to reference model weights. If None, uses the same model.",
+        default=None,
+    )
     return parser
 
 
@@ -231,18 +268,7 @@ def train_model(
     adapter_file = adapter_path / "adapters.safetensors"
     save_config(vars(args), adapter_path / "adapter_config.json")
 
-    # init training args
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=args.iters,
-        val_batches=args.val_batches,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.save_every,
-        adapter_file=adapter_file,
-        max_seq_length=args.max_seq_length,
-        grad_checkpoint=args.grad_checkpoint,
-    )
+    model.train()
 
     # Initialize the selected optimizer
     lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
@@ -259,29 +285,101 @@ def train_model(
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
-    # Train model
-    train(
-        model=model,
-        args=training_args,
-        optimizer=opt,
-        train_dataset=CacheDataset(train_set),
-        val_dataset=CacheDataset(valid_set),
-        training_callback=training_callback,
-    )
+    if args.training_mode == "dpo":
+        training_args = DPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=args.val_batches,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=adapter_file,
+            max_seq_length=args.max_seq_length,
+            grad_checkpoint=args.grad_checkpoint,
+            beta=args.beta,
+            loss_type=args.dpo_loss_type,
+            delta=args.delta,
+            reference_model_path=args.reference_model_path,
+        )
+
+        if args.reference_model_path:
+            reference_model, _ = load(args.reference_model_path)
+        else:
+            reference_model, _ = load(args.model)
+
+        train_dpo(
+            model=model,
+            ref_model=reference_model.freeze(),
+            optimizer=opt,
+            train_dataset=CacheDataset(train_set),
+            val_dataset=CacheDataset(valid_set),
+            args=training_args,
+            training_callback=training_callback,
+        )
+    else:
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=args.val_batches,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=adapter_file,
+            max_seq_length=args.max_seq_length,
+            grad_checkpoint=args.grad_checkpoint,
+        )
+
+        # Train model
+        train(
+            model=model,
+            args=training_args,
+            optimizer=opt,
+            train_dataset=CacheDataset(train_set),
+            val_dataset=CacheDataset(valid_set),
+            training_callback=training_callback,
+        )
 
 
 def evaluate_model(args, model: nn.Module, test_set):
-    test_loss = evaluate(
-        model=model,
-        dataset=CacheDataset(test_set),
-        batch_size=args.batch_size,
-        num_batches=args.test_batches,
-        max_seq_length=args.max_seq_length,
-    )
+    model.eval()
 
-    test_ppl = math.exp(test_loss)
+    if args.training_mode == "dpo":
+        if args.reference_model_path:
+            reference_model, _ = load(args.reference_model_path)
+        else:
+            reference_model = model
 
-    print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
+        test_loss, _, _, test_metrics = evaluate_dpo(
+            model=model,
+            ref_model=reference_model.freeze(),
+            dataset=test_set,
+            batch_size=args.batch_size,
+            num_batches=args.test_batches,
+            max_seq_length=args.max_seq_length,
+            beta=args.beta,
+            delta=args.delta,
+            loss_type=args.dpo_loss_type,
+        )
+
+        test_ppl = math.exp(test_loss)
+
+        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}")
+        print("DPO Test Metrics:")
+        for metric_name, metric_value in test_metrics.items():
+            print(f"  {metric_name}: {float(metric_value):.3f}")
+
+    else:
+        test_loss = evaluate(
+            model=model,
+            dataset=test_set,
+            batch_size=args.batch_size,
+            num_batches=args.test_batches,
+            max_seq_length=args.max_seq_length,
+        )
+
+        test_ppl = math.exp(test_loss)
+
+        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
 
 def run(args, training_callback: TrainingCallback = None):
