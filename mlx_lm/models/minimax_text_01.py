@@ -38,7 +38,7 @@ class ModelArgs(BaseModelArgs):
     shared_intermediate_size: int
     sliding_window: Optional[int]
     tie_word_embeddings: bool
-    vocab_size: int
+    vocab_size: int = 200064
     layernorm_linear_attention_alpha: float = 1
     layernorm_linear_attention_beta: float = 1
     layernorm_mlp_alpha: float = 1
@@ -434,3 +434,6 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+
+# Goekdeniz-Guelmez/MiniMax01Text-Dev
