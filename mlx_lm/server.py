@@ -547,6 +547,9 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_len = len(prompt)
         com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
 
+        # Leave at least one token in the prompt
+        com_prefix_len = min(com_prefix_len, len(prompt) - 1)
+
         # Condition 1: Model changed or no common prefix at all. Reset cache.
         if (
             self.prompt_cache.model_key != self.model_provider.model_key

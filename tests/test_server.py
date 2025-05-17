@@ -357,7 +357,9 @@ class TestGetPromptCache(unittest.TestCase):
         self.assertEqual(self.handler.prompt_cache.model_key, ("model_v1", None, None))
         mock_make_cache.assert_called_once()
 
-    def test_identical_request_full_hit(self):
+    @patch("mlx_lm.server.trim_prompt_cache")
+    @patch("mlx_lm.server.can_trim_prompt_cache", return_value=True)
+    def test_identical_request_full_hit(self, mock_can_trim, mock_trim_cache):
         """Test when the new prompt is identical to the cached one."""
         self.handler.prompt_cache.tokens = [1, 2, 3]
         self.handler.prompt_cache.model_key = ("model_v1", None, None)
@@ -368,10 +370,9 @@ class TestGetPromptCache(unittest.TestCase):
         with patch("mlx_lm.server.common_prefix_len", return_value=3):
             processed_prompt = self.handler.get_prompt_cache(prompt)
 
-        # Should process nothing, cache remains unchanged
-        self.assertEqual(processed_prompt, [])
+        mock_trim_cache.assert_called_once_with("existing_cache_obj", 1)
+        self.assertEqual(processed_prompt, [3])
         self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3])
-        self.assertEqual(self.handler.prompt_cache.cache, "existing_cache_obj")
 
     def test_cache_is_prefix(self):
         """Test when the cached prompt is a prefix of the new prompt."""
