@@ -295,7 +295,10 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = int(self.headers["Content-Length"])
         raw_body = self.rfile.read(content_length)
-        self.body = json.loads(raw_body.decode())
+        self.body = json.loads(
+            raw_body.decode(),
+            object_hook=lambda d: {**d, "content": d.get("content") or ""},
+        )
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
         assert isinstance(
