@@ -141,6 +141,8 @@ def process_message_content(messages):
             if len(text_fragments) != len(content):
                 raise ValueError("Only 'text' content type is supported.")
             message["content"] = "".join(text_fragments)
+        elif content is None:
+            message["content"] = ""
 
 
 @dataclass
@@ -295,10 +297,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = int(self.headers["Content-Length"])
         raw_body = self.rfile.read(content_length)
-        self.body = json.loads(
-            raw_body.decode(),
-            object_hook=lambda d: {**d, "content": d.get("content") or ""},
-        )
+        self.body = json.loads(raw_body.decode())
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
         assert isinstance(
