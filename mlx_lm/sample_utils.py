@@ -184,7 +184,6 @@ def apply_min_p(
     selected_logprobs = mx.where(tokens_to_remove, -float("inf"), sorted_logprobs)
 
     # Create a mapping to rearrange back to original indices
-    # Use argsort of sorted_indices to get the inverse permutation
     inverse_indices = mx.put_along_axis(
         mx.zeros_like(sorted_indices),
         sorted_indices,
