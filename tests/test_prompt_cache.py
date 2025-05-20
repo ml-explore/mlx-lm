@@ -8,6 +8,7 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step
+from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import (
     ChunkedKVCache,
     KVCache,
@@ -55,6 +56,61 @@ class TestPromptCache(unittest.TestCase):
         save_prompt_cache(cache_file, cache, metadata)
         _, loaded_metadata = load_prompt_cache(cache_file, return_metadata=True)
         self.assertEqual(metadata, loaded_metadata)
+
+    def test_rotating_cache_mask(self):
+        cache = RotatingKVCache(max_size=8)
+
+        mask = cache.make_mask(4, window_size=5)
+        self.assertEqual(mask, "causal")
+        mask = create_attention_mask(mx.zeros((1, 4, 32)), [cache], window_size=5)
+        self.assertEqual(mask, "causal")
+        mask = create_attention_mask(
+            mx.zeros((1, 4, 32)), [cache], window_size=5, return_array=True
+        )
+        self.assertEqual(mask.dtype, mx.bool_)
+        self.assertEqual(mask.shape, (4, 4))
+
+        mask = cache.make_mask(6, window_size=5)
+        self.assertEqual(mask.dtype, mx.bool_)
+        self.assertEqual(mask.sum(axis=-1).max(), 5)
+        cmask = create_attention_mask(mx.zeros((1, 6, 32)), [cache], window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
+
+        mask = cache.make_mask(1, window_size=5)
+        self.assertEqual(mask, None)
+        mask = create_attention_mask(mx.zeros((1, 1, 32)), [cache], window_size=5)
+        self.assertEqual(mask, None)
+
+        kv = mx.zeros((1, 1, 10, 32))
+        cache.update_and_fetch(kv, kv)
+        mask = cache.make_mask(3, window_size=5)
+        self.assertEqual(mask.shape, (3, 11))
+        self.assertTrue(mx.all(mask.sum(axis=-1) == 5))
+        for i in range(3):
+            s = 11 - 3 + i
+            self.assertTrue(mx.all(mask[s - 5 : s]))
+        cmask = create_attention_mask(mx.zeros((1, 3, 32)), [cache], window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
+
+        mask = cache.make_mask(1)
+        self.assertEqual(mask, None)
+        mask = create_attention_mask(mx.zeros((1, 1, 32)), [cache])
+        self.assertEqual(mask, None)
+
+        mask = cache.make_mask(1, window_size=5)
+        self.assertEqual(mask.squeeze(1).tolist(), [True] + [False] * 3 + [True] * 4)
+        cmask = create_attention_mask(mx.zeros((1, 1, 32)), [cache], window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
+
+        kv = mx.zeros((1, 1, 1, 32))
+        cache.update_and_fetch(kv, kv)
+
+        mask = cache.make_mask(1, window_size=5)
+        self.assertEqual(
+            mask.squeeze(1).tolist(), [True] * 2 + [False] * 3 + [True] * 3
+        )
+        cmask = create_attention_mask(mx.zeros((1, 1, 32)), [cache], window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
 
     def test_save_load_rotating_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
