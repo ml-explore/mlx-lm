@@ -156,7 +156,6 @@ def evaluate(
     max_seq_length=2048,
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
-    display_progress: bool = False,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -164,20 +163,18 @@ def evaluate(
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
-
-    for _, batch in tqdm(zip(
-        index_iterator,
-        iterate_batches(
-            dataset=dataset,
-            batch_size=batch_size,
-            max_seq_length=max_seq_length,
+    for _, batch in tqdm(
+        zip(
+            index_iterator,
+            iterate_batches(
+                dataset=dataset,
+                batch_size=batch_size,
+                max_seq_length=max_seq_length,
+            ),
         ),
-    ),
-            unit="examples",
-            disable=not display_progress,
-            unit_scale=batch_size,
-            desc="Calculating loss...",
-            total=min(len(dataset)//batch_size, num_batches)):
+        desc="Calculating loss...",
+        total=min(len(dataset) // batch_size, num_batches),
+    ):
         losses, toks = loss(model, *batch)
         all_losses += losses * toks
         ntokens += toks
