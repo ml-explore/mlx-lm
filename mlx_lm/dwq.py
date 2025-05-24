@@ -11,6 +11,7 @@ import mlx.nn as nn
 import mlx.optimizers as optimizers
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
+from tqdm import tqdm
 
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.tuner.datasets import load_dataset
@@ -57,7 +58,7 @@ def dwq_quantize(
     q_model.apply_to_modules(unfreeze)
     print_trainable_parameters(q_model)
 
-    layer_id_step = int(activation_layer_step * len(model.layers))
+    layer_id_step = max(int(activation_layer_step * len(model.layers)), 1)
     layer_ids = list(range(len(model.layers)))[layer_id_step::layer_id_step]
 
     for lid in layer_ids:
@@ -108,11 +109,15 @@ def dwq_quantize(
         q_model.trainable_parameters(),
     )
 
-    avg_loss = None
+    total_loss = 0.0
+    total_tokens = 0
     tokens = 0
     tic = time.time()
-    for it, (batch, lengths) in enumerate(
-        iterate_batches(data, batch_size, max_seq_length)
+    for it, (batch, lengths) in (
+        pbar := tqdm(
+            enumerate(iterate_batches(data, batch_size, max_seq_length)),
+            total=len(data) // batch_size,
+        )
     ):
         batch = batch[:, :-1]
         targets, extra_targets = forward(model, batch)
@@ -122,21 +127,27 @@ def dwq_quantize(
         loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
         ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
         tokens += ntoks
-        toks_per_sec = tokens / (time.time() - tic)
-        avg_loss = 0.95 * (avg_loss or loss) + 0.05 * loss
+        total_loss += loss * ntoks
         if rank == 0:
-            peak_memory_gb = mx.get_peak_memory() / 1e9
-            print(
-                f"{it=}, {loss=:.3f}, {avg_loss=:.4f}, {tokens=},"
-                f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
-                flush=True,
-            )
+            pbar.set_description(desc=f"{loss=:.4f}")
+            if (it + 1) % 20 == 0:
+                toks_per_sec = tokens / (time.time() - tic)
+                peak_memory_gb = mx.get_peak_memory() / 1e9
+                avg_loss = total_loss / tokens
+                total_tokens += tokens
+                tqdm.write(
+                    f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
+                    f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
+                )
+                tic = time.time()
+                tokens = 0
+                total_loss = 0
     q_model.update(tree_map(lambda x: x.astype(dtype), params))
     for lid in layer_ids:
         q_model.layers[lid] = q_model.layers[lid].module
 
 
-def load_data(tokenizer, data_path: str, num_samples: int):
+def load_data(tokenizer, data_path: str, num_samples: int, max_seq_length: int):
     args = types.SimpleNamespace(
         hf_dataset={
             "path": data_path,
@@ -148,7 +159,7 @@ def load_data(tokenizer, data_path: str, num_samples: int):
     )
     dataset = load_dataset(args, tokenizer)[0]
     perm = np.random.permutation(len(dataset))[:num_samples].tolist()
-    return [dataset.process(dataset[i]) for i in perm]
+    return [dataset.process(dataset[i])[:max_seq_length] for i in perm]
 
 
 def main():
@@ -203,7 +214,9 @@ def main():
     model_path = get_model_path(args.model, revision=None)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
-    calibration_data = load_data(tokenizer, args.data_path, args.num_samples)
+    calibration_data = load_data(
+        tokenizer, args.data_path, args.num_samples, args.max_seq_length
+    )
 
     if args.quantized_model is not None:
         q_model_path = get_model_path(args.quantized_model, revision=None)
