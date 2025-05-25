@@ -42,9 +42,8 @@ def dwq_quantize(
     data,
     batch_size: int = 2,
     max_seq_length: int = 2048,
-    temperature: float = 0.5,
     activation_layer_step: float = 0.25,
-    activation_loss_weight: float = 1e-1,
+    activation_loss_weight: float = 1.0,
     dtype: mx.Dtype = mx.bfloat16,
 ):
     group = mx.distributed.init()
@@ -66,8 +65,6 @@ def dwq_quantize(
         q_model.layers[lid] = Catcher(q_model.layers[lid])
 
     def log_norm(x):
-        if temperature != 1.0:
-            x = x * (1 / temperature)
         return x - mx.logsumexp(x, axis=-1, keepdims=True)
 
     def forward(model, inputs):
@@ -194,12 +191,6 @@ def main():
         default="allenai/tulu-3-sft-mixture",
         help="A Hugging Face dataset which is compatible with an mlx-lm dataset format.",
     )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.5,
-        help="Temperature scaling for the loss.",
-    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -238,7 +229,6 @@ def main():
         calibration_data,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
-        temperature=args.temperature,
     )
     save(
         args.mlx_path,
