@@ -80,7 +80,7 @@ def dwq_quantize(
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
         logprobs, q_extra_targets = forward(q_model, x)
         losses = nn.losses.kl_div_loss(logprobs, targets, reduction="none")
-        mask = mx.arange(targets.shape[1]) < lengths[:, 1:]
+        mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
         kl_loss = (mask * losses).sum() / ntoks
         act_loss = mx.stack(
@@ -183,7 +183,7 @@ def main():
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=1024,
+        default=2048,
         help="Number of samples to use for training.",
     )
     parser.add_argument("--max-seq-length", type=int, default=2049)
