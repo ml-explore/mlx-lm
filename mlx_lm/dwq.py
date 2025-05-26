@@ -156,7 +156,12 @@ def load_data(tokenizer, data_path: str, num_samples: int, max_seq_length: int):
     )
     dataset = load_dataset(args, tokenizer)[0]
     perm = np.random.permutation(len(dataset))[:num_samples].tolist()
-    return [dataset.process(dataset[i])[:max_seq_length] for i in perm]
+
+    def process(idx):
+        tokens, offset = dataset.process(dataset[idx])
+        return (tokens[:max_seq_length], offset)
+
+    return [process(i) for i in perm]
 
 
 def main():
