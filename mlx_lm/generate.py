@@ -12,9 +12,11 @@ from typing import (
     Callable,
     Generator,
     List,
+    NamedTuple,
     Optional,
+    Sequence,
     Tuple,
-    Union, Sequence, NamedTuple,
+    Union,
 )
 
 import mlx.core as mx
@@ -728,16 +730,16 @@ def stream_generate(
             )
             prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         prompt = mx.array(prompt)
-        
+
     # Process stop_words from kwargs into stop_id_sequences for stopping criteria
     stop_id_sequences = []
-    stop_words = kwargs.pop('stop_words', None)
+    stop_words = kwargs.pop("stop_words", None)
     if stop_words is not None:
         if isinstance(stop_words, str):
             stop_words = [stop_words]
         for stop_word in stop_words:
             # Process escape sequences like \n, \t, etc.
-            processed_stop_word = stop_word.encode().decode('unicode_escape')
+            processed_stop_word = stop_word.encode().decode("unicode_escape")
             stop_ids = tokenizer.encode(processed_stop_word, add_special_tokens=False)
             if stop_ids:
                 stop_id_sequences.append(stop_ids)
@@ -762,33 +764,33 @@ def stream_generate(
         tokens = []
         finish_reason = "length"
         stop_sequence_suffix = None
-        
+
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
-            
+
             # Handle the case when token is already an int
-            token_id = token.item() if hasattr(token, 'item') else token
+            token_id = token.item() if hasattr(token, "item") else token
             tokens.append(token_id)
             detokenizer.add_token(token)
             segment = detokenizer.last_segment
-            
+
             if stop_id_sequences:
                 stop_condition = stopping_criteria(
-                    tokens, 
-                    stop_id_sequences, 
-                    tokenizer.eos_token_id
+                    tokens, stop_id_sequences, tokenizer.eos_token_id
                 )
-                
+
                 if stop_condition.stop_met:
                     finish_reason = "stop"
                     if stop_condition.trim_length > 0:
-                        stop_sequence_suffix = tokens[-stop_condition.trim_length:]
+                        stop_sequence_suffix = tokens[-stop_condition.trim_length :]
                     break
 
-                elif any(sequence_overlap(tokens, sequence) for sequence in stop_id_sequences):
+                elif any(
+                    sequence_overlap(tokens, sequence) for sequence in stop_id_sequences
+                ):
                     continue
 
             if token_id in tokenizer.eos_token_ids:
@@ -810,23 +812,23 @@ def stream_generate(
             )
 
         detokenizer.finalize()
-        
+
         # Prepare final text with stop sequence removed if necessary
         final_text = detokenizer.last_segment
         if finish_reason == "stop" and stop_sequence_suffix:
             suffix_text = tokenizer.decode(stop_sequence_suffix)
             # Make sure we remove the stop word from the output
             if len(suffix_text) > 0 and final_text.endswith(suffix_text):
-                final_text = final_text[:-len(suffix_text)]
+                final_text = final_text[: -len(suffix_text)]
             # In some cases, the detokenizer might have added extra spaces or characters
             # Try to match against the original stop words
             elif stop_words is not None:
                 for stop_word in stop_words:
-                    processed_stop_word = stop_word.encode().decode('unicode_escape')
+                    processed_stop_word = stop_word.encode().decode("unicode_escape")
                     if final_text.endswith(processed_stop_word):
-                        final_text = final_text[:-len(processed_stop_word)]
+                        final_text = final_text[: -len(processed_stop_word)]
                         break
-        
+
         # Final response
         yield GenerationResponse(
             text=final_text,

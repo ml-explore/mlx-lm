@@ -627,7 +627,7 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache=self.prompt_cache.cache,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
-            stop_words=stop_words
+            stop_words=stop_words,
         ):
             logging.debug(gen_response.text)
 
@@ -659,7 +659,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             token_logprobs.append(logprobs[token].item())
 
-            if hasattr(gen_response, 'finish_reason') and gen_response.finish_reason == "stop":
+            if (
+                hasattr(gen_response, "finish_reason")
+                and gen_response.finish_reason == "stop"
+            ):
                 finish_reason = "stop"
                 break
 
