@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -8,7 +7,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
