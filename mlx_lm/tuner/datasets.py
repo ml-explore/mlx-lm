@@ -1,7 +1,9 @@
+# Copyright © 2024 Apple Inc.
+
 import json
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from transformers import PreTrainedTokenizer
 

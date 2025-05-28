@@ -26,8 +26,6 @@ from .models import cache
 from .models.cache import (
     QuantizedKVCache,
     load_prompt_cache,
-    make_prompt_cache,
-    trim_prompt_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
