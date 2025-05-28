@@ -159,7 +159,7 @@ def merge(
     save_config(config, config_path=mlx_path / "config.json")
 
     if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo, base_hf_path)
+        upload_to_hub(mlx_path, upload_repo)
 
 
 def main():

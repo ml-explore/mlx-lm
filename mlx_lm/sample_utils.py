@@ -184,8 +184,12 @@ def apply_min_p(
     selected_logprobs = mx.where(tokens_to_remove, -float("inf"), sorted_logprobs)
 
     # Create a mapping to rearrange back to original indices
-    # Use argsort of sorted_indices to get the inverse permutation
-    inverse_indices = mx.argsort(sorted_indices, axis=-1)
+    inverse_indices = mx.put_along_axis(
+        mx.zeros_like(sorted_indices),
+        sorted_indices,
+        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
+        axis=-1,
+    )
 
     # Rearrange selected_logprobs back to original order
     original_order_logprobs = mx.take_along_axis(
@@ -196,40 +200,39 @@ def apply_min_p(
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
-def apply_top_p(logits: mx.array, top_p: float) -> mx.array:
+def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """
     Apply top-p (nucleus) sampling to logits.
 
     Args:
-        logits: The logits from the model's output.
+        logprobs: A vector of log probabilities.
         top_p: The cumulative probability threshold for top-p filtering.
     Returns:
         token selected based on the top-p criterion.
     """
     # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L449-L460
-    probs = mx.softmax(logits, axis=-1)
-    # sort probs in ascending order
-    sorted_indices = mx.argsort(probs, axis=-1)
+    probs = mx.exp(logprobs)
+    # sort in ascending order
+    sorted_indices = mx.argsort(logprobs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
 
     cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
 
-    # select tokens with cumulative probs below threshold
-    top_probs = mx.where(
-        cumulative_probs > 1 - top_p,
-        sorted_probs,
-        0,
+    # Rearrange cumulative probs back to original order
+    inverse_indices = mx.put_along_axis(
+        mx.zeros_like(sorted_indices),
+        sorted_indices,
+        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
+        axis=-1,
     )
+    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
 
-    # Create a mapping to rearrange back to original indices
-    # Use argsort of sorted_indices to get the inverse permutation
-    inverse_indices = mx.argsort(sorted_indices, axis=-1)
-
-    # Rearrange top_probs back to original order
-    original_order_probs = mx.take_along_axis(top_probs, inverse_indices, axis=-1)
-
-    # Convert back to logits and return
-    return mx.log(original_order_probs)
+    # select tokens with cumulative probs below threshold
+    return mx.where(
+        cumulative_probs > 1 - top_p,
+        logprobs,
+        -float("inf"),
+    )
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)

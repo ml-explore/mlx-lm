@@ -11,6 +11,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten
+from tqdm import tqdm
 
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
@@ -162,13 +163,17 @@ def evaluate(
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
-    for _, batch in zip(
-        index_iterator,
-        iterate_batches(
-            dataset=dataset,
-            batch_size=batch_size,
-            max_seq_length=max_seq_length,
+    for _, batch in tqdm(
+        zip(
+            index_iterator,
+            iterate_batches(
+                dataset=dataset,
+                batch_size=batch_size,
+                max_seq_length=max_seq_length,
+            ),
         ),
+        desc="Calculating loss...",
+        total=min(len(dataset) // batch_size, num_batches),
     ):
         losses, toks = loss(model, *batch)
         all_losses += losses * toks
@@ -261,7 +266,7 @@ def train(
 
             if training_callback is not None:
                 val_info = {
-                    "iteration": it,
+                    "iteration": it - 1,
                     "val_loss": val_loss,
                     "val_time": val_time,
                 }
