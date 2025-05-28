@@ -19,7 +19,6 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
-    num_experts_per_tok: int
     num_experts: int
     num_experts_per_tok: int
     decoder_sparse_step: int
