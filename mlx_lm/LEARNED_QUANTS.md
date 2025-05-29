@@ -1,21 +1,22 @@
 # Learned Quantization 
 
-To reduce the quality loss from quantization MLX LM has two options:
+To reduce the quality loss from quantization MLX LM has several options:
 
 - Distilled Weight Quantization (DWQ)
 - Activation-aware Weight Quantization (AWQ)[^1].
+- Dynamic quantization
 
-Both DWQ and AWQ use an example dataset to tune parameters of the model. DWQ
-fine-tunes non-quantized parameters (including quantization scales and biases)
-using the non-quantized model as a teacher. AWQ scales and clips the weights
-prior to quantization. The scaling and clipping values are found with a grid
-search minimizing the distance from the quantized hidden activations to the
-non-quantized hidden activations
+All methods use calibration data to tune parameters or hyper-parameters of the
+model. DWQ fine-tunes non-quantized parameters (including quantization scales
+and biases) using the non-quantized model as a teacher. AWQ scales and clips
+the weights prior to quantization. Dynamic quantization estimates the
+sensitivity of a model's outputs to each layer and uses a higher precision for
+layers which have higher sensitivity.
 
 To get started, first install the requirements:
 
 ```
-pip install mlx-lm[lwq]
+pip install mlx-lm[quant]
 ```
 
 ### DWQ
