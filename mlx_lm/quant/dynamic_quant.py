@@ -85,10 +85,8 @@ def estimate_sensitivities(
 
     sensitivities = []
     for k, l in layers.items():
-        sensitivity = grad_norms[k + ".weight"].item()
-        sens_per_mparam = 1e6 * sensitivity / l.weight.size
-        sensitivities.append((k, sens_per_mparam))
-        tqdm.write(f"{k} sensitivity {sens_per_mparam:.4f}")
+        sensitivity = grad_norms[k + ".weight"].item() / math.sqrt(l.weight.size)
+        sensitivities.append((k, sensitivity))
 
     return sensitivities
 
@@ -184,7 +182,7 @@ def main():
     model_path = get_model_path(args.model, revision=None)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
     mx.random.seed(args.seed)
-    data = load_dataset(tokenizer, args.num_samples, args.sequence_length)
+    data = load_data(tokenizer, num_samples=-1, sequence_length=512)
 
     if args.report_ppl:
         ppl = eval_ppl(model, data)
