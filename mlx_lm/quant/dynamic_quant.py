@@ -8,7 +8,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 
 from mlx_lm.quant.utils import load_data
@@ -51,7 +51,7 @@ def estimate_sensitivities(
     q_layers = copy.deepcopy(layers)
     for l in q_layers.values():
         l.weight = qdq(l.weight)
-    q_model.update_modules(q_layers)
+    q_model.update_modules(tree_unflatten(list(q_layers.items())))
 
     def log_norm(x):
         x = x.astype(mx.float32)
