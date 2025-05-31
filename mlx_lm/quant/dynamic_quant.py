@@ -37,6 +37,10 @@ def eval_ppl(model, data, batch_size=8):
 def estimate_sensitivities(
     model,
     data,
+    low_bits,
+    low_group_size,
+    high_bits,
+    high_group_size,
 ):
     batch_size = 4
     layers = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
@@ -44,13 +48,14 @@ def estimate_sensitivities(
 
     q_model = copy.deepcopy(model)
 
-    def qdq(w):
-        w, s, b = mx.quantize(w, bits=4, group_size=64)
-        return mx.dequantize(w, scales=s, biases=b, bits=4, group_size=64)
+    def qdq(w, bits, group_size):
+        w, s, b = mx.quantize(w, bits=bits, group_size=group_size)
+        return mx.dequantize(w, scales=s, biases=b, bits=bits, group_size=group_size)
 
     q_layers = copy.deepcopy(layers)
     for l in q_layers.values():
-        l.weight = qdq(l.weight)
+        l.weight = qdq(l.weight, low_bits, low_group_size)
+    q_model.freeze()
     q_model.update_modules(tree_unflatten(list(q_layers.items())))
 
     def log_norm(x):
@@ -61,7 +66,7 @@ def estimate_sensitivities(
         logprobs = log_norm(q_model(batch))
         return nn.losses.kl_div_loss(logprobs, targets, reduction="mean")
 
-    grad_accum = None
+    grad_accum = tree_map(lambda x: mx.zeros(x.shape), q_model.trainable_parameters())
     for e, s in tqdm(
         enumerate(range(0, len(data), batch_size)),
         total=len(data) // batch_size,
@@ -71,22 +76,26 @@ def estimate_sensitivities(
         targets = log_norm(model(batch))
         mx.eval(targets)
         _, grads = nn.value_and_grad(q_model, loss_fn)(batch, targets)
-        if grad_accum is not None:
-            grad_accum = tree_map(
-                lambda x, y: (1 / (e + 1)) * x.astype(mx.float32) + (e / (e + 1)) * y,
-                grads,
-                grad_accum,
-            )
-        else:
-            grad_accum = tree_map(lambda x: x.astype(mx.float32), grads)
+        grad_accum = tree_map(lambda x, y: x + y, grad_accum, grads)
         mx.eval(grad_accum)
-    grad_norms = dict(tree_flatten(tree_map(lambda g: mx.linalg.norm(g), grad_accum)))
-    mx.eval(grad_norms)
 
-    sensitivities = []
-    for k, l in layers.items():
-        sensitivity = grad_norms[k + ".weight"].item() / math.sqrt(l.weight.size)
-        sensitivities.append((k, sensitivity))
+    def compute_sensitivity(gradient, low_q_weight, original_weight):
+        n_batches = (len(data) + batch_size - 1) // batch_size
+        gradient = gradient / n_batches
+        high_q_weight = qdq(original_weight, high_bits, high_group_size)
+        param_size = original_weight.size / 1e6
+        alignment = (gradient * (low_q_weight - high_q_weight)).sum()
+        return alignment / param_size
+
+    sensitivities = tree_map(
+        compute_sensitivity,
+        grad_accum,
+        q_model.parameters(),
+        model.parameters(),
+    )
+    mx.eval(sensitivities)
+
+    sensitivities = [(k[:-7], s.item()) for k, s in tree_flatten(sensitivities)]
 
     return sensitivities
 
@@ -170,6 +179,10 @@ def main():
         sensitivities = estimate_sensitivities(
             model,
             data,
+            args.low_bits,
+            args.low_group_size,
+            args.high_bits,
+            args.high_group_size,
         )
         model_name = args.model.replace("/", "_")
         with open(f"{model_name}_sensitivities.json", "w") as fid:
