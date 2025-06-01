@@ -653,7 +653,7 @@ class APIHandler(BaseHTTPRequestHandler):
         ):
             segment = gen_response.text
             text += segment
-            logging.debug(text)
+            logging.debug(segment)
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
