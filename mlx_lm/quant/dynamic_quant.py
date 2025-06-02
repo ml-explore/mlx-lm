@@ -218,7 +218,7 @@ def main():
             return {"bits": args.high_bits, "group_size": args.high_group_size}
         return True
 
-    weights, config = quantize_model(
+    model, config = quantize_model(
         model,
         config,
         q_group_size=args.low_group_size,
@@ -233,7 +233,7 @@ def main():
     save(
         args.mlx_path,
         model_path,
-        weights,
+        model,
         tokenizer,
         config,
         hf_repo=args.model,
