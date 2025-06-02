@@ -3,7 +3,7 @@
 To reduce the quality loss from quantization MLX LM has several options:
 
 - Distilled Weight Quantization (DWQ)
-- Activation-aware Weight Quantization (AWQ)[^1].
+- Activation-aware Weight Quantization (AWQ)[^1]
 - Dynamic quantization
 
 All methods use calibration data to tune parameters or hyper-parameters of the
@@ -83,7 +83,7 @@ mlx_lm.dynamic_quant --model mistralai/Mistral-7B-Instruct-v0.3
 The script will estimate the sensitivity for each quantizable layer in the
 model. It will then quantize the model using higher precision (default 5 bits)
 for the more sensitive layers and lower precision (default 4 bits) for the
-rest. The script also saves a JSON file with each layers sensitivities which
+rest. The script also saves a JSON file with each layer's sensitivities which
 saves needing to compute it multiple times to make different precision quants
 of the same model.
 
