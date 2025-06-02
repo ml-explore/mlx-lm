@@ -33,7 +33,7 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
 else:
     from huggingface_hub import snapshot_download
 
-from mlx.utils import tree_flatten, tree_reduce
+from mlx.utils import tree_flatten, tree_map, tree_reduce
 from transformers import PreTrainedTokenizer
 
 # Local imports
@@ -393,7 +393,7 @@ def save_model(
         "weight_map": {},
     }
     if donate_model:
-        del model
+        model.update(tree_map(lambda _: mx.array([]), model.parameters()))
 
     # Write the weights and make sure no references are kept other than the
     # necessary ones
@@ -503,7 +503,7 @@ def save_config(
 def save(
     dst_path: Union[str, Path],
     src_path: Union[str, Path],
-    weights: Dict[str, mx.array],
+    model: nn.Module,
     tokenizer: TokenizerWrapper,
     config: Dict[str, Any],
     hf_repo: Optional[str] = None,
@@ -511,7 +511,7 @@ def save(
 ):
     src_path = Path(src_path)
     dst_path = Path(dst_path)
-    save_model(dst_path, weights, donate_model=True)
+    save_model(dst_path, model, donate_model=True)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 
