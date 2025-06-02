@@ -1,7 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass, field
-from dataclasses import fields as dataclass_fields
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx

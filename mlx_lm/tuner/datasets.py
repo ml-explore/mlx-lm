@@ -1,7 +1,9 @@
+# Copyright © 2024 Apple Inc.
+
 import json
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from transformers import PreTrainedTokenizer
 
@@ -25,7 +27,7 @@ class TextDataset:
         d = self.tokenizer.encode(d[self.text_key])
         if d[-1] != self.tokenizer.eos_token_id:
             d.append(self.tokenizer.eos_token_id)
-        return d
+        return (d, 0)
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -61,7 +63,7 @@ class ChatDataset:
             offset = len(self.tokenizer.apply_chat_template(messages, tools=tools))
             return (tokens, offset)
         else:
-            return tokens
+            return (tokens, 0)
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -106,7 +108,7 @@ class CompletionsDataset:
             )
             return (tokens, offset)
 
-        return tokens
+        return (tokens, 0)
 
     def __getitem__(self, idx: int):
         return self._data[idx]

@@ -8,7 +8,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from . import llama
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import BaseModelArgs
 
 
 @dataclass

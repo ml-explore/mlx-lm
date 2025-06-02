@@ -4,8 +4,6 @@ from pathlib import Path
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .gguf import convert_to_gguf
-from .tuner.dora import DoRAEmbedding, DoRALinear
-from .tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 from .tuner.utils import dequantize, load_adapters
 from .utils import (
     fetch_from_hub,

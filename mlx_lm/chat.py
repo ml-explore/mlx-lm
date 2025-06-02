@@ -1,7 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
-import json
 
 import mlx.core as mx
 

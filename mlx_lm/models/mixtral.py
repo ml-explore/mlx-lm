@@ -1,8 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn

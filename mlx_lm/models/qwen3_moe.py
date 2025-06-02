@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -8,7 +7,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -19,7 +17,6 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
-    num_experts_per_tok: int
     num_experts: int
     num_experts_per_tok: int
     decoder_sparse_step: int
