@@ -594,11 +594,10 @@ def main():
     )
 
     config = update_config(model, config)
-    weights = dict(tree_flatten(model.parameters()))
     save(
         args.mlx_path,
         model_path,
-        weights,
+        model,
         tokenizer,
         config,
         hf_repo=args.model,

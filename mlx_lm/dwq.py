@@ -236,7 +236,7 @@ def main():
     save(
         args.mlx_path,
         model_path,
-        dict(tree_flatten(q_model.parameters())),
+        q_model,
         tokenizer,
         config,
         hf_repo=args.model,

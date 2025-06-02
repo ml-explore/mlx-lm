@@ -263,20 +263,24 @@ def remove_lora_layers(model: nn.Module) -> nn.Module:
     return model
 
 
-def nparams(module):
-    if hasattr(module, "bits"):
-        n = 0 if not hasattr(module, "bias") else module.bias.size
-        return n + module.weight.size * 32 // module.bits
-    return sum(v.size for _, v in tree_flatten(module.parameters()))
-
-
-def print_trainable_parameters(model):
+def get_total_parameters(model):
     leaf_modules = tree_flatten(
         model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
     )
-    total_p = sum(nparams(m) for _, m in leaf_modules) / 10**6
+
+    def nparams(m):
+        if hasattr(m, "bits"):
+            n = 0 if not hasattr(m, "bias") else m.bias.size
+            return n + m.weight.size * 32 // m.bits
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
+
+    return sum(nparams(m) for _, m in leaf_modules)
+
+
+def print_trainable_parameters(model):
+    total_p = get_total_parameters(model) / 1e6
     trainable_p = (
-        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
+        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 1e6
     )
     print(
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
