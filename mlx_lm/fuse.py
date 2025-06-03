@@ -75,7 +75,9 @@ def main() -> None:
     model = load_adapters(model, args.adapter_path)
 
     fused_linears = [
-        (n, m.fuse()) for n, m in model.named_modules() if hasattr(m, "fuse")
+        (n, m.fuse(de_quantize=args.de_quantize))
+        for n, m in model.named_modules()
+        if hasattr(m, "fuse")
     ]
 
     if fused_linears:
