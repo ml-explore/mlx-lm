@@ -326,7 +326,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
             h = moe_h * (1 - coef) + output_mlp * coef
         else:
             h = moe_h
-        return r * self.layernorm_mlp_alpha + moe_h * self.layernorm_mlp_beta
+        return r * self.layernorm_mlp_alpha + h * self.layernorm_mlp_beta
 
 
 class MiniMaxText01Model(nn.Module):
