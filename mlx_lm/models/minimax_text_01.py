@@ -19,7 +19,6 @@ class ModelArgs(BaseModelArgs):
     attn_type_list: List[int]
     head_dim: int
     hidden_size: int
-    initializer_range: float
     intermediate_size: int
     layernorm_full_attention_alpha: float
     layernorm_full_attention_beta: float
@@ -29,22 +28,19 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     num_key_value_heads: int
     num_local_experts: int
-    output_router_logits: bool
     rms_norm_eps: float
     rope_theta: int
     rotary_dim: int
     router_aux_loss_coef: float
-    router_jitter_noise: float
     shared_intermediate_size: int
-    sliding_window: Optional[int]
     tie_word_embeddings: bool
-    vocab_size: int = 200064
+    vocab_size: int
     layernorm_linear_attention_alpha: float = 1
     layernorm_linear_attention_beta: float = 1
     layernorm_mlp_alpha: float = 1
     layernorm_mlp_beta: float = 1
     mlp_bias: bool = False
-    postnorm: bool = False
+    postnorm: bool = True
 
 
 BLOCK: int = 256
@@ -202,7 +198,6 @@ class MiniMaxText01AttentionType1(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        slope_rate: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
