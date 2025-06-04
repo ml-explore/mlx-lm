@@ -217,8 +217,13 @@ class KVCache(_BaseCache):
         self.values = None
         self.offset = 0
         self.step = 256
+        self._initial_state = None
 
     def update_and_fetch(self, keys, values):
+        # Store initial state if not already stored
+        if self._initial_state is None:
+            self._initial_state = (keys, values, self.offset)
+
         prev = self.offset
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
@@ -241,6 +246,14 @@ class KVCache(_BaseCache):
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    def reset_to_initial_state(self):
+        """Reset the cache back to its initial state."""
+        if self._initial_state is None:
+            self._initial_state = self.keys, self.values, self.offset
+            self.offset = self.offset
+        else:
+            self.keys, self.values, self.offset = self._initial_state
 
     @property
     def state(self):
