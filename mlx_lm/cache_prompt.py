@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+import os
 
 import mlx.core as mx
 
@@ -105,7 +106,15 @@ def main():
         tokenizer_config=tokenizer_config,
     )
 
-    args.prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    if args.prompt == "-":
+        args.prompt = sys.stdin.read()
+    else:
+        # check if args.prompt is a file
+        if os.path.isfile(args.prompt):
+            with open(args.prompt, "r") as f:
+                args.prompt = f.read()
+        else:
+            args.prompt = args.prompt.strip()
 
     if args.use_default_chat_template:
         if tokenizer.chat_template is None:
