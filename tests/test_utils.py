@@ -68,7 +68,8 @@ class TestUtils(unittest.TestCase):
             vocab_size=10_000,
         )
         model = llama.Model(args)
-        weights, config = utils.quantize_model(model, {}, 64, 4)
+        model, config = utils.quantize_model(model, {}, 64, 4)
+        weights = dict(tree_flatten(model.parameters()))
         self.assertTrue("model.layers.2.mlp.up_proj.scales" in weights)
         self.assertTrue("model.layers.2.mlp.up_proj.biases" in weights)
         self.assertEqual(config["quantization"]["group_size"], 64)

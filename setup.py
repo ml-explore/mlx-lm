@@ -29,12 +29,13 @@ setup(
     extras_require={
         "test": ["datasets"],
         "evaluate": ["lm-eval", "tqdm"],
-        "lwq": ["datasets"],
+        "quant": ["datasets", "tqdm"],
     },
     entry_points={
         "console_scripts": [
-            "mlx_lm.awq = mlx_lm.awq:main",
-            "mlx_lm.dwq = mlx_lm.dwq:main",
+            "mlx_lm.awq = mlx_lm.quant.awq:main",
+            "mlx_lm.dwq = mlx_lm.quant.dwq:main",
+            "mlx_lm.dynamic_quant = mlx_lm.quant.dynamic_quant:main",
             "mlx_lm.cache_prompt = mlx_lm.cache_prompt:main",
             "mlx_lm.chat = mlx_lm.chat:main",
             "mlx_lm.convert = mlx_lm.convert:main",
@@ -42,7 +43,6 @@ setup(
             "mlx_lm.fuse = mlx_lm.fuse:main",
             "mlx_lm.generate = mlx_lm.generate:main",
             "mlx_lm.lora = mlx_lm.lora:main",
-            "mlx_lm.merge = mlx_lm.merge:main",
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.manage = mlx_lm.manage:main",
             "mlx_lm.upload = mlx_lm.upload:main",

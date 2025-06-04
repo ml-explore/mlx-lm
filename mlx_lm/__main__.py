@@ -5,8 +5,9 @@ import sys
 
 if __name__ == "__main__":
     subcommands = {
-        "awq",
-        "dwq",
+        "quant.awq",
+        "quant.dwq",
+        "quant.dynamic_quant",
         "cache_prompt",
         "chat",
         "convert",
@@ -14,7 +15,6 @@ if __name__ == "__main__":
         "fuse",
         "generate",
         "lora",
-        "merge",
         "server",
         "manage",
         "upload",

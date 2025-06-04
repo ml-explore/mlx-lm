@@ -33,13 +33,13 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
 else:
     from huggingface_hub import snapshot_download
 
-from mlx.utils import tree_flatten, tree_reduce
+from mlx.utils import tree_flatten, tree_map, tree_reduce
 from transformers import PreTrainedTokenizer
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .tuner.utils import dequantize as dequantize_model
-from .tuner.utils import load_adapters, nparams
+from .tuner.utils import get_total_parameters, load_adapters
 
 # Constants
 MODEL_REMAPPING = {
@@ -77,10 +77,7 @@ def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
     )
-    leaf_modules = tree_flatten(
-        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
-    )
-    model_params = sum(nparams(m) for _, m in leaf_modules)
+    model_params = get_total_parameters(model)
     return model_bytes * 8 / model_params
 
 
@@ -367,17 +364,18 @@ def upload_to_hub(path: str, upload_repo: str):
     print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
 
 
-def save_weights(
+def save_model(
     save_path: Union[str, Path],
-    weights: Dict[str, Any],
+    model: nn.Module,
     *,
-    donate_weights: bool = False,
+    donate_model: bool = False,
 ) -> None:
-    """Save model weights into specified directory."""
+    """Save model weights and metadata index into specified directory."""
     if isinstance(save_path, str):
         save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
 
+    weights = dict(tree_flatten(model.parameters()))
     shards = make_shards(weights)
     shards_count = len(shards)
     shard_file_format = (
@@ -387,13 +385,20 @@ def save_weights(
     )
 
     total_size = sum(v.nbytes for v in weights.values())
-    index_data = {"metadata": {"total_size": total_size}, "weight_map": {}}
+    index_data = {
+        "metadata": {
+            "total_size": total_size,
+            "total_parameters": get_total_parameters(model),
+        },
+        "weight_map": {},
+    }
+    if donate_model:
+        model.update(tree_map(lambda _: mx.array([]), model.parameters()))
 
     # Write the weights and make sure no references are kept other than the
     # necessary ones
-    if donate_weights:
-        weights.clear()
-        del weights
+    weights.clear()
+    del weights
 
     for i in range(len(shards)):
         shard = shards[i]
@@ -443,7 +448,7 @@ def quantize_model(
             a dict of quantization parameters to pass to `to_quantized`.
 
     Returns:
-        Tuple: Tuple containing quantized weights and config.
+        Tuple: Tuple containing quantized model and config.
     """
     if "quantization" in config:
         raise ValueError("Cannot quantize already quantized model")
@@ -464,12 +469,11 @@ def quantize_model(
     )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
-    quantized_weights = dict(tree_flatten(model.parameters()))
 
     bpw = compute_bits_per_weight(model)
     print(f"[INFO] Quantized model with {bpw:.3f} bits per weight.")
 
-    return quantized_weights, quantized_config
+    return model, quantized_config
 
 
 def save_config(
@@ -499,15 +503,15 @@ def save_config(
 def save(
     dst_path: Union[str, Path],
     src_path: Union[str, Path],
-    weights: Dict[str, mx.array],
+    model: nn.Module,
     tokenizer: TokenizerWrapper,
     config: Dict[str, Any],
     hf_repo: Optional[str] = None,
-    donate_weights: bool = True,
+    donate_model: bool = True,
 ):
     src_path = Path(src_path)
     dst_path = Path(dst_path)
-    save_weights(dst_path, weights, donate_weights=True)
+    save_model(dst_path, model, donate_model=True)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 

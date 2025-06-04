@@ -1,21 +1,26 @@
 # Learned Quantization 
 
-To reduce the quality loss from quantization MLX LM has two options:
+To reduce the quality loss from quantization MLX LM has several options:
 
 - Distilled Weight Quantization (DWQ)
-- Activation-aware Weight Quantization (AWQ)[^1].
+- Activation-aware Weight Quantization (AWQ)[^1]
+- Dynamic quantization
 
-Both DWQ and AWQ use an example dataset to tune parameters of the model. DWQ
-fine-tunes non-quantized parameters (including quantization scales and biases)
-using the non-quantized model as a teacher. AWQ scales and clips the weights
-prior to quantization. The scaling and clipping values are found with a grid
-search minimizing the distance from the quantized hidden activations to the
-non-quantized hidden activations
+All methods use calibration data to tune parameters or hyper-parameters of the
+model. DWQ fine-tunes non-quantized parameters (including quantization scales
+and biases) using the non-quantized model as a teacher. AWQ scales and clips
+the weights prior to quantization. Dynamic quantization estimates the
+sensitivity of a model's outputs to each layer and uses a higher precision for
+layers which have higher sensitivity.
+
+Dynamic quantization is the fastest to run. DWQ takes longer but typically
+yields better results. You can also cascade methods. For example a dynamically
+quantized model can be further refined with DWQ.
 
 To get started, first install the requirements:
 
 ```
-pip install mlx-lm[lwq]
+pip install mlx-lm[quant]
 ```
 
 ### DWQ
@@ -66,6 +71,30 @@ A few options to reduce memory use for DWQ:
   `--max-seq-length 512` reduces the memory and still gets good results.
 - Use a smaller batch size, e.g. `--batch-size 1`
 
+### Dynamic Quantization
+
+Use `mlx_lm.dynamic_quant` to generate a dynamic quantization of given model.
+For example:
+
+```bash
+mlx_lm.dynamic_quant --model mistralai/Mistral-7B-Instruct-v0.3
+```
+
+The script will estimate the sensitivity for each quantizable layer in the
+model. It will then quantize the model using higher precision (default 5 bits)
+for the more sensitive layers and lower precision (default 4 bits) for the
+rest. The script also saves a JSON file with each layer's sensitivities which
+saves needing to compute it multiple times to make different precision quants
+of the same model.
+
+Some important options are:
+
+- `--target-bpw`: The target bits-per-weight. For a given set of quantization
+  parameters only certain ranges are possible. For example, with the default
+  parameters a BPW in the range `[4.5, 5.5]` is achievable.
+- `--sensitivities`: A path to a precomputed sensitivities file.
+- `--low-bits`: The number of bits to use for the less sensitive layers.
+- `--high-bits`: The number of bits to use for the more sensitive layers.
 
 ### AWQ 
 

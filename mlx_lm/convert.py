@@ -6,7 +6,7 @@ from typing import Callable, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_map_with_path
 
 from .utils import (
     dequantize_model,
@@ -120,44 +120,36 @@ def convert(
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
-    weights = dict(tree_flatten(model.parameters()))
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
         dtype = getattr(mx, dtype)
+        cast_predicate = getattr(model, "cast_predicate", lambda _: True)
 
-        if hasattr(model, "cast_predicate"):
-            cast_predicate = model.cast_predicate()
-        else:
-            cast_predicate = lambda _: True
-        weights = {
-            k: (
-                v.astype(dtype)
-                if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating)
-                else v
-            )
-            for k, v in weights.items()
-        }
+        def set_dtype(k, v):
+            if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
+                return v.astype(dtype)
+            else:
+                return v
+
+        model.update(tree_map_with_path(set_dtype, model.parameters()))
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
         print("[INFO] Quantizing")
-        model.load_weights(list(weights.items()))
-        weights, config = quantize_model(
+        model, config = quantize_model(
             model, config, q_group_size, q_bits, quant_predicate=quant_predicate
         )
 
     if dequantize:
         print("[INFO] Dequantizing")
         model = dequantize_model(model)
-        weights = dict(tree_flatten(model.parameters()))
 
-    del model
     save(
         mlx_path,
         model_path,
-        weights,
+        model,
         tokenizer,
         config,
         hf_repo=hf_path,

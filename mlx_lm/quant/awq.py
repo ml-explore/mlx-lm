@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.switch_layers import SwitchLinear
+from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     fetch_from_hub,
     get_model_path,
@@ -510,23 +511,6 @@ def awq_quantize(
         )
 
 
-def load_dataset(tokenizer, num_samples: int, sequence_length: int) -> mx.array:
-    save_dir = Path.home() / ".cache/mlx-lm/calibration_v5.txt"
-    if not save_dir.exists():
-        save_dir.parent.mkdir(parents=True, exist_ok=True)
-        url = "https://gist.githubusercontent.com/tristandruyen/9e207a95c7d75ddf37525d353e00659c/raw/571fda718462de863e5a0171078c175420c7649a/calibration_data_v5_rc.txt"
-        request.urlretrieve(url, save_dir)
-    with open(save_dir) as fid:
-        texts = fid.read()
-    tokens = tokenizer.encode(texts, return_tensors="mlx")[0]
-
-    # select random non-overlapping chunks
-    tokens = tokens[: (tokens.size // sequence_length) * sequence_length]
-    tokens = tokens.reshape(-1, sequence_length)
-    segments = mx.random.permutation(tokens.shape[0])[:num_samples]
-    return tokens[segments]
-
-
 def update_config(
     model: nn.Module,
     config: Dict[str, Any],
@@ -578,7 +562,7 @@ def main():
     if (awq_config := AWQ_MODEL_CONFIGS.get(model_type, None)) is None:
         raise NotImplementedError(f"AWQ support for {model_type} models NYI.")
 
-    calibration_data = load_dataset(tokenizer, args.num_samples, args.sequence_length)
+    calibration_data = load_data(tokenizer, args.num_samples, args.sequence_length)
 
     calibration_data = dist_split(calibration_data, group)
 
@@ -594,11 +578,10 @@ def main():
     )
 
     config = update_config(model, config)
-    weights = dict(tree_flatten(model.parameters()))
     save(
         args.mlx_path,
         model_path,
-        weights,
+        model,
         tokenizer,
         config,
         hf_repo=args.model,
