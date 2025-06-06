@@ -117,6 +117,7 @@ def linear_to_lora_layers(
         "glm4",
         "mimo",
         "ernie4_5",
+        "dots1",
     ]:
         keys = set(["self_attn.q_proj", "self_attn.v_proj"])
         if model.model_type in ["mixtral", "phimoe"]:
@@ -124,7 +125,7 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe"]:
+        if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
 
     elif model.model_type == "gpt_bigcode":
