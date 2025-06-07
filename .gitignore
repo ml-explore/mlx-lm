@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+minicpm4-test.py
 
 # C extensions
 *.so
