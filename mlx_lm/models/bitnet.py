@@ -160,8 +160,9 @@ class BitLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # Initialize weights in packed format
-        self.weight = mx.zeros((out_features // VALUES_PER_ITEM, in_features), dtype=mx.uint8)
+        # Calculate packed dimensions - the first dimension gets packed 4:1
+        packed_out_features = (out_features + 3) // 4
+        self.weight = mx.zeros((packed_out_features, in_features), dtype=mx.uint8)
         self.weight_scale = mx.array([1.0], dtype=dtype)
 
         if bias:
@@ -267,27 +268,20 @@ class BitLinear(nn.Module):
 
     def __call__(self, x):
         """
-        Forward pass using custom kernel to avoid memory overhead.
+        Forward pass with weight scaling applied correctly.
         """
         org_dtype = x.dtype
 
-        # Quantize the input
-        input_quant, input_scale = self.activation_quant(x)
-        input_quant = input_quant.astype(self.dtype)
+        # Use custom kernel for matrix multiplication directly on packed weights
+        y = self.bitlinear_kernel(x, self.weight)
 
-        # Use custom kernel for matrix multiplication with packed weights
-        y = self.bitlinear_kernel(input_quant, self.weight)
-
-        # Rescale the output
-        y = y / input_scale
+        # Apply weight scaling
+        y = y * self.weight_scale
 
         # Add bias if present
         if self.bias is not None:
             y = y + self.bias
-
         return y.astype(org_dtype)
-
-
 
 
 class Attention(nn.Module):
