@@ -353,6 +353,7 @@ class Attention(nn.Module):
 
         return output
 
+@partial(mx.compile, shapeless=True)
 def relu2(x):
     return mx.square(nn.relu(x))
 
