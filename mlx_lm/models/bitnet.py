@@ -152,7 +152,7 @@ def unpack_weights(packed, dtype=mx.float32):
 
 class BitLinear(nn.Module):
     """
-    BitLinear module with optimized weight unpacking.
+    BitLinear module with memory-efficient weight handling.
     """
     def __init__(self, in_features, out_features, bias=True, dtype=mx.float32):
         super().__init__()
@@ -169,58 +169,85 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
-        # Cache for unpacked weights to avoid repeated unpacking
-        self._unpacked_weights = None
-        self._weight_hash = None
-
-    def get_unpacked_weights(self):
+    def bitlinear_kernel(self, x, packed_weights):
         """
-        Get unpacked weights with caching to avoid repeated expensive unpacking.
+        Custom Metal kernel that performs matrix multiplication directly on packed weights.
+        This eliminates the need to store unpacked weights in memory.
         """
-        # Simple hash to check if weights changed
-        current_hash = hash(self.weight.data_ptr() if hasattr(self.weight, 'data_ptr') else id(self.weight))
+        source = """
+        uint tid = thread_position_in_grid.x;
+        uint total_elements = batch_size * out_features;
 
-        if self._unpacked_weights is None or self._weight_hash != current_hash:
-            self._unpacked_weights = self.optimized_unpack_weights(self.weight)
-            self._weight_hash = current_hash
+        if (tid >= total_elements) return;
 
-        return self._unpacked_weights
+        uint batch_idx = tid / out_features;
+        uint out_idx = tid % out_features;
 
-    def optimized_unpack_weights(self, packed):
+        float sum = 0.0;
+
+        // Calculate packed dimensions
+        uint packed_rows = out_features / 4;  // Each packed row contains 4 output rows
+
+        for (uint i = 0; i < in_features; i++) {
+            // Get input value
+            float x_val = x[batch_idx * in_features + i];
+
+            // Determine which packed row and which bit position within that packed value
+            uint which_slice = out_idx / packed_rows;  // Which of the 4 slices (0, 1, 2, 3)
+            uint row_in_slice = out_idx % packed_rows;  // Which row within that slice
+
+            // Get the packed weight value
+            uint packed_idx = row_in_slice * in_features + i;
+            uint8_t packed_val = packed_weights[packed_idx];
+
+            // Extract the 2-bit value for this slice
+            uint8_t mask = 3 << (2 * which_slice);  // 0b11 shifted to the right position
+            uint8_t weight_bits = (packed_val & mask) >> (2 * which_slice);
+
+            // Convert from {0,1,2} back to {-1,0,1}
+            float weight_val = float(weight_bits) - 1.0;
+
+            sum += x_val * weight_val;
+        }
+
+        out[tid] = sum;
         """
-        Significantly optimized weight unpacking using vectorized operations.
-        """
-        packed_shape = packed.shape
 
-        if len(packed_shape) == 1:
-            original_row_dim = packed_shape[0] * VALUES_PER_ITEM
-            unpacked_shape = (original_row_dim,)
+        # Handle multi-dimensional inputs by flattening all but the last dimension
+        original_shape = x.shape
+        if len(original_shape) > 2:
+            # Flatten to (total_batch_elements, in_features)
+            x_flattened = x.reshape(-1, original_shape[-1])
+            total_batch_elements = x_flattened.shape[0]
+            in_features = x_flattened.shape[1]
         else:
-            original_row_dim = packed_shape[0] * VALUES_PER_ITEM
-            unpacked_shape = (original_row_dim, *packed_shape[1:])
+            x_flattened = x
+            total_batch_elements, in_features = x_flattened.shape
 
-        # Create all masks at once
-        masks = mx.array([3 << (2 * i) for i in range(VALUES_PER_ITEM)], dtype=mx.uint8)
+        out_features = self.out_features
 
-        # Vectorized unpacking
-        unpacked_parts = []
-        for i in range(VALUES_PER_ITEM):
-            mask = masks[i]
-            masked = mx.bitwise_and(packed, mask)
-            shifted = mx.right_shift(masked, 2 * i)
-            unpacked_parts.append(shifted)
+        kernel = mx.fast.metal_kernel(
+            name="bitlinear_matmul",
+            input_names=["x", "packed_weights"],
+            output_names=["out"],
+            source=source,
+        )
 
-        # Concatenate all parts efficiently
-        if len(packed_shape) == 1:
-            unpacked = mx.concatenate(unpacked_parts, axis=0)
+        outputs = kernel(
+            inputs=[x_flattened.astype(self.dtype), packed_weights],
+            template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
+            grid=(total_batch_elements * out_features, 1, 1),
+            threadgroup=(min(256, total_batch_elements * out_features), 1, 1),
+            output_shapes=[(total_batch_elements, out_features)],
+            output_dtypes=[self.dtype],
+        )
+
+        # Reshape output back to match input shape but with out_features as last dimension
+        if len(original_shape) > 2:
+            output_shape = original_shape[:-1] + (out_features,)
+            return outputs[0].reshape(output_shape)
         else:
-            unpacked = mx.concatenate(unpacked_parts, axis=0)
-
-        # Trim to correct size if needed
-        if unpacked.shape[0] > unpacked_shape[0]:
-            unpacked = unpacked[:unpacked_shape[0]]
-
-        return unpacked.astype(self.dtype) - 1
+            return outputs[0]
 
     def activation_quant(self, x, num_bits=8):
         """
@@ -240,19 +267,16 @@ class BitLinear(nn.Module):
 
     def __call__(self, x):
         """
-        Forward pass with optimized weight handling.
+        Forward pass using custom kernel to avoid memory overhead.
         """
         org_dtype = x.dtype
-
-        # Get cached unpacked weights (major speedup here)
-        w_quant = self.get_unpacked_weights()
 
         # Quantize the input
         input_quant, input_scale = self.activation_quant(x)
         input_quant = input_quant.astype(self.dtype)
 
-        # Perform the linear transformation
-        y = mx.matmul(input_quant, w_quant.T)
+        # Use custom kernel for matrix multiplication with packed weights
+        y = self.bitlinear_kernel(input_quant, self.weight)
 
         # Rescale the output
         y = y / input_scale
@@ -262,7 +286,6 @@ class BitLinear(nn.Module):
             y = y + self.bias
 
         return y.astype(org_dtype)
-
 
 
 
