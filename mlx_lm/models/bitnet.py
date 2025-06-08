@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-
+from functools import partial
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 
@@ -36,7 +36,7 @@ class ModelArgs(BaseModelArgs):
 # the weights are ternary so can be represented with 2 bits, and they are packed in uint8 tensors, hence the number of values per item is 4
 VALUES_PER_ITEM = 4
 
-
+@partial(mx.compile, shapeless=True)
 def pack_weights(quantized_weights):
     """
     Packs a tensor of quantized weights into a compact format using 2 bits per value.
@@ -78,7 +78,6 @@ def pack_weights(quantized_weights):
             packed = mx.indexed_update(packed, indices, mx.bitwise_or(packed[:end-start], shift_value))
 
     return packed
-
 
 def unpack_weights(packed, dtype=mx.float32):
     """
@@ -236,6 +235,7 @@ class BitLinear(nn.Module):
         mx.array
             Output after linear transformation with quantized weights.
         """
+        org_dtype = x.dtype
         # Unpack the quantized weights
         w_quant = unpack_weights(self.weight, dtype=self.dtype)
 
@@ -255,7 +255,7 @@ class BitLinear(nn.Module):
         if self.bias is not None:
             y = y + self.bias
 
-        return y
+        return y.astype(org_dtype)
 
 
 class Attention(nn.Module):
@@ -395,6 +395,7 @@ class LlamaModel(nn.Module):
     ):
         h = self.embed_tokens(inputs)
 
+
         if mask is None:
             mask = create_attention_mask(h, cache)
 
@@ -403,6 +404,7 @@ class LlamaModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
+
 
         return self.norm(h)
 
