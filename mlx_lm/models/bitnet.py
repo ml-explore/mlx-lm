@@ -8,6 +8,7 @@ import mlx.nn as nn
 from functools import partial
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
+import numpy as np
 
 
 @dataclass
@@ -151,9 +152,7 @@ def unpack_weights(packed, dtype=mx.float32):
 
 class BitLinear(nn.Module):
     """
-    BitLinear module for MLX that uses 1.58-bit quantization.
-
-    Mimics the functionality of the PyTorch BitLinear class.
+    BitLinear module with optimized weight unpacking.
     """
     def __init__(self, in_features, out_features, bias=True, dtype=mx.float32):
         super().__init__()
@@ -170,23 +169,62 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
+        # Cache for unpacked weights to avoid repeated unpacking
+        self._unpacked_weights = None
+        self._weight_hash = None
+
+    def get_unpacked_weights(self):
+        """
+        Get unpacked weights with caching to avoid repeated expensive unpacking.
+        """
+        # Simple hash to check if weights changed
+        current_hash = hash(self.weight.data_ptr() if hasattr(self.weight, 'data_ptr') else id(self.weight))
+
+        if self._unpacked_weights is None or self._weight_hash != current_hash:
+            self._unpacked_weights = self.optimized_unpack_weights(self.weight)
+            self._weight_hash = current_hash
+
+        return self._unpacked_weights
+
+    def optimized_unpack_weights(self, packed):
+        """
+        Significantly optimized weight unpacking using vectorized operations.
+        """
+        packed_shape = packed.shape
+
+        if len(packed_shape) == 1:
+            original_row_dim = packed_shape[0] * VALUES_PER_ITEM
+            unpacked_shape = (original_row_dim,)
+        else:
+            original_row_dim = packed_shape[0] * VALUES_PER_ITEM
+            unpacked_shape = (original_row_dim, *packed_shape[1:])
+
+        # Create all masks at once
+        masks = mx.array([3 << (2 * i) for i in range(VALUES_PER_ITEM)], dtype=mx.uint8)
+
+        # Vectorized unpacking
+        unpacked_parts = []
+        for i in range(VALUES_PER_ITEM):
+            mask = masks[i]
+            masked = mx.bitwise_and(packed, mask)
+            shifted = mx.right_shift(masked, 2 * i)
+            unpacked_parts.append(shifted)
+
+        # Concatenate all parts efficiently
+        if len(packed_shape) == 1:
+            unpacked = mx.concatenate(unpacked_parts, axis=0)
+        else:
+            unpacked = mx.concatenate(unpacked_parts, axis=0)
+
+        # Trim to correct size if needed
+        if unpacked.shape[0] > unpacked_shape[0]:
+            unpacked = unpacked[:unpacked_shape[0]]
+
+        return unpacked.astype(self.dtype) - 1
+
     def activation_quant(self, x, num_bits=8):
         """
         Performs symmetric, per-token quantization on the input activations.
-
-        Parameters:
-        -----------
-        x : mx.array
-            Input activations to be quantized.
-        num_bits : int, optional (default=8)
-            Number of bits to use for quantization.
-
-        Returns:
-        --------
-        result : mx.array
-            Quantized activation tensor.
-        scale : mx.array
-            The per-channel scaling factors used for quantization.
         """
         Qn = -(2 ** (num_bits - 1))
         Qp = 2 ** (num_bits - 1) - 1
@@ -200,62 +238,33 @@ class BitLinear(nn.Module):
 
         return result.astype(mx.int8), scale
 
-    def post_quant_process(self, x, input_scale, weight_scale=None):
-        """
-        Rescales the output after quantized matrix multiplication.
-
-        Parameters:
-        -----------
-        x : mx.array
-            Result of the quantized matrix multiplication.
-        weight_scale : mx.array
-            Scaling factor for the weights.
-        input_scale : mx.array
-            Scaling factor for the inputs.
-
-        Returns:
-        --------
-        mx.array
-            Rescaled output.
-        """
-        scale = input_scale * weight_scale if weight_scale is not None else input_scale
-        return x / scale
-
     def __call__(self, x):
         """
-        Forward pass of the BitLinear layer.
-
-        Parameters:
-        -----------
-        x : mx.array
-            Input tensor.
-
-        Returns:
-        --------
-        mx.array
-            Output after linear transformation with quantized weights.
+        Forward pass with optimized weight handling.
         """
         org_dtype = x.dtype
-        # Unpack the quantized weights
-        w_quant = unpack_weights(self.weight, dtype=self.dtype)
 
-        # # Quantize the input
+        # Get cached unpacked weights (major speedup here)
+        w_quant = self.get_unpacked_weights()
+
+        # Quantize the input
         input_quant, input_scale = self.activation_quant(x)
-
-        # # # Convert to same dtype for matrix multiplication
         input_quant = input_quant.astype(self.dtype)
 
         # Perform the linear transformation
         y = mx.matmul(input_quant, w_quant.T)
 
         # Rescale the output
-        y = self.post_quant_process(y, input_scale=input_scale)
+        y = y / input_scale
 
         # Add bias if present
         if self.bias is not None:
             y = y + self.bias
 
         return y.astype(org_dtype)
+
+
+
 
 
 class Attention(nn.Module):
