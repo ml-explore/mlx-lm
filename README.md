@@ -13,18 +13,17 @@ Some key features include:
   with support for quantized models.
 * Distributed inference and fine-tuning with `mx.distributed`
 
-The easiest way to get started is to install the `mlx-lm` package:
-
-**With `pip`**:
-
-```sh
-pip install mlx-lm
-```
-
-**With `conda`**:
+The easiest way to get started is to install the `mlx-lm` package with `conda`:
 
 ```sh
 conda install -c conda-forge mlx-lm
+```
+
+The package is also available on PyPI, but installing it with `pip` may take
+some extra work:
+
+```sh
+pip install mlx-lm
 ```
 
 ### Quick Start
