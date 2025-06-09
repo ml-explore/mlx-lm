@@ -58,7 +58,7 @@ class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
     """
-    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, act_quant_bits=False):
+    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, act_quant_bits=None):
         super().__init__()
         self.dtype = dtype
         self.in_features = in_features
@@ -81,7 +81,7 @@ class BitLinear(nn.Module):
 
     def bitlinear_kernel(self, x, packed_weights):
         """
-        Custom Metal kernel that performs matrix multiplication directly on packed weights.
+        Custom Metal kernel that performs matrix multiplication directly on packed weights and scales the output.
         This eliminates the need to store unpacked weights in memory.
         """
         source = """
@@ -120,7 +120,8 @@ class BitLinear(nn.Module):
             sum += x_val * weight_val;
         }
 
-        out[tid] = sum;
+        // Apply weight scaling
+        out[tid] = sum * weight_scale[0];
         """
 
         # Handle multi-dimensional inputs by flattening all but the last dimension
@@ -140,13 +141,13 @@ class BitLinear(nn.Module):
         if self._compiled_kernel is None:
             self._compiled_kernel = mx.fast.metal_kernel(
                 name="bitlinear_matmul",
-                input_names=["x", "packed_weights"],
+                input_names=["x", "packed_weights", "weight_scale"],
                 output_names=["out"],
                 source=source,
             )
 
         outputs = self._compiled_kernel(
-            inputs=[x_flattened.astype(self.dtype), packed_weights],
+            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale],
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
             threadgroup=(min(256, total_batch_elements * out_features), 1, 1),
@@ -169,21 +170,14 @@ class BitLinear(nn.Module):
         """
         org_dtype = x.dtype
 
-        scale = None
-        if self.act_quant_bits:
-            x, scale = activation_quant(x)
 
         # Use custom kernel for matrix multiplication directly on packed weights
         y = self.bitlinear_kernel(x, self.weight)
 
-        # Apply weight and activation scaling
-        y = y * self.weight_scale
-        if scale is not None:
-            y = y / scale
-
         # Add bias if present
         if self.bias is not None:
-            y = y + self.bias
+
+            y = mx.add(y, self.bias)
 
         return y.astype(org_dtype)
 
