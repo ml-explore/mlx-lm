@@ -57,6 +57,9 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
+        # Add kernel cache 
+        self._compiled_kernel = None
+
     def bitlinear_kernel(self, x, packed_weights):
         """
         Custom Metal kernel that performs matrix multiplication directly on packed weights.
@@ -114,14 +117,16 @@ class BitLinear(nn.Module):
 
         out_features = self.out_features
 
-        kernel = mx.fast.metal_kernel(
-            name="bitlinear_matmul",
-            input_names=["x", "packed_weights"],
-            output_names=["out"],
-            source=source,
-        )
+        # Compile kernel once and cache it
+        if self._compiled_kernel is None:
+            self._compiled_kernel = mx.fast.metal_kernel(
+                name="bitlinear_matmul",
+                input_names=["x", "packed_weights"],
+                output_names=["out"],
+                source=source,
+            )
 
-        outputs = kernel(
+        outputs = self._compiled_kernel(
             inputs=[x_flattened.astype(self.dtype), packed_weights],
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
