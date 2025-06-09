@@ -28,7 +28,6 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
-    act_quant_bits: int = None # N-bit quantization of activations (None means no quantization)
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -37,28 +36,11 @@ class ModelArgs(BaseModelArgs):
 # the weights are ternary so can be represented with 2 bits, and they are packed in uint8 tensors, hence the number of values per item is 4
 VALUES_PER_ITEM = 4
 
-@partial(mx.compile, shapeless=True)
-def activation_quant(x, num_bits=8):
-    """
-    Performs symmetric, per-token quantization on the input activations.
-    """
-    Qn = -(2 ** (num_bits - 1))
-    Qp = 2 ** (num_bits - 1) - 1
-
-    # Find max value along last dimension
-    max_abs = mx.max(mx.abs(x), axis=-1, keepdims=True)
-    max_abs = mx.maximum(max_abs, 1e-5)  # Clamp to avoid division by zero
-
-    scale = Qp / max_abs
-    result = mx.clip(mx.round(x * scale), Qn, Qp)
-
-    return result.astype(mx.int8), scale
-
 class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
     """
-    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, act_quant_bits=None):
+    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16):
         super().__init__()
         self.dtype = dtype
         self.in_features = in_features
@@ -76,8 +58,6 @@ class BitLinear(nn.Module):
 
         # Add kernel cache
         self._compiled_kernel = None
-
-        self.act_quant_bits = act_quant_bits
 
     def bitlinear_kernel(self, x, packed_weights):
         """
@@ -170,13 +150,11 @@ class BitLinear(nn.Module):
         """
         org_dtype = x.dtype
 
-
         # Use custom kernel for matrix multiplication directly on packed weights
         y = self.bitlinear_kernel(x, self.weight)
 
         # Add bias if present
         if self.bias is not None:
-
             y = mx.add(y, self.bias)
 
         return y.astype(org_dtype)
@@ -198,10 +176,10 @@ class Attention(nn.Module):
         else:
             attention_bias = False
 
-        self.q_proj = BitLinear(dim, n_heads * head_dim, bias=attention_bias, act_quant_bits=args.act_quant_bits)
-        self.k_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias, act_quant_bits=args.act_quant_bits)
-        self.v_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias, act_quant_bits=args.act_quant_bits)
-        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias, act_quant_bits=args.act_quant_bits)
+        self.q_proj = BitLinear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -260,9 +238,9 @@ class MLP(nn.Module):
         else:
             mlp_bias = False
 
-        self.gate_proj = BitLinear(dim, hidden_dim, bias=mlp_bias, act_quant_bits=args.act_quant_bits)
-        self.down_proj = BitLinear(hidden_dim, dim, bias=mlp_bias, act_quant_bits=args.act_quant_bits)
-        self.up_proj = BitLinear(dim, hidden_dim, bias=mlp_bias, act_quant_bits=args.act_quant_bits)
+        self.gate_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
+        self.down_proj = BitLinear(hidden_dim, dim, bias=mlp_bias)
+        self.up_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
         self.ffn_sub_norm = nn.RMSNorm(args.intermediate_size, eps=args.rms_norm_eps)
 
     def __call__(self, x) -> mx.array:
