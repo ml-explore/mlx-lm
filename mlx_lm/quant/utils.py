@@ -3,7 +3,14 @@
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_unflatten
 
+from ..models.bitlinear_layers import BitLinear
+
+QUANT_LINEAR_MAPPING = {
+    'bitnet': BitLinear,
+}
 
 def load_data(tokenizer, num_samples: int, sequence_length: int) -> mx.array:
     save_dir = Path.home() / ".cache/mlx-lm/calibration_v5.txt"
@@ -24,3 +31,23 @@ def load_data(tokenizer, num_samples: int, sequence_length: int) -> mx.array:
     if num_samples > 0:
         segments = segments[:num_samples]
     return tokens[segments]
+
+def replace_linear_with_quant_linear(model, quant_method = "bitnet", modules_to_not_convert=None):
+    quantize_layers = []
+    for name, module in model.named_modules():     
+        if modules_to_not_convert is None:
+            modules_to_not_convert = []
+        
+        # Replace nn.Linear layers, but skip 'lm_head'
+        if name not in modules_to_not_convert and isinstance(module, nn.Linear):
+            old_weight = module.weight
+            out_features, in_features = old_weight.shape
+            bias = "bias" in module
+            # Create a new instance of the custom linear layer
+            new_layer = QUANT_LINEAR_MAPPING[quant_method](in_features, out_features, bias=bias, invert_weight_scales=True)
+
+            # Replace the layer in the model
+            quantize_layers.append((name, new_layer))
+    if len(quantize_layers) > 0:
+        model.update_modules(tree_unflatten(quantize_layers))
+    return model

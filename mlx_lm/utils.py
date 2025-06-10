@@ -40,7 +40,7 @@ from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import get_total_parameters, load_adapters
 
 # Quant imports
-from .tuner.utils import replace_linear_with_quant_linear
+from .quant.utils import replace_linear_with_quant_linear
 
 # Constants
 MODEL_REMAPPING = {
