@@ -210,8 +210,9 @@ def load_model(
             bits=quantization["bits"],
             class_predicate=class_predicate,
         )
+
     # We can also handle HF-related quant models such as bitnet
-    elif config.get("quantization_config", None) is not None:
+    if config.get("quantization_config", None) is not None:
         quantization_config = config["quantization_config"]
         quant_method = quantization_config.get("quant_method", None)
         modules_to_not_convert = quantization_config.get("modules_to_not_convert", None)
@@ -219,8 +220,8 @@ def load_model(
         if quant_method is not None and quant_method in SUPPORTED_HF_QUANTIZATIONS:
             # Replace linear layers with quantized versions
             model = replace_linear_with_quant_linear(
-                model, 
-                quant_method=quant_method, 
+                model,
+                quant_method=quant_method,
                 modules_to_not_convert=modules_to_not_convert
             )
 
@@ -478,7 +479,8 @@ def quantize_model(
     if "quantization" in config:
         raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+    quant_method = quantized_config.get("quantization_config", {})
+    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits, **quant_method}
 
     # Add any custom quantization parameters to the config as we go
     def _class_predicate(p, m):
