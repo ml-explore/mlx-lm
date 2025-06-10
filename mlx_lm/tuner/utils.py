@@ -2,7 +2,7 @@
 import json
 import types
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Set
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -32,6 +32,29 @@ def build_schedule(schedule_config: Dict):
         )
     else:
         return bound_schedule_fn
+
+
+def should_convert_to_lora(
+    layer_key: str, module: nn.Module, keys: Set[str], all_linear_layers: bool = False
+) -> bool:
+    """
+    Determines whether a given module should be converted to a LoRA layer
+
+    Returns True if `layer_key` is in the set of keys or all_linear_layers is True
+    and the related module is a Linear or SwitchLinear layer
+
+    Args:
+        layer_key (str): The layer key for the module
+        module (nn.Module): The corresponding module
+        keys (set): The indicated layer keys to convert (if all_linear_layers is False)
+        all_linear_layers (bool): Whether or not to convert all linear layers (defaults to False).
+
+    Returns:
+        bool: A boolean indicating whether the module should be converted to LoRA
+    """
+    return (
+        all_linear_layers and isinstance(module, (nn.Linear, LoRASwitchLinear))
+    ) or (layer_key in keys)
 
 
 def linear_to_lora_layers(
@@ -160,13 +183,21 @@ def linear_to_lora_layers(
         keys = set(["attn.attention.q_proj", "attn.attention.v_proj"])
     else:
         raise ValueError(f"Lora does not support {model.model_type}")
-
+    all_linear_layers = "all" in keys
     for l in model.layers[-max(num_layers, 0) :]:
-        lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
+        lora_layers = [
+            (k, to_lora(m))
+            for k, m in l.named_modules()
+            if should_convert_to_lora(k, m, keys, all_linear_layers=all_linear_layers)
+        ]
         if lora_layers:
             l.update_modules(tree_unflatten(lora_layers))
 
-    lora_modules = [(k, to_lora(m)) for k, m in model.named_modules() if k in keys]
+    lora_modules = [
+        (k, to_lora(m))
+        for k, m in model.named_modules()
+        if should_convert_to_lora(k, m, keys, all_linear_layers=all_linear_layers)
+    ]
     if lora_modules:
         model.update_modules(tree_unflatten(lora_modules))
 

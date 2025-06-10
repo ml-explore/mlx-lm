@@ -71,6 +71,7 @@ grad_checkpoint: false
 lora_parameters:
   # The layer keys to apply LoRA to.
   # These will be applied for the last lora_layers
+  #Use ["all"] to have them applied to all linear layers
   keys: ["self_attn.q_proj", "self_attn.v_proj"]
   rank: 8
   scale: 20.0
