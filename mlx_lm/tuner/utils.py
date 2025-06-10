@@ -10,9 +10,13 @@ import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from ..models.bitlinear_layers import BitLinear
 from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
+QUANT_LINEAR_MAPPING = {
+    'bitnet': BitLinear,
+}
 
 def build_schedule(schedule_config: Dict):
     """
@@ -294,3 +298,23 @@ def print_trainable_parameters(model):
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
         f"({trainable_p:.3f}M/{total_p:.3f}M)"
     )
+
+def replace_linear_with_quant_linear(model, quant_method = "bitnet", modules_to_not_convert=None):
+    quantize_layers = []
+    for name, module in model.named_modules():     
+        if modules_to_not_convert is None:
+            modules_to_not_convert = []
+        
+        # Replace nn.Linear layers, but skip 'lm_head'
+        if name not in modules_to_not_convert and isinstance(module, nn.Linear):
+            old_weight = module.weight
+            out_features, in_features = old_weight.shape
+            bias = "bias" in module
+            # Create a new instance of the custom linear layer
+            new_layer = QUANT_LINEAR_MAPPING[quant_method](in_features, out_features, bias=bias, invert_weight_scales=True)
+
+            # Replace the layer in the model
+            quantize_layers.append((name, new_layer))
+    if len(quantize_layers) > 0:
+        model.update_modules(tree_unflatten(quantize_layers))
+    return model

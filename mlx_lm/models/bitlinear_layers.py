@@ -6,17 +6,18 @@ class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
     """
-    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16):
+    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, invert_weight_scales = False):
         super().__init__()
         self.dtype = dtype
         self.in_features = in_features
         self.out_features = out_features
-
         # Calculate packed dimensions - the first dimension gets packed 4:1
         # The weights are ternary so can be represented with 2 bits,
         # and they are packed in uint8 tensors, hence the number of values per item is 4
         packed_out_features = (out_features + 3) // 4
         self.weight = mx.zeros((packed_out_features, in_features), dtype=mx.uint8)
+
+        self.invert_weight_scales = invert_weight_scales
         self.weight_scale = mx.array([1.0], dtype=dtype)
 
         if bias:
@@ -68,8 +69,12 @@ class BitLinear(nn.Module):
             sum += x_val * weight_val;
         }
 
-        // Apply weight scaling
-        out[tid] = sum * weight_scale[0];
+        // Apply weight scaling by diving them or multiplying them
+        if (invert_weight_scales) {
+            out[tid] = sum / weight_scale[0];
+        } else {
+            out[tid] = sum * weight_scale[0];
+        }
         """
 
         # Handle multi-dimensional inputs by flattening all but the last dimension
@@ -89,13 +94,13 @@ class BitLinear(nn.Module):
         if self._compiled_kernel is None:
             self._compiled_kernel = mx.fast.metal_kernel(
                 name="bitlinear_matmul",
-                input_names=["x", "packed_weights", "weight_scale"],
+                input_names=["x", "packed_weights", "weight_scale", "invert_weight_scales"],
                 output_names=["out"],
                 source=source,
             )
 
         outputs = self._compiled_kernel(
-            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale],
+            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
             threadgroup=(min(256, total_batch_elements * out_features), 1, 1),
@@ -125,3 +130,4 @@ class BitLinear(nn.Module):
             y = mx.add(y, self.bias)
 
         return y.astype(org_dtype)
+    

@@ -39,6 +39,9 @@ from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import get_total_parameters, load_adapters
 
+# Quant imports
+from .tuner.utils import replace_linear_with_quant_linear
+
 # Constants
 MODEL_REMAPPING = {
     "mistral": "llama",  # mistral is compatible with llama
@@ -48,6 +51,9 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+SUPPORTED_HF_QUANTIZATIONS = [
+    "bitnet"
+]
 
 def _get_classes(config: dict):
     """
@@ -164,6 +170,7 @@ def load_model(
     config = load_config(model_path)
     config.update(model_config)
 
+
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files:
@@ -186,8 +193,8 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    # This handles the case where we use MLX-related quantizations
     if (quantization := config.get("quantization", None)) is not None:
-
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -203,6 +210,19 @@ def load_model(
             bits=quantization["bits"],
             class_predicate=class_predicate,
         )
+    # We can also handle HF-related quant models such as bitnet
+    elif config.get("quantization_config", None) is not None:
+        quantization_config = config["quantization_config"]
+        quant_method = quantization_config.get("quant_method", None)
+        modules_to_not_convert = quantization_config.get("modules_to_not_convert", None)
+
+        if quant_method is not None and quant_method in SUPPORTED_HF_QUANTIZATIONS:
+            # Replace linear layers with quantized versions
+            model = replace_linear_with_quant_linear(
+                model, 
+                quant_method=quant_method, 
+                modules_to_not_convert=modules_to_not_convert
+            )
 
     model.load_weights(list(weights.items()), strict=strict)
 
