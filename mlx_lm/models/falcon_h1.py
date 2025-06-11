@@ -113,7 +113,7 @@ def compute_mup_vector(config):
         config: FalconH1Config object
 
     Returns:
-        torch.Tensor: The computed MuP vector
+        mx.array: The computed MuP vector
     """
     # We'll need some values from the config to compute the vector dimensions
     intermediate_size = (
@@ -160,16 +160,16 @@ class Mamba2Cache:
             The respective dimension of the heads used in the linear attention / SSM.
         intermediate_size: (`int`):
             Model's intermediate_size based on (expand * hidden_dim) from config.
-        conv_states: (`torch.Tensor`):
-            A tensor of shape `[num_layers, batch_size, conv_kernel_size, intermediate_size + 2 * n_groups * state_size]` that holds convolutional states.
-        ssm_states: (`torch.Tensor`):
-            A tensor of shape `[num_layers, batch_size, num_heads, head_dim, state_size]` that holds ssm states.
+        conv_states: (`dict`):
+            A dict of tensors that holds convolutional states.
+        ssm_states: (`dict`):
+            A dict of tensors that holds ssm states.
     """
 
     def __init__(
         self,
         config,
-        batch_size: int=1,
+        batch_size: int = 1,
     ):
         self.seqlen_offset = 0
         self.has_previous_state = False
@@ -181,23 +181,21 @@ class Mamba2Cache:
             config.mamba_d_ssm if config.mamba_d_ssm is not None else int(config.mamba_expand * config.hidden_size)
         )
 
-        self.conv_states = {
-            i: mx.zeros(
+        self.conv_states = {}
+        self.ssm_states = {}
+
+        for i in range(config.num_hidden_layers):
+            self.conv_states[i] = mx.zeros(
                 (batch_size,
                 self.intermediate_size + 2 * config.mamba_n_groups * config.mamba_d_state,
                 self.conv_kernel_size)
             )
-            for i in range(config.num_hidden_layers)
-        }
-        self.ssm_states = {
-            i: mx.zeros(
+            self.ssm_states[i] = mx.zeros(
                 (batch_size,
                 config.mamba_n_heads,
                 config.mamba_d_head,
                 config.mamba_d_state)
             )
-            for i in range(config.num_hidden_layers)
-        }
 
         self.transformer_layers = []
         for i in range(config.num_hidden_layers):
@@ -245,25 +243,22 @@ class Mamba2Cache:
         conv_state = mx.roll(conv_state, shift=-1, axis=-1)
 
         if len(cache_position) > 1:
-            conv_state[:, :, :] = new_conv_state.transpose(0, 2, 1)
+            conv_state = conv_state.at[:, :, :].set(new_conv_state.transpose(0, 2, 1))
         else:
-            conv_state[:, :, -1] = new_conv_state[:, :, -1]
-        self.conv_states[layer_idx] = mx.zeros(self.conv_states[layer_idx].shape)
-        self.conv_states[layer_idx] += conv_state
+            conv_state = conv_state.at[:, :, -1].set(new_conv_state[:, :, -1])
+
+        self.conv_states[layer_idx] = conv_state
         return self.conv_states[layer_idx]
 
     def reset(self):
-        self.conv_states = mx.zeros(self.conv_states.shape)
-        self.ssm_states = mx.zeros(self.ssm_states.shape)
-
-
+        for i in range(len(self.conv_states)):
+            self.conv_states[i] = mx.zeros_like(self.conv_states[i])
+            self.ssm_states[i] = mx.zeros_like(self.ssm_states[i])
 
 
 # ========================================
 # Attention Components
 # ========================================
-
-
 
 class FalconH1Attention(nn.Module):
     """Multi-head attention component"""
@@ -278,12 +273,13 @@ class FalconH1Attention(nn.Module):
         self.scale = self.head_dim ** -0.5
 
         self.layer_idx = layer_idx
+        self.key_multiplier = config.key_multiplier
 
         # Linear projections
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
         # RoPE
         self.rope = initialize_rope(
@@ -294,7 +290,6 @@ class FalconH1Attention(nn.Module):
             config.max_position_embeddings,
         )
 
-
     def __call__(self, x, mask=None, cache=None):
         B, L, _ = x.shape
 
@@ -302,6 +297,9 @@ class FalconH1Attention(nn.Module):
         queries = self.q_proj(x)
         keys = self.k_proj(x)
         values = self.v_proj(x)
+
+        # Apply key multiplier BEFORE reshaping
+        keys = keys * self.key_multiplier
 
         # Reshape for multi-head attention
         queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
@@ -385,8 +383,9 @@ def segment_sum(input_tensor):
 
     return tensor_segsum
 
+
 class FalconH1Mixer(nn.Module):
-    def __init__(self, config, layer_idx: int, mup_vector: mx.array, batch_size: int=1):
+    def __init__(self, config, layer_idx: int, mup_vector: mx.array, batch_size: int = 1):
         super().__init__()
         self.num_heads = config.mamba_n_heads
         self.hidden_size = config.hidden_size
@@ -424,18 +423,25 @@ class FalconH1Mixer(nn.Module):
         self.in_proj = nn.Linear(
             self.hidden_size,
             projection_size,
-            bias=config.mlp_bias,
+            bias=config.mamba_proj_bias,  # Fixed to use correct config field
         )
-        self.dt_bias = mx.zeros(self.num_heads) + 1.0
-        A = mx.arange(1, self.num_heads + 1)
+
+        # Initialize dt_bias correctly
+        self.dt_bias = mx.ones(self.num_heads)
+
+        # Initialize A_log correctly
+        A = mx.arange(1, self.num_heads + 1, dtype=mx.float32)
         self.A_log = mx.log(A)
 
         self.mamba_rms_norm = config.mamba_rms_norm
         if self.mamba_rms_norm:
             self.norm = nn.RMSNorm(self.intermediate_size, eps=self.layer_norm_epsilon)
-        self.D = mx.zeros((self.num_heads)) + 1.0
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
-        self.use_bias = config.mlp_bias
+
+        # Initialize D correctly
+        self.D = mx.ones(self.num_heads) + 1.0
+
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.projectors_bias)
+        self.use_bias = config.projectors_bias
 
         self.ssm_in_multiplier = config.ssm_in_multiplier
         self._mup_vector = mup_vector
@@ -454,12 +460,10 @@ class FalconH1Mixer(nn.Module):
         projected_states = self.in_proj(input_states)
         projected_states = projected_states * self._mup_vector  # ADD Mup Multipliers
 
-
         # Split projected states
         gate = projected_states[..., :self.intermediate_size]
         hidden_states_B_C = projected_states[..., self.intermediate_size:self.intermediate_size + self.conv_dim]
         dt = projected_states[..., self.intermediate_size + self.conv_dim:]
-
 
         use_precomputed_states = (
             cache is not None
@@ -475,22 +479,17 @@ class FalconH1Mixer(nn.Module):
         # 2. Convolution sequence transformation
         if use_precomputed_states:
             # Roll cache states
-            cache.conv_states[self.layer_idx] = mx.roll(
-                cache.conv_states[self.layer_idx], shift=-1, axis=-1
-            )
-            cache.conv_states[self.layer_idx] = cache.conv_states[self.layer_idx].at[:, :, -1].set(
-                hidden_states_B_C[:, 0, :]
-            )
-
-            conv_states = cache.conv_states[self.layer_idx]
+            conv_state = mx.roll(cache.conv_states[self.layer_idx], shift=-1, axis=-1)
+            conv_state = conv_state.at[:, :, -1].set(hidden_states_B_C[:, 0, :])
+            cache.conv_states[self.layer_idx] = conv_state
 
             # Convolution using matrix multiplication
             hidden_states_B_C = mx.sum(
-                conv_states * mx.squeeze(self.conv1d.weight, axis=1), axis=-1
+                conv_state * mx.squeeze(self.conv1d.weight, axis=1), axis=-1
             )
             if self.use_conv_bias:
                 hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
-            hidden_states_B_C = self.act(hidden_states_B_C)
+            hidden_states_B_C = nn.silu(hidden_states_B_C)
         else:
             # Init cache
             if cache is not None:
@@ -498,14 +497,17 @@ class FalconH1Mixer(nn.Module):
                 # Ensure padding size is non-negative
                 seq_len_transposed = hidden_states_B_C_transposed.shape[-1]
                 pad_size = max(0, self.conv_kernel_size - seq_len_transposed)
-                pad_width = [(0, 0), (0, 0), (pad_size, 0)]
-                conv_states = mx.pad(hidden_states_B_C_transposed, pad_width)
+
+                if pad_size > 0:
+                    pad_width = [(0, 0), (0, 0), (pad_size, 0)]
+                    conv_states = mx.pad(hidden_states_B_C_transposed, pad_width)
+                else:
+                    conv_states = hidden_states_B_C_transposed
 
                 cache.conv_states[self.layer_idx] = conv_states
 
-
             # Apply 1D convolution
-            hidden_states_B_C = nn.silu(self.conv1d(hidden_states_B_C))[:, :seq_len,:]
+            hidden_states_B_C = nn.silu(self.conv1d(hidden_states_B_C))[:, :seq_len, :]
 
         hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, mask)
 
@@ -551,9 +553,8 @@ class FalconH1Mixer(nn.Module):
             dBx = dB * mx.expand_dims(hidden_states, axis=-1)
 
             # State calculation
-            cache.ssm_states[self.layer_idx] = (
-                cache.ssm_states[self.layer_idx] * dA + dBx
-            )
+            new_ssm_state = cache.ssm_states[self.layer_idx] * dA + dBx
+            cache.ssm_states[self.layer_idx] = new_ssm_state
 
             # Subsequent output
             C = mx.reshape(C, (batch_size, self.n_groups, -1))
@@ -567,8 +568,8 @@ class FalconH1Mixer(nn.Module):
             ssm_states_reshaped = mx.reshape(ssm_states, (batch_size * self.num_heads, self.head_dim, self.ssm_state_size))
             C_reshaped = mx.reshape(C, (batch_size * self.num_heads, self.ssm_state_size, 1))
 
-            # Batch matrix multiplication
-            y = mx.matmul(ssm_states_reshaped, C_reshaped)
+            # Batch matrix multiplication using @ operator
+            y = ssm_states_reshaped @ C_reshaped
             y = mx.reshape(y, (batch_size, self.num_heads, self.head_dim))
 
             # D skip connection
@@ -609,12 +610,8 @@ class FalconH1Mixer(nn.Module):
             A = mx.transpose(A, [0, 3, 1, 2])
             A_cumsum = mx.cumsum(A, axis=-1)
 
-
             # 1. Compute the output for each intra-chunk (diagonal blocks)
             L = mx.exp(segment_sum(A))
-
-
-
 
             # Contraction of C and B to get G
             C_expanded = mx.expand_dims(C, axis=3)
@@ -700,7 +697,6 @@ class FalconH1Mixer(nn.Module):
         return contextualized_states
 
 
-
 class FalconH1DecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int, mup_vector: mx.array):
         super().__init__()
@@ -727,8 +723,7 @@ class FalconH1DecoderLayer(nn.Module):
         mask: mx.array,
         cache_position: mx.array,
         **kwargs,
-    ) -> Tuple[mx.array, Optional[Tuple[mx.array, mx.array]]]:
-
+    ) -> mx.array:
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -762,7 +757,6 @@ class FalconH1DecoderLayer(nn.Module):
         return hidden_states
 
 
-
 # ========================================
 # MLP Component
 # ========================================
@@ -776,12 +770,17 @@ class FalconH1MLP(nn.Module):
         hidden_size = config.hidden_size
         intermediate_size = getattr(config, 'intermediate_size', 4 * hidden_size)
 
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=config.mlp_bias)
+
+        # Add MLP multipliers
+        self.gate_multiplier, self.down_multiplier = config.mlp_multipliers
 
     def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        y = self.up_proj(x) * nn.silu(self.gate_proj(x) * self.gate_multiplier)
+        y = self.down_proj(y) * self.down_multiplier
+        return y
 
 
 # ========================================
@@ -817,6 +816,9 @@ class FalconH1Model(nn.Module):
     def __call__(self, inputs, mask=None, cache=None):
         h = self.embed_tokens(inputs)
 
+        # Apply embedding multiplier
+        h = h * self.config.embedding_multiplier
+
         # Create causal mask for attention
         if mask is None:
             mask = create_attention_mask(h, return_array=True)
@@ -825,8 +827,7 @@ class FalconH1Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-
-        cache_position = mx.arange(h.shape[1]).astype(h.dtype)
+        cache_position = mx.arange(h.shape[1], dtype=mx.int32)
 
         # Forward through layers
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
@@ -847,16 +848,20 @@ class Model(nn.Module):
     def __call__(self, inputs, mask=None, cache=None):
         hidden_states = self.model(inputs, mask=mask, cache=cache)
         logits = self.lm_head(hidden_states)
+
+        # Apply lm_head multiplier
+        logits = logits * self.config.lm_head_multiplier
+
         return logits
 
     def sanitize(self, weights):
         sanitized_weights = {}
         for name, param in weights.items():
             if "conv1d.weight" in name:
-                param = param.transpose(0, 2, 1) # Channels first
+                # MLX Conv1d expects [out_channels, in_channels, kernel_size] format
+                param = param.transpose(0, 2, 1)
             sanitized_weights[name] = param
         return sanitized_weights
 
     def make_cache(self):
         return [Mamba2Cache(self.config) for _ in range(self.config.num_hidden_layers)]
-
