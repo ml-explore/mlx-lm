@@ -8,6 +8,7 @@ import mlx.nn as nn
 from dataclasses import dataclass, field
 from typing import List, Optional
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .rope_utils import initialize_rope
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -52,6 +53,7 @@ class ModelArgs(BaseModelArgs):
     pad_token_id: int = 0
     projectors_bias: bool = False
     rms_norm_eps: float = 1e-05
+    rope_traditional: bool = False
     rope_scaling: Optional[float] = None
     rope_theta: float = 100000000000.0
     ssm_in_multiplier: float = 1.25
@@ -284,7 +286,13 @@ class FalconH1Attention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         # RoPE
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=10000)
+        self.rope = initialize_rope(
+            self.head_dim,
+            config.rope_theta,
+            config.rope_traditional,
+            config.rope_scaling,
+            config.max_position_embeddings,
+        )
 
 
     def __call__(self, x, mask=None, cache=None):
