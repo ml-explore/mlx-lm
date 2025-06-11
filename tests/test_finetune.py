@@ -1,5 +1,4 @@
 # Copyright © 2024 Apple Inc.
-
 import math
 import sys
 import unittest
@@ -53,6 +52,24 @@ class TestShouldConvertToLoRa(unittest.TestCase):
         switch_linear = MagicMock(spec=LoRASwitchLinear)
         self.assertFalse(
             should_convert_to_lora("self_attn.q_proj", switch_linear, set())
+        )
+
+    def test_not_all_linear_pattern_key_matching(self):
+        linear = MagicMock(spec=nn.Linear)
+        self.assertFalse(
+            should_convert_to_lora(
+                "self_attn.q_proj", linear, set(), key_patterns=[r"^.+mlp"]
+            )
+        )
+        self.assertTrue(
+            should_convert_to_lora(
+                "self_attn.q_proj", linear, set(), key_patterns=[r"^.+q_proj"]
+            )
+        )
+        self.assertTrue(
+            should_convert_to_lora(
+                "mlp.up_proj", linear, set(), key_patterns=[r"^.+mlp.up.+$"]
+            )
         )
 
 

@@ -76,6 +76,8 @@ lora_parameters:
   rank: 8
   scale: 20.0
   dropout: 0.0
+  #Match keys by key_patterns
+  #key_patterns: ['^.+mlp\.up.+$', '^.+self_attn\..+$']
 
 # Schedule can only be specified in a config file, uncomment to use.
 #lr_schedule:
