@@ -75,7 +75,7 @@ class TestShouldConvertToLoRa(unittest.TestCase):
                 "mlp.up_proj",
                 linear,
                 set(),
-                key_patterns=[re.compile(r"^.+mlp\.up.+$")],
+                key_patterns=[re.compile(r"^.*mlp\.up.+$")],
             )
         )
 
