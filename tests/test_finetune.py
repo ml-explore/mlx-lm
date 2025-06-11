@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 import math
+import re
 import sys
 import unittest
 from contextlib import contextmanager
@@ -58,17 +59,20 @@ class TestShouldConvertToLoRa(unittest.TestCase):
         linear = MagicMock(spec=nn.Linear)
         self.assertFalse(
             should_convert_to_lora(
-                "self_attn.q_proj", linear, set(), key_patterns=[r"^.+mlp"]
+                "self_attn.q_proj", linear, set(), key_patterns=[re.compile(r"^.+mlp")]
             )
         )
         self.assertTrue(
             should_convert_to_lora(
-                "self_attn.q_proj", linear, set(), key_patterns=[r"^.+q_proj"]
+                "self_attn.q_proj",
+                linear,
+                set(),
+                key_patterns=[re.compile(r"^.+q_proj")],
             )
         )
         self.assertTrue(
             should_convert_to_lora(
-                "mlp.up_proj", linear, set(), key_patterns=[r"^.+mlp.up.+$"]
+                "mlp.up_proj", linear, set(), key_patterns=[re.compile(r"^.+mlp.up.+$")]
             )
         )
 
