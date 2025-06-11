@@ -35,8 +35,8 @@ class TestShouldConvertToLoRa(unittest.TestCase):
     def tearDown(self):
         sys.stdout = sys.__stdout__
 
-    def test_all_linear_with_quantized(self):
-        quantized_linear = MagicMock(spec=nn.QuantizedLinear)
+    def test_all_linear_with_non_linear(self):
+        quantized_linear = MagicMock(spec=nn.QuantizedEmbedding)
         self.assertFalse(
             should_convert_to_lora("", quantized_linear, set(), all_linear_layers=True)
         )
@@ -72,7 +72,10 @@ class TestShouldConvertToLoRa(unittest.TestCase):
         )
         self.assertTrue(
             should_convert_to_lora(
-                "mlp.up_proj", linear, set(), key_patterns=[re.compile(r"^.+mlp.up.+$")]
+                "mlp.up_proj",
+                linear,
+                set(),
+                key_patterns=[re.compile(r"^.+mlp\.up.+$")],
             )
         )
 
