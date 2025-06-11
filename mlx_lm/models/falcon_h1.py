@@ -96,6 +96,46 @@ def pscan(A, X):
 
     return Y
 
+# ========================================
+# RMSNorm Gated
+# ========================================
+class FalconH1RMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, n_groups=1, norm_before_gate=True):
+        super().__init__()
+        self.weight = mx.ones((hidden_size,))
+        self.variance_epsilon = eps
+        self.n_groups = n_groups
+        self.norm_before_gate = norm_before_gate
+
+    def forward(self, hidden_states, gate=None):
+        input_dtype = hidden_states.dtype
+
+        if not self.norm_before_gate and gate is not None:
+            hidden_states = hidden_states * nn.silu(gate.astype(mx.float32))
+
+        if len(hidden_states.shape) == 3:
+            batch_size, seq_len, dim = hidden_states.shape
+        else:
+            batch_size, dim = hidden_states.shape
+            seq_len = 1
+        hidden_states = hidden_states.astype(mx.float32)
+
+        hidden_states = hidden_states.reshape(batch_size, seq_len, self.n_groups, int(dim // self.n_groups))
+        variance = (hidden_states**2).mean(-1, keepdims=True)
+
+        hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
+
+        hidden_states = self.weight.reshape(self.n_groups, int(dim // self.n_groups)) * hidden_states
+        hidden_states = hidden_states.reshape(batch_size, seq_len, dim)
+
+        if seq_len == 1:
+            hidden_states = hidden_states.squeeze(1)
+
+        if self.norm_before_gate and gate is not None:
+            hidden_states = hidden_states * nn.silu(gate.astype(mx.float32))
+        return hidden_states.astype(input_dtype)
+
+
 
 # ========================================
 # Compute MuP Vector
@@ -298,15 +338,12 @@ class FalconH1Attention(nn.Module):
         keys = self.k_proj(x)
         values = self.v_proj(x)
 
-        # Apply key multiplier BEFORE reshaping
         keys = keys * self.key_multiplier
 
-        # Reshape for multi-head attention
         queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        # Apply RoPE
         if cache is not None:
             queries = self.rope(queries, offset=cache.seqlen_offset)
             keys = self.rope(keys, offset=cache.seqlen_offset)
@@ -315,7 +352,6 @@ class FalconH1Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        # Attention computation
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, mask=mask, scale=self.scale
         )
@@ -423,21 +459,23 @@ class FalconH1Mixer(nn.Module):
         self.in_proj = nn.Linear(
             self.hidden_size,
             projection_size,
-            bias=config.mamba_proj_bias,  # Fixed to use correct config field
+            bias=config.mamba_proj_bias,
         )
 
-        # Initialize dt_bias correctly
         self.dt_bias = mx.ones(self.num_heads)
 
-        # Initialize A_log correctly
         A = mx.arange(1, self.num_heads + 1, dtype=mx.float32)
         self.A_log = mx.log(A)
 
         self.mamba_rms_norm = config.mamba_rms_norm
         if self.mamba_rms_norm:
-            self.norm = nn.RMSNorm(self.intermediate_size, eps=self.layer_norm_epsilon)
+            self.norm = FalconH1RMSNormGated(
+                self.intermediate_size,
+                eps=self.layer_norm_epsilon,
+                n_groups=self.n_groups,
+                norm_before_gate=config.mamba_norm_before_gate,
+            )
 
-        # Initialize D correctly
         self.D = mx.ones(self.num_heads) + 1.0
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.projectors_bias)
@@ -458,7 +496,7 @@ class FalconH1Mixer(nn.Module):
         # Add Multipliers
         input_states = input_states * self.ssm_in_multiplier
         projected_states = self.in_proj(input_states)
-        projected_states = projected_states * self._mup_vector  # ADD Mup Multipliers
+        projected_states = projected_states * self._mup_vector
 
         # Split projected states
         gate = projected_states[..., :self.intermediate_size]
@@ -816,21 +854,17 @@ class FalconH1Model(nn.Module):
     def __call__(self, inputs, mask=None, cache=None):
         h = self.embed_tokens(inputs)
 
-        # Apply embedding multiplier
         h = h * self.config.embedding_multiplier
 
-        # Create causal mask for attention
         if mask is None:
             mask = create_attention_mask(h, return_array=True)
 
-        # Initialize cache if needed
         if cache is None:
             cache = [None] * len(self.layers)
 
         cache_position = mx.arange(h.shape[1], dtype=mx.int32)
 
-        # Forward through layers
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for layer, c in zip(self.layers, cache):
             h = layer(h, cache=c, mask=mask, cache_position=cache_position)
 
         return self.final_layernorm(h)
@@ -848,11 +882,7 @@ class Model(nn.Module):
     def __call__(self, inputs, mask=None, cache=None):
         hidden_states = self.model(inputs, mask=mask, cache=cache)
         logits = self.lm_head(hidden_states)
-
-        # Apply lm_head multiplier
-        logits = logits * self.config.lm_head_multiplier
-
-        return logits
+        return logits * self.config.lm_head_multiplier
 
     def sanitize(self, weights):
         sanitized_weights = {}
