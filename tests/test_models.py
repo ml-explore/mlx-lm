@@ -251,6 +251,29 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_bitnet_llama(self):
+        from mlx_lm.models import llama
+        from mlx_lm.utils import apply_hf_quantization
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+            quantization_config={
+                "quant_method": "bitnet",
+                "modules_to_not_convert": ["lm_head"],
+            },
+        )
+        model = llama.Model(args)
+        model = apply_hf_quantization(model, args.__dict__)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_bitnet(self):
         from mlx_lm.models import bitnet
 
