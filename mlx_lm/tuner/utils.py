@@ -54,7 +54,7 @@ def linear_to_lora_layers(
     """
 
     def to_lora(layer):
-        if hasattr(layer, "to_lora"):
+        if not use_dora and hasattr(layer, "to_lora"):
             return layer.to_lora(
                 r=config["rank"],
                 scale=config["scale"],
