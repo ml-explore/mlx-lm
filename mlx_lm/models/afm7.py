@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import ConcatenateKVCache
+from .cache import ConcatenateKVCache, KVCache
 from .rope_utils import initialize_rope
 
 
@@ -388,6 +388,9 @@ class Model(nn.Module):
         out = self.model(inputs, mask, cache)
         out = self.model.embedding.as_linear(out)
         return out
+
+    def make_cache(self):
+        return [KVCache() for _ in range(len(self.model.layers))]
 
     @property
     def layers(self):

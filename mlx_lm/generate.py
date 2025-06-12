@@ -345,7 +345,7 @@ def generate_step(
             model,
             max_kv_size=max_kv_size,
         )
-    elif len(prompt_cache) != len(model.layers):
+    elif not hasattr(model, "make_cache") and len(prompt_cache) != len(model.layers):
         raise ValueError("Wrong number of layers in the prompt cache.")
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
