@@ -503,6 +503,7 @@ class FalconH1Mixer(nn.Module):
         hidden_states_B_C = projected_states[..., self.intermediate_size:self.intermediate_size + self.conv_dim]
         dt = projected_states[..., self.intermediate_size + self.conv_dim:]
 
+
         use_precomputed_states = (
             cache is not None
             and hasattr(cache, 'has_previous_state')
@@ -518,12 +519,12 @@ class FalconH1Mixer(nn.Module):
         if use_precomputed_states:
             # Roll cache states
             conv_state = mx.roll(cache.conv_states[self.layer_idx], shift=-1, axis=-1)
-            conv_state = conv_state.at[:, :, -1].set(hidden_states_B_C[:, 0, :])
+            conv_state[:, :, -1] = hidden_states_B_C[:, 0, :]
             cache.conv_states[self.layer_idx] = conv_state
 
             # Convolution using matrix multiplication
             hidden_states_B_C = mx.sum(
-                conv_state * mx.squeeze(self.conv1d.weight, axis=1), axis=-1
+                conv_state * mx.squeeze(self.conv1d.weight, axis=-1), axis=-1
             )
             if self.use_conv_bias:
                 hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
@@ -534,13 +535,13 @@ class FalconH1Mixer(nn.Module):
                 hidden_states_B_C_transposed = mx.transpose(hidden_states_B_C, [0, 2, 1])
                 # Ensure padding size is non-negative
                 seq_len_transposed = hidden_states_B_C_transposed.shape[-1]
-                pad_size = max(0, self.conv_kernel_size - seq_len_transposed)
+                pad_size = self.conv_kernel_size - seq_len_transposed
 
                 if pad_size > 0:
                     pad_width = [(0, 0), (0, 0), (pad_size, 0)]
                     conv_states = mx.pad(hidden_states_B_C_transposed, pad_width)
                 else:
-                    conv_states = hidden_states_B_C_transposed
+                    conv_states = hidden_states_B_C_transposed[:, :, :pad_size]
 
                 cache.conv_states[self.layer_idx] = conv_states
 
@@ -618,7 +619,6 @@ class FalconH1Mixer(nn.Module):
             # Reshape output
             y = mx.reshape(y, (batch_size, -1))
             y = mx.expand_dims(y, axis=1)
-            import pdb; pdb.set_trace()
         else:
             # Full sequence processing path
             dt = nn.softplus(dt + self.dt_bias)
@@ -724,6 +724,7 @@ class FalconH1Mixer(nn.Module):
             # Init cache
             if ssm_state is not None and cache is not None:
                 cache.ssm_states[self.layer_idx] = ssm_state
+                cache.has_previous_state = True
 
         # Apply normalization or activation
         if self.mamba_rms_norm:
@@ -866,6 +867,10 @@ class FalconH1Model(nn.Module):
             cache = [None] * len(self.layers)
 
         cache_position = mx.arange(h.shape[1], dtype=mx.int32)
+
+        if h.shape[1] == 1 and cache is not None and cache[0] is not None:
+            prev_seqlen = cache[0].key_cache[0].shape[-2]
+            cache_position = (cache_position + prev_seqlen)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, cache=c, mask=mask, mamba_mask=mamba_mask, cache_position=cache_position)
