@@ -70,11 +70,7 @@ class BitLinear(nn.Module):
         }
 
         // Apply weight scaling by diving them or multiplying them
-        if (invert_weight_scales) {
-            out[tid] = sum / weight_scale[0];
-        } else {
-            out[tid] = sum * weight_scale[0];
-        }
+        out[tid] = invert_weight_scales ? (sum / weight_scale[0]) : (sum * weight_scale[0]);
         """
 
         # Handle multi-dimensional inputs by flattening all but the last dimension
@@ -103,7 +99,7 @@ class BitLinear(nn.Module):
             inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
-            threadgroup=(min(256, total_batch_elements * out_features), 1, 1),
+            threadgroup=(min(64, total_batch_elements * out_features), 1, 1),
             output_shapes=[(total_batch_elements, out_features)],
             output_dtypes=[self.dtype],
         )
@@ -130,4 +126,3 @@ class BitLinear(nn.Module):
             y = mx.add(y, self.bias)
 
         return y.astype(org_dtype)
-    
