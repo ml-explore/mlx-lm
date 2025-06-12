@@ -96,7 +96,7 @@ class BitLinear(nn.Module):
             inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
-            threadgroup=(min(64, total_batch_elements * out_features), 1, 1),
+            threadgroup=(min(32, total_batch_elements * out_features), 1, 1),
             output_shapes=[(total_batch_elements, out_features)],
             output_dtypes=[self.dtype],
         )
