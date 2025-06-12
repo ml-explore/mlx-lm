@@ -59,12 +59,9 @@ class BitLinear(nn.Module):
             uint packed_idx = row_in_slice * in_features + i;
             uint8_t packed_val = packed_weights[packed_idx];
 
-            // Extract the 2-bit value for this slice
-            uint8_t mask = 3 << (2 * which_slice);  // 0b11 shifted to the right position
-            uint8_t weight_bits = (packed_val & mask) >> (2 * which_slice);
 
-            // Convert from {0,1,2} back to {-1,0,1}
-            float weight_val = float(weight_bits) - 1.0;
+            // Extract the 2-bit slice; {0,1,2} -> {-1,0,1} (11 is unused and would map to 2)
+            float weight_val = float((packed_val >> (2 * which_slice)) & 3) - 1.0;
 
             sum += x_val * weight_val;
         }
@@ -126,3 +123,49 @@ class BitLinear(nn.Module):
             y = mx.add(y, self.bias)
 
         return y.astype(org_dtype)
+
+
+def benchmark():
+    """
+    Benchmark performance.
+    """
+    import time
+
+    # Simulate real prompt/generation scenarios
+    test_cases = [
+        ("Tiny prompt", 1, 5, 4096),
+        ("Small prompt", 1, 11, 4096),
+        ("Medium prompt", 1, 32, 4096),
+        ("Large prompt", 1, 128, 4096),
+        ("Generation", 1, 200, 4096),
+        ("Batch generation", 8, 100, 4096),
+    ]
+
+    models = [
+        ("BitLinear", BitLinear),
+    ]
+
+    for model_name, ModelClass in models:
+        print(f"\n{model_name} Results:")
+
+        for test_name, batch_size, seq_len, hidden_size in test_cases:
+            model = ModelClass(hidden_size, hidden_size)
+            x = mx.random.normal((batch_size, seq_len, hidden_size))
+
+            # Warmup
+            for _ in range(5):
+                _ = model(x)
+
+            # Benchmark
+            start = time.time()
+            for _ in range(100):
+                output = model(x)
+                mx.eval(output)
+            elapsed = (time.time() - start) / 100
+
+            tokens_per_sec = (batch_size * seq_len) / elapsed
+            print(f"  {test_name}: {elapsed*1000:.3f}ms ({tokens_per_sec:.1f} tokens/sec)")
+
+
+if __name__ == "__main__":
+    benchmark()
