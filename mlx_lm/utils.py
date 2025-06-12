@@ -40,7 +40,7 @@ from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import get_total_parameters, load_adapters
 
 # Quant imports
-from .quant.utils import replace_linear_with_quant_linear
+from .quant.utils import apply_hf_quantization
 
 # Constants
 MODEL_REMAPPING = {
@@ -50,10 +50,6 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
-
-SUPPORTED_HF_QUANTIZATIONS = [
-    "bitnet"
-]
 
 def _get_classes(config: dict):
     """
@@ -136,24 +132,6 @@ def load_config(model_path: Path) -> dict:
         raise
     return config
 
-def apply_hf_quantization(model, config):
-    """
-    Apply HF quantization to a model if it has a quantization config.
-    """
-    if config.get("quantization_config", None) is not None:
-        quantization_config = config["quantization_config"]
-        quant_method = quantization_config.get("quant_method", None)
-        modules_to_not_convert = quantization_config.get("modules_to_not_convert", None)
-
-        if quant_method is not None and quant_method in SUPPORTED_HF_QUANTIZATIONS:
-            # Replace linear layers with quantized versions
-            model = replace_linear_with_quant_linear(
-                model,
-                quant_method=quant_method,
-                modules_to_not_convert=modules_to_not_convert
-            )
-    return model
-
 
 def load_model(
     model_path: Path,
@@ -231,7 +209,7 @@ def load_model(
 
     # We can also handle HF-related quant models such as bitnet
     model = apply_hf_quantization(model, config)
-    
+
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:

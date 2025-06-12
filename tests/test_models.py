@@ -253,7 +253,7 @@ class TestModels(unittest.TestCase):
 
     def test_bitnet_llama(self):
         from mlx_lm.models import llama
-        from mlx_lm.utils import apply_hf_quantization
+        from mlx_lm.quant.utils import apply_hf_quantization
 
         args = llama.ModelArgs(
             model_type="llama",
