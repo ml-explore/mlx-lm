@@ -24,6 +24,7 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
+    quantization_config: Optional[Dict[str, Union[str, int]]] = None
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
