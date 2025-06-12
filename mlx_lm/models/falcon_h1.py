@@ -107,7 +107,7 @@ class FalconH1RMSNormGated(nn.Module):
         self.n_groups = n_groups
         self.norm_before_gate = norm_before_gate
 
-    def forward(self, hidden_states, gate=None):
+    def __call__(self, hidden_states, gate=None):
         input_dtype = hidden_states.dtype
 
         if not self.norm_before_gate and gate is not None:
@@ -618,6 +618,7 @@ class FalconH1Mixer(nn.Module):
             # Reshape output
             y = mx.reshape(y, (batch_size, -1))
             y = mx.expand_dims(y, axis=1)
+            import pdb; pdb.set_trace()
         else:
             # Full sequence processing path
             dt = nn.softplus(dt + self.dt_bias)
@@ -759,6 +760,7 @@ class FalconH1DecoderLayer(nn.Module):
         hidden_states: mx.array,
         cache: Mamba2Cache,
         mask: mx.array,
+        mamba_mask: mx.array,
         cache_position: mx.array,
         **kwargs,
     ) -> mx.array:
@@ -769,7 +771,7 @@ class FalconH1DecoderLayer(nn.Module):
         mamba_hidden_states = self.mamba(
             input_states=hidden_states,
             cache=cache,
-            mask=mask,
+            mask=mamba_mask,
             cache_position=cache_position,
         )
         mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
@@ -858,6 +860,7 @@ class FalconH1Model(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, return_array=True)
+            mamba_mask = None
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -865,7 +868,7 @@ class FalconH1Model(nn.Module):
         cache_position = mx.arange(h.shape[1], dtype=mx.int32)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, cache=c, mask=mask, cache_position=cache_position)
+            h = layer(h, cache=c, mask=mask, mamba_mask=mamba_mask, cache_position=cache_position)
 
         return self.final_layernorm(h)
 
