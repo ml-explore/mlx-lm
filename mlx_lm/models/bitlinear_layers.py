@@ -53,7 +53,7 @@ class BitLinear(nn.Module):
 
             // Determine which packed row and which bit position within that packed value
             uint which_slice = out_idx / packed_rows;  // Which of the 4 slices (0, 1, 2, 3)
-            uint row_in_slice = out_idx % packed_rows;  // Which row within that slice
+            uint row_in_slice = out_idx - which_slice * packed_rows;  // Which row within that slice
 
             // Get the packed weight value
             uint packed_idx = row_in_slice * in_features + i;
