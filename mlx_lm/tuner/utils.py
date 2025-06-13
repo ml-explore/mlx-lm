@@ -13,7 +13,6 @@ from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
-
 def build_schedule(schedule_config: Dict):
     """
     Build a learning rate schedule from the given config.
@@ -88,6 +87,7 @@ def linear_to_lora_layers(
         "mistral",
         "mistral3",
         "llama",
+        "bitnet",
         "phi",
         "mixtral",
         "nemotron",
