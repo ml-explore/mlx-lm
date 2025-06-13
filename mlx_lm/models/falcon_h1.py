@@ -12,12 +12,10 @@ from .rope_utils import initialize_rope
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    architectures: List[str] = field(default_factory=lambda: ["FalconH1ForCausalLM"])
     attention_bias: bool = False
     attention_dropout: float = 0.0
     attention_in_multiplier: float = 1.0
     attention_out_multiplier: float = 0.9375
-    attn_layer_indices: Optional[List[int]] = None
     bos_token_id: int = 1
     embedding_multiplier: float = 5.656854249492381
     eos_token_id: int = 11
@@ -141,27 +139,27 @@ class FalconH1RMSNormGated(nn.Module):
 # Compute MuP Vector
 # ========================================
 
-def compute_mup_vector(config):
+def compute_mup_vector(args):
     """
-    Computes the MuP vector based on model configuration.
+    Computes the MuP vector based on model argsuration.
 
     FalconH1 applies different MuP multiplier for each dimension of the hidden states.
     The MuP vector is partitioned into chunks, and each chunk is multiplied with its
     corresponding projected dimension.
 
     Args:
-        config: FalconH1Config object
+        args: FalconH1args object
 
     Returns:
         mx.array: The computed MuP vector
     """
-    # We'll need some values from the config to compute the vector dimensions
+    # We'll need some values from the args to compute the vector dimensions
     intermediate_size = (
-        config.mamba_d_ssm if config.mamba_d_ssm is not None else int(config.mamba_expand * config.hidden_size)
+        args.mamba_d_ssm if args.mamba_d_ssm is not None else int(args.mamba_expand * args.hidden_size)
     )
-    groups_time_state_size = config.mamba_n_groups * config.mamba_d_state
-    num_heads = config.mamba_n_heads
-    zxbcdt_multipliers = config.ssm_multipliers
+    groups_time_state_size = args.mamba_n_groups * args.mamba_d_state
+    num_heads = args.mamba_n_heads
+    zxbcdt_multipliers = args.ssm_multipliers
 
     vector_shape = 2 * intermediate_size + 2 * groups_time_state_size + num_heads
     mup_vector = mx.ones((1, 1, vector_shape))
@@ -184,22 +182,22 @@ def compute_mup_vector(config):
 class Mamba2Cache:
     """
     Arguments:
-        config: Mamba2Config
+        args: Mamba2args
         batch_size: int
 
     Attributes:
         conv_kernel_size: (`int`):
-            Model's convolution kernel size taken from config.
+            Model's convolution kernel size taken from args.
         n_groups: (`int`):
-            Model's number of groups taken from the config - similar to tensor parallel in Transformer.
+            Model's number of groups taken from the args - similar to tensor parallel in Transformer.
         state_size: (`int`):
-            Model's SSM state size taken from config.
+            Model's SSM state size taken from args.
         num_heads: (`int`):
             The number of heads used in the linear attention / SSM.
         head_dim: (`int`):
             The respective dimension of the heads used in the linear attention / SSM.
         intermediate_size: (`int`):
-            Model's intermediate_size based on (expand * hidden_dim) from config.
+            Model's intermediate_size based on (expand * hidden_dim) from args.
         conv_states: (`dict`):
             A dict of tensors that holds convolutional states.
         ssm_states: (`dict`):
@@ -208,37 +206,37 @@ class Mamba2Cache:
 
     def __init__(
         self,
-        config,
+        args,
         batch_size: int = 1,
     ):
         self.seqlen_offset = 0
         self.has_previous_state = False
-        self.conv_kernel_size = config.mamba_d_conv
+        self.conv_kernel_size = args.mamba_d_conv
 
         self._seen_tokens = 0
 
         self.intermediate_size = (
-            config.mamba_d_ssm if config.mamba_d_ssm is not None else int(config.mamba_expand * config.hidden_size)
+            args.mamba_d_ssm if args.mamba_d_ssm is not None else int(args.mamba_expand * args.hidden_size)
         )
 
         self.conv_states = {}
         self.ssm_states = {}
 
-        for i in range(config.num_hidden_layers):
+        for i in range(args.num_hidden_layers):
             self.conv_states[i] = mx.zeros(
                 (batch_size,
-                self.intermediate_size + 2 * config.mamba_n_groups * config.mamba_d_state,
+                self.intermediate_size + 2 * args.mamba_n_groups * args.mamba_d_state,
                 self.conv_kernel_size)
             )
             self.ssm_states[i] = mx.zeros(
                 (batch_size,
-                config.mamba_n_heads,
-                config.mamba_d_head,
-                config.mamba_d_state)
+                args.mamba_n_heads,
+                args.mamba_d_head,
+                args.mamba_d_state)
             )
 
         self.transformer_layers = []
-        for i in range(config.num_hidden_layers):
+        for i in range(args.num_hidden_layers):
             self.transformer_layers.append(i)
 
         self.key_cache: List[mx.array] = []
@@ -303,31 +301,31 @@ class Mamba2Cache:
 class FalconH1Attention(nn.Module):
     """Multi-head attention component"""
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, args, layer_idx: int):
         super().__init__()
 
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.hidden_size = args.hidden_size
+        self.num_heads = args.num_attention_heads
+        self.num_kv_heads = args.num_key_value_heads
+        self.head_dim = getattr(args, "head_dim", args.hidden_size // args.num_attention_heads)
         self.scale = self.head_dim ** -0.5
 
         self.layer_idx = layer_idx
-        self.key_multiplier = config.key_multiplier
+        self.key_multiplier = args.key_multiplier
 
         # Linear projections
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=args.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=args.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias)
 
         # RoPE
         self.rope = initialize_rope(
             self.head_dim,
-            config.rope_theta,
-            config.rope_traditional,
-            config.rope_scaling,
-            config.max_position_embeddings,
+            args.rope_theta,
+            args.rope_traditional,
+            args.rope_scaling,
+            args.max_position_embeddings,
         )
 
     def __call__(self, x, mask=None, cache=None):
@@ -421,25 +419,25 @@ def segment_sum(input_tensor):
 
 
 class FalconH1Mixer(nn.Module):
-    def __init__(self, config, layer_idx: int, mup_vector: mx.array, batch_size: int = 1):
+    def __init__(self, args, layer_idx: int, mup_vector: mx.array, batch_size: int = 1):
         super().__init__()
-        self.num_heads = config.mamba_n_heads
-        self.hidden_size = config.hidden_size
-        self.ssm_state_size = config.mamba_d_state
-        self.conv_kernel_size = config.mamba_d_conv
+        self.num_heads = args.mamba_n_heads
+        self.hidden_size = args.hidden_size
+        self.ssm_state_size = args.mamba_d_state
+        self.conv_kernel_size = args.mamba_d_conv
         self.intermediate_size = (
-            int(config.mamba_expand * self.hidden_size) if config.mamba_d_ssm is None else config.mamba_d_ssm
+            int(args.mamba_expand * self.hidden_size) if args.mamba_d_ssm is None else args.mamba_d_ssm
         )
         self.layer_idx = layer_idx
-        self.use_conv_bias = config.mamba_conv_bias
-        self.use_bias = config.mamba_proj_bias
+        self.use_conv_bias = args.mamba_conv_bias
+        self.use_bias = args.mamba_proj_bias
 
-        self.layer_norm_epsilon = config.rms_norm_eps
-        self.groups_time_state_size = config.mamba_n_groups * self.ssm_state_size
+        self.layer_norm_epsilon = args.rms_norm_eps
+        self.groups_time_state_size = args.mamba_n_groups * self.ssm_state_size
 
-        self.n_groups = config.mamba_n_groups
-        self.head_dim = config.mamba_d_head
-        self.chunk_size = config.mamba_chunk_size
+        self.n_groups = args.mamba_n_groups
+        self.head_dim = args.mamba_d_head
+        self.chunk_size = args.mamba_chunk_size
 
         self.time_step_limit = (0.0, float("inf"))
         self.time_step_min = 0.001
@@ -459,7 +457,7 @@ class FalconH1Mixer(nn.Module):
         self.in_proj = nn.Linear(
             self.hidden_size,
             projection_size,
-            bias=config.mamba_proj_bias,
+            bias=args.mamba_proj_bias,
         )
 
         self.dt_bias = mx.ones(self.num_heads)
@@ -467,21 +465,21 @@ class FalconH1Mixer(nn.Module):
         A = mx.arange(1, self.num_heads + 1, dtype=mx.float32)
         self.A_log = mx.log(A)
 
-        self.mamba_rms_norm = config.mamba_rms_norm
+        self.mamba_rms_norm = args.mamba_rms_norm
         if self.mamba_rms_norm:
             self.norm = FalconH1RMSNormGated(
                 self.intermediate_size,
                 eps=self.layer_norm_epsilon,
                 n_groups=self.n_groups,
-                norm_before_gate=config.mamba_norm_before_gate,
+                norm_before_gate=args.mamba_norm_before_gate,
             )
 
         self.D = mx.ones(self.num_heads) + 1.0
 
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.projectors_bias)
-        self.use_bias = config.projectors_bias
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.projectors_bias)
+        self.use_bias = args.projectors_bias
 
-        self.ssm_in_multiplier = config.ssm_in_multiplier
+        self.ssm_in_multiplier = args.ssm_in_multiplier
         self._mup_vector = mup_vector
 
     def __call__(self, input_states, cache=None, mask=None, cache_position=None):
@@ -738,23 +736,23 @@ class FalconH1Mixer(nn.Module):
 
 
 class FalconH1DecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int, mup_vector: mx.array):
+    def __init__(self, args, layer_idx: int, mup_vector: mx.array):
         super().__init__()
-        self.feed_forward = FalconH1MLP(config)
+        self.feed_forward = FalconH1MLP(args)
 
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.channels_attn = config.num_attention_heads * head_dim + 2 * config.num_key_value_heads * head_dim
+        head_dim = args.hidden_size // args.num_attention_heads
+        self.channels_attn = args.num_attention_heads * head_dim + 2 * args.num_key_value_heads * head_dim
 
-        self.mamba = FalconH1Mixer(config=config, layer_idx=layer_idx, mup_vector=mup_vector)
+        self.mamba = FalconH1Mixer(args=args, layer_idx=layer_idx, mup_vector=mup_vector)
 
-        self.self_attn = FalconH1Attention(config, layer_idx)
+        self.self_attn = FalconH1Attention(args, layer_idx)
 
-        self.attention_in_multiplier = config.attention_in_multiplier
-        self.ssm_out_multiplier = config.ssm_out_multiplier
-        self.attn_out_multiplier = config.attention_out_multiplier
+        self.attention_in_multiplier = args.attention_in_multiplier
+        self.ssm_out_multiplier = args.ssm_out_multiplier
+        self.attn_out_multiplier = args.attention_out_multiplier
 
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_ff_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
@@ -805,18 +803,18 @@ class FalconH1DecoderLayer(nn.Module):
 class FalconH1MLP(nn.Module):
     """Feed-forward network"""
 
-    def __init__(self, config):
+    def __init__(self, args):
         super().__init__()
 
-        hidden_size = config.hidden_size
-        intermediate_size = getattr(config, 'intermediate_size', 4 * hidden_size)
+        hidden_size = args.hidden_size
+        intermediate_size = getattr(args, 'intermediate_size', 4 * hidden_size)
 
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=args.mlp_bias)
 
         # Add MLP multipliers
-        self.gate_multiplier, self.down_multiplier = config.mlp_multipliers
+        self.gate_multiplier, self.down_multiplier = args.mlp_multipliers
 
     def __call__(self, x):
         y = self.up_proj(x) * nn.silu(self.gate_proj(x) * self.gate_multiplier)
@@ -831,33 +829,33 @@ class FalconH1MLP(nn.Module):
 class FalconH1Model(nn.Module):
     """Falcon-H1 model implementation"""
 
-    def __init__(self, config):
+    def __init__(self, args):
         super().__init__()
 
-        self.config = config
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
+        self.args = args
+        self.vocab_size = args.vocab_size
+        self.hidden_size = args.hidden_size
 
         # Embeddings
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_size)
 
         # Transformer layers
-        mup_vector = compute_mup_vector(config)
+        mup_vector = compute_mup_vector(args)
         self.layers = [
-            FalconH1DecoderLayer(config, layer_idx=layer_idx, mup_vector=mup_vector)
-            for layer_idx in range(config.num_hidden_layers)
+            FalconH1DecoderLayer(args, layer_idx=layer_idx, mup_vector=mup_vector)
+            for layer_idx in range(args.num_hidden_layers)
         ]
 
         # Final norm
         self.final_layernorm = nn.RMSNorm(
             self.hidden_size,
-            eps=getattr(config, 'rms_norm_eps', 1e-5)
+            eps=getattr(args, 'rms_norm_eps', 1e-5)
         )
 
     def __call__(self, inputs, mask=None, cache=None):
         h = self.embed_tokens(inputs)
 
-        h = h * self.config.embedding_multiplier
+        h = h * self.args.embedding_multiplier
 
         if mask is None:
             mask = create_attention_mask(h, return_array=True)
@@ -880,17 +878,17 @@ class FalconH1Model(nn.Module):
 
 class Model(nn.Module):
     """Falcon-H1 model with language modeling head"""
-
-    def __init__(self, config):
+    def __init__(self, args):
         super().__init__()
-        self.config = config
-        self.model = FalconH1Model(config=config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.args = args
+        self.model_type = args.model_type
+        self.model = FalconH1Model(args=args)
+        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs, mask=None, cache=None):
         hidden_states = self.model(inputs, mask=mask, cache=cache)
         logits = self.lm_head(hidden_states)
-        return logits * self.config.lm_head_multiplier
+        return logits * self.args.lm_head_multiplier
 
     def sanitize(self, weights):
         sanitized_weights = {}
@@ -904,4 +902,8 @@ class Model(nn.Module):
         return sanitized_weights
 
     def make_cache(self):
-        return [Mamba2Cache(self.config) for _ in range(self.config.num_hidden_layers)]
+        return [Mamba2Cache(self.args) for _ in range(self.args.num_hidden_layers)]
+
+    @property
+    def layers(self):
+        return self.model.layers
