@@ -666,6 +666,19 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_falcon_h1(self):
+        from mlx_lm.models import falcon_h1
+
+        args = falcon_h1.ModelArgs(
+            model_type="falcon_h1", 
+            num_hidden_layers=12,
+            vocab_size=10000,
+        )
+        model = falcon_h1.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_gpt2(self):
         from mlx_lm.models import gpt2
 
