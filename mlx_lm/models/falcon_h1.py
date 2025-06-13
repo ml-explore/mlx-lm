@@ -897,7 +897,9 @@ class Model(nn.Module):
         for name, param in weights.items():
             if "conv1d.weight" in name:
                 # MLX Conv1d expects [out_channels, in_channels, kernel_size] format
-                param = param.transpose(0, 2, 1)
+                if param.shape[-1] > param.shape[1]:
+                    param = param.transpose(0, 2, 1)
+
             sanitized_weights[name] = param
         return sanitized_weights
 
