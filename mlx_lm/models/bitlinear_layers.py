@@ -25,10 +25,10 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
-        # Add kernel cache
-        self._compiled_kernel = None
+        # Compile kernel
+        self._compiled_kernel = self.compile_matmul_kernel()
 
-    def bitlinear_kernel(self, x, packed_weights):
+    def compile_matmul_kernel(self):
         """
         Custom Metal kernel that performs matrix multiplication directly on packed weights and scales the output.
         This eliminates the need to store unpacked weights in memory.
@@ -70,6 +70,15 @@ class BitLinear(nn.Module):
         out[tid] = invert_weight_scales ? (sum / weight_scale[0]) : (sum * weight_scale[0]);
         """
 
+        return mx.fast.metal_kernel(
+            name="bitlinear_matmul",
+            input_names=["x", "packed_weights", "weight_scale", "invert_weight_scales"],
+            output_names=["out"],
+            source=source,
+        )
+
+
+    def execute_matmul_kernel(self, x, packed_weights):
         # Handle multi-dimensional inputs by flattening all but the last dimension
         original_shape = x.shape
         if len(original_shape) > 2:
@@ -82,15 +91,6 @@ class BitLinear(nn.Module):
             total_batch_elements, in_features = x_flattened.shape
 
         out_features = self.out_features
-
-        # Compile kernel once and cache it
-        if self._compiled_kernel is None:
-            self._compiled_kernel = mx.fast.metal_kernel(
-                name="bitlinear_matmul",
-                input_names=["x", "packed_weights", "weight_scale", "invert_weight_scales"],
-                output_names=["out"],
-                source=source,
-            )
 
         outputs = self._compiled_kernel(
             inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
@@ -116,7 +116,7 @@ class BitLinear(nn.Module):
         org_dtype = x.dtype
 
         # Use custom kernel for matrix multiplication directly on packed weights
-        y = self.bitlinear_kernel(x, self.weight)
+        y = self.execute_matmul_kernel(x, self.weight)
 
         # Add bias if present
         if self.bias is not None:
