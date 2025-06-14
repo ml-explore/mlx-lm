@@ -549,8 +549,8 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_len = len(prompt)
         com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
 
-        # Leave at least one token in the prompt
-        com_prefix_len = min(com_prefix_len, len(prompt) - 1)
+        
+        com_prefix_len = min(com_prefix_len, len(prompt))
 
         # Condition 1: Model changed or no common prefix at all. Reset cache.
         if (
@@ -564,7 +564,8 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.debug(
                 f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
             )
-            prompt = prompt[com_prefix_len:]
+            # Leave at least one token in the prompt
+            prompt = prompt[-2:]
             self.prompt_cache.tokens.extend(prompt)
 
         # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
