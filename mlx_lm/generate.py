@@ -345,8 +345,6 @@ def generate_step(
             model,
             max_kv_size=max_kv_size,
         )
-    elif len(prompt_cache) != len(model.layers):
-        raise ValueError("Wrong number of layers in the prompt cache.")
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
@@ -471,8 +469,6 @@ def speculative_generate_step(
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
         draft_cache = cache.make_prompt_cache(draft_model)
-    elif len(prompt_cache) != (len(model.layers) + len(draft_model.layers)):
-        raise ValueError("Wrong number of layers in the prompt cache.")
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
