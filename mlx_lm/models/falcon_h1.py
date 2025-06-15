@@ -304,6 +304,30 @@ class FalconH1Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        if mask is not None:
+            # mask should be broadcastable to (B, num_heads, L, kv_seq_len)
+            # where kv_seq_len is the total length including cached keys
+            kv_seq_len = keys.shape[-2]
+
+            if mask.ndim == 2:
+                # Causal mask case: (L, L) -> (1, 1, L, L)
+                mask = mask[None, None, :, :]
+
+            # If we have cached states, we need to extend the mask
+            if kv_seq_len > L:
+                if mask.shape[-1] < kv_seq_len:
+                    # Extend mask to cover cached sequence length
+                    num_heads_dim = mask.shape[1] if mask.shape[1] > 1 else 1
+
+                    # Create padding for the cached portion (usually all ones/zeros)
+                    pad_length = kv_seq_len - mask.shape[-1]
+
+                    # For causal masks, pad with appropriate values
+                    pad_shape = (B, num_heads_dim, L, pad_length)
+                    padding = mx.ones(pad_shape, dtype=mask.dtype)
+
+                    mask = mx.concatenate([padding, mask], axis=-1)
+
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, mask=mask, scale=self.scale
         )
