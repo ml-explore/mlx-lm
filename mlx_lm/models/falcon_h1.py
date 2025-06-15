@@ -109,29 +109,14 @@ class FalconH1RMSNormGated(nn.Module):
         input_dtype = hidden_states.dtype
 
         if not self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate.astype(mx.float32))
+            hidden_states = hidden_states * nn.silu(gate.astype(mx.float16))
 
-        if len(hidden_states.shape) == 3:
-            batch_size, seq_len, dim = hidden_states.shape
-        else:
-            batch_size, dim = hidden_states.shape
-            seq_len = 1
-        hidden_states = hidden_states.astype(mx.float32)
-
-        hidden_states = hidden_states.reshape(batch_size, seq_len, self.n_groups, int(dim // self.n_groups))
-        variance = (hidden_states**2).mean(-1, keepdims=True)
-
-        hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
-
-        hidden_states = self.weight.reshape(self.n_groups, int(dim // self.n_groups)) * hidden_states
-        hidden_states = hidden_states.reshape(batch_size, seq_len, dim)
-
-        if seq_len == 1:
-            hidden_states = hidden_states.squeeze(1)
+        hidden_states = mx.fast.rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
         if self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate.astype(mx.float32))
+            hidden_states = hidden_states * nn.silu(gate.astype(mx.float16))
         return hidden_states.astype(input_dtype)
+
 
 
 
