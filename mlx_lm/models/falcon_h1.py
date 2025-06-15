@@ -62,37 +62,6 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int = 32784
 
 
-# ========================================
-# Parallel Scan Implementation for Mamba
-# ========================================
-
-def pscan(A, X):
-    """
-    Parallel scan operation for Mamba SSM.
-    Simplified implementation using MLX operations.
-
-    Args:
-        A: State transition matrices [B, L, D_state]
-        X: Input sequence [B, L, D_state]
-
-    Returns:
-        Y: Output sequence [B, L, D_state]
-    """
-    B, L, D = X.shape
-
-    # For now, use a simplified sequential scan
-    # This can be optimized later with a proper parallel scan
-    outputs = []
-    h = mx.zeros((B, D))  # Initial hidden state
-
-    for t in range(L):
-        h = A[:, t, :] * h + X[:, t, :]  # State update
-        outputs.append(h)
-
-    # Stack outputs
-    Y = mx.stack(outputs, axis=1)  # [B, L, D]
-
-    return Y
 
 # ========================================
 # RMSNorm Gated
