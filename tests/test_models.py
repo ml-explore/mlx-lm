@@ -670,7 +670,7 @@ class TestModels(unittest.TestCase):
         from mlx_lm.models import falcon_h1
 
         args = falcon_h1.ModelArgs(
-            model_type="falcon_h1", 
+            model_type="falcon_h1",
             num_hidden_layers=12,
             vocab_size=10000,
         )
