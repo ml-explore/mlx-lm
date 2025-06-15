@@ -1,14 +1,13 @@
 import inspect
-from typing import Optional, Tuple
-
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from dataclasses import dataclass, field
-from typing import List, Optional
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -42,7 +41,9 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 131072
     mlp_bias: bool = False
     mlp_expansion_factor: int = 8
-    mlp_multipliers: List[float] = field(default_factory=lambda: [0.8838834764831844, 0.5859375])
+    mlp_multipliers: List[float] = field(
+        default_factory=lambda: [0.8838834764831844, 0.5859375]
+    )
     model_type: str = "falcon_h1"
     num_attention_heads: int = 8
     num_hidden_layers: int = 36
@@ -55,12 +56,19 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Optional[float] = None
     rope_theta: float = 100000000000.0
     ssm_in_multiplier: float = 1.25
-    ssm_multipliers: List[float] = field(default_factory=lambda: [0.3535533905932738, 0.25, 0.3535533905932738, 0.5, 0.3535533905932738])
+    ssm_multipliers: List[float] = field(
+        default_factory=lambda: [
+            0.3535533905932738,
+            0.25,
+            0.3535533905932738,
+            0.5,
+            0.3535533905932738,
+        ]
+    )
     ssm_out_multiplier: float = 0.23570226039551587
     tie_word_embeddings: bool = False
     torch_dtype: str = "bfloat16"
     vocab_size: int = 32784
-
 
 
 # ========================================
@@ -80,18 +88,19 @@ class FalconH1RMSNormGated(nn.Module):
         if not self.norm_before_gate and gate is not None:
             hidden_states = hidden_states * nn.silu(gate.astype(mx.float16))
 
-        hidden_states = mx.fast.rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        hidden_states = mx.fast.rms_norm(
+            hidden_states, self.weight, self.variance_epsilon
+        )
 
         if self.norm_before_gate and gate is not None:
             hidden_states = hidden_states * nn.silu(gate.astype(mx.float16))
         return hidden_states.astype(input_dtype)
 
 
-
-
 # ========================================
 # Compute MuP Vector
 # ========================================
+
 
 def compute_mup_vector(args):
     """
@@ -109,7 +118,9 @@ def compute_mup_vector(args):
     """
     # We'll need some values from the args to compute the vector dimensions
     intermediate_size = (
-        args.mamba_d_ssm if args.mamba_d_ssm is not None else int(args.mamba_expand * args.hidden_size)
+        args.mamba_d_ssm
+        if args.mamba_d_ssm is not None
+        else int(args.mamba_expand * args.hidden_size)
     )
     groups_time_state_size = args.mamba_n_groups * args.mamba_d_state
     num_heads = args.mamba_n_heads
@@ -121,17 +132,26 @@ def compute_mup_vector(args):
     # Apply multipliers to different sections of the vector
     mup_vector[:, :, :intermediate_size] *= zxbcdt_multipliers[0]
     mup_vector[:, :, intermediate_size : 2 * intermediate_size] *= zxbcdt_multipliers[1]
-    mup_vector[:, :, 2 * intermediate_size : 2 * intermediate_size + groups_time_state_size] *= zxbcdt_multipliers[2]
     mup_vector[
-        :, :, 2 * intermediate_size + groups_time_state_size : 2 * intermediate_size + 2 * groups_time_state_size
+        :, :, 2 * intermediate_size : 2 * intermediate_size + groups_time_state_size
+    ] *= zxbcdt_multipliers[2]
+    mup_vector[
+        :,
+        :,
+        2 * intermediate_size
+        + groups_time_state_size : 2 * intermediate_size
+        + 2 * groups_time_state_size,
     ] *= zxbcdt_multipliers[3]
-    mup_vector[:, :, 2 * intermediate_size + 2 * groups_time_state_size :] *= zxbcdt_multipliers[4]
+    mup_vector[
+        :, :, 2 * intermediate_size + 2 * groups_time_state_size :
+    ] *= zxbcdt_multipliers[4]
     return mup_vector
 
 
 # ========================================
 # Mamba2 Cache
 # ========================================
+
 
 class Mamba2Cache:
     """
@@ -170,7 +190,9 @@ class Mamba2Cache:
         self._seen_tokens = 0
 
         self.intermediate_size = (
-            args.mamba_d_ssm if args.mamba_d_ssm is not None else int(args.mamba_expand * args.hidden_size)
+            args.mamba_d_ssm
+            if args.mamba_d_ssm is not None
+            else int(args.mamba_expand * args.hidden_size)
         )
 
         self.conv_states = {}
@@ -178,15 +200,15 @@ class Mamba2Cache:
 
         for i in range(args.num_hidden_layers):
             self.conv_states[i] = mx.zeros(
-                (batch_size,
-                self.intermediate_size + 2 * args.mamba_n_groups * args.mamba_d_state,
-                self.conv_kernel_size)
+                (
+                    batch_size,
+                    self.intermediate_size
+                    + 2 * args.mamba_n_groups * args.mamba_d_state,
+                    self.conv_kernel_size,
+                )
             )
             self.ssm_states[i] = mx.zeros(
-                (batch_size,
-                args.mamba_n_heads,
-                args.mamba_d_head,
-                args.mamba_d_state)
+                (batch_size, args.mamba_n_heads, args.mamba_d_head, args.mamba_d_state)
             )
 
         self.transformer_layers = []
@@ -214,12 +236,18 @@ class Mamba2Cache:
                 self.value_cache.append([])
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
-        elif len(self.key_cache[layer_idx]) == 0:  # fills previously skipped layers; checking for tensor causes errors
+        elif (
+            len(self.key_cache[layer_idx]) == 0
+        ):  # fills previously skipped layers; checking for tensor causes errors
             self.key_cache[layer_idx] = key_states
             self.value_cache[layer_idx] = value_states
         else:
-            self.key_cache[layer_idx] = mx.concatenate([self.key_cache[layer_idx], key_states], axis=-2)
-            self.value_cache[layer_idx] = mx.concatenate([self.value_cache[layer_idx], value_states], axis=-2)
+            self.key_cache[layer_idx] = mx.concatenate(
+                [self.key_cache[layer_idx], key_states], axis=-2
+            )
+            self.value_cache[layer_idx] = mx.concatenate(
+                [self.value_cache[layer_idx], value_states], axis=-2
+            )
 
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
@@ -252,6 +280,7 @@ class Mamba2Cache:
 # Attention Components
 # ========================================
 
+
 class FalconH1Attention(nn.Module):
     """Multi-head attention component"""
 
@@ -261,17 +290,31 @@ class FalconH1Attention(nn.Module):
         self.hidden_size = args.hidden_size
         self.num_heads = args.num_attention_heads
         self.num_kv_heads = args.num_key_value_heads
-        self.head_dim = getattr(args, "head_dim", args.hidden_size // args.num_attention_heads)
-        self.scale = self.head_dim ** -0.5
+        self.head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
+        self.scale = self.head_dim**-0.5
 
         self.layer_idx = layer_idx
         self.key_multiplier = args.key_multiplier
 
         # Linear projections
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=args.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=args.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
+        )
 
         # RoPE
         self.rope = initialize_rope(
@@ -340,6 +383,7 @@ class FalconH1Attention(nn.Module):
 # Hybrid Mixer Block
 # ========================================
 
+
 def apply_mask_to_padding_states(input_states, attention_mask):
     """Apply attention mask to padding states"""
     if attention_mask is not None:
@@ -380,7 +424,9 @@ def segment_sum(input_tensor):
     # 1. expand input tensor to have an additional dimension and repeat along that dimension
     # [..., chunk_size] -> [..., chunk_size, chunk_size]
     input_tensor = mx.expand_dims(input_tensor, axis=-1)
-    input_tensor = mx.broadcast_to(input_tensor, input_tensor.shape[:-1] + (chunk_size,))
+    input_tensor = mx.broadcast_to(
+        input_tensor, input_tensor.shape[:-1] + (chunk_size,)
+    )
 
     # 2. create a lower triangular mask with the diagonal set to 0 to zero out elements above diag
     mask = mx.tri(chunk_size, k=-1, dtype=mx.bool_)  # Lower triangular, diagonal=-1
@@ -404,7 +450,9 @@ class FalconH1Mixer(nn.Module):
         self.ssm_state_size = args.mamba_d_state
         self.conv_kernel_size = args.mamba_d_conv
         self.intermediate_size = (
-            int(args.mamba_expand * self.hidden_size) if args.mamba_d_ssm is None else args.mamba_d_ssm
+            int(args.mamba_expand * self.hidden_size)
+            if args.mamba_d_ssm is None
+            else args.mamba_d_ssm
         )
         self.layer_idx = layer_idx
         self.use_conv_bias = args.mamba_conv_bias
@@ -428,7 +476,7 @@ class FalconH1Mixer(nn.Module):
             bias=self.use_conv_bias,
             kernel_size=self.conv_kernel_size,
             groups=self.conv_dim,
-            padding=self.conv_kernel_size - 1
+            padding=self.conv_kernel_size - 1,
         )
 
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
@@ -454,7 +502,9 @@ class FalconH1Mixer(nn.Module):
 
         self.D = mx.ones(self.num_heads) + 1.0
 
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.projectors_bias)
+        self.out_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=args.projectors_bias
+        )
         self.use_bias = args.projectors_bias
 
         self.ssm_in_multiplier = args.ssm_in_multiplier
@@ -465,7 +515,7 @@ class FalconH1Mixer(nn.Module):
         dtype = input_states.dtype
 
         if mask is not None:
-            mask = mask[:1, ...] # only take the first token
+            mask = mask[:1, ...]  # only take the first token
 
         input_states = apply_mask_to_padding_states(input_states, mask)
 
@@ -475,14 +525,15 @@ class FalconH1Mixer(nn.Module):
         projected_states = projected_states * self._mup_vector
 
         # Split projected states
-        gate = projected_states[..., :self.intermediate_size]
-        hidden_states_B_C = projected_states[..., self.intermediate_size:self.intermediate_size + self.conv_dim]
-        dt = projected_states[..., self.intermediate_size + self.conv_dim:]
-
+        gate = projected_states[..., : self.intermediate_size]
+        hidden_states_B_C = projected_states[
+            ..., self.intermediate_size : self.intermediate_size + self.conv_dim
+        ]
+        dt = projected_states[..., self.intermediate_size + self.conv_dim :]
 
         use_precomputed_states = (
             cache is not None
-            and hasattr(cache, 'has_previous_state')
+            and hasattr(cache, "has_previous_state")
             and cache.has_previous_state
             and seq_len == 1
             and cache.conv_states[self.layer_idx].shape[0] == batch_size
@@ -508,7 +559,9 @@ class FalconH1Mixer(nn.Module):
         else:
             # Init cache
             if cache is not None:
-                hidden_states_B_C_transposed = mx.transpose(hidden_states_B_C, [0, 2, 1])
+                hidden_states_B_C_transposed = mx.transpose(
+                    hidden_states_B_C, [0, 2, 1]
+                )
                 # Ensure padding size is non-negative
                 seq_len_transposed = hidden_states_B_C_transposed.shape[-1]
                 pad_size = self.conv_kernel_size - seq_len_transposed
@@ -527,9 +580,15 @@ class FalconH1Mixer(nn.Module):
         hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, mask)
 
         # Split hidden states
-        hidden_states = hidden_states_B_C[..., :self.intermediate_size]
-        B = hidden_states_B_C[..., self.intermediate_size:self.intermediate_size + self.n_groups * self.ssm_state_size]
-        C = hidden_states_B_C[..., self.intermediate_size + self.n_groups * self.ssm_state_size:]
+        hidden_states = hidden_states_B_C[..., : self.intermediate_size]
+        B = hidden_states_B_C[
+            ...,
+            self.intermediate_size : self.intermediate_size
+            + self.n_groups * self.ssm_state_size,
+        ]
+        C = hidden_states_B_C[
+            ..., self.intermediate_size + self.n_groups * self.ssm_state_size :
+        ]
 
         # 3. SSM transformation
         A = -mx.exp(self.A_log.astype(mx.float32))  # [num_heads]
@@ -549,7 +608,9 @@ class FalconH1Mixer(nn.Module):
 
             # Expand A
             A = mx.expand_dims(mx.expand_dims(A, axis=-1), axis=-1)
-            A = mx.broadcast_to(A, (self.num_heads, self.head_dim, self.ssm_state_size)).astype(mx.float32)
+            A = mx.broadcast_to(
+                A, (self.num_heads, self.head_dim, self.ssm_state_size)
+            ).astype(mx.float32)
 
             # Discretize A
             dA = mx.exp(mx.expand_dims(dt, axis=-1) * A)
@@ -557,7 +618,15 @@ class FalconH1Mixer(nn.Module):
             # Discretize B
             B = mx.reshape(B, (batch_size, self.n_groups, -1))
             B = mx.expand_dims(B, axis=2)
-            B = mx.broadcast_to(B, (batch_size, self.n_groups, self.num_heads // self.n_groups, B.shape[-1]))
+            B = mx.broadcast_to(
+                B,
+                (
+                    batch_size,
+                    self.n_groups,
+                    self.num_heads // self.n_groups,
+                    B.shape[-1],
+                ),
+            )
             B = mx.reshape(B, (batch_size, -1, B.shape[-1]))
 
             # Compute dB
@@ -574,14 +643,27 @@ class FalconH1Mixer(nn.Module):
             # Subsequent output
             C = mx.reshape(C, (batch_size, self.n_groups, -1))
             C = mx.expand_dims(C, axis=2)
-            C = mx.broadcast_to(C, (batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1]))
+            C = mx.broadcast_to(
+                C,
+                (
+                    batch_size,
+                    self.n_groups,
+                    self.num_heads // self.n_groups,
+                    C.shape[-1],
+                ),
+            )
             C = mx.reshape(C, (batch_size, -1, C.shape[-1]))
 
             ssm_states = cache.ssm_states[self.layer_idx].astype(C.dtype)
 
             # Reshape for batch matrix multiplication
-            ssm_states_reshaped = mx.reshape(ssm_states, (batch_size * self.num_heads, self.head_dim, self.ssm_state_size))
-            C_reshaped = mx.reshape(C, (batch_size * self.num_heads, self.ssm_state_size, 1))
+            ssm_states_reshaped = mx.reshape(
+                ssm_states,
+                (batch_size * self.num_heads, self.head_dim, self.ssm_state_size),
+            )
+            C_reshaped = mx.reshape(
+                C, (batch_size * self.num_heads, self.ssm_state_size, 1)
+            )
 
             # Batch matrix multiplication using @ operator
             y = ssm_states_reshaped @ C_reshaped
@@ -599,9 +681,15 @@ class FalconH1Mixer(nn.Module):
             # Full sequence processing path
             dt = nn.softplus(dt + self.dt_bias)
             dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-            hidden_states = mx.reshape(hidden_states, (batch_size, seq_len, -1, self.head_dim)).astype(mx.float32)
-            B = mx.reshape(B, (batch_size, seq_len, -1, self.ssm_state_size)).astype(mx.float32)
-            C = mx.reshape(C, (batch_size, seq_len, -1, self.ssm_state_size)).astype(mx.float32)
+            hidden_states = mx.reshape(
+                hidden_states, (batch_size, seq_len, -1, self.head_dim)
+            ).astype(mx.float32)
+            B = mx.reshape(B, (batch_size, seq_len, -1, self.ssm_state_size)).astype(
+                mx.float32
+            )
+            C = mx.reshape(C, (batch_size, seq_len, -1, self.ssm_state_size)).astype(
+                mx.float32
+            )
 
             # Repeat B and C for multiple heads
             B = mx.repeat(B, self.num_heads // self.n_groups, axis=2)
@@ -609,14 +697,18 @@ class FalconH1Mixer(nn.Module):
 
             pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
 
-            D_residual = mx.expand_dims(self.D, axis=-1) * pad_tensor_by_size(hidden_states, pad_size)
+            D_residual = mx.expand_dims(self.D, axis=-1) * pad_tensor_by_size(
+                hidden_states, pad_size
+            )
 
             # Discretize x and A
             hidden_states = hidden_states * mx.expand_dims(dt, axis=-1)
             A = A.astype(hidden_states.dtype) * dt
 
             # Rearrange into blocks/chunks
-            hidden_states = reshape_into_chunks(hidden_states, pad_size, self.chunk_size)
+            hidden_states = reshape_into_chunks(
+                hidden_states, pad_size, self.chunk_size
+            )
             A = reshape_into_chunks(A, pad_size, self.chunk_size)
             B = reshape_into_chunks(B, pad_size, self.chunk_size)
             C = reshape_into_chunks(C, pad_size, self.chunk_size)
@@ -636,7 +728,9 @@ class FalconH1Mixer(nn.Module):
 
             # Compute M
             L_permuted = mx.transpose(L, [0, 2, 3, 4, 1])
-            M_intermediate = mx.expand_dims(G, axis=-1) * mx.expand_dims(L_permuted, axis=-1)
+            M_intermediate = mx.expand_dims(G, axis=-1) * mx.expand_dims(
+                L_permuted, axis=-1
+            )
             M = mx.sum(M_intermediate, axis=-1)
 
             # Compute Y_diag
@@ -655,7 +749,9 @@ class FalconH1Mixer(nn.Module):
 
             # 3. Compute the inter-chunk SSM recurrence
             if use_precomputed_states:
-                previous_states = mx.expand_dims(cache.ssm_states[self.layer_idx], axis=1)
+                previous_states = mx.expand_dims(
+                    cache.ssm_states[self.layer_idx], axis=1
+                )
             else:
                 previous_states = mx.zeros_like(states[:, :1])
 
@@ -663,12 +759,18 @@ class FalconH1Mixer(nn.Module):
 
             # Pad and compute decay
             A_cumsum_last = A_cumsum[:, :, :, -1]
-            pad_width = [(0, 0), (0, 0), (1, 0)]  # Pad last dimension with 1 zero at the beginning
+            pad_width = [
+                (0, 0),
+                (0, 0),
+                (1, 0),
+            ]  # Pad last dimension with 1 zero at the beginning
             padded = mx.pad(A_cumsum_last, pad_width)
             decay_chunk = mx.exp(segment_sum(padded))
             decay_chunk = mx.transpose(decay_chunk, [0, 3, 2, 1])
 
-            decay_expanded = mx.expand_dims(mx.expand_dims(decay_chunk, axis=-1), axis=-1)
+            decay_expanded = mx.expand_dims(
+                mx.expand_dims(decay_chunk, axis=-1), axis=-1
+            )
             states_expanded = mx.expand_dims(states, axis=2)
             new_states = mx.sum(decay_expanded * states_expanded, axis=1)
 
@@ -683,7 +785,9 @@ class FalconH1Mixer(nn.Module):
 
             state_decay_out_permuted = mx.transpose(state_decay_out, [0, 2, 3, 1])
             C_times_states_sum = mx.sum(C_times_states, axis=-1)
-            Y_off = C_times_states_sum * mx.expand_dims(state_decay_out_permuted, axis=-1)
+            Y_off = C_times_states_sum * mx.expand_dims(
+                state_decay_out_permuted, axis=-1
+            )
 
             # Add output of intra-chunk and inter-chunk terms
             y = Y_diag + Y_off
@@ -719,9 +823,14 @@ class FalconH1DecoderLayer(nn.Module):
         self.feed_forward = FalconH1MLP(args)
 
         head_dim = args.hidden_size // args.num_attention_heads
-        self.channels_attn = args.num_attention_heads * head_dim + 2 * args.num_key_value_heads * head_dim
+        self.channels_attn = (
+            args.num_attention_heads * head_dim
+            + 2 * args.num_key_value_heads * head_dim
+        )
 
-        self.mamba = FalconH1Mixer(args=args, layer_idx=layer_idx, mup_vector=mup_vector)
+        self.mamba = FalconH1Mixer(
+            args=args, layer_idx=layer_idx, mup_vector=mup_vector
+        )
 
         self.self_attn = FalconH1Attention(args, layer_idx)
 
@@ -778,6 +887,7 @@ class FalconH1DecoderLayer(nn.Module):
 # MLP Component
 # ========================================
 
+
 class FalconH1MLP(nn.Module):
     """Feed-forward network"""
 
@@ -785,7 +895,7 @@ class FalconH1MLP(nn.Module):
         super().__init__()
 
         hidden_size = args.hidden_size
-        intermediate_size = getattr(args, 'intermediate_size', 4 * hidden_size)
+        intermediate_size = getattr(args, "intermediate_size", 4 * hidden_size)
 
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
@@ -803,6 +913,7 @@ class FalconH1MLP(nn.Module):
 # ========================================
 # Main Model
 # ========================================
+
 
 class FalconH1Model(nn.Module):
     """Falcon-H1 model implementation"""
@@ -826,8 +937,7 @@ class FalconH1Model(nn.Module):
 
         # Final norm
         self.final_layernorm = nn.RMSNorm(
-            self.hidden_size,
-            eps=getattr(args, 'rms_norm_eps', 1e-5)
+            self.hidden_size, eps=getattr(args, "rms_norm_eps", 1e-5)
         )
 
     def __call__(self, inputs, mask=None, cache=None):
@@ -846,16 +956,23 @@ class FalconH1Model(nn.Module):
 
         if h.shape[1] == 1 and cache is not None and cache[0] is not None:
             prev_seqlen = cache[0].key_cache[0].shape[-2]
-            cache_position = (cache_position + prev_seqlen)
+            cache_position = cache_position + prev_seqlen
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, cache=c, mask=mask, mamba_mask=mamba_mask, cache_position=cache_position)
+            h = layer(
+                h,
+                cache=c,
+                mask=mask,
+                mamba_mask=mamba_mask,
+                cache_position=cache_position,
+            )
 
         return self.final_layernorm(h)
 
 
 class Model(nn.Module):
     """Falcon-H1 model with language modeling head"""
+
     def __init__(self, args):
         super().__init__()
         self.args = args
