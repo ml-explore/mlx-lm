@@ -181,16 +181,15 @@ class Dots1TopkRouter(nn.Module):
 
 
 class Dots1MLP(nn.Module):
-    def __init__(self, args: ModelArgs, intermediate_size: int = None):
+    def __init__(self, args: ModelArgs, hidden_size: int = None, intermediate_size: int = None):
         super().__init__()
 
-        self.intermediate_size = (
-            args.intermediate_size if intermediate_size is None else intermediate_size
-        )
+        self.hidden_size = args.hidden_size if hidden_size is None else hidden_size
+        self.intermediate_size = args.intermediate_size if intermediate_size is None else intermediate_size
 
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.mlp_bias)
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
