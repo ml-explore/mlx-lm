@@ -20,9 +20,9 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    head_dim: Optional[int] = None
-    max_position_embeddings: Optional[int] = None
-    num_key_value_heads: Optional[int] = None
+    head_dim: Optional[int]
+    max_position_embeddings: Optional[int]
+    num_key_value_heads: Optional[int]
     first_k_dense_replace: int
     moe_intermediate_size: int
     moe_layer_freq: int
