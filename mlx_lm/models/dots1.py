@@ -55,7 +55,7 @@ class Dots1Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.head_dim
+        head_dim = args.head_dim or args.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -211,7 +211,7 @@ class Dots1MoE(nn.Module):
         self.gate = Dots1TopkRouter(args)
 
         self.shared_experts = Dots1MLP(
-            config=args, intermediate_size=args.moe_intermediate_size * args.n_shared_experts
+            args=args, intermediate_size=args.moe_intermediate_size * args.n_shared_experts
         )
 
     def __call__(self, x):
