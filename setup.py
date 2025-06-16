@@ -24,7 +24,7 @@ setup(
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
     install_requires=requirements,
-    packages=["mlx_lm", "mlx_lm.models", "mlx_lm.tuner"],
+    packages=["mlx_lm", "mlx_lm.models", "mlx_lm.quant", "mlx_lm.tuner"],
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets"],

@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .su_rope import SuScaledRotaryEmbedding
+from .rope_utils import SuScaledRoPE
 
 
 @dataclass
@@ -82,7 +82,7 @@ class Attention(nn.Module):
             bias=self.attention_bias,
         )
 
-        self.rope = SuScaledRotaryEmbedding(
+        self.rope = SuScaledRoPE(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
             max_position_embeddings=args.max_position_embeddings,

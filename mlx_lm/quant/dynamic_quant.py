@@ -55,6 +55,9 @@ def estimate_sensitivities(
     q_layers = copy.deepcopy(layers)
     for l in q_layers.values():
         l.weight = qdq(l.weight, low_bits, low_group_size)
+        # Freeze everything but the quantizable weight
+        l.freeze()
+        l.unfreeze(keys=["weight"])
     q_model.freeze()
     q_model.update_modules(tree_unflatten(list(q_layers.items())))
 

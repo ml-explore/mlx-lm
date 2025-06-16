@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .su_rope import SuScaledRotaryEmbedding
+from .rope_utils import SuScaledRoPE
 
 
 @dataclass
@@ -63,7 +63,7 @@ class Attention(nn.Module):
 
         rope_dim = int(head_dim * args.partial_rotary_factor)
         if args.rope_scaling and args.rope_scaling["type"] in ["longrope", "su"]:
-            self.rope = SuScaledRotaryEmbedding(
+            self.rope = SuScaledRoPE(
                 rope_dim,
                 base=args.rope_theta,
                 max_position_embeddings=args.max_position_embeddings,

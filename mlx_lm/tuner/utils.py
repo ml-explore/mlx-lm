@@ -54,6 +54,13 @@ def linear_to_lora_layers(
     """
 
     def to_lora(layer):
+        if not use_dora and hasattr(layer, "to_lora"):
+            return layer.to_lora(
+                r=config["rank"],
+                scale=config["scale"],
+                dropout=config["dropout"],
+            )
+
         if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
             LoRALayer = DoRALinear if use_dora else LoRALinear
         elif isinstance(layer, (SwitchLinear, QuantizedSwitchLinear)):
@@ -102,6 +109,7 @@ def linear_to_lora_layers(
         "cohere2",
         "minicpm",
         "minicpm3",
+        "minicpm4",
         "minimax_text_01",
         "deepseek",
         "olmo2",
