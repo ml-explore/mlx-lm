@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .su_rope import SuScaledRotaryEmbedding
+from .rope_utils import SuScaledRoPE
 from .switch_layers import SwitchGLU
 
 
@@ -45,7 +45,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=True)
 
-        self.rope = SuScaledRotaryEmbedding(
+        self.rope = SuScaledRoPE(
             head_dim,
             base=args.rope_theta,
             max_position_embeddings=args.max_position_embeddings,

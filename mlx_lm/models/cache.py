@@ -129,6 +129,40 @@ class _BaseCache:
         return False
 
 
+class ConcatenateKVCache(_BaseCache):
+    """ConcatenateKVCache the simplest KV cache implementation.
+
+    Can be used as a mock KV cache or when large blocks are being processed at
+    a time in which case KVCache isn't necessarily faster. Consider using the
+    KVCache with a larger step size before using this cache.
+    """
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys, values):
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=-2)
+            self.values = mx.concatenate([self.values, values], axis=-2)
+        self.offset = self.keys.shape[-2]
+
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self.offset = self.keys.shape[-2]
+
+
 class QuantizedKVCache(_BaseCache):
     def __init__(self, group_size: int = 64, bits: int = 8):
         self.keys = None

@@ -3,7 +3,7 @@ from functools import partial
 from json import JSONDecodeError
 from typing import List
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 
 class StreamingDetokenizer:
@@ -300,6 +300,35 @@ class TokenizerWrapper:
             super().__setattr__(attr, value)
         else:
             setattr(self._tokenizer, attr, value)
+
+
+class NewlineTokenizer(PreTrainedTokenizerFast):
+    """A tokenizer that replaces newlines with <n> and <n> with new line."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _preprocess_text(self, text):
+        return text.replace("\n", "<n>")
+
+    def _postprocess_text(self, text):
+        return text.replace("<n>", "\n")
+
+    def encode(self, text, **kwargs):
+        return super().encode(self._preprocess_text(text), **kwargs)
+
+    def encode_batch(self, texts, **kwargs):
+        return super().encode_batch([self._preprocess_text(t) for t in texts], **kwargs)
+
+    def decode(self, *args, **kwargs):
+        return self._postprocess_text(super().decode(*args, **kwargs))
+
+    def batch_decode(self, *args, **kwargs):
+        decoded = super().batch_decode(*args, **kwargs)
+        return [self._postprocess_text(d) for d in decoded]
+
+
+AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
 
 
 def _match(a, b):
