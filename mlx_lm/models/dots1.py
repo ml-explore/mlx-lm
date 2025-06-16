@@ -174,6 +174,7 @@ class Dots1TopkRouter(nn.Module):
             self.top_k,
             self.n_group,
             self.topk_group,
+            self.n_routed_experts,
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
