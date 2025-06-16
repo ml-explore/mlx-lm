@@ -198,6 +198,7 @@ class MiniMaxText01AttentionType1(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        slope_rate: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
