@@ -263,9 +263,9 @@ class Mamba2Cache:
         conv_state = mx.roll(conv_state, shift=-1, axis=-1)
 
         if len(cache_position) > 1:
-            conv_state = conv_state.at[:, :, :].set(new_conv_state.transpose(0, 2, 1))
+            conv_state[:, :, :] = new_conv_state.transpose(0, 2, 1)
         else:
-            conv_state = conv_state.at[:, :, -1].set(new_conv_state[:, :, -1])
+            conv_state[:, :, -1] = new_conv_state[:, :, -1]
 
         self.conv_states[layer_idx] = conv_state
         return self.conv_states[layer_idx]
@@ -957,6 +957,7 @@ class FalconH1Model(nn.Module):
         if h.shape[1] == 1 and cache is not None and cache[0] is not None:
             prev_seqlen = cache[0].key_cache[0].shape[-2]
             cache_position = cache_position + prev_seqlen
+
 
         for layer, c in zip(self.layers, cache):
             h = layer(
