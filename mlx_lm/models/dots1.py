@@ -309,14 +309,15 @@ class Model(nn.Module):
         
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+            if l >= self.args.first_k_dense_replace:
+                for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+                    for k in ["weight", "scales", "biases"]:
+                        if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+                            to_join = [
+                                weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
+                                for e in range(self.args.n_routed_experts)
+                            ]
+                            weights[f"{prefix}.mlp.experts.{m}.{k}"] = mx.stack(to_join)
 
         return {
             k: v
