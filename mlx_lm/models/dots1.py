@@ -20,7 +20,6 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    head_dim: Optional[int]
     max_position_embeddings: Optional[int]
     num_key_value_heads: Optional[int]
     first_k_dense_replace: int
@@ -32,6 +31,7 @@ class ModelArgs(BaseModelArgs):
     num_experts_per_tok: int
     rope_theta: float
     routed_scaling_factor: float
+    head_dim: Optional[int] = None
     scoring_func: str = "noaux_tc",
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
