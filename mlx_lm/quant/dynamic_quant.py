@@ -176,41 +176,50 @@ def estimate_threshold(
     q_model = copy.deepcopy(model)
     nn.quantize(q_model, group_size=low_group_size, bits=low_bits)
     budget = int(compute_bit_budget(q_model, target_bpw))
-
     benefit_map = {}
 
     def benefit(layer, option, budget):
         if (layer, option, budget) in benefit_map:
             return benefit_map[layer, option, budget]
 
-        if budget <= 0:
-            benefit_map[layer, option, budget] = 0
-            return 0
+        stack = [(layer, option, budget)]
+        while stack:
+            layer, option, budget = stack[-1]
 
-        if layer < 0:
-            benefit_map[layer, option, budget] = 0
-            return 0
+            if budget <= 0 or layer < 0 or option < 0:
+                benefit_map[layer, option, budget] = 0
+                stack.pop()
+                continue
 
-        if option < 0:
-            benefit_map[layer, option, budget] = 0
-            return 0
+            # We either not use this option
+            prev_layer = layer if option > 0 else layer - 1
+            prev_option = (option if option > 0 else len(options)) - 1
+            if (prev_layer, prev_option, budget) not in benefit_map:
+                stack.append((prev_layer, prev_option, budget))
+                continue
+            a = benefit_map[prev_layer, prev_option, budget]
 
-        # We either not use this option
-        prev_layer = layer if option > 0 else layer - 1
-        prev_option = (option if option > 0 else len(options)) - 1
-        a = benefit(prev_layer, prev_option, budget)
+            # Or we use it so we have less budget for before
+            b = float("-inf")
+            info = sensitivities[layer][1][option]
+            prev_layer = layer - 1
+            prev_option = len(options) - 1
+            prev_budget = budget - info["extra_bits"]
+            if (
+                prev_layer,
+                prev_option,
+                prev_budget,
+            ) not in benefit_map and prev_budget >= 0:
+                stack.append((prev_layer, prev_option, prev_budget))
+                continue
+            if prev_budget >= 0:
+                b = benefit_map[prev_layer, prev_option, prev_budget]
+                b += info["loss_change"]
 
-        # Or we use it so we have less budget for before
-        prev_layer = layer - 1
-        prev_option = len(options) - 1
-        b = float("-inf")
-        info = sensitivities[layer][1][option]
-        if info["extra_bits"] <= budget:
-            b = benefit(prev_layer, prev_option, budget - info["extra_bits"])
-            b += info["loss_change"]
+            benefit_map[layer, option, budget] = max(a, b)
+            stack.pop()
 
-        benefit_map[layer, option, budget] = max(a, b)
-        return max(a, b)
+        return benefit_map[layer, option, budget]
 
     def backtrack(layer, budget):
         selected = []
@@ -224,12 +233,6 @@ def estimate_threshold(
                 selected.append((layer, idx))
             layer -= 1
         return selected[::-1]
-
-    # Search for the config that gets us closest to target bpw with maximum
-    # benefit as approximated by loss change
-    for i in range(len(sensitivities)):
-        for j in range(len(options)):
-            benefit(i, j, budget)
 
     selected = backtrack(len(sensitivities) - 1, budget)
     config = {sensitivities[l][0]: options[i] for l, i in selected}
