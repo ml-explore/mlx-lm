@@ -41,6 +41,9 @@ from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import get_total_parameters, load_adapters
 
+# Quant imports
+from .quant.utils import apply_hf_quantization
+
 # Constants
 MODEL_REMAPPING = {
     "mistral": "llama",  # mistral is compatible with llama
@@ -49,7 +52,6 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
-
 
 def _get_classes(config: dict):
     """
@@ -159,6 +161,7 @@ def load_model(
     config = load_config(model_path)
     config.update(model_config)
 
+
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files:
@@ -181,8 +184,8 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    # This handles the case where we use MLX-related quantizations
     if (quantization := config.get("quantization", None)) is not None:
-
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -198,6 +201,9 @@ def load_model(
             bits=quantization["bits"],
             class_predicate=class_predicate,
         )
+
+    # We can also handle HF-related quant models such as bitnet
+    model = apply_hf_quantization(model, config)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -453,7 +459,8 @@ def quantize_model(
     if "quantization" in config:
         raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+    quant_method = quantized_config.get("quantization_config", {})
+    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits, **quant_method}
 
     # Add any custom quantization parameters to the config as we go
     def _class_predicate(p, m):
