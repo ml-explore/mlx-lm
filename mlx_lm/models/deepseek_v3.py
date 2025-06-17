@@ -529,6 +529,7 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers[self.model.start_idx : self.model.end_idx]
 
+    @property
     def cast_predicate(self):
         def predicate(k):
             return "e_score_correction_bias" not in k
