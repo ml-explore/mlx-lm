@@ -437,6 +437,7 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs: Optional[List[float]] = None,
         top_tokens: Optional[List[Dict[int, float]]] = None,
         tokens: Optional[List[int]] = None,
+        tool_calls: Optional[List[str]] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -455,13 +456,26 @@ class APIHandler(BaseHTTPRequestHandler):
             top_tokens (Optional[List[Dict[int, float]]]): List of dictionaries mapping
               tokens to logprobs for the top N tokens at each token position.
             tokens (Optional[List[int]]): List of tokens to return with logprobs structure
+            tool_calls (Optional[List[str]]): List of tool calls.
 
         Returns:
             dict: A dictionary containing the response, in the same format as
               OpenAI's API.
         """
-        token_logprobs = token_logprobs if token_logprobs else []
-        top_logprobs = top_tokens if top_tokens else []
+        token_logprobs = token_logprobs or []
+        top_logprobs = top_tokens or []
+        tool_calls = tool_calls or []
+
+        def parse_function(tool_text):
+            tool_call = json.loads(tool_text.strip())
+            return {
+                "function": {
+                    "name": tool_call.get("name", None),
+                    "arguments": json.dumps(tool_call.get("arguments", "")),
+                },
+                "type": "function",
+                "id": None,
+            }
 
         # Static response
         response = {
@@ -479,7 +493,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         "tokens": tokens,
                     },
                     "finish_reason": finish_reason,
-                }
+                },
             ],
         }
 
@@ -503,7 +517,11 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
-            choice[key_name] = {"role": "assistant", "content": text}
+            choice[key_name] = {
+                "role": "assistant",
+                "content": text,
+                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
+            }
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
@@ -640,6 +658,10 @@ class APIHandler(BaseHTTPRequestHandler):
             self.repetition_context_size,
         )
 
+        tool_calls = []
+        tool_text = ""
+        in_tool_call = False
+        segment = ""
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -651,9 +673,23 @@ class APIHandler(BaseHTTPRequestHandler):
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
         ):
-            segment = gen_response.text
-            text += segment
-            logging.debug(segment)
+            logging.debug(gen_response.text)
+
+            if (
+                self.tokenizer.has_tool_calling
+                and gen_response.text == self.tokenizer.tool_call_start
+            ):
+                in_tool_call = True
+            elif in_tool_call:
+                if gen_response.text == self.tokenizer.tool_call_end:
+                    tool_calls.append(tool_text)
+                    tool_text = ""
+                    in_tool_call = False
+                else:
+                    tool_text += gen_response.text
+            else:
+                text += gen_response.text
+                segment += gen_response.text
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
@@ -677,9 +713,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         tokens[-stop_condition.trim_length :]
                     )
                     text = text[: -len(stop_sequence_suffix)]
+                segment = ""
                 break
 
-            if self.stream:
+            if self.stream and not in_tool_call:
                 # If the end of tokens overlaps with a stop sequence, generate new
                 # tokens until we know if the stop sequence is hit or not
                 if any(
@@ -689,10 +726,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
-                elif segment:
-                    response = self.generate_response(segment, None)
+                elif segment or tool_calls:
+                    response = self.generate_response(
+                        segment, None, tool_calls=tool_calls
+                    )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
+                    segment = ""
+                    tool_calls = []
 
         self.prompt_cache.tokens.extend(tokens)
 
@@ -701,7 +742,9 @@ class APIHandler(BaseHTTPRequestHandler):
         logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
 
         if self.stream:
-            response = self.generate_response(segment, finish_reason)
+            response = self.generate_response(
+                segment, finish_reason, tool_calls=tool_calls
+            )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
@@ -719,6 +762,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
+                tool_calls=tool_calls,
             )
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings

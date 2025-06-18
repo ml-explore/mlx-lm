@@ -267,6 +267,30 @@ class TokenizerWrapper:
             if eos_token_ids is not None
             else {tokenizer.eos_token_id}
         )
+        self._think_start = None
+        self._think_end = None
+        self._tool_call_start = None
+        self._tool_call_end = None
+
+        THINK_TOKENS = [("<think>", "</think>")]
+        TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
+
+        for think_start, think_end in THINK_TOKENS:
+            if think_start in tokenizer.vocab and think_end in tokenizer.vocab:
+                self._think_start = think_start
+                self._think_end = think_end
+                break
+        if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
+            self._tool_call_start = ""
+            self._tool_call_end = ""
+            for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
+                if (
+                    tool_call_start in tokenizer.vocab
+                    and tool_call_end in tokenizer.vocab
+                ):
+                    self._tool_call_start = tool_call_start
+                    self._tool_call_end = tool_call_end
+                    break
 
     def add_eos_token(self, token: str):
         token_id = None
@@ -279,6 +303,30 @@ class TokenizerWrapper:
             raise ValueError(f"'{token}' is not a token for this tokenizer")
 
         self._eos_token_ids.add(token_id)
+
+    @property
+    def has_thinking(self):
+        return self._think_start is not None
+
+    @property
+    def think_start(self):
+        return self._think_start
+
+    @property
+    def think_end(self):
+        return self._think_end
+
+    @property
+    def has_tool_calling(self):
+        return self._tool_call_start is not None
+
+    @property
+    def tool_call_start(self):
+        return self._tool_call_start
+
+    @property
+    def tool_call_end(self):
+        return self._tool_call_end
 
     def __getattr__(self, attr):
         if attr == "detokenizer":
