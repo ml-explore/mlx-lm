@@ -46,6 +46,7 @@ MODEL_REMAPPING = {
     "mistral": "llama",  # mistral is compatible with llama
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "minimax_m1": "minimax_text_01",
 }
 
 MAX_FILE_SIZE_GB = 5
