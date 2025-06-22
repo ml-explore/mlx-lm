@@ -131,20 +131,20 @@ def noaux_tc_select(
     top2_per_group = mx.topk(group_scores_reshaped, 2, axis=-1)
     group_scores = top2_per_group.sum(axis=-1)
     
-    selected_group_idx = mx.topk(group_scores, topk_group, axis=-1) # Select top groups
+    selected_group_idx = mx.topk(group_scores, topk_group, axis=-1).astype(mx.int32)
     
     # Create group mask
     group_mask = mx.zeros_like(group_scores)
-    group_mask = mx.put_along_axis(group_mask, selected_group_idx, 1.0, axis=-1)
+    group_mask = mx.put_along_axis(group_mask, selected_group_idx, mx.ones_like(selected_group_idx, dtype=group_mask.dtype), axis=-1)
     
     # Expand mask to expert level
     expert_mask = mx.repeat(group_mask[:, :, None], experts_per_group, axis=-1)
     expert_mask = expert_mask.reshape(batch_size, n_routed_experts)
     
-    masked_scores = scores_for_choice * expert_mask # Apply mask
+    masked_scores = scores_for_choice * expert_mask
     
     # Final top-k selection
-    topk_indices = mx.topk(masked_scores, top_k, axis=-1)
+    topk_indices = mx.topk(masked_scores, top_k, axis=-1).astype(mx.int32)
     topk_scores = mx.take_along_axis(orig_scores, topk_indices, axis=-1)
     
     # Normalize if needed
@@ -152,7 +152,7 @@ def noaux_tc_select(
         denominator = topk_scores.sum(axis=-1, keepdims=True)
         topk_scores = topk_scores / (denominator + 1e-20)
     
-    return (topk_scores * routed_scaling_factor), topk_scores
+    return (topk_scores * routed_scaling_factor), topk_indices
 
 
 class Dots1TopkRouter(nn.Module):
