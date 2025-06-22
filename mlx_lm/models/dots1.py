@@ -107,7 +107,7 @@ class Dots1Attention(nn.Module):
 
 
 @mx.compile
-def noaux_tc_select(
+def get_topk_indices(
     gates,
     e_score_correction_bias,
     top_k,
@@ -168,7 +168,7 @@ class Dots1TopkRouter(nn.Module):
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, x):
-        return noaux_tc_select(
+        return get_topk_indices(
             x @ self.weight.T,
             self.e_score_correction_bias,
             self.top_k,
