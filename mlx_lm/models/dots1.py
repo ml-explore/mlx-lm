@@ -33,8 +33,8 @@ class ModelArgs(BaseModelArgs):
     routed_scaling_factor: float
     head_dim: Optional[int] = None
     scoring_func: str = "noaux_tc",
-    n_group: Optional[int] = None
-    topk_group: Optional[int] = None
+    n_group: Optional[int] = 1
+    topk_group: Optional[int] = 1
     attention_bias: bool = False
     mlp_bias: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
