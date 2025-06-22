@@ -110,6 +110,7 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    @property
     def cast_predicate(self):
         def predicate(k):
             return "e_score_correction_bias" not in k
