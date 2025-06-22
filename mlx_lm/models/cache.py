@@ -12,7 +12,7 @@ def make_prompt_cache(
     max_kv_size: Optional[int] = None,
 ) -> List[Any]:
     """
-    Construct the model's cache for use when cgeneration.
+    Construct the model's cache for use in generation.
 
     This function will defer the cache construction to the model if it has a
     ``make_cache`` method, otherwise it will make a default KV cache.

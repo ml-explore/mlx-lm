@@ -214,6 +214,12 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     async eval could be running pass in the streams to synchronize with prior
     to exiting the context manager.
     """
+    if not mx.metal.is_available():
+        try:
+            yield
+        finally:
+            return
+
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
     )
@@ -229,7 +235,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         )
     old_limit = mx.set_wired_limit(max_rec_size)
     try:
-        yield None
+        yield
     finally:
         if streams is not None:
             for s in streams:
