@@ -91,6 +91,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
             self._current_text = self._tokenizer.decode(self._current_tokens)
             if (
                 self._tokenizer.clean_up_tokenization_spaces
+                and len(self._current_text) > 0
                 and self._current_text[-1] == " "
             ):
                 self._current_text = self._current_text[:-1]
