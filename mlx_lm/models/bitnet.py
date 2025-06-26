@@ -1,14 +1,16 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from functools import partial
+
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 from .bitlinear_layers import BitLinear
+from .rope_utils import initialize_rope
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -32,7 +34,6 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-
 
 
 class Attention(nn.Module):
@@ -98,9 +99,11 @@ class Attention(nn.Module):
 
         return output
 
+
 @partial(mx.compile, shapeless=True)
 def relu2(x):
     return mx.square(nn.relu(x))
+
 
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -173,7 +176,6 @@ class LlamaModel(nn.Module):
     ):
         h = self.embed_tokens(inputs)
 
-
         if mask is None:
             mask = create_attention_mask(h, cache)
 
@@ -182,7 +184,6 @@ class LlamaModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
-
 
         return self.norm(h)
 

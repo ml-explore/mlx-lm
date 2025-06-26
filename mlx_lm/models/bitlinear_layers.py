@@ -6,7 +6,15 @@ class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
     """
-    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, invert_weight_scales = False):
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=mx.float16,
+        invert_weight_scales=False,
+    ):
         super().__init__()
         self.dtype = dtype
         self.in_features = in_features
@@ -34,40 +42,43 @@ class BitLinear(nn.Module):
         This eliminates the need to store unpacked weights in memory.
         """
         source = """
-        uint tid = thread_position_in_grid.x;
-        uint total_elements = batch_size * out_features;
+        constexpr int M = 4;
+        constexpr int BLOCK = 32;
 
-        if (tid >= total_elements) return;
+        uint tid = thread_position_in_grid.y;
+        uint in_offset = thread_position_in_grid.x;
 
-        uint batch_idx = tid / out_features;
-        uint out_idx = tid % out_features;
+        uint batch_idx = tid / (out_features / 4);
+        uint row_idx = tid % (out_features / 4);
 
-        float sum = 0.0;
+        float sum[4] = {0.0};
 
-        // Calculate packed dimensions
-        uint packed_rows = out_features / 4;  // Each packed row contains 4 output rows
+        for (uint i = in_offset * M; i < in_features; i += BLOCK * M) {
+            float v[M];
+            for (int j=0; j<M; j++) {
+                v[j] = x[batch_idx * in_features + i + j];
+            }
 
-        for (uint i = 0; i < in_features; i++) {
-            // Get input value
-            float x_val = x[batch_idx * in_features + i];
+            for (int j=0; j<M; j++) {
+                uint8_t w = packed_weights[row_idx * in_features + i + j];
+                sum[0] += v[j] * ((w & 3) - 1);
+                sum[1] += v[j] * (((w >> 2) & 3) - 1);
+                sum[2] += v[j] * (((w >> 4) & 3) - 1);
+                sum[3] += v[j] * (((w >> 6) & 3) - 1);
+            }
+        }
 
-            // Determine which packed row and which bit position within that packed value
-            uint which_slice = out_idx / packed_rows;  // Which of the 4 slices (0, 1, 2, 3)
-            uint row_in_slice = out_idx - which_slice * packed_rows;  // Which row within that slice
-
-            // Get the packed weight value
-            uint packed_idx = row_in_slice * in_features + i;
-            uint8_t packed_val = packed_weights[packed_idx];
-
-
-            // Extract the 2-bit slice; {0,1,2} -> {-1,0,1} (11 is unused and would map to 2)
-            float weight_val = float((packed_val >> (2 * which_slice)) & 3) - 1.0;
-
-            sum += x_val * weight_val;
+        for (int j=0; j<4; j++) {
+            sum[j] = simd_sum(sum[j]);
         }
 
         // Apply weight scaling by diving them or multiplying them
-        out[tid] = invert_weight_scales ? (sum / weight_scale[0]) : (sum * weight_scale[0]);
+        if (in_offset == 0) {
+            float scale = invert_weight_scales ? 1 / weight_scale[0] : weight_scale[0];
+            for (int i=0; i<4; i++) {
+                out[batch_idx * out_features + row_idx + i * (out_features/4)] = sum[i] * scale;
+            }
+        }
         """
 
         return mx.fast.metal_kernel(
@@ -76,7 +87,6 @@ class BitLinear(nn.Module):
             output_names=["out"],
             source=source,
         )
-
 
     def execute_matmul_kernel(self, x, packed_weights):
         # Handle multi-dimensional inputs by flattening all but the last dimension
@@ -93,10 +103,19 @@ class BitLinear(nn.Module):
         out_features = self.out_features
 
         outputs = self._compiled_kernel(
-            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
-            template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
-            grid=(total_batch_elements * out_features, 1, 1),
-            threadgroup=(32, 1, 1), # SIMD width is 32 threads
+            inputs=[
+                x_flattened.astype(self.dtype),
+                packed_weights,
+                self.weight_scale,
+                self.invert_weight_scales,
+            ],
+            template=[
+                ("batch_size", total_batch_elements),
+                ("in_features", in_features),
+                ("out_features", out_features),
+            ],
+            grid=(32, total_batch_elements * out_features // 4, 1),
+            threadgroup=(32, 1, 1),  # SIMD width is 32 threads
             output_shapes=[(total_batch_elements, out_features)],
             output_dtypes=[self.dtype],
         )
@@ -107,7 +126,6 @@ class BitLinear(nn.Module):
             return outputs[0].reshape(output_shape)
         else:
             return outputs[0]
-
 
     def __call__(self, x):
         """
@@ -164,7 +182,9 @@ def benchmark():
             elapsed = (time.time() - start) / 100
 
             tokens_per_sec = (batch_size * seq_len) / elapsed
-            print(f"  {test_name}: {elapsed*1000:.3f}ms ({tokens_per_sec:.1f} tokens/sec)")
+            print(
+                f"  {test_name}: {elapsed*1000:.3f}ms ({tokens_per_sec:.1f} tokens/sec)"
+            )
 
 
 if __name__ == "__main__":
