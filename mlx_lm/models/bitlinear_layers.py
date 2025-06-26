@@ -148,7 +148,9 @@ class QuantAndBitLinear(nn.Linear):
     A Linear layer that can be converted to a quantized and bitlinear version.
     """
 
-    def to_quantized(self, method: str = None, group_size: int = 64, bits: int = 4, **kwargs):
+    def to_quantized(
+        self, method: str = None, group_size: int = 64, bits: int = 4, **kwargs
+    ):
 
         if method is None or group_size is None or bits is None:
             return QuantizedLinear.from_linear(self, group_size, bits)
@@ -157,11 +159,10 @@ class QuantAndBitLinear(nn.Linear):
             bitlinear = BitLinear(
                 in_features=self.weight.shape[1],
                 out_features=self.weight.shape[0],
-                bias= getattr(self, "bias", None) is not None,
+                bias=getattr(self, "bias", None) is not None,
                 invert_weight_scales=True,
-                **kwargs
+                **kwargs,
             )
             return bitlinear
         else:
             raise ValueError(f"Unknown quantization method: {method}")
-

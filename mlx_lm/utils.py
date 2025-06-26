@@ -50,6 +50,7 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -165,7 +166,6 @@ def load_model(
     config = load_config(model_path)
     config.update(model_config)
 
-
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files:
@@ -189,14 +189,23 @@ def load_model(
         weights = model.sanitize(weights)
 
     # This handles the case where we use MLX-related quantizations
-    if (quantization := (config.get("quantization_config", None) or config.get("quantization", None))) is not None:
+    if (
+        quantization := (
+            config.get("quantization_config", None) or config.get("quantization", None)
+        )
+    ) is not None:
+
         def class_predicate(p, m):
 
             # Handle custom per layer quantizations (i.e. bitnet)
             quantization_config = config.get("quantization_config", {})
             quant_method = quantization_config.get("quant_method")
 
-            if hasattr(m, "to_quantized") and quant_method is not None and "scales" not in p:
+            if (
+                hasattr(m, "to_quantized")
+                and quant_method is not None
+                and "scales" not in p
+            ):
                 # Check if the to_quantized method accepts a 'method' parameter
                 if "method" in m.to_quantized.__code__.co_varnames:
                     return {"method": quant_method}
@@ -220,7 +229,6 @@ def load_model(
             bits=quantization.get("bits", None),
             class_predicate=class_predicate,
         )
-
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -477,7 +485,11 @@ def quantize_model(
         raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
     quant_method = quantized_config.get("quantization_config", {})
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits, **quant_method}
+    quantized_config["quantization"] = {
+        "group_size": q_group_size,
+        "bits": q_bits,
+        **quant_method,
+    }
 
     # Add any custom quantization parameters to the config as we go
     def _class_predicate(p, m):

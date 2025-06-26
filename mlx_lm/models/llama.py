@@ -7,8 +7,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 from .bitlinear_layers import QuantAndBitLinear
+from .rope_utils import initialize_rope
 
 
 @dataclass
