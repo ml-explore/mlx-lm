@@ -40,7 +40,6 @@ from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import get_total_parameters, load_adapters
 
 # Quant imports
-from .quant.utils import apply_hf_quantization
 
 # Constants
 MODEL_REMAPPING = {
@@ -190,10 +189,25 @@ def load_model(
         weights = model.sanitize(weights)
 
     # This handles the case where we use MLX-related quantizations
-    if (quantization := config.get("quantization", None)) is not None:
+    if (quantization := (config.get("quantization_config", None) or config.get("quantization", None))) is not None:
         def class_predicate(p, m):
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
+
+            # Handle custom per layer quantizations (i.e. bitnet)
+            quantization_config = config.get("quantization_config", {})
+            quant_method = quantization_config.get("quant_method")
+
+            if hasattr(m, "to_quantized") and quant_method is not None and "scales" not in p:
+                # Check if the to_quantized method accepts a 'method' parameter
+                if "method" in m.to_quantized.__code__.co_varnames:
+                    return {"method": quant_method}
+                elif quantization_config.get("group_size") is not None:
+                    # N-bit quantize Embeddings and LM Head (i.e. 4-bit)
+                    return True
+                else:
+                    # Skip Embeddings and LM Head quantization
+                    return False
+
+            if p in config.get("quantization", {}):
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
@@ -202,13 +216,11 @@ def load_model(
 
         nn.quantize(
             model,
-            group_size=quantization["group_size"],
-            bits=quantization["bits"],
+            group_size=quantization.get("group_size", None),
+            bits=quantization.get("bits", None),
             class_predicate=class_predicate,
         )
 
-    # We can also handle HF-related quant models such as bitnet
-    model = apply_hf_quantization(model, config)
 
     model.load_weights(list(weights.items()), strict=strict)
 
