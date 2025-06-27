@@ -219,13 +219,11 @@ class Gemma3nAttention(nn.Module):
         position_embeddings: Optional[mx.array] = None,
         cache_position: Optional[mx.array] = None,
     ) -> mx.array:
-        input_shape = x.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
+        B, L, _ = x.shape
         cos, sin = position_embeddings
 
         queries = self.q_proj(x)
-        queries = queries.reshape(hidden_shape)
+        queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
         queries = apply_rotary_pos_emb(queries, cos, sin, unsqueeze_dim=2)
         queries = queries.transpose(0, 2, 1, 3)
@@ -240,35 +238,26 @@ class Gemma3nAttention(nn.Module):
             keys, values = shared_cache.state
 
         else:
-            keys = self.k_proj(x).reshape(hidden_shape)
+            keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
             keys = apply_rotary_pos_emb(keys, cos, sin, unsqueeze_dim=2)
             keys = keys.transpose(0, 2, 1, 3)
 
-            values = self.v_proj(x).reshape(hidden_shape)
+            values = self.v_proj(x).reshape(B, L, -1, self.head_dim)
             values = self.v_norm(values)
             values = values.transpose(0, 2, 1, 3)
 
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
 
-        keys = mx.repeat(keys, repeats=self.repeats, axis=1)
-        values = mx.repeat(values, repeats=self.repeats, axis=1)
+        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
+            mask = mask[:, : keys.shape[-2]]
 
-        attn_weights = mx.matmul(queries, keys.swapaxes(2, 3)) * self.scale
-
-        if mask is not None:  # no matter the length, we just slice it
-            causal_mask = mask[:, : keys.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        # upcast attention to fp32
-        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(
-            queries.dtype
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
 
-        output = mx.matmul(attn_weights, values)
-
-        output = output.transpose(0, 2, 1, 3).reshape(input_shape + (-1,))
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output)
 
@@ -480,34 +469,6 @@ class Gemma3nDecoderLayer(nn.Module):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
 
-        if self.is_sliding and mask is not None:  # efficient SDPA and no padding
-            # In prefill, we may be larger than sliding window
-            effective_seq_len = max(cache_position.shape[0], self.sliding_window)
-            # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
-            # thus we must slice from the right (at most `effective_seq_len` elements)
-
-            # Handle boolean mask properly
-            if mask.dtype == mx.bool_:
-                # Convert boolean mask to float mask where True=0.0 (allowed) and False=min_value (masked)
-                min_dtype = mx.finfo(mx.float32).min
-                mask = mx.where(mask, 0.0, min_dtype)
-            else:
-                min_dtype = mx.finfo(mask.dtype).min
-
-            sliding_window_mask = mx.tril(
-                mx.ones(mask.shape, dtype=mx.bool_), k=-self.sliding_window
-            )
-            mask = mx.where(sliding_window_mask, min_dtype, mask)
-            # In case we are beyond the sliding window, we need to correctly offset the mask slicing
-            offset = cache_position[-1] - effective_seq_len + 1
-            # Should only be used when beyond the sliding window (i.e. offset > 0)
-            offset = mx.clip(offset, a_min=0, a_max=None)
-            # equivalent to: `attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]`,
-            # but without data-dependent slicing (i.e. torch.compile friendly)
-            mask_indexes = mx.arange(min(effective_seq_len, mask.shape[-1]))
-            mask_indexes += offset
-            mask = mask[:, mask_indexes.astype(mx.int32)]
-
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
 
@@ -561,46 +522,26 @@ class Gemma3nDecoderLayer(nn.Module):
         return corrected_predictions
 
 
-class Gemma3nTextScaledWordEmbedding(nn.Embedding):
-    """This module overrides nn.Embeddings' forward by multiplying with embeddings scale."""
-
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        embed_scale: Optional[float] = 1.0,
-    ):
-        super().__init__(num_embeddings, embedding_dim)
-        self.embed_scale = embed_scale
-
-    def __call__(self, x: mx.array):
-        return super().__call__(x) * mx.array(self.embed_scale, mx.float32).astype(
-            self.weight.dtype
-        )
-
-
 class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         self.vocab_size = config.vocab_size
         self.vocab_size_per_layer_input = config.vocab_size_per_layer_input
         self.num_hidden_layers = config.num_hidden_layers
         self.final_logit_softcapping = config.final_logit_softcapping
 
-        self.embed_tokens = Gemma3nTextScaledWordEmbedding(
-            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
             Gemma3nDecoderLayer(config=config, layer_idx=layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ]
 
-        self.embed_tokens_per_layer = Gemma3nTextScaledWordEmbedding(
+        self.embed_tokens_per_layer = nn.Embedding(
             config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
-            embed_scale=config.hidden_size_per_layer_input**0.5,
         )
 
         self.per_layer_model_projection = nn.Linear(
@@ -650,7 +591,7 @@ class LanguageModel(nn.Module):
     ):
         per_layer_inputs = self.get_per_layer_inputs(inputs)
         if input_embeddings is None:
-            h = self.embed_tokens(inputs)
+            h = self.embed_tokens(inputs) * (self.hidden_size**0.5)
         else:
             h = input_embeddings
 
@@ -681,7 +622,6 @@ class LanguageModel(nn.Module):
             sliding_window_mask = create_attention_mask(
                 h, cache[self.first_sliding_idx :], return_array=True
             )
-
         h0 = h
 
         # Initialize RoPE embeddings
@@ -751,12 +691,14 @@ class LanguageModel(nn.Module):
             input_ids >= 0, input_ids < self.vocab_size_per_layer_input
         )
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
-        result = self.embed_tokens_per_layer(tokens).reshape(
+        result = self.embed_tokens_per_layer(tokens) * (
+            self.hidden_size_per_layer_input**0.5
+        )
+        return result.reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,
             self.config.hidden_size_per_layer_input,
         )
-        return result
 
     def project_per_layer_inputs(
         self, inputs_embeds: mx.array, per_layer_inputs: Optional[mx.array] = None
