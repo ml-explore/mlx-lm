@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import copy
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -82,95 +81,6 @@ class Gemma3nLaurelBlock(nn.Module):
         return x + normed_laurel_x
 
 
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate((-x2, x1), axis=-1)
-
-
-def apply_rotary_pos_emb(
-    x: mx.array,
-    cos: mx.array,
-    sin: mx.array,
-    unsqueeze_dim: int = 1,
-):
-
-    cos = mx.expand_dims(cos, unsqueeze_dim)
-    sin = mx.expand_dims(sin, unsqueeze_dim)
-    return (x * cos) + (rotate_half(x) * sin)
-
-
-def _compute_default_rope_parameters(
-    config: Optional[TextConfig] = None,
-    **rope_kwargs,
-) -> tuple[mx.array, float]:
-
-    if config is not None and len(rope_kwargs) > 0:
-        raise ValueError(
-            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
-            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
-        )
-    if len(rope_kwargs) > 0:
-        base = rope_kwargs["base"]
-        dim = rope_kwargs["dim"]
-    elif config is not None:
-        base = config.rope_theta
-        partial_rotary_factor = (
-            config.partial_rotary_factor
-            if hasattr(config, "partial_rotary_factor")
-            else 1.0
-        )
-        head_dim = (
-            getattr(config, "head_dim", None)
-            or config.hidden_size // config.num_attention_heads
-        )
-        dim = int(head_dim * partial_rotary_factor)
-
-    attention_factor = 1.0  # Unused in this type of RoPE
-
-    # Compute the inverse frequencies
-    inv_freq = 1.0 / (
-        base ** (mx.arange(0, dim, 2, dtype=mx.int64).astype(mx.float32) / dim)
-    )
-    return inv_freq, attention_factor
-
-
-class Gemma3nRotaryEmbedding(nn.Module):
-    def __init__(self, config: TextConfig, device=None):
-        super().__init__()
-
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
-        else:
-            self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-
-        self.rope_init_fn = _compute_default_rope_parameters
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config)
-        self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
-        self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
-
-    def __call__(self, x, position_ids):
-        inv_freq_expanded = self._inv_freq[None, :, None].astype(mx.float32)
-        position_ids_expanded = position_ids[:, None, :].astype(mx.float32)
-
-        freqs = (
-            inv_freq_expanded.astype(mx.float32)
-            @ position_ids_expanded.astype(mx.float32)
-        ).transpose(0, 2, 1)
-        emb = mx.concatenate((freqs, freqs), axis=-1)
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
-
-        return cos.astype(x.dtype), sin.astype(x.dtype)
-
-
 class Gemma3nAttention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -200,6 +110,14 @@ class Gemma3nAttention(nn.Module):
 
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx
 
+        self.rope = nn.RoPE(
+            head_dim,
+            traditional=False,
+            base=(
+                config.rope_local_base_freq if self.is_sliding else config.rope_theta
+            ),
+        )
+
         # Compute the layer index from which shared KV cache values will be retrieved.
         if not self.is_kv_shared_layer:
             self.kv_shared_layer_index = None
@@ -216,18 +134,14 @@ class Gemma3nAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         caches: Optional[List[Any]] = None,
-        position_embeddings: Optional[mx.array] = None,
-        cache_position: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        cos, sin = position_embeddings
 
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
-        queries = apply_rotary_pos_emb(queries, cos, sin, unsqueeze_dim=2)
-        queries = queries.transpose(0, 2, 1, 3)
 
+        offset = 0
         if (
             self.is_kv_shared_layer
             and self.kv_shared_layer_index is not None
@@ -236,12 +150,15 @@ class Gemma3nAttention(nn.Module):
             # For shared layers, retrieve KV from the designated cache layer
             shared_cache = caches[self.kv_shared_layer_index]
             keys, values = shared_cache.state
+            offset = shared_cache.offset
 
         else:
+            if cache is not None:
+                offset = cache.offset
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
-            keys = apply_rotary_pos_emb(keys, cos, sin, unsqueeze_dim=2)
             keys = keys.transpose(0, 2, 1, 3)
+            keys = self.rope(keys, offset=offset)
 
             values = self.v_proj(x).reshape(B, L, -1, self.head_dim)
             values = self.v_norm(values)
@@ -249,6 +166,9 @@ class Gemma3nAttention(nn.Module):
 
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
+
+        queries = queries.transpose(0, 2, 1, 3)
+        queries = self.rope(queries, offset=offset)
 
         if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
             mask = mask[:, : keys.shape[-2]]
@@ -320,19 +240,15 @@ class Gemma3nAltUp(nn.Module):
             dims=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
-        self._router_input_scale = mx.array(self.config.hidden_size**-1.0)
 
     def compute_router_modalities(self, x: mx.array) -> mx.array:
-        router_inputs = self.router_norm(x) * self._router_input_scale.astype(
-            self.router_norm.weight.dtype
-        )
+        router_inputs = self.router_norm(x) * (self.config.hidden_size**-1.0)
         routed = self.modality_router(router_inputs).astype(mx.float32)
         return mx.tanh(routed)
 
     def predict(self, x: mx.array) -> mx.array:
         modalities = self.compute_router_modalities(x[self.config.altup_active_idx])
 
-        # Force float32 computation like PyTorch
         self.prediction_coefs.weight = self.prediction_coefs.weight.astype(mx.float32)
 
         if self.config.altup_coef_clip is not None:
@@ -342,7 +258,6 @@ class Gemma3nAltUp(nn.Module):
                 self.config.altup_coef_clip,
             )
 
-        # Fix: Use permute pattern that matches PyTorch exactly
         all_coefs = (
             self.prediction_coefs(modalities)
             .reshape(
@@ -350,23 +265,18 @@ class Gemma3nAltUp(nn.Module):
                 self.config.altup_num_inputs,
                 self.config.altup_num_inputs,
             )
-            .transpose(0, 1, 3, 2)  # This should match PyTorch's permute(0, 1, 3, 2)
+            .transpose(0, 1, 3, 2)
         )
 
-        # Fix: Match PyTorch's tensor manipulation exactly
-        # PyTorch: hidden_states.float().permute(1, 2, 3, 0)
         x_permuted = x.astype(mx.float32).transpose(1, 2, 3, 0)
         predictions = mx.matmul(x_permuted, all_coefs)
-        predictions = predictions.transpose(
-            3, 0, 1, 2
-        )  # Match PyTorch's permute(3, 0, 1, 2)
+        predictions = predictions.transpose(3, 0, 1, 2)
         predictions += x
         return predictions.astype(x.dtype)
 
     def correct(self, predictions: mx.array, activated: mx.array):
         modalities = self.compute_router_modalities(activated)
 
-        # Force float32 computation like PyTorch
         self.correction_coefs.weight = self.correction_coefs.weight.astype(mx.float32)
 
         if self.config.altup_coef_clip is not None:
@@ -376,24 +286,19 @@ class Gemma3nAltUp(nn.Module):
                 self.config.altup_coef_clip,
             )
 
-        # Fix: Match PyTorch's broadcasting approach instead of loop
         all_coefs = self.correction_coefs(modalities) + 1.0
 
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
 
-        # Replicate innovation for all inputs like PyTorch
         innovation_expanded = mx.broadcast_to(
             mx.expand_dims(innovation, axis=0),
             (self.config.altup_num_inputs,) + innovation.shape,
         )
 
-        # Fix: Match PyTorch's tensor manipulation
-        # PyTorch: all_coefs.permute(2, 1, 0).unsqueeze(1)
         all_coefs_reshaped = all_coefs.transpose(2, 1, 0)
         all_coefs_reshaped = mx.expand_dims(all_coefs_reshaped, axis=1)
 
-        # Broadcast multiply like PyTorch
         corrected = innovation_expanded * all_coefs_reshaped
         corrected += predictions
 
@@ -402,14 +307,6 @@ class Gemma3nAltUp(nn.Module):
     def scale_corrected_output(self, corrected: mx.array):
         scale = self.correct_output_scale if self.config.altup_correct_scale else 1.0
         return corrected * scale
-
-    def __call__(self, x: mx.array, activated: mx.array):
-        predictions = self.predict(x)
-        corrected = self.correct(predictions=predictions, activated=activated)
-        output = corrected[self.config.altup_active_idx]
-        if self.config.altup_correct_scale:
-            output = self.scale_corrected_output(output)
-        return corrected, output
 
 
 class Gemma3nDecoderLayer(nn.Module):
@@ -462,9 +359,6 @@ class Gemma3nDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
         caches: Optional[List[Any]] = None,
-        cache_position: Optional[mx.array] = None,
-        position_embeddings_global: Optional[mx.array] = None,
-        position_embeddings_local: Optional[mx.array] = None,
     ):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
@@ -475,27 +369,17 @@ class Gemma3nDecoderLayer(nn.Module):
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
-        # apply global RoPE to non-sliding layer only
-        if self.is_sliding:
-            position_embeddings = position_embeddings_local
-        else:
-            position_embeddings = position_embeddings_global
-
         attn = self.self_attn(
             active_prediction_normed,
             mask,
             cache,
             caches,
-            position_embeddings,
-            cache_position,
         )
 
         attn = self.post_attention_layernorm(attn)
 
         attn_gated = active_prediction + attn
-        attn_laurel = (attn_gated + laurel_output) / mx.sqrt(
-            mx.array(2.0, dtype=active_prediction.dtype)
-        )
+        attn_laurel = (attn_gated + laurel_output) * (2.0**-0.5)
 
         attn_norm = self.pre_feedforward_layernorm(attn_laurel)
         attn_ffw = self.mlp(attn_norm)
@@ -570,15 +454,6 @@ class LanguageModel(nn.Module):
             eps=config.rms_norm_eps,
         )
 
-        self._per_layer_projection_scale = mx.array(self.hidden_size**-0.5)
-        self._per_layer_input_scale = mx.rsqrt(mx.array(2.0))
-
-        self.rope_embedding = Gemma3nRotaryEmbedding(config)
-
-        config = copy.deepcopy(config)
-        config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default"}
-        self.rope_embedding_local = Gemma3nRotaryEmbedding(config)
         self.first_sliding_idx = self.config.layer_types.index("sliding_attention")
         self.first_full_idx = self.config.layer_types.index("full_attention")
 
@@ -589,63 +464,42 @@ class LanguageModel(nn.Module):
         cache=None,
         input_embeddings: mx.array = None,
     ):
-        per_layer_inputs = self.get_per_layer_inputs(inputs)
         if input_embeddings is None:
             h = self.embed_tokens(inputs) * (self.hidden_size**0.5)
         else:
             h = input_embeddings
 
-        if per_layer_inputs is None and inputs is not None:
-            per_layer_inputs = self.get_per_layer_inputs(inputs)
-
+        per_layer_inputs = self.get_per_layer_inputs(inputs)
         per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        cache_position = None
-        if cache_position is None:
-            past_seen_tokens = 0
-            if cache is not None and cache[0] is not None:
-                past_seen_tokens = cache[0].offset
-
-            cache_position = mx.arange(
-                past_seen_tokens,
-                past_seen_tokens + h.shape[1],
-            )
-
         if mask is None:
-            # TOOD why return_array?
             full_mask = create_attention_mask(
-                h, cache[self.first_full_idx :], return_array=True
+                h,
+                cache[self.first_full_idx :],
             )
             sliding_window_mask = create_attention_mask(
-                h, cache[self.first_sliding_idx :], return_array=True
+                h,
+                cache[self.first_sliding_idx :],
             )
         h0 = h
-
-        # Initialize RoPE embeddings
-        position_ids = cache_position[None, :]
-        position_embeddings_global = self.rope_embedding(h0, position_ids)
-        position_embeddings_local = self.rope_embedding_local(h0, position_ids)
 
         # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
         epsilon_tensor = mx.array(mx.finfo(h0.dtype).min, dtype=h0.dtype)
 
-        h_list = [h0] * self.config.altup_num_inputs
+        h_list = [h0]
 
         for i in range(1, self.config.altup_num_inputs):
-            altup_proj = self.altup_projections[i - 1](h_list[i])
-            h_list[i] = altup_proj.astype(h0.dtype)
+            h_list.append(self.altup_projections[i - 1](h0))
             new_magnitude = mx.mean(h_list[i] ** 2, axis=-1, keepdims=True) ** 0.5
             h_list[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
 
         h = mx.stack(h_list, axis=0)
 
-        for i, (layer, c) in enumerate(
-            zip(self.layers[: self.config.num_hidden_layers], cache)
-        ):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
             is_global = self.config.layer_types[i] == "full_attention"
@@ -662,9 +516,6 @@ class LanguageModel(nn.Module):
                 c,
                 per_layer_input,
                 cache,
-                cache_position,
-                position_embeddings_global,
-                position_embeddings_local,
             )
 
         # Per-layer inputs to single output
@@ -687,43 +538,32 @@ class LanguageModel(nn.Module):
         return out
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
-        per_layer_inputs_mask = mx.logical_and(
-            input_ids >= 0, input_ids < self.vocab_size_per_layer_input
-        )
+        per_layer_inputs_mask = input_ids < self.vocab_size_per_layer_input
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
         result = self.embed_tokens_per_layer(tokens) * (
             self.hidden_size_per_layer_input**0.5
         )
         return result.reshape(
             *input_ids.shape,
-            self.config.num_hidden_layers,
-            self.config.hidden_size_per_layer_input,
+            self.num_hidden_layers,
+            self.hidden_size_per_layer_input,
         )
 
     def project_per_layer_inputs(
-        self, inputs_embeds: mx.array, per_layer_inputs: Optional[mx.array] = None
+        self,
+        inputs_embeds: mx.array,
+        per_layer_inputs: mx.array,
     ) -> mx.array:
-        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
-        per_layer_projection *= self._per_layer_projection_scale.astype(
-            inputs_embeds.dtype
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds) * (
+            self.hidden_size**-0.5
         )
-
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1],
             self.config.num_hidden_layers,
             self.config.hidden_size_per_layer_input,
         )
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
-
-        if per_layer_inputs is None:
-            return per_layer_projection
-
-        if per_layer_projection.shape != per_layer_inputs.shape:
-            per_layer_inputs = per_layer_inputs[..., : self.config.num_hidden_layers, :]
-
-        return (
-            per_layer_projection + per_layer_inputs
-        ) * self._per_layer_input_scale.astype(inputs_embeds.dtype)
+        return (per_layer_projection + per_layer_inputs) * (2.0**-0.5)
 
 
 class Gemma3n(nn.Module):
