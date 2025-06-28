@@ -9,6 +9,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -82,7 +83,7 @@ class Gemma3nLaurelBlock(nn.Module):
 
 
 class Gemma3nAttention(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int):
+    def __init__(self, config: TextConfig, layer_idx: int, is_kv_shared_layer: bool):
         super().__init__()
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
 
@@ -104,11 +105,7 @@ class Gemma3nAttention(nn.Module):
         self.k_norm = nn.RMSNorm(dims=config.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNoScale(eps=config.rms_norm_eps)
 
-        first_kv_shared_layer_idx = (
-            config.num_hidden_layers - config.num_kv_shared_layers
-        )
-
-        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx
+        self.is_kv_shared_layer = is_kv_shared_layer
 
         self.rope = nn.RoPE(
             head_dim,
@@ -118,22 +115,11 @@ class Gemma3nAttention(nn.Module):
             ),
         )
 
-        # Compute the layer index from which shared KV cache values will be retrieved.
-        if not self.is_kv_shared_layer:
-            self.kv_shared_layer_index = None
-        elif self.is_sliding:
-            # The last layer that computes local sliding attention is always 2 before sharing starts
-            self.kv_shared_layer_index = first_kv_shared_layer_idx - 2
-        else:
-            # The last layer before sharing starts is always the last that computes global attention layer
-            self.kv_shared_layer_index = first_kv_shared_layer_idx - 1
-
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        caches: Optional[List[Any]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -142,15 +128,10 @@ class Gemma3nAttention(nn.Module):
         queries = self.q_norm(queries)
 
         offset = 0
-        if (
-            self.is_kv_shared_layer
-            and self.kv_shared_layer_index is not None
-            and cache is not None
-        ):
+        if self.is_kv_shared_layer and cache is not None:
             # For shared layers, retrieve KV from the designated cache layer
-            shared_cache = caches[self.kv_shared_layer_index]
-            keys, values = shared_cache.state
-            offset = shared_cache.offset
+            keys, values = cache.state
+            offset = cache.offset
 
         else:
             if cache is not None:
@@ -310,12 +291,12 @@ class Gemma3nAltUp(nn.Module):
 
 
 class Gemma3nDecoderLayer(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int):
+    def __init__(self, config: TextConfig, layer_idx: int, is_kv_shared_layer: bool):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self.self_attn = Gemma3nAttention(config, layer_idx)
+        self.self_attn = Gemma3nAttention(config, layer_idx, is_kv_shared_layer)
         self.mlp = MLP(config, layer_idx=layer_idx)
         self.input_layernorm = nn.RMSNorm(
             self.hidden_size,
@@ -358,7 +339,6 @@ class Gemma3nDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
-        caches: Optional[List[Any]] = None,
     ):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
@@ -373,7 +353,6 @@ class Gemma3nDecoderLayer(nn.Module):
             active_prediction_normed,
             mask,
             cache,
-            caches,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -416,10 +395,17 @@ class LanguageModel(nn.Module):
         self.vocab_size_per_layer_input = config.vocab_size_per_layer_input
         self.num_hidden_layers = config.num_hidden_layers
         self.final_logit_softcapping = config.final_logit_softcapping
+        self.first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
+        )
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            Gemma3nDecoderLayer(config=config, layer_idx=layer_idx)
+            Gemma3nDecoderLayer(
+                config=config,
+                layer_idx=layer_idx,
+                is_kv_shared_layer=layer_idx >= self.first_kv_shared_layer_idx,
+            )
             for layer_idx in range(config.num_hidden_layers)
         ]
 
@@ -456,6 +442,26 @@ class LanguageModel(nn.Module):
 
         self.first_sliding_idx = self.config.layer_types.index("sliding_attention")
         self.first_full_idx = self.config.layer_types.index("full_attention")
+
+        concrete_layers = self.config.layer_types[: self.first_kv_shared_layer_idx]
+        shared_full_idx = (
+            len(concrete_layers) - 1 - concrete_layers[::-1].index("full_attention")
+        )
+        shared_sliding_idx = (
+            len(concrete_layers) - 1 - concrete_layers[::-1].index("sliding_attention")
+        )
+
+        self.layer_idx_to_cache_idx = []
+        for i, layer_type in enumerate(self.config.layer_types):
+            if i < self.first_kv_shared_layer_idx:
+                self.layer_idx_to_cache_idx.append(i)
+            else:
+                if layer_type == "full_attention":
+                    self.layer_idx_to_cache_idx.append(shared_full_idx)
+                elif layer_type == "sliding_attention":
+                    self.layer_idx_to_cache_idx.append(shared_sliding_idx)
+                else:
+                    raise NotImplementedError(f"Unknown layer type: {layer_type}")
 
     def __call__(
         self,
@@ -499,7 +505,7 @@ class LanguageModel(nn.Module):
 
         h = mx.stack(h_list, axis=0)
 
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for i, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
             is_global = self.config.layer_types[i] == "full_attention"
@@ -513,9 +519,8 @@ class LanguageModel(nn.Module):
             h = layer(
                 h,
                 local_mask,
-                c,
+                cache[self.layer_idx_to_cache_idx[i]],
                 per_layer_input,
-                cache,
             )
 
         # Per-layer inputs to single output
@@ -565,6 +570,19 @@ class LanguageModel(nn.Module):
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
         return (per_layer_projection + per_layer_inputs) * (2.0**-0.5)
 
+    def make_cache(self):
+        caches = []
+        for layer_type in self.config.layer_types[: self.first_kv_shared_layer_idx]:
+            if layer_type == "full_attention":
+                caches.append(KVCache())
+            elif layer_type == "sliding_attention":
+                caches.append(
+                    RotatingKVCache(max_size=self.config.sliding_window, keep=0)
+                )
+            else:
+                raise NotImplementedError(f"Unknown layer type: {layer_type}")
+        return caches
+
 
 class Gemma3n(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -582,10 +600,14 @@ class Gemma3n(nn.Module):
             inputs, cache=cache, mask=mask, input_embeddings=input_embeddings
         )
 
+    def make_cache(self):
+        return self.language_model.make_cache()
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.args = args
         self.model = Gemma3n(args)
 
     def __call__(
@@ -608,3 +630,6 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.language_model.layers
+
+    def make_cache(self):
+        return self.model.make_cache()
