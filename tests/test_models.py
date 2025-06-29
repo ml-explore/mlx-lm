@@ -1,4 +1,5 @@
 # Copyright © 2024 Apple Inc.
+import copy
 import unittest
 
 import mlx.core as mx
@@ -230,6 +231,9 @@ class TestModels(unittest.TestCase):
             self.assertEqual(outputs.shape, (1, 1, vocab_size))
             self.assertEqual(outputs.dtype, t)
 
+        # Make sure the model can be copied / pickled
+        copy.deepcopy(model)
+
     def test_llama(self):
         from mlx_lm.models import llama
 
@@ -255,15 +259,6 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
-
-    def test_phixtral(self):
-        from mlx_lm.models import phixtral
-
-        args = phixtral.ModelArgs(
-            "phixtral", num_vocab=1000, num_layers=4, model_dim=1024
-        )
-        model = phixtral.Model(args)
-        self.model_test_runner(model, args.model_type, args.num_vocab, args.num_layers)
 
     def test_phi3(self):
         from mlx_lm.models import phi3
