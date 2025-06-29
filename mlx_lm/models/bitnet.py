@@ -1,13 +1,14 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .bitlinear_layers import QuantAndBitLinear
+from .bitlinear_layers import BitLinear
 from .rope_utils import initialize_rope
 
 
@@ -25,7 +26,6 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
-    quantization_config: Optional[Dict[str, Union[str, int]]] = None
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -52,10 +52,10 @@ class Attention(nn.Module):
         else:
             attention_bias = False
 
-        self.q_proj = QuantAndBitLinear(dim, n_heads * head_dim, bias=attention_bias)
-        self.k_proj = QuantAndBitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.v_proj = QuantAndBitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.o_proj = QuantAndBitLinear(n_heads * head_dim, dim, bias=attention_bias)
+        self.q_proj = BitLinear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -64,6 +64,7 @@ class Attention(nn.Module):
             args.rope_scaling,
             args.max_position_embeddings,
         )
+        self.attn_sub_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
@@ -93,7 +94,15 @@ class Attention(nn.Module):
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        output = self.attn_sub_norm(output)
+        output = self.o_proj(output)
+
+        return output
+
+
+@partial(mx.compile, shapeless=True)
+def relu2(x):
+    return mx.square(nn.relu(x))
 
 
 class MLP(nn.Module):
@@ -107,12 +116,16 @@ class MLP(nn.Module):
         else:
             mlp_bias = False
 
-        self.gate_proj = QuantAndBitLinear(dim, hidden_dim, bias=mlp_bias)
-        self.down_proj = QuantAndBitLinear(hidden_dim, dim, bias=mlp_bias)
-        self.up_proj = QuantAndBitLinear(dim, hidden_dim, bias=mlp_bias)
+        self.gate_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
+        self.down_proj = BitLinear(hidden_dim, dim, bias=mlp_bias)
+        self.up_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
+        self.ffn_sub_norm = nn.RMSNorm(args.intermediate_size, eps=args.rms_norm_eps)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        x = relu2(self.gate_proj(x)) * self.up_proj(x)
+        x = self.ffn_sub_norm(x)
+        x = self.down_proj(x)
+        return x
 
 
 class TransformerBlock(nn.Module):
@@ -134,6 +147,7 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
@@ -159,12 +173,8 @@ class LlamaModel(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
-        input_embeddings: Optional[mx.array] = None,
     ):
-        if input_embeddings is not None:
-            h = input_embeddings
-        else:
-            h = self.embed_tokens(inputs)
+        h = self.embed_tokens(inputs)
 
         if mask is None:
             mask = create_attention_mask(h, cache)
@@ -192,9 +202,8 @@ class Model(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
-        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache, input_embeddings)
+        out = self.model(inputs, mask, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
