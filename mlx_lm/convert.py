@@ -59,6 +59,8 @@ def mixed_quant_predicate_builder(
 
         if not hasattr(module, "to_quantized"):
             return False
+        if module.weight.shape[1] % group_size != 0:
+            return False
 
         index = (
             int(path.split(".")[layer_location])
@@ -115,8 +117,16 @@ def convert(
     model_path = get_model_path(hf_path, revision=revision)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
+    def base_quant_predicate(path, module, config):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if module.weight.shape[1] % q_group_size != 0:
+            return False
+        return True
+
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
+    quant_predicate = quant_predicate or base_quant_predicate
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
