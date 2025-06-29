@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
-from functools import partial
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -10,6 +10,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -32,18 +33,13 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     routed_scaling_factor: float
     head_dim: Optional[int] = None
-    scoring_func: str = "noaux_tc",
+    scoring_func: str = ("noaux_tc",)
     n_group: Optional[int] = 1
     topk_group: Optional[int] = 1
     attention_bias: bool = False
     mlp_bias: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
-
-
-@partial(mx.compile, shapeless=True)
-def clipped_silu(x):
-    return mx.clip(x * mx.sigmoid(x), a_min=-100, a_max=100)
 
 
 class Dots1Attention(nn.Module):
@@ -107,52 +103,37 @@ class Dots1Attention(nn.Module):
 
 
 @mx.compile
-def get_topk_indices(
+def group_expert_select(
     gates,
     e_score_correction_bias,
     top_k,
     n_group,
     topk_group,
-    n_routed_experts,
     routed_scaling_factor,
     norm_topk_prob,
 ):
+
+    k = top_k
     scores = mx.sigmoid(gates.astype(mx.float32))
     orig_scores = scores
-    
-    scores_for_choice = scores + e_score_correction_bias # Apply bias correction
-    
-    # Reshape for group processing
-    batch_size = scores_for_choice.shape[0]
-    experts_per_group = n_routed_experts // n_group
-    group_scores_reshaped = scores_for_choice.reshape(batch_size, n_group, experts_per_group)
-    
-    # Get top-2 in each group and sum
-    top2_per_group = mx.topk(group_scores_reshaped, 2, axis=-1)
-    group_scores = top2_per_group.sum(axis=-1)
-    
-    selected_group_idx = mx.topk(group_scores, topk_group, axis=-1).astype(mx.int32)
-    
-    # Create group mask
-    group_mask = mx.zeros_like(group_scores)
-    group_mask = mx.put_along_axis(group_mask, selected_group_idx, mx.ones_like(selected_group_idx, dtype=group_mask.dtype), axis=-1)
-    
-    # Expand mask to expert level
-    expert_mask = mx.repeat(group_mask[:, :, None], experts_per_group, axis=-1)
-    expert_mask = expert_mask.reshape(batch_size, n_routed_experts)
-    
-    masked_scores = scores_for_choice * expert_mask
-    
-    # Final top-k selection
-    topk_indices = mx.topk(masked_scores, top_k, axis=-1).astype(mx.int32)
-    topk_scores = mx.take_along_axis(orig_scores, topk_indices, axis=-1)
-    
-    # Normalize if needed
-    if norm_topk_prob and top_k > 1:
-        denominator = topk_scores.sum(axis=-1, keepdims=True)
-        topk_scores = topk_scores / (denominator + 1e-20)
-    
-    return (topk_scores * routed_scaling_factor), topk_indices
+    scores = scores + e_score_correction_bias
+    k = n_group - topk_group
+    if k != 0:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(scores, group_idx, mx.array(0.0), axis=-2)
+        scores = mx.flatten(scores, -2, -1)
+
+    k = top_k
+    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+    if top_k > 1 and norm_topk_prob:
+        denominator = scores.sum(axis=-1, keepdims=True)
+        scores = scores / denominator
+    scores = scores * routed_scaling_factor
+
+    return inds, scores
 
 
 class Dots1TopkRouter(nn.Module):
@@ -168,28 +149,37 @@ class Dots1TopkRouter(nn.Module):
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, x):
-        return get_topk_indices(
+        return group_expert_select(
             x @ self.weight.T,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
             self.topk_group,
-            self.n_routed_experts,
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
 
 
 class Dots1MLP(nn.Module):
-    def __init__(self, args: ModelArgs, hidden_size: int = None, intermediate_size: int = None):
+    def __init__(
+        self, args: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+    ):
         super().__init__()
 
         self.hidden_size = args.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = args.intermediate_size if intermediate_size is None else intermediate_size
+        self.intermediate_size = (
+            args.intermediate_size if intermediate_size is None else intermediate_size
+        )
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=args.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=args.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.mlp_bias)
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=args.mlp_bias
+        )
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -205,13 +195,13 @@ class Dots1MoE(nn.Module):
             args.hidden_size,
             args.moe_intermediate_size,
             args.n_routed_experts,
-            activation=clipped_silu,
         )
 
         self.gate = Dots1TopkRouter(args)
 
         self.shared_experts = Dots1MLP(
-            args=args, intermediate_size=args.moe_intermediate_size * args.n_shared_experts
+            args=args,
+            intermediate_size=args.moe_intermediate_size * args.n_shared_experts,
         )
 
     def __call__(self, x):
@@ -222,7 +212,7 @@ class Dots1MoE(nn.Module):
             y = y + self.shared_experts(x)
 
         return y
-    
+
 
 class Dots1DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
@@ -249,14 +239,15 @@ class Dots1DecoderLayer(nn.Module):
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
-    
+
 
 class Dots1Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Dots1DecoderLayer(args, layer_idx) for layer_idx in range(args.num_hidden_layers)
+            Dots1DecoderLayer(args, layer_idx)
+            for layer_idx in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -278,7 +269,7 @@ class Dots1Model(nn.Module):
             h = layer(h, mask, c)
 
         return self.norm(h)
-    
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -305,11 +296,15 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        
+
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             if l >= self.args.first_k_dense_replace:
-                for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+                for n, m in [
+                    ("w1", "gate_proj"),
+                    ("w2", "down_proj"),
+                    ("w3", "up_proj"),
+                ]:
                     for k in ["weight", "scales", "biases"]:
                         if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                             to_join = [
@@ -318,11 +313,7 @@ class Model(nn.Module):
                             ]
                             weights[f"{prefix}.mlp.experts.{m}.{k}"] = mx.stack(to_join)
 
-        return {
-            k: v
-            for k, v in weights.items()
-            if "rotary_emb.inv_freq" not in k
-        }
+        return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 
     @property
     def layers(self):
