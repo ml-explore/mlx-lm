@@ -190,6 +190,7 @@ class MLP(nn.Module):
         down_proj = self.down_proj(activations * up_proj)
         return down_proj
 
+    # TODO compile that
     def _gaussian_topk(self, inputs: mx.array) -> mx.array:
         # TODO does that need higher precision ?
         inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
@@ -249,10 +250,11 @@ class Gemma3nAltUp(nn.Module):
             .transpose(0, 1, 3, 2)
         )
 
-        x_permuted = x.astype(mx.float32).transpose(1, 2, 3, 0)
+        x_up = x.astype(mx.float32)
+        x_permuted = x_up.transpose(1, 2, 3, 0)
         predictions = mx.matmul(x_permuted, all_coefs)
         predictions = predictions.transpose(3, 0, 1, 2)
-        predictions += x
+        predictions += x_up
         return predictions.astype(x.dtype)
 
     def correct(self, predictions: mx.array, activated: mx.array):
@@ -272,22 +274,11 @@ class Gemma3nAltUp(nn.Module):
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
 
-        innovation_expanded = mx.broadcast_to(
-            mx.expand_dims(innovation, axis=0),
-            (self.config.altup_num_inputs,) + innovation.shape,
-        )
-
-        all_coefs_reshaped = all_coefs.transpose(2, 1, 0)
-        all_coefs_reshaped = mx.expand_dims(all_coefs_reshaped, axis=1)
-
-        corrected = innovation_expanded * all_coefs_reshaped
+        all_coefs = all_coefs.transpose(2, 1, 0)
+        corrected = innovation[None] * all_coefs[:, None]
         corrected += predictions
 
         return corrected.astype(activated.dtype)
-
-    def scale_corrected_output(self, corrected: mx.array):
-        scale = self.correct_output_scale if self.config.altup_correct_scale else 1.0
-        return corrected * scale
 
 
 class Gemma3nDecoderLayer(nn.Module):
@@ -340,9 +331,6 @@ class Gemma3nDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
     ):
-        if isinstance(x, list):
-            x = mx.stack(x, axis=0)
-
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
 
@@ -369,7 +357,7 @@ class Gemma3nDecoderLayer(nn.Module):
 
         first_prediction = corrected_predictions[self.config.altup_active_idx]
         if self.config.altup_correct_scale:
-            first_prediction = self.altup.scale_corrected_output(first_prediction)
+            first_prediction = first_prediction * self.altup.correct_output_scale
 
         first_prediction = self.per_layer_input_gate(first_prediction)
         first_prediction = nn.gelu_approx(first_prediction)
@@ -379,8 +367,7 @@ class Gemma3nDecoderLayer(nn.Module):
         first_prediction = self.per_layer_projection(first_prediction)
         first_prediction = self.post_per_layer_input_norm(first_prediction)
 
-        for i in range(1, len(corrected_predictions)):
-            corrected_predictions[i] = corrected_predictions[i] + first_prediction
+        corrected_predictions[1:] = corrected_predictions[1:] + first_prediction
 
         return corrected_predictions
 
@@ -494,16 +481,12 @@ class LanguageModel(nn.Module):
 
         # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
-        epsilon_tensor = mx.array(mx.finfo(h0.dtype).min, dtype=h0.dtype)
 
         h_list = [h0]
-
-        for i in range(1, self.config.altup_num_inputs):
-            h_list.append(self.altup_projections[i - 1](h0))
-            new_magnitude = mx.mean(h_list[i] ** 2, axis=-1, keepdims=True) ** 0.5
-            h_list[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
-
+        h_list.extend([proj(h0) for proj in self.altup_projections])
         h = mx.stack(h_list, axis=0)
+        mags = mx.mean(h[1:] ** 2, axis=-1, keepdims=True) ** 0.5
+        h[1:] = h[1:] * (target_magnitude / mx.maximum(mags, mx.finfo(h0.dtype).min))
 
         for i, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, i, :]
@@ -525,12 +508,10 @@ class LanguageModel(nn.Module):
 
         # Per-layer inputs to single output
         target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
-
-        for i in range(1, self.config.altup_num_inputs):
-            altup_unemb_proj = self.altup_unembed_projections[i - 1](h[i])
-            h[i] = altup_unemb_proj.astype(h0.dtype)
-            new_magnitude = mx.mean(h[i] ** 2, axis=-1, keepdims=True) ** 0.5
-            h[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
+        for i, proj in enumerate(self.altup_unembed_projections):
+            h[i + 1] = proj(h[i + 1])
+        mags = mx.mean(h[1:] ** 2, axis=-1, keepdims=True) ** 0.5
+        h[1:] = h[1:] * (target_magnitude / mx.maximum(mags, mx.finfo(h0.dtype).min))
 
         h = mx.mean(h, axis=0)
 
