@@ -111,10 +111,9 @@ class PhiMLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.act = nn.GELU(approx="precise")
 
     def __call__(self, x) -> mx.array:
-        return self.fc2(self.act(self.fc1(x)))
+        return self.fc2(nn.gelu_approx(self.fc1(x)))
 
 
 class PhiDecoderLayer(nn.Module):
