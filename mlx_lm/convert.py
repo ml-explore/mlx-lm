@@ -114,7 +114,7 @@ def convert(
         )
 
     print("[INFO] Loading")
-    model_path = get_model_path(hf_path, revision=revision)
+    model_path, hf_path = get_model_path(hf_path, revision=revision)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     def base_quant_predicate(path, module, config):

@@ -27,9 +27,7 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
     except ImportError:
-        raise ImportError(
-            "Please run `pip install modelscope` to activate the ModelScope."
-        )
+        raise ImportError("Run `pip install modelscope` to use ModelScope.")
 else:
     from huggingface_hub import snapshot_download
 
@@ -91,11 +89,12 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
 
     Returns:
-        Path: The path to the model.
+        Tuple[Path, str]: A tuple containing the local file path and the Hugging Face repo ID.
     """
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
+        hf_path = path_or_hf_repo
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -113,7 +112,13 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                 ],
             )
         )
-    return model_path
+    else:
+
+        from huggingface_hub import ModelCard
+
+        card = ModelCard.load(model_path / "README.md")
+        hf_path = card.data.base_model
+    return model_path, hf_path
 
 
 def load_config(model_path: Path) -> dict:
@@ -236,7 +241,7 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo)
+    model_path, _ = get_model_path(path_or_hf_repo)
 
     model, config = load_model(model_path, lazy)
     if adapter_path is not None:

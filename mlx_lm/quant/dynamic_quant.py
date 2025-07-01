@@ -16,6 +16,7 @@ from mlx_lm.utils import (
     compute_bits_per_weight,
     fetch_from_hub,
     get_model_path,
+    load,
     quantize_model,
     save,
 )
@@ -174,8 +175,7 @@ def main():
     group = mx.distributed.init()
 
     if args.sensitivities is None:
-        model_path = get_model_path(args.model, revision=None)
-        model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+        model, tokenizer = load(args.model)
         mx.random.seed(args.seed)
         data = load_data(tokenizer, num_samples=-1, sequence_length=512)
 
@@ -195,7 +195,7 @@ def main():
             sensitivities = json.load(fid)
 
     sensitivities = dict(sensitivities)
-    model_path = get_model_path(args.model, revision=None)
+    model_path, hf_repo = get_model_path(args.model, revision=None)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
     mx.random.seed(args.seed)
     data = load_data(tokenizer, num_samples=-1, sequence_length=512)
@@ -239,7 +239,7 @@ def main():
         model,
         tokenizer,
         config,
-        hf_repo=args.model,
+        hf_repo=hf_repo,
     )
 
 
