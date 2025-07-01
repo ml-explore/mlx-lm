@@ -154,6 +154,8 @@ def convert(
 
     if dequantize:
         print("[INFO] Dequantizing")
+        config.pop("quantization", None)
+        config.pop("quantization_config", None)
         model = dequantize_model(model)
 
     save(

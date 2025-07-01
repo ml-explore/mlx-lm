@@ -41,7 +41,7 @@ class TestLoadModelCustomGetClasses(unittest.TestCase):
         self.assertTrue(hasattr(model, "qwenWeights"))
 
     def test_load_model_with_default_get_classes(self):
-        model_path = get_model_path(HF_MODEL_PATH)
+        model_path, _ = get_model_path(HF_MODEL_PATH)
         model, _ = load_model(model_path)
 
         self.assertIsInstance(model, Qwen2Model)
