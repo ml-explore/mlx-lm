@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -163,6 +164,14 @@ class Gemma3nAttention(nn.Module):
         return self.o_proj(output)
 
 
+@partial(mx.compile, shapeless=True)
+def gelu_topk(inputs, std_multiplier):
+    inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
+    inputs_std = mx.std(inputs, axis=-1, keepdims=True)
+    cutoff_x = inputs_mean + inputs_std * std_multiplier.astype(inputs_std.dtype)
+    return nn.gelu_approx(mx.maximum(0, inputs - cutoff_x))
+
+
 class MLP(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int = 0):
         super().__init__()
@@ -184,21 +193,12 @@ class MLP(nn.Module):
     def __call__(self, x: mx.array):
         gate_proj = self.gate_proj(x)
         if self.activation_sparsity > 0.0:
-            gate_proj = self._gaussian_topk(gate_proj)
-        activations = nn.gelu_approx(gate_proj)
+            activations = gelu_topk(gate_proj, self._std_multiplier)
+        else:
+            activations = nn.gelu_approx(gate_proj)
         up_proj = self.up_proj(x)
         down_proj = self.down_proj(activations * up_proj)
         return down_proj
-
-    # TODO compile that
-    def _gaussian_topk(self, inputs: mx.array) -> mx.array:
-        # TODO does that need higher precision ?
-        inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
-        inputs_std = mx.std(inputs, axis=-1, keepdims=True)
-        cutoff_x = inputs_mean + inputs_std * self._std_multiplier.astype(
-            inputs_std.dtype
-        )
-        return mx.maximum(0, inputs - cutoff_x)
 
 
 class Gemma3nAltUp(nn.Module):
@@ -372,6 +372,13 @@ class Gemma3nDecoderLayer(nn.Module):
         return corrected_predictions
 
 
+@partial(mx.compile, shapeless=True)
+def logit_softcap(softcap, x):
+    out = mx.tanh(x / softcap)
+    out = out * softcap
+    return out
+
+
 class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -517,10 +524,8 @@ class LanguageModel(nn.Module):
 
         out = self.norm(h)
         out = self.embed_tokens.as_linear(out)
-        # TODO compile that
         if self.final_logit_softcapping is not None:
-            out = mx.tanh(out / self.final_logit_softcapping)
-            out = out * self.final_logit_softcapping
+            out = logit_softcap(self.final_logit_softcapping, out)
         return out
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
