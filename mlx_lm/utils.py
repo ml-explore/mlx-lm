@@ -39,8 +39,6 @@ from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import get_total_parameters, load_adapters
 
-# Quant imports
-
 # Constants
 MODEL_REMAPPING = {
     "mistral": "llama",  # mistral is compatible with llama
@@ -188,35 +186,11 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    # This handles the case where we use MLX-related quantizations
-    if (
-        quantization := (
-            config.get("quantization_config", None) or config.get("quantization", None)
-        )
-    ) is not None:
+    if (quantization := config.get("quantization", None)) is not None:
 
         def class_predicate(p, m):
-
-            # Handle custom per layer quantizations (i.e. bitnet)
-            quantization_config = config.get("quantization_config", {})
-            quant_method = quantization_config.get("quant_method")
-
-            if (
-                hasattr(m, "to_quantized")
-                and quant_method is not None
-                and "scales" not in p
-            ):
-                # Check if the to_quantized method accepts a 'method' parameter
-                if "method" in m.to_quantized.__code__.co_varnames:
-                    return {"method": quant_method}
-                elif quantization_config.get("group_size") is not None:
-                    # N-bit quantize Embeddings and LM Head (i.e. 4-bit)
-                    return True
-                else:
-                    # Skip Embeddings and LM Head quantization
-                    return False
-
-            if p in config.get("quantization", {}):
+            # Handle custom per layer quantizations
+            if p in config["quantization"]:
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
@@ -225,8 +199,8 @@ def load_model(
 
         nn.quantize(
             model,
-            group_size=quantization.get("group_size", None),
-            bits=quantization.get("bits", None),
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
             class_predicate=class_predicate,
         )
 
@@ -484,12 +458,7 @@ def quantize_model(
     if "quantization" in config:
         raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
-    quant_method = quantized_config.get("quantization_config", {})
-    quantized_config["quantization"] = {
-        "group_size": q_group_size,
-        "bits": q_bits,
-        **quant_method,
-    }
+    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
     # Add any custom quantization parameters to the config as we go
     def _class_predicate(p, m):
