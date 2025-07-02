@@ -33,16 +33,10 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        if args.head_dim is not None:
-            head_dim = args.head_dim
-        else:
-            head_dim = dim // n_heads
-
-        self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
+        self.head_dim = head_dim = args.head_dim or dim // n_heads
+        self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=args.use_bias)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.use_bias)
@@ -57,10 +51,10 @@ class Attention(nn.Module):
         )
 
     def __call__(
-            self,
-            x: mx.array,
-            mask: Optional[mx.array] = None,
-            cache: Optional[Any] = None,
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -108,10 +102,10 @@ class DecoderLayer(nn.Module):
         )
 
     def __call__(
-            self,
-            x: mx.array,
-            mask: Optional[mx.array] = None,
-            cache: Optional[Any] = None,
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -124,16 +118,14 @@ class Ernie45Model(nn.Module):
         super().__init__()
         assert args.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [
-            DecoderLayer(args) for _ in range(args.num_hidden_layers)
-        ]
+        self.layers = [DecoderLayer(args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
-            self,
-            inputs: mx.array,
-            mask: mx.array = None,
-            cache=None,
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
     ):
         h = self.embed_tokens(inputs)
 
@@ -159,10 +151,10 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
-            self,
-            inputs: mx.array,
-            mask: mx.array = None,
-            cache=None,
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
     ):
         out = self.model(inputs, mask, cache)
         if self.args.tie_word_embeddings:
@@ -170,11 +162,6 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
-
-    def sanitize(self, weights):
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        return weights
 
     @property
     def layers(self):
