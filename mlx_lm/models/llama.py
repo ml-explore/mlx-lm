@@ -7,7 +7,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .bitlinear_layers import QuantAndBitLinear
 from .rope_utils import initialize_rope
 
 
@@ -25,7 +24,6 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
-    quantization_config: Optional[Dict[str, Union[str, int]]] = None
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -52,10 +50,10 @@ class Attention(nn.Module):
         else:
             attention_bias = False
 
-        self.q_proj = QuantAndBitLinear(dim, n_heads * head_dim, bias=attention_bias)
-        self.k_proj = QuantAndBitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.v_proj = QuantAndBitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.o_proj = QuantAndBitLinear(n_heads * head_dim, dim, bias=attention_bias)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -107,9 +105,9 @@ class MLP(nn.Module):
         else:
             mlp_bias = False
 
-        self.gate_proj = QuantAndBitLinear(dim, hidden_dim, bias=mlp_bias)
-        self.down_proj = QuantAndBitLinear(hidden_dim, dim, bias=mlp_bias)
-        self.up_proj = QuantAndBitLinear(dim, hidden_dim, bias=mlp_bias)
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=mlp_bias)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=mlp_bias)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=mlp_bias)
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))

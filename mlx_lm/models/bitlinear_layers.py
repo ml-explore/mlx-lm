@@ -159,7 +159,7 @@ class QuantAndBitLinear(nn.Linear):
             bitlinear = BitLinear(
                 in_features=self.weight.shape[1],
                 out_features=self.weight.shape[0],
-                bias=getattr(self, "bias", None) is not None,
+                bias="bias" in self,
                 invert_weight_scales=True,
                 **kwargs,
             )

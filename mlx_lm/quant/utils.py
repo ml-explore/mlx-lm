@@ -3,8 +3,6 @@
 from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
-from mlx.utils import tree_unflatten
 
 
 def load_data(tokenizer, num_samples: int, sequence_length: int) -> mx.array:

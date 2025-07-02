@@ -19,21 +19,17 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
+    num_key_value_heads: int
     rms_norm_eps: float
     vocab_size: int
     head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
-    num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
 
 
 class Attention(nn.Module):
@@ -47,10 +43,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
 
         self.scale = head_dim**-0.5
-        if hasattr(args, "attention_bias"):
-            attention_bias = args.attention_bias
-        else:
-            attention_bias = False
+        attention_bias = args.attention_bias
 
         self.q_proj = BitLinear(dim, n_heads * head_dim, bias=attention_bias)
         self.k_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
@@ -139,7 +132,6 @@ class TransformerBlock(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.args = args
 
     def __call__(
         self,
@@ -161,7 +153,6 @@ class LlamaModel(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
-        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
