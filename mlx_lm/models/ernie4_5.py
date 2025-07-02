@@ -46,7 +46,7 @@ class Attention(nn.Module):
         self.rope = initialize_rope(
             head_dim,
             base=args.rope_theta,
-            traditional=False,
+            traditional=True,
             max_position_embeddings=args.max_position_embeddings,
         )
 
@@ -116,7 +116,6 @@ class DecoderLayer(nn.Module):
 class Ernie45Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        assert args.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)

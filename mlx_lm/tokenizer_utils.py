@@ -276,8 +276,9 @@ class TokenizerWrapper:
         THINK_TOKENS = [("<think>", "</think>")]
         TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
 
+        vocab = tokenizer.get_vocab()
         for think_start, think_end in THINK_TOKENS:
-            if hasattr(tokenizer, 'vocab') and think_start in tokenizer.vocab and think_end in tokenizer.vocab:
+            if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
                 self._think_end = think_end
                 break
@@ -285,10 +286,7 @@ class TokenizerWrapper:
             self._tool_call_start = ""
             self._tool_call_end = ""
             for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
-                if (
-                    tool_call_start in tokenizer.vocab
-                    and tool_call_end in tokenizer.vocab
-                ):
+                if tool_call_start in vocab and tool_call_end in vocab:
                     self._tool_call_start = tool_call_start
                     self._tool_call_end = tool_call_end
                     break
