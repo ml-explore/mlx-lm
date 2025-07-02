@@ -12,6 +12,7 @@ from .rope_utils import initialize_rope
 
 # python -m mlx_lm.generate --model baidu/ERNIE-4.5-0.3B-PT --prompt "wrtie a long storry about a AI machine helping a human" -m 20000
 # python -m mlx_lm.convert --hf-path baidu/ERNIE-4.5-21B-A3B-PT -q --mlx-path /Users/gokdenizgulmez/Desktop/ERNIE-4.5-21B-A3B-PT-4bit
+# python -m mlx_lm.generate --model /Users/gokdenizgulmez/Desktop/ERNIE-4.5-21B-A3B-PT-4bit --prompt "wrtie a long storry about a AI machine helping a human" -m 20000
 
 
 @dataclass
@@ -174,7 +175,15 @@ class Ernie4_5_MoeMLP(nn.Module):
         # Gate computation
         gate_logits = self.gate(input.astype(mx.float32))
         gate_probs = self.gate_act(gate_logits)
-        topk_probs, topk_indices = mx.topk(gate_probs, self.k, axis=-1)
+        
+        # Get top-k indices and values
+        # Method 1: Using argsort (most reliable)
+        sorted_indices = mx.argsort(gate_probs, axis=-1)[:, -self.k:]  # Get top-k indices
+        topk_indices = sorted_indices[:, ::-1]  # Reverse to get highest first
+        
+        # Gather the corresponding probabilities
+        batch_indices = mx.arange(gate_probs.shape[0])[:, None]
+        topk_probs = gate_probs[batch_indices, topk_indices]
         
         # Normalize weights
         combine_weights = topk_probs / mx.maximum(
@@ -187,26 +196,28 @@ class Ernie4_5_MoeMLP(nn.Module):
     def _process_experts(self, input: mx.array, expert_indices: mx.array, weights: mx.array) -> mx.array:
         """Process input through selected experts and combine outputs."""
         batch_size, hidden_size = input.shape
-        output_dim = self.experts[0](input[:1]).shape[-1]  # Get output dimension
         
-        # Initialize combined output
-        combined_output = mx.zeros((batch_size, output_dim))
+        # Initialize output
+        combined_output = mx.zeros((batch_size, self.experts[0](input[:1]).shape[-1]))
         
-        # Process each token
+        # Create a list to store outputs for each position in the batch
+        outputs = []
+        
         for i in range(batch_size):
-            token_input = input[i:i+1]  # Keep batch dimension
-            token_output = mx.zeros((1, output_dim))
+            token_output = mx.zeros_like(combined_output[0:1])
             
-            # Process through top-k experts for this token
             for k in range(self.k):
-                expert_idx = expert_indices[i, k].item()
+                expert_idx = int(expert_indices[i, k])
                 weight = weights[i, k]
                 
-                if weight > 1e-12:  # Skip if weight is negligible
-                    expert_output = self.experts[expert_idx](token_input)
+                if weight > 1e-12:
+                    expert_output = self.experts[expert_idx](input[i:i+1])
                     token_output = token_output + weight * expert_output
             
-            combined_output = combined_output.at[i].set(token_output.squeeze(0))
+            outputs.append(token_output)
+        
+        # Stack all outputs
+        combined_output = mx.concatenate(outputs, axis=0)
         
         return combined_output
 
@@ -231,7 +242,6 @@ class Ernie4_5_DecoderLayer(nn.Module):
                 else args.moe_layer_end_index
             )
 
-        # Decide whether to use MoE or regular MLP
         if (
             ((layer_idx + 1) % args.moe_layer_interval == 0)
             and layer_idx >= moe_layer_start_index
