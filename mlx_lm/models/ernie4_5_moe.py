@@ -11,7 +11,7 @@ from .rope_utils import initialize_rope
 
 
 # python -m mlx_lm.generate --model baidu/ERNIE-4.5-0.3B-PT --prompt "wrtie a long storry about a AI machine helping a human" -m 20000
-# python -m mlx_lm.convert --hf-path baidu/ERNIE-4.5-21B-A3B-PT -q --mlx-path /Users/gokdenizgulmez/Desktop/mlx-lm/mlx_lm/models/ERNIE-4.5-21B-A3B-PT-4bit
+# python -m mlx_lm.convert --hf-path baidu/ERNIE-4.5-21B-A3B-PT -q --mlx-path /Users/gokdenizgulmez/Desktop/ERNIE-4.5-21B-A3B-PT-4bit
 
 
 @dataclass
@@ -104,6 +104,18 @@ class Ernie4_5_MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class Ernie4_5_MoeStatics(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        
+        num_experts = args.moe_num_experts
+        num_experts_groups = 1
+        self.e_score_correction_bias = mx.zeros((num_experts_groups, num_experts), dtype=mx.float32)
+    
+    def __call__(self, x):
+        return x
+    
+
 class Ernie4_5_MoeMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -123,6 +135,9 @@ class Ernie4_5_MoeMLP(nn.Module):
             self.shared_experts = Ernie4_5_MLP(args.hidden_size, args.intermediate_size)
         else:
             self.shared_experts = None
+
+        if args.moe_use_aux_free:
+            self.moe_statics = Ernie4_5_MoeStatics(args)
 
         if args.moe_gate_act == "softmax":
             self.gate_act = nn.Softmax()
@@ -295,3 +310,20 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+    
+    def sanitize(self, weights):
+        remove_patterns = [
+            "mtp_block.",
+            "mtp_linear_proj.",
+            "mtp_hidden_norm.",
+            "mtp_emb_norm.",
+        ]
+        
+        # Filter out unwanted parameters
+        sanitized_weights = {}
+        for key, value in weights.items():
+            should_remove = any(pattern in key for pattern in remove_patterns)
+            if not should_remove:
+                sanitized_weights[key] = value
+        
+        return sanitized_weights
