@@ -34,12 +34,6 @@ def parse_arguments() -> argparse.Namespace:
         help="Path to the trained adapter weights and config.",
     )
     parser.add_argument(
-        "--hf-path",
-        type=str,
-        default=None,
-        help="Path to the original Hugging Face model. Required for upload if --model is a local directory.",
-    )
-    parser.add_argument(
         "--upload-repo",
         help="The Hugging Face repo to upload the model to.",
         type=str,
@@ -68,7 +62,7 @@ def main() -> None:
     print("Loading pretrained model")
     args = parse_arguments()
 
-    model_path = get_model_path(args.model)
+    model_path, hf_path = get_model_path(args.model)
     model, config, tokenizer = fetch_from_hub(model_path)
 
     model.freeze()
@@ -89,7 +83,6 @@ def main() -> None:
         config.pop("quantization", None)
 
     save_path = Path(args.save_path)
-    hf_path = args.hf_path or (args.model if not Path(args.model).exists() else None)
     save(
         save_path,
         model_path,

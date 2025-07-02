@@ -205,7 +205,7 @@ def main():
     np.random.seed(args.seed)
     mx.random.seed(args.seed)
 
-    model_path = get_model_path(args.model, revision=None)
+    model_path, hf_repo = get_model_path(args.model, revision=None)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     calibration_data = load_data(
@@ -239,5 +239,5 @@ def main():
         q_model,
         tokenizer,
         config,
-        hf_repo=args.model,
+        hf_repo=hf_repo,
     )

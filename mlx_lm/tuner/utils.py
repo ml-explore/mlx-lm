@@ -117,6 +117,8 @@ def linear_to_lora_layers(
         "internlm3",
         "glm4",
         "mimo",
+        "ernie4_5",
+        "dots1",
     ]:
         keys = set(["self_attn.q_proj", "self_attn.v_proj"])
         if model.model_type in ["mixtral", "phimoe"]:
@@ -124,7 +126,7 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe"]:
+        if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
 
     elif model.model_type == "gpt_bigcode":
@@ -232,39 +234,36 @@ def dequantize(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
-    de_quantize_layers = []
+    dequantize_layers = []
     for name, module in model.named_modules():
+        bias = "bias" in module
         if isinstance(module, nn.QuantizedLinear):
-            bias = "bias" in module
-            weight = module.weight
-            weight = mx.dequantize(
-                weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            output_dims, input_dims = weight.shape
-            linear = nn.Linear(input_dims, output_dims, bias=bias)
-            linear.weight = weight
-            if bias:
-                linear.bias = module.bias
-            de_quantize_layers.append((name, linear))
-        if isinstance(module, nn.QuantizedEmbedding):
-            weight = mx.dequantize(
-                module.weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            num_embeddings, dims = weight.shape
-            emb = nn.Embedding(num_embeddings, dims)
-            emb.weight = weight
-            de_quantize_layers.append((name, emb))
+            cls = nn.Linear
+            kwargs = {"bias": bias}
+        elif isinstance(module, nn.QuantizedEmbedding):
+            kwargs = {}
+            cls = nn.Embedding
+        elif isinstance(module, QuantizedSwitchLinear):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        else:
+            continue
+        weight = mx.dequantize(
+            module.weight,
+            module.scales,
+            module.biases,
+            module.group_size,
+            module.bits,
+        )
+        args = weight.shape[::-1]
+        m = cls(*args, **kwargs)
+        if bias:
+            m.bias = module.bias
+        m.weight = weight
+        dequantize_layers.append((name, m))
 
-    if len(de_quantize_layers) > 0:
-        model.update_modules(tree_unflatten(de_quantize_layers))
+    if len(dequantize_layers) > 0:
+        model.update_modules(tree_unflatten(dequantize_layers))
     return model
 
 

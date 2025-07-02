@@ -555,7 +555,7 @@ def main():
 
     mx.random.seed(args.seed)
 
-    model_path = get_model_path(args.model, revision=None)
+    model_path, hf_repo = get_model_path(args.model, revision=None)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     model_type = config["model_type"]
@@ -584,5 +584,5 @@ def main():
         model,
         tokenizer,
         config,
-        hf_repo=args.model,
+        hf_repo=hf_repo,
     )
