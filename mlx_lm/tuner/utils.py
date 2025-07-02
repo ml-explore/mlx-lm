@@ -167,6 +167,7 @@ def linear_to_lora_layers(
         "internlm3",
         "glm4",
         "mimo",
+        "ernie4_5",
     ]:
         keys = set(["self_attn.q_proj", "self_attn.v_proj"])
         if model.model_type in ["mixtral", "phimoe"]:
