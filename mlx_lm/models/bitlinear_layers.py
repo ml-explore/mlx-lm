@@ -5,6 +5,63 @@ import mlx.nn as nn
 from mlx.nn.layers.quantized import QuantizedLinear
 
 
+def make_bitlinear_kernel():
+    """
+    Custom Metal kernel that performs matrix multiplication directly on
+    packed weights and scales the output. This eliminates the need to
+    store unpacked weights in memory.
+    """
+    source = """
+    constexpr int M = 4;
+    constexpr int BLOCK = 32;
+
+    uint tid = thread_position_in_grid.y;
+    uint in_offset = thread_position_in_grid.x;
+
+    uint batch_idx = tid / (out_features / 4);
+    uint row_idx = tid % (out_features / 4);
+
+    float sum[4] = {0.0};
+
+    for (uint i = in_offset * M; i < in_features; i += BLOCK * M) {
+        float v[M];
+        for (int j=0; j<M; j++) {
+            v[j] = x[batch_idx * in_features + i + j];
+        }
+
+        for (int j=0; j<M; j++) {
+            uint8_t w = packed_weights[row_idx * in_features + i + j];
+            sum[0] += v[j] * ((w & 3) - 1);
+            sum[1] += v[j] * (((w >> 2) & 3) - 1);
+            sum[2] += v[j] * (((w >> 4) & 3) - 1);
+            sum[3] += v[j] * (((w >> 6) & 3) - 1);
+        }
+    }
+
+    for (int j=0; j<4; j++) {
+        sum[j] = simd_sum(sum[j]);
+    }
+
+    // Apply weight scaling by diving them or multiplying them
+    if (in_offset == 0) {
+        float scale = invert_weight_scales ? 1 / weight_scale[0] : weight_scale[0];
+        for (int i=0; i<4; i++) {
+            out[batch_idx * out_features + row_idx + i * (out_features/4)] = static_cast<T>(sum[i] * scale);
+        }
+    }
+    """
+
+    return mx.fast.metal_kernel(
+        name="bitlinear_matmul",
+        input_names=["x", "packed_weights", "weight_scale"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+_bitlinear_kernel = make_bitlinear_kernel()
+
+
 class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
@@ -34,62 +91,6 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
-        # Compile kernel
-        self._compiled_kernel = self.compile_matmul_kernel()
-
-    def compile_matmul_kernel(self):
-        """
-        Custom Metal kernel that performs matrix multiplication directly on
-        packed weights and scales the output. This eliminates the need to
-        store unpacked weights in memory.
-        """
-        source = """
-        constexpr int M = 4;
-        constexpr int BLOCK = 32;
-
-        uint tid = thread_position_in_grid.y;
-        uint in_offset = thread_position_in_grid.x;
-
-        uint batch_idx = tid / (out_features / 4);
-        uint row_idx = tid % (out_features / 4);
-
-        float sum[4] = {0.0};
-
-        for (uint i = in_offset * M; i < in_features; i += BLOCK * M) {
-            float v[M];
-            for (int j=0; j<M; j++) {
-                v[j] = x[batch_idx * in_features + i + j];
-            }
-
-            for (int j=0; j<M; j++) {
-                uint8_t w = packed_weights[row_idx * in_features + i + j];
-                sum[0] += v[j] * ((w & 3) - 1);
-                sum[1] += v[j] * (((w >> 2) & 3) - 1);
-                sum[2] += v[j] * (((w >> 4) & 3) - 1);
-                sum[3] += v[j] * (((w >> 6) & 3) - 1);
-            }
-        }
-
-        for (int j=0; j<4; j++) {
-            sum[j] = simd_sum(sum[j]);
-        }
-
-        // Apply weight scaling by diving them or multiplying them
-        if (in_offset == 0) {
-            float scale = invert_weight_scales ? 1 / weight_scale[0] : weight_scale[0];
-            for (int i=0; i<4; i++) {
-                out[batch_idx * out_features + row_idx + i * (out_features/4)] = static_cast<T>(sum[i] * scale);
-            }
-        }
-        """
-
-        return mx.fast.metal_kernel(
-            name="bitlinear_matmul",
-            input_names=["x", "packed_weights", "weight_scale"],
-            output_names=["out"],
-            source=source,
-        )
-
     def execute_matmul_kernel(self, x, packed_weights):
         original_shape = x.shape
         if len(original_shape) > 2:
@@ -100,7 +101,7 @@ class BitLinear(nn.Module):
 
         dtype = self.weight_scale.dtype
         assert x.dtype == dtype, "Wrong type for input."
-        out = self._compiled_kernel(
+        out = _bitlinear_kernel(
             inputs=[
                 x,
                 packed_weights,
