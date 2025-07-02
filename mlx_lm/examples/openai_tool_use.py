@@ -52,7 +52,7 @@ response = client.chat.completions.create(
 
 # Call the function
 function = response.choices[0].message.tool_calls[0].function
-tool_result = functions[function.name](**function.arguments)
+tool_result = functions[function.name](**json.loads(function.arguments))
 
 # Put the result of the function in the messages and generate the final
 # response:
