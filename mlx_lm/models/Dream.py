@@ -10,6 +10,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .rope_utils import initialize_rope
 
 # python -m mlx_lm.convert --hf-path apple/DiffuCoder-7B-cpGRPO -q --mlx-path /Users/gokdenizgulmez/Desktop/dream_grpo-4bit
+# python -m mlx_lm.generate --model /Users/gokdenizgulmez/Desktop/dream_grpo-4bit --prompt "write quick sort in python"
 
 
 @dataclass
@@ -24,8 +25,6 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
     num_key_value_heads: Optional[int] = None
-    attention_bias: bool = False
-    mlp_bias: bool = False
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -39,7 +38,7 @@ class DreamMLP(nn.Module):
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
-    def forward(self, x) -> mx.array:
+    def __call__(self, x) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -51,10 +50,10 @@ class DreamAttention(nn.Module):
         self.head_dim = args.head_dim or args.hidden_size // self.n_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(args.hidden_size, self.n_heads * self.head_dim, bias=args.attention_bias)
-        self.k_proj = nn.Linear(args.hidden_size, self.n_kv_heads * self.head_dim, bias=args.attention_bias)
-        self.v_proj = nn.Linear(args.hidden_size, self.n_kv_heads * self.head_dim, bias=args.attention_bias)
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, args.hidden_size, bias=args.attention_bias)
+        self.q_proj = nn.Linear(args.hidden_size, self.n_heads * self.head_dim, bias=True)
+        self.k_proj = nn.Linear(args.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(args.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, args.hidden_size, bias=False)
 
         self.rope = initialize_rope(
             self.head_dim,
