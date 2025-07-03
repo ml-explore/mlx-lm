@@ -121,7 +121,7 @@ class DreamDecoderLayer(nn.Module):
         return out
 
 
-class LlamaModel(nn.Module):
+class DreamModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -159,7 +159,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = LlamaModel(args)
+        self.model = DreamModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
