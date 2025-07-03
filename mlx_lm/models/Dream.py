@@ -9,9 +9,6 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 
-# python -m mlx_lm.convert --hf-path apple/DiffuCoder-7B-cpGRPO -q --mlx-path /Users/gokdenizgulmez/Desktop/dream_grpo-4bit
-# python -m mlx_lm.generate --model /Users/gokdenizgulmez/Desktop/dream_grpo-4bit --prompt "write quick sort in c++"
-
 
 @dataclass
 class ModelArgs(BaseModelArgs):
