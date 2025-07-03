@@ -71,28 +71,6 @@ def _get_classes(config: dict):
     return arch.Model, arch.ModelArgs
 
 
-def _sanitize_config(config: dict):
-    """
-    Apply some pre-processing on the model config to ensure compatibility with the model loading process.
-
-    Args:
-        config (dict): The model configuration.
-
-    Returns:
-        The modified configuration dictionary.
-    """
-    quantization_config = config.get("quantization_config", None)
-    if quantization_config is not None:
-        # Check if quantization_config is a bitnet
-        quant_method = quantization_config["quant_method"]
-        if quant_method == "bitnet":
-            quantization_mode = quantization_config.get("quantization_mode", "")
-            if quantization_mode != "offline":
-                config["model_type"] = "bitnet"
-                config['architectures'] = ['BitNetForCausalLM']
-    return config
-
-
 def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
@@ -186,7 +164,6 @@ def load_model(
     config = load_config(model_path)
     config.update(model_config)
 
-    config = _sanitize_config(config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -227,6 +204,17 @@ def load_model(
             bits=quantization["bits"],
             class_predicate=class_predicate,
         )
+    elif (quantization_config := config.get("quantization_config", None)) is not None:
+        # Handle legacy quantization config
+        quantization_method = quantization_config.get("quant_method")
+        if quantization_method == "bitnet" and config.get("model_type") != "bitnet":
+            from .models.bitlinear_layers import bitnet_quantize
+
+            model = bitnet_quantize(
+                model, 
+                quantization_config.get("modules_to_not_convert", None),
+                invert_weight_scales= quantization_config.get("linear_class", "") != "autobitlinear"
+            )
 
     model.load_weights(list(weights.items()), strict=strict)
 

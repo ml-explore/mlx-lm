@@ -2,8 +2,29 @@
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_unflatten
 from mlx.nn.layers.quantized import QuantizedLinear
 
+
+def bitnet_quantize(model, modules_to_not_convert=None, invert_weight_scales: bool = False):
+    quantize_layers = []
+    for name, module in model.named_modules():     
+        if modules_to_not_convert is None:
+            modules_to_not_convert = []
+
+        # Replace nn.Linear layers, but skip 'lm_head'
+        if name not in modules_to_not_convert and isinstance(module, nn.Linear):
+            old_weight = module.weight
+            out_features, in_features = old_weight.shape
+            bias = "bias" in module
+            # Create a new instance of the custom linear layer
+            new_layer = BitLinear(in_features, out_features, bias=bias, invert_weight_scales=invert_weight_scales)
+
+            # Replace the layer in the model
+            quantize_layers.append((name, new_layer))
+    if len(quantize_layers) > 0:
+        model.update_modules(tree_unflatten(quantize_layers))
+    return model
 
 def make_bitlinear_kernel():
     """
