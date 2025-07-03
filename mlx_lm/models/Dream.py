@@ -47,10 +47,18 @@ class DreamAttention(nn.Module):
         self.head_dim = args.head_dim or args.hidden_size // self.n_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(args.hidden_size, self.n_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(args.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(args.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, args.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            args.hidden_size, self.n_heads * self.head_dim, bias=True
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.n_kv_heads * self.head_dim, bias=True
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.n_kv_heads * self.head_dim, bias=True
+        )
+        self.o_proj = nn.Linear(
+            self.n_heads * self.head_dim, args.hidden_size, bias=False
+        )
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -88,7 +96,7 @@ class DreamAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-    
+
 
 class DreamDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -111,7 +119,7 @@ class DreamDecoderLayer(nn.Module):
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
         return out
-    
+
 
 class LlamaModel(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -144,7 +152,7 @@ class LlamaModel(nn.Module):
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
-    
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
