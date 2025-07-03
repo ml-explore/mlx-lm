@@ -207,14 +207,10 @@ def load_model(
     elif (quantization_config := config.get("quantization_config", None)) is not None:
         # Handle legacy quantization config
         quantization_method = quantization_config.get("quant_method")
-        if quantization_method == "bitnet" and config.get("model_type") != "bitnet":
+        if quantization_method == "bitnet":
             from .models.bitlinear_layers import bitnet_quantize
 
-            model = bitnet_quantize(
-                model, 
-                quantization_config.get("modules_to_not_convert", None),
-                invert_weight_scales= quantization_config.get("linear_class", "") != "autobitlinear"
-            )
+            model = bitnet_quantize(model, quantization_config)
 
     model.load_weights(list(weights.items()), strict=strict)
 

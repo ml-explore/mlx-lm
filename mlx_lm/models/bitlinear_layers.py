@@ -6,12 +6,14 @@ from mlx.utils import tree_unflatten
 from mlx.nn.layers.quantized import QuantizedLinear
 
 
-def bitnet_quantize(model, modules_to_not_convert=None, invert_weight_scales: bool = False):
+def bitnet_quantize(model, quantization_config: dict):
     quantize_layers = []
-    for name, module in model.named_modules():     
-        modules_to_not_convert = modules_to_not_convert or []
+    modules_to_not_convert = quantization_config.get("modules_to_not_convert") or []
+    invert_weight_scales = quantization_config.get("linear_class", "") != "autobitlinear"
 
-        # Replace nn.Linear layers, but skip 'lm_head'
+    for name, module in model.named_modules():     
+
+        # Replace nn.Linear layers, but skip any layer from the `modules_to_not_convert` list
         if name not in modules_to_not_convert and isinstance(module, nn.Linear):
             old_weight = module.weight
             out_features, in_features = old_weight.shape
