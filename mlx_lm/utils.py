@@ -71,6 +71,28 @@ def _get_classes(config: dict):
     return arch.Model, arch.ModelArgs
 
 
+def _sanitize_config(config: dict):
+    """
+    Apply some pre-processing on the model config to ensure compatibility with the model loading process.
+
+    Args:
+        config (dict): The model configuration.
+
+    Returns:
+        The modified configuration dictionary.
+    """
+    quantization_config = config.get("quantization_config", None)
+    if quantization_config is not None:
+        # Check if quantization_config is a bitnet
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "bitnet":
+            quantization_mode = quantization_config.get("quantization_mode", "")
+            if quantization_mode != "offline":
+                config["model_type"] = "bitnet"
+                config['architectures'] = ['BitNetForCausalLM']
+    return config
+
+
 def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
@@ -163,6 +185,8 @@ def load_model(
     """
     config = load_config(model_path)
     config.update(model_config)
+
+    config = _sanitize_config(config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
