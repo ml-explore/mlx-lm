@@ -10,7 +10,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .rope_utils import initialize_rope
 
 # python -m mlx_lm.convert --hf-path apple/DiffuCoder-7B-cpGRPO -q --mlx-path /Users/gokdenizgulmez/Desktop/dream_grpo-4bit
-# python -m mlx_lm.generate --model /Users/gokdenizgulmez/Desktop/dream_grpo-4bit --prompt "write quick sort in python"
+# python -m mlx_lm.generate --model /Users/gokdenizgulmez/Desktop/dream_grpo-4bit --prompt "write quick sort in c++"
 
 
 @dataclass
@@ -22,13 +22,13 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    head_dim: Optional[int] = None
-    max_position_embeddings: Optional[int] = None
-    num_key_value_heads: Optional[int] = None
-    rope_theta: float = 10000
+    max_position_embeddings: int
+    num_key_value_heads: int
+    rope_theta: float
+    rope_scaling: Optional[Dict[str, Union[float, str]]]
+    tie_word_embeddings: bool
     rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
+    head_dim: Optional[int] = None
 
 
 class DreamMLP(nn.Module):
