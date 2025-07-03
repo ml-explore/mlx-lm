@@ -40,6 +40,8 @@ class Attention(nn.Module):
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        # `autobitliner` is the new bitnet class from HF transformers that do not invert the weight scales
+        # and adds an extra norm layer after attention
         self.use_bitnet_norm = args.quantization_config.get("linear_class", "") == "autobitlinear"
 
         self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
@@ -108,6 +110,8 @@ class MLP(nn.Module):
 
         dim = args.hidden_size
         hidden_dim = args.intermediate_size
+        # `autobitliner` is the new bitnet class from HF transformers that do not invert the weight scales
+        # and adds an extra norm layer after attention
         self.use_bitnet_norm = args.quantization_config.get("linear_class", "") == "autobitlinear"
         if hasattr(args, "mlp_bias"):
             mlp_bias = args.mlp_bias
