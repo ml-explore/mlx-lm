@@ -42,6 +42,7 @@ setup(
             "mlx_lm.evaluate = mlx_lm.evaluate:main",
             "mlx_lm.fuse = mlx_lm.fuse:main",
             "mlx_lm.generate = mlx_lm.generate:main",
+            "mlx_lm.generate.diffusion = mlx_lm.generate_diffusion:main",
             "mlx_lm.lora = mlx_lm.lora:main",
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.manage = mlx_lm.manage:main",
