@@ -802,6 +802,19 @@ def main():
     elif using_cache:
         tokenizer.chat_template = json.loads(metadata["chat_template"])
 
+    # Normalize chat_template content format: flatten list-of-dicts to strings
+    if tokenizer.chat_template is not None and isinstance(tokenizer.chat_template, list):
+        for msg in tokenizer.chat_template:
+            # Skip entries that aren’t dicts (e.g., plain strings)
+            if not isinstance(msg, dict):
+                continue
+            cont = msg.get("content")
+            if isinstance(cont, list):
+                msg["content"] = "".join(
+                    part.get("text", "") for part in cont
+                    if isinstance(part, dict)
+                )
+
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
     prompt = sys.stdin.read() if prompt == "-" else prompt
     if not args.ignore_chat_template and tokenizer.chat_template is not None:
@@ -814,6 +827,13 @@ def main():
         has_prefill = args.prefill_response is not None
         if has_prefill:
             messages.append({"role": "assistant", "content": args.prefill_response})
+
+        # Ensure message content is a list of dicts with .text, for templates expecting part.text
+        for msg in messages:
+            cont = msg.get("content")
+            if isinstance(cont, str):
+                msg["content"] = [{"type": "text", "text": cont}]
+
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
