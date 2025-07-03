@@ -9,8 +9,7 @@ from mlx.nn.layers.quantized import QuantizedLinear
 def bitnet_quantize(model, modules_to_not_convert=None, invert_weight_scales: bool = False):
     quantize_layers = []
     for name, module in model.named_modules():     
-        if modules_to_not_convert is None:
-            modules_to_not_convert = []
+        modules_to_not_convert = modules_to_not_convert or []
 
         # Replace nn.Linear layers, but skip 'lm_head'
         if name not in modules_to_not_convert and isinstance(module, nn.Linear):
