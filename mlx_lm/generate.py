@@ -815,7 +815,7 @@ def main():
     prompt = sys.stdin.read() if prompt == "-" else prompt
     if not args.ignore_chat_template and tokenizer.chat_template is not None:
         if args.system_prompt is not None:
-            messages = [{"role": "system", "content": args.system_prompt}]xw
+            messages = [{"role": "system", "content": args.system_prompt}]
         else:
             messages = []
         messages.append({"role": "user", "content": prompt})
