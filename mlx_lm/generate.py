@@ -802,11 +802,20 @@ def main():
     elif using_cache:
         tokenizer.chat_template = json.loads(metadata["chat_template"])
 
+    if tokenizer.chat_template is not None:
+        for msg in tokenizer.chat_template:
+            cont = msg.get("content")
+            if isinstance(cont, list):
+                msg["content"] = "".join(
+                    part.get("text", "") for part in cont
+                    if isinstance(part, dict)
+                )
+
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
     prompt = sys.stdin.read() if prompt == "-" else prompt
     if not args.ignore_chat_template and tokenizer.chat_template is not None:
         if args.system_prompt is not None:
-            messages = [{"role": "system", "content": args.system_prompt}]
+            messages = [{"role": "system", "content": args.system_prompt}]xw
         else:
             messages = []
         messages.append({"role": "user", "content": prompt})
