@@ -6,7 +6,8 @@ from typing import Any, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from transformers import PreTrainedTokenizer
+
+import numpy as np
 
 from .models import cache
 from .tokenizer_utils import TokenizerWrapper
@@ -16,15 +17,15 @@ from .utils import load
 @dataclass
 class DreamGenerationConfig:
     """Configuration for Dream diffusion generation."""
-    temperature: float = 0.0
+    temperature: float = 0.7
     top_p: Optional[float] = None
     top_k: Optional[int] = None
-    max_length: int = 20
+    max_length: int = 64
     max_new_tokens: Optional[int] = None
     
     # Diffusion specific params
     eps: float = 1e-3
-    steps: int = 32
+    steps: int = 20
     alg: str = 'origin'  # 'origin', 'maskgit_plus', 'topk_margin', 'entropy'
     alg_temp: Optional[float] = None
     
@@ -135,6 +136,24 @@ def sample_tokens(
     
     return confidence, x0
 
+def custom_nonzero(arr: mx.array) -> mx.array:
+    """
+    Returns indices of True values in a boolean array.
+    Equivalent to numpy's np.argwhere(arr) but for MLX.
+    """
+    if arr.size == 0:
+        return mx.array([], dtype=mx.int32).reshape(0, arr.ndim)
+    
+    # Use mx.where to get indices
+    indices = mx.where(arr)
+    
+    # mx.where returns a tuple of arrays for each dimension
+    if isinstance(indices, tuple):
+        # Stack the indices to get the final result
+        return mx.stack(indices, axis=-1)
+    else:
+        # If mx.where returns something else, handle accordingly
+        return indices
 
 def diffusion_generate_step(
     prompt: mx.array,
@@ -142,10 +161,6 @@ def diffusion_generate_step(
     generation_config: DreamGenerationConfig,
     prompt_cache: Optional[Any] = None,
 ) -> Union[DreamModelOutput, mx.array]:
-    """
-    Generate text using diffusion sampling.
-    """
-    
     # Extract config parameters
     max_length = generation_config.max_length
     mask_token_id = generation_config.mask_token_id
@@ -158,7 +173,7 @@ def diffusion_generate_step(
     top_k = generation_config.top_k
     output_history = generation_config.output_history
     return_dict = generation_config.return_dict_in_generate
-    
+
     batch_size = prompt.shape[0]
     
     # Pad input to max_length with mask tokens
@@ -176,11 +191,11 @@ def diffusion_generate_step(
     histories = [] if output_history else None
     
     # Initialize random key
-    base_key = mx.random.key(int(time.time() * 1000))
+    key = mx.random.key(int(time.time() * 1000))
     
     # Diffusion sampling loop
     for i in range(steps):
-        # Find masked positions
+        # Find masked positions manually
         mask_index = (x == mask_token_id)
         
         # Check if there are any masked tokens left
@@ -190,107 +205,110 @@ def diffusion_generate_step(
         # Forward pass through model
         logits = model(x, cache=prompt_cache)
         
-        # Shift logits to align with tokens (if needed)
+        # Apply logits shifting: [B, L, V] -> [B, L, V]
         if logits.shape[1] == x.shape[1] + 1:
             logits = logits[:, :-1]  # Remove last position
+        logits = mx.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
         
         # Get current timestep values
         t = timesteps[i]
         s = timesteps[i + 1]
         
-        # Generate unique key for this step
-        step_key = mx.random.split(base_key, steps)[i]
+        # Manually find masked positions and extract logits
+        masked_positions = []
+        masked_logits_list = []
         
-        # Process each position individually
-        seq_len = x.shape[1]
+        # Iterate through all positions to find masked ones
+        for b in range(batch_size):
+            for pos in range(x.shape[1]):
+                # Check if this position is masked
+                if x[b, pos].item() == mask_token_id:
+                    masked_positions.append((b, pos))
+                    masked_logits_list.append(logits[b, pos])
         
-        # Convert to list for modification (MLX doesn't have .at[].set())
+        if len(masked_positions) == 0:
+            continue
+        
+        # Stack the logits for masked positions
+        masked_logits = mx.stack(masked_logits_list)
+        
+        # Split keys for this step
+        key, sample_key, transfer_key = mx.random.split(key, 3)
+        
+        # Convert to list for easier manipulation
         x_list = x.tolist()
         
-        for batch_idx in range(batch_size):
-            for pos_idx in range(seq_len):
-                # Check if this position is masked
-                if x_list[batch_idx][pos_idx] == mask_token_id:
-                    # Generate unique keys for this position
-                    pos_keys = mx.random.split(step_key, batch_size * seq_len * 2)
-                    key_idx = (batch_idx * seq_len + pos_idx) * 2
-                    sample_key = pos_keys[key_idx]
-                    transfer_key = pos_keys[key_idx + 1]
-                    
-                    # Get logits for this position
-                    pos_logits = logits[batch_idx, pos_idx:pos_idx+1]  # Keep batch dimension
-                    
-                    if alg == 'origin':
-                        # Original algorithm: probabilistic transfer
-                        p_transfer = 1 - s / t if i < steps - 1 else 1
-                        
-                        # Sample new token
-                        _, x0 = sample_tokens(
-                            pos_logits, 
-                            temperature=temperature, 
-                            top_p=top_p, 
-                            top_k=top_k,
-                            key=sample_key
-                        )
-                        
-                        # Generate random number for transfer decision
-                        transfer_prob_array = mx.random.uniform(low=0.0, high=1.0, shape=(1,), key=transfer_key)
-                        transfer_prob = transfer_prob_array[0]
-                        
-                        if transfer_prob < p_transfer:
-                            # Transfer the token (modify list)
-                            x_list[batch_idx][pos_idx] = int(x0[0])
-                        
-                    else:
-                        # Confidence-based algorithms
-                        if alg == 'maskgit_plus':
-                            confidence, x0 = sample_tokens(
-                                pos_logits, 
-                                temperature=temperature, 
-                                top_p=top_p, 
-                                top_k=top_k,
-                                key=sample_key
-                            )
-                        elif alg == 'topk_margin':
-                            confidence, x0 = sample_tokens(
-                                pos_logits, 
-                                temperature=temperature, 
-                                top_p=top_p, 
-                                top_k=top_k,
-                                margin_confidence=True,
-                                key=sample_key
-                            )
-                        elif alg == 'entropy':
-                            confidence, x0 = sample_tokens(
-                                pos_logits, 
-                                temperature=temperature, 
-                                top_p=top_p, 
-                                top_k=top_k,
-                                neg_entropy=True,
-                                key=sample_key
-                            )
-                        else:
-                            raise ValueError(f"Unknown algorithm: {alg}")
-                        
-                        # Calculate transfer probability based on confidence
-                        transfer_ratio = 1 - s / t if i < steps - 1 else 1
-                        
-                        # Use confidence as a probability for transfer
-                        if alg_temp is None or alg_temp == 0:
-                            # Deterministic: transfer if confidence is high enough
-                            conf_threshold = 1.0 - transfer_ratio
-                            if confidence[0] > conf_threshold:
-                                x_list[batch_idx][pos_idx] = int(x0[0])
-                        else:
-                            # Stochastic: use confidence-weighted probability
-                            conf_prob = mx.softmax(confidence / alg_temp)
-                            transfer_sample = mx.random.uniform(low=0.0, high=1.0, shape=(), key=transfer_key)
-                            
-                            if transfer_sample < (transfer_ratio * conf_prob[0]):
-                                x_list[batch_idx][pos_idx] = int(x0[0])
+        if alg == 'origin':
+            # Original algorithm: probabilistic transfer
+            p_transfer = 1 - s / t if i < steps - 1 else 1
+            
+            # Sample new tokens
+            _, new_tokens = sample_tokens(
+                masked_logits, 
+                temperature=temperature, 
+                top_p=top_p, 
+                top_k=top_k,
+                key=sample_key
+            )
+            
+            # Apply transfer with probability
+            transfer_probs = mx.random.uniform(shape=new_tokens.shape, key=transfer_key)
+            update_mask = transfer_probs < p_transfer
+            
+            # Update tokens where transfer condition is met
+            for idx, (b, pos) in enumerate(masked_positions):
+                if update_mask[idx].item():
+                    x_list[b][pos] = int(new_tokens[idx].item())
+            
+        else:
+            # Confidence-based algorithms
+            if alg == 'maskgit_plus':
+                confidence, new_tokens = sample_tokens(
+                    masked_logits, 
+                    temperature=temperature, 
+                    top_p=top_p, 
+                    top_k=top_k,
+                    key=sample_key
+                )
+            elif alg == 'topk_margin':
+                confidence, new_tokens = sample_tokens(
+                    masked_logits, 
+                    temperature=temperature, 
+                    top_p=top_p, 
+                    top_k=top_k,
+                    margin_confidence=True,
+                    key=sample_key
+                )
+            elif alg == 'entropy':
+                confidence, new_tokens = sample_tokens(
+                    masked_logits, 
+                    temperature=temperature, 
+                    top_p=top_p, 
+                    top_k=top_k,
+                    neg_entropy=True,
+                    key=sample_key
+                )
+            else:
+                raise ValueError(f"Unknown algorithm: {alg}")
+            
+            # Calculate number of tokens to update
+            num_masked = len(masked_positions)
+            num_update = int(num_masked * (1 - s / t)) if i < steps - 1 else num_masked
+            
+            if num_update > 0:
+                # Get top confidence positions
+                sorted_indices = mx.argsort(-confidence)
+                top_indices = sorted_indices[:num_update]
+                
+                # Update tokens in sequence
+                for idx in top_indices:
+                    idx_val = int(idx.item())
+                    if idx_val < len(masked_positions):
+                        b, pos = masked_positions[idx_val]
+                        x_list[b][pos] = int(new_tokens[idx_val].item())
         
-        # Convert back to mx.array
-        x = mx.array(x_list, dtype=x.dtype)
+        # Convert back to MLX array
+        x = mx.array(x_list)
         
         # Store history
         if histories is not None:
@@ -304,7 +322,7 @@ def diffusion_generate_step(
 
 def stream_diffusion_generate(
     model: nn.Module,
-    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    tokenizer,
     prompt: Union[str, mx.array, List[int]],
     generation_config: Optional[DreamGenerationConfig] = None,
     **kwargs,
@@ -398,52 +416,50 @@ def stream_diffusion_generate(
 
 def diffusion_generate(
     model: nn.Module,
-    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    tokenizer,
     prompt: Union[str, List[int]],
-    verbose: bool = False,
     **kwargs,
 ) -> str:
     """
     Generate a complete response using Dream's diffusion process.
-    
+
     Args:
         model: The Dream model
         tokenizer: Tokenizer for encoding/decoding
         prompt: Input prompt
-        verbose: Whether to print timing information
         **kwargs: Generation parameters
-        
+
     Returns:
         Generated text string
     """
-    
-    if verbose:
-        print("=" * 10)
-        print("Diffusion Generation")
-        print("=" * 10)
-    
-    text = ""
+    print("=" * 10)
+    print("Diffusion Generation")
+    print("=" * 10)
+
     response = None
-    
+    last_len = 0  # Track length to print only new tokens
+
     for response in stream_diffusion_generate(model, tokenizer, prompt, **kwargs):
-        text = response.text
-        if verbose:
-            print(f"Generated: {text}")
-    
-    if verbose and response:
-        print("=" * 10)
-        print(f"Prompt: {response.prompt_tokens} tokens")
-        print(f"Generation: {response.generation_tokens} tokens")
-        print(f"Generation TPS: {response.generation_tps:.3f}")
-        print(f"Peak memory: {response.peak_memory:.3f} GB")
-        if response.history:
-            print(f"Diffusion steps: {len(response.history)}")
-    
-    return text
+        current_text = response.text
+        new_part = current_text[last_len:]
+        print(new_part, end="", flush=True)
+        last_len = len(current_text)
+
+    print("\n" + "=" * 10)
+    print(f"Prompt: {response.prompt_tokens} tokens")
+    print(f"Generation: {response.generation_tokens} tokens")
+    print(f"Generation TPS: {response.generation_tps:.3f}")
+    print(f"Peak memory: {response.peak_memory:.3f} GB")
+    if response.history:
+        print(f"Diffusion steps: {len(response.history)}")
+
+    return response.text
 
 if __name__ == "__main__":
-    model, tokenizer = load("/Users/gokdenizgulmez/Desktop/dream_grpo-4bit")
+    tokenizer_config = (
+        {}
+    )
+    tokenizer_config["trust_remote_code"] = True
+    model, tokenizer = load("/Users/gokdenizgulmez/Desktop/dream_grpo-4bit", tokenizer_config=tokenizer_config)
 
     response = diffusion_generate(model, tokenizer, "Write a quick sort in c++")
-
-    print(response)

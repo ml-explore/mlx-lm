@@ -44,6 +44,15 @@ DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 
+# Diffusion-specific defaults
+DEFAULT_STEPS = 32
+DEFAULT_EPSILON = 1e-3
+DEFAULT_GEN_LENGTH = 18
+DEFAULT_NOISE_TEMP = 0.0
+DEFAULT_CFG = 1.0
+DEFAULT_UNMASKING = "topk" # 'origin', 'maskgit_plus', 'topk_margin', 'entropy', 'topk'
+DEFAULT_BLOCK_LENGTH = None
+
 
 def str2bool(string):
     return string.lower() not in ["false", "f"]
@@ -197,6 +206,50 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+
+    # Diffusion-specific arguments
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_STEPS,
+        help="Number of diffusion steps",
+    )
+    parser.add_argument(
+        "--gen-length",
+        type=int,
+        default=DEFAULT_GEN_LENGTH,
+        help="Length of generated sequence",
+    )
+    parser.add_argument(
+        "--noise-temp",
+        type=float,
+        default=DEFAULT_NOISE_TEMP,
+        help="Temperature for the noise in diffusion sampling",
+    )
+    parser.add_argument(
+        "--eps",
+        type=float,
+        default=DEFAULT_EPSILON,
+        help="Epsilon",
+    )
+    parser.add_argument(
+        "--cfg",
+        type=float,
+        default=DEFAULT_CFG,
+        help="Classifier-Free Guidance scale",
+    )
+    parser.add_argument(
+        "--block-length",
+        type=int,
+        default=DEFAULT_BLOCK_LENGTH,
+        help="Length of semi-autoregressive blocks for diffusion",
+    )
+    parser.add_argument(
+        "--unmasking",
+        type=str,
+        default=DEFAULT_UNMASKING,
+        help="Unmasking strategy ('topk' or 'random')",
     )
     return parser
 
@@ -597,6 +650,223 @@ def speculative_generate_step(
     finally:
         _rewind_cache(num_draft, n)
 
+def generate_diffusion(
+    prompt: mx.array,
+    model: nn.Module,
+    tokenizer,
+    *,
+    steps: int = 64,
+    gen_length: int = 64,
+    block_length: int = None,
+    noise_temp: float = 0.0,
+    cfg: float = 0.0,
+    mask_token_id: int = None,
+    verbose: bool = False,
+    unmasking: str = "topk",
+) -> Generator[GenerationResponse, None, None]:
+    """
+    Generate text using a diffusion-based approach.
+
+    Args:
+        prompt: mx.array, tokenized input prompt of shape (prompt_length,)
+        model: nn.Module, Transformer-based mask predictor
+        tokenizer: tokenizer object with decode method
+        steps: int, total number of diffusion steps
+        gen_length: int, length of the generated sequence
+        block_length: int, size of each block (defaults to gen_length)
+        noise_temp: float, temperature for Gumbel noise sampling
+        cfg: float, classifier-free guidance scale
+        mask_token_id: int, token ID for masking (defaults to model-specific or 126336)
+        verbose: bool, whether to yield intermediate responses with step updates
+        unmasking: str, strategy for selecting tokens to unmask ('topk' or 'random')
+    """
+
+    @mx.compile
+    def sample_noise_or_greedy(logits, temp):
+        """Sample token indices from logits using Gumbel-Max trick, relying on global PRNG."""
+        if temp == 0.0:
+            return mx.argmax(logits, axis=-1), None
+        uniform = mx.random.uniform(
+            low=1e-7, high=1 - 1e-7, shape=logits.shape, dtype=model_dtype
+        )
+        gumbel_noise = -mx.log(-mx.log(uniform))
+        noisy_logits = logits + gumbel_noise * temp
+        sampled_ids = mx.argmax(noisy_logits, axis=-1)
+        return sampled_ids, gumbel_noise
+
+    model_dtype = (
+        model.dtype
+        if hasattr(model, "dtype")
+        and model.dtype in (mx.float16, mx.bfloat16, mx.float32)
+        else mx.float32
+    )
+    mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
+
+    batch_size = 1
+    prompt_length = prompt.shape[0]
+    seq_len = prompt_length + gen_length
+
+    # Block setup
+    block_length = block_length or gen_length
+    num_blocks = (gen_length + block_length - 1) // block_length
+    block_sizes = [
+        min(block_length, gen_length - i * block_length) for i in range(num_blocks)
+    ]
+    base_steps = steps // num_blocks
+    remainder = steps % num_blocks
+    steps_per_block = [
+        base_steps + 1 if i < remainder else base_steps for i in range(num_blocks)
+    ]
+
+    x = mx.full((batch_size, seq_len), mask_token_id, dtype=mx.int32)
+    x[:, :prompt_length] = prompt.astype(mx.int32)
+    full_mask = mx.zeros((1, 1, seq_len, seq_len), dtype=mx.bfloat16)
+
+    max_unmask = max(block_sizes)
+    index_buffer = mx.arange(max_unmask, dtype=mx.int32)
+
+    tic = time.perf_counter()
+    for block_idx, (block_size, block_steps) in enumerate(
+        zip(block_sizes, steps_per_block)
+    ):
+        block_start = prompt_length + sum(block_sizes[:block_idx])
+        block_end = block_start + block_size
+        seq_indices = mx.arange(seq_len, dtype=mx.int32)
+        block_mask = (seq_indices >= block_start) & (seq_indices < block_end)[None, :]
+
+        timesteps = mx.linspace(1.0, 0.0, block_steps, dtype=mx.float32)
+
+        for step, t in enumerate(timesteps):
+            mask_condition = x == mask_token_id
+            block_mask_condition = mask_condition & block_mask
+            num_masks_in_block = int(mx.sum(block_mask_condition).item())
+
+            # Early stopping logic if all unmasked
+            if num_masks_in_block == 0:
+                break
+
+            # CFG (Classifier-free guidance) and logits
+            if cfg > 0.0:
+                # Create unconditional input by masking only the prompt portion
+                un_x = mx.where(
+                    mx.arange(seq_len, dtype=mx.int32) < prompt_length,
+                    mx.full((batch_size, seq_len), mask_token_id, dtype=x.dtype),
+                    x,
+                )
+                x_ = mx.concatenate([x, un_x], axis=0)
+                logits = model(x_, mask=full_mask)
+                logits, un_logits = mx.split(logits, 2, axis=0)
+                logits = un_logits + (cfg + 1) * (logits - un_logits)
+            else:
+                logits = model(x, mask=full_mask)
+
+            # Sampling
+            x0, gumbel_noise = sample_noise_or_greedy(logits, noise_temp)
+
+            # unmasking logic
+            if unmasking == "topk":
+                probs = mx.softmax(logits, axis=-1).astype(model_dtype)
+                confidence_scores = mx.take_along_axis(
+                    probs, x0[..., None], axis=-1
+                ).squeeze(-1)
+            elif unmasking == "random":
+                confidence_scores = mx.random.uniform(
+                    shape=(batch_size, seq_len), dtype=model_dtype
+                )
+            else:
+                raise ValueError(
+                    f"Invalid unmasking strategy: {unmasking}, must be 'topk' or 'random'"
+                )
+
+            masked_confidences = mx.where(
+                block_mask_condition,
+                confidence_scores,
+                mx.full(block_mask_condition.shape, -1e9, dtype=model_dtype),
+            )
+            target_unmasked = int(mx.round(block_size * (1 - t)).item())
+            current_unmasked = block_size - num_masks_in_block
+            num_to_unmask = (
+                num_masks_in_block
+                if step == block_steps - 1
+                else min(max(0, target_unmasked - current_unmasked), num_masks_in_block)
+            )
+
+            if num_to_unmask > 0:
+                sorted_indices = mx.argsort(masked_confidences.flatten())[::-1]
+                unmask_indices = mx.take(sorted_indices, index_buffer[:num_to_unmask])
+                x[:, unmask_indices] = x0[:, unmask_indices]
+
+            # Recalculate masks after unmasking
+            mask_condition = x == mask_token_id
+            block_mask_condition = mask_condition & block_mask
+            num_masks_in_block = int(mx.sum(block_mask_condition).item())
+            unmasked_count = block_size - num_masks_in_block
+
+            if verbose:
+                mx.eval(x)
+                response_tokens = x[0, prompt_length:block_end].tolist()
+                current_text = (
+                    tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
+                    or "(No text revealed yet)"
+                )
+                elapsed_time = time.perf_counter() - tic
+                yield GenerationResponse(
+                    text=f"\033[2J\033[H{'=' * 10}\n"
+                    f"Generating with diffusion model: {steps} steps, {gen_length} tokens\n"
+                    f"Block {block_idx + 1}/{num_blocks} | Step {step + 1}/{block_steps} | "
+                    f"Unmasked {unmasked_count}/{block_size}\n\n{current_text}",
+                    token=0,
+                    logprobs=mx.array([]),
+                    from_draft=False,  # No draft model in diffusion yet
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt.size / elapsed_time if elapsed_time > 0 else 0,
+                    generation_tokens=block_end - prompt_length,
+                    generation_tps=(
+                        (block_end - prompt_length) / elapsed_time
+                        if elapsed_time > 0
+                        else 0
+                    ),
+                    peak_memory=mx.metal.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+
+        mx.eval(x)  # Finalize block
+
+    # Final response
+    mx.eval(x)
+    final_text = tokenizer.decode(
+        x[0, prompt_length:].tolist(), skip_special_tokens=True
+    ).strip()
+    prompt_time = time.perf_counter() - tic
+    generation_tokens = seq_len - prompt_length
+
+    if not verbose:
+        yield GenerationResponse(
+            text=final_text,
+            token=0,
+            logprobs=mx.array([]),
+            from_draft=False,
+            prompt_tokens=prompt.size,
+            prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
+            generation_tokens=generation_tokens,
+            generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
+            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            finish_reason="length",
+        )
+    elif verbose:
+        # In verbose mode, yield a final response with empty text to signal completion
+        yield GenerationResponse(
+            text="",  # Avoid duplicating final_text
+            token=0,
+            logprobs=mx.array([]),
+            from_draft=False,
+            prompt_tokens=prompt.size,
+            prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
+            generation_tokens=generation_tokens,
+            generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
+            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            finish_reason="length",
+        )
 
 def stream_generate(
     model: nn.Module,
@@ -637,31 +907,68 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
-    if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
+    is_diffusion = getattr(model.args, "model_type", None) in ["llada", "Dream"]
+
+    if is_diffusion:
+        diffusion_keys = {
+            "steps",
+            "gen_length",
+            "block_length",
+            "noise_temp",
+            "cfg",
+            "mask_token_id",
+            "verbose",
+            "unmasking",
+        }
+        diffusion_kwargs = {k: v for k, v in kwargs.items() if k in diffusion_keys}
+        diffusion_generator = generate_diffusion(
+            prompt,
+            model,
+            tokenizer,
+            **diffusion_kwargs
         )
+        for response in diffusion_generator:
+            yield response
     else:
-        kwargs.pop("max_kv_size", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
-    with wired_limit(model, [generation_stream]):
-        detokenizer.reset()
-        tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+        if draft_model is None:
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = generate_step(prompt, model, **kwargs)
+            # from_draft always false for non-speculative generation
+            token_generator = (
+                (token, logprobs, False) for token, logprobs in token_generator
+            )
+        else:
+            kwargs.pop("max_kv_size", None)
+            token_generator = speculative_generate_step(
+                prompt, model, draft_model, **kwargs
+            )
+        with wired_limit(model, [generation_stream]):
+            detokenizer.reset()
+            tic = time.perf_counter()
+            for n, (token, logprobs, from_draft) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
-            detokenizer.add_token(token)
+                detokenizer.add_token(token)
 
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    from_draft=from_draft,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+
+            detokenizer.finalize()
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
@@ -672,22 +979,8 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=None,
+                finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
             )
-
-        detokenizer.finalize()
-        yield GenerationResponse(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
-            prompt_tokens=prompt.size,
-            prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
-        )
 
 
 def generate(
@@ -867,6 +1160,12 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        steps=args.steps,
+        gen_length=args.gen_length,
+        noise_temp=args.noise_temp,
+        cfg=args.cfg,
+        block_length=args.block_length,
+        unmasking=args.unmasking,
     )
     if not args.verbose:
         print(response)
