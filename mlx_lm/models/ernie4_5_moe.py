@@ -104,24 +104,30 @@ class Ernie4_5_MLP(nn.Module):
 class Ernie4_5_MoeStatics(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        
+
         num_experts = args.moe_num_experts
         num_experts_groups = 1
-        self.e_score_correction_bias = mx.zeros((num_experts_groups, num_experts), dtype=mx.float32)
-    
+        self.e_score_correction_bias = mx.zeros(
+            (num_experts_groups, num_experts), dtype=mx.float32
+        )
+
     def __call__(self, x):
         return x
-    
+
 
 class Ernie4_5_MoeMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.k = args.moe_k
-        self.moe_intermediate_size = args.moe_intermediate_size if args.moe_intermediate_size else args.intermediate_size
+        self.moe_intermediate_size = (
+            args.moe_intermediate_size
+            if args.moe_intermediate_size
+            else args.intermediate_size
+        )
 
         self.gate = nn.Linear(args.hidden_size, args.moe_num_experts, bias=False)
-        
+
         # Use SwitchGLU instead of custom experts
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
@@ -137,7 +143,9 @@ class Ernie4_5_MoeMLP(nn.Module):
                 if getattr(args, "moe_intermediate_size", None)
                 else args.intermediate_size * args.moe_num_shared_experts
             )
-            self.shared_experts = Ernie4_5_MLP(args.hidden_size, shared_intermediate_size, args.use_bias)
+            self.shared_experts = Ernie4_5_MLP(
+                args.hidden_size, shared_intermediate_size, args.use_bias
+            )
         else:
             self.shared_experts = None
 
@@ -156,23 +164,23 @@ class Ernie4_5_MoeMLP(nn.Module):
         # Gate computation
         gates = self.gate(x)
         gates = self.gate_act(gates)
-        
+
         # Get top-k indices
         k = self.k
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(gates, inds, axis=-1)
-        
+
         # Normalize scores
         scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-12)
-        
+
         # Process through switch MLP
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-        
+
         # Add shared expert output if available
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
-        
+
         return y
 
 
@@ -186,7 +194,7 @@ class Ernie4_5_DecoderLayer(nn.Module):
             if isinstance(args.moe_layer_start_index, (tuple, list))
             else args.moe_layer_start_index
         )
-        
+
         if args.moe_layer_end_index is None:
             moe_layer_end_index = args.num_hidden_layers - 1
         else:
@@ -203,7 +211,9 @@ class Ernie4_5_DecoderLayer(nn.Module):
         ):
             self.mlp = Ernie4_5_MoeMLP(args)
         else:
-            self.mlp = Ernie4_5_MLP(args.hidden_size, args.intermediate_size, args.use_bias)
+            self.mlp = Ernie4_5_MLP(
+                args.hidden_size, args.intermediate_size, args.use_bias
+            )
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -226,7 +236,9 @@ class Ernie45Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [Ernie4_5_DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
+        self.layers = [
+            Ernie4_5_DecoderLayer(args, i) for i in range(args.num_hidden_layers)
+        ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
@@ -274,40 +286,65 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
-    
+
     def sanitize(self, weights):
         # Remove unwanted patterns
-        remove_patterns = ["mtp_block.", "mtp_linear_proj.", "mtp_hidden_norm.", "mtp_emb_norm."]
-        
+        remove_patterns = [
+            "mtp_block.",
+            "mtp_linear_proj.",
+            "mtp_hidden_norm.",
+            "mtp_emb_norm.",
+        ]
+
         # Filter out unwanted parameters
         sanitized_weights = {
-            key: value for key, value in weights.items()
+            key: value
+            for key, value in weights.items()
             if not any(pattern in key for pattern in remove_patterns)
         }
-        
+
         expert_keys = {}
         for key in list(sanitized_weights.keys()):
             if ".mlp.experts." in key:
                 parts = key.split(".")
-                layer_idx = next((int(parts[i+1]) for i, part in enumerate(parts) if part == "layers" and i+1 < len(parts)), None)
-                expert_idx = next((int(parts[i+1]) for i, part in enumerate(parts) if part == "experts" and i+1 < len(parts)), None)
-                
+                layer_idx = next(
+                    (
+                        int(parts[i + 1])
+                        for i, part in enumerate(parts)
+                        if part == "layers" and i + 1 < len(parts)
+                    ),
+                    None,
+                )
+                expert_idx = next(
+                    (
+                        int(parts[i + 1])
+                        for i, part in enumerate(parts)
+                        if part == "experts" and i + 1 < len(parts)
+                    ),
+                    None,
+                )
+
                 if layer_idx is not None and expert_idx is not None:
                     expert_keys.setdefault(layer_idx, set()).add(expert_idx)
-        
+
         for layer_idx, expert_indices in expert_keys.items():
             prefix = f"model.layers.{layer_idx}"
             expert_indices = sorted(expert_indices)
-            
+
             for proj_type in ["up_proj", "down_proj", "gate_proj"]:
                 for weight_type in ["weight", "bias", "scales", "biases"]:
                     weights_to_join = [
-                        sanitized_weights.pop(f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}")
+                        sanitized_weights.pop(
+                            f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}"
+                        )
                         for e in expert_indices
-                        if f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}" in sanitized_weights
+                        if f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}"
+                        in sanitized_weights
                     ]
-                    
+
                     if weights_to_join:
-                        sanitized_weights[f"{prefix}.mlp.switch_mlp.{proj_type}.{weight_type}"] = mx.stack(weights_to_join)
-        
+                        sanitized_weights[
+                            f"{prefix}.mlp.switch_mlp.{proj_type}.{weight_type}"
+                        ] = mx.stack(weights_to_join)
+
         return sanitized_weights
