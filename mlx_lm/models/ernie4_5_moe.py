@@ -128,7 +128,6 @@ class Ernie4_5_MoeMLP(nn.Module):
 
         self.gate = nn.Linear(args.hidden_size, args.moe_num_experts, bias=False)
 
-        # Use SwitchGLU instead of custom experts
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             self.moe_intermediate_size,
@@ -136,7 +135,6 @@ class Ernie4_5_MoeMLP(nn.Module):
             bias=args.use_bias,
         )
 
-        # Keep shared experts functionality
         if getattr(args, "moe_num_shared_experts", 0) > 0:
             shared_intermediate_size = (
                 args.moe_intermediate_size * args.moe_num_shared_experts
@@ -160,24 +158,18 @@ class Ernie4_5_MoeMLP(nn.Module):
             raise ValueError(f"{args.moe_gate_act} is not supported.")
 
     def __call__(self, x: mx.array) -> mx.array:
-        """Forward pass through MoE layer."""
-        # Gate computation
         gates = self.gate(x)
         gates = self.gate_act(gates)
 
-        # Get top-k indices
         k = self.k
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(gates, inds, axis=-1)
 
-        # Normalize scores
         scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-12)
 
-        # Process through switch MLP
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
 
-        # Add shared expert output if available
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
 
@@ -288,7 +280,6 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
-        # Remove unwanted patterns
         remove_patterns = [
             "mtp_block.",
             "mtp_linear_proj.",
@@ -296,7 +287,6 @@ class Model(nn.Module):
             "mtp_emb_norm.",
         ]
 
-        # Filter out unwanted parameters
         sanitized_weights = {
             key: value
             for key, value in weights.items()
