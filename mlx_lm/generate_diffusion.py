@@ -17,35 +17,26 @@ from .utils import load
 @dataclass
 class DreamGenerationConfig:
     """Configuration for Dream diffusion generation."""
-    temperature: float = 0.7
+    temperature: float = 0.4
     top_p: Optional[float] = None
     top_k: Optional[int] = None
-    max_length: int = 64
+    max_length: int = 256
     max_new_tokens: Optional[int] = None
     
     # Diffusion specific params
     eps: float = 1e-3
-    steps: int = 20
+    steps: int = 512
     alg: str = 'origin'  # 'origin', 'maskgit_plus', 'topk_margin', 'entropy'
     alg_temp: Optional[float] = None
     
     # Special tokens
-    mask_token_id: Optional[int] = None
-    pad_token_id: Optional[int] = None
-    bos_token_id: Optional[int] = None
-    eos_token_id: Optional[int] = None
+    mask_token_id: Optional[int] = 151666
+    pad_token_id: Optional[int] = 151643
+    bos_token_id: Optional[int] = 151643
+    eos_token_id: Optional[int] = 151643
     
     # Output control
     num_return_sequences: int = 1
-    return_dict_in_generate: bool = False
-    output_history: bool = False
-
-
-@dataclass
-class DreamModelOutput:
-    """Output from Dream diffusion generation."""
-    sequences: mx.array
-    history: Optional[List[mx.array]] = None
 
 
 @dataclass
@@ -160,7 +151,7 @@ def diffusion_generate_step(
     model: nn.Module,
     generation_config: DreamGenerationConfig,
     prompt_cache: Optional[Any] = None,
-) -> Union[DreamModelOutput, mx.array]:
+) -> mx.array:
     # Extract config parameters
     max_length = generation_config.max_length
     mask_token_id = generation_config.mask_token_id
@@ -171,8 +162,6 @@ def diffusion_generate_step(
     temperature = generation_config.temperature
     top_p = generation_config.top_p
     top_k = generation_config.top_k
-    output_history = generation_config.output_history
-    return_dict = generation_config.return_dict_in_generate
 
     batch_size = prompt.shape[0]
     
@@ -186,9 +175,6 @@ def diffusion_generate_step(
     
     # Create timestep schedule
     timesteps = mx.linspace(1, eps, steps + 1)
-    
-    # Store history if requested
-    histories = [] if output_history else None
     
     # Initialize random key
     key = mx.random.key(int(time.time() * 1000))
@@ -309,15 +295,9 @@ def diffusion_generate_step(
         
         # Convert back to MLX array
         x = mx.array(x_list)
-        
-        # Store history
-        if histories is not None:
-            histories.append(x.copy())
     
-    if return_dict:
-        return DreamModelOutput(sequences=x, history=histories)
-    else:
-        return x
+    # Return the final result after all diffusion steps
+    return x
 
 
 def stream_diffusion_generate(
@@ -328,17 +308,7 @@ def stream_diffusion_generate(
     **kwargs,
 ) -> Generator[DreamGenerationResponse, None, None]:
     """
-    Generate text using Dream's diffusion process.
-    
-    Args:
-        model: The Dream model
-        tokenizer: Tokenizer for encoding/decoding
-        prompt: Input prompt
-        generation_config: Generation configuration
-        **kwargs: Additional generation parameters
-        
-    Yields:
-        DreamGenerationResponse with generated text and metadata
+    Generate text using Dream's diffusion process with step-by-step streaming.
     """
     
     if not isinstance(tokenizer, TokenizerWrapper):
@@ -369,48 +339,256 @@ def stream_diffusion_generate(
     if generation_config.max_new_tokens is not None:
         generation_config.max_length = generation_config.max_new_tokens + input_length
     
-    # Generate
+    # Generate with step-by-step streaming
     tic = time.perf_counter()
     
     # Create prompt cache
     prompt_cache = cache.make_prompt_cache(model)
     
-    result = diffusion_generate_step(
+    # Call the streaming diffusion function
+    for step_result in diffusion_generate_step_streaming(
         prompt=prompt,
         model=model,
         generation_config=generation_config,
         prompt_cache=prompt_cache,
-    )
+        tokenizer=tokenizer,
+        input_length=input_length,
+        start_time=tic,
+    ):
+        yield step_result
+
+
+def diffusion_generate_step_streaming(
+    prompt: mx.array,
+    model: nn.Module,
+    generation_config: DreamGenerationConfig,
+    prompt_cache: Optional[Any],
+    tokenizer,
+    input_length: int,
+    start_time: float,
+) -> Generator[DreamGenerationResponse, None, None]:
+    """
+    Streaming version of diffusion generation that yields after each step.
+    """
     
-    generation_time = time.perf_counter() - tic
+    def safe_decode_tokens(tokens, tokenizer, mask_token_id):
+        """Safely decode tokens, handling mask tokens and None values."""
+        decoded_tokens = []
+        for t in tokens:
+            token_id = t.item()
+            if token_id == mask_token_id:
+                # Use a placeholder for mask tokens
+                decoded_tokens.append("[MASK]")
+            else:
+                try:
+                    # Try to decode individual token
+                    decoded_token = tokenizer.decode([token_id], skip_special_tokens=False)
+                    decoded_tokens.append(decoded_token)
+                except (TypeError, ValueError):
+                    # If decoding fails, use a placeholder
+                    decoded_tokens.append(f"[UNK_{token_id}]")
+        return "".join(decoded_tokens)
     
-    # Extract sequences and history
-    if isinstance(result, DreamModelOutput):
-        sequences = result.sequences
-        history = result.history
+    # Extract config parameters
+    max_length = generation_config.max_length
+    mask_token_id = generation_config.mask_token_id
+    steps = generation_config.steps
+    eps = generation_config.eps
+    alg = generation_config.alg
+    temperature = generation_config.temperature
+    top_p = generation_config.top_p
+    top_k = generation_config.top_k
+
+    batch_size = prompt.shape[0]
+    
+    # Pad input to max_length with mask tokens
+    pad_length = max_length - prompt.shape[1]
+    if pad_length > 0:
+        mask_tokens = mx.full((batch_size, pad_length), mask_token_id, dtype=prompt.dtype)
+        x = mx.concatenate([prompt, mask_tokens], axis=1)
     else:
-        sequences = result
-        history = None
+        x = prompt[:, :max_length]
     
-    # Decode generated text
-    generated_tokens = sequences[0, input_length:]  # Remove prompt tokens
-    generated_text = tokenizer.decode(generated_tokens.tolist(), skip_special_tokens=True)
+    # Create timestep schedule
+    timesteps = mx.linspace(1, eps, steps + 1)
     
-    # Calculate metrics
-    prompt_tps = input_length / generation_time if generation_time > 0 else 0
-    generation_tokens = generated_tokens.shape[0]
-    generation_tps = generation_tokens / generation_time if generation_time > 0 else 0
+    # Initialize random key
+    key = mx.random.key(int(time.time() * 1000))
+    
+    # Yield initial state (all masked)
+    current_time = time.perf_counter()
+    generated_tokens = x[0, input_length:]
+    generated_text = safe_decode_tokens(generated_tokens, tokenizer, mask_token_id)
     
     yield DreamGenerationResponse(
         text=generated_text,
-        sequences=sequences,
+        sequences=x,
         prompt_tokens=input_length,
-        prompt_tps=prompt_tps,
-        generation_tokens=generation_tokens,
-        generation_tps=generation_tps,
+        prompt_tps=input_length / (current_time - start_time) if current_time > start_time else 0,
+        generation_tokens=generated_tokens.shape[0],
+        generation_tps=0,
         peak_memory=mx.get_peak_memory() / 1e9,
-        finish_reason="length",
-        history=history,
+        finish_reason=f"step_0/{steps}",
+    )
+    
+    # Diffusion sampling loop
+    for i in range(steps):
+        # Find masked positions manually
+        mask_index = (x == mask_token_id)
+        
+        # Check if there are any masked tokens left
+        if not mx.any(mask_index):
+            break  # No more masked tokens
+        
+        # Forward pass through model
+        logits = model(x, cache=prompt_cache)
+        
+        # Apply logits shifting: [B, L, V] -> [B, L, V]
+        if logits.shape[1] == x.shape[1] + 1:
+            logits = logits[:, :-1]  # Remove last position
+        logits = mx.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
+        
+        # Get current timestep values
+        t = timesteps[i]
+        s = timesteps[i + 1]
+        
+        # Manually find masked positions and extract logits
+        masked_positions = []
+        masked_logits_list = []
+        
+        # Iterate through all positions to find masked ones
+        for b in range(batch_size):
+            for pos in range(x.shape[1]):
+                # Check if this position is masked
+                if x[b, pos].item() == mask_token_id:
+                    masked_positions.append((b, pos))
+                    masked_logits_list.append(logits[b, pos])
+        
+        if len(masked_positions) == 0:
+            continue
+        
+        # Stack the logits for masked positions
+        masked_logits = mx.stack(masked_logits_list)
+        
+        # Split keys for this step
+        key, sample_key, transfer_key = mx.random.split(key, 3)
+        
+        # Convert to list for easier manipulation
+        x_list = x.tolist()
+        
+        if alg == 'origin':
+            # Original algorithm: probabilistic transfer
+            p_transfer = 1 - s / t if i < steps - 1 else 1
+            
+            # Sample new tokens
+            _, new_tokens = sample_tokens(
+                masked_logits, 
+                temperature=temperature, 
+                top_p=top_p, 
+                top_k=top_k,
+                key=sample_key
+            )
+            
+            # Apply transfer with probability
+            transfer_probs = mx.random.uniform(shape=new_tokens.shape, key=transfer_key)
+            update_mask = transfer_probs < p_transfer
+            
+            # Update tokens where transfer condition is met
+            for idx, (b, pos) in enumerate(masked_positions):
+                if update_mask[idx].item():
+                    x_list[b][pos] = int(new_tokens[idx].item())
+            
+        else:
+            # Confidence-based algorithms
+            if alg == 'maskgit_plus':
+                confidence, new_tokens = sample_tokens(
+                    masked_logits, 
+                    temperature=temperature, 
+                    top_p=top_p, 
+                    top_k=top_k,
+                    key=sample_key
+                )
+            elif alg == 'topk_margin':
+                confidence, new_tokens = sample_tokens(
+                    masked_logits, 
+                    temperature=temperature, 
+                    top_p=top_p, 
+                    top_k=top_k,
+                    margin_confidence=True,
+                    key=sample_key
+                )
+            elif alg == 'entropy':
+                confidence, new_tokens = sample_tokens(
+                    masked_logits, 
+                    temperature=temperature, 
+                    top_p=top_p, 
+                    top_k=top_k,
+                    neg_entropy=True,
+                    key=sample_key
+                )
+            else:
+                raise ValueError(f"Unknown algorithm: {alg}")
+            
+            # Calculate number of tokens to update
+            num_masked = len(masked_positions)
+            num_update = int(num_masked * (1 - s / t)) if i < steps - 1 else num_masked
+            
+            if num_update > 0:
+                # Get top confidence positions
+                sorted_indices = mx.argsort(-confidence)
+                top_indices = sorted_indices[:num_update]
+                
+                # Update tokens in sequence
+                for idx in top_indices:
+                    idx_val = int(idx.item())
+                    if idx_val < len(masked_positions):
+                        b, pos = masked_positions[idx_val]
+                        x_list[b][pos] = int(new_tokens[idx_val].item())
+        
+        # Convert back to MLX array
+        x = mx.array(x_list)
+        
+        # Yield intermediate result after each step
+        current_time = time.perf_counter()
+        generated_tokens = x[0, input_length:]
+        generated_text = safe_decode_tokens(generated_tokens, tokenizer, mask_token_id)
+        
+        # Count remaining masked tokens
+        remaining_masked = mx.sum(x == mask_token_id).item()
+        
+        yield DreamGenerationResponse(
+            text=generated_text,
+            sequences=x,
+            prompt_tokens=input_length,
+            prompt_tps=input_length / (current_time - start_time) if current_time > start_time else 0,
+            generation_tokens=generated_tokens.shape[0],
+            generation_tps=generated_tokens.shape[0] / (current_time - start_time) if current_time > start_time else 0,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=f"step_{i+1}/{steps}_masked_{remaining_masked}",
+        )
+    
+    # Final result - use skip_special_tokens=True for clean output
+    current_time = time.perf_counter()
+    generated_tokens = x[0, input_length:]
+    
+    # For final result, try to decode normally first
+    try:
+        generated_text = tokenizer.decode(generated_tokens.tolist(), skip_special_tokens=True)
+    except (TypeError, ValueError):
+        # If that fails, use safe decoding
+        generated_text = safe_decode_tokens(generated_tokens, tokenizer, mask_token_id)
+        # Remove [MASK] tokens from final output
+        generated_text = generated_text.replace("[MASK]", "")
+    
+    yield DreamGenerationResponse(
+        text=generated_text,
+        sequences=x,
+        prompt_tokens=input_length,
+        prompt_tps=input_length / (current_time - start_time) if current_time > start_time else 0,
+        generation_tokens=generated_tokens.shape[0],
+        generation_tps=generated_tokens.shape[0] / (current_time - start_time) if current_time > start_time else 0,
+        peak_memory=mx.get_peak_memory() / 1e9,
+        finish_reason="complete",
     )
 
 
@@ -421,45 +599,74 @@ def diffusion_generate(
     **kwargs,
 ) -> str:
     """
-    Generate a complete response using Dream's diffusion process.
-
-    Args:
-        model: The Dream model
-        tokenizer: Tokenizer for encoding/decoding
-        prompt: Input prompt
-        **kwargs: Generation parameters
-
-    Returns:
-        Generated text string
+    Generate a complete response using Dream's diffusion process with live updates.
     """
-    print("=" * 10)
-    print("Diffusion Generation")
-    print("=" * 10)
+    print("=" * 50)
+    print("🎭 DIFFUSION GENERATION - LIVE VIEW")
+    print("=" * 50)
+    print(f"Prompt: {prompt}")
+    print("=" * 50)
 
     response = None
-    last_len = 0  # Track length to print only new tokens
-
-    for response in stream_diffusion_generate(model, tokenizer, prompt, **kwargs):
+    
+    for i, response in enumerate(stream_diffusion_generate(model, tokenizer, prompt, **kwargs)):
+        # Clear the current line and move cursor to beginning
+        print(f"\r\033[K", end="")
+        
+        # Show step info
+        step_info = f"[{response.finish_reason}] "
+        
+        # Show current state with masked tokens visible
         current_text = response.text
-        new_part = current_text[last_len:]
-        print(new_part, end="", flush=True)
-        last_len = len(current_text)
-
-    print("\n" + "=" * 10)
-    print(f"Prompt: {response.prompt_tokens} tokens")
-    print(f"Generation: {response.generation_tokens} tokens")
+        
+        # Color coding: green for unmasked, red for masked
+        colored_text = ""
+        if "[MASK]" in current_text:
+            # Replace mask tokens with colored placeholders
+            colored_text = current_text.replace("[MASK]", "\033[91m[MASK]\033[0m")
+        else:
+            colored_text = f"\033[92m{current_text}\033[0m"
+        
+        # Truncate text if too long for terminal display
+        max_display_length = 100
+        if len(current_text) > max_display_length:
+            display_text = current_text[:max_display_length] + "..."
+            if "[MASK]" in display_text:
+                display_text = display_text.replace("[MASK]", "\033[91m[MASK]\033[0m")
+            else:
+                display_text = f"\033[92m{display_text}\033[0m"
+            colored_text = display_text
+        
+        print(f"{step_info}{colored_text}", end="", flush=True)
+        
+        # Add a small delay to see the progression
+        time.sleep(0.1)
+    
+    # Clear the line one final time and show completion
+    print(f"\r\033[K", end="")
+    print("✅ Generation complete!")
+    
+    print("\n" + "=" * 50)
+    print("📊 GENERATION STATS")
+    print("=" * 50)
+    print(f"Prompt tokens: {response.prompt_tokens}")
+    print(f"Generated tokens: {response.generation_tokens}")
     print(f"Generation TPS: {response.generation_tps:.3f}")
     print(f"Peak memory: {response.peak_memory:.3f} GB")
-    if response.history:
-        print(f"Diffusion steps: {len(response.history)}")
+    print("=" * 50)
+    print("📝 FINAL RESULT:")
+    print("=" * 50)
+    print(response.text)
+    print("=" * 50)
 
     return response.text
+
 
 if __name__ == "__main__":
     tokenizer_config = (
         {}
     )
     tokenizer_config["trust_remote_code"] = True
-    model, tokenizer = load("/Users/gokdenizgulmez/Desktop/dream_grpo-4bit", tokenizer_config=tokenizer_config)
+    model, tokenizer = load("apple/DiffuCoder-7B-cpGRPO", tokenizer_config=tokenizer_config)
 
     response = diffusion_generate(model, tokenizer, "Write a quick sort in c++")
