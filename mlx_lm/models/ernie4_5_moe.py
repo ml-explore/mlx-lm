@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
+from .switch_layers import SwitchGLU
 
 
 # python -m mlx_lm.generate --model baidu/ERNIE-4.5-0.3B-PT --prompt "wrtie a long storry about a AI machine helping a human" -m 20000
@@ -125,15 +126,23 @@ class Ernie4_5_MoeMLP(nn.Module):
         self.moe_intermediate_size = args.moe_intermediate_size if args.moe_intermediate_size else args.intermediate_size
 
         self.gate = nn.Linear(args.hidden_size, args.moe_num_experts, bias=False)
-        self.experts = [Ernie4_5_MLP(dim=args.hidden_size, hidden_dim=self.moe_intermediate_size) for _ in range(args.moe_num_experts)]
+        
+        # Use SwitchGLU instead of custom experts
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            self.moe_intermediate_size,
+            args.moe_num_experts,
+            bias=args.use_bias,
+        )
 
+        # Keep shared experts functionality
         if getattr(args, "moe_num_shared_experts", 0) > 0:
-            args.intermediate_size = (
+            shared_intermediate_size = (
                 args.moe_intermediate_size * args.moe_num_shared_experts
                 if getattr(args, "moe_intermediate_size", None)
                 else args.intermediate_size * args.moe_num_shared_experts
             )
-            self.shared_experts = Ernie4_5_MLP(args.hidden_size, args.intermediate_size)
+            self.shared_experts = Ernie4_5_MLP(args.hidden_size, shared_intermediate_size, args.use_bias)
         else:
             self.shared_experts = None
 
@@ -147,79 +156,29 @@ class Ernie4_5_MoeMLP(nn.Module):
         else:
             raise ValueError(f"{args.moe_gate_act} is not supported.")
 
-    def __call__(self, input: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         """Forward pass through MoE layer."""
-        # Handle 3D input
-        orig_shape = None
-        if input.ndim == 3:
-            orig_shape = input.shape
-            input = input.reshape(-1, input.shape[-1])
+        # Gate computation
+        gates = self.gate(x)
+        gates = self.gate_act(gates)
         
-        assert input.ndim == 2, f"Input must be 2D, got shape: {input.shape}"
+        # Get top-k indices
+        k = self.k
+        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+        scores = mx.take_along_axis(gates, inds, axis=-1)
         
-        # Route and process through experts
-        output = self._route_and_process(input)
+        # Normalize scores
+        scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-12)
+        
+        # Process through switch MLP
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         
         # Add shared expert output if available
         if self.shared_experts is not None:
-            output = output + self.shared_experts(input)
+            y = y + self.shared_experts(x)
         
-        # Restore original shape
-        if orig_shape:
-            output = output.reshape(orig_shape[:-1] + (output.shape[-1],))
-        
-        return output
-    
-    def _route_and_process(self, input: mx.array) -> mx.array:
-        """Combined routing and expert processing."""
-        # Gate computation
-        gate_logits = self.gate(input.astype(mx.float32))
-        gate_probs = self.gate_act(gate_logits)
-        
-        # Get top-k indices and values
-        # Method 1: Using argsort (most reliable)
-        sorted_indices = mx.argsort(gate_probs, axis=-1)[:, -self.k:]  # Get top-k indices
-        topk_indices = sorted_indices[:, ::-1]  # Reverse to get highest first
-        
-        # Gather the corresponding probabilities
-        batch_indices = mx.arange(gate_probs.shape[0])[:, None]
-        topk_probs = gate_probs[batch_indices, topk_indices]
-        
-        # Normalize weights
-        combine_weights = topk_probs / mx.maximum(
-            topk_probs.sum(axis=-1, keepdims=True), 1e-12
-        )
-        
-        # Process through experts and combine
-        return self._process_experts(input, topk_indices, combine_weights)
-    
-    def _process_experts(self, input: mx.array, expert_indices: mx.array, weights: mx.array) -> mx.array:
-        """Process input through selected experts and combine outputs."""
-        batch_size, hidden_size = input.shape
-        
-        # Initialize output
-        combined_output = mx.zeros((batch_size, self.experts[0](input[:1]).shape[-1]))
-        
-        # Create a list to store outputs for each position in the batch
-        outputs = []
-        
-        for i in range(batch_size):
-            token_output = mx.zeros_like(combined_output[0:1])
-            
-            for k in range(self.k):
-                expert_idx = int(expert_indices[i, k])
-                weight = weights[i, k]
-                
-                if weight > 1e-12:
-                    expert_output = self.experts[expert_idx](input[i:i+1])
-                    token_output = token_output + weight * expert_output
-            
-            outputs.append(token_output)
-        
-        # Stack all outputs
-        combined_output = mx.concatenate(outputs, axis=0)
-        
-        return combined_output
+        return y
 
 
 class Ernie4_5_DecoderLayer(nn.Module):
@@ -322,6 +281,7 @@ class Model(nn.Module):
         return self.model.layers
     
     def sanitize(self, weights):
+        # First remove unwanted patterns
         remove_patterns = [
             "mtp_block.",
             "mtp_linear_proj.",
@@ -335,5 +295,69 @@ class Model(nn.Module):
             should_remove = any(pattern in key for pattern in remove_patterns)
             if not should_remove:
                 sanitized_weights[key] = value
+        
+        # Handle MoE expert weight mapping
+        # Dynamically discover expert indices for each layer
+        expert_keys = {}
+        for key in list(sanitized_weights.keys()):
+            if ".mlp.experts." in key:
+                # Extract layer index and expert index
+                parts = key.split(".")
+                layer_idx = None
+                expert_idx = None
+                
+                for i, part in enumerate(parts):
+                    if part == "layers" and i + 1 < len(parts):
+                        layer_idx = int(parts[i + 1])
+                    elif part == "experts" and i + 1 < len(parts):
+                        expert_idx = int(parts[i + 1])
+                
+                if layer_idx is not None and expert_idx is not None:
+                    if layer_idx not in expert_keys:
+                        expert_keys[layer_idx] = set()
+                    expert_keys[layer_idx].add(expert_idx)
+        
+        # Map individual expert weights to SwitchGLU format
+        for layer_idx, expert_indices in expert_keys.items():
+            prefix = f"model.layers.{layer_idx}"
+            expert_indices = sorted(expert_indices)
+            
+            # Handle the three projection types
+            for n in ["up_proj", "down_proj", "gate_proj"]:
+                # Handle weights
+                to_join_weights = []
+                for e in expert_indices:
+                    key = f"{prefix}.mlp.experts.{e}.{n}.weight"
+                    if key in sanitized_weights:
+                        to_join_weights.append(sanitized_weights.pop(key))
+                if to_join_weights:
+                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join_weights)
+                
+                # Handle biases if they exist
+                to_join_biases = []
+                for e in expert_indices:
+                    key = f"{prefix}.mlp.experts.{e}.{n}.bias"
+                    if key in sanitized_weights:
+                        to_join_biases.append(sanitized_weights.pop(key))
+                if to_join_biases:
+                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.bias"] = mx.stack(to_join_biases)
+                
+                # Handle scales if they exist (for quantization)
+                to_join_scales = []
+                for e in expert_indices:
+                    key = f"{prefix}.mlp.experts.{e}.{n}.scales"
+                    if key in sanitized_weights:
+                        to_join_scales.append(sanitized_weights.pop(key))
+                if to_join_scales:
+                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.scales"] = mx.stack(to_join_scales)
+                
+                # Handle biases for scales if they exist (for quantization)
+                to_join_biases_scales = []
+                for e in expert_indices:
+                    key = f"{prefix}.mlp.experts.{e}.{n}.biases"
+                    if key in sanitized_weights:
+                        to_join_biases_scales.append(sanitized_weights.pop(key))
+                if to_join_biases_scales:
+                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.biases"] = mx.stack(to_join_biases_scales)
         
         return sanitized_weights
