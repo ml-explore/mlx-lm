@@ -14,6 +14,7 @@ if __name__ == "__main__":
         "evaluate",
         "fuse",
         "generate",
+        "generate.diffusion",
         "lora",
         "server",
         "manage",
