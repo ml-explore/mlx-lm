@@ -101,20 +101,6 @@ class Ernie4_5_MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Ernie4_5_MoeStatics(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-
-        num_experts = args.moe_num_experts
-        num_experts_groups = 1
-        self.e_score_correction_bias = mx.zeros(
-            (num_experts_groups, num_experts), dtype=mx.float32
-        )
-
-    def __call__(self, x):
-        return x
-
-
 class Ernie4_5_MoeMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -147,9 +133,6 @@ class Ernie4_5_MoeMLP(nn.Module):
         else:
             self.shared_experts = None
 
-        if args.moe_use_aux_free:
-            self.moe_statics = Ernie4_5_MoeStatics(args)
-
         if args.moe_gate_act == "softmax":
             self.gate_act = nn.Softmax()
         elif args.moe_gate_act == "sigmoid":
@@ -159,7 +142,7 @@ class Ernie4_5_MoeMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
-        gates = self.gate_act(gates)
+        gates = self.gate_act(gates.astype(mx.float32))
 
         k = self.k
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
@@ -285,56 +268,24 @@ class Model(nn.Module):
             "mtp_linear_proj.",
             "mtp_hidden_norm.",
             "mtp_emb_norm.",
+            "e_score_correction_bias",
         ]
 
-        sanitized_weights = {
+        weights = {
             key: value
             for key, value in weights.items()
             if not any(pattern in key for pattern in remove_patterns)
         }
 
-        expert_keys = {}
-        for key in list(sanitized_weights.keys()):
-            if ".mlp.experts." in key:
-                parts = key.split(".")
-                layer_idx = next(
-                    (
-                        int(parts[i + 1])
-                        for i, part in enumerate(parts)
-                        if part == "layers" and i + 1 < len(parts)
-                    ),
-                    None,
-                )
-                expert_idx = next(
-                    (
-                        int(parts[i + 1])
-                        for i, part in enumerate(parts)
-                        if part == "experts" and i + 1 < len(parts)
-                    ),
-                    None,
-                )
-
-                if layer_idx is not None and expert_idx is not None:
-                    expert_keys.setdefault(layer_idx, set()).add(expert_idx)
-
-        for layer_idx, expert_indices in expert_keys.items():
-            prefix = f"model.layers.{layer_idx}"
-            expert_indices = sorted(expert_indices)
-
-            for proj_type in ["up_proj", "down_proj", "gate_proj"]:
-                for weight_type in ["weight", "bias", "scales", "biases"]:
-                    weights_to_join = [
-                        sanitized_weights.pop(
-                            f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}"
-                        )
-                        for e in expert_indices
-                        if f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}"
-                        in sanitized_weights
+        # Stack experts
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}"
+            for m in ["gate_proj", "down_proj", "up_proj"]:
+                if f"{prefix}.mlp.experts.0.{m}.weight" in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.{m}.weight")
+                        for e in range(self.args.moe_num_experts)
                     ]
+                    weights[f"{prefix}.mlp.switch_mlp.{m}.weight"] = mx.stack(to_join)
 
-                    if weights_to_join:
-                        sanitized_weights[
-                            f"{prefix}.mlp.switch_mlp.{proj_type}.{weight_type}"
-                        ] = mx.stack(weights_to_join)
-
-        return sanitized_weights
+        return weights
