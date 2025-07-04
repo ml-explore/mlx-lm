@@ -11,11 +11,6 @@ from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
-# python -m mlx_lm.generate --model baidu/ERNIE-4.5-0.3B-PT --prompt "wrtie a long storry about a AI machine helping a human" -m 20000
-# python -m mlx_lm.convert --hf-path baidu/ERNIE-4.5-21B-A3B-PT -q --mlx-path /Users/gokdenizgulmez/Desktop/ERNIE-4.5-21B-A3B-PT-4bit
-# python -m mlx_lm.generate --model /Users/gokdenizgulmez/Desktop/ERNIE-4.5-21B-A3B-PT-4bit --prompt "wrtie a long storry about a AI machine helping a human" -m 20000
-
-
 @dataclass
 class ModelArgs(BaseModelArgs):
     hidden_size: int
@@ -281,83 +276,38 @@ class Model(nn.Module):
         return self.model.layers
     
     def sanitize(self, weights):
-        # First remove unwanted patterns
-        remove_patterns = [
-            "mtp_block.",
-            "mtp_linear_proj.",
-            "mtp_hidden_norm.",
-            "mtp_emb_norm.",
-        ]
+        # Remove unwanted patterns
+        remove_patterns = ["mtp_block.", "mtp_linear_proj.", "mtp_hidden_norm.", "mtp_emb_norm."]
         
         # Filter out unwanted parameters
-        sanitized_weights = {}
-        for key, value in weights.items():
-            should_remove = any(pattern in key for pattern in remove_patterns)
-            if not should_remove:
-                sanitized_weights[key] = value
+        sanitized_weights = {
+            key: value for key, value in weights.items()
+            if not any(pattern in key for pattern in remove_patterns)
+        }
         
-        # Handle MoE expert weight mapping
-        # Dynamically discover expert indices for each layer
         expert_keys = {}
         for key in list(sanitized_weights.keys()):
             if ".mlp.experts." in key:
-                # Extract layer index and expert index
                 parts = key.split(".")
-                layer_idx = None
-                expert_idx = None
-                
-                for i, part in enumerate(parts):
-                    if part == "layers" and i + 1 < len(parts):
-                        layer_idx = int(parts[i + 1])
-                    elif part == "experts" and i + 1 < len(parts):
-                        expert_idx = int(parts[i + 1])
+                layer_idx = next((int(parts[i+1]) for i, part in enumerate(parts) if part == "layers" and i+1 < len(parts)), None)
+                expert_idx = next((int(parts[i+1]) for i, part in enumerate(parts) if part == "experts" and i+1 < len(parts)), None)
                 
                 if layer_idx is not None and expert_idx is not None:
-                    if layer_idx not in expert_keys:
-                        expert_keys[layer_idx] = set()
-                    expert_keys[layer_idx].add(expert_idx)
+                    expert_keys.setdefault(layer_idx, set()).add(expert_idx)
         
-        # Map individual expert weights to SwitchGLU format
         for layer_idx, expert_indices in expert_keys.items():
             prefix = f"model.layers.{layer_idx}"
             expert_indices = sorted(expert_indices)
             
-            # Handle the three projection types
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                # Handle weights
-                to_join_weights = []
-                for e in expert_indices:
-                    key = f"{prefix}.mlp.experts.{e}.{n}.weight"
-                    if key in sanitized_weights:
-                        to_join_weights.append(sanitized_weights.pop(key))
-                if to_join_weights:
-                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join_weights)
-                
-                # Handle biases if they exist
-                to_join_biases = []
-                for e in expert_indices:
-                    key = f"{prefix}.mlp.experts.{e}.{n}.bias"
-                    if key in sanitized_weights:
-                        to_join_biases.append(sanitized_weights.pop(key))
-                if to_join_biases:
-                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.bias"] = mx.stack(to_join_biases)
-                
-                # Handle scales if they exist (for quantization)
-                to_join_scales = []
-                for e in expert_indices:
-                    key = f"{prefix}.mlp.experts.{e}.{n}.scales"
-                    if key in sanitized_weights:
-                        to_join_scales.append(sanitized_weights.pop(key))
-                if to_join_scales:
-                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.scales"] = mx.stack(to_join_scales)
-                
-                # Handle biases for scales if they exist (for quantization)
-                to_join_biases_scales = []
-                for e in expert_indices:
-                    key = f"{prefix}.mlp.experts.{e}.{n}.biases"
-                    if key in sanitized_weights:
-                        to_join_biases_scales.append(sanitized_weights.pop(key))
-                if to_join_biases_scales:
-                    sanitized_weights[f"{prefix}.mlp.switch_mlp.{n}.biases"] = mx.stack(to_join_biases_scales)
+            for proj_type in ["up_proj", "down_proj", "gate_proj"]:
+                for weight_type in ["weight", "bias", "scales", "biases"]:
+                    weights_to_join = [
+                        sanitized_weights.pop(f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}")
+                        for e in expert_indices
+                        if f"{prefix}.mlp.experts.{e}.{proj_type}.{weight_type}" in sanitized_weights
+                    ]
+                    
+                    if weights_to_join:
+                        sanitized_weights[f"{prefix}.mlp.switch_mlp.{proj_type}.{weight_type}"] = mx.stack(weights_to_join)
         
         return sanitized_weights
