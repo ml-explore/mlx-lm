@@ -43,8 +43,8 @@ class ModelArgs(llama.ModelArgs):
             raise ValueError("`no_rope_layers` length mismatch")
 
 
-class _IdentityRoPE(nn.Module):
-    """A no-op replacement for layers that use *NoPE*."""
+class NoPE(nn.Module):
+    """No-op RoPE used to disable rotary embeddings in selected layers."""
 
     def __call__(self, x, offset: int = 0):  # noqa: D401, D403
         return x
@@ -66,7 +66,7 @@ class Model(nn.Module):
         # ------------------------------------------------------------------
         # Patch rotary embeddings for layers that opt-out (NoPE)
         # ------------------------------------------------------------------
-        identity_rope = _IdentityRoPE()
+        identity_rope = NoPE()
         for idx, use_rope in enumerate(args.no_rope_layers):
             if not use_rope:
                 # Navigate to the attention module inside the layer and swap
