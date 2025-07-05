@@ -164,6 +164,7 @@ def load_model(
     config = load_config(model_path)
     config.update(model_config)
 
+
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files:
@@ -203,6 +204,13 @@ def load_model(
             bits=quantization["bits"],
             class_predicate=class_predicate,
         )
+    elif (quantization_config := config.get("quantization_config", None)) is not None:
+        # Handle legacy quantization config
+        quantization_method = quantization_config.get("quant_method")
+        if quantization_method == "bitnet":
+            from .models.bitlinear_layers import bitnet_quantize
+
+            model = bitnet_quantize(model, quantization_config)
 
     model.load_weights(list(weights.items()), strict=strict)
 
