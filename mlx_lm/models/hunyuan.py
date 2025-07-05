@@ -29,6 +29,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     use_cla: bool
     cla_share_factor: 2
+    moe_intermediate_size: Optional[Union[int, list]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
 
@@ -154,20 +155,36 @@ class Gate(nn.Module):
 
 
 class MoeBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int = 0):
         super().__init__()
         dim = args.hidden_size
         intermediate_size = args.intermediate_size
         self.use_shared_mlp = args.use_mixed_mlp_moe
 
         if args.use_mixed_mlp_moe:
-            self.shared_mlp = MLP(dim, intermediate_size * args.num_shared_expert)
+            num_shared = args.num_shared_expert
+            if isinstance(num_shared, list):
+                num_shared = num_shared[layer_idx]
+            self.shared_mlp = MLP(dim, int(intermediate_size * num_shared))
 
         self.num_experts = num_experts = args.num_experts
-        self.top_k = args.moe_topk
+        top_k = args.moe_topk
+        if isinstance(top_k, list):
+            top_k = top_k[layer_idx]
+        self.top_k = top_k
 
         self.gate = Gate(dim, num_experts)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+
+        # Use moe_intermediate_size if available, otherwise use intermediate_size
+        expert_intermediate_size = intermediate_size
+        if hasattr(args, 'moe_intermediate_size') and args.moe_intermediate_size is not None:
+            moe_intermediate = args.moe_intermediate_size
+            if isinstance(moe_intermediate, list):
+                expert_intermediate_size = moe_intermediate[layer_idx]
+            else:
+                expert_intermediate_size = moe_intermediate
+
+        self.switch_mlp = SwitchGLU(dim, expert_intermediate_size, num_experts)
 
     def __call__(
         self,
@@ -191,14 +208,14 @@ class MoeBlock(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, kv_proj: bool):
+    def __init__(self, args: ModelArgs, kv_proj: bool, layer_idx: int = 0):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(kv_proj, args)
         if args.num_experts == 1:
             self.mlp = MLP(args.hidden_size, args.intermediate_size)
         else:
-            self.mlp = MoeBlock(args)
+            self.mlp = MoeBlock(args, layer_idx)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -234,6 +251,7 @@ class HunYuanModel(nn.Module):
             DecoderLayer(
                 args=args,
                 kv_proj=(not args.use_cla) or (i % args.cla_share_factor) == 0,
+                layer_idx=i,
             )
             for i in range(args.num_hidden_layers)
         ]
