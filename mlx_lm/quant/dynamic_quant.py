@@ -11,6 +11,8 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 
+from mlx_lm.tuner.losses import kl_div_loss
+from mlx_lm.tuner.trainer import grad_checkpoint
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     compute_bits_per_weight,
@@ -42,17 +44,17 @@ def estimate_sensitivities(
     low_group_size,
     high_bits,
     high_group_size,
+    batch_size: int = 4,
+    gradient_accum_dtype: mx.Dtype = mx.float32,
+    gradient_checkpoint: bool = False,
 ):
-    batch_size = 4
-    layers = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
-    layers = {k: l for k, l in layers if hasattr(l, "to_quantized")}
-
-    q_model = copy.deepcopy(model)
-
     def qdq(w, bits, group_size):
         w, s, b = mx.quantize(w, bits=bits, group_size=group_size)
         return mx.dequantize(w, scales=s, biases=b, bits=bits, group_size=group_size)
 
+    layers = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+    layers = {k: l for k, l in layers if hasattr(l, "to_quantized")}
+    q_model = copy.deepcopy(model)
     q_layers = copy.deepcopy(layers)
     for l in q_layers.values():
         l.weight = qdq(l.weight, low_bits, low_group_size)
@@ -62,25 +64,27 @@ def estimate_sensitivities(
     q_model.freeze()
     q_model.update_modules(tree_unflatten(list(q_layers.items())))
 
-    def log_norm(x):
-        x = x.astype(mx.float32)
-        return x - mx.logsumexp(x, axis=-1, keepdims=True)
-
     def loss_fn(batch, targets):
-        logprobs = log_norm(q_model(batch))
-        return nn.losses.kl_div_loss(logprobs, targets, reduction="mean")
+        return kl_div_loss(q_model(batch), targets).mean()
 
-    grad_accum = tree_map(lambda x: mx.zeros(x.shape), q_model.trainable_parameters())
+    if gradient_checkpoint:
+        grad_checkpoint(q_model.layers[0])
+
+    grad_accum = tree_map(
+        lambda x: mx.zeros(x.shape, dtype=gradient_accum_dtype),
+        q_model.trainable_parameters()
+    )
     for e, s in tqdm(
         enumerate(range(0, len(data), batch_size)),
         total=len(data) // batch_size,
         desc="Estimating sensitivities",
     ):
         batch = data[s : s + batch_size]
-        targets = log_norm(model(batch))
+        targets = model(batch)
         mx.eval(targets)
         _, grads = nn.value_and_grad(q_model, loss_fn)(batch, targets)
         grad_accum = tree_map(lambda x, y: x + y, grad_accum, grads)
+        del grads
         mx.eval(grad_accum)
 
     def compute_sensitivity(gradient, low_q_weight, original_weight):
@@ -169,7 +173,17 @@ def main():
         action="store_true",
         help="Compute the perplexity of the base and quantized models.",
     )
-
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Use gradient checkpointing to reduce memory use.",
+    )
+    parser.add_argument(
+        "--accumulation-dtype",
+        default="float32",
+        choices=["float32", "bfloat16"],
+        help="What type to use to accumulate the gradients for the sensitivities"
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -186,6 +200,8 @@ def main():
             args.low_group_size,
             args.high_bits,
             args.high_group_size,
+            gradient_accum_dtype=getattr(mx, args.accumulation_dtype),
+            gradient_checkpoint=args.grad_checkpoint,
         )
         model_name = args.model.replace("/", "_")
         with open(f"{model_name}_sensitivities.json", "w") as fid:
@@ -241,6 +257,7 @@ def main():
         config,
         hf_repo=hf_repo,
     )
+    print(f"Peak memory used: {mx.get_peak_memory() / 1000**3:.3f}GB")
 
 
 if __name__ == "__main__":

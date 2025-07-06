@@ -348,7 +348,7 @@ def _kl_div_loss(logits_q, logits_p):
     )[0]
 
 
-@kl_div_loss.vjp
+@_kl_div_loss.vjp
 def _kl_div_loss(primals, cotangent, output):
     logits_q, logits_p = primals
     dt = logits_q.dtype
