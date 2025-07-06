@@ -11,9 +11,9 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 
+from mlx_lm.quant.utils import load_data
 from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint
-from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     compute_bits_per_weight,
     fetch_from_hub,
@@ -72,7 +72,7 @@ def estimate_sensitivities(
 
     grad_accum = tree_map(
         lambda x: mx.zeros(x.shape, dtype=gradient_accum_dtype),
-        q_model.trainable_parameters()
+        q_model.trainable_parameters(),
     )
     for e, s in tqdm(
         enumerate(range(0, len(data), batch_size)),
@@ -182,7 +182,7 @@ def main():
         "--accumulation-dtype",
         default="float32",
         choices=["float32", "bfloat16"],
-        help="What type to use to accumulate the gradients for the sensitivities"
+        help="What type to use to accumulate the gradients for the sensitivities",
     )
     args = parser.parse_args()
 
