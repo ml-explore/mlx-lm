@@ -1082,6 +1082,23 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_smollm3(self):
+        from mlx_lm.models import smollm3
+
+        args = smollm3.ModelArgs(
+            model_type="smollm3",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+        )
+        model = smollm3.Model(args)
+        self.model_test_runner(
+            model, "smollm3", args.vocab_size, args.num_hidden_layers
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
