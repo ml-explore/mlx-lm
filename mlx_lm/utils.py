@@ -116,8 +116,12 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
 
         from huggingface_hub import ModelCard
 
-        card = ModelCard.load(model_path / "README.md")
-        hf_path = card.data.base_model
+        card_path = model_path / "README.md"
+        if card_path.is_file():
+            card = ModelCard.load(card_path)
+            hf_path = card.data.base_model
+        else:
+            hf_path = None
     return model_path, hf_path
 
 
