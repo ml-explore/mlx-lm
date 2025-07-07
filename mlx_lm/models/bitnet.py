@@ -112,7 +112,7 @@ class MLP(nn.Module):
         self.gate_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
         self.down_proj = BitLinear(hidden_dim, dim, bias=mlp_bias)
         self.up_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
-        
+
         self.ffn_sub_norm = nn.RMSNorm(args.intermediate_size, eps=args.rms_norm_eps)
 
     def __call__(self, x) -> mx.array:
