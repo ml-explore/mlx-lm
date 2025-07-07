@@ -53,12 +53,6 @@ class QuantizedSwitchLinear(nn.Module):
         # Freeze this model's parameters
         self.freeze()
 
-    def unfreeze(self, *args, **kwargs):
-        """Wrap unfreeze so that we unfreeze any layers we might contain but
-        our parameters will remain frozen."""
-        super().unfreeze(*args, **kwargs)
-        self.freeze(recurse=False)
-
     @property
     def input_dims(self):
         return self.scales.shape[2] * self.group_size
