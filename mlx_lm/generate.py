@@ -406,7 +406,7 @@ def generate_step(
         prompt_processed_tokens = 0
         while total_prompt_tokens - prompt_processed_tokens > prefill_step_size:
             _model_call(
-                input_tokens=(prompt[:prefill_step_size][None]),
+                input_tokens=prompt[:prefill_step_size][None],
                 input_embeddings=(
                     input_embeddings[:prefill_step_size][None]
                     if input_embeddings is not None
