@@ -41,6 +41,12 @@ class ModelArgs(BaseModelArgs):
                 raise ValueError(f"rope_scaling must contain keys {required_keys}")
 
 
+def _int_or_list(arg, idx):
+    if isinstance(arg, list):
+        return arg[idx]
+    return arg
+
+
 class DynamicNTKAlphaRoPE(nn.Module):
     def __init__(
         self,
@@ -162,27 +168,20 @@ class MoeBlock(nn.Module):
         self.use_shared_mlp = args.use_mixed_mlp_moe
 
         if args.use_mixed_mlp_moe:
-            num_shared = args.num_shared_expert
-            if isinstance(num_shared, list):
-                num_shared = num_shared[layer_idx]
+            num_shared = _int_or_list(args.num_shared_expert, layer_idx)
             self.shared_mlp = MLP(dim, int(intermediate_size * num_shared))
 
         self.num_experts = num_experts = args.num_experts
-        top_k = args.moe_topk
-        if isinstance(top_k, list):
-            top_k = top_k[layer_idx]
-        self.top_k = top_k
+        self.top_k = _int_or_list(args.moe_topk, layer_idx)
 
         self.gate = Gate(dim, num_experts)
 
         # Use moe_intermediate_size if available, otherwise use intermediate_size
         expert_intermediate_size = intermediate_size
         if args.moe_intermediate_size is not None:
-            moe_intermediate = args.moe_intermediate_size
-            if isinstance(moe_intermediate, list):
-                expert_intermediate_size = moe_intermediate[layer_idx]
-            else:
-                expert_intermediate_size = moe_intermediate
+            expert_intermediate_size = _int_or_list(
+                args.moe_intermediate_size, layer_idx
+            )
 
         self.switch_mlp = SwitchGLU(dim, expert_intermediate_size, num_experts)
 
