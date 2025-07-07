@@ -177,7 +177,7 @@ class MoeBlock(nn.Module):
 
         # Use moe_intermediate_size if available, otherwise use intermediate_size
         expert_intermediate_size = intermediate_size
-        if hasattr(args, 'moe_intermediate_size') and args.moe_intermediate_size is not None:
+        if args.moe_intermediate_size is not None:
             moe_intermediate = args.moe_intermediate_size
             if isinstance(moe_intermediate, list):
                 expert_intermediate_size = moe_intermediate[layer_idx]
