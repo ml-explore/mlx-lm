@@ -56,12 +56,6 @@ def mixed_quant_predicate_builder(
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
         By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
         """
-
-        if not hasattr(module, "to_quantized"):
-            return False
-        if module.weight.shape[1] % group_size != 0:
-            return False
-
         index = (
             int(path.split(".")[layer_location])
             if len(path.split(".")) > layer_location
@@ -117,16 +111,8 @@ def convert(
     model_path, hf_path = get_model_path(hf_path, revision=revision)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
-    def base_quant_predicate(path, module, config):
-        if not hasattr(module, "to_quantized"):
-            return False
-        if module.weight.shape[1] % q_group_size != 0:
-            return False
-        return True
-
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
-    quant_predicate = quant_predicate or base_quant_predicate
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)

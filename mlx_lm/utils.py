@@ -194,7 +194,6 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
         nn.quantize(
@@ -460,9 +459,18 @@ def quantize_model(
     quantized_config = copy.deepcopy(config)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
+    def base_predicate(path, module):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if module.weight.shape[-1] % q_group_size != 0:
+            return False
+        return True
+
     # Add any custom quantization parameters to the config as we go
-    def _class_predicate(p, m):
-        bool_or_params = quant_predicate(p, m, config)
+    def wrapped_predicate(p, m):
+        bool_or_params = base_predicate(p, m)
+        if bool_or_params:
+            bool_or_params = quant_predicate(p, m, config)
         quantized_config["quantization"][p] = bool_or_params
         return bool_or_params
 
@@ -470,7 +478,7 @@ def quantize_model(
         model,
         q_group_size,
         q_bits,
-        class_predicate=_class_predicate if quant_predicate else None,
+        class_predicate=wrapped_predicate if quant_predicate else base_predicate,
     )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
