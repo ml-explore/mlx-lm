@@ -329,16 +329,18 @@ def generate_step(
            when ``kv_bits`` is non-None. Default: ``0``.
         prompt_progress_callback (Callable[int, int]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
-        input_embeddings (mx.array, optional): Input embeddings to use in place of
-           or in conjunction with prompt tokens. Default: ``None``.
+        input_embeddings (mx.array, optional): Input embeddings to use in conjunction
+           with prompt tokens. Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
     """
+    if len(prompt) == 0:
+        raise ValueError("Prompt must be non-empty.")
     if input_embeddings is not None:
         if not does_model_support_input_embeddings(model):
             raise ValueError("Model does not support input embeddings.")
-        elif len(prompt) != 0 and prompt.shape[0] != input_embeddings.shape[0]:
+        elif prompt.shape[0] != input_embeddings.shape[0]:
             raise ValueError(
                 "If using input embeddings, the sequence length must match that of the prompt."
             )
@@ -384,7 +386,7 @@ def generate_step(
 
             logits = logits[:, -1, :]
 
-            if logits_processors and len(input_tokens) > 0:
+            if logits_processors:
                 tokens = (
                     mx.concat([tokens, input_tokens])
                     if tokens is not None
@@ -400,15 +402,11 @@ def generate_step(
             return sampled, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
-        total_prompt_tokens = (
-            prompt.shape[0] if len(prompt) > 0 else input_embeddings.shape[0]
-        )
+        total_prompt_tokens = prompt.shape[0]
         prompt_processed_tokens = 0
         while total_prompt_tokens - prompt_processed_tokens > prefill_step_size:
             _model_call(
-                input_tokens=(
-                    prompt[:prefill_step_size][None] if len(prompt) > 0 else prompt
-                ),
+                input_tokens=(prompt[:prefill_step_size][None]),
                 input_embeddings=(
                     input_embeddings[:prefill_step_size][None]
                     if input_embeddings is not None
