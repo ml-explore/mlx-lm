@@ -574,7 +574,6 @@ class FalconH1Mixer(nn.Module):
         # 3. SSM transformation
         A = -mx.exp(self.A_log)  # [num_heads]
 
-        # print(A.dtype, dt.dtype, B.dtype, C.dtype)
 
         if use_precomputed_states:
             # Single token generation path
