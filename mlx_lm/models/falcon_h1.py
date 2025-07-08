@@ -1,12 +1,13 @@
-import inspect
+
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
+from .cache import Mamba2Cache
 
 
 @dataclass
@@ -71,9 +72,6 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int = 32784
 
 
-# ========================================
-# RMSNorm Gated
-# ========================================
 class FalconH1RMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, n_groups=1, norm_before_gate=True):
         super().__init__()
@@ -140,131 +138,6 @@ def compute_mup_vector(args):
         :, :, 2 * intermediate_size + 2 * groups_time_state_size :
     ] *= zxbcdt_multipliers[4]
     return mup_vector
-
-
-
-
-class Mamba2Cache:
-    """
-    Arguments:
-        args: Mamba2args
-        batch_size: int
-
-    Attributes:
-        conv_kernel_size: (`int`):
-            Model's convolution kernel size taken from args.
-        n_groups: (`int`):
-            Model's number of groups taken from the args - similar to tensor parallel in Transformer.
-        state_size: (`int`):
-            Model's SSM state size taken from args.
-        num_heads: (`int`):
-            The number of heads used in the linear attention / SSM.
-        head_dim: (`int`):
-            The respective dimension of the heads used in the linear attention / SSM.
-        intermediate_size: (`int`):
-            Model's intermediate_size based on (expand * hidden_dim) from args.
-        conv_states: (`dict`):
-            A dict of tensors that holds convolutional states.
-        ssm_states: (`dict`):
-            A dict of tensors that holds ssm states.
-    """
-
-    def __init__(
-        self,
-        args,
-        batch_size: int = 1,
-    ):
-        self.seqlen_offset = 0
-        self.has_previous_state = False
-        self.conv_kernel_size = args.mamba_d_conv
-
-        self._seen_tokens = 0
-
-        self.intermediate_size = (
-            args.mamba_d_ssm
-            if args.mamba_d_ssm is not None
-            else int(args.mamba_expand * args.hidden_size)
-        )
-
-        self.conv_states = {}
-        self.ssm_states = {}
-
-        for i in range(args.num_hidden_layers):
-            self.conv_states[i] = mx.zeros(
-                (
-                    batch_size,
-                    self.intermediate_size
-                    + 2 * args.mamba_n_groups * args.mamba_d_state,
-                    self.conv_kernel_size,
-                )
-            )
-            self.ssm_states[i] = mx.zeros(
-                (batch_size, args.mamba_n_heads, args.mamba_d_head, args.mamba_d_state)
-            )
-
-        self.transformer_layers = []
-        for i in range(args.num_hidden_layers):
-            self.transformer_layers.append(i)
-
-        self.key_cache: List[mx.array] = []
-        self.value_cache: List[mx.array] = []
-
-    def update(
-        self,
-        key_states: mx.array,
-        value_states: mx.array,
-        layer_idx: int,
-    ) -> Tuple[mx.array, mx.array]:
-        # Update the number of seen tokens
-        if layer_idx == 0:
-            self._seen_tokens += key_states.shape[-2]
-
-        # Update the cache
-        if len(self.key_cache) <= layer_idx:
-            # There may be skipped layers, fill them with empty lists
-            for _ in range(len(self.key_cache), layer_idx):
-                self.key_cache.append([])
-                self.value_cache.append([])
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
-        elif (
-            len(self.key_cache[layer_idx]) == 0
-        ):  # fills previously skipped layers; checking for tensor causes errors
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
-        else:
-            self.key_cache[layer_idx] = mx.concatenate(
-                [self.key_cache[layer_idx], key_states], axis=-2
-            )
-            self.value_cache[layer_idx] = mx.concatenate(
-                [self.value_cache[layer_idx], value_states], axis=-2
-            )
-
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
-    def update_conv_state(
-        self,
-        layer_idx: int,
-        new_conv_state: mx.array,
-        cache_position: mx.array,
-    ) -> mx.array:
-        conv_state = self.conv_states[layer_idx]
-        cache_position = mx.clip(cache_position, 0, self.conv_kernel_size - 1)
-
-        conv_state = mx.roll(conv_state, shift=-1, axis=-1)
-
-        if len(cache_position) > 1:
-            conv_state[:, :, :] = new_conv_state.transpose(0, 2, 1)
-        else:
-            conv_state[:, :, -1] = new_conv_state[:, :, -1]
-
-        self.conv_states[layer_idx] = conv_state
-        return self.conv_states[layer_idx]
-
-    def reset(self):
-        for i in range(len(self.conv_states)):
-            self.conv_states[i] = mx.zeros_like(self.conv_states[i])
-            self.ssm_states[i] = mx.zeros_like(self.ssm_states[i])
 
 
 
@@ -422,7 +295,6 @@ def segment_sum(input_tensor):
 
     return tensor_segsum
 
-
 class FalconH1Mixer(nn.Module):
     def __init__(self, args, layer_idx: int, mup_vector: mx.array):
         super().__init__()
@@ -493,9 +365,6 @@ class FalconH1Mixer(nn.Module):
 
     def __call__(self, input_states, cache=None, mask=None, cache_position=None):
         batch_size, seq_len, _ = input_states.shape
-
-        if mask is not None:
-            mask = mask[:1, ...]  # only take the first token
         input_states = apply_mask_to_padding_states(input_states, mask)
 
         # Add Multipliers

@@ -1,6 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -436,6 +436,115 @@ class MambaCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.cache = v
+
+class Mamba2Cache(_BaseCache):
+    def __init__(
+        self,
+        args,
+        batch_size: int = 1,
+    ):
+        self.seqlen_offset = 0
+        self.has_previous_state = False
+        self.conv_kernel_size = args.mamba_d_conv
+
+        self._seen_tokens = 0
+
+        self.intermediate_size = (
+            args.mamba_d_ssm
+            if args.mamba_d_ssm is not None
+            else int(args.mamba_expand * args.hidden_size)
+        )
+
+        self.conv_states = {}
+        self.ssm_states = {}
+
+        for i in range(args.num_hidden_layers):
+            self.conv_states[i] = mx.zeros(
+                (
+                    batch_size,
+                    self.intermediate_size
+                    + 2 * args.mamba_n_groups * args.mamba_d_state,
+                    self.conv_kernel_size,
+                )
+            )
+            self.ssm_states[i] = mx.zeros(
+                (batch_size, args.mamba_n_heads, args.mamba_d_head, args.mamba_d_state)
+            )
+
+        self.transformer_layers = []
+        for i in range(args.num_hidden_layers):
+            self.transformer_layers.append(i)
+
+        self.key_cache: List[mx.array] = []
+        self.value_cache: List[mx.array] = []
+
+    def update(
+        self,
+        key_states: mx.array,
+        value_states: mx.array,
+        layer_idx: int,
+    ) -> Tuple[mx.array, mx.array]:
+        # Update the number of seen tokens
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+
+        # Update the cache
+        if len(self.key_cache) <= layer_idx:
+            # There may be skipped layers, fill them with empty lists
+            for _ in range(len(self.key_cache), layer_idx):
+                self.key_cache.append([])
+                self.value_cache.append([])
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        elif (
+            len(self.key_cache[layer_idx]) == 0
+        ):  # fills previously skipped layers; checking for tensor causes errors
+            self.key_cache[layer_idx] = key_states
+            self.value_cache[layer_idx] = value_states
+        else:
+            self.key_cache[layer_idx] = mx.concatenate(
+                [self.key_cache[layer_idx], key_states], axis=-2
+            )
+            self.value_cache[layer_idx] = mx.concatenate(
+                [self.value_cache[layer_idx], value_states], axis=-2
+            )
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def update_conv_state(
+        self,
+        layer_idx: int,
+        new_conv_state: mx.array,
+        cache_position: mx.array,
+    ) -> mx.array:
+        conv_state = self.conv_states[layer_idx]
+        cache_position = mx.clip(cache_position, 0, self.conv_kernel_size - 1)
+
+        conv_state = mx.roll(conv_state, shift=-1)
+
+        if len(cache_position) > 1:
+            conv_state[:, :, :] = new_conv_state
+        else:
+            conv_state[:, :, -1] = new_conv_state[:, :, -1]
+
+        self.conv_states[layer_idx] = conv_state
+        return self.conv_states[layer_idx]
+
+    def reset(self):
+        for i in range(len(self.conv_states)):
+            self.conv_states[i] = mx.zeros_like(self.conv_states[i])
+            self.ssm_states[i] = mx.zeros_like(self.ssm_states[i])
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.seqlen_offset, n)
+        self.seqlen_offset -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        raise NotImplementedError("Mamba2Cache Quantization NYI")
 
 
 class ChunkedKVCache(KVCache):
