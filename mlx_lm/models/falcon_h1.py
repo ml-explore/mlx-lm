@@ -83,23 +83,17 @@ class FalconH1RMSNormGated(nn.Module):
         self.norm_before_gate = norm_before_gate
 
     def __call__(self, hidden_states, gate=None):
-        input_dtype = hidden_states.dtype
-
         if not self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate.astype(mx.float16))
+            hidden_states = hidden_states * nn.silu(gate)
 
         hidden_states = mx.fast.rms_norm(
             hidden_states, self.weight, self.variance_epsilon
         )
 
         if self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate.astype(mx.float16))
-        return hidden_states.astype(input_dtype)
+            hidden_states = hidden_states * nn.silu(gate)
+        return hidden_states
 
-
-# ========================================
-# Compute MuP Vector
-# ========================================
 
 
 def compute_mup_vector(args):
@@ -148,9 +142,6 @@ def compute_mup_vector(args):
     return mup_vector
 
 
-# ========================================
-# Mamba2 Cache
-# ========================================
 
 
 class Mamba2Cache:
@@ -276,10 +267,6 @@ class Mamba2Cache:
             self.ssm_states[i] = mx.zeros_like(self.ssm_states[i])
 
 
-# ========================================
-# Attention Components
-# ========================================
-
 
 class FalconH1Attention(nn.Module):
     """Multi-head attention component"""
@@ -333,10 +320,8 @@ class FalconH1Attention(nn.Module):
         keys = self.k_proj(x)
         values = self.v_proj(x)
 
-        keys = keys * self.key_multiplier
-
         queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3) * self.key_multiplier
         values = values.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
@@ -371,17 +356,13 @@ class FalconH1Attention(nn.Module):
 
                     mask = mx.concatenate([padding, mask], axis=-1)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, mask=mask, scale=self.scale
+        output = scaled_dot_product_attention(
+            queries, keys, values, mask=mask, scale=self.scale, cache=cache
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output)
 
-
-# ========================================
-# Hybrid Mixer Block
-# ========================================
 
 
 def apply_mask_to_padding_states(input_states, attention_mask):
@@ -443,7 +424,7 @@ def segment_sum(input_tensor):
 
 
 class FalconH1Mixer(nn.Module):
-    def __init__(self, args, layer_idx: int, mup_vector: mx.array, batch_size: int = 1):
+    def __init__(self, args, layer_idx: int):
         super().__init__()
         self.num_heads = args.mamba_n_heads
         self.hidden_size = args.hidden_size
@@ -488,7 +469,7 @@ class FalconH1Mixer(nn.Module):
 
         self.dt_bias = mx.ones(self.num_heads)
 
-        A = mx.arange(1, self.num_heads + 1, dtype=mx.float32)
+        A = mx.arange(1, self.num_heads + 1)
         self.A_log = mx.log(A)
 
         self.mamba_rms_norm = args.mamba_rms_norm
@@ -508,21 +489,20 @@ class FalconH1Mixer(nn.Module):
         self.use_bias = args.projectors_bias
 
         self.ssm_in_multiplier = args.ssm_in_multiplier
-        self._mup_vector = mup_vector
+        self._mup_vector = compute_mup_vector(args)
 
     def __call__(self, input_states, cache=None, mask=None, cache_position=None):
         batch_size, seq_len, _ = input_states.shape
-        dtype = input_states.dtype
 
         if mask is not None:
             mask = mask[:1, ...]  # only take the first token
-
         input_states = apply_mask_to_padding_states(input_states, mask)
 
         # Add Multipliers
         input_states = input_states * self.ssm_in_multiplier
         projected_states = self.in_proj(input_states)
-        projected_states = projected_states * self._mup_vector
+
+        projected_states = (projected_states * self._mup_vector).astype(projected_states.dtype)
 
         # Split projected states
         gate = projected_states[..., : self.intermediate_size]
@@ -530,6 +510,7 @@ class FalconH1Mixer(nn.Module):
             ..., self.intermediate_size : self.intermediate_size + self.conv_dim
         ]
         dt = projected_states[..., self.intermediate_size + self.conv_dim :]
+
 
         use_precomputed_states = (
             cache is not None
@@ -591,7 +572,7 @@ class FalconH1Mixer(nn.Module):
         ]
 
         # 3. SSM transformation
-        A = -mx.exp(self.A_log.astype(mx.float32))  # [num_heads]
+        A = -mx.exp(self.A_log)  # [num_heads]
 
         if use_precomputed_states:
             # Single token generation path
@@ -603,14 +584,14 @@ class FalconH1Mixer(nn.Module):
             dt_bias = mx.expand_dims(self.dt_bias, axis=-1)
             dt_bias = mx.broadcast_to(dt_bias, (self.dt_bias.shape[0], self.head_dim))
 
-            dt = nn.softplus(dt + dt_bias.astype(dt.dtype))
+            dt = nn.softplus(dt + dt_bias)
             dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
             # Expand A
             A = mx.expand_dims(mx.expand_dims(A, axis=-1), axis=-1)
             A = mx.broadcast_to(
                 A, (self.num_heads, self.head_dim, self.ssm_state_size)
-            ).astype(mx.float32)
+            )
 
             # Discretize A
             dA = mx.exp(mx.expand_dims(dt, axis=-1) * A)
@@ -654,7 +635,7 @@ class FalconH1Mixer(nn.Module):
             )
             C = mx.reshape(C, (batch_size, -1, C.shape[-1]))
 
-            ssm_states = cache.ssm_states[self.layer_idx].astype(C.dtype)
+            ssm_states = cache.ssm_states[self.layer_idx]
 
             # Reshape for batch matrix multiplication
             ssm_states_reshaped = mx.reshape(
@@ -683,13 +664,9 @@ class FalconH1Mixer(nn.Module):
             dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
             hidden_states = mx.reshape(
                 hidden_states, (batch_size, seq_len, -1, self.head_dim)
-            ).astype(mx.float32)
-            B = mx.reshape(B, (batch_size, seq_len, -1, self.ssm_state_size)).astype(
-                mx.float32
             )
-            C = mx.reshape(C, (batch_size, seq_len, -1, self.ssm_state_size)).astype(
-                mx.float32
-            )
+            B = mx.reshape(B, (batch_size, seq_len, -1, self.ssm_state_size))
+            C = mx.reshape(C, (batch_size, seq_len, -1, self.ssm_state_size))
 
             # Repeat B and C for multiple heads
             B = mx.repeat(B, self.num_heads // self.n_groups, axis=2)
@@ -703,7 +680,7 @@ class FalconH1Mixer(nn.Module):
 
             # Discretize x and A
             hidden_states = hidden_states * mx.expand_dims(dt, axis=-1)
-            A = A.astype(hidden_states.dtype) * dt
+            A = A * dt
 
             # Rearrange into blocks/chunks
             hidden_states = reshape_into_chunks(
@@ -812,13 +789,12 @@ class FalconH1Mixer(nn.Module):
         else:
             scan_output = y * nn.silu(gate)
 
-        # 4. Final linear projection
-        contextualized_states = self.out_proj(scan_output.astype(dtype))
+        contextualized_states = self.out_proj(scan_output)
         return contextualized_states
 
 
 class FalconH1DecoderLayer(nn.Module):
-    def __init__(self, args, layer_idx: int, mup_vector: mx.array):
+    def __init__(self, args, layer_idx: int):
         super().__init__()
         self.feed_forward = FalconH1MLP(args)
 
@@ -829,7 +805,7 @@ class FalconH1DecoderLayer(nn.Module):
         )
 
         self.mamba = FalconH1Mixer(
-            args=args, layer_idx=layer_idx, mup_vector=mup_vector
+            args=args, layer_idx=layer_idx
         )
 
         self.self_attn = FalconH1Attention(args, layer_idx)
@@ -883,11 +859,6 @@ class FalconH1DecoderLayer(nn.Module):
         return hidden_states
 
 
-# ========================================
-# MLP Component
-# ========================================
-
-
 class FalconH1MLP(nn.Module):
     """Feed-forward network"""
 
@@ -900,19 +871,12 @@ class FalconH1MLP(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=args.mlp_bias)
-
-        # Add MLP multipliers
         self.gate_multiplier, self.down_multiplier = args.mlp_multipliers
 
     def __call__(self, x):
         y = self.up_proj(x) * nn.silu(self.gate_proj(x) * self.gate_multiplier)
         y = self.down_proj(y) * self.down_multiplier
         return y
-
-
-# ========================================
-# Main Model
-# ========================================
 
 
 class FalconH1Model(nn.Module):
@@ -925,19 +889,15 @@ class FalconH1Model(nn.Module):
         self.vocab_size = args.vocab_size
         self.hidden_size = args.hidden_size
 
-        # Embeddings
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_size)
 
-        # Transformer layers
-        mup_vector = compute_mup_vector(args)
+
         self.layers = [
-            FalconH1DecoderLayer(args, layer_idx=layer_idx, mup_vector=mup_vector)
+            FalconH1DecoderLayer(args, layer_idx=layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
-
-        # Final norm
         self.final_layernorm = nn.RMSNorm(
-            self.hidden_size, eps=getattr(args, "rms_norm_eps", 1e-5)
+            self.hidden_size, eps=args.rms_norm_eps
         )
 
     def __call__(self, inputs, mask=None, cache=None):
@@ -952,7 +912,7 @@ class FalconH1Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        cache_position = mx.arange(h.shape[1], dtype=mx.int32)
+        cache_position = mx.arange(h.shape[1])
 
         if h.shape[1] == 1 and cache is not None and cache[0] is not None:
             prev_seqlen = cache[0].key_cache[0].shape[-2]
