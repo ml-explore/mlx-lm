@@ -38,12 +38,6 @@ def quantize(w, bits, scales, biases):
     return w.flatten(-2, -1)
 
 
-def qdq(w, bits, scales, biases):
-    n_bins = 2**bits - 1
-    q = mx.clip(mx.round((w - biases) / scales), 0.0, n_bins)
-    return scales * q + biases
-
-
 class Catcher(nn.Module):
     def __init__(self, module):
         super().__init__()
@@ -82,8 +76,6 @@ def gptq_quantize(
         model(batch)
         mx.eval(layers)
 
-    blocksize = 128
-
     def compute_inverse_hessian(H):
         with mx.stream(mx.cpu):
             damp = 1e-2 * mx.mean(mx.diag(H))
@@ -94,12 +86,18 @@ def gptq_quantize(
             Hinv = mx.linalg.cholesky(H, upper=True)
             return Hinv
 
+    @mx.compile
+    def gptq_error(w, d, scales, biases):
+        n_bins = 2**bits - 1
+        q = mx.clip(mx.round((w - biases) / scales), 0.0, n_bins)
+        q = scales * q + biases
+        return (w - q) / d
+
     for lid, (key, l) in tqdm(
         enumerate(layers),
         total=len(layers),
         desc="Quantizing",
     ):
-        # Compute inverse Hessian
         Hinv = compute_inverse_hessian(l.H)
         del l.H
         mx.eval(Hinv)
@@ -124,9 +122,8 @@ def gptq_quantize(
                 w = W[..., k : k + 1]
                 d = Hinv[k, k]
 
-                q = qdq(w, bits, scales, biases)
+                e = gptq_error(w, d, scales, biases)
 
-                e = (w - q) / d
                 W[..., k : k + j] -= e @ Hinv[k : k + 1, k : k + j]
                 err[..., k : k + 1] = e
                 mx.eval(err, W)
