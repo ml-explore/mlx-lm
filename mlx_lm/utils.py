@@ -141,7 +141,7 @@ def load_model(
     strict: bool = True,
     model_config: dict = {},
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
-) -> nn.Module:
+) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
 
@@ -159,7 +159,7 @@ def load_model(
             Defaults to the ``_get_classes`` function.
 
     Returns:
-        nn.Module: The loaded and initialized model.
+        Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
