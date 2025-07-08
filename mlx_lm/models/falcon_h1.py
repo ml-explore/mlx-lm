@@ -424,7 +424,7 @@ def segment_sum(input_tensor):
 
 
 class FalconH1Mixer(nn.Module):
-    def __init__(self, args, layer_idx: int):
+    def __init__(self, args, layer_idx: int, mup_vector: mx.array):
         super().__init__()
         self.num_heads = args.mamba_n_heads
         self.hidden_size = args.hidden_size
@@ -489,7 +489,7 @@ class FalconH1Mixer(nn.Module):
         self.use_bias = args.projectors_bias
 
         self.ssm_in_multiplier = args.ssm_in_multiplier
-        self._mup_vector = compute_mup_vector(args)
+        self._mup_vector = mup_vector
 
     def __call__(self, input_states, cache=None, mask=None, cache_position=None):
         batch_size, seq_len, _ = input_states.shape
@@ -573,6 +573,8 @@ class FalconH1Mixer(nn.Module):
 
         # 3. SSM transformation
         A = -mx.exp(self.A_log)  # [num_heads]
+
+        # print(A.dtype, dt.dtype, B.dtype, C.dtype)
 
         if use_precomputed_states:
             # Single token generation path
@@ -794,7 +796,7 @@ class FalconH1Mixer(nn.Module):
 
 
 class FalconH1DecoderLayer(nn.Module):
-    def __init__(self, args, layer_idx: int):
+    def __init__(self, args, layer_idx: int, mup_vector: mx.array):
         super().__init__()
         self.feed_forward = FalconH1MLP(args)
 
@@ -804,8 +806,9 @@ class FalconH1DecoderLayer(nn.Module):
             + 2 * args.num_key_value_heads * head_dim
         )
 
+
         self.mamba = FalconH1Mixer(
-            args=args, layer_idx=layer_idx
+            args=args, layer_idx=layer_idx, mup_vector=mup_vector
         )
 
         self.self_attn = FalconH1Attention(args, layer_idx)
@@ -891,9 +894,9 @@ class FalconH1Model(nn.Module):
 
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_size)
 
-
+        mup_vector = compute_mup_vector(args)
         self.layers = [
-            FalconH1DecoderLayer(args, layer_idx=layer_idx)
+            FalconH1DecoderLayer(args, layer_idx=layer_idx, mup_vector=mup_vector)
             for layer_idx in range(args.num_hidden_layers)
         ]
         self.final_layernorm = nn.RMSNorm(
