@@ -113,7 +113,6 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
             )
         )
     else:
-
         from huggingface_hub import ModelCard
 
         card_path = model_path / "README.md"
@@ -267,11 +266,13 @@ def load(
 
 
 def fetch_from_hub(
-    model_path: Path, lazy: bool = False
+    model_path: Path, lazy: bool = False, trust_remote_code: bool = False
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model, config = load_model(model_path, lazy)
     tokenizer = load_tokenizer(
-        model_path, eos_token_ids=config.get("eos_token_id", None)
+        model_path,
+        eos_token_ids=config.get("eos_token_id", None),
+        tokenizer_config_extra={"trust_remote_code": trust_remote_code},
     )
     return model, config, tokenizer
 
