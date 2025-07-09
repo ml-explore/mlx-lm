@@ -79,7 +79,9 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def get_model_path(
+    path_or_hf_repo: str, revision: Optional[str] = None
+) -> Tuple[Path, Optional[str]]:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -449,7 +451,7 @@ def quantize_model(
     quant_predicate: Optional[
         Callable[[str, nn.Module, dict], Union[bool, dict]]
     ] = None,
-) -> Tuple:
+) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
 
