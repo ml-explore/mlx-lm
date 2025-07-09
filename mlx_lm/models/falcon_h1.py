@@ -294,7 +294,7 @@ class FalconH1Mixer(nn.Module):
         self.ssm_in_multiplier = args.ssm_in_multiplier
         self._mup_vector = mup_vector
 
-    def __call__(self, input_states, cache=None, mask=None):
+    def __call__(self, input_states, cache=None):
         batch_size, seq_len, _ = input_states.shape
 
         input_states = input_states * self.ssm_in_multiplier
@@ -337,74 +337,23 @@ class FalconH1Mixer(nn.Module):
         A = -mx.exp(self.A_log)
 
         if use_precomputed_states:
-            dt = dt[:, 0, :][:, None, ...]
-            dt = mx.transpose(dt, [0, 2, 1])
-            dt = mx.broadcast_to(dt, (batch_size, dt.shape[1], self.head_dim))
-
-            dt_bias = mx.expand_dims(self.dt_bias, axis=-1)
-            dt_bias = mx.broadcast_to(dt_bias, (self.dt_bias.shape[0], self.head_dim))
-
-            dt = nn.softplus(dt + dt_bias)
+            dt = (dt + self.dt_bias).squeeze(1)
+            dt = nn.softplus(dt)
             dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-
-            A = mx.expand_dims(mx.expand_dims(A, axis=-1), axis=-1)
-            A = mx.broadcast_to(A, (self.num_heads, self.head_dim, self.ssm_state_size))
-
-            dA = mx.exp(mx.expand_dims(dt, axis=-1) * A)
-
+            dA = mx.exp(dt * A)
             B = mx.reshape(B, (batch_size, self.n_groups, -1))
-            B = mx.expand_dims(B, axis=2)
-            B = mx.broadcast_to(
-                B,
-                (
-                    batch_size,
-                    self.n_groups,
-                    self.num_heads // self.n_groups,
-                    B.shape[-1],
-                ),
-            )
-            B = mx.reshape(B, (batch_size, -1, B.shape[-1]))
-
-            dB = mx.expand_dims(dt, axis=-1) * mx.expand_dims(B, axis=2)
-
+            dB = B * mx.expand_dims(dt, axis=-1)
             hidden_states = mx.reshape(hidden_states, (batch_size, -1, self.head_dim))
-            dBx = dB * mx.expand_dims(hidden_states, axis=-1)
+            dBx = mx.expand_dims(dB, axis=-2) * mx.expand_dims(hidden_states, axis=-1)
 
-            new_ssm_state = cache[1] * dA + dBx
-            cache[1] = new_ssm_state
+            ssm_state = cache[1] * mx.expand_dims(dA, axis=(2, 3)) + dBx
+            cache[1] = ssm_state
 
-            C = mx.reshape(C, (batch_size, self.n_groups, -1))
-            C = mx.expand_dims(C, axis=2)
-            C = mx.broadcast_to(
-                C,
-                (
-                    batch_size,
-                    self.n_groups,
-                    self.num_heads // self.n_groups,
-                    C.shape[-1],
-                ),
-            )
-            C = mx.reshape(C, (batch_size, -1, C.shape[-1]))
-
-            ssm_states = cache[1]
-
-            ssm_states_reshaped = mx.reshape(
-                ssm_states,
-                (batch_size * self.num_heads, self.head_dim, self.ssm_state_size),
-            )
-            C_reshaped = mx.reshape(
-                C, (batch_size * self.num_heads, self.ssm_state_size, 1)
-            )
-
-            y = ssm_states_reshaped @ C_reshaped
-            y = mx.reshape(y, (batch_size, self.num_heads, self.head_dim))
-
-            D = mx.expand_dims(self.D, axis=-1)
-            D = mx.broadcast_to(D, (self.D.shape[0], self.head_dim))
-            y = y + hidden_states * D
-
-            y = mx.reshape(y, (batch_size, -1))
-            y = mx.expand_dims(y, axis=1)
+            C = mx.reshape(C, (batch_size, self.n_groups, 1, -1, 1))
+            ssm_state = mx.expand_dims(ssm_state, axis=1)
+            y = mx.reshape(ssm_state @ C, (batch_size, self.num_heads, self.head_dim))
+            y = y + hidden_states * self.D[:, None]
+            y = mx.reshape(y, (batch_size, 1, -1))
         else:
             dt = nn.softplus(dt + self.dt_bias)
             dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
@@ -565,16 +514,12 @@ class FalconH1DecoderLayer(nn.Module):
         hidden_states: mx.array,
         cache,
         mask: mx.array,
-        mamba_mask: mx.array,
-        **kwargs,
     ) -> mx.array:
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        mamba_hidden_states = self.mamba(
-            input_states=hidden_states, cache=cache[0], mask=mamba_mask
-        )
+        mamba_hidden_states = self.mamba(input_states=hidden_states, cache=cache[0])
 
         attention_hidden_states = self.self_attn(
             hidden_states * self.attention_in_multiplier,
@@ -612,14 +557,6 @@ class FalconH1Model(nn.Module):
         ]
         self.final_layernorm = nn.RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
 
-    def _update_mamba_mask(self, attention_mask, cache):
-        mamba_mask = attention_mask
-        if (cache is not None and len(cache[0].key_cache) > 0) or (
-            attention_mask is not None and mx.all(attention_mask == 1)
-        ):
-            mamba_mask = None
-        return mamba_mask
-
     def __call__(self, inputs, mask=None, cache=None):
 
         h = self.embed_tokens(inputs)
@@ -633,15 +570,11 @@ class FalconH1Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        #        mamba_mask = self._update_mamba_mask(mask, cache)
-        mamba_mask = None  # self._update_mamba_mask(mask, cache)
-
         for layer, c in zip(self.layers, cache):
             h = layer(
                 h,
                 cache=c,
                 mask=mask,
-                mamba_mask=mamba_mask,
             )
 
         return self.final_layernorm(h)
