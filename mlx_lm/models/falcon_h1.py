@@ -168,24 +168,6 @@ class FalconH1Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        # TODO what's that about..
-        if mask is not None:
-            kv_seq_len = keys.shape[-2]
-
-            if mask.ndim == 2:
-                mask = mask[None, None, :, :]
-
-            if kv_seq_len > L:
-                if mask.shape[-1] < kv_seq_len:
-                    num_heads_dim = mask.shape[1] if mask.shape[1] > 1 else 1
-
-                    pad_length = kv_seq_len - mask.shape[-1]
-
-                    pad_shape = (B, num_heads_dim, L, pad_length)
-                    padding = mx.ones(pad_shape, dtype=mask.dtype)
-
-                    mask = mx.concatenate([padding, mask], axis=-1)
-
         output = scaled_dot_product_attention(
             queries, keys, values, mask=mask, scale=self.scale, cache=cache
         )
@@ -314,7 +296,6 @@ class FalconH1Mixer(nn.Module):
             conv_state, ssm_state = cache[0], cache[1]
         else:
             conv_state, ssm_state = None, None
-        use_precomputed_states = seq_len == 1 and conv_state is not None
 
         if conv_state is None:
             conv_state = mx.zeros(
@@ -336,7 +317,7 @@ class FalconH1Mixer(nn.Module):
 
         A = -mx.exp(self.A_log)
 
-        if use_precomputed_states:
+        if seq_len == 1 and cache is not None and cache[1] is not None:
             dt = (dt + self.dt_bias).squeeze(1)
             dt = nn.softplus(dt)
             dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
@@ -408,7 +389,7 @@ class FalconH1Mixer(nn.Module):
             hidden_states_expanded = mx.expand_dims(hidden_states, axis=-1)
             states = mx.sum(B_decay_expanded * hidden_states_expanded, axis=2)
 
-            if use_precomputed_states:
+            if cache is not None and cache[1] is not None:
                 previous_states = mx.expand_dims(cache[1], axis=1)
             else:
                 previous_states = mx.zeros_like(states[:, :1])
@@ -565,7 +546,7 @@ class FalconH1Model(nn.Module):
 
         if mask is None:
             c = [cache[0][1]] if cache is not None else None
-            mask = create_attention_mask(h, c, return_array=True)
+            mask = create_attention_mask(h, c, return_array=False)
 
         if cache is None:
             cache = [None] * len(self.layers)
