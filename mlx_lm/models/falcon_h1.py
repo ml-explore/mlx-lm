@@ -327,7 +327,7 @@ class FalconH1Mixer(nn.Module):
         self.ssm_in_multiplier = args.ssm_in_multiplier
         self._mup_vector = mup_vector
 
-    def __call__(self, input_states, cache=None, mask=None, cache_position=None):
+    def __call__(self, input_states, cache=None, mask=None):
         batch_size, seq_len, _ = input_states.shape
 
 
@@ -353,8 +353,8 @@ class FalconH1Mixer(nn.Module):
             and seq_len == 1
             and cache.conv_states[self.layer_idx].shape[0] == batch_size
             and cache.ssm_states[self.layer_idx].shape[0] == batch_size
-            and cache_position is not None
-            and cache_position[0] > 0
+            and cache is not None
+            and len(cache.key_cache) > 0
         )
 
         if use_precomputed_states:
@@ -612,7 +612,6 @@ class FalconH1DecoderLayer(nn.Module):
         cache: Mamba2Cache,
         mask: mx.array,
         mamba_mask: mx.array,
-        cache_position: mx.array,
         **kwargs,
     ) -> mx.array:
 
@@ -622,8 +621,7 @@ class FalconH1DecoderLayer(nn.Module):
         mamba_hidden_states = self.mamba(
             input_states=hidden_states,
             cache=cache,
-            mask=mamba_mask,
-            cache_position=cache_position,
+            mask=mamba_mask
         )
         mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
@@ -684,9 +682,9 @@ class FalconH1Model(nn.Module):
             self.hidden_size, eps=args.rms_norm_eps
         )
 
-    def _update_mamba_mask(self, attention_mask, cache_position):
+    def _update_mamba_mask(self, attention_mask, cache):
         mamba_mask = attention_mask
-        if cache_position[0] > 0 or (attention_mask is not None and mx.all(attention_mask == 1)):
+        if (cache is not None and len(cache[0].key_cache) > 0) or (attention_mask is not None and mx.all(attention_mask == 1)):
             mamba_mask = None
         return mamba_mask
 
@@ -699,16 +697,12 @@ class FalconH1Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        cache_position = mx.arange(h.shape[1])
 
-        if h.shape[1] == 1 and cache is not None and cache[0] is not None:
-            prev_seqlen = cache[0].key_cache[0].shape[-2]
-            cache_position = cache_position + prev_seqlen
 
         if mask is None:
             mask = create_attention_mask(h, cache, return_array=True)
 
-        mamba_mask = self._update_mamba_mask(mask, cache_position)
+        mamba_mask = self._update_mamba_mask(mask, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(
@@ -716,7 +710,6 @@ class FalconH1Model(nn.Module):
                 cache=c,
                 mask=mask,
                 mamba_mask=mamba_mask,
-                cache_position=cache_position,
             )
 
         return self.final_layernorm(h)
