@@ -447,7 +447,7 @@ class Mamba2Cache(_BaseCache):
         self.has_previous_state = False
         self.conv_kernel_size = args.mamba_d_conv
 
-        self._seen_tokens = 0
+        self.offset = 0
 
         self.intermediate_size = (
             args.mamba_d_ssm
@@ -486,7 +486,7 @@ class Mamba2Cache(_BaseCache):
     ) -> Tuple[mx.array, mx.array]:
         # Update the number of seen tokens
         if layer_idx == 0:
-            self._seen_tokens += key_states.shape[-2]
+            self.offset += key_states.shape[-2]
 
         # Update the cache
         if len(self.key_cache) <= layer_idx:
@@ -520,7 +520,7 @@ class Mamba2Cache(_BaseCache):
         conv_state = self.conv_states[layer_idx]
         cache_position = mx.clip(cache_position, 0, self.conv_kernel_size - 1)
 
-        conv_state = mx.roll(conv_state, shift=-1)
+        conv_state = mx.roll(conv_state, shift=-1, axis=-1)
 
         if len(cache_position) > 1:
             conv_state[:, :, :] = new_conv_state
