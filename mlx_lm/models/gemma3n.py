@@ -25,7 +25,6 @@ class TextConfig(BaseModelArgs):
     vocab_size: int
     num_key_value_heads: int
     num_kv_shared_layers: int
-    query_pre_attn_scalar: float
     vocab_size_per_layer_input: int
     sliding_window: int
     max_position_embeddings: int
