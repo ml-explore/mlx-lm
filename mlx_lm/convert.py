@@ -21,7 +21,6 @@ from .utils import (
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
-
     high_bits = 6
     group_size = 64
 
@@ -96,6 +95,7 @@ def convert(
     quant_predicate: Optional[
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
+    trust_remote_code: bool = False,
 ):
     # Check the save path is empty
     if isinstance(mlx_path, str):
@@ -109,7 +109,9 @@ def convert(
 
     print("[INFO] Loading")
     model_path, hf_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+    model, config, tokenizer = fetch_from_hub(
+        model_path, lazy=True, trust_remote_code=trust_remote_code
+    )
 
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)

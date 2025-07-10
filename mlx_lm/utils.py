@@ -115,7 +115,6 @@ def get_model_path(
             )
         )
     else:
-
         from huggingface_hub import ModelCard
 
         card_path = model_path / "README.md"
@@ -269,11 +268,13 @@ def load(
 
 
 def fetch_from_hub(
-    model_path: Path, lazy: bool = False
+    model_path: Path, lazy: bool = False, trust_remote_code: bool = False
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model, config = load_model(model_path, lazy)
     tokenizer = load_tokenizer(
-        model_path, eos_token_ids=config.get("eos_token_id", None)
+        model_path,
+        eos_token_ids=config.get("eos_token_id", None),
+        tokenizer_config_extra={"trust_remote_code": trust_remote_code},
     )
     return model, config, tokenizer
 
@@ -519,6 +520,8 @@ def save_config(
     # Clean unused keys
     config.pop("_name_or_path", None)
     config.pop("vision_config", None)
+    if "quantization" in config:
+        config["quantization_config"] = config["quantization"]
 
     # sort the config for better readability
     config = dict(sorted(config.items()))

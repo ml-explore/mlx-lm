@@ -367,8 +367,8 @@ def main():
     parser.add_argument(
         "--chat-template-args",
         type=json.loads,
-        help="""A JSON formatted string of arguments for the tokenizer's "
-        "apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        help="""A JSON formatted string of arguments for the tokenizer's
+        apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
 
