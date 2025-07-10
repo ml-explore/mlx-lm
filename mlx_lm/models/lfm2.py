@@ -164,7 +164,8 @@ class LFM2ShortConv(nn.Module):
                     conv_state = mx.pad(Bx, pad_width)
                 else:
                     conv_state = Bx
-                cache[0] = conv_state
+
+                cache = conv_state
 
             conv_out = self.conv(Bx.transpose(0, 2, 1)).transpose(0, 2, 1)[..., :seqlen]
 
@@ -215,6 +216,7 @@ class Lfm2DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         r = x
+
         if self.is_attention_layer:
             x = self.self_attn(
                 self.operator_norm(x),
@@ -262,7 +264,7 @@ class Lfm2Model(nn.Module):
             h = self.embed_tokens(inputs)
 
         if mask is None:
-            c = cache[0][1] if cache is not None else None
+            c = [cache[0][1]] if cache is not None else None
             mask = create_attention_mask(h, c, return_array=False)
 
         if cache is None:
@@ -317,10 +319,9 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
-        for layer in self.layers:
-            if isinstance(layer, Lfm2DecoderLayer):
-                if layer.is_attention_layer:
-                    caches.append(KVCache())
-                else:
-                    caches.append(MambaCache())
+        for layer_idx in range(len(self.layers)):
+            if self.layers[layer_idx].is_attention_layer:
+                caches.append(KVCache())
+            else:
+                caches.append(MambaCache())
         return caches
