@@ -5,7 +5,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
-from .cache import CacheList, MambaCache, KVCache
+from .cache import MambaCache, KVCache
 
 
 @dataclass
@@ -32,7 +32,6 @@ class ModelArgs(BaseModelArgs):
     block_auto_adjust_ff_dim: bool = True
     full_attn_idxs: Optional[list[int]] = None
     layer_types: Optional[list[str]] = None
-    tie_word_embeddings: bool = True
     rope_traditional: bool = False
     rope_scaling: Optional[str] = None
     rope_theta: float = 1000000.0
@@ -88,9 +87,8 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
-        queries = self.q_layernorm(queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3))
-        keys = self.k_layernorm(keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3))
+        queries = self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
+        keys = self.k_layernorm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
@@ -143,11 +141,11 @@ class LFM2ShortConv(nn.Module):
         B, C, x = mx.split(BCx, 3, axis=-2)
 
         Bx = B * x
-
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
 
-            conv_state = Bx
+            conv_state = mx.roll(conv_state, -1, -1)
+            conv_state[:, :, -1] = Bx.squeeze(-1)
             cache[0] = conv_state
             conv_out = mx.sum(conv_state * self.conv.weight[:, 0, :], axis=-1)
             if self.bias:
@@ -156,18 +154,21 @@ class LFM2ShortConv(nn.Module):
             conv_out = conv_out[:, :, None]
         else:
             if cache is not None:
+                pad_size = self.L_cache - Bx.shape[-1]
                 pad_width = [
                     (0, 0),
                     (0, 0),
-                    (1, 0)
+                    (pad_size, 0)
                 ]
-                conv_state = mx.pad(Bx, pad_width)
+                if pad_size > 0:
+                    conv_state = mx.pad(Bx, pad_width)
+                else:
+                    conv_state = Bx
                 cache[0] = conv_state
 
-            conv_out = self.conv(Bx.transpose(0, 2, 1))[:, :seqlen, :]
+            conv_out = self.conv(Bx.transpose(0, 2, 1)).transpose(0, 2, 1)[..., :seqlen]
 
-
-        y = C * conv_out.swapaxes(1, 2)
+        y = C * conv_out
         y = y.transpose(0, 2, 1)
         y = self.out_proj(y)
         return y
@@ -218,13 +219,16 @@ class Lfm2DecoderLayer(nn.Module):
             x = self.self_attn(
                 self.operator_norm(x),
                 mask=mask,
-                cache=cache[1]
+                cache=cache
             )
+
         else:
+
             x = self.conv(
                 self.operator_norm(x),
-                cache=cache[0]
+                cache=cache
             )
+
         x = x + r
         x = x + self.feed_forward(self.ffn_norm(x))
 
@@ -242,6 +246,7 @@ class Lfm2Model(nn.Module):
             Lfm2DecoderLayer(args, layer_idx=i)
             for i in range(args.num_hidden_layers)
         ]
+
         self.embedding_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
 
     def __call__(
@@ -257,7 +262,7 @@ class Lfm2Model(nn.Module):
             h = self.embed_tokens(inputs)
 
         if mask is None:
-            c = [cache[0][1]] if cache is not None else None
+            c = cache[0][1] if cache is not None else None
             mask = create_attention_mask(h, c, return_array=False)
 
         if cache is None:
@@ -295,25 +300,27 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
-        # Remove unused precomputed rotary freqs
         sanitized_weights = {}
-        for k, v in weights.items():
-            if "self_attn.rotary_emb.inv_freq" not in k:
-                sanitized_weights[k] = v
-            if "conv.weight" in k and v.shape[-1] > v.shape[1]:
-                sanitized_weights[k] = v.transpose(0, 2, 1)
-            else:
-                sanitized_weights[k] = v
-        if self.args.tie_word_embeddings:
-            sanitized_weights.pop("lm_head.weight", None)
+        for name, param in weights.items():
+            if "conv.weight" in name:
+                # MLX Conv1d expects [out_channels, in_channels, kernel_size] format
+                if param.shape[-1] > param.shape[1]:
+                    param = param.transpose(0, 2, 1)
+
+            sanitized_weights[name] = param
         return sanitized_weights
+
 
     @property
     def layers(self):
         return self.model.layers
 
     def make_cache(self):
-        return [
-            CacheList(MambaCache(), KVCache())
-            for _ in range(self.args.num_hidden_layers)
-        ]
+        caches = []
+        for layer in self.layers:
+            if isinstance(layer, Lfm2DecoderLayer):
+                if layer.is_attention_layer:
+                    caches.append(KVCache())
+                else:
+                    caches.append(MambaCache())
+        return caches
