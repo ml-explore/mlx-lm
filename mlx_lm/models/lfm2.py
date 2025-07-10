@@ -5,33 +5,44 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
+from .cache import CacheList, MambaCache, KVCache
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
+    model_type: str = "lfm2"
+    head_dim: int = None
+    block_ff_dim: int = None
     vocab_size: int = 65536
-    hidden_size: int = 2560
-    num_hidden_layers: int = 32
-    pad_token_id: int = 0
+    hidden_size: int = None
+    intermediate_size: int = None
+    num_hidden_layers: int = None
+    num_attention_heads: int = None
+    num_key_value_heads: int = None
+    max_position_embeddings: int = None
+    norm_eps: float = None
+    pad_token_id: int = None
     bos_token_id: int = 1
     eos_token_id: int = 2
-    tie_embedding: bool = True
-    theta: float = 1000000.0
-    max_position_embeddings: int = 128_000
-    use_cache: bool = True
-    norm_eps: float = 0.00001
-    initializer_range: float = 0.02
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 8
+    tie_word_embeddings: bool = True
     conv_bias: bool = False
-    conv_dim: int = 2560
     conv_L_cache: int = 3
-    block_dim: int = 2560
-    block_ff_dim: int = 12288
     block_multiple_of: int = 256
     block_ffn_dim_multiplier: float = 1.0
     block_auto_adjust_ff_dim: bool = True
     full_attn_idxs: Optional[list[int]] = None
+    layer_types: Optional[list[str]] = None
+    tie_word_embeddings: bool = True
+    rope_traditional: bool = False
+    rope_scaling: Optional[str] = None
+    rope_theta: float = 1000000.0
+
+    def __post_init__(self):
+        self.intermediate_size = self.block_ff_dim or self.intermediate_size
+        if self.layer_types is None:
+            full_attn_idxs = self.full_attn_idxs if self.full_attn_idxs is not None else list(range(self.num_hidden_layers))
+            self.layer_types = ["full_attention" if i in full_attn_idxs else "conv" for i in range(self.num_hidden_layers)]
+
 
 
 
@@ -51,13 +62,13 @@ class Attention(nn.Module):
         else:
             attention_bias = False
 
-        self.q_layernorm = nn.RMSNorm(dim, eps=args.norm_eps)
-        self.k_layernorm = nn.RMSNorm(dim, eps=args.norm_eps)
+        self.q_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
+        self.k_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
+        self.out_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -95,52 +106,49 @@ class Attention(nn.Module):
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return self.out_proj(output)
 
 
 class LFM2ShortConv(nn.Module):
     def __init__(
         self,
-        config: LFM2Config,
-        dim: int,
+        args: ModelArgs,
         layer_idx: int,
     ):
         super().__init__()
-        self.config = config
+        self.args = args
         self.layer_idx = layer_idx
-        self.L_cache = config.conv_L_cache
-        self.bias = config.conv_bias
+        self.L_cache = args.conv_L_cache
+        self.bias = args.conv_bias
 
         self.conv = nn.Conv1d(
-            in_channels=dim,
-            out_channels=dim,
+            in_channels=args.hidden_size,
+            out_channels=args.hidden_size,
             kernel_size=self.L_cache,
-            groups=dim,
+            groups=args.hidden_size,
             bias=self.bias,
             padding=self.L_cache - 1,
         )
-        self.in_proj = nn.Linear(dim, 3 * dim, bias=self.bias)
-        self.out_proj = nn.Linear(dim, dim, bias=self.bias)
+        self.in_proj = nn.Linear(args.hidden_size, 3 * args.hidden_size, bias=self.bias)
+        self.out_proj = nn.Linear(args.hidden_size, args.hidden_size, bias=self.bias)
 
 
     def __call__(
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
         seqlen = x.shape[1]
-        BCx = self.in_proj(x).transpose(-1, -2)
-        B, C, x = BCx.chunk(3, dim=-2)
+        BCx = self.in_proj(x).transpose(0, 2, 1)
+        B, C, x = mx.split(BCx, 3, axis=-2)
 
         Bx = B * x
 
-        if cache is not None and cache.conv_cache[self.layer_idx].shape[-2] > 0:
-            conv_state = cache.conv_cache[self.layer_idx]
-            cache_position = mx.clip(cache.conv_position, 0, self.L_cache - 1)
-            conv_state = mx.roll(conv_state, shift=-1, axis=-1)
-            conv_state[:, :, cache_position] = Bx
-            cache.conv_cache[self.layer_idx] = conv_state
+        if cache is not None and cache[0] is not None:
+            conv_state = cache[0]
+
+            conv_state = Bx
+            cache[0] = conv_state
             conv_out = mx.sum(conv_state * self.conv.weight[:, 0, :], axis=-1)
             if self.bias:
                 conv_out += self.conv.bias
@@ -148,40 +156,164 @@ class LFM2ShortConv(nn.Module):
             conv_out = conv_out[:, :, None]
         else:
             if cache is not None:
-                conv_state = mx.pad(Bx, (self.L_cache - Bx.shape[-1], 0))
-                cache.conv_cache[self.layer_idx] = conv_state
+                pad_width = [
+                    (0, 0),
+                    (0, 0),
+                    (1, 0)
+                ]
+                conv_state = mx.pad(Bx, pad_width)
+                cache[0] = conv_state
 
-            conv_out = self.conv(Bx)[..., :seqlen]
+            conv_out = self.conv(Bx.transpose(0, 2, 1))[:, :seqlen, :]
 
-        y = C * conv_out
-        y = y.transpose(-1, -2)
+
+        y = C * conv_out.swapaxes(1, 2)
+        y = y.transpose(0, 2, 1)
         y = self.out_proj(y)
         return y
 
 
 class MLP(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        ff_dim: int,
-        multiple_of: int,
-        auto_adjust_ff_dim: bool,
-        ffn_dim_multiplier: Optional[float],
-    ):
-        if auto_adjust_ff_dim:
-            ff_dim = int(2 * ff_dim / 3)
-            if ffn_dim_multiplier is not None:
-                ff_dim = int(ffn_dim_multiplier * ff_dim)
-            ff_dim = multiple_of * ((ff_dim + multiple_of - 1) // multiple_of)
-
-        self.w1 = nn.Linear(dim, ff_dim, bias=False)
-        self.w3 = nn.Linear(dim, ff_dim, bias=False)
-        self.w2 = nn.Linear(ff_dim, dim, bias=False)
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        intermediate_size = args.intermediate_size
+        if args.block_auto_adjust_ff_dim:
+            intermediate_size = int(2 * intermediate_size / 3)
+            # custom dim factor multiplier
+            if args.block_ffn_dim_multiplier is not None:
+                intermediate_size = int(args.block_ffn_dim_multiplier * intermediate_size)
+                intermediate_size = args.block_multiple_of * (
+                    (intermediate_size + args.block_multiple_of - 1) // args.block_multiple_of
+                )
+        self.w1 = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.w3 = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.w2 = nn.Linear(intermediate_size, args.hidden_size, bias=False)
 
     def __call__(self, x):
         return self.w2(nn.silu(self.w1(x)) * self.w3(x))
 
-class LFM2Model(nn.Module):
+
+
+class Lfm2DecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.is_attention_layer = args.layer_types[layer_idx] == "full_attention"
+
+        if self.is_attention_layer:
+            self.self_attn = Attention(args)
+        else:
+            self.conv = LFM2ShortConv(args, layer_idx)
+        self.feed_forward = MLP(args)
+        self.operator_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
+        self.ffn_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = x
+        if self.is_attention_layer:
+            x = self.self_attn(
+                self.operator_norm(x),
+                mask=mask,
+                cache=cache[1]
+            )
+        else:
+            x = self.conv(
+                self.operator_norm(x),
+                cache=cache[0]
+            )
+        x = x + r
+        x = x + self.feed_forward(self.ffn_norm(x))
+
+        return x
+
+class Lfm2Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        self.vocab_size = args.vocab_size
+        self.num_hidden_layers = args.num_hidden_layers
+        assert self.vocab_size > 0
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [
+            Lfm2DecoderLayer(args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
+        ]
+        self.embedding_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+    ):
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
+
+        if mask is None:
+            c = [cache[0][1]] if cache is not None else None
+            mask = create_attention_mask(h, c, return_array=False)
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, cache=c)
+
+        return self.embedding_norm(h)
+
+
+
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.model = Lfm2Model(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+    ):
+        out = self.model(inputs, mask, cache, input_embeddings)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
+
+    def sanitize(self, weights):
+        # Remove unused precomputed rotary freqs
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "self_attn.rotary_emb.inv_freq" not in k:
+                sanitized_weights[k] = v
+            if "conv.weight" in k and v.shape[-1] > v.shape[1]:
+                sanitized_weights[k] = v.transpose(0, 2, 1)
+            else:
+                sanitized_weights[k] = v
+        if self.args.tie_word_embeddings:
+            sanitized_weights.pop("lm_head.weight", None)
+        return sanitized_weights
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        return [
+            CacheList(MambaCache(), KVCache())
+            for _ in range(self.args.num_hidden_layers)
+        ]
