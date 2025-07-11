@@ -102,13 +102,14 @@ def iterate_batches(
 
     # If running in distributed mode (N machines) then each one should skip N-1
     # samples
+    offset = mx.distributed.init().rank()
     step = mx.distributed.init().size()
     if batch_size % step != 0:
         raise ValueError("The batch size must be divisible by the number of workers")
 
     # Make the batches:
     batch_idx = [
-        idx[i : i + batch_size : step]
+        idx[i + offset : i + offset + batch_size : step]
         for i in range(0, len(idx) - batch_size + 1, batch_size)
     ]
 
