@@ -1,3 +1,4 @@
+# Copyright © 2023-2024 Apple Inc.
 from dataclasses import dataclass
 from typing import Optional, Any
 import mlx.core as mx
@@ -43,8 +44,6 @@ class ModelArgs(BaseModelArgs):
             self.layer_types = ["full_attention" if i in full_attn_idxs else "conv" for i in range(self.num_hidden_layers)]
 
 
-
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -56,10 +55,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
 
         self.scale = head_dim**-0.5
-        if hasattr(args, "attention_bias"):
-            attention_bias = args.attention_bias
-        else:
-            attention_bias = False
+        attention_bias = getattr(args, "attention_bias", False)
 
         self.q_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
         self.k_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
@@ -99,46 +95,11 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-
+        output = scaled_dot_product_attention(queries, keys, values, cache=cache, mask=mask, scale=self.scale)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.out_proj(output)
 
 
-def pad_like_torch(x, pad_tuple, mode='constant', value=0):
-    """
-    MLX equivalent of torch.nn.functional.pad that handles negative values.
-
-    Args:
-        x: Input array
-        pad_tuple: Tuple of padding values (left, right) for the last dimension
-        mode: Padding mode ('constant' supported)
-        value: Fill value for padding
-
-    Returns:
-        Padded/cropped array
-    """
-    left_pad, right_pad = pad_tuple
-
-    # Handle negative padding (cropping)
-    if left_pad < 0:
-        # Crop from the left
-        x = x[..., abs(left_pad):]
-        left_pad = 0
-
-    if right_pad < 0:
-        # Crop from the right
-        x = x[..., :right_pad]
-        right_pad = 0
-
-    # Apply positive padding if needed
-    if left_pad > 0 or right_pad > 0:
-        pad_width = [(0, 0)] * (x.ndim - 1) + [(left_pad, right_pad)]
-        x = mx.pad(x, pad_width, constant_values=value)
-
-    return x
 
 class LFM2ShortConv(nn.Module):
     def __init__(
@@ -163,41 +124,33 @@ class LFM2ShortConv(nn.Module):
         self.in_proj = nn.Linear(args.hidden_size, 3 * args.hidden_size, bias=self.bias)
         self.out_proj = nn.Linear(args.hidden_size, args.hidden_size, bias=self.bias)
 
-
     def __call__(
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        offset: Optional[int] = None,
     ):
         seqlen = x.shape[1]
-
-        BCx = self.in_proj(x).transpose(0, 2, 1)
-        B, C, x = mx.split(BCx, 3, axis=-2)
+        BCx = self.in_proj(x)
+        B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x
 
-        if cache is not None and offset > 0:
-
-            conv_state = cache[0] if cache[0] is not None else mx.zeros((B.shape[0], B.shape[1], self.L_cache))
-            offset = mx.arange(offset, offset + Bx.shape[-1])
-            clamped_offset = mx.clip(offset, 0, self.L_cache - 1)
+        if cache is not None and x.shape[1] == 1:
+            conv_state = cache[0] if cache[0] is not None else mx.zeros((Bx.shape[0], self.args.hidden_size, self.L_cache))
             conv_state = mx.roll(conv_state, -1, -1)
-            conv_state[:, :, clamped_offset] = Bx
+            conv_state[:, :, -1] = Bx[:, 0, :]
             cache[0] = conv_state
-            conv_out = mx.sum(conv_state * self.conv.weight[:, 0, :], axis=-1, keepdims=True)
+            conv_out = mx.sum(conv_state * self.conv.weight[:, :, 0], axis=-1, keepdims=True)
             if self.bias:
-                conv_out += self.conv.bias[..., None]
-        else:
-            if cache is not None:
-                conv_state = pad_like_torch(Bx, (self.L_cache - Bx.shape[-1], 0))
-                cache[0] = conv_state
+                if cache is not None:
+                    cache[0] = Bx[:, -self.L_cache:, :]
 
-            conv_out = self.conv(Bx.transpose(0, 2, 1)).transpose(0, 2, 1)[..., :seqlen]
+            conv_out = conv_out.reshape(Bx.shape[0], 1, -1)
+
+        else:
+            conv_out = self.conv(Bx)[..., :seqlen, :]
 
         y = C * conv_out
-        y = y.transpose(0, 2, 1)
-        y = self.out_proj(y)
-        return y
+        return self.out_proj(y)
 
 
 class MLP(nn.Module):
@@ -220,8 +173,6 @@ class MLP(nn.Module):
         return self.w2(nn.silu(self.w1(x)) * self.w3(x))
 
 
-
-
 class Lfm2DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -240,9 +191,9 @@ class Lfm2DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        offset: Optional[int] = None,
     ) -> mx.array:
-        r = x
+
+        residual = x
 
         if self.is_attention_layer:
             x = self.self_attn(
@@ -250,18 +201,19 @@ class Lfm2DecoderLayer(nn.Module):
                 mask=mask,
                 cache=cache
             )
-
         else:
 
             x = self.conv(
                 self.operator_norm(x),
-                cache=cache
+                cache=cache,
             )
 
-        # x = x + r
-        # x = x + self.feed_forward(self.ffn_norm(x))
+        x = x + residual
+
+        x = x + self.feed_forward(self.ffn_norm(x))
 
         return x
+
 
 class Lfm2Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -291,17 +243,16 @@ class Lfm2Model(nn.Module):
             h = self.embed_tokens(inputs)
 
         if mask is None:
-            c = [cache[0][0]] if cache is not None else None
+            first_attn_idx = self.args.layer_types.index("full_attention")
+            c = [cache[first_attn_idx]] if cache is not None else None
             mask = create_attention_mask(h, c, return_array=False)
 
-
-        offset = cache[2].offset if cache is not None else None
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, cache=c, offset=offset)
+            h = layer(h, mask, cache=c)
 
         return self.embedding_norm(h)
 
@@ -335,7 +286,6 @@ class Model(nn.Module):
         sanitized_weights = {}
         for name, param in weights.items():
             if "conv.weight" in name:
-                # MLX Conv1d expects [out_channels, in_channels, kernel_size] format
                 if param.shape[-1] > param.shape[1]:
                     param = param.transpose(0, 2, 1)
 
