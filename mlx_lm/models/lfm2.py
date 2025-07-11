@@ -107,6 +107,39 @@ class Attention(nn.Module):
         return self.out_proj(output)
 
 
+def pad_like_torch(x, pad_tuple, mode='constant', value=0):
+    """
+    MLX equivalent of torch.nn.functional.pad that handles negative values.
+
+    Args:
+        x: Input array
+        pad_tuple: Tuple of padding values (left, right) for the last dimension
+        mode: Padding mode ('constant' supported)
+        value: Fill value for padding
+
+    Returns:
+        Padded/cropped array
+    """
+    left_pad, right_pad = pad_tuple
+
+    # Handle negative padding (cropping)
+    if left_pad < 0:
+        # Crop from the left
+        x = x[..., abs(left_pad):]
+        left_pad = 0
+
+    if right_pad < 0:
+        # Crop from the right
+        x = x[..., :right_pad]
+        right_pad = 0
+
+    # Apply positive padding if needed
+    if left_pad > 0 or right_pad > 0:
+        pad_width = [(0, 0)] * (x.ndim - 1) + [(left_pad, right_pad)]
+        x = mx.pad(x, pad_width, constant_values=value)
+
+    return x
+
 class LFM2ShortConv(nn.Module):
     def __init__(
         self,
@@ -135,37 +168,29 @@ class LFM2ShortConv(nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
+        offset: Optional[int] = None,
     ):
         seqlen = x.shape[1]
+
         BCx = self.in_proj(x).transpose(0, 2, 1)
         B, C, x = mx.split(BCx, 3, axis=-2)
-
         Bx = B * x
-        if cache is not None and cache[0] is not None:
-            conv_state = cache[0]
 
+        if cache is not None and offset > 0:
+
+            conv_state = cache[0] if cache[0] is not None else mx.zeros((B.shape[0], B.shape[1], self.L_cache))
+            offset = mx.arange(offset, offset + Bx.shape[-1])
+            clamped_offset = mx.clip(offset, 0, self.L_cache - 1)
             conv_state = mx.roll(conv_state, -1, -1)
-            conv_state[:, :, -1] = Bx.squeeze(-1)
+            conv_state[:, :, clamped_offset] = Bx
             cache[0] = conv_state
-            conv_out = mx.sum(conv_state * self.conv.weight[:, 0, :], axis=-1)
+            conv_out = mx.sum(conv_state * self.conv.weight[:, 0, :], axis=-1, keepdims=True)
             if self.bias:
-                conv_out += self.conv.bias
-
-            conv_out = conv_out[:, :, None]
+                conv_out += self.conv.bias[..., None]
         else:
             if cache is not None:
-                pad_size = self.L_cache - Bx.shape[-1]
-                pad_width = [
-                    (0, 0),
-                    (0, 0),
-                    (pad_size, 0)
-                ]
-                if pad_size > 0:
-                    conv_state = mx.pad(Bx, pad_width)
-                else:
-                    conv_state = Bx
-
-                cache = conv_state
+                conv_state = pad_like_torch(Bx, (self.L_cache - Bx.shape[-1], 0))
+                cache[0] = conv_state
 
             conv_out = self.conv(Bx.transpose(0, 2, 1)).transpose(0, 2, 1)[..., :seqlen]
 
@@ -196,6 +221,7 @@ class MLP(nn.Module):
 
 
 
+
 class Lfm2DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -214,6 +240,7 @@ class Lfm2DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        offset: Optional[int] = None,
     ) -> mx.array:
         r = x
 
@@ -231,8 +258,8 @@ class Lfm2DecoderLayer(nn.Module):
                 cache=cache
             )
 
-        x = x + r
-        x = x + self.feed_forward(self.ffn_norm(x))
+        # x = x + r
+        # x = x + self.feed_forward(self.ffn_norm(x))
 
         return x
 
@@ -264,14 +291,17 @@ class Lfm2Model(nn.Module):
             h = self.embed_tokens(inputs)
 
         if mask is None:
-            c = [cache[0][1]] if cache is not None else None
+            c = [cache[0][0]] if cache is not None else None
             mask = create_attention_mask(h, c, return_array=False)
+
+
+        offset = cache[2].offset if cache is not None else None
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, cache=c)
+            h = layer(h, mask, cache=c, offset=offset)
 
         return self.embedding_norm(h)
 
