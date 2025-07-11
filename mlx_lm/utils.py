@@ -41,9 +41,10 @@ from .tuner.utils import get_total_parameters, load_adapters
 
 # Constants
 MODEL_REMAPPING = {
-    "mistral": "llama",  # mistral is compatible with llama
+    "mistral": "llama",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "kimi_k2": "deepseek_v3",
 }
 
 MAX_FILE_SIZE_GB = 5
