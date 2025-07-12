@@ -88,6 +88,7 @@ def linear_to_lora_layers(
         "mistral",
         "mistral3",
         "llama",
+        "lfm2",
         "phi",
         "mixtral",
         "nemotron",
