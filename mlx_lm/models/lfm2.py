@@ -13,22 +13,17 @@ from .rope_utils import initialize_rope
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "lfm2"
-    head_dim: int = None
-    block_ff_dim: int = None
     vocab_size: int = 65536
-    hidden_size: int = None
+    hidden_size: int = 1024
     intermediate_size: int = None
-    num_hidden_layers: int = None
-    num_attention_heads: int = None
-    num_key_value_heads: int = None
+    num_hidden_layers: int = 16
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 8
     max_position_embeddings: int = None
-    norm_eps: float = None
-    pad_token_id: int = None
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    tie_word_embeddings: bool = True
+    norm_eps: float = 1e-05
     conv_bias: bool = False
     conv_L_cache: int = 3
+    block_ff_dim: int = None
     block_multiple_of: int = 256
     block_ffn_dim_multiplier: float = 1.0
     block_auto_adjust_ff_dim: bool = True
@@ -37,6 +32,7 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[str] = None
     rope_theta: float = 1000000.0
+    tie_word_embeddings: bool = True
 
     def __post_init__(self):
         self.intermediate_size = self.block_ff_dim or self.intermediate_size
@@ -60,7 +56,7 @@ class Attention(nn.Module):
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
+        self.head_dim = head_dim = args.hidden_size // n_heads
 
         self.scale = head_dim**-0.5
         attention_bias = getattr(args, "attention_bias", False)
