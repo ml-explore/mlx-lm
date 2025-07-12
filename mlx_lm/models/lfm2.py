@@ -1,12 +1,13 @@
 # Copyright © 2023-2024 Apple Inc.
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Any, Optional
+
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, MambaCache
 from .rope_utils import initialize_rope
-from .cache import MambaCache, KVCache
 
 
 @dataclass
@@ -40,8 +41,15 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         self.intermediate_size = self.block_ff_dim or self.intermediate_size
         if self.layer_types is None:
-            full_attn_idxs = self.full_attn_idxs if self.full_attn_idxs is not None else list(range(self.num_hidden_layers))
-            self.layer_types = ["full_attention" if i in full_attn_idxs else "conv" for i in range(self.num_hidden_layers)]
+            full_attn_idxs = (
+                self.full_attn_idxs
+                if self.full_attn_idxs is not None
+                else list(range(self.num_hidden_layers))
+            )
+            self.layer_types = [
+                "full_attention" if i in full_attn_idxs else "conv"
+                for i in range(self.num_hidden_layers)
+            ]
 
 
 class Attention(nn.Module):
@@ -83,8 +91,12 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
-        keys = self.k_layernorm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        queries = self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        keys = self.k_layernorm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
@@ -95,10 +107,11 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(queries, keys, values, cache=cache, mask=mask, scale=self.scale)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, mask=mask, scale=self.scale
+        )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.out_proj(output)
-
 
 
 class LFM2ShortConv(nn.Module):
@@ -135,19 +148,27 @@ class LFM2ShortConv(nn.Module):
         Bx = B * x
 
         if cache is not None and x.shape[1] == 1:
-            conv_state = cache[0] if cache[0] is not None else mx.zeros((Bx.shape[0], self.L_cache, self.args.hidden_size))
+            conv_state = (
+                cache[0]
+                if cache[0] is not None
+                else mx.zeros((Bx.shape[0], self.L_cache, self.args.hidden_size))
+            )
             conv_state = mx.roll(conv_state, -2, -2)
             conv_state[:, -1, :] = Bx[:, 0, :]
             cache[0] = conv_state
 
-            conv_out = mx.sum(conv_state.transpose(0, 2, 1) * self.conv.weight[:, :, 0], axis=-1, keepdims=True)
+            conv_out = mx.sum(
+                conv_state.transpose(0, 2, 1) * self.conv.weight[:, :, 0],
+                axis=-1,
+                keepdims=True,
+            )
             if self.bias:
                 conv_out = conv_out + self.conv.bias
             conv_out = conv_out.reshape(Bx.shape[0], 1, -1)
 
         else:
             if cache is not None:
-                cache[0] = Bx[:, -self.L_cache:, :]
+                cache[0] = Bx[:, -self.L_cache :, :]
             conv_out = self.conv(Bx)[..., :seqlen, :]
 
         y = C * conv_out
@@ -160,11 +181,13 @@ class MLP(nn.Module):
         intermediate_size = args.intermediate_size
         if args.block_auto_adjust_ff_dim:
             intermediate_size = int(2 * intermediate_size / 3)
-            # custom dim factor multiplier
             if args.block_ffn_dim_multiplier is not None:
-                intermediate_size = int(args.block_ffn_dim_multiplier * intermediate_size)
+                intermediate_size = int(
+                    args.block_ffn_dim_multiplier * intermediate_size
+                )
                 intermediate_size = args.block_multiple_of * (
-                    (intermediate_size + args.block_multiple_of - 1) // args.block_multiple_of
+                    (intermediate_size + args.block_multiple_of - 1)
+                    // args.block_multiple_of
                 )
         self.w1 = nn.Linear(args.hidden_size, intermediate_size, bias=False)
         self.w3 = nn.Linear(args.hidden_size, intermediate_size, bias=False)
@@ -197,13 +220,8 @@ class Lfm2DecoderLayer(nn.Module):
         residual = x
 
         if self.is_attention_layer:
-            x = self.self_attn(
-                self.operator_norm(x),
-                mask=mask,
-                cache=cache
-            )
+            x = self.self_attn(self.operator_norm(x), mask=mask, cache=cache)
         else:
-
             x = self.conv(
                 self.operator_norm(x),
                 cache=cache,
@@ -225,8 +243,7 @@ class Lfm2Model(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Lfm2DecoderLayer(args, layer_idx=i)
-            for i in range(args.num_hidden_layers)
+            Lfm2DecoderLayer(args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
 
         self.embedding_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
@@ -248,7 +265,6 @@ class Lfm2Model(nn.Module):
             c = [cache[first_attn_idx]] if cache is not None else None
             mask = create_attention_mask(h, c, return_array=False)
 
-
         if cache is None:
             cache = [None] * len(self.layers)
 
@@ -256,8 +272,6 @@ class Lfm2Model(nn.Module):
             h = layer(h, mask, cache=c)
 
         return self.embedding_norm(h)
-
-
 
 
 class Model(nn.Module):
@@ -292,7 +306,6 @@ class Model(nn.Module):
 
             sanitized_weights[name] = param
         return sanitized_weights
-
 
     @property
     def layers(self):
