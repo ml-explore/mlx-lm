@@ -135,16 +135,19 @@ class LFM2ShortConv(nn.Module):
         Bx = B * x
 
         if cache is not None and x.shape[1] == 1:
-            conv_state = cache[0] if cache[0] is not None else mx.zeros((Bx.shape[0], self.args.hidden_size, self.L_cache))
-            conv_state = mx.roll(conv_state, -1, -1)
-            conv_state[:, :, -1] = Bx[:, 0, :]
+            conv_state = cache[0] if cache[0] is not None else mx.zeros((Bx.shape[0], self.L_cache, self.args.hidden_size))
+            conv_state = mx.roll(conv_state, -2, -2)
+            conv_state[:, -1, :] = Bx[:, 0, :]
             cache[0] = conv_state
-            conv_out = mx.sum(conv_state * self.conv.weight[:, :, 0], axis=-1, keepdims=True)
+
+            conv_out = mx.sum(conv_state.transpose(0, 2, 1) * self.conv.weight[:, :, 0], axis=-1, keepdims=True)
             if self.bias:
                 conv_out = conv_out + self.conv.bias
             conv_out = conv_out.reshape(Bx.shape[0], 1, -1)
 
         else:
+            if cache is not None:
+                cache[0] = Bx[:, -self.L_cache:, :]
             conv_out = self.conv(Bx)[..., :seqlen, :]
 
         y = C * conv_out
