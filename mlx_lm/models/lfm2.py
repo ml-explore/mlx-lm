@@ -141,9 +141,7 @@ class LFM2ShortConv(nn.Module):
             cache[0] = conv_state
             conv_out = mx.sum(conv_state * self.conv.weight[:, :, 0], axis=-1, keepdims=True)
             if self.bias:
-                if cache is not None:
-                    cache[0] = Bx[:, -self.L_cache:, :]
-
+                conv_out = conv_out + self.conv.bias
             conv_out = conv_out.reshape(Bx.shape[0], 1, -1)
 
         else:
