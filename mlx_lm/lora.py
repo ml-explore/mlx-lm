@@ -253,7 +253,6 @@ def train_model(
 
     optimizer_name = args.optimizer.lower()
     optimizer_config = args.optimizer_config.get(optimizer_name, {})
-    print(optimizer_config)
     if optimizer_name == "adam":
         opt_class = optim.Adam
     elif optimizer_name == "adamw":
