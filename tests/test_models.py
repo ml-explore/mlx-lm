@@ -262,7 +262,7 @@ class TestModels(unittest.TestCase):
             num_key_value_heads=2,
             norm_eps=1e-5,
             vocab_size=10_000,
-            full_attn_idxs=[0, 1, 2, 3],
+            full_attn_idxs=[0, 1, 2],
             rope_theta=10000,
             block_dim=1024,
             block_ffn_dim_multiplier=1.5,

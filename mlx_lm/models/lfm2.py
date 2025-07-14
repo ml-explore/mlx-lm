@@ -116,10 +116,6 @@ class ShortConv(nn.Module):
         x: mx.array,
         cache: Optional[Any] = None,
     ):
-        import pdb
-
-        pdb.set_trace()
-
         seqlen = x.shape[1]
         BCx = self.in_proj(x)
         B, C, x = mx.split(BCx, 3, axis=-1)
@@ -134,7 +130,8 @@ class ShortConv(nn.Module):
             )
 
         Bx = mx.concatenate([state, Bx], axis=-2)
-        cache[0] = Bx[:, -(self.L_cache - 1) :]
+        if cache is not None:
+            cache[0] = Bx[:, -(self.L_cache - 1) :]
         conv_out = self.conv(Bx)
 
         y = C * conv_out
