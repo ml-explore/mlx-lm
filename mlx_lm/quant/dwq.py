@@ -30,8 +30,9 @@ class Catcher(nn.Module):
         self.module = module
 
     def __call__(self, *args, **kwargs):
-        self.outputs = self.module(*args, **kwargs)
-        return self.outputs
+        outputs = self.module(*args, **kwargs)
+        self.outputs = outputs[0] if isinstance(outputs, tuple) else outputs
+        return outputs
 
 
 def dwq_quantize(
@@ -69,12 +70,9 @@ def dwq_quantize(
 
     def forward(model, inputs):
         logits = model(inputs)
-        extra_targets = []
-        for lid in layer_ids:
-            output = model.layers[lid].outputs
-            if isinstance(output, tuple):
-                output = output[0]
-            extra_targets.append(output.astype(mx.float32))
+        extra_targets = [
+            model.layers[lid].outputs.astype(mx.float32) for lid in layer_ids
+        ]
         for lid in layer_ids:
             model.layers[lid].outputs = None
         return logits, extra_targets
@@ -204,11 +202,6 @@ def main():
         action="store_true",
         help="Use gradient checkpointing to reduce memory use.",
     )
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Trust and run custom code from the model repository.",
-    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -221,7 +214,9 @@ def main():
     mx.random.seed(args.seed)
 
     model_path, hf_repo = get_model_path(args.model, revision=None)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True, trust_remote_code=args.trust_remote_code)
+    model, config, tokenizer = fetch_from_hub(
+        model_path, lazy=True, trust_remote_code=True
+    )
 
     calibration_data = load_data(
         tokenizer, args.data_path, args.num_samples, args.max_seq_length
@@ -229,7 +224,9 @@ def main():
 
     if args.quantized_model is not None:
         q_model_path = get_model_path(args.quantized_model, revision=None)
-        q_model, config, _ = fetch_from_hub(q_model_path, lazy=True, trust_remote_code=args.trust_remote_code)
+        q_model, config, _ = fetch_from_hub(
+            q_model_path, lazy=True, trust_remote_code=True
+        )
     else:
         q_model = copy.deepcopy(model)
         _, config = quantize_model(
