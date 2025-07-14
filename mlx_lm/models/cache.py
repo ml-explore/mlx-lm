@@ -453,9 +453,9 @@ class RotatingKVCache(_BaseCache):
         raise NotImplementedError("RotatingKVCache Quantization NYI")
 
 
-class MambaCache(_BaseCache):
-    def __init__(self):
-        self.cache = [None, None]
+class ArraysCache(_BaseCache):
+    def __init__(self, size):
+        self.cache = [None] * size
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -470,6 +470,11 @@ class MambaCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.cache = v
+
+
+class MambaCache(ArraysCache):
+    def __init__(self):
+        super().__init__(size=2)
 
 
 class ChunkedKVCache(KVCache):
