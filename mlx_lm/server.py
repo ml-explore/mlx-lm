@@ -737,6 +737,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         self.prompt_cache.tokens.extend(tokens)
 
+        if gen_response.finish_reason is not None:
+            finish_reason = gen_response.finish_reason
+
         logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
         logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
         logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
