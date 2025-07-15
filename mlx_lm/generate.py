@@ -390,7 +390,7 @@ def generate_step(
 
             logits = logits[:, -1, :]
 
-            if logits_processors and (tokens is not None or len(input_tokens) > 0):
+            if logits_processors and len(input_tokens) > 0:
                 tokens = (
                     mx.concat([tokens, input_tokens])
                     if tokens is not None
@@ -406,7 +406,6 @@ def generate_step(
             return sampled, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
-        total_prompt_tokens = prompt.shape[0]
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
