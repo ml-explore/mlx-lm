@@ -844,8 +844,6 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         if self.path.startswith("/v1/models"):
             self.handle_models_request()
-        elif self.path == "/v1/models":
-            self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
         else:
