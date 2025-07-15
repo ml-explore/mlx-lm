@@ -26,12 +26,12 @@ class ModelArgs(BaseModelArgs):
     head_dim: int
     tie_word_embeddings: bool
     rope_scaling: Dict[str, Union[float, str]]
-    sliding_window: int
-    sliding_window_pattern: str
+    sliding_window: Optional[int]
+    sliding_window_pattern: Optional[str]
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, is_local: bool):
+    def __init__(self, args: ModelArgs, is_local: Optional[bool]):
         super().__init__()
 
         dim = args.hidden_size
@@ -49,8 +49,9 @@ class Attention(nn.Module):
 
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-        self.is_local = is_local
-        if is_local:
+        self.is_local = is_local or False
+        self.use_rope = is_local is None or is_local
+        if self.use_rope:
             self.rope = initialize_rope(
                 head_dim,
                 base=args.rope_theta,
@@ -78,11 +79,11 @@ class Attention(nn.Module):
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            if self.is_local:
+            if self.use_rope:
                 queries = self.rope(queries, offset=cache.offset)
                 keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
-        elif self.is_local:
+        elif self.use_rope:
             queries = self.rope(queries)
             keys = self.rope(keys)
 
@@ -144,7 +145,7 @@ class ExaoneModel(nn.Module):
         self.layers = [
             TransformerBlock(
                 args=args,
-                is_local=pattern[i % len(pattern)] == "L",
+                is_local=pattern[i % len(pattern)] == "L" if pattern else None,
             )
             for i in range(args.num_hidden_layers)
         ]
