@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import platform
+import re
 import socket
 import time
 import uuid
@@ -22,6 +23,7 @@ from typing import (
     Tuple,
     Union,
 )
+from urllib.parse import unquote
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
@@ -842,7 +844,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        if re.match(r'^/v1/models(/[^/]+)?$', self.path):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -865,15 +867,12 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /v1/models endpoint.
         """
-        self._set_completion_headers(200)
-        self.end_headers()
-
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
         parts = self.path.split("/")
         filter_repo_id = None
         if len(parts) > 3:
-            filter_repo_id = "/".join(parts[3:])
+            filter_repo_id = unquote(parts[3])
 
         def probably_mlx_lm(repo):
             if repo.repo_type != "model":
@@ -901,7 +900,18 @@ class APIHandler(BaseHTTPRequestHandler):
             for repo in downloaded_models
         ]
 
-        response = {"object": "list", "data": models}
+        if filter_repo_id is not None:
+            if not models:
+                self._set_completion_headers(404)
+                self.end_headers()
+                self.wfile.write(b"Not Found")
+                return
+            response = models[0]
+        else:
+            response = {"object": "list", "data": models}
+
+        self._set_completion_headers(200)
+        self.end_headers()
 
         response_json = json.dumps(response).encode()
         self.wfile.write(response_json)
