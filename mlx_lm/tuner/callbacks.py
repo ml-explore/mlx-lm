@@ -64,12 +64,19 @@ class SwanLabCallback(TrainingCallback):
         self.wrapped_callback = wrapped_callback
         swanlab.init(project=project_name, logdir=log_dir, config=config)
 
+    def _convert_to_serializable(self, data: dict) -> dict:
+        return {k: v.tolist() if hasattr(v, "tolist") else v for k, v in data.items()}
+
     def on_train_loss_report(self, train_info: dict):
-        swanlab.log(train_info, step=train_info.get("iteration"))
+        swanlab.log(
+            self._convert_to_serializable(train_info), step=train_info.get("iteration")
+        )
         if self.wrapped_callback:
             self.wrapped_callback.on_train_loss_report(train_info)
 
     def on_val_loss_report(self, val_info: dict):
-        swanlab.log(val_info, step=val_info.get("iteration"))
+        swanlab.log(
+            self._convert_to_serializable(val_info), step=val_info.get("iteration")
+        )
         if self.wrapped_callback:
             self.wrapped_callback.on_val_loss_report(val_info)
