@@ -34,7 +34,7 @@ class WandBCallback(TrainingCallback):
     
     def _convert_to_serializable(self, data: dict) -> dict:
         return {
-            k: (v.item() if hasattr(v, "item") else v.tolist() if hasattr(v, "tolist") else v)
+            k: v.tolist() if hasattr(v, "tolist") else v
             for k, v in data.items()
         }
 
