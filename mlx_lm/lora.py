@@ -11,7 +11,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tuner.callbacks import WandBCallback
+from .tuner.callbacks import SwanLabCallback, WandBCallback
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -182,6 +182,12 @@ def build_parser():
         default=None,
         help="WandB project name to report training metrics. Disabled if None.",
     )
+    parser.add_argument(
+        "--swanlab",
+        type=str,
+        default=None,
+        help="swanlab project name to report training metrics. Disabled if None.",
+    )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
 
@@ -292,6 +298,13 @@ def run(args, training_callback: TrainingCallback = None):
     if args.wandb is not None:
         training_callback = WandBCallback(
             project_name=args.wandb,
+            log_dir=args.adapter_path,
+            config=vars(args),
+            wrapped_callback=training_callback,
+        )
+    if args.swanlab is not None:
+        training_callback = SwanLabCallback(
+            project_name=args.swanlab,
             log_dir=args.adapter_path,
             config=vars(args),
             wrapped_callback=training_callback,

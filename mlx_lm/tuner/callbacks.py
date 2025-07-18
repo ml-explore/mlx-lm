@@ -5,6 +5,11 @@ try:
 except ImportError:
     wandb = None
 
+try:
+    import swanlab
+except ImportError:
+    swanlab = None
+
 
 class TrainingCallback:
 
@@ -39,5 +44,32 @@ class WandBCallback(TrainingCallback):
 
     def on_val_loss_report(self, val_info: dict):
         wandb.log(val_info, step=val_info.get("iteration"))
+        if self.wrapped_callback:
+            self.wrapped_callback.on_val_loss_report(val_info)
+
+
+class SwanLabCallback(TrainingCallback):
+    def __init__(
+        self,
+        project_name: str,
+        log_dir: str,
+        config: dict,
+        wrapped_callback: TrainingCallback = None,
+    ):
+        if swanlab is None:
+            raise ImportError(
+                "swanlab is not installed. Please install it with `pip install swanlab`"
+                " to use SwanLabCallback."
+            )
+        self.wrapped_callback = wrapped_callback
+        swanlab.init(project=project_name, logdir=log_dir, config=config)
+
+    def on_train_loss_report(self, train_info: dict):
+        swanlab.log(train_info, step=train_info.get("iteration"))
+        if self.wrapped_callback:
+            self.wrapped_callback.on_train_loss_report(train_info)
+
+    def on_val_loss_report(self, val_info: dict):
+        swanlab.log(val_info, step=val_info.get("iteration"))
         if self.wrapped_callback:
             self.wrapped_callback.on_val_loss_report(val_info)
