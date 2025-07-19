@@ -251,6 +251,33 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_lfm2(self):
+        from mlx_lm.models import lfm2
+
+        args = lfm2.ModelArgs(
+            model_type="lfm2",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            norm_eps=1e-5,
+            vocab_size=10_000,
+            full_attn_idxs=[0, 1, 2],
+            rope_theta=10000,
+            block_dim=1024,
+            block_ffn_dim_multiplier=1.5,
+            block_auto_adjust_ff_dim=True,
+            block_ff_dim=2048,
+            block_multiple_of=256,
+            max_position_embeddings=1000,
+            conv_bias=True,
+            conv_L_cache=3,
+        )
+        model = lfm2.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_bitnet(self):
         from mlx_lm.models import bitnet
 

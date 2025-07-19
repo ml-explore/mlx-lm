@@ -48,6 +48,9 @@ class TestTokenizers(unittest.TestCase):
         tokens = tokenizer.encode("こんにちは！私の名前はAI")
         check(tokens)
 
+        tokens = tokenizer.encode("⊕ ⊻ ∧ ¬")
+        check(tokens)
+
         tokens = tokenizer.encode("a ,b")
         check(tokens)
 

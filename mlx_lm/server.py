@@ -737,6 +737,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         self.prompt_cache.tokens.extend(tokens)
 
+        if gen_response.finish_reason is not None:
+            finish_reason = gen_response.finish_reason
+
         logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
         logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
         logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
@@ -839,7 +842,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path == "/v1/models":
+        if self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -867,10 +870,17 @@ class APIHandler(BaseHTTPRequestHandler):
 
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
+        parts = self.path.split("/")
+        filter_repo_id = None
+        if len(parts) > 3:
+            filter_repo_id = "/".join(parts[3:])
+
         def probably_mlx_lm(repo):
             if repo.repo_type != "model":
                 return False
             if "main" not in repo.refs:
+                return False
+            if filter_repo_id is not None and repo.repo_id != filter_repo_id:
                 return False
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)

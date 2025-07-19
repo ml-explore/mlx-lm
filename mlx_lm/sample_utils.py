@@ -16,7 +16,7 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: List[int] = [],
-) -> Callable[mx.array, mx.array]:
+) -> Callable[[mx.array], mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
 

@@ -41,9 +41,10 @@ from .tuner.utils import get_total_parameters, load_adapters
 
 # Constants
 MODEL_REMAPPING = {
-    "mistral": "llama",  # mistral is compatible with llama
+    "mistral": "llama",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "kimi_k2": "deepseek_v3",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -79,7 +80,9 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def get_model_path(
+    path_or_hf_repo: str, revision: Optional[str] = None
+) -> Tuple[Path, Optional[str]]:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -140,7 +143,7 @@ def load_model(
     strict: bool = True,
     model_config: dict = {},
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
-) -> nn.Module:
+) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
 
@@ -158,7 +161,7 @@ def load_model(
             Defaults to the ``_get_classes`` function.
 
     Returns:
-        nn.Module: The loaded and initialized model.
+        Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
@@ -450,7 +453,7 @@ def quantize_model(
     quant_predicate: Optional[
         Callable[[str, nn.Module, dict], Union[bool, dict]]
     ] = None,
-) -> Tuple:
+) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
 

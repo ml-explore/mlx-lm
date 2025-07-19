@@ -89,7 +89,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if (
+            if self._current_text.endswith("\ufffd") or (
                 self._tokenizer.clean_up_tokenization_spaces
                 and len(self._current_text) > 0
                 and self._current_text[-1] == " "

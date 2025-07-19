@@ -30,8 +30,9 @@ class Catcher(nn.Module):
         self.module = module
 
     def __call__(self, *args, **kwargs):
-        self.outputs = self.module(*args, **kwargs)
-        return self.outputs
+        outputs = self.module(*args, **kwargs)
+        self.outputs = outputs[0] if isinstance(outputs, tuple) else outputs
+        return outputs
 
 
 def dwq_quantize(
@@ -213,7 +214,9 @@ def main():
     mx.random.seed(args.seed)
 
     model_path, hf_repo = get_model_path(args.model, revision=None)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+    model, config, tokenizer = fetch_from_hub(
+        model_path, lazy=True, trust_remote_code=True
+    )
 
     calibration_data = load_data(
         tokenizer, args.data_path, args.num_samples, args.max_seq_length
@@ -221,7 +224,9 @@ def main():
 
     if args.quantized_model is not None:
         q_model_path = get_model_path(args.quantized_model, revision=None)
-        q_model, config, _ = fetch_from_hub(q_model_path, lazy=True)
+        q_model, config, _ = fetch_from_hub(
+            q_model_path, lazy=True, trust_remote_code=True
+        )
     else:
         q_model = copy.deepcopy(model)
         _, config = quantize_model(
