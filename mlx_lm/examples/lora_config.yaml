@@ -67,6 +67,9 @@ max_seq_length: 2048
 # Use gradient checkpointing to reduce memory use.
 grad_checkpoint: false
 
+# Gradient accumulation steps for large models that cannot fit the batch size in memory.
+gradient_accumulation_steps: 1
+
 # LoRA parameters can only be specified in a config file
 lora_parameters:
   # The layer keys to apply LoRA to.
