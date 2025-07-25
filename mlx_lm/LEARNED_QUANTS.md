@@ -22,7 +22,7 @@ quantized model can be further refined with DWQ.
 To get started, first install the requirements:
 
 ```
-pip install mlx-lm[quant]
+pip install "mlx-lm[train]"
 ```
 
 ### DWQ
