@@ -247,6 +247,7 @@ def train_model(
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
+        early_stopping=args.early_stopping,
     )
 
     # Initialize the selected optimizer

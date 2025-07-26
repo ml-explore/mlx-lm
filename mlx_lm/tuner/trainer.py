@@ -64,7 +64,10 @@ class TrainingArgs:
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
     )
-
+    early_stopping: bool = field(
+        default=False,
+        metadata={"help": "Whether to stop when the evaluation loss increases, and overfitting starts."},
+    )
 
 def default_loss(model, batch, lengths):
     inputs = batch[:, :-1]
@@ -233,6 +236,7 @@ def train(
     trained_tokens = 0
     train_time = 0
     # Main training loop
+    last_validation_loss = float("inf")
     for it, batch in zip(
         range(1, args.iters + 1),
         iterate_batches(
@@ -273,6 +277,13 @@ def train(
                     "val_time": val_time,
                 }
                 training_callback.on_val_loss_report(val_info)
+            if args.early_stopping and val_loss > last_validation_loss:
+                print(
+                    f"Early stopping at iteration {it}, "
+                    f"validation loss {val_loss} is higher than the previous loss {last_validation_loss}."
+                )
+                break
+            last_validation_loss = val_loss
 
             tic = time.perf_counter()
 
@@ -336,6 +347,7 @@ def train(
 
     # Save final weights
     if rank == 0:
-        adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+        if not args.early_stopping:  # if early stopping is not used, save the final weights, otherwise the last checkpoint is the best model
+            adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
         print(f"Saved final weights to {args.adapter_file}.")
