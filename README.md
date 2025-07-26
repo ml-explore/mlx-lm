@@ -12,6 +12,7 @@ Some key features include:
   fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
   with support for quantized models.
 * Distributed inference and fine-tuning with `mx.distributed`
+* Supports experiment tracking using SwanLab and W&B.
 
 The easiest way to get started is to install the `mlx-lm` package:
 
