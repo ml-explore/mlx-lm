@@ -188,6 +188,12 @@ def build_parser():
         default=None,
         help="WandB project name to report training metrics. Disabled if None.",
     )
+    parser.add_argument(
+        "--early-stopping",
+        help="Stop when the evaluation loss increases, and overfitting starts.",
+        action="store_true",
+    )
+
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
 
