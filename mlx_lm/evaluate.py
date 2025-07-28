@@ -20,6 +20,7 @@ import mlx.nn as nn
 import numpy as np
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
+from lm_eval.models import huggingface
 from tqdm import tqdm
 
 from .generate import stream_generate
@@ -62,7 +63,7 @@ def chat_template_fn(**extra_kwargs):
 @register_model("mlxlm")
 class MLXLM(LM):
 
-    tokenizer_name = lm_eval.models.huggingface.HFLM.tokenizer_name
+    tokenizer_name = huggingface.HFLM.tokenizer_name
     apply_chat_template = chat_template_fn()
 
     def __init__(
@@ -367,8 +368,8 @@ def main():
     parser.add_argument(
         "--chat-template-args",
         type=json.loads,
-        help="""A JSON formatted string of arguments for the tokenizer's "
-        "apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        help="""A JSON formatted string of arguments for the tokenizer's
+        apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
 

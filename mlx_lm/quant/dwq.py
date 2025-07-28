@@ -13,7 +13,8 @@ from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 from mlx_lm.tuner.datasets import load_dataset
-from mlx_lm.tuner.trainer import iterate_batches
+from mlx_lm.tuner.losses import kl_div_loss
+from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
     fetch_from_hub,
@@ -29,8 +30,9 @@ class Catcher(nn.Module):
         self.module = module
 
     def __call__(self, *args, **kwargs):
-        self.outputs = self.module(*args, **kwargs)
-        return self.outputs
+        outputs = self.module(*args, **kwargs)
+        self.outputs = outputs[0] if isinstance(outputs, tuple) else outputs
+        return outputs
 
 
 def dwq_quantize(
@@ -43,6 +45,7 @@ def dwq_quantize(
     activation_layer_step: float = 0.25,
     activation_loss_weight: float = 1.0,
     dtype: mx.Dtype = mx.bfloat16,
+    gradient_checkpoint: bool = False,
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -62,22 +65,22 @@ def dwq_quantize(
         model.layers[lid] = Catcher(model.layers[lid])
         q_model.layers[lid] = Catcher(q_model.layers[lid])
 
-    def log_norm(x):
-        return x - mx.logsumexp(x, axis=-1, keepdims=True)
+    if gradient_checkpoint:
+        grad_checkpoint(q_model.layers[0])
 
     def forward(model, inputs):
-        logprobs = log_norm(model(inputs).astype(mx.float32))
+        logits = model(inputs)
         extra_targets = [
             model.layers[lid].outputs.astype(mx.float32) for lid in layer_ids
         ]
         for lid in layer_ids:
             model.layers[lid].outputs = None
-        return logprobs, extra_targets
+        return logits, extra_targets
 
     def loss_fn(params, x, targets, extra_targets, lengths):
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
-        logprobs, q_extra_targets = forward(q_model, x)
-        losses = nn.losses.kl_div_loss(logprobs, targets, reduction="none")
+        logits, q_extra_targets = forward(q_model, x)
+        losses = kl_div_loss(logits, targets)
         mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
         kl_loss = (mask * losses).sum() / ntoks
@@ -194,6 +197,11 @@ def main():
         default="allenai/tulu-3-sft-mixture",
         help="A Hugging Face dataset which is compatible with an mlx-lm dataset format.",
     )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Use gradient checkpointing to reduce memory use.",
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -205,8 +213,10 @@ def main():
     np.random.seed(args.seed)
     mx.random.seed(args.seed)
 
-    model_path = get_model_path(args.model, revision=None)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+    model_path, hf_repo = get_model_path(args.model, revision=None)
+    model, config, tokenizer = fetch_from_hub(
+        model_path, lazy=True, trust_remote_code=True
+    )
 
     calibration_data = load_data(
         tokenizer, args.data_path, args.num_samples, args.max_seq_length
@@ -214,7 +224,9 @@ def main():
 
     if args.quantized_model is not None:
         q_model_path = get_model_path(args.quantized_model, revision=None)
-        q_model, config, _ = fetch_from_hub(q_model_path, lazy=True)
+        q_model, config, _ = fetch_from_hub(
+            q_model_path, lazy=True, trust_remote_code=True
+        )
     else:
         q_model = copy.deepcopy(model)
         _, config = quantize_model(
@@ -232,6 +244,7 @@ def main():
         calibration_data,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
+        gradient_checkpoint=args.grad_checkpoint,
     )
     save(
         args.mlx_path,
@@ -239,5 +252,5 @@ def main():
         q_model,
         tokenizer,
         config,
-        hf_repo=args.model,
+        hf_repo=hf_repo,
     )

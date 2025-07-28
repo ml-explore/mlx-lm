@@ -53,12 +53,6 @@ class QuantizedSwitchLinear(nn.Module):
         # Freeze this model's parameters
         self.freeze()
 
-    def unfreeze(self, *args, **kwargs):
-        """Wrap unfreeze so that we unfreeze any layers we might contain but
-        our parameters will remain frozen."""
-        super().unfreeze(*args, **kwargs)
-        self.freeze(recurse=False)
-
     @property
     def input_dims(self):
         return self.scales.shape[2] * self.group_size
@@ -163,7 +157,8 @@ class SwitchGLU(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-
+        if self.training:
+            idx = mx.stop_gradient(idx)
         x_up = self.up_proj(x, idx, sorted_indices=do_sort)
         x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
@@ -203,7 +198,8 @@ class SwitchMLP(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-
+        if self.training:
+            idx = mx.stop_gradient(idx)
         x = self.fc1(x, idx, sorted_indices=do_sort)
         x = self.activation(x)
         x = self.fc2(x, idx, sorted_indices=do_sort)

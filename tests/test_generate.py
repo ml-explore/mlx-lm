@@ -104,7 +104,7 @@ class TestGenerate(unittest.TestCase):
         for generation_result in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
-            prompt=[],  # no prompt tokens passed
+            prompt=prompt,
             max_tokens=5,
             sampler=sampler,
             input_embeddings=prompt_embeddings,
@@ -136,7 +136,7 @@ class TestGenerate(unittest.TestCase):
         for generation_result in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
-            prompt=[],  # no prompt tokens passed
+            prompt=prompt,
             max_tokens=5,
             sampler=sampler,
             input_embeddings=prompt_embeddings,

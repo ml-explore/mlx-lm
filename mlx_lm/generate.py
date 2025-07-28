@@ -329,8 +329,8 @@ def generate_step(
            when ``kv_bits`` is non-None. Default: ``0``.
         prompt_progress_callback (Callable[int, int]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
-        input_embeddings (mx.array, optional): Input embeddings to use in place of
-           prompt tokens. Default: ``None``.
+        input_embeddings (mx.array, optional): Input embeddings to use instead of or in
+          conjunction with prompt tokens. Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -338,10 +338,16 @@ def generate_step(
     if input_embeddings is not None:
         if not does_model_support_input_embeddings(model):
             raise ValueError("Model does not support input embeddings.")
-        if len(prompt) != 0:
+        elif len(prompt) > 0 and len(prompt) != len(input_embeddings):
             raise ValueError(
-                "If using input embeddings, prompt tokens must be an empty array."
+                f"When providing input_embeddings, their sequence length ({len(input_embeddings)}) "
+                f"must match the sequence length of the prompt ({len(prompt)}), or the "
+                "prompt must be empty."
             )
+    elif len(prompt) == 0:
+        raise ValueError(
+            "Either input_embeddings or prompt (or both) must be provided."
+        )
 
     tokens = None
 
@@ -363,47 +369,69 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    def _model_call(y):
-        if y.ndim == 3:
-            return model(None, cache=prompt_cache, input_embeddings=y)
+    def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+        if input_embeddings is not None:
+            return model(
+                input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
+            )
         else:
-            return model(y, cache=prompt_cache)
+            return model(input_tokens, cache=prompt_cache)
 
-    def _step(y):
+    def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
 
         with mx.stream(generation_stream):
-            logits = _model_call(y[None])
+            logits = _model_call(
+                input_tokens=input_tokens[None],
+                input_embeddings=(
+                    input_embeddings[None] if input_embeddings is not None else None
+                ),
+            )
 
             logits = logits[:, -1, :]
 
-            if logits_processors and input_embeddings is None:
-                tokens = mx.concat([tokens, y]) if tokens is not None else y
+            if logits_processors and len(input_tokens) > 0:
+                tokens = (
+                    mx.concat([tokens, input_tokens])
+                    if tokens is not None
+                    else input_tokens
+                )
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
 
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
-            y = sampler(logprobs)
-            return y, logprobs.squeeze(0)
+            sampled = sampler(logprobs)
+            return sampled, logprobs.squeeze(0)
 
-    using_embeddings = input_embeddings is not None
-
-    y = input_embeddings if using_embeddings else prompt
     with mx.stream(generation_stream):
-        total_prompt_tokens = y.shape[0]
+        total_prompt_tokens = (
+            len(input_embeddings) if input_embeddings is not None else len(prompt)
+        )
         prompt_processed_tokens = 0
-        while y.shape[0] > prefill_step_size:
-            _model_call(y[:prefill_step_size][None])
+        while total_prompt_tokens - prompt_processed_tokens > prefill_step_size:
+            _model_call(
+                input_tokens=prompt[:prefill_step_size][None],
+                input_embeddings=(
+                    input_embeddings[:prefill_step_size][None]
+                    if input_embeddings is not None
+                    else None
+                ),
+            )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt_processed_tokens += prefill_step_size
-            y = y[prefill_step_size:]
+            prompt = prompt[prefill_step_size:]
+            input_embeddings = (
+                input_embeddings[prefill_step_size:]
+                if input_embeddings is not None
+                else input_embeddings
+            )
             mx.clear_cache()
 
-        y, logprobs = _step(y)
+        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
     mx.async_eval(y, logprobs)
     n = 0
