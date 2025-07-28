@@ -223,7 +223,7 @@ def main():
     )
 
     if args.quantized_model is not None:
-        q_model_path = get_model_path(args.quantized_model, revision=None)
+        q_model_path, _ = get_model_path(args.quantized_model, revision=None)
         q_model, config, _ = fetch_from_hub(
             q_model_path, lazy=True, trust_remote_code=True
         )
