@@ -43,7 +43,13 @@ CONFIG_DEFAULTS = {
     "train": False,
     "fine_tune_type": "lora",
     "optimizer": "adam",
-    "optimizer_config": {"adam": {}, "adamw": {}, "sgd": {}, "adafactor": {}},
+    "optimizer_config": {
+        "adam": {},
+        "adamw": {},
+        "muon": {},
+        "sgd": {},
+        "adafactor": {},
+    },
     "data": "data/",
     "seed": 0,
     "num_layers": 16,
@@ -260,6 +266,8 @@ def train_model(
         opt_class = optim.Adam
     elif optimizer_name == "adamw":
         opt_class = optim.AdamW
+    elif optimizer_name == "muon":
+        opt_class = optim.Muon
     elif optimizer_name == "sgd":
         opt_class = optim.SGD
     elif optimizer_name == "adafactor":

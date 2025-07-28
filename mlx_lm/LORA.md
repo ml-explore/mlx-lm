@@ -26,6 +26,12 @@ LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
 
 ## Run
 
+First, make sure you have the training dependenices installed:
+
+```shell
+pip install "mlx-lm[train]"
+```
+
 The main command is `mlx_lm.lora`. To see a full list of command-line options run:
 
 ```shell
