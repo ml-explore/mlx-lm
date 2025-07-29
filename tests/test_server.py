@@ -89,6 +89,30 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_handle_silly_tavern_completions(self):
+        url = f"http://localhost:{self.port}/completion"
+
+        post_data = {
+            "model": "",
+            "prompt": "Once upon a time",
+            "max_tokens": 10,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "repetition_penalty": 1.1,
+            "repetition_context_size": 20,
+            "logit_bias": [[10, -1], [20, -2]],
+            "xtc_probability": 0,
+            "xtc_threshold": 0,
+            "stop": "stop sequence",
+        }
+
+        response = requests.post(url, json=post_data)
+
+        response_body = response.text
+
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {

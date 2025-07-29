@@ -284,6 +284,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         endpoints = {
             "/v1/completions": self.handle_text_completions,
+            "/completion": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
         }
@@ -308,6 +309,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
+        if self.requested_model == "":
+            self.requested_model = "default_model"
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
@@ -408,19 +411,26 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if self.logit_bias is not None:
             if not isinstance(self.logit_bias, dict):
-                raise ValueError("logit_bias must be a dict of int to float")
+                if isinstance(self.logit_bias, list):
+                    try:
+                        self.logit_bias = {x[0]: x[1] for x in self.logit_bias}
+                    except:
+                        self.logit_bias = None
+                if not isinstance(self.logit_bias, dict):
+                    raise ValueError("logit_bias must be a dict of int to float")
 
             try:
                 self.logit_bias = {int(k): v for k, v in self.logit_bias.items()}
             except ValueError:
                 raise ValueError("logit_bias must be a dict of int to float")
         if not (
-            isinstance(self.xtc_probability, float)
+            isinstance(self.xtc_probability, (float, int))
             and 0.00 <= self.xtc_probability <= 1.00
         ):
             raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
         if not (
-            isinstance(self.xtc_threshold, float) and 0.00 <= self.xtc_threshold <= 0.50
+            isinstance(self.xtc_threshold, (float, int))
+            and 0.00 <= self.xtc_threshold <= 0.50
         ):
             raise ValueError(f"xtc_threshold must be a float between 0.00 and 0.5")
         if not isinstance(self.requested_model, str):
