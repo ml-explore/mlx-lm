@@ -151,7 +151,7 @@ def group_expert_select(
         scores = mx.flatten(scores, -2, -1)
 
     k = top_k
-    inds = mx.stop_gradient(mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k])
+    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
