@@ -543,7 +543,7 @@ class APIHandler(BaseHTTPRequestHandler):
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
-            ValueError(f"Unsupported response type: {self.object_type}")
+            raise ValueError(f"Unsupported response type: {self.object_type}")
 
         return response
 
