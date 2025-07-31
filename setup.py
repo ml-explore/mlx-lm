@@ -27,7 +27,7 @@ setup(
     packages=["mlx_lm", "mlx_lm.models", "mlx_lm.quant", "mlx_lm.tuner"],
     python_requires=">=3.8",
     extras_require={
-        "test": ["datasets"],
+        "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
     },
