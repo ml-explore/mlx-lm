@@ -265,6 +265,13 @@ def load(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
 
+    if tokenizer.chat_template is None:
+        template_path = model_path / "chat_template.jinja"
+        if template_path.exists() and template_path.is_file():
+            with open(template_path, "r", encoding="utf-8") as f:
+                chat_template_content = f.read()
+            tokenizer.chat_template = chat_template_content
+
     return model, tokenizer
 
 
