@@ -96,33 +96,51 @@ def dwq_quantize(
                 for qe, e in zip(q_extra_targets, extra_targets)
             ]
         )
-        loss = kl_loss + activation_loss_weight * act_loss.mean()
-        return loss, ntoks
+        act_loss = act_loss.mean()
+        loss = kl_loss + activation_loss_weight * act_loss
+        return loss, ntoks, kl_loss, act_loss
 
     def step(inputs, targets, extra_targets, lengths, params):
-        (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
+        (loss, ntoks, *_), grads = mx.value_and_grad(loss_fn)(
             params, inputs, targets, extra_targets, lengths
         )
         grads = nn.average_gradients(grads)
         params = opt.apply_gradients(grads, params)
         return loss, ntoks, params
 
-    def validate(params):
+    def validate(params, it):
         v_loss = 0.0
+        v_kl_loss = 0.0
+        v_act_loss = 0.0
         v_tokens = 0
-        for it, (batch, lengths) in enumerate(
-            iterate_batches(valid_data, batch_size, max_seq_length)
+        for it, (batch, lengths) in tqdm(
+            enumerate(iterate_batches(valid_data, batch_size, max_seq_length)),
+            total=len(valid_data) // batch_size,
+            desc="Computing validation loss",
+            leave=False,
         ):
             batch = batch[:, :-1]
             targets, extra_targets = forward(model, batch)
             mx.eval(targets, extra_targets)
-            loss, ntoks = loss_fn(params, batch, targets, extra_targets, lengths)
+            loss, ntoks, kl_loss, act_loss = loss_fn(
+                params, batch, targets, extra_targets, lengths
+            )
             mx.eval(loss, ntoks)
             loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
+            kl_loss = mx.distributed.all_sum(kl_loss, stream=mx.cpu).item() / world_size
+            act_loss = (
+                mx.distributed.all_sum(act_loss, stream=mx.cpu).item() / world_size
+            )
             ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
             v_tokens += ntoks
             v_loss += loss * ntoks
-        return v_loss / v_tokens
+            v_kl_loss += kl_loss * ntoks
+            v_act_loss += act_loss * ntoks
+        loss = v_loss / v_tokens
+        kl_loss = v_kl_loss / v_tokens
+        act_loss = v_act_loss / v_tokens
+        rprint(f"Validation: {it=}, {loss=:.3f}, {kl_loss=:.3f}, {act_loss=:.3f}")
+        return loss
 
     # Accumulate learned weights in higher precision
     params = tree_map(
@@ -137,9 +155,7 @@ def dwq_quantize(
     tic = time.time()
 
     # Compute initial validation loss
-    rprint(f"Runnning initial validation...", end="")
-    initial_valid_loss = valid_loss = validate(params)
-    rprint(f"it=0, {valid_loss=:.3f}")
+    initial_valid_loss = valid_loss = validate(params, it=0)
 
     for it, (batch, lengths) in (
         pbar := tqdm(
@@ -171,13 +187,9 @@ def dwq_quantize(
                 tokens = 0
                 total_loss = 0
         if (it + 1) % 200 == 0:
-            rprint(f"Running validation...", end="")
-            valid_loss = validate(params)
-            rprint(f"{it=}, {valid_loss=:.3f}")
+            valid_loss = validate(params, it=it)
 
-    rprint(f"Running validation...", end="")
-    valid_loss = validate(params)
-    rprint(f"{it=}, {valid_loss=:.3f}")
+    valid_loss = validate(params, it=it)
     if initial_valid_loss < valid_loss:
         rprint(
             f"❌❌❌\n[WARNING] Final validation loss {valid_loss:.3f} is "
