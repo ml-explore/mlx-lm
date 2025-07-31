@@ -769,7 +769,12 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(prompt), len(tokens))
+                original_prompt_length = (
+                    len(self.prompt_cache.tokens) - len(tokens) + len(prompt)
+                )
+                response = self.completion_usage_response(
+                    original_prompt_length, len(tokens)
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
