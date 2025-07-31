@@ -297,7 +297,23 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = int(self.headers["Content-Length"])
         raw_body = self.rfile.read(content_length)
-        self.body = json.loads(raw_body.decode())
+        try:
+            self.body = json.loads(raw_body.decode())
+        except json.JSONDecodeError as e:
+            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
+            # Set appropriate headers based on streaming requirement
+            if self.stream:
+                self._set_stream_headers(400)
+                self.wfile.write(
+                    f"data: {json.dumps({'error': f'Invalid JSON in request body: {e}'})}\n\n".encode()
+                )
+            else:
+                self._set_completion_headers(400)
+                self.wfile.write(
+                    json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+                )
+            return
+
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
         assert isinstance(
