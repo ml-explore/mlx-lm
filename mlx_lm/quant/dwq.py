@@ -55,6 +55,7 @@ def dwq_quantize(
         if hasattr(m, "bits") and hasattr(m, "group_size"):
             m.unfreeze(keys=["scales", "biases"], recurse=False)
 
+    q_model.train()
     q_model.apply_to_modules(unfreeze)
     print_trainable_parameters(q_model)
 

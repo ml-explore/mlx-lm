@@ -476,7 +476,7 @@ class LanguageModel(nn.Module):
         per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = self.make_cache()
 
         if mask is None:
             full_mask = create_attention_mask(
