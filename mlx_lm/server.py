@@ -487,15 +487,17 @@ class APIHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
-                    "logprobs": {
-                        "token_logprobs": token_logprobs,
-                        "top_logprobs": top_logprobs,
-                        "tokens": tokens,
-                    },
                     "finish_reason": finish_reason,
                 },
             ],
         }
+
+        if token_logprobs or top_logprobs or tokens:
+            response["choices"][0]["logprobs"] = {
+                "token_logprobs": token_logprobs,
+                "top_logprobs": top_logprobs,
+                "tokens": tokens,
+            }
 
         if not self.stream:
             if not (
