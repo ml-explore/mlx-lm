@@ -276,8 +276,8 @@ class MLXLM(LM):
         )
         inputs = self._tokenize([req.args[0] for req in requests])
         all_scores = []
-        for i in tqdm(range(0, len(texts), self._batch_size)):
-            batch = texts[i : i + self._batch_size]
+        for i in tqdm(range(0, len(inputs), self._batch_size)):
+            batch = inputs[i : i + self._batch_size]
             scores, lengths, _ = self._score_fn(batch)
             mask = mx.arange(scores.shape[-1]) < lengths[:, None]
             all_scores.extend((mask * scores).sum(axis=-1).tolist())
