@@ -236,8 +236,19 @@ def load_data(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", "-m", default="Qwen/Qwen3-4B")
-    parser.add_argument("--quantized-model", default=None)
+    parser.add_argument(
+        "--model",
+        "-m",
+        help="A model to distill from for DWQ. If `quantized-model` is not"
+        " given the student model will be this model quantized according"
+        " to `bits` and `group-size`.",
+        required=True,
+    )
+    parser.add_argument(
+        "--quantized-model",
+        default=None,
+        help="An already quantized model (the student model) to improve with DWQ.",
+    )
     parser.add_argument(
         "--mlx-path", default="mlx_model", help="Path to save the quantized model."
     )
@@ -296,6 +307,8 @@ def main():
         q_model, config, _ = fetch_from_hub(
             q_model_path, lazy=True, trust_remote_code=True
         )
+        if "quantization" not in config:
+            raise ValueError("Quantized model must already be quantized.")
     else:
         q_model = copy.deepcopy(model)
         _, config = quantize_model(
