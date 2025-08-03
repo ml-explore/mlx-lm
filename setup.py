@@ -30,6 +30,7 @@ setup(
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
+        "mistral": ["mistral-common"],
     },
     entry_points={
         "console_scripts": [
