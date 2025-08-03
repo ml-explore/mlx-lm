@@ -372,6 +372,12 @@ def main():
         apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
+    parser.add_argument(
+        "--confirm-run-unsafe-code",
+        action="store_true",
+        help="Confirm that you want to run tasks that execute untrusted code.",
+        default=False,
+    )
 
     args = parser.parse_args()
 
@@ -401,6 +407,7 @@ def main():
         numpy_random_seed=args.seed,
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
+        confirm_run_unsafe_code=args.confirm_run_unsafe_code,
     )
 
     file_keys = ["eval", args.model.replace("/", "_"), version("lm_eval")]
