@@ -210,6 +210,12 @@ def configure_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        help="Trust remote code when loading tokenizer.",
+        action="store_true",
+        default=False,
+    )
     return parser
 
 

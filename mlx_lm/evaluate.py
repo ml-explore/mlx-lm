@@ -71,9 +71,13 @@ class MLXLM(LM):
         path_or_hf_repo: str,
         max_tokens: Optional[int] = None,
         use_chat_template: Optional[bool] = None,
+        trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
-        self._model, self.tokenizer = load(path_or_hf_repo)
+        tokenizer_config = {"trust_remote_code": True if trust_remote_code else None}
+        self._model, self.tokenizer = load(
+            path_or_hf_repo, tokenizer_config=tokenizer_config
+        )
         self._max_tokens = max_tokens or self.tokenizer.model_max_length
         self._batch_size = 8
         self.use_chat_template = use_chat_template
@@ -378,6 +382,11 @@ def main():
         help="Confirm that you want to run tasks that execute untrusted code.",
         default=False,
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
+    )
 
     args = parser.parse_args()
 
@@ -393,6 +402,7 @@ def main():
         args.model,
         max_tokens=args.max_tokens,
         use_chat_template=args.apply_chat_template,
+        trust_remote_code=args.trust_remote_code,
     )
     MLXLM.apply_chat_template = chat_template_fn(**args.chat_template_args)
 

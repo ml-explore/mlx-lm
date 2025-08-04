@@ -1039,6 +1039,38 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_hunyuan_v1_dense(self):
+        from mlx_lm.models import hunyuan_v1_dense
+
+        args = hunyuan_v1_dense.ModelArgs(
+            model_type="hunyuan_v1_dense",
+            hidden_size=128,
+            attention_bias=False,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-4,
+            rope_theta=1000,
+            vocab_size=1000,
+            use_qk_norm=True,
+            rope_scaling={
+                "alpha": 1000.0,
+                "factor": 1.0,
+                "type": "dynamic",
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0,
+                "mscale_all_dim": 0.0,
+                "original_max_position_embeddings": 8192,
+            },
+            max_position_embeddings=32768,
+        )
+        model = hunyuan_v1_dense.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_olmo2(self):
         from mlx_lm.models import olmo2
 
