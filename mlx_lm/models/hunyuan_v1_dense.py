@@ -25,6 +25,7 @@ class ModelArgs(BaseModelArgs):
     use_qk_norm: bool = True
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
+    head_dim: Optional[int] = None
 
     def __post_init__(self):
         if self.rope_scaling:
@@ -65,7 +66,10 @@ class Attention(nn.Module):
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        head_dim = (
+            args.head_dim if args.head_dim is not None else args.hidden_size // n_heads
+        )
+        self.head_dim = head_dim
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=args.attention_bias)
@@ -98,9 +102,13 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -213,17 +221,45 @@ class Model(nn.Module):
         return self.model.embed_tokens.as_linear(out)
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.gate_and_up_proj.weight" in weights:
-            new_weights = {}
+        new_weights = {}
+
+        has_qkv = "model.layers.0.self_attn.qkv_proj.weight" in weights
+        has_gate_up = "model.layers.0.mlp.gate_and_up_proj.weight" in weights
+
+        if has_qkv or has_gate_up:
+            n_heads = self.args.num_attention_heads
+            n_kv_heads = self.args.num_key_value_heads
+            head_dim = (
+                self.args.head_dim
+                if self.args.head_dim is not None
+                else self.args.hidden_size // n_heads
+            )
+
             for k, v in weights.items():
-                if "gate_and_up_proj" in k:
-                    splits = v.split(2, axis=0)
-                    for k_up, v_new in zip(["gate_proj", "up_proj"], splits):
-                        k_new = k.replace("gate_and_up_proj", k_up)
-                        new_weights[k_new] = v_new
+                if "qkv_proj" in k and has_qkv:
+                    q_size = n_heads * head_dim
+                    k_size = n_kv_heads * head_dim
+                    v_size = n_kv_heads * head_dim
+
+                    q_proj, k_proj, v_proj = v.split([q_size, k_size, v_size], axis=0)
+
+                    k_new = k.replace("qkv_proj", "q_proj")
+                    new_weights[k_new] = q_proj
+                    k_new = k.replace("qkv_proj", "k_proj")
+                    new_weights[k_new] = k_proj
+                    k_new = k.replace("qkv_proj", "v_proj")
+                    new_weights[k_new] = v_proj
+
+                elif "gate_and_up_proj" in k and has_gate_up:
+                    gate_proj, up_proj = v.split(2, axis=0)
+                    k_new = k.replace("gate_and_up_proj", "gate_proj")
+                    new_weights[k_new] = gate_proj
+                    k_new = k.replace("gate_and_up_proj", "up_proj")
+                    new_weights[k_new] = up_proj
                 else:
                     new_weights[k] = v
-            weights = new_weights
+
+            return new_weights
 
         return weights
 
