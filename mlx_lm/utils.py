@@ -476,6 +476,8 @@ def quantize_model(
     quantized_config = copy.deepcopy(config)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
+    quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+
     def base_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
@@ -487,8 +489,9 @@ def quantize_model(
     def wrapped_predicate(p, m):
         bool_or_params = base_predicate(p, m)
         if bool_or_params:
-            bool_or_params = quant_predicate(p, m, config)
-        quantized_config["quantization"][p] = bool_or_params
+            bool_or_params = quant_predicate(p, m)
+        if isinstance(bool_or_params, dict):
+            quantized_config["quantization"][p] = bool_or_params
         return bool_or_params
 
     nn.quantize(
