@@ -32,21 +32,14 @@ class ModelArgs(BaseModelArgs):
 
 ### BEGIN MLX PSEUDO-OPERATORS ###
 # These operators emulate particular methods in torch that don't exist in MLX natively
-def mlx_topk_sorted(a, k, axis=-1):
-    """MLX equivalent of torch.topk with sorted=True"""
-    # TODO(christian): this may not be well optimized
+def mlx_topk(a, k, axis=-1):
+    """MLX equivalent of torch.topk"""
     partitioned_indices = mx.argpartition(a, kth=-k, axis=axis)
     # Extract only the top k indices (last k elements after partition)
     top_k_indices = partitioned_indices[..., -k:]
-
     # Get the corresponding values
     top_k_values = mx.take_along_axis(a, top_k_indices, axis=axis)
-    sort_order = mx.argsort(top_k_values, axis=axis)[..., ::-1]
-
-    final_values = mx.take_along_axis(top_k_values, sort_order, axis=axis)
-    final_indices = mx.take_along_axis(top_k_indices, sort_order, axis=axis)
-
-    return final_values, final_indices
+    return top_k_values, top_k_indices
 
 
 ### END MLX PSEUDO-OPERATORS ###
@@ -223,18 +216,6 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     return out_glu * (x_linear + 1)
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, num_features: int, eps: float = 1e-05):
-        super().__init__()
-        self.weight = mx.ones((num_features,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array):
-        # TODO(christian): monitor for regression
-        # N.B. source of numerical imprecision between mlx and torch
-        return mx.fast.rms_norm(x, self.weight, self.eps)
-
-
 # ref. eager_attention_forward in tfm impl
 def sdpa(
     Q: mx.array,
@@ -368,7 +349,7 @@ class MLPBlock(nn.Module):
         ### BEGIN ROUTER BLOCK ###
         # N.B. As elsewhere, upcast is required in linear layers
         g = self.router(x.astype(mx.float32)).astype(mx.bfloat16)
-        experts, indices = mlx_topk_sorted(g, k=self.num_experts_per_tok, axis=-1)
+        experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
         # N.B. As elsewhere, upcast is required in softmax
         expert_weights = mx.softmax(experts, axis=-1, precise=True)
         ### END ROUTER BLOCK ###
@@ -386,8 +367,8 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.self_attn = AttentionBlock(config)
         self.mlp = MLPBlock(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
         residual = x
@@ -406,7 +387,7 @@ class GptOssMoeModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.norm = RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
 
         self.layers = [
             TransformerBlock(args)
