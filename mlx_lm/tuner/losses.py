@@ -4,6 +4,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def can_run_metal():
+    return mx.default_device() == mx.gpu and mx.metal.is_available()
+
+
 def _make_kl_forward_kernel():
     source = """
     constexpr int M = 4;
@@ -367,7 +371,7 @@ def _kl_div_loss(primals, cotangent, output):
 
 
 def kl_div_loss(logits_q, logits_p):
-    if mx.metal.is_available():
+    if can_run_metal():
         return _kl_div_loss(logits_q, logits_p)
     else:
         return nn.losses.kl_div_loss(
@@ -730,6 +734,7 @@ def _make_js_backward_kernel():
         ensure_row_contiguous=True,
     )
 
+
 _js_forward_kernel = _make_js_forward_kernel()
 _js_backward_kernel = _make_js_backward_kernel()
 
@@ -748,6 +753,7 @@ def _js_div_loss(logits_q, logits_p):
         threadgroup=(1024, 1, 1),
     )
     return outputs[0], mx.stop_gradient(outputs[1])
+
 
 @_js_div_loss.vjp
 def _js_div_loss(primals, cotangents, outputs):
@@ -769,12 +775,16 @@ def _js_div_loss(primals, cotangents, outputs):
 
 
 def js_div_loss(logits_q, logits_p):
-    if mx.metal.is_available():
+    if can_run_metal():
         return _js_div_loss(logits_q, logits_p)[0]
     else:
         logprobs_p = logits_p - mx.logsumexp(logits_p, axis=-1, keepdims=True)
         logprobs_q = logits_q - mx.logsumexp(logits_q, axis=-1, keepdims=True)
-        logprobs_m = logprobs_p + mx.log(1 + mx.exp(logprobs_q - logprobs_p)) - mx.log(2).astype(logits_q.dtype)
+        logprobs_m = (
+            logprobs_p
+            + mx.log(1 + mx.exp(logprobs_q - logprobs_p))
+            - mx.log(2).astype(logits_q.dtype)
+        )
         kl_p = nn.losses.kl_div_loss(logprobs_m, logprobs_p, axis=-1, reduction="none")
         kl_q = nn.losses.kl_div_loss(logprobs_m, logprobs_q, axis=-1, reduction="none")
         return 0.5 * (kl_p + kl_q)
