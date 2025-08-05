@@ -236,7 +236,6 @@ class RMSNorm(nn.Module):
 
 
 # ref. eager_attention_forward in tfm impl
-@mx.compile
 def sdpa(
     Q: mx.array,
     K: mx.array,
@@ -262,11 +261,6 @@ def sdpa(
     sinks = mx.tile(S.reshape(1, -1, 1, 1), [batch, 1, q_len, 1])
 
     combined_logits = mx.concatenate([attn_weights, sinks], axis=-1)
-    # TODO(christian): So this is just numerical stabilization, which we may not(?) need
-    # Gain about 0.5 tok/s (out of 50) if we remove this
-    max_vals = mx.max(combined_logits, axis=-1, keepdims=True)
-    combined_logits = combined_logits - max_vals
-
     probs = mx.softmax(combined_logits, axis=-1, precise=True)
     scores = probs[..., :-1].reshape(batch, num_kv_heads, n_rep, q_len, seqlen)
     attn_output = mx.matmul(scores, mx.expand_dims(V, axis=2))
@@ -365,9 +359,6 @@ class MLPBlock(nn.Module):
         )
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=True)
 
-        self.alpha = 1.702
-        self.limit = 7.0
-
     def __call__(self, x: mx.array) -> mx.array:
         num_tokens = x.size // x.shape[-1]
         # N.B. num_tokens here is just -1 in the HF implementation because PyTorch reshape infers dimension sizes
@@ -385,6 +376,7 @@ class MLPBlock(nn.Module):
         # Experts block
         x = self.experts(x, indices)
 
+        # TODO(christian): Sum in fp32?
         x = x * mx.expand_dims(expert_weights, axis=2)
         return x.sum(axis=1)
 
@@ -433,8 +425,6 @@ class GptOssMoeModel(nn.Module):
         else:
             x = self.embed_tokens(inputs)
 
-        # TODO(christian): This is how gemma3_text does it.
-        # We always expect cache to not be None in mlx-engine so /shrug
         if cache is None:
             cache = [None] * len(self.layers)
 
