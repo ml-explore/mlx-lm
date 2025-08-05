@@ -236,5 +236,14 @@ class Model(nn.Module):
         return weights
 
     @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
     def layers(self):
         return self.model.layers

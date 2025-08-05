@@ -276,8 +276,8 @@ class MLXLM(LM):
         )
         inputs = self._tokenize([req.args[0] for req in requests])
         all_scores = []
-        for i in tqdm(range(0, len(texts), self._batch_size)):
-            batch = texts[i : i + self._batch_size]
+        for i in tqdm(range(0, len(inputs), self._batch_size)):
+            batch = inputs[i : i + self._batch_size]
             scores, lengths, _ = self._score_fn(batch)
             mask = mx.arange(scores.shape[-1]) < lengths[:, None]
             all_scores.extend((mask * scores).sum(axis=-1).tolist())
@@ -372,6 +372,12 @@ def main():
         apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
+    parser.add_argument(
+        "--confirm-run-unsafe-code",
+        action="store_true",
+        help="Confirm that you want to run tasks that execute untrusted code.",
+        default=False,
+    )
 
     args = parser.parse_args()
 
@@ -401,6 +407,7 @@ def main():
         numpy_random_seed=args.seed,
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
+        confirm_run_unsafe_code=args.confirm_run_unsafe_code,
     )
 
     file_keys = ["eval", args.model.replace("/", "_"), version("lm_eval")]

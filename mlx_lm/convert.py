@@ -49,7 +49,6 @@ def mixed_quant_predicate_builder(
     def mixed_quant_predicate(
         path: str,
         module: nn.Module,
-        config: dict,
     ) -> Union[bool, dict]:
         """Implements mixed quantization predicates with similar choices to, for example, llama.cpp's Q4_K_M.
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
