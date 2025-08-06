@@ -127,9 +127,9 @@ class AttentionBlock(nn.Module):
         # We are in inference so cache the mask and try to reuse it
         length = ((L + offset + 511) // 512) * 512
         if (
-            self._previous_mask is None or
-            self._previous_mask.shape[-1] < length or
-            self._previous_mask.shape[-2] != L
+            self._previous_mask is None
+            or self._previous_mask.shape[-1] < length
+            or self._previous_mask.shape[-2] != L
         ):
             self._previous_mask = _make_mask(L, length - L)
 
@@ -200,9 +200,7 @@ class AttentionBlock(nn.Module):
             k, v = cache.update_and_fetch(k, v)
 
         # NOTE: mask should contain the sink weights already
-        v_hat = scaled_dot_product_attention(
-            q, k, v, cache, self.sm_scale, mask=mask
-        )
+        v_hat = scaled_dot_product_attention(q, k, v, cache, self.sm_scale, mask=mask)
 
         return self.o_proj(v_hat.swapaxes(1, 2).reshape(B, L, -1))
 
