@@ -1158,6 +1158,28 @@ class TestModels(unittest.TestCase):
             model, "smollm3", args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gpt_oss(self):
+        from mlx_lm.models import gpt_oss
+
+        args = gpt_oss.ModelArgs(
+            model_type="gpt_oss",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            num_local_experts=16,
+            experts_per_token=2,
+            sliding_window=128,
+            rope_theta=10000,
+            vocab_size=10_000,
+            layer_types=["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+        )
+        model = gpt_oss.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

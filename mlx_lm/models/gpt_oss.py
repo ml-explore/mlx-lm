@@ -16,9 +16,10 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
+    model_type: str = "gpt_oss"
     num_hidden_layers: int = 36
     num_local_experts: int = 128
-    num_experts_per_tok: int = 4
+    experts_per_token: int = 4  # Changed from num_experts_per_tok to match config
     vocab_size: int = 201088
     rms_norm_eps: float = 1e-05
     hidden_size: int = 2880
@@ -29,6 +30,7 @@ class ModelArgs(BaseModelArgs):
     sliding_window: int = 128
     rope_theta: int = 150000
     rope_scaling: Any = None
+    layer_types: list = None  # Added to support alternating attention types
 
 
 # These operators emulate particular methods in torch that don't exist in MLX natively
@@ -47,9 +49,12 @@ def swiglu(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
     # Clamp the input values
     x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
     x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
-    glu_scaled = (alpha * x_glu.astype(mx.float32)).astype(mx.bfloat16)
+
+    # Preserve input dtype
+    input_dtype = x_glu.dtype
+    glu_scaled = (alpha * x_glu.astype(mx.float32)).astype(input_dtype)
     negative_glu = (-glu_scaled).astype(mx.float32)
-    sig = (1.0 / (1.0 + mx.exp(negative_glu))).astype(mx.bfloat16)
+    sig = (1.0 / (1.0 + mx.exp(negative_glu))).astype(input_dtype)
 
     out_glu = x_glu * sig
     # Note we add an extra bias of 1 to the linear layer
@@ -213,7 +218,7 @@ class MLPBlock(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.num_local_experts = config.num_local_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
+        self.experts_per_token = config.experts_per_token
 
         self.experts = SwitchGLU(
             input_dims=config.hidden_size,
@@ -225,18 +230,23 @@ class MLPBlock(nn.Module):
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
+        original_shape = x.shape
         x = x.reshape(-1, self.hidden_size)
 
         # N.B. As elsewhere, upcast is required in linear layers
-        g = self.router(x.astype(mx.float32)).astype(mx.bfloat16)
-        experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
+        input_dtype = x.dtype
+        g = self.router(x.astype(mx.float32)).astype(input_dtype)
+        experts, indices = mlx_topk(g, k=self.experts_per_token, axis=-1)
         expert_weights = mx.softmax(experts, axis=-1, precise=True)
 
         # Experts block
         x = self.experts(x, indices)
 
         x = x * mx.expand_dims(expert_weights, axis=2)
-        return x.sum(axis=1)
+        x = x.sum(axis=1)
+
+        # Reshape back to original shape
+        return x.reshape(original_shape)
 
 
 class TransformerBlock(nn.Module):
@@ -267,6 +277,7 @@ class GptOssMoeModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.layer_types = args.layer_types or ["sliding_attention", "full_attention"] * (args.num_hidden_layers // 2)
         self.layers = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
         self.window_size = args.sliding_window
 
@@ -347,7 +358,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = (
-            args.model_type if hasattr(args, "model_type") else "gpt_oss_moe"
+            args.model_type if hasattr(args, "model_type") else "gpt_oss"
         )
         self.model = GptOssMoeModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -405,9 +416,9 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
+        layer_types = self.args.layer_types or ["sliding_attention", "full_attention"] * (self.args.num_hidden_layers // 2)
         for i in range(self.args.num_hidden_layers):
-            # full attn on odd indices, swa on even
-            if i % 2 == 1:
+            if i < len(layer_types) and layer_types[i] == "full_attention":
                 caches.append(KVCache())
             else:
                 caches.append(

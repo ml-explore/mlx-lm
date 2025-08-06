@@ -122,6 +122,7 @@ def linear_to_lora_layers(
         "smollm3",
         "exaone4",
         "hunyuan_v1_dense",
+        "gpt_oss",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
