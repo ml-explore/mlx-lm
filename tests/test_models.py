@@ -1169,7 +1169,7 @@ class TestModels(unittest.TestCase):
             num_attention_heads=8,
             num_key_value_heads=2,
             num_local_experts=16,
-            experts_per_token=2,
+            num_experts_per_tok=2,
             sliding_window=128,
             rope_theta=10000,
             vocab_size=10_000,
