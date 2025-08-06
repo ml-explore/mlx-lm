@@ -1173,7 +1173,12 @@ class TestModels(unittest.TestCase):
             sliding_window=128,
             rope_theta=10000,
             vocab_size=10_000,
-            layer_types=["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
         )
         model = gpt_oss.Model(args)
         self.model_test_runner(
