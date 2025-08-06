@@ -179,7 +179,6 @@ class HunyuanV1DenseModel(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
-        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
