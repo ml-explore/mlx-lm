@@ -220,49 +220,6 @@ class Model(nn.Module):
         out = self.model(inputs, mask, cache)
         return self.model.embed_tokens.as_linear(out)
 
-    def sanitize(self, weights):
-        new_weights = {}
-
-        has_qkv = "model.layers.0.self_attn.qkv_proj.weight" in weights
-        has_gate_up = "model.layers.0.mlp.gate_and_up_proj.weight" in weights
-
-        if has_qkv or has_gate_up:
-            n_heads = self.args.num_attention_heads
-            n_kv_heads = self.args.num_key_value_heads
-            head_dim = (
-                self.args.head_dim
-                if self.args.head_dim is not None
-                else self.args.hidden_size // n_heads
-            )
-
-            for k, v in weights.items():
-                if "qkv_proj" in k and has_qkv:
-                    q_size = n_heads * head_dim
-                    k_size = n_kv_heads * head_dim
-                    v_size = n_kv_heads * head_dim
-
-                    q_proj, k_proj, v_proj = v.split([q_size, k_size, v_size], axis=0)
-
-                    k_new = k.replace("qkv_proj", "q_proj")
-                    new_weights[k_new] = q_proj
-                    k_new = k.replace("qkv_proj", "k_proj")
-                    new_weights[k_new] = k_proj
-                    k_new = k.replace("qkv_proj", "v_proj")
-                    new_weights[k_new] = v_proj
-
-                elif "gate_and_up_proj" in k and has_gate_up:
-                    gate_proj, up_proj = v.split(2, axis=0)
-                    k_new = k.replace("gate_and_up_proj", "gate_proj")
-                    new_weights[k_new] = gate_proj
-                    k_new = k.replace("gate_and_up_proj", "up_proj")
-                    new_weights[k_new] = up_proj
-                else:
-                    new_weights[k] = v
-
-            return new_weights
-
-        return weights
-
     @property
     def layers(self):
         return self.model.layers
