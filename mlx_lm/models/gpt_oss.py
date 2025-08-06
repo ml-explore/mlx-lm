@@ -230,7 +230,6 @@ class MLPBlock(nn.Module):
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
-        input_dtype = x.dtype
         g = self.router(x)
         experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
         expert_weights = mx.softmax(experts, axis=-1, precise=True)
