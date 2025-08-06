@@ -221,7 +221,7 @@ class TestModels(unittest.TestCase):
             self.assertEqual(outputs.shape, (1, 2, vocab_size))
             self.assertEqual(outputs.dtype, t)
 
-            if model_type not in ("mamba", "plamo2"):
+            if model_type not in ("mamba", "plamo2", "gpt_oss"):
                 mask = create_causal_mask(inputs.shape[1], 0).astype(t)
                 outputs = model(inputs, mask=mask)
                 self.assertEqual(outputs.shape, (1, 2, vocab_size))

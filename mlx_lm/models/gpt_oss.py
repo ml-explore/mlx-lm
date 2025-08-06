@@ -173,11 +173,11 @@ class AttentionBlock(nn.Module):
 
         return self._previous_mask[..., : min(L + offset, window_size + 1)]
 
-    def get_mask(self, x, cache, window_size, idx):
-        if idx % 2 == 1:
-            return self.get_causal_mask(x, cache)
-        else:
+    def get_mask(self, x, cache, window_size):
+        if window_size is not None:
             return self.get_sliding_window_mask(x, cache, window_size)
+        else:
+            return self.get_causal_mask(x, cache)
 
     def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
         B, L, _ = x.shape
@@ -293,8 +293,10 @@ class GptOssMoeModel(nn.Module):
 
         if mask is None:
             masks = [
-                l.self_attn.get_mask(x, c, self.window_size, i)
-                for i, (l, c) in enumerate(zip(self.layers, cache))
+                l.self_attn.get_mask(
+                    x, c, self.window_size if lt == "sliding_attention" else None
+                )
+                for (l, c, lt) in zip(self.layers, cache, self.layer_types)
             ]
         else:
             masks = [mask] * len(self.layers)
