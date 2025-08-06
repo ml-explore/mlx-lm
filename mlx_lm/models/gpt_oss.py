@@ -118,13 +118,15 @@ class AttentionBlock(nn.Module):
             mask = mx.concatenate([sinks, mask], axis=-1)
             return mask
 
-        # If we are training then simply re-create the mask every time to make
-        # sure gradients flow to the sinks.
-        if self.training:
+        # When training re-create the mask so that gradients flow to the sinks.
+        # When L is large then recreate the mask because otherwise it will take
+        # a pretty significant chunk of memory.
+        if self.training or L > 8:
             self._previous_mask = None
             return _make_mask(L, offset)
 
-        # We are in inference so cache the mask and try to reuse it
+        # Create the mask once and try to reuse it. For this reason we round up
+        # to the closest multiple of 512 so we can reuse the mask several times.
         length = ((L + offset + 511) // 512) * 512
         if (
             self._previous_mask is None
@@ -162,9 +164,9 @@ class AttentionBlock(nn.Module):
 
         # We are in inference so cache the mask and try to reuse it
         if self._previous_mask is None:
-            self._previous_mask = _make_mask(L, window_size)
+            self._previous_mask = _make_mask(L, window_size + 1)
 
-        return self._previous_mask[..., : L + offset]
+        return self._previous_mask[..., : min(L + offset, window_size + 1)]
 
     def get_mask(self, x, cache, window_size, idx):
         if idx % 2 == 1:
