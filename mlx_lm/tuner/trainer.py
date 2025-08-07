@@ -1,6 +1,5 @@
 # Copyright © 2024 Apple Inc.
 
-
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -63,6 +62,16 @@ class TrainingArgs:
     grad_checkpoint: bool = field(
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
+    )
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of steps to accumulate gradients before performing an optimizer update. "
+                "Useful for simulating larger batch sizes when limited by memory. "
+                "Set to a value >1 to accumulate gradients over multiple forward/backward passes."
+            )
+        }
     )
 
 
@@ -216,13 +225,13 @@ def train(
         # Forward and backward pass
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
 
-        # All reduce the gradients if running in distributed mode
-        grad = average_gradients(grad)
-
-        # Model update
-        optimizer.update(model, grad)
-
-        return lvalue, toks
+        if (it + 1) % args.gradient_accumulation_steps == 0:
+            # All reduce the gradients if running in distributed mode
+            grad = average_gradients(grad)
+            # Model update
+            optimizer.update(model, grad)
+        
+        return (lvalue / args.gradient_accumulation_steps), toks
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
