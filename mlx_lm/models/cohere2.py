@@ -171,7 +171,9 @@ class CohereModel(nn.Module):
         if mask is None:
             j = self.args.sliding_window_pattern
             full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
+            sliding_window_mask = create_attention_mask(
+                h, cache, window_size=self.args.sliding_window
+            )
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
@@ -217,9 +219,7 @@ class Model(nn.Module):
             ):
                 caches.append(KVCache())
             else:
-                caches.append(
-                    RotatingKVCache(max_size=self.args.sliding_window, keep=0)
-                )
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches
 
     @property
