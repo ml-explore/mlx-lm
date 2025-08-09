@@ -104,7 +104,7 @@ def get_model_path(
                 revision=revision,
                 allow_patterns=[
                     "*.json",
-                    "*.safetensors",
+                    "model*.safetensors",
                     "*.py",
                     "tokenizer.model",
                     "*.tiktoken",
@@ -172,10 +172,6 @@ def load_model(
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
-    if not weight_files:
-        # Try weight for back-compat
-        weight_files = glob.glob(str(model_path / "weight*.safetensors"))
-
     if not weight_files and strict:
         logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
@@ -215,8 +211,6 @@ def load_model(
             from .models.bitlinear_layers import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
-        else:
-            raise ValueError(f"Unsupported quantization method {quant_method}")
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -476,6 +470,8 @@ def quantize_model(
     quantized_config = copy.deepcopy(config)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
+    quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+
     def base_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
@@ -487,8 +483,9 @@ def quantize_model(
     def wrapped_predicate(p, m):
         bool_or_params = base_predicate(p, m)
         if bool_or_params:
-            bool_or_params = quant_predicate(p, m, config)
-        quantized_config["quantization"][p] = bool_or_params
+            bool_or_params = quant_predicate(p, m)
+        if isinstance(bool_or_params, dict):
+            quantized_config["quantization"][p] = bool_or_params
         return bool_or_params
 
     nn.quantize(

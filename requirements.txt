@@ -1,4 +1,4 @@
-mlx>=0.25.0
+mlx>=0.26.0
 numpy
 transformers>=4.39.3
 protobuf

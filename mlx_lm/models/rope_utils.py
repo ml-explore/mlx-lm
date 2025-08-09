@@ -236,6 +236,7 @@ def initialize_rope(
             dims=dims,
             max_position_embeddings=max_position_embeddings,
             traditional=traditional,
+            scaling_factor=scaling_factor,
             base=base,
             **rope_kwargs,
         )

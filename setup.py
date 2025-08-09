@@ -15,7 +15,7 @@ from _version import __version__
 setup(
     name="mlx-lm",
     version=__version__,
-    description="LLMs on Apple silicon with MLX and the Hugging Face Hub",
+    description="LLMs with MLX and the Hugging Face Hub",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     readme="README.md",
@@ -27,9 +27,9 @@ setup(
     packages=["mlx_lm", "mlx_lm.models", "mlx_lm.quant", "mlx_lm.tuner"],
     python_requires=">=3.8",
     extras_require={
-        "test": ["datasets"],
+        "test": ["datasets", "lm-eval"],
+        "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
-        "quant": ["datasets", "tqdm"],
     },
     entry_points={
         "console_scripts": [

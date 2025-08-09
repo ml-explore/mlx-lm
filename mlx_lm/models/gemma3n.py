@@ -176,7 +176,11 @@ class MLP(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = (
+            config.intermediate_size[layer_idx]
+            if isinstance(config.intermediate_size, list)
+            else config.intermediate_size
+        )
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -472,7 +476,7 @@ class LanguageModel(nn.Module):
         per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = self.make_cache()
 
         if mask is None:
             full_mask = create_attention_mask(

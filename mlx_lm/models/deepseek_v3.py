@@ -124,20 +124,6 @@ class DeepseekV3YarnRotaryEmbedding(nn.Module):
         )
 
 
-# A clipped silu to prevent fp16 from overflowing
-@partial(mx.compile, shapeless=True)
-def clipped_silu(x):
-    return mx.clip(x * mx.sigmoid(x), a_min=-100, a_max=100)
-
-
-class ClippedSilu(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def __call__(self, x):
-        return clipped_silu(x)
-
-
 class DeepseekV3Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -303,7 +289,9 @@ def group_expert_select(
     group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
     k = n_group - topk_group
     group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-    scores = mx.put_along_axis(scores, group_idx, mx.array(0.0), axis=-2)
+    scores = mx.put_along_axis(
+        scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+    )
     scores = mx.flatten(scores, -2, -1)
 
     k = top_k
@@ -352,7 +340,6 @@ class DeepseekV3MoE(nn.Module):
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
-            activation=ClippedSilu(),
         )
 
         self.gate = MoEGate(config)

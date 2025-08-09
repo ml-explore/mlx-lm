@@ -62,6 +62,11 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         help="Optional path for the trained adapter weights and config.",
@@ -218,31 +223,31 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         try:
             yield
         finally:
-            return
-
-    model_bytes = tree_reduce(
-        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
-    )
-    max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
-    if model_bytes > 0.9 * max_rec_size:
-        model_mb = model_bytes // 2**20
-        max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+            pass
+    else:
+        model_bytes = tree_reduce(
+            lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
         )
-    old_limit = mx.set_wired_limit(max_rec_size)
-    try:
-        yield
-    finally:
-        if streams is not None:
-            for s in streams:
-                mx.synchronize(s)
-        else:
-            mx.synchronize()
-        mx.set_wired_limit(old_limit)
+        max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+        if model_bytes > 0.9 * max_rec_size:
+            model_mb = model_bytes // 2**20
+            max_rec_mb = max_rec_size // 2**20
+            print(
+                f"[WARNING] Generating with a model that requires {model_mb} MB "
+                f"which is close to the maximum recommended size of {max_rec_mb} "
+                "MB. This can be slow. See the documentation for possible work-arounds: "
+                "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+            )
+        old_limit = mx.set_wired_limit(max_rec_size)
+        try:
+            yield
+        finally:
+            if streams is not None:
+                for s in streams:
+                    mx.synchronize(s)
+            else:
+                mx.synchronize()
+            mx.set_wired_limit(old_limit)
 
 
 @dataclass
@@ -798,7 +803,7 @@ def main():
     tokenizer_config = (
         {} if not using_cache else json.loads(metadata["tokenizer_config"])
     )
-    tokenizer_config["trust_remote_code"] = True
+    tokenizer_config["trust_remote_code"] = True if args.trust_remote_code else None
 
     model_path = args.model
     if using_cache:
