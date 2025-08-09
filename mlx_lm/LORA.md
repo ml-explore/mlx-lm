@@ -84,7 +84,9 @@ You can resume fine-tuning with an existing adapter with
 
 #### Logging
 
-You can log training metrics to Weights & Biases by passing a project name with the `--wandb` flag. Similarly, you can enable SwanLab for tracking training metrics by using the `--swanlab` flag followed by a project name. Make sure to install the required packages beforehand: `pip install wandb` and `pip install swanlab`. Both logging integrations can be used simultaneously if desired.
+You can log training metrics to Weights & Biases using `--report_to wandb`, or to SwanLab using `--report_to swanlab`. Make sure to install the required packages beforehand: `pip install wandb` or `pip install swanlab`. You can enable both tracking tools simultaneously by separating them with a comma, for example: `--report_to wandb,swanlab`.
+
+To specify a project name for the logging tracker, use `--project_name <YOUR PROJECT NAME>`.
 
 #### Prompt Masking
 
