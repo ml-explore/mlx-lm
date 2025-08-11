@@ -308,9 +308,9 @@ class TokenizerWrapper:
         TOOL_CALL_TOKENS = [
             ("<tool_call>", "</tool_call>"),  # ChatML style
         ]
-        MISTRAL_TOOL_CALL_TOKENS = [
-            ("[TOOL_CALLS]", "</s>")  # MistralTokenizer style
-        ]
+        MISTRAL_TOOL_CALL_START = (
+            "[TOOL_CALLS]"  # MistralTokenizer style - no end token
+        )
 
         # Get vocabulary
         vocab = {}
@@ -341,12 +341,11 @@ class TokenizerWrapper:
             self._tool_call_end = ""
 
             # Check for MistralTokenizer style first
-            if is_mistral_tokenizer and MISTRAL_TOOL_CALL_TOKENS[0][0] in vocab:
-                for tool_call_start, tool_call_end in MISTRAL_TOOL_CALL_TOKENS:
-                    if tool_call_start in vocab and tool_call_end in vocab:
-                        self._tool_call_start = tool_call_start
-                        self._tool_call_end = tool_call_end
-                        break
+            if is_mistral_tokenizer and MISTRAL_TOOL_CALL_START in vocab:
+                self._tool_call_start = MISTRAL_TOOL_CALL_START
+                self._tool_call_end = ""
+                # No tool-calling end token for Mistral: it emits </s> (eos)
+                # after tool calls, which stops the generation loop.
             else:
                 # Check for ChatML style tokens
                 for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
