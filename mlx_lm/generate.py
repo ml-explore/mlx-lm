@@ -62,6 +62,11 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         help="Optional path for the trained adapter weights and config.",
@@ -798,7 +803,7 @@ def main():
     tokenizer_config = (
         {} if not using_cache else json.loads(metadata["tokenizer_config"])
     )
-    tokenizer_config["trust_remote_code"] = True
+    tokenizer_config["trust_remote_code"] = True if args.trust_remote_code else None
 
     model_path = args.model
     if using_cache:

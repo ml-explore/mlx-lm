@@ -28,6 +28,11 @@ def setup_arg_parser():
         default=DEFAULT_MODEL,
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         help="Optional path for the trained adapter weights and config.",
@@ -87,7 +92,9 @@ def main():
     model, tokenizer = load(
         args.model,
         adapter_path=args.adapter_path,
-        tokenizer_config={"trust_remote_code": True},
+        tokenizer_config={
+            "trust_remote_code": True if args.trust_remote_code else None
+        },
     )
 
     def print_help():
