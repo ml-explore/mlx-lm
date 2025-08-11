@@ -494,16 +494,20 @@ class TokenizerWrapper:
             return []
 
         mistral_messages = []
+        # Track tool calls to map IDs back to function names
+        tool_call_map = {}
+
         for msg in messages:
             role = msg["role"]
             content = msg.get("content")
 
             if role == "system" and SystemMessage is not None:
                 mistral_messages.append(SystemMessage(content=content))
+
             elif role == "user" and UserMessage is not None:
                 mistral_messages.append(UserMessage(content=content))
+
             elif role == "assistant" and AssistantMessage is not None:
-                # Handle assistant messages with tool calls
                 if "tool_calls" in msg and msg["tool_calls"]:
                     try:
                         from mistral_common.protocol.instruct.tool_calls import (
@@ -515,11 +519,17 @@ class TokenizerWrapper:
                         for tool_call in msg["tool_calls"]:
                             if tool_call.get("type") == "function":
                                 function_call = tool_call["function"]
+                                call_id = tool_call["id"]
+                                func_name = function_call["name"]
+
+                                # Store mapping for later tool result messages
+                                tool_call_map[call_id] = func_name
+
                                 tool_calls.append(
                                     ToolCall(
-                                        id=tool_call["id"],
+                                        id=call_id,
                                         function=FunctionCall(
-                                            name=function_call["name"],
+                                            name=func_name,
                                             arguments=function_call["arguments"],
                                         ),
                                     )
@@ -529,25 +539,37 @@ class TokenizerWrapper:
                             AssistantMessage(content=content, tool_calls=tool_calls)
                         )
                     except ImportError:
-                        # Fallback if tool call imports fail
                         mistral_messages.append(AssistantMessage(content=content))
                 else:
                     mistral_messages.append(AssistantMessage(content=content))
+
             elif role == "tool":
-                # Handle tool result messages
                 try:
                     from mistral_common.protocol.instruct.messages import ToolMessage
 
+                    tool_call_id = msg["tool_call_id"]
+                    name = msg.get("name", "")
+
+                    # If name is missing, try to get it from our mapping
+                    if not name and tool_call_id in tool_call_map:
+                        name = tool_call_map[tool_call_id]
+
+                    # If we still don't have a name, log a warning but continue
+                    if not name:
+                        print(
+                            f"Warning: Tool message missing function name for call_id {tool_call_id}"
+                        )
+
                     mistral_messages.append(
                         ToolMessage(
-                            tool_call_id=msg["tool_call_id"],
-                            name=msg.get("name", ""),
+                            tool_call_id=tool_call_id,
+                            name=name,
                             content=content,
                         )
                     )
                 except ImportError:
-                    # Skip tool messages if imports fail
                     pass
+
         return mistral_messages
 
     def _convert_to_mistral_tools(self, tools):

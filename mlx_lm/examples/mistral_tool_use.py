@@ -200,8 +200,6 @@ print(f"Formatted prompt:\n{formatted_prompt}\n")
 
 # Create prompt cache once for reuse across the conversation
 # Note: Caching effectiveness depends on shared prefixes between prompts.
-# In multi-turn conversations, caching provides modest benefits since
-# each turn has different prompt structure and length.
 prompt_cache = make_prompt_cache(model)
 
 response = generate(
