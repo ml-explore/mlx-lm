@@ -1,9 +1,10 @@
 # Copyright © 2024 Apple Inc.
 
+
 import time
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -67,11 +68,10 @@ class TrainingArgs:
         default=1,
         metadata={
             "help": (
-                "Number of steps to accumulate gradients before performing an optimizer update. "
-                "Useful for simulating larger batch sizes when limited by memory. "
-                "Set to a value >1 to accumulate gradients over multiple forward/backward passes."
+                "Accumulate gradients over this many micro-steps "
+                "before applying an optimizer update."
             )
-        }
+        },
     )
 
 
@@ -218,29 +218,105 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
-    state = [model.state, optimizer.state, mx.random.state]
+    # tree math
+    def zeros_like_tree(tree):
+        if isinstance(tree, dict):
+            return {k: zeros_like_tree(v) for k, v in tree.items()}
+        elif isinstance(tree, (list, tuple)):
+            t = [zeros_like_tree(v) for v in tree]
+            return type(tree)(t)
+        else:
+            return mx.zeros_like(tree)
 
-    @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch):
-        # Forward and backward pass
-        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
+    def tree_add(a, b):
+        if isinstance(a, dict):
+            return {k: tree_add(a[k], b[k]) for k in a}
+        elif isinstance(a, (list, tuple)):
+            t = [tree_add(x, y) for x, y in zip(a, b)]
+            return type(a)(t)
+        else:
+            return a + b
 
-        if (it + 1) % args.gradient_accumulation_steps == 0:
-            # All reduce the gradients if running in distributed mode
-            grad = average_gradients(grad)
-            # Model update
-            optimizer.update(model, grad)
-        
-        return (lvalue / args.gradient_accumulation_steps), toks
+    def tree_div(a, scalar):
+        if isinstance(a, dict):
+            return {k: tree_div(v, scalar) for k, v in a.items()}
+        elif isinstance(a, (list, tuple)):
+            t = [tree_div(v, scalar) for v in a]
+            return type(a)(t)
+        else:
+            return a / scalar
 
+    def tree_l2_and_absmax(tree):
+        """Return (sum_of_squares, absmax) over all leaves in the tree as MLX arrays."""
+        def _acc(t):
+            if isinstance(t, dict):
+                ss = mx.array(0.0, dtype=mx.float32)
+                am = mx.array(0.0, dtype=mx.float32)
+                for v in t.values():
+                    ssv, amv = _acc(v)
+                    ss = ss + ssv
+                    am = mx.maximum(am, amv)
+                return ss, am
+            elif isinstance(t, (list, tuple)):
+                ss = mx.array(0.0, dtype=mx.float32)
+                am = mx.array(0.0, dtype=mx.float32)
+                for v in t:
+                    ssv, amv = _acc(v)
+                    ss = ss + ssv
+                    am = mx.maximum(am, amv)
+                return ss, am
+            else:
+                x = t.astype(mx.float32)
+                ss = mx.sum(x * x)
+                am = mx.max(mx.abs(x))
+                return ss, am
+        return _acc(tree)
+
+    # gradfn & accum
     loss_value_and_grad = nn.value_and_grad(model, loss)
+    grad_accum = zeros_like_tree(model.trainable_parameters())
+    micro_count = 0
 
+    @mx.compile
+    def micro_forward_backward(batch):
+        # returns ((loss, ntoks), grad_tree)
+        return loss_value_and_grad(model, *batch)
+
+    def apply_optimizer_update():
+        nonlocal grad_accum, micro_count
+        # average over local micro-steps first
+        grad_local_avg = tree_div(grad_accum, args.gradient_accumulation_steps)
+        if rank == 0:
+            ss_loc, am_loc = tree_l2_and_absmax(grad_local_avg)
+            mx.eval(ss_loc, am_loc)
+            print(
+                f"[GRAD-DBG] UPDATE(local) GA={args.gradient_accumulation_steps} "
+                f"local_l2={mx.sqrt(ss_loc).item():.3e} local_absmax={am_loc.item():.3e}",
+                flush=True,
+            )
+        # average across workers (single all-reduce per update)
+        grad_avg = average_gradients(grad_local_avg)
+        if rank == 0:
+            ss_w, am_w = tree_l2_and_absmax(grad_avg)
+            mx.eval(ss_w, am_w)
+            print(
+                f"[GRAD-DBG] UPDATE(world) GA={args.gradient_accumulation_steps} "
+                f"world_l2={mx.sqrt(ss_w).item():.3e} world_absmax={am_w.item():.3e}",
+                flush=True,
+            )
+        optimizer.update(model, grad_avg)
+        mx.eval(model.state, optimizer.state)
+        grad_accum = zeros_like_tree(model.trainable_parameters())
+        micro_count = 0
+
+    # ---------- training state ----------
     model.train()
     losses = 0
     n_tokens = 0
     steps = 0
     trained_tokens = 0
-    train_time = 0
+    train_time = 0.0
+
     # Main training loop
     for it, batch in zip(
         range(1, args.iters + 1),
@@ -252,9 +328,8 @@ def train(
         ),
     ):
         tic = time.perf_counter()
-        # Report validation loss if needed, the first validation loss
-        # is always measured before any training.
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+        # Report validation loss if needed, the first validation loss is always measured before any training.
+        if args.steps_per_eval is not None and (it == 1 or it % args.steps_per_eval == 0 or it == args.iters):
             tic = time.perf_counter()
             val_loss = evaluate(
                 model=model,
@@ -285,22 +360,46 @@ def train(
 
             tic = time.perf_counter()
 
-        lvalue, toks = step(batch)
+        # ----- micro step: forward+backward, accumulate grads -----
+        (lvalue, toks), grad = micro_forward_backward(batch)
+        grad_accum = tree_add(grad_accum, grad)
+        micro_count += 1
+        if rank == 0 and micro_count == args.gradient_accumulation_steps:
+            ss_g, am_g = tree_l2_and_absmax(grad)
+            ss_a, am_a = tree_l2_and_absmax(grad_accum)
+            mx.eval(ss_g, am_g, ss_a, am_a)
+            grad_l2 = mx.sqrt(ss_g).item()
+            accum_l2 = mx.sqrt(ss_a).item()
+            grad_absmax = am_g.item()
+            accum_absmax = am_a.item()
+            print(
+                f"[GRAD-DBG] it={it} micro={micro_count}/{args.gradient_accumulation_steps} "
+                f"loss={float(lvalue.item()):.4f} toks={int(toks.item())} "
+                f"grad_l2={grad_l2:.3e} grad_absmax={grad_absmax:.3e} "
+                f"accum_l2={accum_l2:.3e} accum_absmax={accum_absmax:.3e}",
+                flush=True,
+            )
+
+        # logging accumulators (loss/tokens) – keep at micro-step granularity
         losses += lvalue
         n_tokens += toks
         steps += 1
-        mx.eval(state, losses, n_tokens)
+        mx.eval(losses, n_tokens)
         train_time += time.perf_counter() - tic
+
+        # ----- apply optimizer update every GA steps -----
+        if micro_count == args.gradient_accumulation_steps:
+            apply_optimizer_update()
 
         # Report training loss if needed
         if it % args.steps_per_report == 0 or it == args.iters:
             train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
             train_loss /= steps * world_size
-            n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+            n_tokens_world = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
             learning_rate = optimizer.learning_rate.item()
             it_sec = args.steps_per_report / train_time
-            tokens_sec = float(n_tokens) / train_time
-            trained_tokens += n_tokens
+            tokens_sec = float(n_tokens_world) / train_time
+            trained_tokens += n_tokens_world
             peak_mem = mx.get_peak_memory() / 1e9
             if rank == 0:
                 print(
@@ -328,7 +427,7 @@ def train(
             losses = 0
             n_tokens = 0
             steps = 0
-            train_time = 0
+            train_time = 0.0
 
         # Save adapter weights
         if it % args.steps_per_save == 0 and rank == 0:
@@ -340,8 +439,13 @@ def train(
             mx.save_safetensors(str(checkpoint), adapter_weights)
             print(
                 f"Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}."
+                f"{args.adapter_file} and {checkpoint}.",
+                flush=True,
             )
+
+    # Flush a partial accumulation at the very end (if iters not divisible by GA)
+    if micro_count > 0:
+        apply_optimizer_update()
 
     # Save final weights
     if rank == 0:
