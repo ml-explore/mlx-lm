@@ -335,9 +335,3 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
-
-
-# python -m mlx_lm.convert --hf-path inclusionAI/Ling-lite-1.5 --mlx-path /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit -q
-# python -m mlx_lm.generate --model /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit --prompt 'who is einstein'
-# python -m mlx_lm.generate --model inclusionAI/Ling-lite-1.5 --prompt 'who is einstein'
-# python -m mlx_lm.lora --model /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit --data mlx-community/wikisql --iters 50 --val-batches 1 --max-seq-length 12 --train --num-layers 4 --batch-size 1 --adapter-path /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit-train-test
