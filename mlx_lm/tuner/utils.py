@@ -123,6 +123,7 @@ def linear_to_lora_layers(
         "exaone4",
         "hunyuan_v1_dense",
         "gpt_oss",
+        "bailing_moe",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
@@ -132,7 +133,6 @@ def linear_to_lora_layers(
             keys.add("mlp.shared_expert_gate")
         if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
-
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
@@ -149,6 +149,14 @@ def linear_to_lora_layers(
         keys = {"mixer.Wqkv", "moe.gate"}
     elif model.model_type == "dbrx":
         keys = {"norm_attn_norm.attn.Wqkv", "ffn.router.layer"}
+    elif model.model_type == "bailing_moe":
+        print("mapping")
+        keys = {
+            "attention.query_key_value",
+            "attention.dense",
+            "mlp.gate.gate_proj",
+            "mlp.switch_mlp",
+        }
     elif model.model_type == "internlm2":
         keys = {"attention.wqkv", "attention.wo"}
     elif model.model_type in {"deepseek_v2", "deepseek_v3", "minicpm3"}:

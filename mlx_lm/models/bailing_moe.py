@@ -112,26 +112,23 @@ class BailingMoeGate(nn.Module):
         self.norm_topk_prob = getattr(config, "norm_topk_prob", False)
         self.gating_dim = config.hidden_size
 
-        self.weight = mx.zeros((self.num_experts, self.gating_dim))
+        self.gate_proj = nn.Linear(self.gating_dim, self.num_experts, bias=False)
 
     def __call__(self, hidden_states):
         B, L, D = hidden_states.shape
         x = hidden_states.reshape(-1, D)
 
-        logits = mx.matmul(x, mx.transpose(self.weight))
+        logits = self.gate_proj(x)
         scores = mx.softmax(logits.astype(mx.float32), axis=-1)
 
-        # Select top-k indices via argpartition, then sort them by descending score
         topk_idx = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k:]
 
-        # sort per row by score desc and reorder both idx and weights coherently
         batch_indices = mx.arange(topk_idx.shape[0])[:, None]
         topk_scores = scores[batch_indices, topk_idx]
         sort_idx = mx.argsort(topk_scores, axis=-1)[:, ::-1]
         topk_idx = topk_idx[batch_indices, sort_idx]
         topk_weight = topk_scores[batch_indices, sort_idx]
 
-        # Optional normalization to sum to 1 across experts
         if self.top_k > 1 and self.norm_topk_prob:
             denom = mx.sum(topk_weight, axis=-1, keepdims=True)
             topk_weight = topk_weight / mx.maximum(denom, mx.array(1e-9, dtype=denom.dtype))
@@ -145,7 +142,6 @@ class BailingMoeSparseMoeBlock(nn.Module):
         self.args = args
         self.num_experts_per_tok = args.num_experts_per_tok
         
-        # Use SwitchGLU for efficient expert computation
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             args.moe_intermediate_size, 
@@ -155,7 +151,6 @@ class BailingMoeSparseMoeBlock(nn.Module):
 
         self.gate = BailingMoeGate(config=args)
 
-        # Shared experts (optional)
         if getattr(args, 'num_shared_experts', None) is not None and args.num_shared_experts > 0:
             self.shared_experts = BailingMoeMLP(
                 args=args, 
@@ -167,27 +162,18 @@ class BailingMoeSparseMoeBlock(nn.Module):
     def __call__(self, hidden_states):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
-        # Store identity for residual connection with shared experts
         if self.shared_experts is not None:
             identity = hidden_states
         
-        # Flatten for processing
         x = hidden_states.reshape(-1, hidden_dim)
         
-        # Get routing from gate
         expert_indices, expert_weights = self.gate(hidden_states)
-        
-        # Process through SwitchGLU which returns [N, K, H] in the same expert order as `expert_indices`
         expert_outputs = self.switch_mlp(x, expert_indices)
 
-        # Match dtypes and apply the per-token top-k routing weights in the SAME order as indices
         expert_weights = expert_weights.astype(expert_outputs.dtype)
         weighted_output = mx.sum(expert_outputs * expert_weights[..., None], axis=-2)
-        
-        # Reshape back to original dimensions
         output = weighted_output.reshape(batch_size, seq_len, hidden_dim)
 
-        # Add shared experts if present
         if self.shared_experts is not None:
             shared_output = self.shared_experts(identity)
             output = output + shared_output
@@ -276,11 +262,9 @@ class Model(nn.Module):
         return logits
     
     def sanitize(self, weights):
-        # Stack experts for SwitchGLU
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             
-            # Only process layers that use MoE (>= first_k_dense_replace)
             if l >= self.args.first_k_dense_replace:
                 for n, m in [("gate_proj", "gate_proj"), ("down_proj", "down_proj"), ("up_proj", "up_proj")]:
                     for k in ["weight", "scales", "biases"]:
@@ -290,6 +274,14 @@ class Model(nn.Module):
                                 for e in range(self.args.num_experts)
                             ]
                             weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+                
+                if f"{prefix}.mlp.gate.weight" in weights:
+                    gate_weight = weights.pop(f"{prefix}.mlp.gate.weight")
+                    weights[f"{prefix}.mlp.gate.gate_proj.weight"] = gate_weight
+                    
+                if f"{prefix}.mlp.gate.bias" in weights:
+                    gate_bias = weights.pop(f"{prefix}.mlp.gate.bias")
+                    weights[f"{prefix}.mlp.gate.gate_proj.bias"] = gate_bias
         
         return weights
 
@@ -300,3 +292,4 @@ class Model(nn.Module):
 # python -m mlx_lm.convert --hf-path inclusionAI/Ling-lite-1.5 --mlx-path /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit -q
 # python -m mlx_lm.generate --model /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit --prompt 'who is einstein'
 # python -m mlx_lm.generate --model inclusionAI/Ling-lite-1.5 --prompt 'who is einstein'
+# python -m mlx_lm.lora --model /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit --data mlx-community/wikisql --iters 50 --val-batches 1 --max-seq-length 12 --train --num-layers 4 --batch-size 1 --adapter-path /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit-train-test
