@@ -142,7 +142,6 @@ class BailingMoeGate(nn.Module):
         logits = self.gate_proj(x)
         scores = mx.softmax(logits.astype(mx.float32), axis=-1)
 
-        # Top-k indices via argpartition, then order them by score.
         topk_idx_pre = mx.argpartition(scores, kth=-self.top_k, axis=-1)[
             ..., -self.top_k :
         ]
