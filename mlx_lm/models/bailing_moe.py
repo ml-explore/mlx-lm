@@ -8,6 +8,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -36,15 +37,25 @@ class ModelArgs(BaseModelArgs):
 class BailingMoeMLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
-        self.intermediate_size = intermediate_size if intermediate_size is not None else args.intermediate_size
+        self.intermediate_size = (
+            intermediate_size
+            if intermediate_size is not None
+            else args.intermediate_size
+        )
 
-        self.gate_proj = nn.Linear(args.hidden_size, self.intermediate_size, bias=args.use_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, args.hidden_size, bias=args.use_bias)
-        self.up_proj = nn.Linear(args.hidden_size, self.intermediate_size, bias=args.use_bias)
+        self.gate_proj = nn.Linear(
+            args.hidden_size, self.intermediate_size, bias=args.use_bias
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size, args.hidden_size, bias=args.use_bias
+        )
+        self.up_proj = nn.Linear(
+            args.hidden_size, self.intermediate_size, bias=args.use_bias
+        )
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-    
+
 
 class BailingMoeAttention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -59,7 +70,11 @@ class BailingMoeAttention(nn.Module):
             (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
             bias=args.use_qkv_bias,
         )
-        self.dense = nn.Linear(self.num_attention_heads * self.head_dim, args.hidden_size, bias=args.use_bias)
+        self.dense = nn.Linear(
+            self.num_attention_heads * self.head_dim,
+            args.hidden_size,
+            bias=args.use_bias,
+        )
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -78,14 +93,20 @@ class BailingMoeAttention(nn.Module):
         B, L, D = x.shape
 
         qkv = self.query_key_value(x)
-        
+
         q_size = self.num_attention_heads * self.head_dim
         kv_size = self.num_key_value_heads * self.head_dim
         q, k, v = mx.split(qkv, [q_size, q_size + kv_size], axis=-1)
 
-        queries = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
-        keys = k.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+        queries = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        keys = k.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        values = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -122,7 +143,9 @@ class BailingMoeGate(nn.Module):
         scores = mx.softmax(logits.astype(mx.float32), axis=-1)
 
         # Top-k indices via argpartition, then order them by score.
-        topk_idx_pre = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k:]
+        topk_idx_pre = mx.argpartition(scores, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]
         # Do not backprop through index computations.
         topk_idx_pre = mx.stop_gradient(topk_idx_pre)
 
@@ -137,7 +160,9 @@ class BailingMoeGate(nn.Module):
 
         if self.top_k > 1 and self.norm_topk_prob:
             denom = mx.sum(topk_weight, axis=-1, keepdims=True)
-            topk_weight = topk_weight / mx.maximum(denom, mx.array(1e-9, dtype=denom.dtype))
+            topk_weight = topk_weight / mx.maximum(
+                denom, mx.array(1e-9, dtype=denom.dtype)
+            )
 
         return topk_idx, topk_weight
 
@@ -147,32 +172,35 @@ class BailingMoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.args = args
         self.num_experts_per_tok = args.num_experts_per_tok
-        
+
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
-            args.moe_intermediate_size, 
+            args.moe_intermediate_size,
             args.num_experts,
             bias=args.use_bias,
         )
 
         self.gate = BailingMoeGate(config=args)
 
-        if getattr(args, 'num_shared_experts', None) is not None and args.num_shared_experts > 0:
+        if (
+            getattr(args, "num_shared_experts", None) is not None
+            and args.num_shared_experts > 0
+        ):
             self.shared_experts = BailingMoeMLP(
-                args=args, 
-                intermediate_size=args.moe_intermediate_size * args.num_shared_experts
+                args=args,
+                intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
             )
         else:
             self.shared_experts = None
-    
+
     def __call__(self, hidden_states):
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        
+
         if self.shared_experts is not None:
             identity = hidden_states
-        
+
         x = hidden_states.reshape(-1, hidden_dim)
-        
+
         expert_indices, expert_weights = self.gate(hidden_states)
         expert_indices = mx.stop_gradient(expert_indices)
         expert_outputs = self.switch_mlp(x, expert_indices)
@@ -184,7 +212,7 @@ class BailingMoeSparseMoeBlock(nn.Module):
         if self.shared_experts is not None:
             shared_output = self.shared_experts(identity)
             output = output + shared_output
-        
+
         return output
 
 
@@ -192,14 +220,18 @@ class BailingMoeDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.attention = BailingMoeAttention(args)
-        
+
         self.mlp = (
             BailingMoeSparseMoeBlock(args)
-            if (args.num_experts is not None and layer_idx >= args.first_k_dense_replace)
+            if (
+                args.num_experts is not None and layer_idx >= args.first_k_dense_replace
+            )
             else BailingMoeMLP(args)
         )
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
     def __call__(
         self,
@@ -211,14 +243,15 @@ class BailingMoeDecoderLayer(nn.Module):
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
-    
+
 
 class BailingMoeModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.word_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            BailingMoeDecoderLayer(args, layer_idx=i) for i in range(args.num_hidden_layers)
+            BailingMoeDecoderLayer(args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -259,43 +292,52 @@ class Model(nn.Module):
     ):
         h = self.model(inputs, mask, cache)
         if self.norm_head:
-            weight_norm = mx.linalg.norm(self.lm_head.weight, axis=0, keepdims=True) + 1e-7
+            weight_norm = (
+                mx.linalg.norm(self.lm_head.weight, axis=0, keepdims=True) + 1e-7
+            )
             normalized_weight = self.lm_head.weight / weight_norm
             logits = mx.matmul(h, normalized_weight.T)
             self.norm_head = False
         else:
             logits = self.lm_head(h)
-        
+
         return logits
-    
+
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            
+
             if l >= self.args.first_k_dense_replace:
-                for n, m in [("gate_proj", "gate_proj"), ("down_proj", "down_proj"), ("up_proj", "up_proj")]:
+                for n, m in [
+                    ("gate_proj", "gate_proj"),
+                    ("down_proj", "down_proj"),
+                    ("up_proj", "up_proj"),
+                ]:
                     for k in ["weight", "scales", "biases"]:
                         if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                             to_join = [
                                 weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
                                 for e in range(self.args.num_experts)
                             ]
-                            weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-                
+                            weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(
+                                to_join
+                            )
+
                 if f"{prefix}.mlp.gate.weight" in weights:
                     gate_weight = weights.pop(f"{prefix}.mlp.gate.weight")
                     weights[f"{prefix}.mlp.gate.gate_proj.weight"] = gate_weight
-                    
+
                 if f"{prefix}.mlp.gate.bias" in weights:
                     gate_bias = weights.pop(f"{prefix}.mlp.gate.bias")
                     weights[f"{prefix}.mlp.gate.gate_proj.bias"] = gate_bias
-        
+
         return weights
 
     @property
     def layers(self):
         return self.model.layers
-    
+
+
 # python -m mlx_lm.convert --hf-path inclusionAI/Ling-lite-1.5 --mlx-path /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit -q
 # python -m mlx_lm.generate --model /Volumes/T7_Shield/MODELS/MLX/Ling-lite-1.5-4bit --prompt 'who is einstein'
 # python -m mlx_lm.generate --model inclusionAI/Ling-lite-1.5 --prompt 'who is einstein'
