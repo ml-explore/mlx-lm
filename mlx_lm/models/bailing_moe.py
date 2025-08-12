@@ -121,12 +121,18 @@ class BailingMoeGate(nn.Module):
         logits = self.gate_proj(x)
         scores = mx.softmax(logits.astype(mx.float32), axis=-1)
 
-        topk_idx = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k:]
+        # Top-k indices via argpartition, then order them by score.
+        topk_idx_pre = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k:]
+        # Do not backprop through index computations.
+        topk_idx_pre = mx.stop_gradient(topk_idx_pre)
 
-        batch_indices = mx.arange(topk_idx.shape[0])[:, None]
-        topk_scores = scores[batch_indices, topk_idx]
+        batch_indices = mx.arange(topk_idx_pre.shape[0])[:, None]
+        topk_scores = scores[batch_indices, topk_idx_pre]
+
         sort_idx = mx.argsort(topk_scores, axis=-1)[:, ::-1]
-        topk_idx = topk_idx[batch_indices, sort_idx]
+        sort_idx = mx.stop_gradient(sort_idx)
+
+        topk_idx = topk_idx_pre[batch_indices, sort_idx]
         topk_weight = topk_scores[batch_indices, sort_idx]
 
         if self.top_k > 1 and self.norm_topk_prob:
@@ -168,6 +174,7 @@ class BailingMoeSparseMoeBlock(nn.Module):
         x = hidden_states.reshape(-1, hidden_dim)
         
         expert_indices, expert_weights = self.gate(hidden_states)
+        expert_indices = mx.stop_gradient(expert_indices)
         expert_outputs = self.switch_mlp(x, expert_indices)
 
         expert_weights = expert_weights.astype(expert_outputs.dtype)

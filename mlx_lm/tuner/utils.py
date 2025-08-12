@@ -133,6 +133,16 @@ def linear_to_lora_layers(
             keys.add("mlp.shared_expert_gate")
         if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
+        if model.model_type == "bailing_moe":
+            keys.add("mlp.gate.gate_proj")
+            keys.add("attention.query_key_value")
+            keys.add("attention.dense")
+            keys.add("mlp.gate_proj")
+            keys.add("mlp.up_proj")
+            keys.add("mlp.down_proj")
+            keys.add("mlp.shared_experts.gate_proj")
+            keys.add("mlp.shared_experts.up_proj")
+            keys.add("mlp.shared_experts.down_proj")
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
@@ -149,14 +159,6 @@ def linear_to_lora_layers(
         keys = {"mixer.Wqkv", "moe.gate"}
     elif model.model_type == "dbrx":
         keys = {"norm_attn_norm.attn.Wqkv", "ffn.router.layer"}
-    elif model.model_type == "bailing_moe":
-        print("mapping")
-        keys = {
-            "attention.query_key_value",
-            "attention.dense",
-            "mlp.gate.gate_proj",
-            "mlp.switch_mlp",
-        }
     elif model.model_type == "internlm2":
         keys = {"attention.wqkv", "attention.wo"}
     elif model.model_type in {"deepseek_v2", "deepseek_v3", "minicpm3"}:
