@@ -1,7 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
 import os
-import warnings
 
 try:
     import wandb
@@ -125,8 +124,10 @@ def get_reporting_callbacks(
                 config=config,
                 wrapped_callback=training_callback,
             )
-        except ImportError as e:
-            warnings.warn(
-                f"{callback} callback will be skipped. {e}",
-            )
+        except KeyError as e:
+            raise ValueError(
+                f"{callback} callback doesn't exist "
+                f"choose from {', '.join(SUPPORT_CALLBACK.keys())}"
+            ) from e
+
     return training_callback

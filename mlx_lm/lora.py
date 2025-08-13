@@ -189,20 +189,22 @@ def build_parser():
         "--wandb",
         type=str,
         default=None,
-        help="The 'wandb' argument is deprecated and will be removed in a future release. "
-        "Use 'report_to: wandb' and 'project_name' in the configuration instead.",
+        help=(
+            "The 'wandb' argument is deprecated and will be removed in a future release. "
+            "Use 'report_to: wandb' and 'project_name' in the configuration instead.",
+        ),
     )
     parser.add_argument(
-        "--report_to",
+        "--report-to",
         type=str,
         default=None,
-        help="Services to report logs to (comma-separated): 'wandb', 'swanlab', or both ('wandb,swanlab').",
+        help="Services to report logs to ('wandb', 'swanlab', or 'wandb,swanlab').",
     )
     parser.add_argument(
-        "--project_name",
+        "--project-name",
         type=str,
         default=None,
-        help="Project name for logging. Default is the name of the root directory. ",
+        help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
