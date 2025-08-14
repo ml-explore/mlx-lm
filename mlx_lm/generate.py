@@ -26,6 +26,8 @@ from .models import cache
 from .models.cache import (
     QuantizedKVCache,
     load_prompt_cache,
+    make_prompt_cache,
+    save_prompt_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -170,6 +172,11 @@ def setup_arg_parser():
         type=str,
         default=None,
         help="A file containing saved KV caches to avoid recomputing them",
+    )
+    parser.add_argument(
+        "--save-prompt-cache",
+        action="store_true",
+        help="Whether to save the updated prompt cache",
     )
     parser.add_argument(
         "--kv-bits",
@@ -783,30 +790,39 @@ def main():
         mx.random.seed(args.seed)
 
     # Load the prompt cache and metadata if a cache file is provided
+    cache_exists = False
     using_cache = args.prompt_cache_file is not None
     if using_cache:
-        prompt_cache, metadata = load_prompt_cache(
-            args.prompt_cache_file,
-            return_metadata=True,
+        try:
+            prompt_cache, metadata = load_prompt_cache(
+                args.prompt_cache_file,
+                return_metadata=True,
+            )
+            if isinstance(prompt_cache[0], QuantizedKVCache):
+                if args.kv_bits is not None and args.kv_bits != prompt_cache[0].bits:
+                    raise ValueError(
+                        "--kv-bits does not match the kv cache loaded from --prompt-cache-file."
+                    )
+                if args.kv_group_size != prompt_cache[0].group_size:
+                    raise ValueError(
+                        "--kv-group-size does not match the kv cache loaded from --prompt-cache-file."
+                    )
+            cache_exists = True
+        except RuntimeError:
+            pass
+    elif args.save_prompt_cache:
+        raise ValueError(
+            "--save-prompt-cache flag set but --prompt-cache-file not provided."
         )
-        if isinstance(prompt_cache[0], QuantizedKVCache):
-            if args.kv_bits is not None and args.kv_bits != prompt_cache[0].bits:
-                raise ValueError(
-                    "--kv-bits does not match the kv cache loaded from --prompt-cache-file."
-                )
-            if args.kv_group_size != prompt_cache[0].group_size:
-                raise ValueError(
-                    "--kv-group-size does not match the kv cache loaded from --prompt-cache-file."
-                )
 
     # Building tokenizer_config
     tokenizer_config = (
-        {} if not using_cache else json.loads(metadata["tokenizer_config"])
+        {} if not cache_exists else json.loads(metadata["tokenizer_config"])
     )
     tokenizer_config["trust_remote_code"] = True if args.trust_remote_code else None
 
     model_path = args.model
-    if using_cache:
+    if cache_exists:
         if model_path is None:
             model_path = metadata["model"]
         elif model_path != metadata["model"]:
@@ -832,7 +848,7 @@ def main():
     if args.use_default_chat_template:
         if tokenizer.chat_template is None:
             tokenizer.chat_template = tokenizer.default_chat_template
-    elif using_cache:
+    elif cache_exists:
         tokenizer.chat_template = json.loads(metadata["chat_template"])
 
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
@@ -857,7 +873,7 @@ def main():
 
         # Treat the prompt as a suffix assuming that the prefix is in the
         # stored kv cache.
-        if using_cache:
+        if cache_exists:
             messages[-1]["content"] = "<query>"
             test_prompt = tokenizer.apply_chat_template(
                 messages,
@@ -876,6 +892,15 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
+
+    if using_cache and not cache_exists:
+        prompt_cache = make_prompt_cache(model)
+        metadata = {}
+        metadata["model"] = args.model
+        metadata["chat_template"] = json.dumps(tokenizer.chat_template)
+        metadata["tokenizer_config"] = json.dumps(tokenizer_config)
+        cache_exists = True
+
     sampler = make_sampler(
         args.temp,
         args.top_p,
@@ -901,6 +926,10 @@ def main():
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
+
+    if args.save_prompt_cache:
+        save_prompt_cache(args.prompt_cache_file, prompt_cache, metadata)
+
     if not args.verbose:
         print(response)
 
