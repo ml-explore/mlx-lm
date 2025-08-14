@@ -1,6 +1,6 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -132,7 +132,7 @@ class BailingMoeGate(nn.Module):
         self.config = config
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
-        self.norm_topk_prob = getattr(config, "norm_topk_prob", False)
+        self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
 
         self.gate_proj = nn.Linear(self.gating_dim, self.num_experts, bias=False)
@@ -142,30 +142,16 @@ class BailingMoeGate(nn.Module):
         x = hidden_states.reshape(-1, D)
 
         logits = self.gate_proj(x)
-        scores = mx.softmax(logits.astype(mx.float32), axis=-1)
+        scores = mx.softmax(logits, axis=-1, precise=True)
 
-        topk_idx_pre = mx.argpartition(scores, kth=-self.top_k, axis=-1)[
-            ..., -self.top_k :
-        ]
-        # Do not backprop through index computations.
-        topk_idx_pre = mx.stop_gradient(topk_idx_pre)
-
-        batch_indices = mx.arange(topk_idx_pre.shape[0])[:, None]
-        topk_scores = scores[batch_indices, topk_idx_pre]
-
-        sort_idx = mx.argsort(topk_scores, axis=-1)[:, ::-1]
-        sort_idx = mx.stop_gradient(sort_idx)
-
-        topk_idx = topk_idx_pre[batch_indices, sort_idx]
-        topk_weight = topk_scores[batch_indices, sort_idx]
+        topk_idx = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+        topk_scores = mx.take_along_axis(scores, topk_idx, axis=-1)
 
         if self.top_k > 1 and self.norm_topk_prob:
-            denom = mx.sum(topk_weight, axis=-1, keepdims=True)
-            topk_weight = topk_weight / mx.maximum(
-                denom, mx.array(1e-9, dtype=denom.dtype)
-            )
+            denom = mx.sum(topk_scores, axis=-1, keepdims=True)
+            topk_scores = topk_scores / mx.maximum(denom, 1e-9)
 
-        return topk_idx, topk_weight
+        return topk_idx, topk_scores
 
 
 class BailingMoeSparseMoeBlock(nn.Module):
@@ -183,10 +169,7 @@ class BailingMoeSparseMoeBlock(nn.Module):
 
         self.gate = BailingMoeGate(config=args)
 
-        if (
-            getattr(args, "num_shared_experts", None) is not None
-            and args.num_shared_experts > 0
-        ):
+        if args.num_shared_experts > 0:
             self.shared_experts = BailingMoeMLP(
                 args=args,
                 intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
@@ -203,16 +186,13 @@ class BailingMoeSparseMoeBlock(nn.Module):
         x = hidden_states.reshape(-1, hidden_dim)
 
         expert_indices, expert_weights = self.gate(hidden_states)
-        expert_indices = mx.stop_gradient(expert_indices)
         expert_outputs = self.switch_mlp(x, expert_indices)
 
-        expert_weights = expert_weights.astype(expert_outputs.dtype)
         weighted_output = mx.sum(expert_outputs * expert_weights[..., None], axis=-2)
         output = weighted_output.reshape(batch_size, seq_len, hidden_dim)
 
         if self.shared_experts is not None:
-            shared_output = self.shared_experts(identity)
-            output = output + shared_output
+            output = output + self.shared_experts(hidden_states)
 
         return output
 
@@ -292,28 +272,22 @@ class Model(nn.Module):
         cache=None,
     ):
         h = self.model(inputs, mask, cache)
-        if self.norm_head:
-            weight_norm = (
-                mx.linalg.norm(self.lm_head.weight, axis=0, keepdims=True) + 1e-7
-            )
-            normalized_weight = self.lm_head.weight / weight_norm
-            logits = mx.matmul(h, normalized_weight.T)
-            self.norm_head = False
-        else:
-            logits = self.lm_head(h)
-
-        return logits
+        return self.lm_head(h)
 
     def sanitize(self, weights):
+        if self.norm_head:
+            w = weights["lm_head.weight"]
+            dtype = w.dtype
+            weight_norm = (
+                mx.linalg.norm(w.astype(mx.float32), axis=0, keepdims=True) + 1e-7
+            )
+            weights["lm_head.weight"] = (w / weight_norm).astype(dtype)
+
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
 
             if l >= self.args.first_k_dense_replace:
-                for n, m in [
-                    ("gate_proj", "gate_proj"),
-                    ("down_proj", "down_proj"),
-                    ("up_proj", "up_proj"),
-                ]:
+                for m in ["gate_proj", "down_proj", "up_proj"]:
                     for k in ["weight", "scales", "biases"]:
                         if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                             to_join = [
@@ -333,6 +307,15 @@ class Model(nn.Module):
                     weights[f"{prefix}.mlp.gate.gate_proj.bias"] = gate_bias
 
         return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     @property
     def layers(self):

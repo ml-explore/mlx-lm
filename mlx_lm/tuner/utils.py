@@ -123,7 +123,6 @@ def linear_to_lora_layers(
         "exaone4",
         "hunyuan_v1_dense",
         "gpt_oss",
-        "bailing_moe",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
@@ -133,16 +132,6 @@ def linear_to_lora_layers(
             keys.add("mlp.shared_expert_gate")
         if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
-        if model.model_type == "bailing_moe":
-            keys.add("mlp.gate.gate_proj")
-            keys.add("attention.query_key_value")
-            keys.add("attention.dense")
-            keys.add("mlp.gate_proj")
-            keys.add("mlp.up_proj")
-            keys.add("mlp.down_proj")
-            keys.add("mlp.shared_experts.gate_proj")
-            keys.add("mlp.shared_experts.up_proj")
-            keys.add("mlp.shared_experts.down_proj")
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
@@ -178,6 +167,8 @@ def linear_to_lora_layers(
         }
     elif model.model_type == "exaone":
         keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
+    elif model.model_type == "bailing_moe":
+        keys = {"attention.query_key_value", "attention.dense"}
     else:
         raise ValueError(f"Lora does not support {model.model_type}")
 
