@@ -808,8 +808,9 @@ def main():
                         "--kv-group-size does not match the kv cache loaded from --prompt-cache-file."
                     )
             cache_exists = True
-        except RuntimeError:
-            pass
+        except RuntimeError as e:
+            if not args.save_prompt_cache:
+                raise e
     elif args.save_prompt_cache:
         raise ValueError(
             "--save-prompt-cache flag set but --prompt-cache-file not provided."
