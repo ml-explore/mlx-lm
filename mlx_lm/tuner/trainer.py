@@ -216,26 +216,22 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
-    # Debug: Check initial model parameters - FIXED
     if rank == 0:
         initial_params = model.trainable_parameters()
         flat_params = tree_flatten(initial_params)
-        param_sum = sum(mx.sum(param).item() for key, param in flat_params)  # Fixed line
+        param_sum = sum(mx.sum(param).item() for key, param in flat_params)
         print(f"Initial parameter sum: {param_sum}")
 
     def tree_l2_norm(tree):
         flat_tree = tree_flatten(tree)
         if not flat_tree:
             return mx.array(0.0)
-        # Fixed: Extract values from (key, value) tuples
         values = [param for key, param in flat_tree]
         squared_vals = [mx.sum(v.astype(mx.float32) ** 2) for v in values]
         return mx.sqrt(mx.sum(mx.stack(squared_vals)))
 
-    # Create loss and gradient function
     loss_and_grad_fn = nn.value_and_grad(model, loss)
     
-    # Initialize gradient accumulator
     accumulated_grads = None
     accumulation_count = 0
 
@@ -261,7 +257,6 @@ def train(
         # Average the accumulated gradients
         final_grads = tree_map(lambda g: g / accumulation_count, accumulated_grads)
         
-        # Debug gradient norms
         if rank == 0:
             grad_norm = tree_l2_norm(final_grads)
             mx.eval(grad_norm)
@@ -271,21 +266,18 @@ def train(
         if world_size > 1:
             final_grads = average_gradients(final_grads)
         
-        # Store parameters before update for debugging - FIXED
         if rank == 0:
             old_params = model.trainable_parameters()
             flat_old_params = tree_flatten(old_params)
-            old_param_sum = sum(mx.sum(param).item() for key, param in flat_old_params)  # Fixed line
+            old_param_sum = sum(mx.sum(param).item() for key, param in flat_old_params)
         
-        # Apply optimizer update
         optimizer.update(model, final_grads)
         mx.eval(model.parameters(), optimizer.state)
         
-        # Debug parameter changes - FIXED
         if rank == 0:
             new_params = model.trainable_parameters()
             flat_new_params = tree_flatten(new_params)
-            new_param_sum = sum(mx.sum(param).item() for key, param in flat_new_params)  # Fixed line
+            new_param_sum = sum(mx.sum(param).item() for key, param in flat_new_params)
             param_change = abs(new_param_sum - old_param_sum)
             print(f"Parameter change: {param_change:.6f} (old: {old_param_sum:.6f}, new: {new_param_sum:.6f})")
             if param_change < 1e-8:
@@ -293,7 +285,6 @@ def train(
         
         reset_accumulation()
 
-    # Training state
     model.train()
     total_loss = 0.0
     total_tokens = 0
@@ -302,7 +293,6 @@ def train(
     report_steps = 0
     train_time = 0.0
 
-    # Create batch iterator
     batch_iterator = iterate_batches(
         dataset=train_dataset,
         batch_size=args.batch_size,
@@ -310,7 +300,6 @@ def train(
         train=True,
     )
 
-    # Main training loop
     for iteration in range(1, args.iters + 1):
         tic = time.perf_counter()
         
@@ -326,20 +315,16 @@ def train(
             )
             batch = next(batch_iterator)
         
-        # Forward and backward pass
         (loss_value, n_tokens), grads = loss_and_grad_fn(model, *batch)
         
-        # Debug: Check if loss and gradients are reasonable
         if rank == 0 and iteration <= 5:
             grad_norm = tree_l2_norm(grads)
             mx.eval(loss_value, n_tokens, grad_norm)
             print(f"Iter {iteration}: loss={loss_value.item():.4f}, "
                   f"tokens={n_tokens.item()}, grad_norm={grad_norm.item():.6f}")
         
-        # Accumulate gradients
         accumulate_gradients(grads)
         
-        # Accumulate loss and tokens for reporting
         report_loss += loss_value.item()
         report_tokens += n_tokens.item()
         report_steps += 1
@@ -350,15 +335,12 @@ def train(
         mx.eval(loss_value, n_tokens)
         train_time += time.perf_counter() - tic
         
-        # Apply gradients when accumulation is complete
         if accumulation_count >= args.gradient_accumulation_steps:
             apply_accumulated_gradients()
         
-        # Validation
         if (args.steps_per_eval is not None and 
             iteration % args.steps_per_eval == 0):
             
-            # Make sure any pending gradients are applied
             if accumulation_count > 0:
                 apply_accumulated_gradients()
             
@@ -383,7 +365,6 @@ def train(
                     "val_loss": val_loss,
                 })
         
-        # Report training progress
         if iteration % args.steps_per_report == 0 or iteration == args.iters:
             avg_loss = report_loss / report_steps
             learning_rate = optimizer.learning_rate.item()
@@ -410,15 +391,12 @@ def train(
                     "peak_memory": peak_mem,
                 })
             
-            # Reset reporting counters
             report_loss = 0.0
             report_tokens = 0
             report_steps = 0
             train_time = 0.0
         
-        # Save checkpoints
         if iteration % args.steps_per_save == 0 and rank == 0:
-            # Make sure any pending gradients are applied
             if accumulation_count > 0:
                 apply_accumulated_gradients()
             
@@ -428,11 +406,9 @@ def train(
             mx.save_safetensors(str(checkpoint), adapter_weights)
             print(f"Iter {iteration}: Saved weights to {checkpoint}")
 
-    # Apply any remaining accumulated gradients
     if accumulation_count > 0:
         apply_accumulated_gradients()
 
-    # Save final weights
     if rank == 0:
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
