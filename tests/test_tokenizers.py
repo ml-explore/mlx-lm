@@ -107,7 +107,7 @@ class TestTokenizers(unittest.TestCase):
 
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
         tokenizer = self.download_tokenizer(tokenizer_repo)
-        self.assertTrue(tokenizer.has_tool_calling, False)
+        self.assertFalse(tokenizer.has_tool_calling)
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
