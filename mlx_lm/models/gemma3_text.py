@@ -215,6 +215,7 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = Gemma3Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.tie_word_embeddings = False
 
     def __call__(
         self,
@@ -224,13 +225,16 @@ class Model(nn.Module):
         input_embeddings: Optional[mx.array] = None,
     ):
         out = self.model(inputs, mask, cache, input_embeddings)
-        out = self.lm_head(out)
+        if self.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
         return out
 
     def sanitize(self, weights):
-        weights = dict(weights)
         if "lm_head.weight" not in weights:
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+            self.tie_word_embeddings = True
+            self.pop("lm_head")
         return weights
 
     @property

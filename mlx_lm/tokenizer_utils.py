@@ -283,8 +283,6 @@ class TokenizerWrapper:
                 self._think_end = think_end
                 break
         if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
-            self._tool_call_start = ""
-            self._tool_call_end = ""
             for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
                 if tool_call_start in vocab and tool_call_end in vocab:
                     self._tool_call_start = tool_call_start

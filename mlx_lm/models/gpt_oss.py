@@ -50,11 +50,8 @@ def swiglu(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
     x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
     x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
 
-    # Preserve input dtype
-    input_dtype = x_glu.dtype
-    glu_scaled = (alpha * x_glu.astype(mx.float32)).astype(input_dtype)
-    negative_glu = (-glu_scaled).astype(mx.float32)
-    sig = (1.0 / (1.0 + mx.exp(negative_glu))).astype(input_dtype)
+    glu_scaled = alpha * x_glu
+    sig = mx.sigmoid(glu_scaled)
 
     out_glu = x_glu * sig
     # Note we add an extra bias of 1 to the linear layer
