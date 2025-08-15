@@ -38,60 +38,6 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
-class StopCondition(NamedTuple):
-    stop_met: bool
-    trim_length: int
-
-
-def stopping_criteria(
-    tokens: List[int],
-    stop_id_sequences: List[List[int]],
-    eos_token_id: Union[int, None],
-) -> StopCondition:
-    """
-    Determines whether the token generation should stop based on predefined
-    conditions.
-
-    Args:
-        tokens (List[int]): The current sequence of generated tokens.
-        stop_id_sequences (List[List[[int]]): A list of integer lists, each
-          representing a sequence of token IDs. If the end of the `tokens`
-          list matches any of these sequences, the generation should stop.
-        eos_token_id (Union[int, None]): The token ID that represents the
-          end-of-sequence. If the last token in `tokens` matches this, the
-          generation should stop.
-
-    Returns:
-        StopCondition: A named tuple indicating whether the stop condition has
-          been met (`stop_met`) and how many tokens should be trimmed from the
-          end if it has (`trim_length`).
-    """
-    if tokens and tokens[-1] == eos_token_id:
-        return StopCondition(stop_met=True, trim_length=0)
-
-    for stop_ids in stop_id_sequences:
-        if len(tokens) >= len(stop_ids):
-            if tokens[-len(stop_ids) :] == stop_ids:
-                return StopCondition(stop_met=True, trim_length=len(stop_ids))
-
-    return StopCondition(stop_met=False, trim_length=0)
-
-
-def sequence_overlap(s1: Sequence, s2: Sequence) -> bool:
-    """
-    Checks if a suffix of s1 has overlap with a prefix of s2
-
-    Args:
-        s1 (Sequence): The first sequence
-        s2 (Sequence): The second sequence
-
-    Returns:
-        bool: If the two sequences have overlap
-    """
-    max_overlap = min(len(s1), len(s2))
-    return any(s1[-i:] == s2[:i] for i in range(1, max_overlap + 1))
-
-
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
     default_role_mapping = {
         "system_prompt": (
@@ -362,12 +308,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Get stop id sequences, if provided
         stop_words = self.body.get("stop")
-        stop_words = stop_words or []
-        stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
-        stop_id_sequences = [
-            self.tokenizer.encode(stop_word, add_special_tokens=False)
-            for stop_word in stop_words
-        ]
 
         # Send header type
         (
@@ -378,7 +318,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Call endpoint specific method
         prompt = endpoints[self.path]()
-        self.handle_completion(prompt, stop_id_sequences)
+        self.handle_completion(prompt, stop_words)
 
     def validate_model_parameters(self):
         """
@@ -633,19 +573,16 @@ class APIHandler(BaseHTTPRequestHandler):
     def handle_completion(
         self,
         prompt: List[int],
-        stop_id_sequences: List[List[int]],
+        stop_words: Optional[List[str]] = None,
     ):
         """
         Generate a response to a prompt and send it to the client in a single batch.
 
         Args:
             prompt (List[int]): The tokenized prompt.
-            stop_id_sequences (List[List[int]]): A list of stop words passed
-              to the stopping_criteria function
         """
         tokens = []
         finish_reason = "length"
-        stop_sequence_suffix = None
         if self.stream:
             self.end_headers()
             logging.debug(f"Starting stream:")
@@ -690,6 +627,7 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache=self.prompt_cache.cache,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
+            stop_words=stop_words,
         ):
             logging.debug(gen_response.text)
 
@@ -721,37 +659,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
             token_logprobs.append(logprobs[token].item())
 
-            stop_condition = stopping_criteria(
-                tokens, stop_id_sequences, self.tokenizer.eos_token_id
-            )
-            if stop_condition.stop_met:
+            if (
+                hasattr(gen_response, "finish_reason")
+                and gen_response.finish_reason == "stop"
+            ):
                 finish_reason = "stop"
-                if stop_condition.trim_length:
-                    stop_sequence_suffix = self.tokenizer.decode(
-                        tokens[-stop_condition.trim_length :]
-                    )
-                    text = text[: -len(stop_sequence_suffix)]
-                segment = ""
                 break
 
-            if self.stream and not in_tool_call:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
-                if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in stop_id_sequences
-                    )
-                ):
-                    continue
-                elif segment or tool_calls:
-                    response = self.generate_response(
-                        segment, None, tool_calls=tool_calls
-                    )
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                    self.wfile.flush()
-                    segment = ""
-                    tool_calls = []
+            if self.stream and segment:
+                response = self.generate_response(segment, None)
+                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                self.wfile.flush()
+                segment = ""
 
         self.prompt_cache.tokens.extend(tokens)
 

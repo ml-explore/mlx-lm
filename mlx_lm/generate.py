@@ -12,7 +12,9 @@ from typing import (
     Callable,
     Generator,
     List,
+    NamedTuple,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -77,6 +79,13 @@ def setup_arg_parser():
         default=(),
         nargs="+",
         help="Add tokens in the list of eos tokens that stop generation.",
+    )
+    parser.add_argument(
+        "--stop-words",
+        type=str,
+        default=None,
+        nargs="+",
+        help="Specify stop words that will cause generation to stop when reached.",
     )
     parser.add_argument(
         "--system-prompt",
@@ -248,6 +257,60 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
             else:
                 mx.synchronize()
             mx.set_wired_limit(old_limit)
+
+
+class StopCondition(NamedTuple):
+    stop_met: bool
+    trim_length: int
+
+
+def stopping_criteria(
+    tokens: List[int],
+    stop_id_sequences: List[List[int]],
+    eos_token_id: Union[int, None],
+) -> StopCondition:
+    """
+    Determines whether the token generation should stop based on predefined
+    conditions.
+
+    Args:
+        tokens (List[int]): The current sequence of generated tokens.
+        stop_id_sequences (List[List[[int]]): A list of integer lists, each
+          representing a sequence of token IDs. If the end of the `tokens`
+          list matches any of these sequences, the generation should stop.
+        eos_token_id (Union[int, None]): The token ID that represents the
+          end-of-sequence. If the last token in `tokens` matches this, the
+          generation should stop.
+
+    Returns:
+        StopCondition: A named tuple indicating whether the stop condition has
+          been met (`stop_met`) and how many tokens should be trimmed from the
+          end if it has (`trim_length`).
+    """
+    if tokens and tokens[-1] == eos_token_id:
+        return StopCondition(stop_met=True, trim_length=0)
+
+    for stop_ids in stop_id_sequences:
+        if len(tokens) >= len(stop_ids):
+            if tokens[-len(stop_ids) :] == stop_ids:
+                return StopCondition(stop_met=True, trim_length=len(stop_ids))
+
+    return StopCondition(stop_met=False, trim_length=0)
+
+
+def sequence_overlap(s1: Sequence, s2: Sequence) -> bool:
+    """
+    Checks if a suffix of s1 has overlap with a prefix of s2
+
+    Args:
+        s1 (Sequence): The first sequence
+        s2 (Sequence): The second sequence
+
+    Returns:
+        bool: If the two sequences have overlap
+    """
+    max_overlap = min(len(s1), len(s2))
+    return any(s1[-i:] == s2[:i] for i in range(1, max_overlap + 1))
 
 
 @dataclass
@@ -668,6 +731,19 @@ def stream_generate(
             prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         prompt = mx.array(prompt)
 
+    # Process stop_words from kwargs into stop_id_sequences for stopping criteria
+    stop_id_sequences = []
+    stop_words = kwargs.pop("stop_words", None)
+    if stop_words is not None:
+        if isinstance(stop_words, str):
+            stop_words = [stop_words]
+        for stop_word in stop_words:
+            # Process escape sequences like \n, \t, etc.
+            processed_stop_word = stop_word.encode().decode("unicode_escape")
+            stop_ids = tokenizer.encode(processed_stop_word, add_special_tokens=False)
+            if stop_ids:
+                stop_id_sequences.append(stop_ids)
+
     detokenizer = tokenizer.detokenizer
 
     if draft_model is None:
@@ -685,18 +761,45 @@ def stream_generate(
     with wired_limit(model, [generation_stream]):
         detokenizer.reset()
         tic = time.perf_counter()
+        tokens = []
+        finish_reason = "length"
+        stop_sequence_suffix = None
+
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
+
+            # Handle the case when token is already an int
+            token_id = token.item() if hasattr(token, "item") else token
+            tokens.append(token_id)
+            detokenizer.add_token(token)
+            segment = detokenizer.last_segment
+
+            if stop_id_sequences:
+                stop_condition = stopping_criteria(
+                    tokens, stop_id_sequences, tokenizer.eos_token_id
+                )
+
+                if stop_condition.stop_met:
+                    finish_reason = "stop"
+                    if stop_condition.trim_length > 0:
+                        stop_sequence_suffix = tokens[-stop_condition.trim_length :]
+                    break
+
+                elif any(
+                    sequence_overlap(tokens, sequence) for sequence in stop_id_sequences
+                ):
+                    continue
+
+            if token_id in tokenizer.eos_token_ids:
+                finish_reason = "stop"
                 break
 
-            detokenizer.add_token(token)
-
+            # Generate response
             yield GenerationResponse(
-                text=detokenizer.last_segment,
+                text=segment,
                 token=token,
                 logprobs=logprobs,
                 from_draft=from_draft,
@@ -709,8 +812,26 @@ def stream_generate(
             )
 
         detokenizer.finalize()
+
+        # Prepare final text with stop sequence removed if necessary
+        final_text = detokenizer.last_segment
+        if finish_reason == "stop" and stop_sequence_suffix:
+            suffix_text = tokenizer.decode(stop_sequence_suffix)
+            # Make sure we remove the stop word from the output
+            if len(suffix_text) > 0 and final_text.endswith(suffix_text):
+                final_text = final_text[: -len(suffix_text)]
+            # In some cases, the detokenizer might have added extra spaces or characters
+            # Try to match against the original stop words
+            elif stop_words is not None:
+                for stop_word in stop_words:
+                    processed_stop_word = stop_word.encode().decode("unicode_escape")
+                    if final_text.endswith(processed_stop_word):
+                        final_text = final_text[: -len(processed_stop_word)]
+                        break
+
+        # Final response
         yield GenerationResponse(
-            text=detokenizer.last_segment,
+            text=final_text,
             token=token,
             logprobs=logprobs,
             from_draft=from_draft,
@@ -719,7 +840,7 @@ def stream_generate(
             generation_tokens=n + 1,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
+            finish_reason=finish_reason,
         )
 
 
@@ -740,7 +861,9 @@ def generate(
        prompt (Union[str, List[int]]): The input prompt string or integer tokens.
        verbose (bool): If ``True``, print tokens and timing information.
            Default: ``False``.
+       formatter: A deprecated argument that is no longer used.
        kwargs: The remaining options get passed to :func:`stream_generate`.
+          Additional supported options include stop_words for custom stopping words.
           See :func:`stream_generate` for more details.
     """
     if formatter is not None:
@@ -900,6 +1023,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        stop_words=args.stop_words,
     )
     if not args.verbose:
         print(response)
