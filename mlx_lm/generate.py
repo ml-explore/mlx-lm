@@ -679,6 +679,7 @@ def stream_generate(
         )
     else:
         kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
