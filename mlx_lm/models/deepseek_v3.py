@@ -483,10 +483,11 @@ class Model(nn.Module):
             weight = weight.reshape(
                 ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
             )
+            scale_inv = scale_inv.astype(dtype)
             weight = (weight * scale_inv[:, None, :, None]).reshape(
                 m + pad_bottom, n + pad_side
             )
-            return weight[:m, :n].astype(dtype)
+            return weight[:m, :n]
 
         # Dequantize
         new_weights = {}
