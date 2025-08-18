@@ -45,7 +45,6 @@ MODEL_REMAPPING = {
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
     "kimi_k2": "deepseek_v3",
-    "lfm2-vl": "lfm2_vl",
 }
 
 MAX_FILE_SIZE_GB = 5
