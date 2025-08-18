@@ -170,7 +170,7 @@ class MLXLM(LM):
         indices = []
         for v in group_reqs.values():
             idx, resp = zip(*v)
-            indices.extend(idx)
+            indices.append(idx)
             responses.append(resp)
 
         # split data accross ranks
@@ -216,31 +216,36 @@ class MLXLM(LM):
                 scores[-1] += mx.sum(score).item()
                 is_greedy[-1] &= mx.all(ig).item()
 
-        scores = mx.array(scores)
-        is_greedy = mx.array(is_greedy)
-
         if long_completions > 0:
             logging.info(
                 f"Prefix eliminated for {long_completions} requests with "
                 + "completion longer than context."
             )
 
+        # All gather the results across nodes
         num_results = len(requests)
+        per_group = mx.distributed.all_max(len(scores), stream=mx.cpu).item()
+        scores = scores + [0] * (per_group - len(scores))
+        is_greedy = is_greedy + [False] * (per_group - len(is_greedy))
+        scores = mx.array(scores)
+        is_greedy = mx.array(is_greedy)
+        scores = mx.distributed.all_gather(scores, stream=mx.cpu)
+        is_greedy = mx.distributed.all_gather(is_greedy, stream=mx.cpu)
+        mx.eval(scores, is_greedy)
 
-        # all gather the results across groups
-        if group.size() > 1:
-            per_group = int(np.ceil(num_results / group.size()))
-            scores = mx.pad(scores, ((0, per_group - len(scores)),))
-            is_greedy = mx.pad(is_greedy, ((0, per_group - len(is_greedy))))
-            scores = mx.distributed.all_gather(scores[mx.newaxis], stream=mx.cpu)
-            is_greedy = mx.distributed.all_gather(is_greedy[mx.newaxis], stream=mx.cpu)
-            mx.eval(scores, is_greedy)
-            scores = scores.T.reshape(-1)
-            is_greedy = is_greedy.T.reshape(-1)
-
-        inv_sort = mx.argsort(mx.array(indices))
+        # Arrange the indices to match the scores from each node and then
+        # inverse sort the scores
+        all_indices = []
+        for rank in range(group.size()):
+            rank_indices = [
+                idx for question in indices[rank :: group.size()] for idx in question
+            ]
+            rank_indices += [num_results] * (per_group - len(rank_indices))
+            all_indices.extend(rank_indices)
+        inv_sort = mx.argsort(mx.array(all_indices))
         scores = scores[:num_results][inv_sort]
         is_greedy = is_greedy[:num_results][inv_sort]
+
         return list(zip(scores.tolist(), is_greedy.tolist()))
 
     def loglikelihood_rolling(self, requests) -> list[float]:
@@ -398,6 +403,12 @@ def main():
 
     mx.random.seed(args.seed)
 
+    # Initialize the communication if in distributed mode
+    world = mx.distributed.init()
+    mx.eval(mx.distributed.all_sum(1, stream=mx.cpu))
+    if world.size() > 1 and world.rank() == 0:
+        print(f"Evaluating with {world.size()} nodes")
+
     lm = MLXLM(
         args.model,
         max_tokens=args.max_tokens,
@@ -425,7 +436,7 @@ def main():
         file_keys += [f"{args.num_shots:02d}"]
     file_keys += args.tasks
     filename = "_".join(file_keys)
-    if mx.distributed.init().rank() == 0:
+    if world.rank() == 0:
         output_path = output_dir / filename
         output_path.write_text(json.dumps(results["results"], indent=4))
         print("Results:")

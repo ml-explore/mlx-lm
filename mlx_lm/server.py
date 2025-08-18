@@ -680,6 +680,23 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         in_tool_call = False
         segment = ""
+
+        # Create keepalive callback to send SSE comments during long prompt processing
+        def keepalive_callback(processed_tokens, total_tokens):
+            logging.info(
+                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+            )
+            if self.stream:
+                try:
+                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
+                    self.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # Client disconnected, ignore
+                    pass
+
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -690,6 +707,7 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache=self.prompt_cache.cache,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
+            prompt_progress_callback=keepalive_callback,
         ):
             logging.debug(gen_response.text)
 
