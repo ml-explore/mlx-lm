@@ -109,7 +109,7 @@ def build_parser():
     parser.add_argument(
         "--optimizer",
         type=str,
-        choices=["adam", "adamw", "sgd", "adafactor"],
+        choices=["adam", "adamw", "muon", "sgd", "adafactor"],
         default=None,
         help="Optimizer to use for training: adam, adamw, sgd, or adafactor.",
     )
@@ -191,7 +191,7 @@ def build_parser():
         default=None,
         help=(
             "The 'wandb' argument is deprecated and will be removed in a future release. "
-            "Use 'report_to: wandb' and 'project_name' in the configuration instead.",
+            "Use 'report_to: wandb' and 'project_name' in the configuration instead."
         ),
     )
     parser.add_argument(
