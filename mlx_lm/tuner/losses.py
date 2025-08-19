@@ -8,15 +8,9 @@ def can_run_metal():
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
-def metal_only_function(fn):
-    def wrapped_fn(*args, **kwargs):
-        if can_run_metal():
-            return fn(*args, **kwargs)
-
-    return wrapped_fn
-
-
 def _make_kl_forward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -183,6 +177,8 @@ def _make_kl_forward_kernel():
 
 
 def _make_kl_backward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -341,8 +337,6 @@ def _make_kl_backward_kernel():
     )
 
 
-_make_kl_forward_kernel = metal_only_function(_make_kl_forward_kernel)
-_make_kl_backward_kernel = metal_only_function(_make_kl_backward_kernel)
 _kl_forward_kernel = _make_kl_forward_kernel()
 _kl_backward_kernel = _make_kl_backward_kernel()
 
@@ -393,6 +387,8 @@ def kl_div_loss(logits_q, logits_p):
 
 
 def _make_js_forward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -577,6 +573,8 @@ def _make_js_forward_kernel():
 
 
 def _make_js_backward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -745,8 +743,6 @@ def _make_js_backward_kernel():
     )
 
 
-_make_js_forward_kernel = metal_only_function(_make_js_forward_kernel)
-_make_js_backward_kernel = metal_only_function(_make_js_backward_kernel)
 _js_forward_kernel = _make_js_forward_kernel()
 _js_backward_kernel = _make_js_backward_kernel()
 
