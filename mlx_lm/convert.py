@@ -87,6 +87,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
+    q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -134,9 +135,16 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
+        if "quantization" in config:
+            raise ValueError("Cannot quantize already quantized model.")
         print("[INFO] Quantizing")
         model, config = quantize_model(
-            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
+            model,
+            config,
+            q_group_size,
+            q_bits,
+            mode=q_mode,
+            quant_predicate=quant_predicate,
         )
 
     if dequantize:
@@ -181,6 +189,13 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--q-bits", help="Bits per weight for quantization.", type=int, default=4
+    )
+    parser.add_argument(
+        "--q-mode",
+        help="The quantization mode.",
+        type=str,
+        default="affine",
+        choices=["affine", "mxfp4"],
     )
     parser.add_argument(
         "--quant-predicate",

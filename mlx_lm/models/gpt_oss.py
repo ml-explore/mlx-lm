@@ -304,48 +304,6 @@ class GptOssMoeModel(nn.Module):
         return x
 
 
-def convert_moe_packed_tensors(blocks, scales):
-    assert (
-        blocks.shape[:-1] == scales.shape
-    ), f"{blocks.shape=} does not match {scales.shape=}"
-
-    scales = scales.astype(mx.int32) - 127
-    lut = mx.array(
-        [
-            +0.0,
-            +0.5,
-            +1.0,
-            +1.5,
-            +2.0,
-            +3.0,
-            +4.0,
-            +6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=mx.bfloat16,
-    )
-
-    *prefix_shape, G, B = blocks.shape
-
-    blocks = blocks.reshape(-1, B)
-    scales = scales.reshape(-1, 1)
-
-    idx_lo = blocks & 0x0F
-    idx_hi = blocks >> 4
-
-    out = mx.stack((lut[idx_lo], lut[idx_hi]), axis=-1).flatten(-2)
-    out = (2.0**scales) * out
-    out = out.reshape(*prefix_shape, G * B * 2)
-    return out.astype(mx.bfloat16)
-
-
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -361,33 +319,23 @@ class Model(nn.Module):
         if any("gate_proj.weight" in k for k in weights.keys()):
             return weights  # already sanitized
 
-        # Needs dequantization
-        if any("gate_up_proj_scales" in k for k in weights.keys()):
-            new_weights = {}
-            for k, v in weights.items():
-                if k.endswith("_scales"):
-                    pass
-                elif k.endswith("_blocks"):
-                    scale_k = k.replace("_blocks", "_scales")
-                    scales = weights[scale_k]
-                    new_v = convert_moe_packed_tensors(v, scales)
-                    new_k = k.replace("_blocks", "")
-                    new_weights[new_k] = new_v
-                else:
-                    new_weights[k] = v
-            weights = new_weights
-
         new_weights = {}
         for k, v in weights.items():
             if "gate_up_proj" in k and "bias" not in k:
-                new_weights[k.replace("gate_up_proj", "gate_proj.weight")] = v[
-                    ..., ::2, :
-                ]
-                new_weights[k.replace("gate_up_proj", "up_proj.weight")] = v[
-                    ..., 1::2, :
-                ]
+                if "_blocks" in k:
+                    v = v.view(mx.uint32).flatten(-2)
+                    k = k.replace("_blocks", ".weight")
+                if "_scales" in k:
+                    k = k.replace("_scales", ".scales")
+                new_weights[k.replace("gate_up_proj", "gate_proj")] = v[..., ::2, :]
+                new_weights[k.replace("gate_up_proj", "up_proj")] = v[..., 1::2, :]
             elif "down_proj" in k and "bias" not in k:
-                new_weights[k.replace("down_proj", "down_proj.weight")] = v
+                if "_blocks" in k:
+                    v = v.view(mx.uint32).flatten(-2)
+                    k = k.replace("_blocks", ".weight")
+                if "_scales" in k:
+                    k = k.replace("_scales", ".scales")
+                new_weights[k] = v
             elif "gate_up_proj_bias" in k:
                 new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = v[
                     ..., ::2
@@ -399,6 +347,7 @@ class Model(nn.Module):
                 new_weights[k.replace("down_proj_bias", "down_proj.bias")] = v
             else:
                 new_weights[k] = v
+
         return new_weights
 
     @property

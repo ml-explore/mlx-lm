@@ -188,8 +188,7 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    if (quantization := config.get("quantization", None)) is not None:
-
+    def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -202,8 +201,13 @@ def load_model(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+
+    if (quantization := config.get("quantization", None)) is not None:
+        _quantize(quantization)
+
     elif quantization_config := config.get("quantization_config", False):
         # Handle legacy quantization config
         quant_method = quantization_config["quant_method"]
@@ -211,6 +215,13 @@ def load_model(
             from .models.bitlinear_layers import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
+        elif quant_method == "mxfp4":
+            quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        else:
+            raise ValueError(f"Unknown quantization method {quant_method}.")
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -442,8 +453,9 @@ def save_model(
 def quantize_model(
     model: nn.Module,
     config: dict,
-    q_group_size: int,
-    q_bits: int,
+    group_size: int,
+    bits: int,
+    mode: str = "affine",
     quant_predicate: Optional[
         Callable[[str, nn.Module, dict], Union[bool, dict]]
     ] = None,
@@ -454,8 +466,9 @@ def quantize_model(
     Args:
         model (nn.Module): The model to be quantized.
         config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
+        group_size (int): Group size for quantization.
+        bits (int): Bits per weight for quantization.
+        mode (str): The quantization mode.
         quant_predicate (Callable): A callable that decides how
             to quantize each layer based on the path.
             Accepts the layer `path`, the `module` and the model `config`.
