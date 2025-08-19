@@ -478,34 +478,38 @@ def quantize_model(
     Returns:
         Tuple: Tuple containing quantized model and config.
     """
-    if "quantization" in config:
-        raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
+    if "quantization" in quantized_config:
+        # If the model is already partially quantized, return params so that
+        # the config is set on a per-layer basis
+        fine_grained_config = True
+    else:
+        fine_grained_config = False
+        quantized_config["quantization"] = quant_params
 
-    def base_predicate(path, module):
+    def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
-        if module.weight.shape[-1] % q_group_size != 0:
+        if module.weight.shape[-1] % group_size != 0:
             return False
-        return True
-
-    # Add any custom quantization parameters to the config as we go
-    def wrapped_predicate(p, m):
-        bool_or_params = base_predicate(p, m)
-        if bool_or_params:
-            bool_or_params = quant_predicate(p, m)
+        bool_or_params = True
+        if quant_predicate is not None:
+            bool_or_params = quant_predicate(path, m)
         if isinstance(bool_or_params, dict):
-            quantized_config["quantization"][p] = bool_or_params
+            quantized_config["quantization"][path] = bool_or_params
+        elif fine_grained_config and bool_or_params:
+            quantized_config["quantization"][path] = quant_params
         return bool_or_params
 
     nn.quantize(
         model,
-        q_group_size,
-        q_bits,
-        class_predicate=wrapped_predicate if quant_predicate else base_predicate,
+        group_size,
+        bits,
+        mode=mode,
+        class_predicate=wrapped_predicate,
     )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
