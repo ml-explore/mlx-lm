@@ -8,6 +8,14 @@ def can_run_metal():
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
+def metal_only_function(fn):
+    def wrapped_fn(*args, **kwargs):
+        if can_run_metal():
+            return fn(*args, **kwargs)
+
+    return wrapped_fn
+
+
 def _make_kl_forward_kernel():
     source = """
     constexpr int M = 4;
@@ -333,6 +341,8 @@ def _make_kl_backward_kernel():
     )
 
 
+_make_kl_forward_kernel = metal_only_function(_make_kl_forward_kernel)
+_make_kl_backward_kernel = metal_only_function(_make_kl_backward_kernel)
 _kl_forward_kernel = _make_kl_forward_kernel()
 _kl_backward_kernel = _make_kl_backward_kernel()
 
@@ -735,6 +745,8 @@ def _make_js_backward_kernel():
     )
 
 
+_make_js_forward_kernel = metal_only_function(_make_js_forward_kernel)
+_make_js_backward_kernel = metal_only_function(_make_js_backward_kernel)
 _js_forward_kernel = _make_js_forward_kernel()
 _js_backward_kernel = _make_js_backward_kernel()
 
