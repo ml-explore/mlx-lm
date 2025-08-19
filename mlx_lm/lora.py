@@ -330,7 +330,7 @@ def run(args, training_callback: TrainingCallback = None):
     )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model)
+    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
