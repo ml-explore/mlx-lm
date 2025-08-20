@@ -3,6 +3,7 @@ import math
 import os
 import re
 import types
+import warnings
 from pathlib import Path
 
 import mlx.core as mx
@@ -11,7 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tuner.callbacks import WandBCallback
+from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -70,7 +71,9 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
-    "wandb": None,
+    "wandb": None,  # will be deprecated in a future release
+    "report_to": None,
+    "project_name": None,
 }
 
 
@@ -106,7 +109,7 @@ def build_parser():
     parser.add_argument(
         "--optimizer",
         type=str,
-        choices=["adam", "adamw", "sgd", "adafactor"],
+        choices=["adam", "adamw", "muon", "sgd", "adafactor"],
         default=None,
         help="Optimizer to use for training: adam, adamw, sgd, or adafactor.",
     )
@@ -182,11 +185,26 @@ def build_parser():
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
     )
-    parser.add_argument(
+    parser.add_argument(  # will be deprecated in a future release
         "--wandb",
         type=str,
         default=None,
-        help="WandB project name to report training metrics. Disabled if None.",
+        help=(
+            "The 'wandb' argument is deprecated and will be removed in a future release. "
+            "Use 'report_to: wandb' and 'project_name' in the configuration instead."
+        ),
+    )
+    parser.add_argument(
+        "--report-to",
+        type=str,
+        default=None,
+        help="Services to report logs to ('wandb', 'swanlab', or 'wandb,swanlab').",
+    )
+    parser.add_argument(
+        "--project-name",
+        type=str,
+        default=None,
+        help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
@@ -296,17 +314,23 @@ def evaluate_model(args, model: nn.Module, test_set):
 
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
-
     if args.wandb is not None:
-        training_callback = WandBCallback(
-            project_name=args.wandb,
-            log_dir=args.adapter_path,
-            config=vars(args),
-            wrapped_callback=training_callback,
+        warnings.warn(
+            "The 'wandb' argument is deprecated and will be removed in a future release. "
+            "Use 'report_to: wandb' and 'project_name' in the configuration instead.",
+            DeprecationWarning,
         )
+        args.report_to = "wandb"
+        args.project_name = args.wandb
+    training_callback = get_reporting_callbacks(
+        args.report_to,
+        project_name=args.project_name,
+        log_dir=args.adapter_path,
+        config=vars(args),
+    )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model)
+    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)

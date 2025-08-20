@@ -104,7 +104,7 @@ def get_model_path(
                 revision=revision,
                 allow_patterns=[
                     "*.json",
-                    "*.safetensors",
+                    "model*.safetensors",
                     "*.py",
                     "tokenizer.model",
                     "*.tiktoken",
@@ -172,10 +172,6 @@ def load_model(
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
-    if not weight_files:
-        # Try weight for back-compat
-        weight_files = glob.glob(str(model_path / "weight*.safetensors"))
-
     if not weight_files and strict:
         logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
@@ -215,8 +211,6 @@ def load_model(
             from .models.bitlinear_layers import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
-        else:
-            raise ValueError(f"Unsupported quantization method {quant_method}")
 
     model.load_weights(list(weights.items()), strict=strict)
 

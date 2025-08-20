@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -131,13 +132,26 @@ class SwitchLinear(nn.Module):
         return ql
 
 
+@partial(mx.compile, shapeless=True)
+def swiglu(x, gate):
+    return nn.silu(gate) * x
+
+
+class SwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, x, gate):
+        return swiglu(x, gate)
+
+
 class SwitchGLU(nn.Module):
     def __init__(
         self,
         input_dims: int,
         hidden_dims: int,
         num_experts: int,
-        activation=nn.SiLU(),
+        activation=SwiGLU(),
         bias: bool = False,
     ):
         super().__init__()
@@ -162,7 +176,7 @@ class SwitchGLU(nn.Module):
         x_up = self.up_proj(x, idx, sorted_indices=do_sort)
         x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
-            self.activation(x_gate) * x_up,
+            self.activation(x_up, x_gate),
             idx,
             sorted_indices=do_sort,
         )

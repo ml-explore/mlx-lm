@@ -86,9 +86,7 @@ def dwq_quantize(
     def loss_fn(params, x, targets, extra_targets, lengths):
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
         logits, q_extra_targets = forward(q_model, x)
-        losses_lt = kl_div_loss(logits, targets)
-        losses_tl = kl_div_loss(targets, logits)
-        losses = 0.5 * (losses_lt + losses_tl)
+        losses = kl_div_loss(logits, targets)
         mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
         kl_loss = (mask * losses).sum() / ntoks
