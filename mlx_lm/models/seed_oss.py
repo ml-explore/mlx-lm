@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
@@ -19,9 +19,9 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    head_dim: Optional[int] = None
+    num_key_value_heads: int
+    head_dim: int
     max_position_embeddings: Optional[int] = None
-    num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     attention_out_bias: bool = False
     mlp_bias: bool = False
@@ -29,10 +29,6 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
 
 
 class Attention(nn.Module):
@@ -42,14 +38,12 @@ class Attention(nn.Module):
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-
-        self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
+        self.head_dim = head_dim = args.head_dim
 
         self.scale = head_dim**-0.5
-        
-        # Seed-OSS specific: attention_bias for input projections, attention_out_bias for output
-        input_bias = getattr(args, "attention_bias", False)
-        output_bias = getattr(args, "attention_out_bias", False)
+
+        input_bias = args.attention_bias
+        output_bias = args.attention_out_bias
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=input_bias)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=input_bias)
@@ -130,19 +124,14 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Model(nn.Module):
+class SeedModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -161,23 +150,35 @@ class Model(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
 
-        h = self.norm(h)
-        
-        if hasattr(self, "lm_head"):
-            return self.lm_head(h)
+        return self.norm(h)
+
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.model = SeedModel(args)
+        self.tie_word_embeddings = args.tie_word_embeddings
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: mx.array = None,
+        cache=None,
+    ):
+        h = self.model(inputs, mask=mask, cache=cache)
+        if self.tie_word_embeddings:
+            return h @ self.model.embed_tokens.weight.T
         else:
-            # Use tied embeddings if lm_head doesn't exist
-            return h @ self.embed_tokens.weight.T
+            return self.lm_head(h)
 
     def sanitize(self, weights):
-        # Remove unused precomputed freqs
-        weights = {k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k}
-        
-        # Remove 'model.' prefix from weight names
-        weights = {k.replace('model.', ''): v for k, v in weights.items()}
-        
-        # Handle tied embeddings
-        if self.args.tie_word_embeddings:
+        if self.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        
+
         return weights
+
+    @property
+    def layers(self):
+        return self.model.layers
