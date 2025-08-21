@@ -166,7 +166,7 @@ class AttentionBlock(nn.Module):
 
         # We are in inference so cache the mask and try to reuse it
         if self._previous_mask is None:
-            self._previous_mask = _make_mask(L, window_size + 1)
+            self._previous_mask = _make_mask(L, window_size)
 
         return self._previous_mask[..., : min(L + offset, window_size + 1)]
 
