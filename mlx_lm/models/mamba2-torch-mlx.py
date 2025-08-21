@@ -11,6 +11,6 @@ print(tokenizer.batch_decode(out))
 """
 
 python -m mlx_lm.generate --model AntonV/mamba2-130m-hf --prompt "Hey," --temp 0.8
-python -m mlx_lm.generate --model mlx-community/Mamba-Codestral-7B-v0.1-4bit --prompt "<s>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][INST]Write the quick sort in C[/INST] "
+python -m mlx_lm.generate --model mlx-community/Mamba-Codestral-7B-v0.1-4bit --prompt "<s>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][INST]Write a function in python[/INST]"
 python -m mlx_lm.convert --hf-path
 """
