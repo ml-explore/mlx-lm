@@ -135,8 +135,6 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
-        if "quantization" in config:
-            raise ValueError("Cannot quantize already quantized model.")
         print("[INFO] Quantizing")
         model, config = quantize_model(
             model,

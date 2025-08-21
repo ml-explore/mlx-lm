@@ -327,8 +327,12 @@ class Model(nn.Module):
                     k = k.replace("_blocks", ".weight")
                 if "_scales" in k:
                     k = k.replace("_scales", ".scales")
-                new_weights[k.replace("gate_up_proj", "gate_proj")] = v[..., ::2, :]
-                new_weights[k.replace("gate_up_proj", "up_proj")] = v[..., 1::2, :]
+                new_weights[k.replace("gate_up_proj", "gate_proj")] = mx.contiguous(
+                    v[..., ::2, :]
+                )
+                new_weights[k.replace("gate_up_proj", "up_proj")] = mx.contiguous(
+                    v[..., 1::2, :]
+                )
             elif "down_proj" in k and "bias" not in k:
                 if "_blocks" in k:
                     v = v.view(mx.uint32).flatten(-2)
@@ -337,12 +341,12 @@ class Model(nn.Module):
                     k = k.replace("_scales", ".scales")
                 new_weights[k] = v
             elif "gate_up_proj_bias" in k:
-                new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = v[
-                    ..., ::2
-                ]
-                new_weights[k.replace("gate_up_proj_bias", "up_proj.bias")] = v[
-                    ..., 1::2
-                ]
+                new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = (
+                    mx.contiguous(v[..., ::2])
+                )
+                new_weights[k.replace("gate_up_proj_bias", "up_proj.bias")] = (
+                    mx.contiguous(v[..., 1::2])
+                )
             elif "down_proj_bias" in k:
                 new_weights[k.replace("down_proj_bias", "down_proj.bias")] = v
             else:
@@ -353,6 +357,15 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("router"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     def make_cache(self):
         caches = []

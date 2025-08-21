@@ -497,7 +497,7 @@ def quantize_model(
             return False
         bool_or_params = True
         if quant_predicate is not None:
-            bool_or_params = quant_predicate(path, m)
+            bool_or_params = quant_predicate(path, module)
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
