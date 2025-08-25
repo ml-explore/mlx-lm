@@ -16,6 +16,7 @@ if __name__ == "__main__":
         "fuse",
         "generate",
         "lora",
+        "perplexity",
         "server",
         "manage",
         "upload",
