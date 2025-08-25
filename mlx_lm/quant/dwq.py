@@ -312,8 +312,8 @@ def main():
         _, config = quantize_model(
             q_model,
             config,
-            q_group_size=args.group_size,
-            q_bits=args.bits,
+            group_size=args.group_size,
+            bits=args.bits,
         )
 
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)

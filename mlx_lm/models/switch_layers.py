@@ -31,11 +31,12 @@ class QuantizedSwitchLinear(nn.Module):
         bias: bool = True,
         group_size: int = 64,
         bits: int = 4,
+        mode: str = "affine",
     ):
         super().__init__()
 
         scale = math.sqrt(1 / input_dims)
-        self.weight, self.scales, self.biases = mx.quantize(
+        self.weight, *scales_biases = mx.quantize(
             mx.random.uniform(
                 low=-scale,
                 high=scale,
@@ -43,13 +44,19 @@ class QuantizedSwitchLinear(nn.Module):
             ),
             group_size=group_size,
             bits=bits,
+            mode=mode,
         )
+        if mode == "affine":
+            self.scales, self.biases = scales_biases
+        else:
+            (self.scales,) = scales_biases
 
         if bias:
             self.bias = mx.zeros((num_experts, output_dims))
 
         self.group_size = group_size
         self.bits = bits
+        self.mode = mode
 
         # Freeze this model's parameters
         self.freeze()
@@ -71,11 +78,12 @@ class QuantizedSwitchLinear(nn.Module):
             x,
             self["weight"],
             self["scales"],
-            self["biases"],
+            self.get("biases"),
             rhs_indices=indices,
             transpose=True,
             group_size=self.group_size,
             bits=self.bits,
+            mode=self.mode,
             sorted_indices=sorted_indices,
         )
         if "bias" in self:
@@ -121,12 +129,25 @@ class SwitchLinear(nn.Module):
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4):
+    def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):
         num_experts, output_dims, input_dims = self.weight.shape
         ql = QuantizedSwitchLinear(
-            input_dims, output_dims, num_experts, False, group_size, bits
+            input_dims,
+            output_dims,
+            num_experts,
+            False,
+            group_size,
+            bits,
+            mode=mode,
         )
-        ql.weight, ql.scales, ql.biases = mx.quantize(self.weight, group_size, bits)
+        ql.weight, *scales_biases = mx.quantize(
+            self.weight, group_size, bits, mode=mode
+        )
+        if mode == "affine":
+            ql.scales, ql.biases = scales_biases
+        else:
+            (ql.scales,) = scales_biases
+
         if "bias" in self:
             ql.bias = self.bias
         return ql
