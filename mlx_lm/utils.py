@@ -22,6 +22,7 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
+from huggingface_hub.utils import LocalEntryNotFoundError
 
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
@@ -81,7 +82,7 @@ def compute_bits_per_weight(model):
 
 
 def get_model_path(
-    path_or_hf_repo: str, revision: Optional[str] = None
+    path_or_hf_repo: str, revision: Optional[str] = None, local_files_only: bool = False
 ) -> Tuple[Path, Optional[str]]:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -102,6 +103,7 @@ def get_model_path(
             snapshot_download(
                 path_or_hf_repo,
                 revision=revision,
+                local_files_only=local_files_only,
                 allow_patterns=[
                     "*.json",
                     "model*.safetensors",
@@ -227,6 +229,7 @@ def load(
     model_config={},
     adapter_path: Optional[str] = None,
     lazy: bool = False,
+    attempt_with_local_files: bool = False,
 ) -> Tuple[nn.Module, TokenizerWrapper]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
@@ -242,6 +245,9 @@ def load(
         lazy (bool): If ``False`` eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        attempt_with_local_files (bool): If True, first attempts to load from local files only.
+            If that fails, falls back to downloading from Hugging Face. If False, always
+            attempts to download from Hugging Face. Default: ``False``
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
 
@@ -249,7 +255,19 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path, _ = get_model_path(path_or_hf_repo)
+    if attempt_with_local_files:
+        try:
+            logging.debug(
+                f"Attempting to loading {path_or_hf_repo} from local cache files"
+            )
+            model_path, _ = get_model_path(path_or_hf_repo, local_files_only=True)
+        except LocalEntryNotFoundError:
+            # Only fallback when local file was attempted and failed
+            logging.debug(f"Model not found in cache. Fetching from HuggingFace")
+            model_path, _ = get_model_path(path_or_hf_repo)
+    else:
+        # local cache disabled, get from HF
+        model_path, _ = get_model_path(path_or_hf_repo)
 
     model, config = load_model(model_path, lazy)
     if adapter_path is not None:

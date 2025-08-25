@@ -202,11 +202,15 @@ class ModelProvider:
                     adapter_path if adapter_path else self.cli_args.adapter_path
                 ),  # if the user doesn't change the model but adds an adapter path
                 tokenizer_config=tokenizer_config,
+                attempt_with_local_files=True,
             )
         else:
             self._validate_model_path(model_path)
             model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
+                model_path,
+                adapter_path=adapter_path,
+                tokenizer_config=tokenizer_config,
+                attempt_with_local_files=True,
             )
 
         if self.cli_args.use_default_chat_template:
@@ -230,12 +234,16 @@ class ModelProvider:
             draft_model_path == "default_model"
             and self.cli_args.draft_model is not None
         ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+            self.draft_model, draft_tokenizer = load(
+                self.cli_args.draft_model, attempt_with_local_files=True
+            )
             validate_draft_tokenizer(draft_tokenizer)
 
         elif draft_model_path is not None and draft_model_path != "default_model":
             self._validate_model_path(draft_model_path)
-            self.draft_model, draft_tokenizer = load(draft_model_path)
+            self.draft_model, draft_tokenizer = load(
+                draft_model_path, attempt_with_local_files=True
+            )
             validate_draft_tokenizer(draft_tokenizer)
         return self.model, self.tokenizer
 
