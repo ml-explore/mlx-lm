@@ -9,6 +9,7 @@ if __name__ == "__main__":
         "quant.dwq",
         "quant.dynamic_quant",
         "quant.gptq",
+        "benchmark",
         "cache_prompt",
         "chat",
         "convert",
