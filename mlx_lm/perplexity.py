@@ -30,15 +30,13 @@ def eval_ppl(model, data, batch_size=8):
     all_losses = []
 
     num_batches = (len(data) + batch_size - 1) // batch_size
-
     for i, s in enumerate(range(0, len(data), batch_size)):
         batch = data[s : s + batch_size]
-
         # Forward pass: get logits for all tokens except last
         logits = model(batch[:, :-1]).astype(mx.float32)
 
         # Calculate cross-entropy loss with next tokens
-        losses = nn.losses.cross_entropy(logits, batch[:, 1:])
+        losses = nn.losses.cross_entropy(logits, batch[:, 1:], reduction="none")
         mx.eval(losses)
         # Store individual token losses
         all_losses.append(losses.flatten())
@@ -55,13 +53,14 @@ def eval_ppl(model, data, batch_size=8):
     # Calculate mean loss and perplexity
     mean_loss = all_losses.mean().item()
     ppl = math.exp(mean_loss)
-
     # Calculate standard error
-    std_dev = mx.sqrt(mx.var(all_losses)).item()
+    std_dev = mx.sqrt(mx.var(all_losses, ddof=1)).item()
     num_tokens = all_losses.size
     standard_error = std_dev / math.sqrt(num_tokens)
+    # Delta approximation for standard error of perplexity
+    standard_error_ppl = ppl * standard_error
 
-    return ppl, standard_error
+    return ppl, standard_error_ppl
 
 
 def main():
@@ -124,7 +123,7 @@ def main():
     ppl, se = eval_ppl(model, data, batch_size=args.batch_size)
 
     eval_time = time.time() - start_time
-
+    tokens_evaluated = data.shape[0] * (data.shape[1] - 1)  # B * (L - 1)
     # Print results
     print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
@@ -133,7 +132,7 @@ def main():
     print(f"Perplexity: {ppl:.3f} ± {se:.3f}")
     print(f"Evaluation time: {eval_time:.2f} seconds")
     print(f"Peak memory: {mx.get_peak_memory() / 1024**3:.2f} GB")
-    print(f"  Tokens per second: {data.size / eval_time:.0f}")
+    print(f"  Tokens per second: {tokens_evaluated / eval_time:.0f}")
 
     # Additional statistics
     print(f"\nDataset statistics:")
