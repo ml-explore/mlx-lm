@@ -68,6 +68,7 @@ CONFIG_DEFAULTS = {
     "max_seq_length": 2048,
     "config": None,
     "grad_checkpoint": False,
+    "gradient_accumulation_steps": 1,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -185,6 +186,12 @@ def build_parser():
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
     )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        help="Number of steps to accumulate gradients before performing an optimizer update.",
+        default=1
+    )
     parser.add_argument(  # will be deprecated in a future release
         "--wandb",
         type=str,
@@ -265,6 +272,7 @@ def train_model(
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     # Initialize the selected optimizer

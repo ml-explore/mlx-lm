@@ -1,16 +1,13 @@
-# Copyright © 2024 Apple Inc.
-
-
 import time
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 from .callbacks import TrainingCallback
@@ -63,6 +60,15 @@ class TrainingArgs:
     grad_checkpoint: bool = field(
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
+    )
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Accumulate gradients over this many micro-steps "
+                "before applying an optimizer update."
+            )
+        },
     )
 
 
@@ -176,6 +182,7 @@ def evaluate(
         desc="Calculating loss...",
         total=min(len(dataset) // batch_size, num_batches),
     ):
+        # Use default loss function (no gradient_accumulation_steps parameter)
         losses, toks = loss(model, *batch)
         all_losses += losses * toks
         ntokens += toks
@@ -209,44 +216,135 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
-    state = [model.state, optimizer.state, mx.random.state]
+    if rank == 0:
+        initial_params = model.trainable_parameters()
+        flat_params = tree_flatten(initial_params)
+        param_sum = sum(mx.sum(param).item() for key, param in flat_params)
+        print(f"Initial parameter sum: {param_sum}")
 
-    @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch):
-        # Forward and backward pass
-        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
+    def tree_l2_norm(tree):
+        flat_tree = tree_flatten(tree)
+        if not flat_tree:
+            return mx.array(0.0)
+        values = [param for key, param in flat_tree]
+        squared_vals = [mx.sum(v.astype(mx.float32) ** 2) for v in values]
+        return mx.sqrt(mx.sum(mx.stack(squared_vals)))
 
-        # All reduce the gradients if running in distributed mode
-        grad = average_gradients(grad)
+    loss_and_grad_fn = nn.value_and_grad(model, loss)
+    
+    accumulated_grads = None
+    accumulation_count = 0
 
-        # Model update
-        optimizer.update(model, grad)
+    def reset_accumulation():
+        nonlocal accumulated_grads, accumulation_count
+        accumulated_grads = None
+        accumulation_count = 0
 
-        return lvalue, toks
+    def accumulate_gradients(new_grads):
+        nonlocal accumulated_grads, accumulation_count
+        if accumulated_grads is None:
+            accumulated_grads = new_grads
+        else:
+            accumulated_grads = tree_map(lambda acc, new: acc + new, accumulated_grads, new_grads)
+        accumulation_count += 1
 
-    loss_value_and_grad = nn.value_and_grad(model, loss)
+    def apply_accumulated_gradients():
+        nonlocal accumulated_grads, accumulation_count
+        if accumulated_grads is None or accumulation_count == 0:
+            print("WARNING: No gradients to apply!")
+            return
+        
+        # Average the accumulated gradients
+        final_grads = tree_map(lambda g: g / accumulation_count, accumulated_grads)
+        
+        if rank == 0:
+            grad_norm = tree_l2_norm(final_grads)
+            mx.eval(grad_norm)
+            print(f"Gradient L2 norm: {grad_norm.item():.6f}")
+        
+        # Average across workers if distributed
+        if world_size > 1:
+            final_grads = average_gradients(final_grads)
+        
+        if rank == 0:
+            old_params = model.trainable_parameters()
+            flat_old_params = tree_flatten(old_params)
+            old_param_sum = sum(mx.sum(param).item() for key, param in flat_old_params)
+        
+        optimizer.update(model, final_grads)
+        mx.eval(model.parameters(), optimizer.state)
+        
+        if rank == 0:
+            new_params = model.trainable_parameters()
+            flat_new_params = tree_flatten(new_params)
+            new_param_sum = sum(mx.sum(param).item() for key, param in flat_new_params)
+            param_change = abs(new_param_sum - old_param_sum)
+            print(f"Parameter change: {param_change:.6f} (old: {old_param_sum:.6f}, new: {new_param_sum:.6f})")
+            if param_change < 1e-8:
+                print("WARNING: Very small parameter change detected!")
+        
+        reset_accumulation()
 
     model.train()
-    losses = 0
-    n_tokens = 0
-    steps = 0
-    trained_tokens = 0
-    train_time = 0
-    # Main training loop
-    for it, batch in zip(
-        range(1, args.iters + 1),
-        iterate_batches(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            max_seq_length=args.max_seq_length,
-            train=True,
-        ),
-    ):
+    total_loss = 0.0
+    total_tokens = 0
+    report_loss = 0.0
+    report_tokens = 0
+    report_steps = 0
+    train_time = 0.0
+
+    batch_iterator = iterate_batches(
+        dataset=train_dataset,
+        batch_size=args.batch_size,
+        max_seq_length=args.max_seq_length,
+        train=True,
+    )
+
+    for iteration in range(1, args.iters + 1):
         tic = time.perf_counter()
-        # Report validation loss if needed, the first validation loss
-        # is always measured before any training.
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
-            tic = time.perf_counter()
+        
+        try:
+            batch = next(batch_iterator)
+        except StopIteration:
+            print("WARNING: Batch iterator exhausted, recreating...")
+            batch_iterator = iterate_batches(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                max_seq_length=args.max_seq_length,
+                train=True,
+            )
+            batch = next(batch_iterator)
+        
+        (loss_value, n_tokens), grads = loss_and_grad_fn(model, *batch)
+        
+        if rank == 0 and iteration <= 5:
+            grad_norm = tree_l2_norm(grads)
+            mx.eval(loss_value, n_tokens, grad_norm)
+            print(f"Iter {iteration}: loss={loss_value.item():.4f}, "
+                  f"tokens={n_tokens.item()}, grad_norm={grad_norm.item():.6f}")
+        
+        accumulate_gradients(grads)
+        
+        report_loss += loss_value.item()
+        report_tokens += n_tokens.item()
+        report_steps += 1
+        
+        total_loss += loss_value.item()
+        total_tokens += n_tokens.item()
+        
+        mx.eval(loss_value, n_tokens)
+        train_time += time.perf_counter() - tic
+        
+        if accumulation_count >= args.gradient_accumulation_steps:
+            apply_accumulated_gradients()
+        
+        if (args.steps_per_eval is not None and 
+            iteration % args.steps_per_eval == 0):
+            
+            if accumulation_count > 0:
+                apply_accumulated_gradients()
+            
+            model.eval()
             val_loss = evaluate(
                 model=model,
                 dataset=val_dataset,
@@ -257,85 +355,61 @@ def train(
                 iterate_batches=iterate_batches,
             )
             model.train()
-            val_time = time.perf_counter() - tic
+            
             if rank == 0:
-                print(
-                    f"Iter {it}: "
-                    f"Val loss {val_loss:.3f}, "
-                    f"Val took {val_time:.3f}s",
-                    flush=True,
-                )
-
+                print(f"Iter {iteration}: Val loss {val_loss:.4f}")
+            
             if training_callback is not None:
-                val_info = {
-                    "iteration": it - 1,
+                training_callback.on_val_loss_report({
+                    "iteration": iteration,
                     "val_loss": val_loss,
-                    "val_time": val_time,
-                }
-                training_callback.on_val_loss_report(val_info)
-
-            tic = time.perf_counter()
-
-        lvalue, toks = step(batch)
-        losses += lvalue
-        n_tokens += toks
-        steps += 1
-        mx.eval(state, losses, n_tokens)
-        train_time += time.perf_counter() - tic
-
-        # Report training loss if needed
-        if it % args.steps_per_report == 0 or it == args.iters:
-            train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
-            train_loss /= steps * world_size
-            n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+                })
+        
+        if iteration % args.steps_per_report == 0 or iteration == args.iters:
+            avg_loss = report_loss / report_steps
             learning_rate = optimizer.learning_rate.item()
             it_sec = args.steps_per_report / train_time
-            tokens_sec = float(n_tokens) / train_time
-            trained_tokens += n_tokens
+            tokens_sec = report_tokens / train_time
             peak_mem = mx.get_peak_memory() / 1e9
+            
             if rank == 0:
                 print(
-                    f"Iter {it}: Train loss {train_loss:.3f}, "
-                    f"Learning Rate {learning_rate:.3e}, "
-                    f"It/sec {it_sec:.3f}, "
-                    f"Tokens/sec {tokens_sec:.3f}, "
-                    f"Trained Tokens {trained_tokens}, "
-                    f"Peak mem {peak_mem:.3f} GB",
-                    flush=True,
+                    f"Iter {iteration}: Train loss {avg_loss:.4f}, "
+                    f"LR {learning_rate:.3e}, "
+                    f"It/sec {it_sec:.2f}, "
+                    f"Tokens/sec {tokens_sec:.0f}, "
+                    f"Peak mem {peak_mem:.1f} GB"
                 )
-
+            
             if training_callback is not None:
-                train_info = {
-                    "iteration": it,
-                    "train_loss": train_loss,
+                training_callback.on_train_loss_report({
+                    "iteration": iteration,
+                    "train_loss": avg_loss,
                     "learning_rate": learning_rate,
                     "iterations_per_second": it_sec,
                     "tokens_per_second": tokens_sec,
-                    "trained_tokens": trained_tokens,
                     "peak_memory": peak_mem,
-                }
-                training_callback.on_train_loss_report(train_info)
-
-            losses = 0
-            n_tokens = 0
-            steps = 0
-            train_time = 0
-
-        # Save adapter weights
-        if it % args.steps_per_save == 0 and rank == 0:
+                })
+            
+            report_loss = 0.0
+            report_tokens = 0
+            report_steps = 0
+            train_time = 0.0
+        
+        if iteration % args.steps_per_save == 0 and rank == 0:
+            if accumulation_count > 0:
+                apply_accumulated_gradients()
+            
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
             mx.save_safetensors(str(args.adapter_file), adapter_weights)
-            checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
-            )
+            checkpoint = Path(args.adapter_file).parent / f"{iteration:07d}_adapters.safetensors"
             mx.save_safetensors(str(checkpoint), adapter_weights)
-            print(
-                f"Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}."
-            )
+            print(f"Iter {iteration}: Saved weights to {checkpoint}")
 
-    # Save final weights
+    if accumulation_count > 0:
+        apply_accumulated_gradients()
+
     if rank == 0:
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
-        print(f"Saved final weights to {args.adapter_file}.")
+        print(f"Saved final weights to {args.adapter_file}")
