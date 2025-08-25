@@ -1,18 +1,54 @@
+# Copyright © 2025 Apple Inc.
 """
 Evaluate perplexity (PPL) of MLX models.
-Based on the eval_ppl function from quant/dynamic_quant.py.
 """
 
 import argparse
 import math
 import time
+import types
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
-from .quant.utils import load_data
-from .tuner.utils import get_total_parameters
-from .utils import load
+from mlx_lm.tuner.datasets import load_dataset
+from mlx_lm.tuner.utils import get_total_parameters
+from mlx_lm.utils import load
+
+
+def load_data(
+    tokenizer,
+    data_path: str,
+    num_samples: int,
+    sequence_length: int,
+):
+    args = types.SimpleNamespace(
+        hf_dataset={
+            "path": data_path,
+            "train_split": "train",
+            "valid_split": "train[:1]",
+        },
+        train=True,
+        test=False,
+    )
+    dataset = load_dataset(args, tokenizer)[0]
+
+    perm = np.random.permutation(len(dataset)).tolist()
+
+    num_tokens = sequence_length * num_samples if num_samples > 0 else float("inf")
+    data = []
+    i = 0
+    while len(data) < num_tokens:
+        tokens, _ = dataset.process(dataset[perm[i]])
+        i += 1
+        data.extend(tokens)
+
+    data = mx.array(data[: (len(data) // sequence_length) * sequence_length])
+    data = data.reshape(-1, sequence_length)
+    if num_samples > 0:
+        data = data[:num_samples]
+    return data
 
 
 def eval_ppl(model, data, batch_size=8):
@@ -83,8 +119,14 @@ def main():
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=-1,
+        default=256,
         help="Number of samples to use (-1 for all available)",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default="allenai/tulu-3-sft-mixture",
+        help="A Hugging Face dataset which is compatible with an mlx-lm dataset format.",
     )
     parser.add_argument(
         "--seed", type=int, default=123, help="Random seed for data sampling"
@@ -106,12 +148,12 @@ def main():
     # Load evaluation data
     print(f"\nLoading dataset...")
     print(f"  Sequence length: {args.sequence_length}")
-    print(
-        f"  Number of samples: {'all available' if args.num_samples == -1 else args.num_samples}"
-    )
 
     data = load_data(
-        tokenizer, num_samples=args.num_samples, sequence_length=args.sequence_length
+        tokenizer,
+        args.data_path,
+        num_samples=args.num_samples,
+        sequence_length=args.sequence_length,
     )
 
     print(f"  Loaded {len(data)} samples")
@@ -131,7 +173,7 @@ def main():
     print(f"Model: {args.model}")
     print(f"Perplexity: {ppl:.3f} ± {se:.3f}")
     print(f"Evaluation time: {eval_time:.2f} seconds")
-    print(f"Peak memory: {mx.get_peak_memory() / 1024**3:.2f} GB")
+    print(f"Peak memory: {mx.get_peak_memory() / 1e9:.2f} GB")
     print(f"Tokens per second: {tokens_evaluated / eval_time:.0f}")
 
     # Additional statistics
@@ -141,8 +183,4 @@ def main():
 
 
 if __name__ == "__main__":
-    print(
-        "Calling `python -m mlx_lm.perplexity...` directly is deprecated."
-        " Use `mlx_lm.perplexity...` or `python -m mlx_lm perplexity ...` instead."
-    )
     main()
