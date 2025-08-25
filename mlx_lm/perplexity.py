@@ -132,7 +132,7 @@ def main():
     print(f"Perplexity: {ppl:.3f} ± {se:.3f}")
     print(f"Evaluation time: {eval_time:.2f} seconds")
     print(f"Peak memory: {mx.get_peak_memory() / 1024**3:.2f} GB")
-    print(f"  Tokens per second: {tokens_evaluated / eval_time:.0f}")
+    print(f"Tokens per second: {tokens_evaluated / eval_time:.0f}")
 
     # Additional statistics
     print(f"\nDataset statistics:")
