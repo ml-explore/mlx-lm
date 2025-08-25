@@ -1,6 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
