@@ -162,8 +162,10 @@ class ModelProvider:
         self.draft_model = None
 
         # Preload the default model if it is provided
+        self.default_model_map = {}
         if self.cli_args.model is not None:
-            self.load("default_model", draft_model_path="default_model")
+            self.default_model_map[self.cli_args.model] = "default_model"
+            self.load(self.cli_args.model, draft_model_path="default_model")
 
     def _validate_model_path(self, model_path: str):
         model_path = Path(model_path)
@@ -174,6 +176,12 @@ class ModelProvider:
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
+        model_path, adapter_path, draft_model_path = map(
+            lambda s: s.lower() if s else None,
+            (model_path, adapter_path, draft_model_path),
+        )
+
+        model_path = self.default_model_map.get(model_path, model_path)
         if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
 
@@ -196,11 +204,10 @@ class ModelProvider:
                     "A model path has to be given as a CLI "
                     "argument or in the HTTP request"
                 )
+            adapter_path = adapter_path or self.cli_args.adapter_path
             model, tokenizer = load(
                 self.cli_args.model,
-                adapter_path=(
-                    adapter_path if adapter_path else self.cli_args.adapter_path
-                ),  # if the user doesn't change the model but adds an adapter path
+                adapter_path=adapter_path,
                 tokenizer_config=tokenizer_config,
             )
         else:
