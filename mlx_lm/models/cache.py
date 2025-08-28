@@ -477,7 +477,7 @@ class MambaCache(ArraysCache):
         super().__init__(size=2)
 
 
-class Mamba2Cache:
+class NemotronHMamba2Cache:
     def __init__(self, batch_size, conv_dim, args):
         self.args = args
         self.conv_states = [
