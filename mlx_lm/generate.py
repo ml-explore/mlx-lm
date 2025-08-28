@@ -293,6 +293,19 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                 )
 
 
+class LastSlice(nn.Module):
+    def __init__(self, module: nn.Module, n: int = 1):
+        super().__init__()
+        self["module"] = module
+        self.n = n
+
+    def __getattr__(self, key):
+        return getattr(self["module"], key)
+
+    def __call__(self, *args, **kwargs):
+        return self["module"](*args, **kwargs)[..., -self.n :, :]
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -373,6 +386,7 @@ def generate_step(
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    model.layers[-1] = LastSlice(model.layers[-1])
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
