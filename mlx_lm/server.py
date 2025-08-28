@@ -736,6 +736,7 @@ class APIHandler(BaseHTTPRequestHandler):
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
+            self.prompt_cache.tokens.append(token)
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
@@ -777,8 +778,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     segment = ""
                     tool_calls = []
-
-        self.prompt_cache.tokens.extend(tokens)
 
         if gen_response.finish_reason is not None:
             finish_reason = gen_response.finish_reason
