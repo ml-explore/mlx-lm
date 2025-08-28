@@ -558,10 +558,10 @@ class Mamba2Cache:
             for _ in range(args.num_hidden_layers)
         ]
         self.ssm_states = [
-            mx.zeros((batch_size, args.num_heads, args.head_dim, args.ssm_state_size)) 
+            mx.zeros((batch_size, args.num_heads, args.head_dim, args.ssm_state_size))
             for _ in range(args.num_hidden_layers)
         ]
-    
+
     def update_conv_state(self, layer_idx, new_conv_state):
         current_state = self.conv_states[layer_idx]
         if new_conv_state.ndim == 3:
@@ -578,10 +578,10 @@ class Mamba2Cache:
             raise ValueError(
                 f"new_conv_state must be (B, K, C) or (B, C), got shape {new_conv_state.shape}"
             )
-    
+
     def get_ssm_state(self, layer_idx):
         return self.ssm_states[layer_idx]
-    
+
     def update_ssm_state(self, layer_idx, new_ssm_state):
         self.ssm_states[layer_idx] = new_ssm_state
 
