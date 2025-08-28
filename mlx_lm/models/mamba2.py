@@ -149,7 +149,7 @@ class Mamba2Block(nn.Module):
         if self.conv_kernel_size > 1:
             if cache is not None:
                 # Use last K-1 frames from cache as left context
-                left_ctx = cache.conv_states[self.layer_idx][:, :-1, :]
+                left_ctx = cache.conv_states[self.layer_idx][:, 1:, :]
                 padded_input = mx.concatenate([left_ctx, conv_input], axis=1)
             else:
                 # Fallback: zero-pad when no cache
@@ -205,9 +205,11 @@ class Mamba2Block(nn.Module):
         # Discretization
         A = -mx.exp(self.A_log.astype(mx.float32))
         
-        # Process sequence
         outputs = []
-        h = mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
+        if cache is not None:
+            h = cache.get_ssm_state(self.layer_idx)
+        else:
+            h = mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
         
         for t in range(seq_len):
             dt_t = dt[:, t, :, None, None]
@@ -218,6 +220,9 @@ class Mamba2Block(nn.Module):
             y_t = mx.sum(C[:, t, :, None, :] * h, axis=-1) + \
                 self.D[None, :, None] * hidden_states[:, t]
             outputs.append(y_t)
+        
+        if cache is not None:
+            cache.update_ssm_state(self.layer_idx, h)
         
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
