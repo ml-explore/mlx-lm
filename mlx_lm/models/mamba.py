@@ -126,21 +126,16 @@ class MambaBlock(nn.Module):
         xz = self.in_proj(x)
         x, z = xz.split(indices_or_sections=2, axis=-1)
         
-        # Handle cache
         if conv_cache is not None:
             x_full = mx.concatenate([conv_cache, x], axis=1)
         else:
-            # Add manual padding for first call
             padding = self.conv_kernel_size - 1
             x_full = mx.pad(x, [(0, 0), (padding, 0), (0, 0)])
 
-        # Simple conv call - no transpose needed for MLX
         conv_out = self.conv1d(x_full)
         
-        # Trim to correct length
         conv_out = conv_out[:, -T:, :]
         
-        # Update cache - save last (kernel_size-1) inputs
         cache_size = self.conv_kernel_size - 1
         if cache_size > 0:
             new_conv_cache = x_full[:, -cache_size:, :]
