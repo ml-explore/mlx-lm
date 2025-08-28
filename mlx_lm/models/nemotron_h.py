@@ -6,8 +6,24 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
+from .cache import KVCache, Mamba2Cache
 
-@dataclass
+# Unified cache wrapper for both attention and Mamba2 state caches
+class UnifiedCache:
+    """Simple wrapper to hold both attention KV caches and Mamba2 state cache.
+
+    Attributes
+    ----------
+    attn_cache : list[KVCache]
+        Per-layer attention KV caches.
+    mamba_cache : Mamba2Cache
+        Shared Mamba2 cache holding conv and SSM states.
+    """
+    def __init__(self, attn_cache: list[KVCache], mamba_cache: Mamba2Cache):
+        self.attn_cache = attn_cache
+        self.mamba_cache = mamba_cache
+
+@dataclass(kw_only=True)
 class ModelArgs(BaseModelArgs):
     # Model identification
     model_type: str
@@ -20,14 +36,10 @@ class ModelArgs(BaseModelArgs):
     # Attention configuration
     num_attention_heads: int
     num_key_value_heads: int
-    num_query_groups: int
-    head_dim: int
     attention_bias: bool
     # Mamba-specific configuration
     mamba_num_heads: int
     mamba_head_dim: int
-    mamba_num_groups: int
-    mamba_state_dim: int
     mamba_hidden_act: str
     mamba_proj_bias: bool
     # SSM configuration
@@ -57,18 +69,26 @@ class ModelArgs(BaseModelArgs):
     # Hybrid pattern
     hybrid_override_pattern: str
     # Derived fields (will be set in __post_init__)
-    layers_block_type: List[str] = None
-    expand: int = None  # Will be calculated
+    head_dim: Optional[int] = None
+    num_heads: Optional[int] = None
+    layers_block_type: Optional[List[str]] = None
+    expand: Optional[int] = None
 
     def __post_init__(self):
-        # Set compatibility fields for existing code
+        # Compute derived fields
         if self.expand is None:
             self.expand = self.intermediate_size // self.hidden_size
-        # Parse hybrid pattern into layer types
+
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+
+        if self.num_heads is None:
+            self.num_heads = self.num_attention_heads
+
+        # Determine layer block types from pattern, or default to all mamba
         if self.hybrid_override_pattern:
             self.layers_block_type = self._parse_hybrid_pattern(self.hybrid_override_pattern)
         else:
-            # Default to all mamba if no pattern specified
             self.layers_block_type = ["mamba"] * self.num_hidden_layers
 
     def _parse_hybrid_pattern(self, pattern: str) -> List[str]:
@@ -97,75 +117,6 @@ class ModelArgs(BaseModelArgs):
         return layer_types
 
 
-class HybridMambaAttentionCache:
-    """Hybrid cache for Mamba + Attention layers."""
-    def __init__(self, args: ModelArgs, batch_size: int = 1, dtype=mx.float32):
-        self.batch_size = batch_size
-        self.offset = 0  # For RoPE
-        self.layers_block_type = args.layers_block_type
-        self.args = args
-        
-        # Cache storage
-        self.key_cache = [None] * args.num_hidden_layers
-        self.value_cache = [None] * args.num_hidden_layers
-        self.conv_states = [None] * args.num_hidden_layers
-        self.ssm_states = [None] * args.num_hidden_layers
-        
-        # Initialize only needed caches
-        for i, layer_type in enumerate(self.layers_block_type):
-            if layer_type == "mamba":
-                conv_dim = args.mamba_num_heads * args.mamba_head_dim + 2 * args.mamba_num_groups * args.ssm_state_size
-                self.conv_states[i] = mx.zeros((batch_size, conv_dim, args.conv_kernel - 1), dtype=dtype)
-                self.ssm_states[i] = mx.zeros((batch_size, args.mamba_num_heads, args.mamba_head_dim, args.ssm_state_size), dtype=dtype)
-            elif layer_type == "attention":
-                self.key_cache[i] = mx.zeros((batch_size, args.num_key_value_heads, 0, args.head_dim), dtype=dtype)
-                self.value_cache[i] = mx.zeros((batch_size, args.num_key_value_heads, 0, args.head_dim), dtype=dtype)
-
-    # Mamba methods
-    def update_conv_state(self, layer_idx: int, new_input: mx.array) -> mx.array:
-        new_input_reshaped = new_input.squeeze(axis=1)[:, :, None]
-        conv_state = self.conv_states[layer_idx]
-        if conv_state.shape[-1] > 1:
-            updated_state = mx.concatenate([conv_state[:, :, 1:], new_input_reshaped], axis=-1)
-        else:
-            updated_state = new_input_reshaped
-        self.conv_states[layer_idx] = updated_state
-        return mx.concatenate([conv_state, new_input_reshaped], axis=-1)
-
-    def update_ssm_state(self, layer_idx: int, new_state: mx.array):
-        self.ssm_states[layer_idx] = new_state
-
-    def get_ssm_state(self, layer_idx: int) -> mx.array:
-        return self.ssm_states[layer_idx]
-
-    # Attention methods
-    def update_and_fetch(self, layer_idx: int, keys: mx.array, values: mx.array) -> Tuple[mx.array, mx.array]:
-        """Update cache for specific layer and return cached keys/values."""
-        if self.key_cache[layer_idx].shape[2] == 0:
-            self.key_cache[layer_idx] = keys
-            self.value_cache[layer_idx] = values
-        else:
-            self.key_cache[layer_idx] = mx.concatenate([self.key_cache[layer_idx], keys], axis=2)
-            self.value_cache[layer_idx] = mx.concatenate([self.value_cache[layer_idx], values], axis=2)
-        
-        self.offset = self.key_cache[layer_idx].shape[2]
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
-    def reset(self):
-        for i, layer_type in enumerate(self.layers_block_type):
-            if layer_type == "mamba":
-                if self.conv_states[i] is not None:
-                    self.conv_states[i] = mx.zeros_like(self.conv_states[i])
-                if self.ssm_states[i] is not None:
-                    self.ssm_states[i] = mx.zeros_like(self.ssm_states[i])
-            elif layer_type == "attention":
-                if self.key_cache[i] is not None:
-                    b, h, _, d = self.key_cache[i].shape
-                    self.key_cache[i] = mx.zeros((b, h, 0, d))
-                    self.value_cache[i] = mx.zeros((b, h, 0, d))
-        self.offset = 0
-
-
 class MambaRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -186,148 +137,175 @@ class NemotronHMamba2Mixer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        # Use mamba-specific parameters
         self.num_heads = args.mamba_num_heads
         self.hidden_size = args.hidden_size
-        self.ssm_state_size = args.mamba_state_dim
+        self.ssm_state_size = args.ssm_state_size
         self.conv_kernel_size = args.conv_kernel
-        self.head_dim = args.mamba_head_dim
-        self.intermediate_size = self.num_heads * self.head_dim
+        self.intermediate_size = args.mamba_num_heads * args.mamba_head_dim
         self.use_conv_bias = args.use_conv_bias
-        self.n_groups = args.mamba_num_groups
+        self.n_groups = args.n_groups
+        self.head_dim = args.mamba_head_dim
         self.time_step_limit = args.time_step_limit
         self.heads_per_group = self.num_heads // self.n_groups
-        self.chunk_size = args.chunk_size
-        self.use_bias = args.mamba_proj_bias
+        self.use_bias = args.use_bias
+
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
 
-        # Match expected weight names from the error
-        self.conv1d = nn.Conv1d(self.conv_dim, self.conv_dim, kernel_size=args.conv_kernel, groups=self.conv_dim, bias=args.use_conv_bias)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            kernel_size=args.conv_kernel,
+            padding=0,
+            groups=self.conv_dim,
+            bias=args.use_conv_bias,
+        )
+
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
-        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=self.use_bias)
+        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.use_bias)
+
         self.dt_bias = mx.ones(self.num_heads)
-        A = mx.arange(1, self.num_heads + 1, dtype=mx.float32)
-        self.A_log = mx.log(A)
+        self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
         self.D = mx.ones(self.num_heads)
-        self.norm = MambaRMSNormGated(self.intermediate_size, eps=args.rms_norm_eps)
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.use_bias)
-        
-        # Pre-compute split indices
-        d_mlp = 0
-        self.proj_splits = [
-            d_mlp,
-            2 * d_mlp,
-            2 * d_mlp + self.intermediate_size,
-            2 * d_mlp + self.intermediate_size + self.conv_dim
-        ]
-        self.state_splits = [
-            self.intermediate_size,
-            self.intermediate_size + self.n_groups * self.ssm_state_size
-        ]
 
-    @property
-    def neg_A(self):
-        return -mx.exp(self.A_log.astype(mx.float32))
+        self.norm = MambaRMSNormGated(
+            self.intermediate_size, eps=args.layer_norm_epsilon
+        )
+        self.out_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=args.use_bias
+        )
 
-    def _apply_incremental_conv(self, conv_input: mx.array, cache: HybridMambaAttentionCache) -> mx.array:
-        """Apply 1D convolution for incremental inference."""
-        conv_window = cache.update_conv_state(self.layer_idx, conv_input)
-        # Use the conv1d layer weights
-        conv_output = mx.sum(conv_window * self.conv1d.weight.squeeze(), axis=-1)
-        if hasattr(self.conv1d, 'bias') and self.conv1d.bias is not None:
-            conv_output = conv_output + self.conv1d.bias
-        return conv_output[:, None, :]
+    def _apply_conv(
+        self, conv_input: mx.array, mamba_cache: Optional[Mamba2Cache] = None
+    ) -> mx.array:
+        batch_size, seq_len, in_ch = conv_input.shape
+        # Manual left causal padding using cache if available
+        if self.conv_kernel_size > 1:
+            if mamba_cache is not None:
+                # Use last K-1 frames from cache as left context
+                left_ctx = mamba_cache.conv_states[self.layer_idx][:, 1:, :]
+                padded_input = mx.concatenate([left_ctx, conv_input], axis=1)
+            else:
+                # Fallback: zero-pad when no cache
+                padded_input = mx.pad(
+                    conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+                )
+        else:
+            padded_input = conv_input
 
-    def _apply_batch_conv(self, conv_input: mx.array) -> mx.array:
-        """Apply 1D convolution for batch processing."""
-        # Transpose for conv1d: (batch, channels, length)
-        conv_input_t = conv_input.transpose(0, 2, 1)
-        conv_output_t = self.conv1d(conv_input_t)
-        # Transpose back: (batch, length, channels)
-        return conv_output_t.transpose(0, 2, 1)
+        conv_output = self.conv1d(padded_input)
 
-    def _incremental_ssm(
+        conv_output = conv_output[:, :seq_len, :]
+        if mamba_cache is not None and self.conv_kernel_size > 1:
+            state_slice = padded_input[:, -self.conv_kernel_size :, :]
+            mamba_cache.update_conv_state(self.layer_idx, state_slice)
+
+        return nn.silu(conv_output)
+
+    def _ssm(
         self,
         hidden_states: mx.array,
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: HybridMambaAttentionCache
+        mamba_cache: Optional[Mamba2Cache] = None,
     ) -> mx.array:
-        """Optimized SSM for single token generation."""
-        batch_size = hidden_states.shape[0]
-        dt = nn.softplus(dt.squeeze(axis=1) + self.dt_bias)
-        dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-        hidden_states = hidden_states.reshape(batch_size, self.num_heads, self.head_dim)
-        B = mx.repeat(B.reshape(batch_size, self.n_groups, self.ssm_state_size),
-                     self.heads_per_group, axis=1)
-        C = mx.repeat(C.reshape(batch_size, self.n_groups, self.ssm_state_size),
-                     self.heads_per_group, axis=1)
-        dt_expanded = dt[:, :, None, None]
-        A_expanded = self.neg_A[None, :, None, None]
-        dA = mx.exp(dt_expanded * A_expanded)
-        dB = dt_expanded * B[:, :, None, :]
-        current_state = cache.get_ssm_state(self.layer_idx)
-        new_state = dA * current_state + dB * hidden_states[:, :, :, None]
-        cache.update_ssm_state(self.layer_idx, new_state)
-        y = mx.sum(C[:, :, None, :] * new_state, axis=-1) + self.D[None, :, None] * hidden_states
-        return y.reshape(batch_size, 1, self.intermediate_size)
-
-    def _batch_ssm(
-        self,
-        hidden_states: mx.array,
-        B: mx.array,
-        C: mx.array,
-        dt: mx.array
-    ) -> mx.array:
-        """Optimized SSM for batch processing."""
         batch_size, seq_len, _ = hidden_states.shape
+
+        # Process dt
         dt = nn.softplus(dt + self.dt_bias)
         dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-        hidden_states = hidden_states.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        B = mx.tile(B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-                   (1, 1, self.heads_per_group, 1))
-        C = mx.tile(C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-                   (1, 1, self.heads_per_group, 1))
+
+        # Reshape inputs explicitly to avoid axis mixups
+        hidden_states = hidden_states.reshape(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        )
+
+        # Expand B and C from (B, L, n_groups*ssm) -> (B, L, num_heads, ssm)
+        B_rep = mx.repeat(
+            B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
+            self.heads_per_group,
+            axis=2,
+        )
+        C_rep = mx.repeat(
+            C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
+            self.heads_per_group,
+            axis=2,
+        )
+
+        # Discretization base A: shape (1, H, 1, 1)
+        A = -mx.exp(self.A_log.astype(mx.float32))  # (H,)
+        A = A[None, :, None, None]
+
+        # Initialize or fetch SSM state h with shape (B, H, D, S)
+        if mamba_cache is not None:
+            h = mamba_cache.get_ssm_state(self.layer_idx)
+        else:
+            h = mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
+
         outputs = []
-        h = mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
         for t in range(seq_len):
-            dt_t = dt[:, t, :, None, None]
-            A_t = self.neg_A[None, :, None, None]
-            dA = mx.exp(dt_t * A_t)
-            dB = dt_t * B[:, t, :, None, :]
+            # dt_t: (B, H, 1, 1)
+            dt_t = dt[:, t, :].reshape(batch_size, self.num_heads, 1, 1)
+
+            # dA: broadcast to (B, H, D, S)
+            dA = mx.exp(dt_t * A)
+            dA = mx.broadcast_to(dA, (batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
+
+            # dB: start from (B, H, 1, S), then broadcast to (B, H, D, S)
+            dB_base = dt_t * B_rep[:, t, :, None, :]  # (B, H, 1, S)
+            dB = mx.broadcast_to(dB_base, (batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
+
+            # Update state
             h = dA * h + dB * hidden_states[:, t, :, :, None]
-            y_t = mx.sum(C[:, t, :, None, :] * h, axis=-1) + \
-                  self.D[None, :, None] * hidden_states[:, t]
+
+            # Output: y_t shape (B, H, D)
+            y_t = (
+                mx.sum(C_rep[:, t, :, None, :] * h, axis=-1)
+                + self.D[None, :, None] * hidden_states[:, t]
+            )
             outputs.append(y_t)
+
+        if mamba_cache is not None:
+            mamba_cache.update_ssm_state(self.layer_idx, h)
+
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
         self,
         hidden_states: mx.array,
+        mamba_cache: Optional[Mamba2Cache] = None,
         attention_mask: Optional[mx.array] = None,
-        cache: Optional[HybridMambaAttentionCache] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
-        is_incremental = cache is not None and seq_len == 1
+
+        # Linear projection
         projected = self.in_proj(hidden_states)
-        splits = mx.split(projected, self.proj_splits, axis=-1)
-        _, _, gate, conv_input, dt = splits
-        
-        if is_incremental:
-            conv_output = self._apply_incremental_conv(conv_input, cache)
-        else:
-            conv_output = self._apply_batch_conv(conv_input)
-        
-        conv_output = nn.silu(conv_output)
-        hidden_states, B, C = mx.split(conv_output, self.state_splits, axis=-1)
-        
-        if is_incremental:
-            y = self._incremental_ssm(hidden_states, B, C, dt, cache)
-        else:
-            y = self._batch_ssm(hidden_states, B, C, dt)
-        
+
+        # Split into components
+        gate = projected[..., : self.intermediate_size]
+        conv_input = projected[
+            ..., self.intermediate_size : self.intermediate_size + self.conv_dim
+        ]
+        dt = projected[..., -self.num_heads :]
+
+        # Apply convolution
+        conv_output = self._apply_conv(conv_input, mamba_cache)
+
+        # Split conv output
+        hidden_states2 = conv_output[..., : self.intermediate_size]
+        B = conv_output[
+            ...,
+            self.intermediate_size : self.intermediate_size
+            + self.n_groups * self.ssm_state_size,
+        ]
+        C = conv_output[
+            ..., self.intermediate_size + self.n_groups * self.ssm_state_size :
+        ]
+
+        # Apply SSM
+        y = self._ssm(hidden_states2, B, C, dt, mamba_cache)
+
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -360,24 +338,27 @@ class NemotronHAttention(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[HybridMambaAttentionCache] = None,
+        attn_cache: Optional[List[KVCache]] = None,
     ) -> mx.array:
         B, L, D = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
-        
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(self.layer_idx, keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-        
+
+        layer_kv = None
+        layer_offset = 0
+        if attn_cache is not None:
+            layer_kv = attn_cache[self.layer_idx]
+            if hasattr(layer_kv, "offset"):
+                layer_offset = layer_kv.offset
+        queries = self.rope(queries, offset=layer_offset) if layer_offset else self.rope(queries)
+        keys = self.rope(keys, offset=layer_offset) if layer_offset else self.rope(keys)
+        if layer_kv is not None:
+            keys, values = layer_kv.update_and_fetch(keys, values)
+
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, cache=layer_kv, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -418,16 +399,16 @@ class NemotronHBlock(nn.Module):
         else:
             raise ValueError(f"Invalid block type: {self.block_type}")
 
-    def __call__(self, x, attention_mask=None, cache: Optional[HybridMambaAttentionCache] = None):
+    def __call__(self, x, attention_mask=None, attn_cache: Optional[List[KVCache]] = None, mamba_cache: Optional[Mamba2Cache] = None):
         residual = x
         hidden_states = self.norm(x)
         if self.residual_in_fp32:
             residual = residual.astype(mx.float32)
 
         if self.block_type == "mamba":
-            hidden_states = self.mixer(hidden_states, attention_mask=attention_mask, cache=cache)
+            hidden_states = self.mixer(hidden_states, mamba_cache=mamba_cache, attention_mask=attention_mask)
         elif self.block_type == "attention":
-            hidden_states = self.mixer(hidden_states, mask=attention_mask, cache=cache)
+            hidden_states = self.mixer(hidden_states, mask=attention_mask, attn_cache=attn_cache)
         elif self.block_type == "mlp":
             hidden_states = self.mixer(hidden_states)
 
@@ -443,21 +424,19 @@ class NemotronHModel(nn.Module):
         self.layers = [NemotronHBlock(args, layer_idx=idx) for idx in range(args.num_hidden_layers)]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def _create_causal_mask_4d(self, inputs, cache=None):
+    def _create_causal_mask_4d(self, inputs, attn_cache: Optional[List[KVCache]] = None):
         """Create 4D causal mask for attention layers."""
         B, L = inputs.shape[:2]
-        
-        if cache is not None and hasattr(cache, 'offset'):
-            offset = cache.offset
-            # Create mask accounting for cache
+        offset = 0
+        if attn_cache is not None and len(attn_cache) > 0 and hasattr(attn_cache[0], "offset"):
+            offset = attn_cache[0].offset
+        if offset:
             mask = mx.full((B, 1, L, L + offset), float('-inf'))
             for i in range(L):
                 mask[:, :, i, :offset + i + 1] = 0
         else:
-            # Standard 4D causal mask
             mask = mx.full((B, 1, L, L), float('-inf'))
             mask = mx.triu(mask, k=1)
-        
         return mask
 
     def _create_mamba_mask_2d(self, inputs):
@@ -472,13 +451,14 @@ class NemotronHModel(nn.Module):
                  inputs,
                  causal_mask: Optional[mx.array] = None,
                  mamba_mask: Optional[mx.array] = None,
-                 cache: Optional[HybridMambaAttentionCache] = None):
+                 attn_cache: Optional[List[KVCache]] = None,
+                 mamba_cache: Optional[Mamba2Cache] = None):
         hidden_states = self.embeddings(inputs)
-        
+
         # Create masks if not provided
         if causal_mask is None:
-            causal_mask = self._create_causal_mask_4d(hidden_states, cache)  # 4D causal mask
-        
+            causal_mask = self._create_causal_mask_4d(hidden_states, attn_cache)  # 4D causal mask
+
         if mamba_mask is None:
             mamba_mask = self._create_mamba_mask_2d(hidden_states)  # 2D base attention mask
 
@@ -493,11 +473,12 @@ class NemotronHModel(nn.Module):
                 layer_mask = None
             else:
                 raise ValueError(f"Invalid block_type: {mixer_block.block_type}")
-            
+
             hidden_states = mixer_block(
                 hidden_states,
                 attention_mask=layer_mask,
-                cache=cache
+                attn_cache=attn_cache,
+                mamba_cache=mamba_cache,
             )
 
         return self.norm_f(hidden_states)
@@ -512,23 +493,61 @@ class Model(nn.Module):
         self.backbone = NemotronHModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+    # Preferred usage: pass a single UnifiedCache via `cache=`. Legacy forms also supported.
     def __call__(
         self,
         inputs: mx.array,
         causal_mask: Optional[mx.array] = None,
         mamba_mask: Optional[mx.array] = None,
-        cache: Optional[HybridMambaAttentionCache] = None,
+        attn_cache: Optional[List[KVCache]] = None,
+        mamba_cache: Optional[Mamba2Cache] = None,
+        cache: Optional[Any] = None,
     ):
-        out = self.backbone(inputs, causal_mask=causal_mask, mamba_mask=mamba_mask, cache=cache)
+        # Accept a single unified cache or legacy forms.
+        if cache is not None and attn_cache is None and mamba_cache is None:
+            # UnifiedCache instance
+            if isinstance(cache, UnifiedCache):
+                attn_cache = cache.attn_cache
+                mamba_cache = cache.mamba_cache
+            # Tuple/list: (attn_cache, mamba_cache) or [KVCache, ...]
+            elif isinstance(cache, (tuple, list)):
+                if len(cache) == 2 and isinstance(cache[0], list):
+                    attn_cache = cache[0]
+                    mamba_cache = cache[1]
+                else:
+                    # Assume list of KVCache for attention only; build a fresh mamba cache
+                    attn_cache = cache  # type: ignore
+                    B = inputs.shape[0]
+                    intermediate_size = self.args.mamba_num_heads * self.args.mamba_head_dim
+                    conv_dim = intermediate_size + 2 * self.args.n_groups * self.args.ssm_state_size
+                    mamba_cache = Mamba2Cache(batch_size=B, conv_dim=conv_dim, args=self.args)
+            # Single Mamba2Cache instance
+            elif isinstance(cache, Mamba2Cache):
+                mamba_cache = cache
+            # Unknown type: leave as None and proceed
+        out = self.backbone(inputs, causal_mask=causal_mask, mamba_mask=mamba_mask, attn_cache=attn_cache, mamba_cache=mamba_cache)
         return self.lm_head(out)
 
     @property
     def layers(self):
         return self.backbone.layers
 
-    def make_cache(self, batch_size: int = 1, dtype=mx.float32) -> HybridMambaAttentionCache:
-        """Create a properly initialized cache for the hybrid model."""
-        return HybridMambaAttentionCache(self.args, batch_size=batch_size, dtype=dtype)
+    def make_cache(self, batch_size: int = 1, dtype=mx.float32):
+        """
+        Create and return a single unified cache that contains both:
+          - attn_cache: List[KVCache] of length num_hidden_layers
+          - mamba_cache: Mamba2Cache with conv and SSM states
+
+        Returns
+        -------
+        UnifiedCache
+            A wrapper holding both cache types.
+        """
+        attn_cache = [KVCache() for _ in range(self.args.num_hidden_layers)]
+        intermediate_size = self.args.mamba_num_heads * self.args.mamba_head_dim
+        conv_dim = intermediate_size + 2 * self.args.n_groups * self.args.ssm_state_size
+        mamba_cache = Mamba2Cache(batch_size=batch_size, conv_dim=conv_dim, args=self.args)
+        return UnifiedCache(attn_cache, mamba_cache)
 
     def sanitize(self, weights):
         """Remove unused weights for the specific architecture."""
