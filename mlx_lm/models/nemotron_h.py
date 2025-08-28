@@ -8,74 +8,52 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .rope_utils import initialize_rope
 from .cache import KVCache, Mamba2Cache
 
-# Unified cache wrapper for both attention and Mamba2 state caches
-class UnifiedCache:
-    """Simple wrapper to hold both attention KV caches and Mamba2 state cache.
 
-    Attributes
-    ----------
-    attn_cache : list[KVCache]
-        Per-layer attention KV caches.
-    mamba_cache : Mamba2Cache
-        Shared Mamba2 cache holding conv and SSM states.
-    """
+class UnifiedCache:
     def __init__(self, attn_cache: list[KVCache], mamba_cache: Mamba2Cache):
         self.attn_cache = attn_cache
         self.mamba_cache = mamba_cache
 
 @dataclass(kw_only=True)
 class ModelArgs(BaseModelArgs):
-    # Model identification
     model_type: str
-    # Basic model dimensions
     vocab_size: int
     hidden_size: int
     intermediate_size: int
     num_hidden_layers: int
     max_position_embeddings: int
-    # Attention configuration
     num_attention_heads: int
     num_key_value_heads: int
     attention_bias: bool
-    # Mamba-specific configuration
     mamba_num_heads: int
     mamba_head_dim: int
     mamba_hidden_act: str
     mamba_proj_bias: bool
-    # SSM configuration
     ssm_state_size: int
     chunk_size: int
     conv_kernel: int
     n_groups: int
-    # Time step configuration
     time_step_rank: int
     time_step_min: float
     time_step_max: float
     time_step_floor: float
     time_step_limit: Tuple[float, float]
-    # MLP configuration
     mlp_bias: bool
     mlp_hidden_act: str
-    # Normalization
     layer_norm_epsilon: float
     rms_norm_eps: float
-    # Bias settings
     use_bias: bool
     use_conv_bias: bool
-    # Other settings
     residual_in_fp32: bool
     rescale_prenorm_residual: bool
     tie_word_embeddings: bool
-    # Hybrid pattern
     hybrid_override_pattern: str
-    # Derived fields (will be set in __post_init__)
     head_dim: Optional[int] = None
     num_heads: Optional[int] = None
     layers_block_type: Optional[List[str]] = None
     expand: Optional[int] = None
 
     def __post_init__(self):
-        # Compute derived fields
         if self.expand is None:
             self.expand = self.intermediate_size // self.hidden_size
 
@@ -85,16 +63,12 @@ class ModelArgs(BaseModelArgs):
         if self.num_heads is None:
             self.num_heads = self.num_attention_heads
 
-        # Determine layer block types from pattern, or default to all mamba
         if self.hybrid_override_pattern:
             self.layers_block_type = self._parse_hybrid_pattern(self.hybrid_override_pattern)
         else:
             self.layers_block_type = ["mamba"] * self.num_hidden_layers
 
     def _parse_hybrid_pattern(self, pattern: str) -> List[str]:
-        """Parse hybrid pattern string into list of layer types.
-        M: Mamba2, *: Attention, -: MLP
-        """
         layer_types = []
         for char in pattern:
             if char == 'M':
@@ -103,16 +77,11 @@ class ModelArgs(BaseModelArgs):
                 layer_types.append("attention")
             elif char == '-':
                 layer_types.append("mlp")
-        # Skip any other characters (like spaces or separators)
-        # Ensure we have the right number of layers
         if len(layer_types) != self.num_hidden_layers:
             print(f"Warning: Pattern length {len(layer_types)} doesn't match num_hidden_layers {self.num_hidden_layers}")
-            # Pad or truncate as needed
             if len(layer_types) < self.num_hidden_layers:
-                # Pad with mamba layers
                 layer_types.extend(["mamba"] * (self.num_hidden_layers - len(layer_types)))
             else:
-                # Truncate
                 layer_types = layer_types[:self.num_hidden_layers]
         return layer_types
 
@@ -178,14 +147,11 @@ class NemotronHMamba2Mixer(nn.Module):
         self, conv_input: mx.array, mamba_cache: Optional[Mamba2Cache] = None
     ) -> mx.array:
         batch_size, seq_len, in_ch = conv_input.shape
-        # Manual left causal padding using cache if available
         if self.conv_kernel_size > 1:
             if mamba_cache is not None:
-                # Use last K-1 frames from cache as left context
                 left_ctx = mamba_cache.conv_states[self.layer_idx][:, 1:, :]
                 padded_input = mx.concatenate([left_ctx, conv_input], axis=1)
             else:
-                # Fallback: zero-pad when no cache
                 padded_input = mx.pad(
                     conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
                 )
@@ -211,16 +177,13 @@ class NemotronHMamba2Mixer(nn.Module):
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Process dt
         dt = nn.softplus(dt + self.dt_bias)
         dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
-        # Reshape inputs explicitly to avoid axis mixups
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
 
-        # Expand B and C from (B, L, n_groups*ssm) -> (B, L, num_heads, ssm)
         B_rep = mx.repeat(
             B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
             self.heads_per_group,
@@ -232,11 +195,9 @@ class NemotronHMamba2Mixer(nn.Module):
             axis=2,
         )
 
-        # Discretization base A: shape (1, H, 1, 1)
-        A = -mx.exp(self.A_log.astype(mx.float32))  # (H,)
+        A = -mx.exp(self.A_log.astype(mx.float32))
         A = A[None, :, None, None]
 
-        # Initialize or fetch SSM state h with shape (B, H, D, S)
         if mamba_cache is not None:
             h = mamba_cache.get_ssm_state(self.layer_idx)
         else:
@@ -244,21 +205,12 @@ class NemotronHMamba2Mixer(nn.Module):
 
         outputs = []
         for t in range(seq_len):
-            # dt_t: (B, H, 1, 1)
             dt_t = dt[:, t, :].reshape(batch_size, self.num_heads, 1, 1)
-
-            # dA: broadcast to (B, H, D, S)
             dA = mx.exp(dt_t * A)
             dA = mx.broadcast_to(dA, (batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
-
-            # dB: start from (B, H, 1, S), then broadcast to (B, H, D, S)
-            dB_base = dt_t * B_rep[:, t, :, None, :]  # (B, H, 1, S)
+            dB_base = dt_t * B_rep[:, t, :, None, :]
             dB = mx.broadcast_to(dB_base, (batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
-
-            # Update state
             h = dA * h + dB * hidden_states[:, t, :, :, None]
-
-            # Output: y_t shape (B, H, D)
             y_t = (
                 mx.sum(C_rep[:, t, :, None, :] * h, axis=-1)
                 + self.D[None, :, None] * hidden_states[:, t]
@@ -279,20 +231,15 @@ class NemotronHMamba2Mixer(nn.Module):
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Linear projection
         projected = self.in_proj(hidden_states)
 
-        # Split into components
         gate = projected[..., : self.intermediate_size]
         conv_input = projected[
             ..., self.intermediate_size : self.intermediate_size + self.conv_dim
         ]
         dt = projected[..., -self.num_heads :]
-
-        # Apply convolution
         conv_output = self._apply_conv(conv_input, mamba_cache)
 
-        # Split conv output
         hidden_states2 = conv_output[..., : self.intermediate_size]
         B = conv_output[
             ...,
@@ -303,7 +250,6 @@ class NemotronHMamba2Mixer(nn.Module):
             ..., self.intermediate_size + self.n_groups * self.ssm_state_size :
         ]
 
-        # Apply SSM
         y = self._ssm(hidden_states2, B, C, dt, mamba_cache)
 
         y = self.norm(y, gate)
@@ -321,11 +267,13 @@ class NemotronHAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = args.max_position_embeddings
         self.scale = self.head_dim**-0.5
+
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
+
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias)
-        # Initialize RoPE
+
         self.rope = initialize_rope(
             self.head_dim,
             getattr(args, 'rope_theta', 10000.0),
@@ -369,13 +317,12 @@ class NemotronHMLP(nn.Module):
         super().__init__()
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
-        # Handle different activation functions
         if args.mlp_hidden_act == "relu2":
             self.activation = lambda x: nn.relu(x) ** 2
         elif args.mlp_hidden_act == "silu":
             self.activation = nn.silu
         else:
-            self.activation = nn.silu  # Default
+            self.activation = nn.silu
 
     def __call__(self, x):
         return self.down_proj(self.activation(self.up_proj(x)))
@@ -387,7 +334,7 @@ class NemotronHBlock(nn.Module):
         self.layer_idx = layer_idx
         self.residual_in_fp32 = args.residual_in_fp32
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        # Get block type from parsed pattern
+
         self.block_type = args.layers_block_type[layer_idx]
         
         if self.block_type == "mamba":
@@ -424,28 +371,9 @@ class NemotronHModel(nn.Module):
         self.layers = [NemotronHBlock(args, layer_idx=idx) for idx in range(args.num_hidden_layers)]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def _create_causal_mask_4d(self, inputs, attn_cache: Optional[List[KVCache]] = None):
-        """Create 4D causal mask for attention layers."""
-        B, L = inputs.shape[:2]
-        offset = 0
-        if attn_cache is not None and len(attn_cache) > 0 and hasattr(attn_cache[0], "offset"):
-            offset = attn_cache[0].offset
-        if offset:
-            mask = mx.full((B, 1, L, L + offset), float('-inf'))
-            for i in range(L):
-                mask[:, :, i, :offset + i + 1] = 0
-        else:
-            mask = mx.full((B, 1, L, L), float('-inf'))
-            mask = mx.triu(mask, k=1)
-        return mask
-
     def _create_mamba_mask_2d(self, inputs):
-        """Create 2D base attention mask for Mamba layers."""
         B, L = inputs.shape[:2]
-        # Simple 2D mask - typically all ones for Mamba (no padding assumed)
-        # You might need to modify this based on your specific requirements
-        mask = mx.ones((B, L), dtype=mx.float32)
-        return mask
+        return mx.ones((B, L), dtype=mx.float32)
 
     def __call__(self,
                  inputs,
@@ -455,16 +383,13 @@ class NemotronHModel(nn.Module):
                  mamba_cache: Optional[Mamba2Cache] = None):
         hidden_states = self.embeddings(inputs)
 
-        # Create masks if not provided
         if causal_mask is None:
-            causal_mask = self._create_causal_mask_4d(hidden_states, attn_cache)  # 4D causal mask
+            causal_mask = create_attention_mask(hidden_states, attn_cache)
 
         if mamba_mask is None:
-            mamba_mask = self._create_mamba_mask_2d(hidden_states)  # 2D base attention mask
+            mamba_mask = self._create_mamba_mask_2d(hidden_states)
 
-        # Process through layers
         for layer_idx, mixer_block in enumerate(self.layers):
-            # Depending on the layer type we opt for 2D base attention mask (Mamba) or 4D causal mask (Attention)
             if mixer_block.block_type == "mamba":
                 layer_mask = mamba_mask
             elif mixer_block.block_type == "attention":
@@ -493,7 +418,6 @@ class Model(nn.Module):
         self.backbone = NemotronHModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    # Preferred usage: pass a single UnifiedCache via `cache=`. Legacy forms also supported.
     def __call__(
         self,
         inputs: mx.array,
@@ -503,28 +427,22 @@ class Model(nn.Module):
         mamba_cache: Optional[Mamba2Cache] = None,
         cache: Optional[Any] = None,
     ):
-        # Accept a single unified cache or legacy forms.
         if cache is not None and attn_cache is None and mamba_cache is None:
-            # UnifiedCache instance
             if isinstance(cache, UnifiedCache):
                 attn_cache = cache.attn_cache
                 mamba_cache = cache.mamba_cache
-            # Tuple/list: (attn_cache, mamba_cache) or [KVCache, ...]
             elif isinstance(cache, (tuple, list)):
                 if len(cache) == 2 and isinstance(cache[0], list):
                     attn_cache = cache[0]
                     mamba_cache = cache[1]
                 else:
-                    # Assume list of KVCache for attention only; build a fresh mamba cache
-                    attn_cache = cache  # type: ignore
+                    attn_cache = cache
                     B = inputs.shape[0]
                     intermediate_size = self.args.mamba_num_heads * self.args.mamba_head_dim
                     conv_dim = intermediate_size + 2 * self.args.n_groups * self.args.ssm_state_size
                     mamba_cache = Mamba2Cache(batch_size=B, conv_dim=conv_dim, args=self.args)
-            # Single Mamba2Cache instance
             elif isinstance(cache, Mamba2Cache):
                 mamba_cache = cache
-            # Unknown type: leave as None and proceed
         out = self.backbone(inputs, causal_mask=causal_mask, mamba_mask=mamba_mask, attn_cache=attn_cache, mamba_cache=mamba_cache)
         return self.lm_head(out)
 
@@ -533,16 +451,6 @@ class Model(nn.Module):
         return self.backbone.layers
 
     def make_cache(self, batch_size: int = 1, dtype=mx.float32):
-        """
-        Create and return a single unified cache that contains both:
-          - attn_cache: List[KVCache] of length num_hidden_layers
-          - mamba_cache: Mamba2Cache with conv and SSM states
-
-        Returns
-        -------
-        UnifiedCache
-            A wrapper holding both cache types.
-        """
         attn_cache = [KVCache() for _ in range(self.args.num_hidden_layers)]
         intermediate_size = self.args.mamba_num_heads * self.args.mamba_head_dim
         conv_dim = intermediate_size + 2 * self.args.n_groups * self.args.ssm_state_size
@@ -550,11 +458,7 @@ class Model(nn.Module):
         return UnifiedCache(attn_cache, mamba_cache)
 
     def sanitize(self, weights):
-        """Remove unused weights for the specific architecture."""
-        sanitized = {}
         for k, v in weights.items():
-            if "conv1d.weight" in k:
-                if len(v.shape) == 3:
-                    v = v.transpose(0, 2, 1)
-            sanitized[k] = v
-        return sanitized
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+        return weights
