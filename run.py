@@ -4,11 +4,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # model = AutoModelForCausalLM.from_pretrained("AntonV/mamba2-130m-hf")
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mamba-Codestral-7B-v0.1")
-model = AutoModelForCausalLM.from_pretrained("mistralai/Mamba-Codestral-7B-v0.1")
+# model = AutoModelForCausalLM.from_pretrained("mistralai/Mamba-Codestral-7B-v0.1")
 
 input_ids = tokenizer("write the quick sort in C", return_tensors="pt")["input_ids"]
-out = model.generate(input_ids, max_new_tokens=10, temperature=0.8, do_sample=True)
-print(tokenizer.batch_decode(out))
+print(tokenizer("write the quick sort in C", return_tensors="pt"))
+
+# out = model.generate(input_ids, max_new_tokens=10, temperature=0.8, do_sample=True)
+# print(tokenizer.batch_decode(out))
 
 
 """
@@ -16,7 +18,7 @@ python -m mlx_lm.generate --model AntonV/mamba2-130m-hf --prompt "Hey," --temp 0
 python -m mlx_lm.generate --model AntonV/mamba2-1.3b-hf  --prompt "Hey," --temp 0.8
 python -m mlx_lm.generate --model mistralai/Mamba-Codestral-7B-v0.1 --prompt "write the quick sort in C" --temp 0.8
 
-python -m mlx_lm.generate --model mlx-community/Mamba-Codestral-7B-v0.1-4bit --prompt "import torch.nn as nn
+python -m mlx_lm.generate --model mistralai/Mamba-Codestral-7B-v0.1 --prompt "import torch.nn as nn
 import torch.nn.functional as F
 
 # two layer mlp cals using pytorch in python

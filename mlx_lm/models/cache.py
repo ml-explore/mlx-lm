@@ -552,47 +552,30 @@ class MambaCache(ArraysCache):
 
 
 class Mamba2Cache:
-    def __init__(self, batch_size: int, num_layers: int, num_heads: int,
-                 head_dim: int, state_size: int, conv_kernel_size: int,
-                 conv_dim: int):
-        self.batch_size = batch_size
-        self.num_layers = num_layers
-        self.conv_kernel_size = conv_kernel_size
-        
-        # Pre-allocate all states to avoid repeated allocations
-        self.conv_states = {}
-        self.ssm_states = {}
-        
-        # Pre-allocate conv states for all layers
-        for i in range(num_layers):
-            self.conv_states[i] = mx.zeros((batch_size, conv_dim, conv_kernel_size - 1))
-            self.ssm_states[i] = mx.zeros((batch_size, num_heads, head_dim, state_size))
+    def __init__(self, batch_size, conv_dim, args):
+        self.conv_states = [
+            mx.zeros((batch_size, conv_dim, args.conv_kernel)) 
+            for _ in range(args.num_hidden_layers)
+        ]
+        self.ssm_states = [
+            mx.zeros((batch_size, args.num_heads, args.head_dim, args.ssm_state_size)) 
+            for _ in range(args.num_hidden_layers)
+        ]
     
-    def update_conv_state(self, layer_idx: int, new_input: mx.array) -> mx.array:
-        # new_input shape: (batch, 1, conv_dim) -> (batch, conv_dim, 1)
-        new_input = mx.transpose(new_input.squeeze(axis=1), (0, 1))[:, :, None]
-        
-        conv_state = self.conv_states[layer_idx]
-        if conv_state.shape[-1] > 1:
-            # Shift left and append new input
-            updated_state = mx.concatenate([conv_state[:, :, 1:], new_input], axis=-1)
-        else:
-            updated_state = new_input
-        
+    def update_conv_state(self, layer_idx, new_conv_state):
+        current_state = self.conv_states[layer_idx]
+        updated_state = mx.concatenate(
+            [current_state[..., 1:], new_conv_state[..., None]], 
+            axis=-1
+        )
         self.conv_states[layer_idx] = updated_state
-        
-        # Return the full conv window (old state + new input) for convolution
-        return mx.concatenate([conv_state, new_input], axis=-1)
+        return updated_state
     
-    def update_ssm_state(self, layer_idx: int, new_state: mx.array):
-        """Direct SSM state update."""
-        self.ssm_states[layer_idx] = new_state
-    
-    def get_conv_state(self, layer_idx: int) -> mx.array:
-        return self.conv_states[layer_idx]
-    
-    def get_ssm_state(self, layer_idx: int) -> mx.array:
+    def get_ssm_state(self, layer_idx):
         return self.ssm_states[layer_idx]
+    
+    def update_ssm_state(self, layer_idx, new_ssm_state):
+        self.ssm_states[layer_idx] = new_ssm_state
 
 
 class ChunkedKVCache(KVCache):
