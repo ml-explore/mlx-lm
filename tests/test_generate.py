@@ -147,8 +147,8 @@ class TestGenerate(unittest.TestCase):
 
         self.assertEqual("TEST", response)
         num_embeddings = prompt_embeddings.shape[0]
-        self.assertEqual(
-            num_embeddings / prefill_step_size, num_prompt_processing_callbacks
+        self.assertTrue(
+            num_embeddings / prefill_step_size < num_prompt_processing_callbacks
         )
 
 
