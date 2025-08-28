@@ -515,7 +515,6 @@ class Mamba2Cache:
 
     def get_ssm_state(self, layer_idx):
         h = self.ssm_states[layer_idx]
-        # Migrate legacy (B, num_heads, head_dim, S) → (B, mamba_num_heads, mamba_head_dim, S)
         if (
             h.shape[1] != self.args.mamba_num_heads
             or h.shape[2] != self.args.mamba_head_dim
