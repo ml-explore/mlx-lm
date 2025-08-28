@@ -150,14 +150,14 @@ class NemotronHMamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(
             self.intermediate_size, self.hidden_size, bias=args.use_bias
         )
-
+    
     def _apply_conv(
-        self, conv_input: mx.array, mamba_cache: Optional[Mamba2Cache] = None
+        self, conv_input: mx.array, cache: Optional[Mamba2Cache] = None
     ) -> mx.array:
         batch_size, seq_len, in_ch = conv_input.shape
         if self.conv_kernel_size > 1:
-            if mamba_cache is not None:
-                left_ctx = mamba_cache.conv_states[self.layer_idx][:, 1:, :]
+            if cache is not None:
+                left_ctx = cache.conv_states[self.layer_idx][:, 1:, :]
                 padded_input = mx.concatenate([left_ctx, conv_input], axis=1)
             else:
                 padded_input = mx.pad(
@@ -169,9 +169,9 @@ class NemotronHMamba2Mixer(nn.Module):
         conv_output = self.conv1d(padded_input)
 
         conv_output = conv_output[:, :seq_len, :]
-        if mamba_cache is not None and self.conv_kernel_size > 1:
+        if cache is not None and self.conv_kernel_size > 1:
             state_slice = padded_input[:, -self.conv_kernel_size :, :]
-            mamba_cache.update_conv_state(self.layer_idx, state_slice)
+            cache.update_conv_state(self.layer_idx, state_slice)
 
         return nn.silu(conv_output)
 
@@ -181,59 +181,56 @@ class NemotronHMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        mamba_cache: Optional[Mamba2Cache] = None,
+        cache: Optional[Mamba2Cache] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
+        # Process dt
         dt = nn.softplus(dt + self.dt_bias)
         dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
+        # Reshape inputs
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
 
-        B_rep = mx.repeat(
+        # Expand B and C to match number of heads
+        B = mx.repeat(
             B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
             self.heads_per_group,
             axis=2,
         )
-        C_rep = mx.repeat(
+        C = mx.repeat(
             C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
             self.heads_per_group,
             axis=2,
         )
 
+        # Discretization
         A = -mx.exp(self.A_log.astype(mx.float32))
-        A = A[None, :, None, None]
 
-        if mamba_cache is not None:
-            h = mamba_cache.get_ssm_state(self.layer_idx)
+        outputs = []
+        if cache is not None:
+            h = cache.get_ssm_state(self.layer_idx)
         else:
             h = mx.zeros(
                 (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
             )
 
-        outputs = []
         for t in range(seq_len):
-            dt_t = dt[:, t, :].reshape(batch_size, self.num_heads, 1, 1)
-            dA = mx.exp(dt_t * A)
-            dA = mx.broadcast_to(
-                dA, (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
-            )
-            dB_base = dt_t * B_rep[:, t, :, None, :]
-            dB = mx.broadcast_to(
-                dB_base,
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
-            )
+            dt_t = dt[:, t, :, None, None]
+            dA = mx.exp(dt_t * A[None, :, None, None])
+            dB = dt_t * B[:, t, :, None, :]
+
             h = dA * h + dB * hidden_states[:, t, :, :, None]
             y_t = (
-                mx.sum(C_rep[:, t, :, None, :] * h, axis=-1)
+                mx.sum(C[:, t, :, None, :] * h, axis=-1)
                 + self.D[None, :, None] * hidden_states[:, t]
             )
             outputs.append(y_t)
 
-        if mamba_cache is not None:
-            mamba_cache.update_ssm_state(self.layer_idx, h)
+        if cache is not None:
+            cache.update_ssm_state(self.layer_idx, h)
 
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
@@ -242,20 +239,25 @@ class NemotronHMamba2Mixer(nn.Module):
         self,
         hidden_states: mx.array,
         mamba_cache: Optional[Mamba2Cache] = None,
-        attention_mask: Optional[mx.array] = None,
+        attention_mask: Optional[mx.array] = None
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
+        # Linear projection
         projected = self.in_proj(hidden_states)
 
+        # Split into components
         gate = projected[..., : self.intermediate_size]
         conv_input = projected[
             ..., self.intermediate_size : self.intermediate_size + self.conv_dim
         ]
         dt = projected[..., -self.num_heads :]
+
+        # Apply convolution
         conv_output = self._apply_conv(conv_input, mamba_cache)
 
-        hidden_states2 = conv_output[..., : self.intermediate_size]
+        # Split conv output
+        hidden_states = conv_output[..., : self.intermediate_size]
         B = conv_output[
             ...,
             self.intermediate_size : self.intermediate_size
@@ -265,7 +267,8 @@ class NemotronHMamba2Mixer(nn.Module):
             ..., self.intermediate_size + self.n_groups * self.ssm_state_size :
         ]
 
-        y = self._ssm(hidden_states2, B, C, dt, mamba_cache)
+        # Apply SSM
+        y = self._ssm(hidden_states, B, C, dt, mamba_cache)
 
         y = self.norm(y, gate)
         return self.out_proj(y)
@@ -301,50 +304,24 @@ class NemotronHAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
         )
 
-        self.rope = initialize_rope(
-            self.head_dim,
-            getattr(args, "rope_theta", 10000.0),
-            False,
-            getattr(args, "rope_scaling", None),
-            args.max_position_embeddings,
-        )
-
     def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        attn_cache: Optional[List[KVCache]] = None,
+        self, x: mx.array, mask: Optional[mx.array] = None, attn_cache: Optional[Any] = None
     ) -> mx.array:
         B, L, D = x.shape
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        values = values.reshape(
-            B, L, self.num_key_value_heads, self.head_dim
-        ).transpose(0, 2, 1, 3)
 
-        layer_kv = None
-        layer_offset = 0
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+
         if attn_cache is not None:
-            layer_kv = attn_cache[self.layer_idx]
-            if hasattr(layer_kv, "offset"):
-                layer_offset = layer_kv.offset
-        queries = (
-            self.rope(queries, offset=layer_offset)
-            if layer_offset
-            else self.rope(queries)
-        )
-        keys = self.rope(keys, offset=layer_offset) if layer_offset else self.rope(keys)
-        if layer_kv is not None:
-            keys, values = layer_kv.update_and_fetch(keys, values)
+            keys, values = attn_cache.update_and_fetch(keys, values)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=layer_kv, scale=self.scale, mask=mask
+            queries, keys, values, cache=attn_cache, scale=self.scale, mask=mask
         )
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -404,8 +381,13 @@ class NemotronHBlock(nn.Module):
                 hidden_states, mamba_cache=mamba_cache, attention_mask=attention_mask
             )
         elif self.block_type == "attention":
+            layer_attn_cache = (
+                attn_cache[self.layer_idx]
+                if isinstance(attn_cache, list) and len(attn_cache) > self.layer_idx
+                else attn_cache
+            )
             hidden_states = self.mixer(
-                hidden_states, mask=attention_mask, attn_cache=attn_cache
+                hidden_states, mask=attention_mask, attn_cache=layer_attn_cache
             )
         elif self.block_type == "mlp":
             hidden_states = self.mixer(hidden_states)
