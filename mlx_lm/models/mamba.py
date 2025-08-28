@@ -71,7 +71,6 @@ class MambaBlock(nn.Module):
             self.hidden_size, self.intermediate_size * 2, bias=args.use_bias
         )
 
-        # Try without groups first to see if basic conv works
         self.conv1d = nn.Conv1d(
             in_channels=self.intermediate_size,
             out_channels=self.intermediate_size,
