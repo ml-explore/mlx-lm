@@ -554,7 +554,7 @@ class MambaCache(ArraysCache):
 class Mamba2Cache:
     def __init__(self, batch_size, conv_dim, args):
         self.conv_states = [
-            mx.zeros((batch_size, conv_dim, args.conv_kernel)) 
+            mx.zeros((batch_size, args.conv_kernel, conv_dim))
             for _ in range(args.num_hidden_layers)
         ]
         self.ssm_states = [
@@ -564,12 +564,20 @@ class Mamba2Cache:
     
     def update_conv_state(self, layer_idx, new_conv_state):
         current_state = self.conv_states[layer_idx]
-        updated_state = mx.concatenate(
-            [current_state[..., 1:], new_conv_state[..., None]], 
-            axis=-1
-        )
-        self.conv_states[layer_idx] = updated_state
-        return updated_state
+        if new_conv_state.ndim == 3:
+            self.conv_states[layer_idx] = new_conv_state
+            return new_conv_state
+        elif new_conv_state.ndim == 2:
+            updated_state = mx.concatenate(
+                [current_state[:, 1:, :], new_conv_state[:, None, :]],
+                axis=1,
+            )
+            self.conv_states[layer_idx] = updated_state
+            return updated_state
+        else:
+            raise ValueError(
+                f"new_conv_state must be (B, K, C) or (B, C), got shape {new_conv_state.shape}"
+            )
     
     def get_ssm_state(self, layer_idx):
         return self.ssm_states[layer_idx]

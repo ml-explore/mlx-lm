@@ -5,45 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
-
-
-class Mamba2Cache:
-    def __init__(self, batch_size, conv_dim, args):
-        self.conv_states = [
-            mx.zeros((batch_size, args.conv_kernel, conv_dim))
-            for _ in range(args.num_hidden_layers)
-        ]
-        self.ssm_states = [
-            mx.zeros((batch_size, args.num_heads, args.head_dim, args.ssm_state_size)) 
-            for _ in range(args.num_hidden_layers)
-        ]
-    
-    def update_conv_state(self, layer_idx, new_conv_state):
-        """Update cached conv window.
-        Accepts either a full window of shape (B, K, C) or a single step (B, C).
-        Internal cache shape is (B, K, C).
-        """
-        current_state = self.conv_states[layer_idx]
-        if new_conv_state.ndim == 3:
-            self.conv_states[layer_idx] = new_conv_state
-            return new_conv_state
-        elif new_conv_state.ndim == 2:
-            updated_state = mx.concatenate(
-                [current_state[:, 1:, :], new_conv_state[:, None, :]],
-                axis=1,
-            )
-            self.conv_states[layer_idx] = updated_state
-            return updated_state
-        else:
-            raise ValueError(
-                f"new_conv_state must be (B, K, C) or (B, C), got shape {new_conv_state.shape}"
-            )
-    
-    def get_ssm_state(self, layer_idx):
-        return self.ssm_states[layer_idx]
-    
-    def update_ssm_state(self, layer_idx, new_ssm_state):
-        self.ssm_states[layer_idx] = new_ssm_state
+from .cache import Mamba2Cache
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -138,13 +100,6 @@ class Mamba2Block(nn.Module):
 
     def _apply_conv(self, conv_input: mx.array, cache: Optional[Mamba2Cache] = None) -> mx.array:
         batch_size, seq_len, in_ch = conv_input.shape
-
-        # Validate channels for depthwise conv
-        if in_ch != self.conv_dim:
-            raise ValueError(
-                f"Input channels {in_ch} don't match expected conv_dim {self.conv_dim}"
-            )
-
         # Manual left causal padding using cache if available
         if self.conv_kernel_size > 1:
             if cache is not None:
@@ -163,10 +118,7 @@ class Mamba2Block(nn.Module):
         # MLX Conv1d expects (batch, length, channels)
         conv_output = self.conv1d(padded_input)
 
-        # Ensure output aligns to original sequence length
         conv_output = conv_output[:, :seq_len, :]
-
-        # Update cache if provided (store the most recent receptive field window)
         if cache is not None and self.conv_kernel_size > 1:
             state_slice = padded_input[:, -self.conv_kernel_size:, :]
             cache.update_conv_state(self.layer_idx, state_slice)
