@@ -99,8 +99,7 @@ class Mamba2Block(nn.Module):
         self.norm = MambaRMSNormGated(self.intermediate_size, eps=args.layer_norm_epsilon)
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.use_bias)
         
-        # Pre-compute split indices - fix for d_mlp
-        d_mlp = 0  # Based on the original code
+        d_mlp = 0
         self.proj_splits = [
             d_mlp,
             2 * d_mlp, 
