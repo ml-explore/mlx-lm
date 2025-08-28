@@ -485,7 +485,14 @@ class Mamba2Cache:
             for _ in range(args.num_hidden_layers)
         ]
         self.ssm_states = [
-            mx.zeros((batch_size, args.mamba_num_heads, args.mamba_head_dim, args.ssm_state_size))
+            mx.zeros(
+                (
+                    batch_size,
+                    args.mamba_num_heads,
+                    args.mamba_head_dim,
+                    args.ssm_state_size,
+                )
+            )
             for _ in range(args.num_hidden_layers)
         ]
 
@@ -509,8 +516,18 @@ class Mamba2Cache:
     def get_ssm_state(self, layer_idx):
         h = self.ssm_states[layer_idx]
         # Migrate legacy (B, num_heads, head_dim, S) → (B, mamba_num_heads, mamba_head_dim, S)
-        if h.shape[1] != self.args.mamba_num_heads or h.shape[2] != self.args.mamba_head_dim:
-            h = mx.zeros((h.shape[0], self.args.mamba_num_heads, self.args.mamba_head_dim, self.args.ssm_state_size))
+        if (
+            h.shape[1] != self.args.mamba_num_heads
+            or h.shape[2] != self.args.mamba_head_dim
+        ):
+            h = mx.zeros(
+                (
+                    h.shape[0],
+                    self.args.mamba_num_heads,
+                    self.args.mamba_head_dim,
+                    self.args.ssm_state_size,
+                )
+            )
             self.ssm_states[layer_idx] = h
         return h
 
