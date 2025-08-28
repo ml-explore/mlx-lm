@@ -78,13 +78,12 @@ class Mamba2Block(nn.Module):
         
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
         
-        # Depthwise convolution
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
             kernel_size=args.conv_kernel,
-            padding=0,  # No internal padding; we do manual left causal pad
-            groups=self.conv_dim,  # Depthwise convolution
+            padding=0,
+            groups=self.conv_dim,
             bias=args.use_conv_bias
         )
         
@@ -115,7 +114,6 @@ class Mamba2Block(nn.Module):
         else:
             padded_input = conv_input
 
-        # MLX Conv1d expects (batch, length, channels)
         conv_output = self.conv1d(padded_input)
 
         conv_output = conv_output[:, :seq_len, :]
