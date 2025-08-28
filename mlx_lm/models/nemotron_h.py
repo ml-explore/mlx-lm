@@ -150,7 +150,7 @@ class NemotronHMamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(
             self.intermediate_size, self.hidden_size, bias=args.use_bias
         )
-    
+
     def _apply_conv(
         self, conv_input: mx.array, cache: Optional[NemotronHMamba2Cache] = None
     ) -> mx.array:
@@ -235,7 +235,7 @@ class NemotronHMamba2Mixer(nn.Module):
         self,
         hidden_states: mx.array,
         mamba_cache: Optional[NemotronHMamba2Cache] = None,
-        attention_mask: Optional[mx.array] = None
+        attention_mask: Optional[mx.array] = None,
     ) -> mx.array:
         projected = self.in_proj(hidden_states)
 
@@ -294,7 +294,10 @@ class NemotronHAttention(nn.Module):
         )
 
     def __call__(
-        self, x: mx.array, mask: Optional[mx.array] = None, attn_cache: Optional[Any] = None
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        attn_cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -302,7 +305,9 @@ class NemotronHAttention(nn.Module):
 
         queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
 
         if attn_cache is not None:
             keys, values = attn_cache.update_and_fetch(keys, values)
