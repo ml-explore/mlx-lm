@@ -5,7 +5,45 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
-from .cache import Mamba2Cache
+
+
+class Mamba2Cache:
+    def __init__(self, batch_size, conv_dim, args):
+        self.conv_states = [
+            mx.zeros((batch_size, args.conv_kernel, conv_dim))
+            for _ in range(args.num_hidden_layers)
+        ]
+        self.ssm_states = [
+            mx.zeros((batch_size, args.num_heads, args.head_dim, args.ssm_state_size)) 
+            for _ in range(args.num_hidden_layers)
+        ]
+    
+    def update_conv_state(self, layer_idx, new_conv_state):
+        """Update cached conv window.
+        Accepts either a full window of shape (B, K, C) or a single step (B, C).
+        Internal cache shape is (B, K, C).
+        """
+        current_state = self.conv_states[layer_idx]
+        if new_conv_state.ndim == 3:
+            self.conv_states[layer_idx] = new_conv_state
+            return new_conv_state
+        elif new_conv_state.ndim == 2:
+            updated_state = mx.concatenate(
+                [current_state[:, 1:, :], new_conv_state[:, None, :]],
+                axis=1,
+            )
+            self.conv_states[layer_idx] = updated_state
+            return updated_state
+        else:
+            raise ValueError(
+                f"new_conv_state must be (B, K, C) or (B, C), got shape {new_conv_state.shape}"
+            )
+    
+    def get_ssm_state(self, layer_idx):
+        return self.ssm_states[layer_idx]
+    
+    def update_ssm_state(self, layer_idx, new_ssm_state):
+        self.ssm_states[layer_idx] = new_ssm_state
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -53,15 +91,11 @@ class MambaRMSNormGated(nn.Module):
         self.weight = mx.ones(hidden_size)
 
     def __call__(self, hidden_states: mx.array, gate: mx.array = None) -> mx.array:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(mx.float32)
-        
         if gate is not None:
-            hidden_states = hidden_states * nn.silu(gate.astype(mx.float32))
+            hidden_states = hidden_states * nn.silu(gate)
         
         variance = mx.mean(mx.square(hidden_states), axis=-1, keepdims=True)
-        hidden_states = hidden_states * mx.rsqrt(variance + self.eps)
-        return (self.weight * hidden_states).astype(input_dtype)
+        return self.weight * hidden_states * mx.rsqrt(variance + self.eps)
 
 
 class Mamba2Block(nn.Module):
@@ -78,191 +112,141 @@ class Mamba2Block(nn.Module):
         self.head_dim = args.head_dim
         self.time_step_limit = args.time_step_limit
         self.heads_per_group = self.num_heads // self.n_groups
-        self.chunk_size = args.chunk_size
         self.use_bias = args.use_bias
         
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
         
-        # Learnable parameters
-        self.conv_weight = mx.random.normal((self.conv_dim, args.conv_kernel)) * 0.1
-        if args.use_conv_bias:
-            self.conv_bias = mx.zeros(self.conv_dim)
+        # Depthwise convolution
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            kernel_size=args.conv_kernel,
+            padding=0,  # No internal padding; we do manual left causal pad
+            groups=self.conv_dim,  # Depthwise convolution
+            bias=args.use_conv_bias
+        )
         
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
         self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.use_bias)
         
         self.dt_bias = mx.ones(self.num_heads)
-        A = mx.arange(1, self.num_heads + 1, dtype=mx.float32)
-        self.A_log = mx.log(A)
+        self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
         self.D = mx.ones(self.num_heads)
         
         self.norm = MambaRMSNormGated(self.intermediate_size, eps=args.layer_norm_epsilon)
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.use_bias)
-        
-        d_mlp = 0
-        self.proj_splits = [
-            d_mlp,
-            2 * d_mlp, 
-            2 * d_mlp + self.intermediate_size,
-            2 * d_mlp + self.intermediate_size + self.conv_dim
-        ]
-        
-        self.state_splits = [
-            self.intermediate_size,
-            self.intermediate_size + self.n_groups * self.ssm_state_size
-        ]
 
-    @property
-    def neg_A(self):
-        return -mx.exp(self.A_log.astype(mx.float32))
+    def _apply_conv(self, conv_input: mx.array, cache: Optional[Mamba2Cache] = None) -> mx.array:
+        batch_size, seq_len, in_ch = conv_input.shape
 
-    def _apply_incremental_conv(self, conv_input: mx.array, cache: Mamba2Cache) -> mx.array:
-        """Apply 1D convolution for incremental inference."""
-        # Get the full convolution window (past states + current input)
-        conv_window = cache.update_conv_state(self.layer_idx, conv_input)
-        # conv_window shape: (batch, conv_dim, conv_kernel_size)
-        
-        # Apply convolution: sum over the kernel dimension
-        conv_output = mx.sum(conv_window * self.conv_weight[None, :, :], axis=-1)
-        # conv_output shape: (batch, conv_dim)
-        
-        # Add bias if present
-        if self.use_conv_bias:
-            conv_output = conv_output + self.conv_bias
-            
-        # Reshape to match expected output: (batch, 1, conv_dim)
-        return conv_output[:, None, :]
+        # Validate channels for depthwise conv
+        if in_ch != self.conv_dim:
+            raise ValueError(
+                f"Input channels {in_ch} don't match expected conv_dim {self.conv_dim}"
+            )
 
-    def _apply_batch_conv(self, conv_input: mx.array) -> mx.array:
-        """Apply 1D convolution for batch processing."""
-        batch_size, seq_len, conv_dim = conv_input.shape
-        
-        # Pad the input for causal convolution
-        padded_input = mx.pad(conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
-        
-        # Apply convolution using sliding windows
-        outputs = []
-        for i in range(seq_len):
-            # Get the conv window for position i
-            window = padded_input[:, i:i + self.conv_kernel_size, :]  # (batch, kernel_size, conv_dim)
-            # Transpose to (batch, conv_dim, kernel_size) to match self.conv_weight shape (conv_dim, kernel_size)
-            window = mx.transpose(window, (0, 2, 1))
-            # Apply convolution: elementwise multiply then sum over kernel dimension -> (batch, conv_dim)
-            conv_out = mx.sum(window * self.conv_weight[None, :, :], axis=-1)
-            outputs.append(conv_out)
-        
-        conv_output = mx.stack(outputs, axis=1)  # (batch, seq_len, conv_dim)
-        
-        if self.use_conv_bias:
-            conv_output = conv_output + self.conv_bias
-            
-        return conv_output
+        # Manual left causal padding using cache if available
+        if self.conv_kernel_size > 1:
+            if cache is not None:
+                # Use last K-1 frames from cache as left context
+                left_ctx = cache.conv_states[self.layer_idx][:, :-1, :]
+                padded_input = mx.concatenate([left_ctx, conv_input], axis=1)
+            else:
+                # Fallback: zero-pad when no cache
+                padded_input = mx.pad(
+                    conv_input,
+                    [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+                )
+        else:
+            padded_input = conv_input
 
-    def _incremental_ssm(
-            self,
-            hidden_states: mx.array,
-            B: mx.array,
-            C: mx.array, 
-            dt: mx.array,
-            cache: Mamba2Cache
-        ) -> mx.array:
-        """Optimized SSM for single token generation."""
-        batch_size = hidden_states.shape[0]
-        
-        # Efficient reshaping without intermediate steps
-        dt = nn.softplus(dt.squeeze(axis=1) + self.dt_bias)
-        dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-        
-        # Direct reshape to target dimensions
-        hidden_states = hidden_states.reshape(batch_size, self.num_heads, self.head_dim)
-        B = mx.repeat(B.reshape(batch_size, self.n_groups, self.ssm_state_size), 
-                     self.heads_per_group, axis=1)
-        C = mx.repeat(C.reshape(batch_size, self.n_groups, self.ssm_state_size), 
-                     self.heads_per_group, axis=1)
-        
-        # Vectorized discretization
-        dt_expanded = dt[:, :, None, None]
-        A_expanded = self.neg_A[None, :, None, None]
-        dA = mx.exp(dt_expanded * A_expanded)
-        dB = dt_expanded * B[:, :, None, :]
-        
-        # Efficient state update
-        current_state = cache.get_ssm_state(self.layer_idx)
-        new_state = dA * current_state + dB * hidden_states[:, :, :, None]
-        cache.update_ssm_state(self.layer_idx, new_state)
-        
-        # Output computation
-        y = mx.sum(C[:, :, None, :] * new_state, axis=-1) + self.D[None, :, None] * hidden_states
-        return y.reshape(batch_size, 1, self.intermediate_size)
+        # MLX Conv1d expects (batch, length, channels)
+        conv_output = self.conv1d(padded_input)
 
-    def _batch_ssm(
-            self,
-            hidden_states: mx.array,
-            B: mx.array,
-            C: mx.array, 
-            dt: mx.array
-        ) -> mx.array:
-        """Optimized SSM for batch processing."""
+        # Ensure output aligns to original sequence length
+        conv_output = conv_output[:, :seq_len, :]
+
+        # Update cache if provided (store the most recent receptive field window)
+        if cache is not None and self.conv_kernel_size > 1:
+            state_slice = padded_input[:, -self.conv_kernel_size:, :]
+            cache.update_conv_state(self.layer_idx, state_slice)
+
+        return nn.silu(conv_output)
+
+    def _ssm(
+        self,
+        hidden_states: mx.array,
+        B: mx.array,
+        C: mx.array, 
+        dt: mx.array,
+        cache: Optional[Mamba2Cache] = None
+    ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
         
+        # Process dt
         dt = nn.softplus(dt + self.dt_bias)
         dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
         
-        # Efficient reshaping
+        # Reshape inputs
         hidden_states = hidden_states.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        B = mx.tile(B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-                   (1, 1, self.heads_per_group, 1))
-        C = mx.tile(C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-                   (1, 1, self.heads_per_group, 1))
         
-        # Process sequence step by step
+        # Expand B and C to match number of heads
+        B = mx.repeat(
+            B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size), 
+            self.heads_per_group, 
+            axis=2
+        )
+        C = mx.repeat(
+            C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size), 
+            self.heads_per_group, 
+            axis=2
+        )
+        
+        # Discretization
+        A = -mx.exp(self.A_log.astype(mx.float32))
+        
+        # Process sequence
         outputs = []
         h = mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
         
         for t in range(seq_len):
             dt_t = dt[:, t, :, None, None]
-            A_t = self.neg_A[None, :, None, None]
-            dA = mx.exp(dt_t * A_t)
+            dA = mx.exp(dt_t * A[None, :, None, None])
             dB = dt_t * B[:, t, :, None, :]
             
             h = dA * h + dB * hidden_states[:, t, :, :, None]
             y_t = mx.sum(C[:, t, :, None, :] * h, axis=-1) + \
-                 self.D[None, :, None] * hidden_states[:, t]
+                self.D[None, :, None] * hidden_states[:, t]
             outputs.append(y_t)
         
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
-            self,
-            hidden_states: mx.array,
-            cache: Optional[Mamba2Cache] = None,
-        ) -> mx.array:
+        self,
+        hidden_states: mx.array,
+        cache: Optional[Mamba2Cache] = None,
+    ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
-        is_incremental = cache is not None and seq_len == 1
         
-        # Linear projection with efficient splitting
+        # Linear projection
         projected = self.in_proj(hidden_states)
-        splits = mx.split(projected, self.proj_splits, axis=-1)
-        _, _, gate, conv_input, dt = splits
+        
+        # Split into components
+        gate = projected[..., :self.intermediate_size]
+        conv_input = projected[..., self.intermediate_size:self.intermediate_size+self.conv_dim]
+        dt = projected[..., -self.num_heads:]
         
         # Apply convolution
-        if is_incremental:
-            conv_output = self._apply_incremental_conv(conv_input, cache)
-        else:
-            conv_output = self._apply_batch_conv(conv_input)
-        
-        # Apply activation
-        conv_output = nn.silu(conv_output)
+        conv_output = self._apply_conv(conv_input, cache)
         
         # Split conv output
-        hidden_states, B, C = mx.split(conv_output, self.state_splits, axis=-1)
+        hidden_states = conv_output[..., :self.intermediate_size]
+        B = conv_output[..., self.intermediate_size:self.intermediate_size+self.n_groups*self.ssm_state_size]
+        C = conv_output[..., self.intermediate_size+self.n_groups*self.ssm_state_size:]
         
         # Apply SSM
-        if is_incremental:
-            y = self._incremental_ssm(hidden_states, B, C, dt, cache)
-        else:
-            y = self._batch_ssm(hidden_states, B, C, dt)
+        y = self._ssm(hidden_states, B, C, dt, cache)
         
         y = self.norm(y, gate)
         return self.out_proj(y)
@@ -338,28 +322,16 @@ class Model(nn.Module):
         
         return Mamba2Cache(
             batch_size=batch_size,
-            num_layers=self.args.num_hidden_layers,
-            num_heads=self.args.num_heads,
-            head_dim=self.args.head_dim,
-            state_size=self.args.ssm_state_size,
-            conv_kernel_size=self.args.conv_kernel,
-            conv_dim=conv_dim
+            conv_dim=conv_dim,
+            args=self.args
         )
 
     @property
     def layers(self):
         return self.backbone.layers
-
+    
     def sanitize(self, weights):
-        """Sanitize weights for proper loading."""
-        sanitized = {}
         for k, v in weights.items():
-            if "conv1d.weight" in k:
-                if v.shape[-1] != 1:
-                    v = v.moveaxis(2, 1)
-                sanitized[k.replace("conv1d.weight", "conv_weight")] = mx.squeeze(v, axis=-1)
-            elif "conv1d.bias" in k:
-                sanitized[k.replace("conv1d.bias", "conv_bias")] = v
-            else:
-                sanitized[k] = v
-        return sanitized
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+        return weights
