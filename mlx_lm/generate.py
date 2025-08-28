@@ -293,19 +293,6 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                 )
 
 
-class LastSlice(nn.Module):
-    def __init__(self, module: nn.Module, n: int = 1):
-        super().__init__()
-        self["module"] = module
-        self.n = n
-
-    def __getattr__(self, key):
-        return getattr(self["module"], key)
-
-    def __call__(self, *args, **kwargs):
-        return self["module"](*args, **kwargs)[..., -self.n :, :]
-
-
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -386,7 +373,6 @@ def generate_step(
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
-    model.layers[-1] = LastSlice(model.layers[-1])
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -429,22 +415,24 @@ def generate_step(
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
-        while total_prompt_tokens - prompt_processed_tokens > prefill_step_size:
+        prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        while total_prompt_tokens - prompt_processed_tokens > 1:
+            n_to_process = min(prefill_step_size, prompt.size - 1)
             _model_call(
-                input_tokens=prompt[:prefill_step_size][None],
+                input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
-                    input_embeddings[:prefill_step_size][None]
+                    input_embeddings[:n_to_process][None]
                     if input_embeddings is not None
                     else None
                 ),
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
+            prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-            prompt_processed_tokens += prefill_step_size
-            prompt = prompt[prefill_step_size:]
+            prompt = prompt[n_to_process:]
             input_embeddings = (
-                input_embeddings[prefill_step_size:]
+                input_embeddings[n_to_process:]
                 if input_embeddings is not None
                 else input_embeddings
             )
