@@ -329,15 +329,9 @@ class NemotronHMLP(nn.Module):
         self.down_proj = nn.Linear(
             args.intermediate_size, args.hidden_size, bias=args.mlp_bias
         )
-        if args.mlp_hidden_act == "relu2":
-            self.activation = lambda x: nn.relu(x) ** 2
-        elif args.mlp_hidden_act == "silu":
-            self.activation = nn.silu
-        else:
-            self.activation = nn.silu
 
     def __call__(self, x):
-        return self.down_proj(self.activation(self.up_proj(x)))
+        return self.down_proj(nn.silu(self.up_proj(x)))
 
 
 class NemotronHBlock(nn.Module):
