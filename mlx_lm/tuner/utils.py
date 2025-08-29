@@ -124,6 +124,7 @@ def linear_to_lora_layers(
         "hunyuan_v1_dense",
         "gpt_oss",
         "ernie4_5_moe",
+        "nemotron_h",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
@@ -133,6 +134,15 @@ def linear_to_lora_layers(
             keys.add("mlp.shared_expert_gate")
         if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
+        elif model.model_type == "nemotron_h":
+            keys.add("mixer.in_proj")
+            keys.add("mixer.out_proj")
+            keys.add("mixer.q_proj")
+            keys.add("mixer.k_proj")
+            keys.add("mixer.v_proj")
+            keys.add("mixer.o_proj")
+            keys.add("mixer.up_proj")
+            keys.add("mixer.down_proj")
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
