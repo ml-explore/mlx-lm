@@ -9,6 +9,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -85,7 +86,7 @@ class GraniteMoeAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-    
+
 
 class GraniteMoeParallelExperts(nn.Module):
     def __init__(self, num_experts: int, input_size: int, output_size: int):
@@ -94,9 +95,9 @@ class GraniteMoeParallelExperts(nn.Module):
         self.num_experts = num_experts
         self.input_size = input_size
         self.output_size = output_size
-    
+
     def __call__(self, inputs: mx.array, expert_indices: mx.array) -> mx.array:
-        all_expert_outputs = mx.einsum('ti,eoi->teo', inputs, self.weight)
+        all_expert_outputs = mx.einsum("ti,eoi->teo", inputs, self.weight)
         expert_one_hot = mx.eye(self.num_experts)[expert_indices]
         return mx.sum(all_expert_outputs * mx.expand_dims(expert_one_hot, -1), axis=1)
 
@@ -108,10 +109,10 @@ class GraniteMoeTopKGating(nn.Module):
         self.input_size = input_size
         self.top_k = top_k
         self.layer = nn.Linear(input_size, num_experts, bias=False)
-    
+
     def __call__(self, hidden_states: mx.array):
         logits = self.layer(hidden_states).astype(mx.float32)
-        top_k_indices = mx.stop_gradient(mx.argsort(logits, axis=1)[:, -self.top_k:])
+        top_k_indices = mx.stop_gradient(mx.argsort(logits, axis=1)[:, -self.top_k :])
         row_ids = mx.arange(logits.shape[0])[:, None]
         top_k_logits = logits[row_ids, top_k_indices]
         top_k_gates = mx.softmax(top_k_logits, axis=1)
@@ -120,27 +121,33 @@ class GraniteMoeTopKGating(nn.Module):
         token_ids = mx.repeat(mx.arange(hidden_states.shape[0]), self.top_k)
         sorted_indices = mx.stop_gradient(mx.argsort(top_k_experts, axis=0))
         sorted_expert_ids = top_k_experts[sorted_indices]
-        sorted_token_ids = token_ids[sorted_indices] 
+        sorted_token_ids = token_ids[sorted_indices]
         sorted_gates = top_k_gates_flat[sorted_indices]
-        expert_sizes = mx.array([mx.sum(sorted_expert_ids == i) for i in range(self.num_experts)])
-        
+        expert_sizes = mx.array(
+            [mx.sum(sorted_expert_ids == i) for i in range(self.num_experts)]
+        )
+
         return (
-            mx.stop_gradient(sorted_token_ids), 
+            mx.stop_gradient(sorted_token_ids),
             sorted_gates,
-            mx.stop_gradient(expert_sizes), 
-            mx.stop_gradient(sorted_expert_ids)
+            mx.stop_gradient(expert_sizes),
+            mx.stop_gradient(sorted_expert_ids),
         )
 
 
 class GraniteMoeMoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        
+
         self.input_size = args.hidden_size
         self.hidden_size = args.intermediate_size
-        self.input_linear = GraniteMoeParallelExperts(args.num_local_experts, self.input_size, self.hidden_size * 2)
-        self.output_linear = GraniteMoeParallelExperts(args.num_local_experts, self.hidden_size, self.input_size)
-        
+        self.input_linear = GraniteMoeParallelExperts(
+            args.num_local_experts, self.input_size, self.hidden_size * 2
+        )
+        self.output_linear = GraniteMoeParallelExperts(
+            args.num_local_experts, self.hidden_size, self.input_size
+        )
+
         self.router = GraniteMoeTopKGating(
             input_size=self.input_size,
             num_experts=args.num_local_experts,
@@ -151,12 +158,12 @@ class GraniteMoeMoE(nn.Module):
         bsz, length, emb_size = layer_input.shape
         layer_input = layer_input.reshape(-1, emb_size)
         token_ids, gates, expert_sizes, expert_ids = self.router(layer_input)
-        selected_tokens = layer_input[token_ids] 
+        selected_tokens = layer_input[token_ids]
         hidden_states = self.input_linear(selected_tokens, expert_ids)
         chunk_size = hidden_states.shape[-1] // 2
         chunked_hidden_states = [
             hidden_states[..., :chunk_size],
-            hidden_states[..., chunk_size:]
+            hidden_states[..., chunk_size:],
         ]
         hidden_states = nn.silu(chunked_hidden_states[0]) * chunked_hidden_states[1]
         expert_outputs = self.output_linear(hidden_states, expert_ids)
@@ -164,9 +171,12 @@ class GraniteMoeMoE(nn.Module):
         if len(expert_outputs) == len(layer_input):
             return expert_outputs.reshape(bsz, length, self.input_size)
         else:
-            zeros = mx.zeros((bsz * length, self.input_size), dtype=expert_outputs.dtype)
+            zeros = mx.zeros(
+                (bsz * length, self.input_size), dtype=expert_outputs.dtype
+            )
             zeros = zeros.at[token_ids].add(expert_outputs)
             return zeros.reshape(bsz, length, self.input_size)
+
 
 class GraniteMoeDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -175,7 +185,9 @@ class GraniteMoeDecoderLayer(nn.Module):
         if args.num_local_experts > 0:
             self.block_sparse_moe = GraniteMoeMoE(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         self.residual_multiplier = args.residual_multiplier
 
     def __call__(
