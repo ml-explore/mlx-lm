@@ -353,7 +353,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
+        self.seed = self.body.get("seed", None)
         self.validate_model_parameters()
+        if self.seed is not None:
+            mx.random.seed(self.seed)
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(
@@ -450,6 +453,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("model must be a string")
         if self.adapter is not None and not isinstance(self.adapter, str):
             raise ValueError("adapter must be a string")
+        if self.seed is not None and not isinstance(self.seed, int):
+            raise ValueError("seed must be an integer")
 
     def generate_response(
         self,

@@ -80,15 +80,20 @@ class TestServer(unittest.TestCase):
             "top_p": 0.9,
             "repetition_penalty": 1.1,
             "repetition_context_size": 20,
+            "seed": 999,
             "stop": "stop sequence",
         }
 
         response = requests.post(url, json=post_data)
 
-        response_body = response.text
+        response_body = json.loads(response.text)
 
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+        self.assertEqual(
+            response_body["choices"][0]["text"],
+            ", there was a beautiful princess named Lila.\n",
+        )
 
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
