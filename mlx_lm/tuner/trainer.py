@@ -216,12 +216,6 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
-    if rank == 0:
-        initial_params = model.trainable_parameters()
-        flat_params = tree_flatten(initial_params)
-        param_sum = sum(mx.sum(param).item() for key, param in flat_params)
-        print(f"Initial parameter sum: {param_sum}")
-
     def tree_l2_norm(tree):
         flat_tree = tree_flatten(tree)
         if not flat_tree:
@@ -250,39 +244,16 @@ def train(
 
     def apply_accumulated_gradients():
         nonlocal accumulated_grads, accumulation_count
-        if accumulated_grads is None or accumulation_count == 0:
-            print("WARNING: No gradients to apply!")
-            return
         
         # Average the accumulated gradients
         final_grads = tree_map(lambda g: g / accumulation_count, accumulated_grads)
-        
-        if rank == 0:
-            grad_norm = tree_l2_norm(final_grads)
-            mx.eval(grad_norm)
-            print(f"Gradient L2 norm: {grad_norm.item():.6f}")
         
         # Average across workers if distributed
         if world_size > 1:
             final_grads = average_gradients(final_grads)
         
-        if rank == 0:
-            old_params = model.trainable_parameters()
-            flat_old_params = tree_flatten(old_params)
-            old_param_sum = sum(mx.sum(param).item() for key, param in flat_old_params)
-        
         optimizer.update(model, final_grads)
         mx.eval(model.parameters(), optimizer.state)
-        
-        if rank == 0:
-            new_params = model.trainable_parameters()
-            flat_new_params = tree_flatten(new_params)
-            new_param_sum = sum(mx.sum(param).item() for key, param in flat_new_params)
-            param_change = abs(new_param_sum - old_param_sum)
-            print(f"Parameter change: {param_change:.6f} (old: {old_param_sum:.6f}, new: {new_param_sum:.6f})")
-            if param_change < 1e-8:
-                print("WARNING: Very small parameter change detected!")
-        
         reset_accumulation()
 
     model.train()
