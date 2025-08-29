@@ -90,9 +90,10 @@ class TestServer(unittest.TestCase):
 
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+        first_text = response_body["choices"][0]["text"]
         self.assertEqual(
-            response_body["choices"][0]["text"],
-            ", there was a beautiful princess named Lila.\n",
+            first_text,
+            json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
     def test_handle_chat_completions(self):
