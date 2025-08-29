@@ -173,6 +173,13 @@ def linear_to_lora_layers(
         keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
     elif model.model_type == "bailing_moe":
         keys = {"attention.query_key_value", "attention.dense"}
+    elif model.model_type == "nemotron_h":
+        keys.add("mixer.in_proj")
+        keys.add("mixer.out_proj")
+        keys.add("mixer.q_proj")
+        keys.add("mixer.k_proj")
+        keys.add("mixer.v_proj")
+        keys.add("mixer.o_proj")
     else:
         raise ValueError(f"Lora does not support {model.model_type}")
 
