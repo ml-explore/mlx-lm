@@ -77,9 +77,9 @@ class Mamba2Block(nn.Module):
         self.time_step_limit = args.time_step_limit
         self.heads_per_group = self.num_heads // self.n_groups
         self.use_bias = args.use_bias
-        
+
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
-        
+
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -88,14 +88,14 @@ class Mamba2Block(nn.Module):
             groups=self.conv_dim,
             bias=args.use_conv_bias,
         )
-        
+
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
         self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.use_bias)
-        
+
         self.dt_bias = mx.ones(self.num_heads)
         self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
         self.D = mx.ones(self.num_heads)
-        
+
         self.norm = MambaRMSNormGated(
             self.intermediate_size, eps=args.layer_norm_epsilon
         )
@@ -107,7 +107,7 @@ class Mamba2Block(nn.Module):
         self, conv_input: mx.array, cache: Optional[Mamba2Cache] = None
     ) -> mx.array:
         batch_size, seq_len, in_ch = conv_input.shape
-        
+
         if self.conv_kernel_size > 1:
             if cache is not None:
                 left_ctx = cache.conv_states[self.layer_idx][:, 1:, :]
@@ -118,14 +118,14 @@ class Mamba2Block(nn.Module):
                 )
         else:
             padded_input = conv_input
-        
+
         conv_output = self.conv1d(padded_input)
         conv_output = conv_output[:, :seq_len, :]
-        
+
         if cache is not None and self.conv_kernel_size > 1:
             state_slice = padded_input[:, -self.conv_kernel_size :, :]
             cache.update_conv_state(self.layer_idx, state_slice)
-        
+
         return nn.silu(conv_output)
 
     def _ssm_vectorized(
@@ -140,11 +140,11 @@ class Mamba2Block(nn.Module):
 
         dt = nn.softplus(dt + self.dt_bias)
         dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-        
+
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
-        
+
         B = mx.repeat(
             B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
             self.heads_per_group,
@@ -156,27 +156,35 @@ class Mamba2Block(nn.Module):
             axis=2,
         )
         A = -mx.exp(self.A_log.astype(mx.float32))
-        
+
         if cache is not None:
             h = cache.get_ssm_state(self.layer_idx)
         else:
             h = mx.zeros(
                 (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
             )
-        
+
         outputs = []
-        
+
         for t in range(seq_len):
             dt_t = dt[:, t, :, None, None]
-            dA = mx.exp(mx.einsum('bh,bhds->bhds', dt_t.squeeze(-1).squeeze(-1) * A[None, :], mx.ones_like(h)))
-            dB_x = mx.einsum('bh,bhs,bhd->bhds', dt[:, t], B[:, t], hidden_states[:, t])
-            h = mx.einsum('bhds,bhds->bhds', dA, h) + dB_x
-            y_t = (mx.einsum('bhs,bhds->bhd', C[:, t], h) + mx.einsum('h,bhd->bhd', self.D, hidden_states[:, t]))
+            dA = mx.exp(
+                mx.einsum(
+                    "bh,bhds->bhds",
+                    dt_t.squeeze(-1).squeeze(-1) * A[None, :],
+                    mx.ones_like(h),
+                )
+            )
+            dB_x = mx.einsum("bh,bhs,bhd->bhds", dt[:, t], B[:, t], hidden_states[:, t])
+            h = mx.einsum("bhds,bhds->bhds", dA, h) + dB_x
+            y_t = mx.einsum("bhs,bhds->bhd", C[:, t], h) + mx.einsum(
+                "h,bhd->bhd", self.D, hidden_states[:, t]
+            )
             outputs.append(y_t)
-        
+
         if cache is not None:
             cache.update_ssm_state(self.layer_idx, h)
-        
+
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
