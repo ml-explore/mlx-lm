@@ -94,13 +94,21 @@ class GraniteMoeParallelExperts(nn.Module):
         self.num_experts = num_experts
         self.input_size = input_size
         self.output_size = output_size
-
+    
     def __call__(self, inputs: mx.array, expert_size) -> mx.array:
-        input_list = mx.split(inputs, indices_or_sections=expert_size, axis=0)
         output_list = []
+        start_idx = 0
+        
         for i in range(self.num_experts):
-            output = input_list[i] @ self.weight[i].T
+            if expert_size[i] == 0:
+                continue
+            
+            end_idx = start_idx + expert_size[i]
+            expert_input = inputs[start_idx:end_idx]
+            output = expert_input @ self.weight[i].T
             output_list.append(output)
+            start_idx = end_idx
+        
         return mx.concatenate(output_list, axis=0)
 
 
@@ -113,34 +121,19 @@ class GraniteMoeTopKGating(nn.Module):
         self.layer = nn.Linear(input_size, num_experts, bias=False)
 
     def __call__(self, hidden_states: mx.array):
-        # logits: [num_tokens, num_experts]
         logits = self.layer(hidden_states).astype(mx.float32)
-
-        # get top-k indices
         top_k_indices = mx.argsort(logits, axis=1)[:, -self.top_k:]
-
-        # gather logits at those indices
-        row_ids = mx.arange(logits.shape[0])[:, None]   # [N,1]
-        top_k_logits = logits[row_ids, top_k_indices]   # [N,K]
-
-        # gates for the selected experts
-        top_k_gates = mx.softmax(top_k_logits, axis=1).astype(hidden_states.dtype)  # [N, K]
-
-        # flatten for grouping
-        top_k_experts = top_k_indices.reshape((-1,))                 # [N*K]
-        index_sorted_experts = mx.argsort(top_k_experts, axis=0)     # [N*K]
-        batch_index = index_sorted_experts // self.top_k             # [N*K]
-
-        # gather gates in the sorted order
-        flat_gates = top_k_gates.reshape((-1,))                      # [N*K]
-        batch_gates = mx.take(flat_gates, index_sorted_experts)      # [N*K]
-
-        # expert_size as Python list (counts per expert)
-        # Avoids scatter/one_hot; works reliably in MLX.
+        row_ids = mx.arange(logits.shape[0])[:, None]
+        top_k_logits = logits[row_ids, top_k_indices]
+        top_k_gates = mx.softmax(top_k_logits, axis=1)
+        top_k_experts = top_k_indices.reshape((-1,))
+        index_sorted_experts = mx.argsort(top_k_experts, axis=0)
+        batch_index = index_sorted_experts // self.top_k
+        flat_gates = top_k_gates.reshape((-1,))
+        batch_gates = mx.take(flat_gates, index_sorted_experts)
         expert_size = [0] * self.num_experts
         for e in top_k_experts.tolist():
             expert_size[e] += 1
-
         return batch_index, batch_gates, expert_size
 
 
@@ -167,14 +160,11 @@ class GraniteMoeMoE(nn.Module):
         expert_inputs = layer_input[batch_index]
         hidden_states = self.input_linear(expert_inputs, expert_size)
         
-        # Split the hidden states into two chunks along the last dimension
         chunk_size = hidden_states.shape[-1] // 2
         chunked_hidden_states = [
             hidden_states[..., :chunk_size], 
             hidden_states[..., chunk_size:]
         ]
-        
-        # Apply SiLU activation and gating
         hidden_states = nn.silu(chunked_hidden_states[0]) * chunked_hidden_states[1]
         expert_outputs = self.output_linear(hidden_states, expert_size)
         expert_outputs = expert_outputs * batch_gates[:, None]
