@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
