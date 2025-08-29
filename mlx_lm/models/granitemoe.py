@@ -94,22 +94,23 @@ class GraniteMoeParallelExperts(nn.Module):
         self.num_experts = num_experts
         self.input_size = input_size
         self.output_size = output_size
-    
-    def __call__(self, inputs: mx.array, expert_size) -> mx.array:
-        output_list = []
-        start_idx = 0
+        
+    def __call__(self, inputs: mx.array, expert_size: mx.array) -> mx.array:
+        expert_cumsum = mx.cumsum(expert_size)
+        expert_cumsum_shifted = mx.concatenate([mx.array([0]), expert_cumsum[:-1]])
+        
+        # Assume inputs already has the correct size
+        num_tokens = inputs.shape[0]
+        outputs = mx.zeros((num_tokens, self.output_size))
         
         for i in range(self.num_experts):
-            if expert_size[i] == 0:
-                continue
+            token_indices = mx.arange(num_tokens)
+            mask = token_indices >= expert_cumsum_shifted[i]
+            mask = mask & (token_indices < expert_cumsum[i])
+            expert_output = inputs @ self.weight[i].T
+            outputs = mx.where(mask[:, None], expert_output, outputs)
             
-            end_idx = start_idx + expert_size[i]
-            expert_input = inputs[start_idx:end_idx]
-            output = expert_input @ self.weight[i].T
-            output_list.append(output)
-            start_idx = end_idx
-        
-        return mx.concatenate(output_list, axis=0)
+        return outputs
 
 
 class GraniteMoeTopKGating(nn.Module):
@@ -119,7 +120,7 @@ class GraniteMoeTopKGating(nn.Module):
         self.input_size = input_size
         self.top_k = top_k
         self.layer = nn.Linear(input_size, num_experts, bias=False)
-
+    
     def __call__(self, hidden_states: mx.array):
         logits = self.layer(hidden_states).astype(mx.float32)
         top_k_indices = mx.argsort(logits, axis=1)[:, -self.top_k:]
@@ -131,9 +132,11 @@ class GraniteMoeTopKGating(nn.Module):
         batch_index = index_sorted_experts // self.top_k
         flat_gates = top_k_gates.reshape((-1,))
         batch_gates = mx.take(flat_gates, index_sorted_experts)
-        expert_size = [0] * self.num_experts
-        for e in top_k_experts.tolist():
-            expert_size[e] += 1
+        
+        expert_size = mx.zeros(self.num_experts, dtype=mx.int32)
+        for i in range(self.num_experts):
+            expert_size[i] = mx.sum(top_k_experts == i)
+        
         return batch_index, batch_gates, expert_size
 
 
