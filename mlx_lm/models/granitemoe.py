@@ -94,23 +94,11 @@ class GraniteMoeParallelExperts(nn.Module):
         self.num_experts = num_experts
         self.input_size = input_size
         self.output_size = output_size
-        
-    def __call__(self, inputs: mx.array, expert_size: mx.array) -> mx.array:
-        expert_cumsum = mx.cumsum(expert_size)
-        expert_cumsum_shifted = mx.concatenate([mx.array([0]), expert_cumsum[:-1]])
-        
-        # Assume inputs already has the correct size
-        num_tokens = inputs.shape[0]
-        outputs = mx.zeros((num_tokens, self.output_size))
-        
-        for i in range(self.num_experts):
-            token_indices = mx.arange(num_tokens)
-            mask = token_indices >= expert_cumsum_shifted[i]
-            mask = mask & (token_indices < expert_cumsum[i])
-            expert_output = inputs @ self.weight[i].T
-            outputs = mx.where(mask[:, None], expert_output, outputs)
-            
-        return outputs
+    
+    def __call__(self, inputs: mx.array, expert_indices: mx.array) -> mx.array:
+        all_expert_outputs = mx.einsum('ti,eoi->teo', inputs, self.weight)
+        expert_one_hot = mx.eye(self.num_experts)[expert_indices]
+        return mx.sum(all_expert_outputs * mx.expand_dims(expert_one_hot, -1), axis=1)
 
 
 class GraniteMoeTopKGating(nn.Module):
@@ -123,32 +111,36 @@ class GraniteMoeTopKGating(nn.Module):
     
     def __call__(self, hidden_states: mx.array):
         logits = self.layer(hidden_states).astype(mx.float32)
-        top_k_indices = mx.argsort(logits, axis=1)[:, -self.top_k:]
+        top_k_indices = mx.stop_gradient(mx.argsort(logits, axis=1)[:, -self.top_k:])
         row_ids = mx.arange(logits.shape[0])[:, None]
         top_k_logits = logits[row_ids, top_k_indices]
         top_k_gates = mx.softmax(top_k_logits, axis=1)
         top_k_experts = top_k_indices.reshape((-1,))
-        index_sorted_experts = mx.argsort(top_k_experts, axis=0)
-        batch_index = index_sorted_experts // self.top_k
-        flat_gates = top_k_gates.reshape((-1,))
-        batch_gates = mx.take(flat_gates, index_sorted_experts)
+        top_k_gates_flat = top_k_gates.reshape((-1,))
+        token_ids = mx.repeat(mx.arange(hidden_states.shape[0]), self.top_k)
+        sorted_indices = mx.stop_gradient(mx.argsort(top_k_experts, axis=0))
+        sorted_expert_ids = top_k_experts[sorted_indices]
+        sorted_token_ids = token_ids[sorted_indices] 
+        sorted_gates = top_k_gates_flat[sorted_indices]
+        expert_sizes = mx.array([mx.sum(sorted_expert_ids == i) for i in range(self.num_experts)])
         
-        expert_size = mx.zeros(self.num_experts, dtype=mx.int32)
-        for i in range(self.num_experts):
-            expert_size[i] = mx.sum(top_k_experts == i)
-        
-        return batch_index, batch_gates, expert_size
+        return (
+            mx.stop_gradient(sorted_token_ids), 
+            sorted_gates,
+            mx.stop_gradient(expert_sizes), 
+            mx.stop_gradient(sorted_expert_ids)
+        )
 
 
 class GraniteMoeMoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-
+        
         self.input_size = args.hidden_size
         self.hidden_size = args.intermediate_size
         self.input_linear = GraniteMoeParallelExperts(args.num_local_experts, self.input_size, self.hidden_size * 2)
         self.output_linear = GraniteMoeParallelExperts(args.num_local_experts, self.hidden_size, self.input_size)
-
+        
         self.router = GraniteMoeTopKGating(
             input_size=self.input_size,
             num_experts=args.num_local_experts,
@@ -158,23 +150,23 @@ class GraniteMoeMoE(nn.Module):
     def __call__(self, layer_input: mx.array) -> mx.array:
         bsz, length, emb_size = layer_input.shape
         layer_input = layer_input.reshape(-1, emb_size)
-        batch_index, batch_gates, expert_size = self.router(layer_input)
-
-        expert_inputs = layer_input[batch_index]
-        hidden_states = self.input_linear(expert_inputs, expert_size)
-        
+        token_ids, gates, expert_sizes, expert_ids = self.router(layer_input)
+        selected_tokens = layer_input[token_ids] 
+        hidden_states = self.input_linear(selected_tokens, expert_ids)
         chunk_size = hidden_states.shape[-1] // 2
         chunked_hidden_states = [
-            hidden_states[..., :chunk_size], 
+            hidden_states[..., :chunk_size],
             hidden_states[..., chunk_size:]
         ]
         hidden_states = nn.silu(chunked_hidden_states[0]) * chunked_hidden_states[1]
-        expert_outputs = self.output_linear(hidden_states, expert_size)
-        expert_outputs = expert_outputs * batch_gates[:, None]
-        zeros = mx.zeros((bsz * length, self.input_size), dtype=expert_outputs.dtype)
-        layer_output = zeros.at[batch_index].add(expert_outputs)
-        return layer_output.reshape(bsz, length, self.input_size)
-
+        expert_outputs = self.output_linear(hidden_states, expert_ids)
+        expert_outputs = expert_outputs * gates[:, None]
+        if len(expert_outputs) == len(layer_input):
+            return expert_outputs.reshape(bsz, length, self.input_size)
+        else:
+            zeros = mx.zeros((bsz * length, self.input_size), dtype=expert_outputs.dtype)
+            zeros = zeros.at[token_ids].add(expert_outputs)
+            return zeros.reshape(bsz, length, self.input_size)
 
 class GraniteMoeDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -199,7 +191,7 @@ class GraniteMoeDecoderLayer(nn.Module):
         return out
 
 
-class GraniteModel(nn.Module):
+class GraniteMoEModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -235,7 +227,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = GraniteModel(args)
+        self.model = GraniteMoEModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.logits_scaling = args.logits_scaling
