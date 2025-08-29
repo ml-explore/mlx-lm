@@ -1,7 +1,7 @@
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -225,7 +225,7 @@ def train(
         return mx.sqrt(mx.sum(mx.stack(squared_vals)))
 
     loss_and_grad_fn = nn.value_and_grad(model, loss)
-    
+
     accumulated_grads = None
     accumulation_count = 0
 
@@ -239,19 +239,21 @@ def train(
         if accumulated_grads is None:
             accumulated_grads = new_grads
         else:
-            accumulated_grads = tree_map(lambda acc, new: acc + new, accumulated_grads, new_grads)
+            accumulated_grads = tree_map(
+                lambda acc, new: acc + new, accumulated_grads, new_grads
+            )
         accumulation_count += 1
 
     def apply_accumulated_gradients():
         nonlocal accumulated_grads, accumulation_count
-        
+
         # Average the accumulated gradients
         final_grads = tree_map(lambda g: g / accumulation_count, accumulated_grads)
-        
+
         # Average across workers if distributed
         if world_size > 1:
             final_grads = average_gradients(final_grads)
-        
+
         optimizer.update(model, final_grads)
         mx.eval(model.parameters(), optimizer.state)
         reset_accumulation()
@@ -273,7 +275,7 @@ def train(
 
     for iteration in range(1, args.iters + 1):
         tic = time.perf_counter()
-        
+
         try:
             batch = next(batch_iterator)
         except StopIteration:
@@ -285,36 +287,37 @@ def train(
                 train=True,
             )
             batch = next(batch_iterator)
-        
+
         (loss_value, n_tokens), grads = loss_and_grad_fn(model, *batch)
-        
+
         if rank == 0 and iteration <= 5:
             grad_norm = tree_l2_norm(grads)
             mx.eval(loss_value, n_tokens, grad_norm)
-            print(f"Iter {iteration}: loss={loss_value.item():.4f}, "
-                  f"tokens={n_tokens.item()}, grad_norm={grad_norm.item():.6f}")
-        
+            print(
+                f"Iter {iteration}: loss={loss_value.item():.4f}, "
+                f"tokens={n_tokens.item()}, grad_norm={grad_norm.item():.6f}"
+            )
+
         accumulate_gradients(grads)
-        
+
         report_loss += loss_value.item()
         report_tokens += n_tokens.item()
         report_steps += 1
-        
+
         total_loss += loss_value.item()
         total_tokens += n_tokens.item()
-        
+
         mx.eval(loss_value, n_tokens)
         train_time += time.perf_counter() - tic
-        
+
         if accumulation_count >= args.gradient_accumulation_steps:
             apply_accumulated_gradients()
-        
-        if (args.steps_per_eval is not None and 
-            iteration % args.steps_per_eval == 0):
-            
+
+        if args.steps_per_eval is not None and iteration % args.steps_per_eval == 0:
+
             if accumulation_count > 0:
                 apply_accumulated_gradients()
-            
+
             model.eval()
             val_loss = evaluate(
                 model=model,
@@ -326,23 +329,25 @@ def train(
                 iterate_batches=iterate_batches,
             )
             model.train()
-            
+
             if rank == 0:
                 print(f"Iter {iteration}: Val loss {val_loss:.4f}")
-            
+
             if training_callback is not None:
-                training_callback.on_val_loss_report({
-                    "iteration": iteration,
-                    "val_loss": val_loss,
-                })
-        
+                training_callback.on_val_loss_report(
+                    {
+                        "iteration": iteration,
+                        "val_loss": val_loss,
+                    }
+                )
+
         if iteration % args.steps_per_report == 0 or iteration == args.iters:
             avg_loss = report_loss / report_steps
             learning_rate = optimizer.learning_rate.item()
             it_sec = args.steps_per_report / train_time
             tokens_sec = report_tokens / train_time
             peak_mem = mx.get_peak_memory() / 1e9
-            
+
             if rank == 0:
                 print(
                     f"Iter {iteration}: Train loss {avg_loss:.4f}, "
@@ -351,29 +356,33 @@ def train(
                     f"Tokens/sec {tokens_sec:.0f}, "
                     f"Peak mem {peak_mem:.1f} GB"
                 )
-            
+
             if training_callback is not None:
-                training_callback.on_train_loss_report({
-                    "iteration": iteration,
-                    "train_loss": avg_loss,
-                    "learning_rate": learning_rate,
-                    "iterations_per_second": it_sec,
-                    "tokens_per_second": tokens_sec,
-                    "peak_memory": peak_mem,
-                })
-            
+                training_callback.on_train_loss_report(
+                    {
+                        "iteration": iteration,
+                        "train_loss": avg_loss,
+                        "learning_rate": learning_rate,
+                        "iterations_per_second": it_sec,
+                        "tokens_per_second": tokens_sec,
+                        "peak_memory": peak_mem,
+                    }
+                )
+
             report_loss = 0.0
             report_tokens = 0
             report_steps = 0
             train_time = 0.0
-        
+
         if iteration % args.steps_per_save == 0 and rank == 0:
             if accumulation_count > 0:
                 apply_accumulated_gradients()
-            
+
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
             mx.save_safetensors(str(args.adapter_file), adapter_weights)
-            checkpoint = Path(args.adapter_file).parent / f"{iteration:07d}_adapters.safetensors"
+            checkpoint = (
+                Path(args.adapter_file).parent / f"{iteration:07d}_adapters.safetensors"
+            )
             mx.save_safetensors(str(checkpoint), adapter_weights)
             print(f"Iter {iteration}: Saved weights to {checkpoint}")
 

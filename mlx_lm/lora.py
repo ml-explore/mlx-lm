@@ -190,7 +190,7 @@ def build_parser():
         "--gradient-accumulation-steps",
         type=int,
         help="Number of steps to accumulate gradients before performing an optimizer update.",
-        default=1
+        default=1,
     )
     parser.add_argument(  # will be deprecated in a future release
         "--wandb",
