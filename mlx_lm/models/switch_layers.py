@@ -36,7 +36,7 @@ class QuantizedSwitchLinear(nn.Module):
         super().__init__()
 
         scale = math.sqrt(1 / input_dims)
-        self.weight, *scales_biases = mx.quantize(
+        self.weight, self.scales, *biases = mx.quantize(
             mx.random.uniform(
                 low=-scale,
                 high=scale,
@@ -46,10 +46,7 @@ class QuantizedSwitchLinear(nn.Module):
             bits=bits,
             mode=mode,
         )
-        if mode == "affine":
-            self.scales, self.biases = scales_biases
-        else:
-            (self.scales,) = scales_biases
+        self.biases = biases[0] if biases else None
 
         if bias:
             self.bias = mx.zeros((num_experts, output_dims))
@@ -140,13 +137,10 @@ class SwitchLinear(nn.Module):
             bits,
             mode=mode,
         )
-        ql.weight, *scales_biases = mx.quantize(
+        ql.weight, ql.scales, *biases = mx.quantize(
             self.weight, group_size, bits, mode=mode
         )
-        if mode == "affine":
-            ql.scales, ql.biases = scales_biases
-        else:
-            (ql.scales,) = scales_biases
+        ql.biases = biases[0] if biases else None
 
         if "bias" in self:
             ql.bias = self.bias
