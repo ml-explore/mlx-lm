@@ -147,6 +147,24 @@ class TestModels(unittest.TestCase):
         out2 = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
         self.assertTrue(mx.allclose(out1[1, :, :2], out2[1, :, :2]))
 
+    def test_mask_with_window(self):
+        mask = create_causal_mask(5, 0, window_size=3)
+        expected_sums = mx.array([1, 2, 3, 3, 3])
+        sums = mask.sum(axis=1)
+        self.assertTrue(mx.array_equal(sums, expected_sums))
+
+        mask = create_causal_mask(5, 1, window_size=3)
+        self.assertEqual(mask.shape, (5, 6))
+        expected_sums = mx.array([2, 3, 3, 3, 3])
+        sums = mask.sum(axis=1)
+        self.assertTrue(mx.array_equal(sums, expected_sums))
+
+        mask = create_causal_mask(5, 2, window_size=3)
+        self.assertEqual(mask.shape, (5, 7))
+        expected_sums = mx.array([3, 3, 3, 3, 3])
+        sums = mask.sum(axis=1)
+        self.assertTrue(mx.array_equal(sums, expected_sums))
+
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
         self.assertTrue(isinstance(rope, nn.RoPE))

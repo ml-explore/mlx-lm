@@ -34,6 +34,14 @@ class Catcher(nn.Module):
         self.outputs = outputs[0] if isinstance(outputs, tuple) else outputs
         return outputs
 
+    def __getattr__(self, key: str):
+        if (value := self.get(key)) is not None:
+            return value
+        elif (m := self.get("module")) is not None:
+            return getattr(m, key)
+        else:
+            super(nn.Module, self).__getattribute__(key)
+
 
 def dwq_quantize(
     model,
@@ -57,7 +65,7 @@ def dwq_quantize(
             tqdm.write(*args, **kwargs)
 
     def unfreeze(_, m):
-        if hasattr(m, "bits") and hasattr(m, "group_size"):
+        if hasattr(m, "bits") and hasattr(m, "group_size") and m.mode == "affine":
             m.unfreeze(keys=["scales", "biases"], recurse=False)
 
     q_model.train()
@@ -312,8 +320,8 @@ def main():
         _, config = quantize_model(
             q_model,
             config,
-            q_group_size=args.group_size,
-            q_bits=args.bits,
+            group_size=args.group_size,
+            bits=args.bits,
         )
 
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)

@@ -9,6 +9,8 @@ def can_run_metal():
 
 
 def _make_kl_forward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -175,6 +177,8 @@ def _make_kl_forward_kernel():
 
 
 def _make_kl_backward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -383,6 +387,8 @@ def kl_div_loss(logits_q, logits_p):
 
 
 def _make_js_forward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -567,6 +573,8 @@ def _make_js_forward_kernel():
 
 
 def _make_js_backward_kernel():
+    if not can_run_metal():
+        return
     source = """
     constexpr int M = 4;
     constexpr int block = 1024 * M;
