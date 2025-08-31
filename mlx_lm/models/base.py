@@ -116,8 +116,11 @@ def scaled_dot_product_attention(
     cache,
     scale: float,
     mask: Optional[mx.array],
+    sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if isinstance(cache, QuantizedKVCache):
+        if sinks is not None:
+            raise ValueError("Quantized SDPA does not support attention sinks.")
         return quantized_scaled_dot_product_attention(
             queries,
             keys,
@@ -129,5 +132,10 @@ def scaled_dot_product_attention(
         )
     else:
         return mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=scale, mask=mask
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
         )
