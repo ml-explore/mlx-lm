@@ -1,17 +1,17 @@
-import math
+# Copyright © 2023-2025 Apple Inc.
+
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, NemotronHMamba2Cache
-from .rope_utils import initialize_rope
+from .cache import KVCache, MambaCache
 
 
 class UnifiedCache:
-    def __init__(self, attn_cache: list[KVCache], mamba_cache: NemotronHMamba2Cache):
+    def __init__(self, attn_cache: list[KVCache], mamba_cache: list[MambaCache]):
         self.attn_cache = attn_cache
         self.mamba_cache = mamba_cache
 
@@ -58,17 +58,13 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.expand is None:
             self.expand = self.intermediate_size // self.hidden_size
-
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
-
         if self.num_heads is None:
             self.num_heads = self.num_attention_heads
 
         if self.hybrid_override_pattern:
-            self.layers_block_type = self._parse_hybrid_pattern(
-                self.hybrid_override_pattern
-            )
+            self.layers_block_type = self._parse_hybrid_pattern(self.hybrid_override_pattern)
         else:
             self.layers_block_type = ["mamba"] * self.num_hidden_layers
 
@@ -81,17 +77,11 @@ class ModelArgs(BaseModelArgs):
                 layer_types.append("attention")
             elif char == "-":
                 layer_types.append("mlp")
-        if len(layer_types) != self.num_hidden_layers:
-            print(
-                f"Warning: Pattern length {len(layer_types)} doesn't match num_hidden_layers {self.num_hidden_layers}"
-            )
-            if len(layer_types) < self.num_hidden_layers:
-                layer_types.extend(
-                    ["mamba"] * (self.num_hidden_layers - len(layer_types))
-                )
-            else:
-                layer_types = layer_types[: self.num_hidden_layers]
-        return layer_types
+        
+        while len(layer_types) < self.num_hidden_layers:
+            layer_types.extend(layer_types)
+        
+        return layer_types[:self.num_hidden_layers]
 
 
 class MambaRMSNormGated(nn.Module):
@@ -119,12 +109,10 @@ class NemotronHMamba2Mixer(nn.Module):
         self.ssm_state_size = args.ssm_state_size
         self.conv_kernel_size = args.conv_kernel
         self.intermediate_size = args.mamba_num_heads * args.mamba_head_dim
-        self.use_conv_bias = args.use_conv_bias
         self.n_groups = args.n_groups
         self.head_dim = args.mamba_head_dim
         self.time_step_limit = args.time_step_limit
         self.heads_per_group = self.num_heads // self.n_groups
-        self.use_bias = args.use_bias
 
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
 
@@ -144,121 +132,91 @@ class NemotronHMamba2Mixer(nn.Module):
         self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
         self.D = mx.ones(self.num_heads)
 
-        self.norm = MambaRMSNormGated(
-            self.intermediate_size, eps=args.layer_norm_epsilon
-        )
-        self.out_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=args.use_bias
-        )
+        self.norm = MambaRMSNormGated(self.intermediate_size, eps=args.layer_norm_epsilon)
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=args.use_bias)
 
-    def _apply_conv(
-        self, conv_input: mx.array, cache: Optional[NemotronHMamba2Cache] = None
-    ) -> mx.array:
-        batch_size, seq_len, in_ch = conv_input.shape
-        if self.conv_kernel_size > 1:
-            if cache is not None:
-                left_ctx = cache.conv_states[self.layer_idx][:, 1:, :]
-                padded_input = mx.concatenate([left_ctx, conv_input], axis=1)
-            else:
-                padded_input = mx.pad(
-                    conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
-                )
+    def _apply_conv(self, conv_input: mx.array, cache: Optional[MambaCache] = None) -> mx.array:
+        if cache is not None:
+            # Get conv state (index 0)
+            conv_state = cache[0] if cache[0] is not None else mx.zeros((conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim))
+            
+            # Use cached state for left padding
+            padded_input = mx.concatenate([conv_state, conv_input], axis=1)
+            
+            # Update conv state for next time
+            new_conv_state = padded_input[:, -(self.conv_kernel_size - 1):, :]
+            cache[0] = new_conv_state
         else:
-            padded_input = conv_input
+            # Pad normally for training
+            padded_input = mx.pad(conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
 
         conv_output = self.conv1d(padded_input)
-
-        conv_output = conv_output[:, :seq_len, :]
-        if cache is not None and self.conv_kernel_size > 1:
-            state_slice = padded_input[:, -self.conv_kernel_size :, :]
-            cache.update_conv_state(self.layer_idx, state_slice)
-
+        conv_output = conv_output[:, :conv_input.shape[1], :]
         return nn.silu(conv_output)
 
-    def _ssm(
-        self,
-        hidden_states: mx.array,
-        B: mx.array,
-        C: mx.array,
-        dt: mx.array,
-        cache: Optional[NemotronHMamba2Cache] = None,
-    ) -> mx.array:
+    def _ssm(self, hidden_states: mx.array, B: mx.array, C: mx.array, dt: mx.array, 
+             cache: Optional[MambaCache] = None) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
         dt = nn.softplus(dt + self.dt_bias)
         dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
-        hidden_states = hidden_states.reshape(
-            batch_size, seq_len, self.num_heads, self.head_dim
-        )
-
-        B = mx.repeat(
-            B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-            self.heads_per_group,
-            axis=2,
-        )
-        C = mx.repeat(
-            C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-            self.heads_per_group,
-            axis=2,
-        )
+        # Reshape inputs
+        hidden_states = hidden_states.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        
+        # Expand B and C to match number of heads
+        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        B = mx.repeat(B, self.heads_per_group, axis=2)
+        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size) 
+        C = mx.repeat(C, self.heads_per_group, axis=2)
 
         A = -mx.exp(self.A_log.astype(mx.float32))
 
-        outputs = []
+        # Get SSM state (index 1)
         if cache is not None:
-            h = cache.get_ssm_state(self.layer_idx)
+            h = cache[1] if cache[1] is not None else mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
         else:
-            h = mx.zeros(
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
-            )
+            h = mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
 
+        outputs = []
         for t in range(seq_len):
             dt_t = dt[:, t, :, None, None]
             dA = mx.exp(dt_t * A[None, :, None, None])
             dB = dt_t * B[:, t, :, None, :]
 
             h = dA * h + dB * hidden_states[:, t, :, :, None]
-            y_t = (
-                mx.sum(C[:, t, :, None, :] * h, axis=-1)
-                + self.D[None, :, None] * hidden_states[:, t]
-            )
+            y_t = mx.sum(C[:, t, :, None, :] * h, axis=-1) + self.D[None, :, None] * hidden_states[:, t]
             outputs.append(y_t)
 
+        # Update SSM state (index 1)
         if cache is not None:
-            cache.update_ssm_state(self.layer_idx, h)
+            cache[1] = h
 
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        mamba_cache: Optional[NemotronHMamba2Cache] = None,
-        attention_mask: Optional[mx.array] = None,
-    ) -> mx.array:
+    def __call__(self, hidden_states: mx.array, cache: Optional[MambaCache] = None,
+                 attention_mask: Optional[mx.array] = None) -> mx.array:
+        
         projected = self.in_proj(hidden_states)
 
-        gate = projected[..., : self.intermediate_size]
-        conv_input = projected[
-            ..., self.intermediate_size : self.intermediate_size + self.conv_dim
-        ]
-        dt = projected[..., -self.num_heads :]
+        # Split projections
+        gate = projected[..., :self.intermediate_size]
+        conv_input = projected[..., self.intermediate_size:self.intermediate_size + self.conv_dim]
+        dt = projected[..., -self.num_heads:]
 
-        conv_output = self._apply_conv(conv_input, mamba_cache)
+        # Apply conv
+        conv_output = self._apply_conv(conv_input, cache)
 
-        hidden_states = conv_output[..., : self.intermediate_size]
-        B = conv_output[
-            ...,
-            self.intermediate_size : self.intermediate_size
-            + self.n_groups * self.ssm_state_size,
-        ]
-        C = conv_output[
-            ..., self.intermediate_size + self.n_groups * self.ssm_state_size :
-        ]
+        # Split conv output
+        hidden_states_ssm = conv_output[..., :self.intermediate_size]
+        B = conv_output[..., self.intermediate_size:self.intermediate_size + self.n_groups * self.ssm_state_size]
+        C = conv_output[..., self.intermediate_size + self.n_groups * self.ssm_state_size:]
 
-        y = self._ssm(hidden_states, B, C, dt, mamba_cache)
+        # Apply SSM
+        y = self._ssm(hidden_states_ssm, B, C, dt, cache)
 
+        # Apply gated normalization and output projection
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -271,51 +229,25 @@ class NemotronHAttention(nn.Module):
         self.num_heads = args.num_attention_heads
         self.head_dim = args.head_dim
         self.num_key_value_heads = args.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = args.max_position_embeddings
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias)
 
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        attn_cache: Optional[Any] = None,
-    ) -> mx.array:
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None, 
+                 cache: Optional[KVCache] = None) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries = self.q_proj(x).reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        keys = self.k_proj(x).reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = self.v_proj(x).reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
 
-        queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
-            0, 2, 1, 3
-        )
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
 
-        if attn_cache is not None:
-            keys, values = attn_cache.update_and_fetch(keys, values)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=attn_cache, scale=self.scale, mask=mask
-        )
-
+        output = scaled_dot_product_attention(queries, keys, values, cache=cache, scale=self.scale, mask=mask)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -323,12 +255,8 @@ class NemotronHAttention(nn.Module):
 class NemotronHMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.up_proj = nn.Linear(
-            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
-        )
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
 
     def __call__(self, x):
         return self.down_proj(nn.silu(self.up_proj(x)))
@@ -338,10 +266,8 @@ class NemotronHBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.residual_in_fp32 = args.residual_in_fp32
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-
         self.block_type = args.layers_block_type[layer_idx]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
         if self.block_type == "mamba":
             self.mixer = NemotronHMamba2Mixer(args, layer_idx)
@@ -349,87 +275,42 @@ class NemotronHBlock(nn.Module):
             self.mixer = NemotronHAttention(args, layer_idx)
         elif self.block_type == "mlp":
             self.mixer = NemotronHMLP(args)
-        else:
-            raise ValueError(f"Invalid block type: {self.block_type}")
 
-    def __call__(
-        self,
-        x,
-        attention_mask=None,
-        attn_cache: Optional[List[KVCache]] = None,
-        mamba_cache: Optional[NemotronHMamba2Cache] = None,
-    ):
+    def __call__(self, x, attention_mask=None, cache: Optional[UnifiedCache] = None):
         residual = x
         hidden_states = self.norm(x)
-        if self.residual_in_fp32:
-            residual = residual.astype(mx.float32)
 
         if self.block_type == "mamba":
-            hidden_states = self.mixer(
-                hidden_states, mamba_cache=mamba_cache, attention_mask=attention_mask
-            )
+            layer_cache = cache.mamba_cache[self.layer_idx] if cache else None
+            hidden_states = self.mixer(hidden_states, cache=layer_cache, attention_mask=attention_mask)
         elif self.block_type == "attention":
-            layer_attn_cache = (
-                attn_cache[self.layer_idx]
-                if isinstance(attn_cache, list) and len(attn_cache) > self.layer_idx
-                else attn_cache
-            )
-            hidden_states = self.mixer(
-                hidden_states, mask=attention_mask, attn_cache=layer_attn_cache
-            )
-        elif self.block_type == "mlp":
+            layer_cache = cache.attn_cache[self.layer_idx] if cache else None
+            hidden_states = self.mixer(hidden_states, mask=attention_mask, cache=layer_cache)
+        else:  # mlp
             hidden_states = self.mixer(hidden_states)
 
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return residual + hidden_states
 
 
 class NemotronHModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = args
         self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [
-            NemotronHBlock(args, layer_idx=idx) for idx in range(args.num_hidden_layers)
-        ]
+        self.layers = [NemotronHBlock(args, idx) for idx in range(args.num_hidden_layers)]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def _create_mamba_mask_2d(self, inputs):
-        B, L = inputs.shape[:2]
-        return mx.ones((B, L), dtype=mx.float32)
-
-    def __call__(
-        self,
-        inputs,
-        causal_mask: Optional[mx.array] = None,
-        mamba_mask: Optional[mx.array] = None,
-        attn_cache: Optional[List[KVCache]] = None,
-        mamba_cache: Optional[NemotronHMamba2Cache] = None,
-    ):
+    def __call__(self, inputs, cache: Optional[UnifiedCache] = None):
         hidden_states = self.embeddings(inputs)
+        
+        # Create attention mask for attention layers
+        attention_mask = None
+        if any(layer.block_type == "attention" for layer in self.layers):
+            attn_cache = cache.attn_cache if cache else None
+            attention_mask = create_attention_mask(hidden_states, attn_cache)
 
-        if causal_mask is None:
-            causal_mask = create_attention_mask(hidden_states, attn_cache)
-
-        if mamba_mask is None:
-            mamba_mask = self._create_mamba_mask_2d(hidden_states)
-
-        for layer_idx, mixer_block in enumerate(self.layers):
-            if mixer_block.block_type == "mamba":
-                layer_mask = mamba_mask
-            elif mixer_block.block_type == "attention":
-                layer_mask = causal_mask
-            elif mixer_block.block_type == "mlp":
-                layer_mask = None
-            else:
-                raise ValueError(f"Invalid block_type: {mixer_block.block_type}")
-
-            hidden_states = mixer_block(
-                hidden_states,
-                attention_mask=layer_mask,
-                attn_cache=attn_cache,
-                mamba_cache=mamba_cache,
-            )
+        for layer in self.layers:
+            mask = attention_mask if layer.block_type == "attention" else None
+            hidden_states = layer(hidden_states, attention_mask=mask, cache=cache)
 
         return self.norm_f(hidden_states)
 
@@ -438,50 +319,11 @@ class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
-        self.model_type = args.model_type
-
         self.backbone = NemotronHModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        causal_mask: Optional[mx.array] = None,
-        mamba_mask: Optional[mx.array] = None,
-        attn_cache: Optional[List[KVCache]] = None,
-        mamba_cache: Optional[NemotronHMamba2Cache] = None,
-        cache: Optional[Any] = None,
-    ):
-        if cache is not None and attn_cache is None and mamba_cache is None:
-            if isinstance(cache, UnifiedCache):
-                attn_cache = cache.attn_cache
-                mamba_cache = cache.mamba_cache
-            elif isinstance(cache, (tuple, list)):
-                if len(cache) == 2 and isinstance(cache[0], list):
-                    attn_cache = cache[0]
-                    mamba_cache = cache[1]
-                else:
-                    attn_cache = cache
-                    B = inputs.shape[0]
-                    intermediate_size = (
-                        self.args.mamba_num_heads * self.args.mamba_head_dim
-                    )
-                    conv_dim = (
-                        intermediate_size
-                        + 2 * self.args.n_groups * self.args.ssm_state_size
-                    )
-                    mamba_cache = NemotronHMamba2Cache(
-                        batch_size=B, conv_dim=conv_dim, args=self.args
-                    )
-            elif isinstance(cache, NemotronHMamba2Cache):
-                mamba_cache = cache
-        out = self.backbone(
-            inputs,
-            causal_mask=causal_mask,
-            mamba_mask=mamba_mask,
-            attn_cache=attn_cache,
-            mamba_cache=mamba_cache,
-        )
+    def __call__(self, inputs: mx.array, cache: Optional[UnifiedCache] = None):
+        out = self.backbone(inputs, cache=cache)
         return self.lm_head(out)
 
     @property
@@ -490,11 +332,7 @@ class Model(nn.Module):
 
     def make_cache(self, batch_size: int = 1, dtype=mx.float32):
         attn_cache = [KVCache() for _ in range(self.args.num_hidden_layers)]
-        intermediate_size = self.args.mamba_num_heads * self.args.mamba_head_dim
-        conv_dim = intermediate_size + 2 * self.args.n_groups * self.args.ssm_state_size
-        mamba_cache = NemotronHMamba2Cache(
-            batch_size=batch_size, conv_dim=conv_dim, args=self.args
-        )
+        mamba_cache = [MambaCache() for _ in range(self.args.num_hidden_layers)]
         return UnifiedCache(attn_cache, mamba_cache)
 
     def sanitize(self, weights):

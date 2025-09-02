@@ -477,63 +477,6 @@ class MambaCache(ArraysCache):
         super().__init__(size=2)
 
 
-class NemotronHMamba2Cache:
-    def __init__(self, batch_size, conv_dim, args):
-        self.args = args
-        self.conv_states = [
-            mx.zeros((batch_size, args.conv_kernel, conv_dim))
-            for _ in range(args.num_hidden_layers)
-        ]
-        self.ssm_states = [
-            mx.zeros(
-                (
-                    batch_size,
-                    args.mamba_num_heads,
-                    args.mamba_head_dim,
-                    args.ssm_state_size,
-                )
-            )
-            for _ in range(args.num_hidden_layers)
-        ]
-
-    def update_conv_state(self, layer_idx, new_conv_state):
-        current_state = self.conv_states[layer_idx]
-        if new_conv_state.ndim == 3:
-            self.conv_states[layer_idx] = new_conv_state
-            return new_conv_state
-        elif new_conv_state.ndim == 2:
-            updated_state = mx.concatenate(
-                [current_state[:, 1:, :], new_conv_state[:, None, :]],
-                axis=1,
-            )
-            self.conv_states[layer_idx] = updated_state
-            return updated_state
-        else:
-            raise ValueError(
-                f"new_conv_state must be (B, K, C) or (B, C), got shape {new_conv_state.shape}"
-            )
-
-    def get_ssm_state(self, layer_idx):
-        h = self.ssm_states[layer_idx]
-        if (
-            h.shape[1] != self.args.mamba_num_heads
-            or h.shape[2] != self.args.mamba_head_dim
-        ):
-            h = mx.zeros(
-                (
-                    h.shape[0],
-                    self.args.mamba_num_heads,
-                    self.args.mamba_head_dim,
-                    self.args.ssm_state_size,
-                )
-            )
-            self.ssm_states[layer_idx] = h
-        return h
-
-    def update_ssm_state(self, layer_idx, new_ssm_state):
-        self.ssm_states[layer_idx] = new_ssm_state
-
-
 class ChunkedKVCache(KVCache):
     def __init__(self, chunk_size=None):
         super().__init__()
