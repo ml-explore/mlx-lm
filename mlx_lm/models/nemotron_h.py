@@ -49,10 +49,9 @@ class ModelArgs(BaseModelArgs):
     residual_in_fp32: bool
     rescale_prenorm_residual: bool
     tie_word_embeddings: bool
-    hybrid_override_pattern: str
     head_dim: Optional[int] = None
     num_heads: Optional[int] = None
-    layers_block_type: Optional[List[str]] = None
+    hybrid_override_pattern: Optional[List[str]] = None
     expand: Optional[int] = None
 
     def __post_init__(self):
@@ -62,26 +61,6 @@ class ModelArgs(BaseModelArgs):
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.num_heads is None:
             self.num_heads = self.num_attention_heads
-
-        if self.hybrid_override_pattern:
-            self.layers_block_type = self._parse_hybrid_pattern(self.hybrid_override_pattern)
-        else:
-            self.layers_block_type = ["mamba"] * self.num_hidden_layers
-
-    def _parse_hybrid_pattern(self, pattern: str) -> List[str]:
-        layer_types = []
-        for char in pattern:
-            if char == "M":
-                layer_types.append("mamba")
-            elif char == "*":
-                layer_types.append("attention")
-            elif char == "-":
-                layer_types.append("mlp")
-        
-        while len(layer_types) < self.num_hidden_layers:
-            layer_types.extend(layer_types)
-        
-        return layer_types[:self.num_hidden_layers]
 
 
 class MambaRMSNormGated(nn.Module):
@@ -137,17 +116,11 @@ class NemotronHMamba2Mixer(nn.Module):
 
     def _apply_conv(self, conv_input: mx.array, cache: Optional[MambaCache] = None) -> mx.array:
         if cache is not None:
-            # Get conv state (index 0)
             conv_state = cache[0] if cache[0] is not None else mx.zeros((conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim))
-            
-            # Use cached state for left padding
             padded_input = mx.concatenate([conv_state, conv_input], axis=1)
-            
-            # Update conv state for next time
             new_conv_state = padded_input[:, -(self.conv_kernel_size - 1):, :]
             cache[0] = new_conv_state
         else:
-            # Pad normally for training
             padded_input = mx.pad(conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
 
         conv_output = self.conv1d(padded_input)
@@ -161,10 +134,8 @@ class NemotronHMamba2Mixer(nn.Module):
         dt = nn.softplus(dt + self.dt_bias)
         dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
-        # Reshape inputs
         hidden_states = hidden_states.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         
-        # Expand B and C to match number of heads
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         B = mx.repeat(B, self.heads_per_group, axis=2)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size) 
@@ -172,7 +143,6 @@ class NemotronHMamba2Mixer(nn.Module):
 
         A = -mx.exp(self.A_log.astype(mx.float32))
 
-        # Get SSM state (index 1)
         if cache is not None:
             h = cache[1] if cache[1] is not None else mx.zeros((batch_size, self.num_heads, self.head_dim, self.ssm_state_size))
         else:
@@ -188,7 +158,6 @@ class NemotronHMamba2Mixer(nn.Module):
             y_t = mx.sum(C[:, t, :, None, :] * h, axis=-1) + self.D[None, :, None] * hidden_states[:, t]
             outputs.append(y_t)
 
-        # Update SSM state (index 1)
         if cache is not None:
             cache[1] = h
 
@@ -200,18 +169,20 @@ class NemotronHMamba2Mixer(nn.Module):
         
         projected = self.in_proj(hidden_states)
 
-        # Split projections
-        gate = projected[..., :self.intermediate_size]
-        conv_input = projected[..., self.intermediate_size:self.intermediate_size + self.conv_dim]
-        dt = projected[..., -self.num_heads:]
+        gate, conv_input, dt = mx.split(
+            projected, 
+            [self.intermediate_size, self.intermediate_size + self.conv_dim], 
+            axis=-1
+        )
 
-        # Apply conv
         conv_output = self._apply_conv(conv_input, cache)
 
         # Split conv output
-        hidden_states_ssm = conv_output[..., :self.intermediate_size]
-        B = conv_output[..., self.intermediate_size:self.intermediate_size + self.n_groups * self.ssm_state_size]
-        C = conv_output[..., self.intermediate_size + self.n_groups * self.ssm_state_size:]
+        hidden_states_ssm, B, C = mx.split(
+            conv_output,
+            [self.intermediate_size, self.intermediate_size + self.n_groups * self.ssm_state_size],
+            axis=-1
+        )
 
         # Apply SSM
         y = self._ssm(hidden_states_ssm, B, C, dt, cache)
@@ -266,24 +237,24 @@ class NemotronHBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.block_type = args.layers_block_type[layer_idx]
+        self.block_type = args.hybrid_override_pattern[layer_idx]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        if self.block_type == "mamba":
+        if self.block_type == "M":
             self.mixer = NemotronHMamba2Mixer(args, layer_idx)
-        elif self.block_type == "attention":
+        elif self.block_type == "*":
             self.mixer = NemotronHAttention(args, layer_idx)
-        elif self.block_type == "mlp":
+        elif self.block_type == "-":
             self.mixer = NemotronHMLP(args)
 
     def __call__(self, x, attention_mask=None, cache: Optional[UnifiedCache] = None):
         residual = x
         hidden_states = self.norm(x)
 
-        if self.block_type == "mamba":
+        if self.block_type == "M":
             layer_cache = cache.mamba_cache[self.layer_idx] if cache else None
             hidden_states = self.mixer(hidden_states, cache=layer_cache, attention_mask=attention_mask)
-        elif self.block_type == "attention":
+        elif self.block_type == "*":
             layer_cache = cache.attn_cache[self.layer_idx] if cache else None
             hidden_states = self.mixer(hidden_states, mask=attention_mask, cache=layer_cache)
         else:  # mlp
@@ -304,12 +275,12 @@ class NemotronHModel(nn.Module):
         
         # Create attention mask for attention layers
         attention_mask = None
-        if any(layer.block_type == "attention" for layer in self.layers):
+        if any(layer.block_type == "*" for layer in self.layers):
             attn_cache = cache.attn_cache if cache else None
             attention_mask = create_attention_mask(hidden_states, attn_cache)
 
         for layer in self.layers:
-            mask = attention_mask if layer.block_type == "attention" else None
+            mask = attention_mask if layer.block_type == "*" else None
             hidden_states = layer(hidden_states, attention_mask=mask, cache=cache)
 
         return self.norm_f(hidden_states)
