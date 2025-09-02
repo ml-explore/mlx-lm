@@ -7,13 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, MambaCache
-
-
-class UnifiedCache:
-    def __init__(self, attn_cache: list[KVCache], mamba_cache: list[MambaCache]):
-        self.attn_cache = attn_cache
-        self.mamba_cache = mamba_cache
+from .cache import KVCache, MambaCache, MambaAttentionHybritCache
 
 
 @dataclass(kw_only=True)
@@ -247,7 +241,7 @@ class NemotronHBlock(nn.Module):
         elif self.block_type == "-":
             self.mixer = NemotronHMLP(args)
 
-    def __call__(self, x, attention_mask=None, cache: Optional[UnifiedCache] = None):
+    def __call__(self, x, attention_mask=None, cache: Optional[MambaAttentionHybritCache] = None):
         residual = x
         hidden_states = self.norm(x)
 
@@ -270,7 +264,7 @@ class NemotronHModel(nn.Module):
         self.layers = [NemotronHBlock(args, idx) for idx in range(args.num_hidden_layers)]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs, cache: Optional[UnifiedCache] = None):
+    def __call__(self, inputs, cache: Optional[MambaAttentionHybritCache] = None):
         hidden_states = self.embeddings(inputs)
         
         # Create attention mask for attention layers
@@ -293,7 +287,7 @@ class Model(nn.Module):
         self.backbone = NemotronHModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache: Optional[UnifiedCache] = None):
+    def __call__(self, inputs: mx.array, cache: Optional[MambaAttentionHybritCache] = None):
         out = self.backbone(inputs, cache=cache)
         return self.lm_head(out)
 
@@ -304,7 +298,7 @@ class Model(nn.Module):
     def make_cache(self, batch_size: int = 1, dtype=mx.float32):
         attn_cache = [KVCache() for _ in range(self.args.num_hidden_layers)]
         mamba_cache = [MambaCache() for _ in range(self.args.num_hidden_layers)]
-        return UnifiedCache(attn_cache, mamba_cache)
+        return MambaAttentionHybritCache(attn_cache, mamba_cache)
 
     def sanitize(self, weights):
         for k, v in weights.items():
