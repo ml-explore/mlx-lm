@@ -34,15 +34,7 @@ class ModelArgs(BaseModelArgs):
     use_bias: bool
     use_conv_bias: bool
     residual_in_fp32: bool
-    head_dim: Optional[int] = None
-    num_heads: Optional[int] = None
     hybrid_override_pattern: Optional[List[str]] = None
-
-    def __post_init__(self):
-        if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
-        if self.num_heads is None:
-            self.num_heads = self.num_attention_heads
 
 
 class MambaRMSNormGated(nn.Module):
@@ -217,7 +209,7 @@ class NemotronHAttention(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = args.hidden_size
         self.num_heads = args.num_attention_heads
-        self.head_dim = args.head_dim
+        self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = args.num_key_value_heads
         self.scale = self.head_dim**-0.5
 
