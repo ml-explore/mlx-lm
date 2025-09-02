@@ -135,7 +135,7 @@ class Mamba2Block(nn.Module):
         conv_output = self.conv1d(padded_input)[:, :seq_len, :]
         return nn.silu(conv_output)
 
-    def _ssm_vectorized(
+    def _ssm(
         self,
         hidden_states: mx.array,
         B: mx.array,
@@ -219,7 +219,7 @@ class Mamba2Block(nn.Module):
             ],
             axis=-1,
         )
-        y = self._ssm_vectorized(hidden_states, B, C, dt, cache)
+        y = self._ssm(hidden_states, B, C, dt, cache)
         y = self.norm(y, gate)
         return self.out_proj(y)
 
