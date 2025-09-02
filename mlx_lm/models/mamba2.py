@@ -6,12 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
-from .cache import ArraysCache
-
-
-class MambaCache(ArraysCache):
-    def __init__(self):
-        super().__init__(size=2)  # conv_state (idx=0), ssm_state (idx=1)
+from .cache import MambaCache
 
 
 @dataclass
