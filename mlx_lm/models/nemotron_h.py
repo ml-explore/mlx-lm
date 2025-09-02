@@ -158,8 +158,7 @@ class NemotronHMamba2Mixer(nn.Module):
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
-    def __call__(self, hidden_states: mx.array, cache: Optional[MambaCache] = None,
-                 attention_mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(self, hidden_states: mx.array, cache: Optional[MambaCache] = None, mask: Optional[mx.array] = None) -> mx.array:
         
         projected = self.in_proj(hidden_states)
 
@@ -171,17 +170,12 @@ class NemotronHMamba2Mixer(nn.Module):
 
         conv_output = self._apply_conv(conv_input, cache)
 
-        # Split conv output
         hidden_states_ssm, B, C = mx.split(
             conv_output,
             [self.intermediate_size, self.intermediate_size + self.n_groups * self.ssm_state_size],
             axis=-1
         )
-
-        # Apply SSM
         y = self._ssm(hidden_states_ssm, B, C, dt, cache)
-
-        # Apply gated normalization and output projection
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -220,11 +214,21 @@ class NemotronHAttention(nn.Module):
 class NemotronHMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(
+            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
+        )
+        if args.mlp_hidden_act == "relu2":
+            self.activation = lambda x: nn.relu(x) ** 2
+        elif args.mlp_hidden_act == "silu":
+            self.activation = nn.silu
+        else:
+            self.activation = nn.silu
 
     def __call__(self, x):
-        return self.down_proj(nn.silu(self.up_proj(x)))
+        return self.down_proj(self.activation(self.up_proj(x)))
 
 
 class NemotronHBlock(nn.Module):
@@ -241,17 +245,17 @@ class NemotronHBlock(nn.Module):
         elif self.block_type == "-":
             self.mixer = NemotronHMLP(args)
 
-    def __call__(self, x, attention_mask=None, cache: Optional[MambaAttentionHybritCache] = None):
+    def __call__(self, x, mask: Optional[mx.array] = None, cache: Optional[MambaAttentionHybritCache] = None):
         residual = x
         hidden_states = self.norm(x)
 
         if self.block_type == "M":
             layer_cache = cache.mamba_cache[self.layer_idx] if cache else None
-            hidden_states = self.mixer(hidden_states, cache=layer_cache, attention_mask=attention_mask)
+            hidden_states = self.mixer(hidden_states, cache=layer_cache, mask=mask)
         elif self.block_type == "*":
             layer_cache = cache.attn_cache[self.layer_idx] if cache else None
-            hidden_states = self.mixer(hidden_states, mask=attention_mask, cache=layer_cache)
-        else:  # mlp
+            hidden_states = self.mixer(hidden_states, mask=mask, cache=layer_cache)
+        else:
             hidden_states = self.mixer(hidden_states)
 
         return residual + hidden_states
@@ -264,18 +268,14 @@ class NemotronHModel(nn.Module):
         self.layers = [NemotronHBlock(args, idx) for idx in range(args.num_hidden_layers)]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs, cache: Optional[MambaAttentionHybritCache] = None):
+    def __call__(self, inputs, mask: Optional[mx.array] = None, cache: Optional[MambaAttentionHybritCache] = None):
         hidden_states = self.embeddings(inputs)
         
-        # Create attention mask for attention layers
-        attention_mask = None
-        if any(layer.block_type == "*" for layer in self.layers):
-            attn_cache = cache.attn_cache if cache else None
-            attention_mask = create_attention_mask(hidden_states, attn_cache)
+        if mask is None:
+            mask = create_attention_mask(hidden_states, cache.attn_cache)
 
         for layer in self.layers:
-            mask = attention_mask if layer.block_type == "*" else None
-            hidden_states = layer(hidden_states, attention_mask=mask, cache=cache)
+            hidden_states = layer(hidden_states, mask=mask, cache=cache)
 
         return self.norm_f(hidden_states)
 
@@ -287,8 +287,8 @@ class Model(nn.Module):
         self.backbone = NemotronHModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache: Optional[MambaAttentionHybritCache] = None):
-        out = self.backbone(inputs, cache=cache)
+    def __call__(self, inputs: mx.array, mask: Optional[mx.array] = None, cache: Optional[MambaAttentionHybritCache] = None):
+        out = self.backbone(inputs, mask=mask, cache=cache)
         return self.lm_head(out)
 
     @property
