@@ -87,7 +87,9 @@ class NemotronHMamba2Mixer(nn.Module):
         )
 
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
-        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.mamba_proj_bias)
+        self.in_proj = nn.Linear(
+            self.hidden_size, projection_size, bias=args.mamba_proj_bias
+        )
 
         self.dt_bias = mx.ones(self.num_heads)
         self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
