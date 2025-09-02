@@ -6,7 +6,12 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
-from .cache import Mamba2Cache
+from .cache import ArraysCache
+
+
+class MambaCache(ArraysCache):
+    def __init__(self):
+        super().__init__(size=2)  # conv_state (idx=0), ssm_state (idx=1)
 
 
 @dataclass
@@ -104,28 +109,35 @@ class Mamba2Block(nn.Module):
         )
 
     def _apply_conv(
-        self, conv_input: mx.array, cache: Optional[Mamba2Cache] = None
+        self, conv_input: mx.array, cache: Optional[MambaCache] = None
     ) -> mx.array:
         batch_size, seq_len, in_ch = conv_input.shape
 
-        if self.conv_kernel_size > 1:
-            if cache is not None:
-                left_ctx = cache.conv_states[self.layer_idx][:, 1:, :]
-                padded_input = mx.concatenate([left_ctx, conv_input], axis=1)
-            else:
-                padded_input = mx.pad(
-                    conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+        if self.conv_kernel_size == 1:
+            return nn.silu(self.conv1d(conv_input))
+
+        if cache is not None:
+            current_conv_state = cache[0]
+            if current_conv_state is None:
+                current_conv_state = cache[0] = mx.zeros(
+                    (batch_size, self.conv_kernel_size, in_ch)
                 )
+
+            if seq_len >= self.conv_kernel_size:
+                cache[0] = conv_input[:, -self.conv_kernel_size :, :]
+            else:
+                cache[0] = mx.concatenate(
+                    [current_conv_state[:, seq_len:, :], conv_input], axis=1
+                )
+
+            left_padding = current_conv_state[:, -(self.conv_kernel_size - 1) :, :]
+            padded_input = mx.concatenate([left_padding, conv_input], axis=1)
         else:
-            padded_input = conv_input
+            padded_input = mx.pad(
+                conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+            )
 
-        conv_output = self.conv1d(padded_input)
-        conv_output = conv_output[:, :seq_len, :]
-
-        if cache is not None and self.conv_kernel_size > 1:
-            state_slice = padded_input[:, -self.conv_kernel_size :, :]
-            cache.update_conv_state(self.layer_idx, state_slice)
-
+        conv_output = self.conv1d(padded_input)[:, :seq_len, :]
         return nn.silu(conv_output)
 
     def _ssm_vectorized(
@@ -134,7 +146,7 @@ class Mamba2Block(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[Mamba2Cache] = None,
+        cache: Optional[MambaCache] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -158,7 +170,13 @@ class Mamba2Block(nn.Module):
         A = -mx.exp(self.A_log.astype(mx.float32))
 
         if cache is not None:
-            h = cache.get_ssm_state(self.layer_idx)
+            h = (
+                cache[1]
+                if cache[1] is not None
+                else mx.zeros(
+                    (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
+                )
+            )
         else:
             h = mx.zeros(
                 (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
@@ -183,32 +201,29 @@ class Mamba2Block(nn.Module):
             outputs.append(y_t)
 
         if cache is not None:
-            cache.update_ssm_state(self.layer_idx, h)
+            cache[1] = h
 
         y = mx.stack(outputs, axis=1)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
-        self,
-        hidden_states: mx.array,
-        cache: Optional[Mamba2Cache] = None,
+        self, hidden_states: mx.array, cache: Optional[MambaCache] = None
     ) -> mx.array:
         projected = self.in_proj(hidden_states)
-        gate = projected[..., : self.intermediate_size]
-        conv_input = projected[
-            ..., self.intermediate_size : self.intermediate_size + self.conv_dim
-        ]
-        dt = projected[..., -self.num_heads :]
+        gate, conv_input, dt = mx.split(
+            projected,
+            [self.intermediate_size, self.intermediate_size + self.conv_dim],
+            axis=-1,
+        )
         conv_output = self._apply_conv(conv_input, cache)
-        hidden_states = conv_output[..., : self.intermediate_size]
-        B = conv_output[
-            ...,
-            self.intermediate_size : self.intermediate_size
-            + self.n_groups * self.ssm_state_size,
-        ]
-        C = conv_output[
-            ..., self.intermediate_size + self.n_groups * self.ssm_state_size :
-        ]
+        hidden_states, B, C = mx.split(
+            conv_output,
+            [
+                self.intermediate_size,
+                self.intermediate_size + self.n_groups * self.ssm_state_size,
+            ],
+            axis=-1,
+        )
         y = self._ssm_vectorized(hidden_states, B, C, dt, cache)
         y = self.norm(y, gate)
         return self.out_proj(y)
@@ -221,11 +236,7 @@ class ResidualBlock(nn.Module):
         self.mixer = Mamba2Block(args, layer_idx)
         self.norm = nn.RMSNorm(args.hidden_size)
 
-    def __call__(
-        self,
-        x: mx.array,
-        cache: Optional[Mamba2Cache] = None,
-    ) -> mx.array:
+    def __call__(self, x: mx.array, cache: Optional[MambaCache] = None) -> mx.array:
         if self.residual_in_fp32:
             x = x.astype(mx.float32)
 
@@ -242,15 +253,14 @@ class Mamba2(nn.Module):
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
 
     def __call__(
-        self,
-        x: mx.array,
-        cache: Optional[Mamba2Cache] = None,
+        self, x: mx.array, cache: Optional[list[MambaCache]] = None
     ) -> mx.array:
         x = self.embeddings(x)
         hidden = x
 
-        for layer in self.layers:
-            hidden = layer(hidden, cache)
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache[i] if cache else None
+            hidden = layer(hidden, layer_cache)
 
         return self.norm_f(hidden)
 
@@ -266,7 +276,7 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
-        self, inputs: mx.array, cache: Optional[Mamba2Cache] = None
+        self, inputs: mx.array, cache: Optional[list[MambaCache]] = None
     ) -> mx.array:
         hidden = self.backbone(inputs, cache)
 
@@ -277,13 +287,8 @@ class Model(nn.Module):
 
         return logits
 
-    def make_cache(self, batch_size: int = 1) -> Mamba2Cache:
-        conv_dim = (
-            self.args.num_heads * self.args.head_dim
-            + 2 * self.args.n_groups * self.args.ssm_state_size
-        )
-
-        return Mamba2Cache(batch_size=batch_size, conv_dim=conv_dim, args=self.args)
+    def make_cache(self, batch_size: int = 1) -> list[MambaCache]:
+        return [MambaCache() for _ in range(self.args.num_hidden_layers)]
 
     @property
     def layers(self):
