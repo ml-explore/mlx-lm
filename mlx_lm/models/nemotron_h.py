@@ -23,34 +23,22 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     mamba_num_heads: int
     mamba_head_dim: int
-    mamba_hidden_act: str
     mamba_proj_bias: bool
     ssm_state_size: int
-    chunk_size: int
     conv_kernel: int
     n_groups: int
-    time_step_rank: int
-    time_step_min: float
-    time_step_max: float
-    time_step_floor: float
     time_step_limit: Tuple[float, float]
     mlp_bias: bool
-    mlp_hidden_act: str
     layer_norm_epsilon: float
     rms_norm_eps: float
     use_bias: bool
     use_conv_bias: bool
     residual_in_fp32: bool
-    rescale_prenorm_residual: bool
-    tie_word_embeddings: bool
     head_dim: Optional[int] = None
     num_heads: Optional[int] = None
     hybrid_override_pattern: Optional[List[str]] = None
-    expand: Optional[int] = None
 
     def __post_init__(self):
-        if self.expand is None:
-            self.expand = self.intermediate_size // self.hidden_size
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.num_heads is None:
@@ -99,7 +87,7 @@ class NemotronHMamba2Mixer(nn.Module):
         )
 
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
-        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.use_bias)
+        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.mamba_proj_bias)
 
         self.dt_bias = mx.ones(self.num_heads)
         self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
@@ -109,7 +97,7 @@ class NemotronHMamba2Mixer(nn.Module):
             self.intermediate_size, eps=args.layer_norm_epsilon
         )
         self.out_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=args.use_bias
+            self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
         )
 
     def _apply_conv(
@@ -287,12 +275,7 @@ class NemotronHMLP(nn.Module):
         self.down_proj = nn.Linear(
             args.intermediate_size, args.hidden_size, bias=args.mlp_bias
         )
-        if args.mlp_hidden_act == "relu2":
-            self.activation = lambda x: nn.relu(x) ** 2
-        elif args.mlp_hidden_act == "silu":
-            self.activation = nn.silu
-        else:
-            self.activation = nn.silu
+        self.activation = lambda x: nn.relu(x) ** 2
 
     def __call__(self, x):
         return self.down_proj(self.activation(self.up_proj(x)))
@@ -302,6 +285,7 @@ class NemotronHBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.residual_in_fp32 = args.residual_in_fp32
         self.block_type = args.hybrid_override_pattern[layer_idx]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -318,7 +302,9 @@ class NemotronHBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[MambaAttentionHybritCache] = None,
     ):
-        residual = x
+        if self.residual_in_fp32:
+            x.astype(mx.float32)
+
         hidden_states = self.norm(x)
 
         if self.block_type == "M":
@@ -330,7 +316,7 @@ class NemotronHBlock(nn.Module):
         else:
             hidden_states = self.mixer(hidden_states)
 
-        return residual + hidden_states
+        return x + hidden_states
 
 
 class NemotronHModel(nn.Module):
@@ -379,7 +365,7 @@ class Model(nn.Module):
     def layers(self):
         return self.backbone.layers
 
-    def make_cache(self, batch_size: int = 1, dtype=mx.float32):
+    def make_cache(self):
         attn_cache = [KVCache() for _ in range(self.args.num_hidden_layers)]
         mamba_cache = [MambaCache() for _ in range(self.args.num_hidden_layers)]
         return MambaAttentionHybritCache(attn_cache, mamba_cache)
