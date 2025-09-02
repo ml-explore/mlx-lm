@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
+from .switch_layers import SwitchGLU
 
 
 @dataclass
@@ -88,20 +89,6 @@ class GraniteMoeAttention(nn.Module):
         return self.o_proj(output)
 
 
-class GraniteMoeParallelExperts(nn.Module):
-    def __init__(self, num_experts: int, input_size: int, output_size: int):
-        super().__init__()
-        self.weight = mx.random.normal((num_experts, output_size, input_size))
-        self.num_experts = num_experts
-        self.input_size = input_size
-        self.output_size = output_size
-
-    def __call__(self, inputs: mx.array, expert_indices: mx.array) -> mx.array:
-        all_expert_outputs = mx.einsum("ti,eoi->teo", inputs, self.weight)
-        expert_one_hot = mx.eye(self.num_experts)[expert_indices]
-        return mx.sum(all_expert_outputs * mx.expand_dims(expert_one_hot, -1), axis=1)
-
-
 class GraniteMoeTopKGating(nn.Module):
     def __init__(self, input_size: int, num_experts: int, top_k: int):
         super().__init__()
@@ -111,28 +98,13 @@ class GraniteMoeTopKGating(nn.Module):
         self.layer = nn.Linear(input_size, num_experts, bias=False)
 
     def __call__(self, hidden_states: mx.array):
-        logits = self.layer(hidden_states).astype(mx.float32)
-        top_k_indices = mx.stop_gradient(mx.argsort(logits, axis=1)[:, -self.top_k :])
-        row_ids = mx.arange(logits.shape[0])[:, None]
-        top_k_logits = logits[row_ids, top_k_indices]
-        top_k_gates = mx.softmax(top_k_logits, axis=1)
-        top_k_experts = top_k_indices.reshape((-1,))
-        top_k_gates_flat = top_k_gates.reshape((-1,))
-        token_ids = mx.repeat(mx.arange(hidden_states.shape[0]), self.top_k)
-        sorted_indices = mx.stop_gradient(mx.argsort(top_k_experts, axis=0))
-        sorted_expert_ids = top_k_experts[sorted_indices]
-        sorted_token_ids = token_ids[sorted_indices]
-        sorted_gates = top_k_gates_flat[sorted_indices]
-        expert_sizes = mx.array(
-            [mx.sum(sorted_expert_ids == i) for i in range(self.num_experts)]
-        )
-
-        return (
-            mx.stop_gradient(sorted_token_ids),
-            sorted_gates,
-            mx.stop_gradient(expert_sizes),
-            mx.stop_gradient(sorted_expert_ids),
-        )
+        logits = self.layer(hidden_states)
+        top_k_idx = mx.argpartition(logits, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]
+        top_k_logits = mx.take_along_axis(logits, top_k_idx, axis=-1)
+        top_k_gates = mx.softmax(top_k_logits.astype(mx.float32), axis=-1)
+        return top_k_idx, top_k_gates
 
 
 class GraniteMoeMoE(nn.Module):
@@ -141,49 +113,26 @@ class GraniteMoeMoE(nn.Module):
 
         self.input_size = args.hidden_size
         self.hidden_size = args.intermediate_size
-        self.input_linear = GraniteMoeParallelExperts(
-            args.num_local_experts, self.input_size, self.hidden_size * 2
+        self.switch_mlp = SwitchGLU(
+            self.input_size, self.hidden_size, args.num_local_experts
         )
-        self.output_linear = GraniteMoeParallelExperts(
-            args.num_local_experts, self.hidden_size, self.input_size
-        )
-
         self.router = GraniteMoeTopKGating(
             input_size=self.input_size,
             num_experts=args.num_local_experts,
             top_k=args.num_experts_per_tok,
         )
 
-    def __call__(self, layer_input: mx.array) -> mx.array:
-        bsz, length, emb_size = layer_input.shape
-        layer_input = layer_input.reshape(-1, emb_size)
-        token_ids, gates, expert_sizes, expert_ids = self.router(layer_input)
-        selected_tokens = layer_input[token_ids]
-        hidden_states = self.input_linear(selected_tokens, expert_ids)
-        chunk_size = hidden_states.shape[-1] // 2
-        chunked_hidden_states = [
-            hidden_states[..., :chunk_size],
-            hidden_states[..., chunk_size:],
-        ]
-        hidden_states = nn.silu(chunked_hidden_states[0]) * chunked_hidden_states[1]
-        expert_outputs = self.output_linear(hidden_states, expert_ids)
-        expert_outputs = expert_outputs * gates[:, None]
-        if len(expert_outputs) == len(layer_input):
-            return expert_outputs.reshape(bsz, length, self.input_size)
-        else:
-            zeros = mx.zeros(
-                (bsz * length, self.input_size), dtype=expert_outputs.dtype
-            )
-            zeros = zeros.at[token_ids].add(expert_outputs)
-            return zeros.reshape(bsz, length, self.input_size)
+    def __call__(self, x: mx.array) -> mx.array:
+        token_ids, gates = self.router(x)
+        y = self.switch_mlp(x, token_ids)
+        return (y * gates[..., None]).sum(axis=-2).astype(y.dtype)
 
 
 class GraniteMoeDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.self_attn = GraniteMoeAttention(args)
-        if args.num_local_experts > 0:
-            self.block_sparse_moe = GraniteMoeMoE(args)
+        self.block_sparse_moe = GraniteMoeMoE(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
@@ -256,6 +205,23 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out / self.logits_scaling
+
+    def sanitize(self, weights):
+        if "model.layers.0.block_sparse_moe.input_linear.weight" not in weights:
+            return weights
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.block_sparse_moe"
+            key = f"{prefix}.input_linear.weight"
+            value = weights.pop(key)
+            gate_proj, up_proj = mx.split(value, 2, axis=1)
+            weights[key.replace("input_linear", "switch_mlp.gate_proj")] = gate_proj
+            weights[key.replace("input_linear", "switch_mlp.up_proj")] = up_proj
+            key = f"{prefix}.output_linear.weight"
+            weights[key.replace("output_linear", "switch_mlp.down_proj")] = weights.pop(
+                key
+            )
+
+        return weights
 
     @property
     def layers(self):
