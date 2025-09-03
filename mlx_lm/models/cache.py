@@ -477,12 +477,6 @@ class MambaCache(ArraysCache):
         super().__init__(size=2)
 
 
-class MambaAttentionHybritCache:
-    def __init__(self, attn_cache: list[KVCache], mamba_cache: list[MambaCache]):
-        self.attn_cache = attn_cache
-        self.mamba_cache = mamba_cache
-
-
 class ChunkedKVCache(KVCache):
     def __init__(self, chunk_size=None):
         super().__init__()
