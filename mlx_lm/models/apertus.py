@@ -1,6 +1,7 @@
 # Copyright © 2023-2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -31,6 +32,17 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
+@partial(mx.compile, shapeless=True)
+def xielu(x, alpha_p, alpha_n, beta, eps):
+    alpha_p = nn.softplus(alpha_p)
+    alpha_n = beta + nn.softplus(alpha_n)
+    return mx.where(
+        x > 0,
+        alpha_p * mx.square(x) + beta * x,
+        (mx.expm1(mx.minimum(x, eps)) - x) * alpha_n + beta * x,
+    )
+
+
 class XieLU(nn.Module):
     def __init__(
         self,
@@ -40,8 +52,8 @@ class XieLU(nn.Module):
         eps=-1e-6,
     ):
         super().__init__()
-        alpha_p_tensor = mx.array([alpha_p_init])
-        alpha_n_tensor = mx.array([alpha_n_init - beta])
+        alpha_p_tensor = mx.array(alpha_p_init)
+        alpha_n_tensor = mx.array(alpha_n_init - beta)
         self.alpha_p = mx.log(mx.exp(alpha_p_tensor) - 1)
         self.alpha_n = mx.log(mx.exp(alpha_n_tensor) - 1)
 
@@ -49,13 +61,7 @@ class XieLU(nn.Module):
         self.eps = mx.array(eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        alpha_p = nn.softplus(self.alpha_p)
-        alpha_n = self.beta + nn.softplus(self.alpha_n)
-        return mx.where(
-            x > 0,
-            alpha_p * x * x + self.beta * x,
-            (mx.expm1(mx.minimum(x, self.eps)) - x) * alpha_n + self.beta * x,
-        )
+        return xielu(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
 
 
 class ApertusMLP(nn.Module):
@@ -204,6 +210,12 @@ class Model(nn.Module):
     ) -> mx.array:
         out = self.model(inputs, mask, cache)
         return self.lm_head(out)
+
+    def sanitize(self, weights):
+        for k, v in weights.items():
+            if k.endswith("alpha_p") or k.endswith("alpha_n"):
+                weights[k] = v.squeeze()
+        return weights
 
     @property
     def layers(self):
