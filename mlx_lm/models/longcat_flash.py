@@ -7,7 +7,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask
 from .switch_layers import SwitchGLU
-from .deepseek_v3 import DeepseekV3YarnRotaryEmbedding
+from .deepseek_v3 import DeepseekV3YarnRotaryEmbedding, yarn_get_mscale
 
 
 @dataclass
@@ -253,40 +253,23 @@ class LongcatFlashMoE(nn.Module):
         
         topk_indices, topk_weights = self.router(hidden_states_flat)
         
-        # Initialize output
-        final_output = mx.zeros_like(hidden_states_flat).astype(topk_weights.dtype)
+        # Process all regular experts at once
+        regular_mask = topk_indices < self.n_routed_experts
+        inputs_expanded = mx.tile(hidden_states_flat[:, None, :], (1, self.num_experts_per_tok, 1))
+        regular_outputs = self.switch_mlp(inputs_expanded, topk_indices[..., None]).squeeze(-2)
         
-        # Process token by token to handle mixed expert types
-        batch_size, top_k = topk_indices.shape
+        # Zero out invalid experts and apply weights
+        regular_outputs = mx.where(regular_mask[..., None], regular_outputs, 0.0)
+        weighted_outputs = regular_outputs * topk_weights[..., None]
         
-        # Collect outputs for each token
-        token_outputs = []
+        # Add identity expert contribution if needed
+        if self.zero_expert_num is not None and self.zero_expert_type == "identity":
+            identity_mask = topk_indices >= self.n_routed_experts
+            identity_weights = mx.where(identity_mask, topk_weights, 0.0)
+            identity_outputs = inputs_expanded * identity_weights[..., None]
+            weighted_outputs = weighted_outputs + identity_outputs
         
-        for token_idx in range(batch_size):
-            token_input = hidden_states_flat[token_idx:token_idx+1]  # Keep batch dimension
-            token_output = mx.zeros_like(token_input).astype(topk_weights.dtype)
-            
-            for k in range(top_k):
-                expert_idx = topk_indices[token_idx, k]
-                weight = topk_weights[token_idx, k]
-                
-                if expert_idx < self.n_routed_experts:
-                    # Regular expert - use SwitchGLU
-                    expert_indices = mx.array([[expert_idx]], dtype=mx.int32)
-                    expert_output = self.switch_mlp(token_input, expert_indices)
-                    token_output = token_output + weight * expert_output.squeeze(-2)
-                    
-                elif (self.zero_expert_num is not None and 
-                      expert_idx >= self.n_routed_experts and
-                      self.zero_expert_type == "identity"):
-                    # Zero expert with identity
-                    token_output = token_output + weight * token_input.squeeze(0)
-            
-            token_outputs.append(token_output.squeeze(0))
-        
-        # Stack all token outputs
-        final_output = mx.stack(token_outputs, axis=0)
-        
+        final_output = mx.sum(weighted_outputs, axis=1)
         return final_output.reshape(*orig_shape).astype(hidden_states.dtype)
 
 
