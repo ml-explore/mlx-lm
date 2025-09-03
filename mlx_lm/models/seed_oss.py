@@ -156,6 +156,8 @@ class SeedModel(nn.Module):
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.args = args
+        self.model_type = args.model_type
         self.model = SeedModel(args)
         self.tie_word_embeddings = args.tie_word_embeddings
         if not args.tie_word_embeddings:
