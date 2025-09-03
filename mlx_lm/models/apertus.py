@@ -54,7 +54,7 @@ class XieLU(nn.Module):
         return mx.where(
             x > 0,
             alpha_p * x * x + self.beta * x,
-            (mx.expm1(mx.min(x, self.eps)) - x) * alpha_n + self.beta * x,
+            (mx.expm1(mx.minimum(x, self.eps)) - x) * alpha_n + self.beta * x,
         )
 
 
