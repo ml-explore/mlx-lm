@@ -224,5 +224,14 @@ class Model(nn.Module):
         return weights
 
     @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("block_sparse_moe.router.layer"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
     def layers(self):
         return self.model.layers
