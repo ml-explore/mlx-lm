@@ -1,4 +1,4 @@
-from typing import Optional, Any
+from typing import Optional, Any, Tuple
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -151,6 +151,99 @@ class LongcatFlashMLP(nn.Module):
         self.gate_proj = nn.Linear(args.hidden_size, args.ffn_hidden_size, bias=False)
         self.up_proj = nn.Linear(args.hidden_size, args.ffn_hidden_size, bias=False)
         self.down_proj = nn.Linear(args.ffn_hidden_size, args.hidden_size, bias=False)
+    
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class LongcatFlashTopkRouter(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.config = args
+        self.top_k = args.moe_topk
+        self.n_routed_experts = (
+            args.n_routed_experts
+            if args.zero_expert_num is None
+            else args.n_routed_experts + args.zero_expert_num
+        )
+        self.routed_scaling_factor = args.routed_scaling_factor
+        self.norm_topk_prob = args.norm_topk_prob
+        self.router_bias = args.router_bias
+
+        self.classifier = nn.Linear(args.hidden_size, self.n_routed_experts, bias=self.router_bias)
+        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
+
+    def get_topk_indices(self, scores: mx.array) -> mx.array:
+        scores_for_choice = scores.reshape(-1, self.n_routed_experts) + mx.expand_dims(self.e_score_correction_bias, 0)
+        topk_indices = mx.argpartition(scores_for_choice, kth=-self.top_k, axis=-1)[..., -self.top_k:]
+        return topk_indices
+
+    def __call__(self, hidden_states: mx.array) -> Tuple[mx.array, mx.array]:
+        hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
+        router_logits = self.classifier(hidden_states.astype(mx.float32))
+        scores = mx.softmax(router_logits, axis=-1)
+        topk_indices = self.get_topk_indices(scores)
+        
+        batch_indices = mx.arange(scores.shape[0])[:, None]
+        topk_weights = scores[batch_indices, topk_indices]
+        
+        if self.norm_topk_prob:
+            denominator = mx.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
+            topk_weights = topk_weights / denominator
+            
+        topk_weights = topk_weights * self.routed_scaling_factor
+        return topk_indices, topk_weights
+
+
+class LongcatFlashMoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.experts = [
+            LongcatFlashMLP(config, intermediate_size=config.expert_ffn_hidden_size)
+            for _ in range(config.n_routed_experts)
+        ]
+        self.router = LongcatFlashTopkRouter(config)
+        self.zero_expert_num = config.zero_expert_num
+        self.zero_expert_type = config.zero_expert_type
+
+    def moe(self, hidden_states: mx.array, topk_indices: mx.array, topk_weights: mx.array):
+        final_hidden_states = mx.zeros_like(hidden_states, dtype=topk_weights.dtype)
+        total_experts = len(self.experts) if self.zero_expert_num is None else len(self.experts) + self.zero_expert_num
+
+        expert_mask = mx.eye(total_experts)[topk_indices]
+        expert_mask = mx.transpose(expert_mask, (2, 0, 1))
+
+        for expert_idx in range(total_experts):
+            expert = self.experts[expert_idx] if expert_idx < len(self.experts) else None
+            mask = expert_mask[expert_idx]
+            
+            token_indices, weight_indices = mx.where(mask)
+
+            if token_indices.size > 0:
+                expert_weights = topk_weights[token_indices, weight_indices]
+                expert_input = hidden_states[token_indices]
+
+                if self.zero_expert_num is None or expert_idx < len(self.experts):
+                    expert_output = expert(expert_input)
+                elif self.zero_expert_type == "identity":
+                    expert_output = expert_input
+                else:
+                    raise ValueError("Unknown condition")
+
+                weighted_output = expert_output * mx.expand_dims(expert_weights, -1)
+                
+                for i, token_idx in enumerate(token_indices):
+                    final_hidden_states = final_hidden_states.at[token_idx].add(weighted_output[i])
+
+        return final_hidden_states.astype(hidden_states.dtype)
+
+    def __call__(self, hidden_states):
+        orig_shape = hidden_states.shape
+        topk_indices, topk_weights = self.router(hidden_states)
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        hidden_states = self.moe(hidden_states, topk_indices, topk_weights).reshape(*orig_shape)
+        return hidden_states
 
 
 class LongcatFlashDecoderLayer(nn.Module):
@@ -159,7 +252,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.hidden_size = args.hidden_size
         self.mlp = LongcatFlashMoE(args)
 
-        # Create lists of modules (2 each)
         self.self_attn = [LongcatFlashMLA(args) for _ in range(2)]
         self.mlps = [LongcatFlashMLP(args) for _ in range(2)]
         self.input_layernorm = [
