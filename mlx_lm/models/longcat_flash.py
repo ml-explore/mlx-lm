@@ -1,11 +1,14 @@
-from typing import Optional, Any, Tuple
+from typing import Optional, Any, Tuple, Dict
 from dataclasses import dataclass
+import math
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -35,6 +38,86 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     norm_topk_prob: bool = False
     router_bias: bool = False
+    rope_scaling: Dict = None
+
+
+def yarn_find_correction_dim(
+    num_rotations, dim, base=10000, max_position_embeddings=2048
+):
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
+
+
+def yarn_find_correction_range(
+    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+):
+    low = math.floor(
+        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    )
+    high = math.ceil(
+        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    )
+    return max(low, 0), min(high, dim - 1)
+
+
+def yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def yarn_linear_ramp_mask(min_val, max_val, dim):
+    if min_val == max_val:
+        max_val += 0.001  # Prevent singularity
+
+    linear_func = (mx.arange(dim, dtype=mx.float32) - min_val) / (max_val - min_val)
+    return mx.clip(linear_func, 0, 1)
+
+
+class DeepseekV3YarnRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        scaling_factor=1.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1,
+        mscale_all_dim=0,
+    ):
+        super().__init__()
+        self.mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
+            scaling_factor, mscale_all_dim
+        )
+        freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+        freq_inter = scaling_factor * freq_extra
+        low, high = yarn_find_correction_range(
+            beta_fast,
+            beta_slow,
+            dim,
+            base,
+            original_max_position_embeddings,
+        )
+        freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2)
+        self._freqs = (freq_inter * freq_extra) / (
+            freq_inter * freq_mask + freq_extra * (1 - freq_mask)
+        )
+
+    def __call__(self, x, offset=0):
+        if self.mscale != 1.0:
+            x = self.mscale * x
+        return mx.fast.rope(
+            x,
+            x.shape[-1],
+            traditional=True,
+            base=None,
+            scale=1.0,
+            offset=offset,
+            freqs=self._freqs,
+        )
 
 
 class LongcatFlashMLA(nn.Module):
@@ -80,11 +163,37 @@ class LongcatFlashMLA(nn.Module):
         if args.mla_scale_kv_lora:
             self.mla_scale_kv_lora = (args.hidden_size / self.kv_lora_rank) ** 0.5
 
-        self.rope = nn.RoPE(
-            dims=self.qk_rope_head_dim,
-            base=args.rope_theta,
-            traditional=True
-        )
+        if args.rope_scaling is not None:
+            mscale_all_dim = args.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = args.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.scale = self.scale * mscale * mscale
+
+            rope_kwargs = {
+                key: args.rope_scaling[key]
+                for key in [
+                    "original_max_position_embeddings",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                ]
+                if key in args.rope_scaling
+            }
+            self.rope = DeepseekV3YarnRotaryEmbedding(
+                dim=self.qk_rope_head_dim,
+                max_position_embeddings=args.max_position_embeddings,
+                scaling_factor=scaling_factor,
+                base=args.rope_theta,
+                **rope_kwargs,
+            )
+        else:
+            self.rope = nn.RoPE(
+                dims=self.qk_rope_head_dim,
+                base=args.rope_theta,
+                traditional=True
+            )
 
     def __call__(
         self,
@@ -205,6 +314,10 @@ class LongcatFlashMoE(nn.Module):
         super().__init__()
         self.config = args
         self.num_experts_per_tok = args.moe_topk
+        self.n_routed_experts = args.n_routed_experts
+        self.zero_expert_num = args.zero_expert_num
+        self.zero_expert_type = args.zero_expert_type
+        
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             args.expert_ffn_hidden_size,
@@ -213,34 +326,47 @@ class LongcatFlashMoE(nn.Module):
         
         self.router = LongcatFlashTopkRouter(args)
         
-        # Handle zero experts if configured
-        if args.zero_expert_num is not None and args.zero_expert_num > 0:
-            if args.zero_expert_type == "identity":
-                # For identity zero experts, we can handle this in the forward pass
-                pass
-            else:
-                raise ValueError(f"Unsupported zero_expert_type: {args.zero_expert_type}")
-
     def __call__(self, hidden_states):
         orig_shape = hidden_states.shape
         hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         
-        # Get routing decisions
         topk_indices, topk_weights = self.router(hidden_states_flat)
         
-        # Use SwitchGLU for expert computation
-        expert_output = self.switch_mlp(hidden_states_flat, topk_indices)
+        # Initialize output
+        final_output = mx.zeros_like(hidden_states_flat).astype(topk_weights.dtype)
         
-        # Apply routing weights and sum
-        weighted_output = (expert_output * topk_weights[..., None]).sum(axis=-2).astype(expert_output.dtype)
+        # Process token by token to handle mixed expert types
+        batch_size, top_k = topk_indices.shape
         
-        # Handle zero experts if configured
-        if self.config.zero_expert_num is not None and self.config.zero_expert_num > 0:
-            if self.config.zero_expert_type == "identity":
-                zero_expert_weight = 0.1  # This should be determined by the router logic
-                weighted_output = weighted_output + zero_expert_weight * hidden_states_flat
+        # Collect outputs for each token
+        token_outputs = []
         
-        return weighted_output.reshape(*orig_shape)
+        for token_idx in range(batch_size):
+            token_input = hidden_states_flat[token_idx:token_idx+1]  # Keep batch dimension
+            token_output = mx.zeros_like(token_input).astype(topk_weights.dtype)
+            
+            for k in range(top_k):
+                expert_idx = topk_indices[token_idx, k]
+                weight = topk_weights[token_idx, k]
+                
+                if expert_idx < self.n_routed_experts:
+                    # Regular expert - use SwitchGLU
+                    expert_indices = mx.array([[expert_idx]], dtype=mx.int32)
+                    expert_output = self.switch_mlp(token_input, expert_indices)
+                    token_output = token_output + weight * expert_output.squeeze(-2)
+                    
+                elif (self.zero_expert_num is not None and 
+                      expert_idx >= self.n_routed_experts and
+                      self.zero_expert_type == "identity"):
+                    # Zero expert with identity
+                    token_output = token_output + weight * token_input.squeeze(0)
+            
+            token_outputs.append(token_output.squeeze(0))
+        
+        # Stack all token outputs
+        final_output = mx.stack(token_outputs, axis=0)
+        
+        return final_output.reshape(*orig_shape).astype(hidden_states.dtype)
 
 
 class LongcatFlashDecoderLayer(nn.Module):
