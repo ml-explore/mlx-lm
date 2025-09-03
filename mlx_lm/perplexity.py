@@ -135,6 +135,7 @@ def main():
     args = parser.parse_args()
 
     # Set random seed
+    np.random.seed(args.seed)
     mx.random.seed(args.seed)
 
     # Load model
