@@ -135,6 +135,8 @@ def linear_to_lora_layers(
             keys.add("mlp.shared_expert_gate")
         if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
+        if model.model_type in ["longcat_flash"]:
+            keys.add("mlp.router.classifier")
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
