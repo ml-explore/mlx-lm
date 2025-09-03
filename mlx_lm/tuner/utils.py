@@ -125,6 +125,7 @@ def linear_to_lora_layers(
         "gpt_oss",
         "ernie4_5_moe",
         "granitemoe",
+        "seed_oss",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
