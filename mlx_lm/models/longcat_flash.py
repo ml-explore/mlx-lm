@@ -8,6 +8,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+from .deepseek_v3 import DeepseekV3YarnRotaryEmbedding
 
 
 @dataclass
@@ -39,85 +40,6 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool = False
     router_bias: bool = False
     rope_scaling: Dict = None
-
-
-def yarn_find_correction_dim(
-    num_rotations, dim, base=10000, max_position_embeddings=2048
-):
-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
-        2 * math.log(base)
-    )
-
-
-def yarn_find_correction_range(
-    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
-):
-    low = math.floor(
-        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
-    )
-    high = math.ceil(
-        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
-    )
-    return max(low, 0), min(high, dim - 1)
-
-
-def yarn_get_mscale(scale=1, mscale=1):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def yarn_linear_ramp_mask(min_val, max_val, dim):
-    if min_val == max_val:
-        max_val += 0.001  # Prevent singularity
-
-    linear_func = (mx.arange(dim, dtype=mx.float32) - min_val) / (max_val - min_val)
-    return mx.clip(linear_func, 0, 1)
-
-
-class DeepseekV3YarnRotaryEmbedding(nn.Module):
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        scaling_factor=1.0,
-        original_max_position_embeddings=4096,
-        beta_fast=32,
-        beta_slow=1,
-        mscale=1,
-        mscale_all_dim=0,
-    ):
-        super().__init__()
-        self.mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
-            scaling_factor, mscale_all_dim
-        )
-        freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-        freq_inter = scaling_factor * freq_extra
-        low, high = yarn_find_correction_range(
-            beta_fast,
-            beta_slow,
-            dim,
-            base,
-            original_max_position_embeddings,
-        )
-        freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2)
-        self._freqs = (freq_inter * freq_extra) / (
-            freq_inter * freq_mask + freq_extra * (1 - freq_mask)
-        )
-
-    def __call__(self, x, offset=0):
-        if self.mscale != 1.0:
-            x = self.mscale * x
-        return mx.fast.rope(
-            x,
-            x.shape[-1],
-            traditional=True,
-            base=None,
-            scale=1.0,
-            offset=offset,
-            freqs=self._freqs,
-        )
 
 
 class LongcatFlashMLA(nn.Module):
