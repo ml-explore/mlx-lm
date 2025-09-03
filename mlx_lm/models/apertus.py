@@ -16,6 +16,7 @@ class ModelArgs(BaseModelArgs):
     hidden_size: int
     num_hidden_layers: int
     intermediate_size: int
+    mlp_bias: bool
     num_attention_heads: int
     attention_bias: bool
     rms_norm_eps: float
@@ -23,24 +24,49 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: int
     max_position_embeddings: int
     rope_theta: float
-    head_dim: int
+    post_norm: bool
+    qk_norm: bool
     tie_word_embeddings: bool
+    rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
-@mx.compile
-def xielu(x: mx.array, alpha=1.0, beta=1.0) -> mx.array:
-    return mx.where(x > 0, x, alpha * (mx.exp(beta * x) - 1))
+class XieLU(nn.Module):
+    def __init__(
+        self,
+        alpha_p_init=0.8,
+        alpha_n_init=0.8,
+        beta=0.5,
+        eps=-1e-6,
+    ):
+        super().__init__()
+        alpha_p_tensor = mx.array([alpha_p_init])
+        alpha_n_tensor = mx.array([alpha_n_init - beta])
+        self.alpha_p = mx.log(mx.exp(alpha_p_tensor) - 1)
+        self.alpha_n = mx.log(mx.exp(alpha_n_tensor) - 1)
+        
+        self.beta = mx.array(beta)
+        self.eps = mx.array(eps)
+    
+    def __call__(self, x: mx.array) -> mx.array:
+        alpha_p = nn.softplus(self.alpha_p)
+        alpha_n = self.beta + nn.softplus(self.alpha_n)
+        return mx.where(
+            x > 0,
+            alpha_p * x * x + self.beta * x,
+            (mx.expm1(mx.min(x, self.eps)) - x) * alpha_n + self.beta * x,
+        )
 
 
 class ApertusMLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
+        self.act_fn = XieLU()
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.xielu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.act_fn(self.up_proj(x)))
     
 
 class ApertusAttention(nn.Module):
@@ -49,23 +75,23 @@ class ApertusAttention(nn.Module):
         self.num_attention_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
 
-        self.head_dim = args.head_dim
-        self.scale = args.head_dim**-0.5
+        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * args.head_dim, bias=False)
-        self.k_proj = nn.Linear(args.hidden_size, args.num_key_value_heads * args.head_dim, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, args.num_key_value_heads * args.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads * args.head_dim, args.hidden_size, bias=False)
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
 
-        self.q_norm = nn.RMSNorm(args.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(args.head_dim, eps=args.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
         self.rope = initialize_rope(
             self.head_dim,
-            base=args.rope_theta,
-            traditional=False,
-            scaling_config=args.rope_scaling,
-            max_position_embeddings=args.max_position_embeddings,
+            args.rope_theta,
+            args.rope_traditional,
+            args.rope_scaling,
+            args.max_position_embeddings,
         )
 
     def __call__(
@@ -99,7 +125,7 @@ class ApertusDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.self_attn = ApertusAttention(args)
-        self.mlp = ApertusMLP(args.hidden_size, args.intermediate_size)
+        self.mlp = ApertusMLP(args)
 
         self.attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.feedforward_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -110,10 +136,8 @@ class ApertusDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.self_attn(self.attention_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.feedforward_layernorm(h))
-        out = h + r
+        h = x + self.self_attn(self.attention_layernorm(x), mask, cache)
+        out = h + self.mlp(self.feedforward_layernorm(h))
         return out
 
 
