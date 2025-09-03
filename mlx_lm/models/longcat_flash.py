@@ -6,7 +6,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask
-from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 from .deepseek_v3 import DeepseekV3YarnRotaryEmbedding
 
