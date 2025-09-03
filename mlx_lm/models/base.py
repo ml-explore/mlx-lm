@@ -35,7 +35,7 @@ def create_causal_mask(
     rinds = rinds[None]
     mask = linds >= rinds
     if window_size is not None:
-        mask = mask & (linds <= rinds + window_size)
+        mask = mask & (linds < rinds + window_size)
     if lengths is not None:
         lengths = lengths[:, None, None, None]
         mask = mask & (rinds < lengths)
