@@ -1,13 +1,12 @@
-from typing import Optional, Any, Tuple, Dict
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
-from .deepseek_v3 import DeepseekV3YarnRotaryEmbedding, yarn_get_mscale
 
 
 @dataclass
@@ -38,7 +37,6 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     norm_topk_prob: bool = False
     router_bias: bool = False
-    rope_scaling: Dict = None
 
 
 class LongcatFlashMLA(nn.Module):
@@ -55,11 +53,21 @@ class LongcatFlashMLA(nn.Module):
         self.scale = self.qk_head_dim**-0.5
 
         if self.q_lora_rank is None:
-            self.q_proj = nn.Linear(args.hidden_size, self.num_attention_heads * self.qk_head_dim, bias=False)
+            self.q_proj = nn.Linear(
+                args.hidden_size,
+                self.num_attention_heads * self.qk_head_dim,
+                bias=False,
+            )
         else:
-            self.q_a_proj = nn.Linear(args.hidden_size, self.q_lora_rank, bias=args.attention_bias)
+            self.q_a_proj = nn.Linear(
+                args.hidden_size, self.q_lora_rank, bias=args.attention_bias
+            )
             self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank)
-            self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_attention_heads * self.qk_head_dim, bias=False)
+            self.q_b_proj = nn.Linear(
+                self.q_lora_rank,
+                self.num_attention_heads * self.qk_head_dim,
+                bias=False,
+            )
 
         self.kv_a_proj_with_mqa = nn.Linear(
             args.hidden_size,
@@ -84,37 +92,9 @@ class LongcatFlashMLA(nn.Module):
         if args.mla_scale_kv_lora:
             self.mla_scale_kv_lora = (args.hidden_size / self.kv_lora_rank) ** 0.5
 
-        if args.rope_scaling is not None:
-            mscale_all_dim = args.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = args.rope_scaling["factor"]
-            if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.scale = self.scale * mscale * mscale
-
-            rope_kwargs = {
-                key: args.rope_scaling[key]
-                for key in [
-                    "original_max_position_embeddings",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                ]
-                if key in args.rope_scaling
-            }
-            self.rope = DeepseekV3YarnRotaryEmbedding(
-                dim=self.qk_rope_head_dim,
-                max_position_embeddings=args.max_position_embeddings,
-                scaling_factor=scaling_factor,
-                base=args.rope_theta,
-                **rope_kwargs,
-            )
-        else:
-            self.rope = nn.RoPE(
-                dims=self.qk_rope_head_dim,
-                base=args.rope_theta,
-                traditional=True
-            )
+        self.rope = nn.RoPE(
+            dims=self.qk_rope_head_dim, base=args.rope_theta, traditional=True
+        )
 
     def __call__(
         self,
@@ -123,18 +103,18 @@ class LongcatFlashMLA(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        
+
         if self.q_lora_rank is None:
             q_states = self.q_proj(x)
         else:
             q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
-        
+
         q_states = q_states.reshape(B, L, -1, self.qk_head_dim).transpose(0, 2, 1, 3)
-        q_pass, q_rot = mx.split(q_states, [self.qk_nope_head_dim], axis=-1)
 
         if self.mla_scale_q_lora is not None:
-            q_pass = q_pass * self.mla_scale_q_lora
-            q_rot = q_rot * self.mla_scale_q_lora
+            q_states = q_states * self.mla_scale_q_lora
+
+        q_pass, q_rot = mx.split(q_states, [self.qk_nope_head_dim], axis=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(x)
         k_pass, k_rot = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
@@ -165,12 +145,12 @@ class LongcatFlashMLA(nn.Module):
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
 
         attn_output = scaled_dot_product_attention(
-            query_states, 
-            key_states, 
-            value_states, 
-            cache=cache, 
-            scale=self.scale, 
-            mask=mask
+            query_states,
+            key_states,
+            value_states,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
         )
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -181,7 +161,7 @@ class LongcatFlashMLP(nn.Module):
     def __init__(self, args: ModelArgs, is_expert: bool = False):
         super().__init__()
         hidden_size = args.expert_ffn_hidden_size if is_expert else args.ffn_hidden_size
-        
+
         self.gate_proj = nn.Linear(args.hidden_size, hidden_size, bias=False)
         self.up_proj = nn.Linear(args.hidden_size, hidden_size, bias=False)
         self.down_proj = nn.Linear(hidden_size, args.hidden_size, bias=False)
@@ -195,39 +175,35 @@ class LongcatFlashTopkRouter(nn.Module):
         super().__init__()
         self.config = args
         self.top_k = args.moe_topk
-        self.n_routed_experts = (
-            args.n_routed_experts
-            if args.zero_expert_num is None
-            else args.n_routed_experts + args.zero_expert_num
-        )
+        self.n_routed_experts = args.n_routed_experts + args.zero_expert_num
         self.routed_scaling_factor = args.routed_scaling_factor
         self.norm_topk_prob = args.norm_topk_prob
         self.router_bias = args.router_bias
 
-        self.classifier = nn.Linear(args.hidden_size, self.n_routed_experts, bias=self.router_bias)
+        self.classifier = nn.Linear(
+            args.hidden_size, self.n_routed_experts, bias=self.router_bias
+        )
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, hidden_states: mx.array) -> Tuple[mx.array, mx.array]:
-        hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
-        router_logits = self.classifier(hidden_states.astype(mx.float32))
-        scores = mx.softmax(router_logits, axis=-1)
-        
-        # Use argsort in descending order to get indices
-        # argsort gives ascending order, so we negate the scores to get descending order
-        sorted_indices = mx.argsort(-scores, axis=-1)  # Negative scores for descending order
-        topk_indices = sorted_indices[..., :self.top_k]  # Take first k (which are the largest due to negation)
-        
-        # Gather the corresponding weights using advanced indexing
-        batch_indices = mx.arange(topk_indices.shape[0])[:, None]
-        topk_weights = scores[batch_indices, topk_indices]
-        
+        router_logits = self.classifier(hidden_states)
+        dtype = router_logits.dtype
+        scores = router_logits.astype(mx.float32)
+        scores = mx.softmax(scores, axis=-1)
+
+        corrected_scores = scores + self.e_score_correction_bias
+        topk_indices = mx.argpartition(corrected_scores, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]
+        topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
+
         if self.norm_topk_prob:
             denominator = mx.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
             topk_weights = topk_weights / denominator
-            
+
         topk_weights = topk_weights * self.routed_scaling_factor
-        
-        return topk_indices, topk_weights
+
+        return topk_indices, topk_weights.astype(dtype)
 
 
 class LongcatFlashMoE(nn.Module):
@@ -238,39 +214,36 @@ class LongcatFlashMoE(nn.Module):
         self.n_routed_experts = args.n_routed_experts
         self.zero_expert_num = args.zero_expert_num
         self.zero_expert_type = args.zero_expert_type
-        
+
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             args.expert_ffn_hidden_size,
             args.n_routed_experts,
         )
-        
+
         self.router = LongcatFlashTopkRouter(args)
-        
+
     def __call__(self, hidden_states):
-        orig_shape = hidden_states.shape
-        hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-        
-        topk_indices, topk_weights = self.router(hidden_states_flat)
-        
+
+        topk_indices, topk_weights = self.router(hidden_states)
+
         # Process all regular experts at once
-        regular_mask = topk_indices < self.n_routed_experts
-        inputs_expanded = mx.tile(hidden_states_flat[:, None, :], (1, self.num_experts_per_tok, 1))
-        regular_outputs = self.switch_mlp(inputs_expanded, topk_indices[..., None]).squeeze(-2)
-        
-        # Zero out invalid experts and apply weights
-        regular_outputs = mx.where(regular_mask[..., None], regular_outputs, 0.0)
+        mask = topk_indices >= self.n_routed_experts
+        topk_indices = mx.where(mask, 0, topk_indices)
+        regular_weights = mx.where(mask, 0.0, topk_weights)
+
+        regular_outputs = self.switch_mlp(hidden_states, topk_indices)
+
         weighted_outputs = regular_outputs * topk_weights[..., None]
-        
+
         # Add identity expert contribution if needed
-        if self.zero_expert_num is not None and self.zero_expert_type == "identity":
-            identity_mask = topk_indices >= self.n_routed_experts
-            identity_weights = mx.where(identity_mask, topk_weights, 0.0)
-            identity_outputs = inputs_expanded * identity_weights[..., None]
-            weighted_outputs = weighted_outputs + identity_outputs
-        
-        final_output = mx.sum(weighted_outputs, axis=1)
-        return final_output.reshape(*orig_shape).astype(hidden_states.dtype)
+        assert self.zero_expert_type == "identity"
+        identity_weights = mx.where(mask, topk_weights, 0.0)
+        identity_outputs = hidden_states[..., None, :] * identity_weights[..., None]
+        weighted_outputs = weighted_outputs + identity_outputs
+
+        final_output = mx.sum(weighted_outputs, axis=-2)
+        return final_output
 
 
 class LongcatFlashDecoderLayer(nn.Module):
@@ -282,12 +255,10 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.self_attn = [LongcatFlashMLA(args) for _ in range(2)]
         self.mlps = [LongcatFlashMLP(args, False) for _ in range(2)]
         self.input_layernorm = [
-            nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps) 
-            for _ in range(2)
+            nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps) for _ in range(2)
         ]
         self.post_attention_layernorm = [
-            nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps) 
-            for _ in range(2)
+            nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps) for _ in range(2)
         ]
 
     def __call__(
@@ -298,7 +269,7 @@ class LongcatFlashDecoderLayer(nn.Module):
     ) -> mx.array:
         hidden_states = x
         shortcut_mlp_output = None
-        
+
         for i in range(2):
             residual = hidden_states
 
@@ -314,7 +285,7 @@ class LongcatFlashDecoderLayer(nn.Module):
 
             hidden_states = self.mlps[i](hidden_states)
             hidden_states = residual + hidden_states
-            
+
             if i == 1:
                 hidden_states = hidden_states + shortcut_mlp_output
 
@@ -326,10 +297,7 @@ class LongcatFlashModel(nn.Module):
         super().__init__()
         self.num_layers = args.num_layers
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [
-            LongcatFlashDecoderLayer(args)
-            for idx in range(args.num_layers)
-        ]
+        self.layers = [LongcatFlashDecoderLayer(args) for idx in range(args.num_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
 
     def __call__(
@@ -345,10 +313,10 @@ class LongcatFlashModel(nn.Module):
 
         if cache is None:
             cache = [None] * self.num_layers
-        
+
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
-        
+
         return self.norm(h)
 
 
@@ -372,7 +340,23 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
-    
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("classifier"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate
+
     def sanitize(self, weights):
         for l in range(self.args.num_layers):
             prefix = f"model.layers.{l}"
@@ -384,4 +368,10 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-        return weights
+
+        new_weights = {}
+        for k, v in weights.items():
+            if k.startswith("model.mtp"):
+                continue
+            new_weights[k] = v
+        return new_weights
