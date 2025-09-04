@@ -157,7 +157,12 @@ def linear_to_lora_layers(
         keys = {"norm_attn_norm.attn.Wqkv", "ffn.router.layer"}
     elif model.model_type == "internlm2":
         keys = {"attention.wqkv", "attention.wo"}
-    elif model.model_type in {"deepseek_v2", "deepseek_v3", "longcat_flash", "minicpm3"}:
+    elif model.model_type in {
+        "deepseek_v2",
+        "deepseek_v3",
+        "longcat_flash",
+        "minicpm3",
+    }:
         keys = {
             "self_attn.q_proj",
             "self_attn.q_a_proj",
