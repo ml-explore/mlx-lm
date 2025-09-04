@@ -11,7 +11,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .cache import KVCache, MambaCache
 
 
-@dataclass(kw_only=True)
+@dataclass()
 class ModelArgs(BaseModelArgs):
     model_type: str
     vocab_size: int
@@ -20,7 +20,6 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     max_position_embeddings: int
     num_attention_heads: int
-    head_dim: int
     num_key_value_heads: int
     attention_bias: bool
     mamba_num_heads: int
@@ -36,6 +35,7 @@ class ModelArgs(BaseModelArgs):
     use_bias: bool
     use_conv_bias: bool
     residual_in_fp32: bool
+    head_dim: Optional[int] = None
     hybrid_override_pattern: Optional[List[str]] = None
 
 
@@ -196,7 +196,11 @@ class NemotronHAttention(nn.Module):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.num_heads = args.num_attention_heads
-        self.head_dim = args.head_dim
+        self.head_dim = (
+            args.head_dim
+            if args.head_dim is not None
+            else (args.hidden_size // args.num_attention_heads)
+        )
         self.num_key_value_heads = args.num_key_value_heads
         self.scale = self.head_dim**-0.5
 
@@ -323,7 +327,9 @@ class NemotronHModel(nn.Module):
         hidden_states = self.embeddings(inputs)
 
         if mask is None:
-            attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx : self.fa_idx + 1])
+            attn_mask = create_attention_mask(
+                hidden_states, cache[self.fa_idx : self.fa_idx + 1]
+            )
 
         if cache is None:
             cache = [None] * len(self.layers)
