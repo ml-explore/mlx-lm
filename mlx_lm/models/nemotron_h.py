@@ -20,6 +20,7 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     max_position_embeddings: int
     num_attention_heads: int
+    head_dim: int
     num_key_value_heads: int
     attention_bias: bool
     mamba_num_heads: int
@@ -195,7 +196,7 @@ class NemotronHAttention(nn.Module):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.num_heads = args.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = args.head_dim
         self.num_key_value_heads = args.num_key_value_heads
         self.scale = self.head_dim**-0.5
 
@@ -322,9 +323,7 @@ class NemotronHModel(nn.Module):
         hidden_states = self.embeddings(inputs)
 
         if mask is None:
-            attn_mask = create_attention_mask(
-                hidden_states, cache[self.fa_idx : self.fa_idx + 1]
-            )
+            attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx : self.fa_idx + 1])
 
         if cache is None:
             cache = [None] * len(self.layers)
