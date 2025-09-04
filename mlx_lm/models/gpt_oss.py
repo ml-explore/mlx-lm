@@ -276,7 +276,6 @@ class GptOssMoeModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
@@ -288,15 +287,12 @@ class GptOssMoeModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            masks = [
-                l.self_attn.get_mask(
-                    x, c, self.window_size if lt == "sliding_attention" else None
-                )
-                for (l, c, lt) in zip(self.layers, cache, self.layer_types)
-            ]
-        else:
-            masks = [mask] * len(self.layers)
+        masks = [
+            l.self_attn.get_mask(
+                x, c, self.window_size if lt == "sliding_attention" else None
+            )
+            for (l, c, lt) in zip(self.layers, cache, self.layer_types)
+        ]
 
         for i, (layer, c, m) in enumerate(zip(self.layers, cache, masks)):
             x = layer(x, m, c)
@@ -312,8 +308,8 @@ class Model(nn.Module):
         self.model = GptOssMoeModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, mask: mx.array = None, cache=None):
-        return self.lm_head(self.model(inputs, mask, cache))
+    def __call__(self, inputs: mx.array, cache=None):
+        return self.lm_head(self.model(inputs, cache))
 
     def sanitize(self, weights):
         if any("gate_proj.weight" in k for k in weights.keys()):

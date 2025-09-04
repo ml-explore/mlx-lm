@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
+from .base import create_causal_mask
+
 
 def make_prompt_cache(
     model: nn.Module,
@@ -106,6 +108,17 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def create_attention_mask(
+    N: int, offset: int, return_array: bool, window_size: Optional[int]
+):
+    if N == 1:
+        return None
+    if return_array:
+        return create_causal_mask(N, offset, window_size=window_size)
+    else:
+        return "causal"
+
+
 class _BaseCache:
     @property
     def state(self):
@@ -169,6 +182,9 @@ class ConcatenateKVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
 
 
 class QuantizedKVCache(_BaseCache):
@@ -252,6 +268,9 @@ class QuantizedKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
 
 class KVCache(_BaseCache):
     def __init__(self):
@@ -316,6 +335,9 @@ class KVCache(_BaseCache):
                 self.values, group_size=group_size, bits=bits
             )
         return quant_cache
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
 
 
 class RotatingKVCache(_BaseCache):
@@ -459,6 +481,29 @@ class RotatingKVCache(_BaseCache):
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("RotatingKVCache Quantization NYI")
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        if N > 1:
+            window_size = window_size or self.max_size
+            offset = min(self.max_size, self.offset)
+            if offset + N > window_size or return_array:
+                return create_causal_mask(N, offset, window_size=window_size)
+            else:
+                return "causal"
+        else:
+            if window_size is None:
+                return None
+            # May need a mask for when window_size < max_size
+            if self.offset >= window_size and self.max_size > window_size:
+                idx = self._idx
+                if idx >= self.max_size:
+                    idx = 0
+                mask_size = min(self.max_size, self.offset)
+                mask = mx.arange(mask_size) >= (mask_size - window_size)
+                mask = mx.roll(mask, shift=idx + 1)
+                return mask[:, None]
 
 
 class ArraysCache(_BaseCache):

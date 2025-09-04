@@ -140,7 +140,6 @@ def group_expert_select(
     orig_scores = scores
     scores = scores + e_score_correction_bias
     if n_group > 1:
-        k = top_k
         scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
         group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
         k = n_group - topk_group
@@ -262,15 +261,13 @@ class LanguageModel(nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = self.embed_tokens(x)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * self.num_layers
+
+        mask = create_attention_mask(h, cache[0])
 
         for i in range(self.num_layers):
             h = self.layers[self.start_idx + i](h, mask, cache[i])
@@ -290,9 +287,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     def sanitize(self, weights):

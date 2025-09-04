@@ -8,6 +8,7 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step
+from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     CacheList,
     ChunkedKVCache,
@@ -322,6 +323,100 @@ class TestPromptCache(unittest.TestCase):
 
         c = CacheList(MambaCache(), KVCache())
         self.assertFalse(c.is_trimmable())
+
+    def test_make_mask_with_cache(self):
+        # For 1 time step with no cache, don't need a mask
+        mask = create_attention_mask(mx.zeros((1, 1)), cache=None, return_array=False)
+        self.assertEqual(mask, None)
+
+        mask = create_attention_mask(mx.zeros((1, 1)), cache=None, return_array=True)
+        self.assertEqual(mask, None)
+
+        # Regular causal mask
+        mask = create_attention_mask(mx.zeros((1, 4)), cache=None, return_array=False)
+        self.assertEqual(mask, "causal")
+
+        mask = create_attention_mask(mx.zeros((1, 4)), cache=None, return_array=True)
+        self.assertTrue(mx.array_equal(mask, create_causal_mask(4)))
+
+        # With a window size
+        mask = create_attention_mask(
+            mx.zeros((1, 4)), cache=None, window_size=4, return_array=False
+        )
+        self.assertEqual(mask, "causal")
+
+        mask = create_attention_mask(
+            mx.zeros((1, 4)), cache=None, window_size=3, return_array=False
+        )
+        self.assertTrue(mx.array_equal(mask, create_causal_mask(4, window_size=3)))
+
+        # With a regular KV cache
+        cache = KVCache()
+        mask = create_attention_mask(mx.zeros((1, 4)), cache=cache, return_array=False)
+        self.assertEqual(mask, "causal")
+
+        mask = create_attention_mask(mx.zeros((1, 4)), cache=cache, return_array=True)
+        self.assertTrue(mx.array_equal(mask, create_causal_mask(4)))
+
+        k = v = mx.zeros((1, 2, 16, 8))
+        cache.update_and_fetch(k, v)
+        mask = create_attention_mask(mx.zeros((1, 4)), cache=cache, return_array=True)
+        self.assertEqual(mask.shape, (4, 20))
+
+    def test_rotating_cache_mask(self):
+        cache = RotatingKVCache(max_size=8)
+
+        mask = cache.make_mask(4, window_size=5)
+        self.assertEqual(mask, "causal")
+        mask = create_attention_mask(mx.zeros((1, 4, 32)), cache, window_size=5)
+        self.assertEqual(mask, "causal")
+        mask = create_attention_mask(
+            mx.zeros((1, 4, 32)), cache, window_size=5, return_array=True
+        )
+        self.assertEqual(mask.dtype, mx.bool_)
+        self.assertEqual(mask.shape, (4, 4))
+
+        mask = cache.make_mask(6, window_size=5)
+        self.assertEqual(mask.dtype, mx.bool_)
+        self.assertEqual(mask.sum(axis=-1).max(), 5)
+        cmask = create_attention_mask(mx.zeros((1, 6, 32)), cache, window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
+
+        mask = cache.make_mask(1, window_size=5)
+        self.assertEqual(mask, None)
+        mask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
+        self.assertEqual(mask, None)
+
+        kv = mx.zeros((1, 1, 10, 32))
+        cache.update_and_fetch(kv, kv)
+        mask = cache.make_mask(3, window_size=5)
+        self.assertEqual(mask.shape, (3, 11))
+        self.assertTrue(mx.all(mask.sum(axis=-1) == 5))
+        for i in range(3):
+            s = 11 - 3 + i
+            self.assertTrue(mx.all(mask[s - 5 : s]))
+        cmask = create_attention_mask(mx.zeros((1, 3, 32)), cache, window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
+
+        mask = cache.make_mask(1)
+        self.assertEqual(mask, None)
+        mask = create_attention_mask(mx.zeros((1, 1, 32)), cache)
+        self.assertEqual(mask, None)
+
+        mask = cache.make_mask(1, window_size=5)
+        self.assertEqual(mask.squeeze(1).tolist(), [True] + [False] * 3 + [True] * 4)
+        cmask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
+
+        kv = mx.zeros((1, 1, 1, 32))
+        cache.update_and_fetch(kv, kv)
+
+        mask = cache.make_mask(1, window_size=5)
+        self.assertEqual(
+            mask.squeeze(1).tolist(), [True] * 2 + [False] * 3 + [True] * 3
+        )
+        cmask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
+        self.assertTrue(mx.array_equal(cmask, mask))
 
 
 if __name__ == "__main__":

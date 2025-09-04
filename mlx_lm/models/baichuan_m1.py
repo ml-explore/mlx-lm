@@ -96,7 +96,10 @@ class Attention(nn.Module):
         k = k.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        if cache is not None:
+        if cache is None:
+            cache = (None, None)
+
+        if cache[0] is not None:
             offset = cache[1].offset
             last_k, last_v = cache[0][0], cache[0][1]
         else:
@@ -110,7 +113,7 @@ class Attention(nn.Module):
         q = self.rope(q, offset=offset)
         k = self.rope(k, offset=offset)
 
-        if cache is not None:
+        if cache[0] is not None:
             k, v = cache[1].update_and_fetch(k, v)
             if L > 0:
                 cache[0][0] = k_init[:, :, -1:, :]
@@ -167,17 +170,40 @@ class BaichuanModel(nn.Module):
         self.layers = [DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(
-        self, inputs: mx.array, mask: mx.array = None, cache: Any = None
-    ) -> mx.array:
+        self.sliding_window = config.sliding_window
+        self.first_swa_idx = None
+        if config.sliding_window_layers:
+            self.first_swa_idx = config.sliding_window_layers[0]
+
+        self.first_global_idx = None
+        self.swa_layers = set(config.sliding_window_layers)
+        for i in range(config.num_hidden_layers):
+            if i in self.swa_layers:
+                continue
+            self.first_global_idx = i
+            break
+
+    def __call__(self, inputs: mx.array, cache: Any = None) -> mx.array:
         x = self.embed_tokens(inputs)
-        if mask is None:
-            if cache is not None:
-                c = [cache[0][1]]
-            mask = create_attention_mask(x, c)
+
         if cache is None:
-            cache = [None] * len(self.layers)
-        for layer, c in zip(self.layers, cache):
+            cache = [(None, None)] * len(self.layers)
+
+        if self.first_global_idx is None:
+            c_global = None
+        else:
+            c_global = cache[self.first_global_idx][1]
+
+        if self.first_swa_idx is None:
+            c_swa = None
+        else:
+            c_swa = cache[self.first_swa_idx][1]
+
+        global_mask = create_attention_mask(x, c_global)
+        swa_mask = create_attention_mask(x, c_swa, window_size=self.sliding_window)
+
+        for l, (layer, c) in enumerate(zip(self.layers, cache)):
+            mask = swa_mask if l in self.swa_layers else global_mask
             x = layer(x, mask, c)
         return self.norm(x)
 
@@ -215,10 +241,8 @@ class Model(nn.Module):
             weights["lm_head.weight"] = w
         return weights
 
-    def __call__(
-        self, inputs: mx.array, mask: mx.array = None, cache: Any = None
-    ) -> mx.array:
-        outputs = self.model(inputs, mask, cache)
+    def __call__(self, inputs: mx.array, cache: Any = None) -> mx.array:
+        outputs = self.model(inputs, cache)
         return self.lm_head(outputs)
 
     @property

@@ -225,13 +225,13 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim, bias=args.mlp_bias)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=args.mlp_bias)
 
-        try:
-            self.act_fn = _ACT2FN[args.hidden_act]
-        except KeyError:
+        self.act_fn = args.hidden_act
+        if self.act_fn not in _ACT2FN:
             raise ValueError(f"Unknown activation function: {args.hidden_act}")
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        act_fn = _ACT2FN[self.act_fn]
+        return self.down_proj(act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class LinearSubblockReplacement(nn.Module):
@@ -333,19 +333,17 @@ class NemotronNASModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[List[Any]] = None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
 
-        for i, layer in enumerate(self.layers):
-            h = layer(h, mask, cache=cache[i])
+        mask = create_attention_mask(h, cache[0])
+
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, cache=c)
 
         return self.norm(h)
 
@@ -365,10 +363,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask=None,
         cache=None,
     ):
-        out = self.model(inputs, mask=mask, cache=cache)
+        out = self.model(inputs, cache=cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
