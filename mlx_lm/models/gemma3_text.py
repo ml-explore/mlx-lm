@@ -160,6 +160,8 @@ class Gemma3Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        self.window_size = args.sliding_window
+        self.sliding_window_pattern = args.sliding_window_pattern
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
         assert self.vocab_size > 0
@@ -173,7 +175,6 @@ class Gemma3Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
@@ -186,24 +187,20 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            j = self.args.sliding_window_pattern
-            full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
+        global_mask = create_attention_mask(h, cache[0])
+
+        sliding_window_mask = create_attention_mask(
+            h,
+            cache[self.sliding_window_pattern - 1],
+            window_size=self.window_size,
+        )
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
-                i % self.args.sliding_window_pattern
-                == self.args.sliding_window_pattern - 1
+                i % self.sliding_window_pattern == self.sliding_window_pattern - 1
             )
-
-            local_mask = mask
-            if mask is None and is_global:
-                local_mask = full_mask
-            elif mask is None:
-                local_mask = sliding_window_mask
-
-            h = layer(h, local_mask, c)
+            mask = global_mask if is_global else sliding_window_mask
+            h = layer(h, mask, c)
 
         return self.norm(h)
 
@@ -221,10 +218,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-        mask: Optional[mx.array] = None,
         input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache, input_embeddings)
+        out = self.model(inputs, cache, input_embeddings)
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

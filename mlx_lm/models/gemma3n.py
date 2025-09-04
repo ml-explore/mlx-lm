@@ -151,9 +151,6 @@ class Gemma3nAttention(nn.Module):
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
 
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[:, : keys.shape[-2]]
-
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
@@ -273,12 +270,11 @@ class Gemma3nAltUp(nn.Module):
             )
 
         all_coefs = self.correction_coefs(modalities) + 1.0
-
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
 
-        all_coefs = all_coefs.transpose(2, 1, 0)
-        corrected = innovation[None] * all_coefs[:, None]
+        all_coefs = all_coefs.moveaxis(2, 0)
+        corrected = innovation[None] * all_coefs[..., None]
         corrected += predictions
 
         return corrected.astype(activated.dtype)
@@ -310,7 +306,6 @@ class Gemma3nDecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
         self.is_sliding = self.self_attn.is_sliding
-        self.sliding_window = config.sliding_window
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
@@ -355,7 +350,6 @@ class Gemma3nDecoderLayer(nn.Module):
         attn_ffw = self.mlp(attn_norm)
         attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
         attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
-
         corrected_predictions = self.altup.correct(predictions, attn_ffw_laurel_gated)
 
         first_prediction = corrected_predictions[self.config.altup_active_idx]
@@ -437,10 +431,11 @@ class LanguageModel(nn.Module):
             eps=config.rms_norm_eps,
         )
 
-        self.first_sliding_idx = self.config.layer_types.index("sliding_attention")
-        self.first_full_idx = self.config.layer_types.index("full_attention")
+        self.first_sliding_idx = config.layer_types.index("sliding_attention")
+        self.first_full_idx = config.layer_types.index("full_attention")
+        self.sliding_window = config.sliding_window
 
-        concrete_layers = self.config.layer_types[: self.first_kv_shared_layer_idx]
+        concrete_layers = config.layer_types[: self.first_kv_shared_layer_idx]
         shared_full_idx = (
             len(concrete_layers) - 1 - concrete_layers[::-1].index("full_attention")
         )
@@ -463,7 +458,6 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array = None,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: mx.array = None,
     ):
@@ -476,17 +470,17 @@ class LanguageModel(nn.Module):
         per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
         if cache is None:
-            cache = self.make_cache()
+            cache = [None] * len(self.layers)
 
-        if mask is None:
-            full_mask = create_attention_mask(
-                h,
-                cache[self.first_full_idx :],
-            )
-            sliding_window_mask = create_attention_mask(
-                h,
-                cache[self.first_sliding_idx :],
-            )
+        global_mask = create_attention_mask(
+            h,
+            cache[self.first_full_idx],
+        )
+        sliding_window_mask = create_attention_mask(
+            h,
+            cache[self.first_sliding_idx],
+            window_size=self.sliding_window,
+        )
         h0 = h
 
         # Expand hidden_states to support per-layer inputs
@@ -497,21 +491,19 @@ class LanguageModel(nn.Module):
         h = mx.stack(h_list, axis=0)
         mags = mx.mean(h[1:] ** 2, axis=-1, keepdims=True) ** 0.5
         h[1:] = h[1:] * (target_magnitude / mx.maximum(mags, mx.finfo(h0.dtype).min))
-
         for i, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
             is_global = self.config.layer_types[i] == "full_attention"
 
-            local_mask = mask
-            if mask is None and is_global:
-                local_mask = full_mask
-            elif mask is None:
-                local_mask = sliding_window_mask
+            if is_global:
+                mask = global_mask
+            else:
+                mask = sliding_window_mask
 
             h = layer(
                 h,
-                local_mask,
+                mask,
                 cache[self.layer_idx_to_cache_idx[i]],
                 per_layer_input,
             )
@@ -582,11 +574,10 @@ class Gemma3n(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-        mask: Optional[mx.array] = None,
         input_embeddings: Optional[mx.array] = None,
     ):
         return self.language_model(
-            inputs, cache=cache, mask=mask, input_embeddings=input_embeddings
+            inputs, cache=cache, input_embeddings=input_embeddings
         )
 
     def make_cache(self):
@@ -598,17 +589,15 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model = Gemma3n(args)
+        self.model_type = args.model_type
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
-        mask: Optional[mx.array] = None,
         input_embeddings: Optional[mx.array] = None,
     ):
-        return self.model(
-            inputs, cache=cache, mask=mask, input_embeddings=input_embeddings
-        )
+        return self.model(inputs, cache=cache, input_embeddings=input_embeddings)
 
     def sanitize(self, weights):
         weights = tree_unflatten(list(weights.items()))

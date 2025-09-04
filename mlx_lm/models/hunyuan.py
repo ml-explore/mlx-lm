@@ -259,17 +259,14 @@ class HunYuanModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
 
+        mask = create_attention_mask(h, cache[0])
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             if (not self.args.use_cla) or i % self.args.cla_share_factor == 0:
                 shared_kv_states = None
@@ -288,10 +285,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         return self.model.embed_tokens.as_linear(out)
 
     def sanitize(self, weights):

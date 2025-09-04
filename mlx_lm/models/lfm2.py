@@ -217,7 +217,6 @@ class Lfm2Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
@@ -226,13 +225,10 @@ class Lfm2Model(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
-        if mask is None:
-            first_attn_idx = self.args.full_attn_idxs[0]
-            c = [cache[first_attn_idx]] if cache is not None else None
-            mask = create_attention_mask(h, c)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[self.args.full_attn_idxs[0]])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -250,11 +246,10 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache, input_embeddings)
+        out = self.model(inputs, cache, input_embeddings)
         return self.model.embed_tokens.as_linear(out)
 
     def sanitize(self, weights):

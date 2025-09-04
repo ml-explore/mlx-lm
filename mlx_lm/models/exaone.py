@@ -123,15 +123,14 @@ class ExaoneModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.wte(inputs)
-        if mask is None:
-            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.h)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.h, cache):
             h = layer(h, mask, cache=c)
@@ -151,10 +150,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.transformer(inputs, mask, cache)
+        out = self.transformer(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.transformer.wte.as_linear(out)
         else:

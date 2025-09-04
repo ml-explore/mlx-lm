@@ -83,11 +83,6 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        if self.use_sliding_window and isinstance(mask, mx.array):
-            key_len = keys.shape[-2]
-            if mask.shape[-1] != key_len:
-                mask = mask[..., -key_len:]
-
         # TODO: maybe remove cast once fused mask is supported since attention
         # may be in higher precision
         sdpa_type = mx.float32 if queries.dtype == mx.float16 else queries.dtype
@@ -148,6 +143,7 @@ class CohereModel(nn.Module):
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
         assert self.vocab_size > 0
+        self.window_size = args.sliding_window
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             TransformerBlock(args=args, layer_idx=i)
@@ -160,7 +156,6 @@ class CohereModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
@@ -168,10 +163,9 @@ class CohereModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            j = self.args.sliding_window_pattern
-            full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
+        j = self.args.sliding_window_pattern
+        full_mask = create_attention_mask(h, cache[j - 1])
+        swa_mask = create_attention_mask(h, cache[0], window_size=self.window_size)
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
@@ -179,13 +173,9 @@ class CohereModel(nn.Module):
                 == self.args.sliding_window_pattern - 1
             )
 
-            local_mask = mask
-            if mask is None and is_global:
-                local_mask = full_mask
-            elif mask is None:
-                local_mask = sliding_window_mask
+            mask = full_mask if is_global else swa_mask
 
-            h = layer(h, local_mask, c)
+            h = layer(h, mask, c)
 
         return self.norm(h)
 
@@ -200,10 +190,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         out = self.model.embed_tokens.as_linear(out)
         out = out * self.model.args.logit_scale
         return out

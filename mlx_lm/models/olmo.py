@@ -124,16 +124,14 @@ class Transformer(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.wte(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.blocks)
+
+        mask = create_attention_mask(h, cache[0])
 
         for block, c in zip(self.blocks, cache):
             h = block(h, mask, c)
@@ -154,10 +152,9 @@ class OlmoModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        return self.transformer(inputs, mask, cache)
+        return self.transformer(inputs, cache)
 
 
 class Model(nn.Module):
@@ -170,10 +167,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        return self.model(inputs, mask, cache)
+        return self.model(inputs, cache)
 
     @property
     def layers(self):

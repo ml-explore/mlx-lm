@@ -107,9 +107,7 @@ class MLXLM(LM):
             T = inp.shape[1]
 
             offset = cache[0].offset
-            mask = create_causal_mask(T, offset, lengths=lengths)
-
-            logits = self._model(inp, cache=cache, mask=mask)
+            logits = self._model(inp, cache=cache)
             log_probs = nn.log_softmax(logits.astype(mx.float32))
 
             score = mx.take_along_axis(
