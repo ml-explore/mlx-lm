@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import CacheList, KVCache
 from .switch_layers import SwitchGLU
 
 
@@ -186,10 +187,10 @@ class LongcatFlashTopkRouter(nn.Module):
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, hidden_states: mx.array) -> Tuple[mx.array, mx.array]:
+
+        dtype = hidden_states.dtype
         router_logits = self.classifier(hidden_states)
-        dtype = router_logits.dtype
-        scores = router_logits.astype(mx.float32)
-        scores = mx.softmax(scores, axis=-1)
+        scores = mx.softmax(router_logits, axis=-1)
 
         corrected_scores = scores + self.e_score_correction_bias
         topk_indices = mx.argpartition(corrected_scores, kth=-self.top_k, axis=-1)[
@@ -274,7 +275,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             residual = hidden_states
 
             hidden_states = self.input_layernorm[i](hidden_states)
-            hidden_states = self.self_attn[i](hidden_states, mask=mask, cache=cache)
+            hidden_states = self.self_attn[i](hidden_states, mask=mask, cache=cache[i])
             hidden_states = residual + hidden_states
 
             residual = hidden_states
@@ -309,7 +310,9 @@ class LongcatFlashModel(nn.Module):
         h = self.embed_tokens(x)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, [cache[0][0]] if cache is not None else None
+            )
 
         if cache is None:
             cache = [None] * self.num_layers
@@ -375,3 +378,6 @@ class Model(nn.Module):
                 continue
             new_weights[k] = v
         return new_weights
+
+    def make_cache(self):
+        return [CacheList(KVCache(), KVCache()) for _ in self.model.layers]
