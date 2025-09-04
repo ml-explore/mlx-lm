@@ -11,7 +11,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .cache import KVCache, MambaCache
 
 
-@dataclass(kw_only=True)
+@dataclass()
 class ModelArgs(BaseModelArgs):
     model_type: str
     vocab_size: int
@@ -35,6 +35,7 @@ class ModelArgs(BaseModelArgs):
     use_bias: bool
     use_conv_bias: bool
     residual_in_fp32: bool
+    head_dim: Optional[int] = None
     hybrid_override_pattern: Optional[List[str]] = None
 
 
@@ -195,7 +196,11 @@ class NemotronHAttention(nn.Module):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.num_heads = args.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = (
+            args.head_dim
+            if args.head_dim is not None
+            else (args.hidden_size // args.num_attention_heads)
+        )
         self.num_key_value_heads = args.num_key_value_heads
         self.scale = self.head_dim**-0.5
 
