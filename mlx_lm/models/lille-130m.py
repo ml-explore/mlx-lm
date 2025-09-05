@@ -25,7 +25,9 @@ class Lille130mAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_head = args.n_head
+        self.n_kv_heads = args.n_kv_heads
         self.head_dim = args.n_embd // args.n_head
+        self.scale = self.head_dim**-0.5
 
         self.qkv_proj = nn.Linear(args.n_embd, (args.n_head + 2 * args.n_kv_heads) * self.head_dim, bias=False)
         self.out_proj = nn.Linear(args.n_head * self.head_dim, args.n_embd, bias=False)
@@ -47,11 +49,19 @@ class Lille130mAttention(nn.Module):
         B, L, D = x.shape
 
         qkv = self.qkv_proj(self.norm(x))
-        queries, keys, values = mx.split(qkv, 3, axis=-1)
+        
+        q_size = self.n_head * self.head_dim
+        kv_size = self.n_kv_heads * self.head_dim
+        
+        queries, keys, values = mx.split(
+            qkv, 
+            [q_size, q_size + kv_size], 
+            axis=-1
+        )
 
         queries = queries.reshape(B, L, self.n_head, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_head, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_head, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -107,7 +117,6 @@ class Lille130(nn.Module):
             Lille130Block(args=args) for _ in range(args.n_layer)
         ]
         self.norm = nn.RMSNorm(args.n_embd, eps=args.layer_norm_eps)
-        self.lm_head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
     
     def __call__(
         self,
@@ -126,7 +135,7 @@ class Lille130(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
 
-        return self.norm(h)
+        return self.tok_embeddings.as_linear(self.norm(h))
     
 
 class Model(nn.Module):
@@ -134,9 +143,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = LlamaModel(args)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.transformer = Lille130(args)
 
     def __call__(
         self,
@@ -144,8 +151,15 @@ class Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        return self.model(inputs, mask, cache, input_embeddings)
+        return self.transformer(inputs, mask=mask, cache=cache)
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.transformer.layers
+    
+    def sanitize(self, weights):
+        weights = {
+            k: v for k, v in weights.items() if "rotary_emb" not in k
+        }
+        weights.pop("lm_head.weight", None)
+        return weights
