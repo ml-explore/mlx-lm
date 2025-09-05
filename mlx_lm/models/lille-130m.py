@@ -1,3 +1,4 @@
+# Copyright © 2023-2025 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Optional
