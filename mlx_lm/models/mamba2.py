@@ -57,9 +57,7 @@ class MambaRMSNormGated(nn.Module):
     def __call__(self, hidden_states: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
             hidden_states = hidden_states * nn.silu(gate)
-
-        variance = mx.mean(mx.square(hidden_states), axis=-1, keepdims=True)
-        return self.weight * hidden_states * mx.rsqrt(variance + self.eps)
+        return mx.fast.rms_norm(hidden_states, self.weight, self.eps)
 
 
 class Mamba2Block(nn.Module):
@@ -106,33 +104,22 @@ class Mamba2Block(nn.Module):
     def _apply_conv(
         self, conv_input: mx.array, cache: Optional[MambaCache] = None
     ) -> mx.array:
-        batch_size, seq_len, in_ch = conv_input.shape
-
-        if self.conv_kernel_size == 1:
-            return nn.silu(self.conv1d(conv_input))
-
         if cache is not None:
-            current_conv_state = cache[0]
-            if current_conv_state is None:
-                current_conv_state = cache[0] = mx.zeros(
-                    (batch_size, self.conv_kernel_size, in_ch)
+            if cache[0] is None:
+                conv_state = mx.zeros(
+                    (conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim),
+                    dtype=conv_input.dtype,
                 )
-
-            if seq_len >= self.conv_kernel_size:
-                cache[0] = conv_input[:, -self.conv_kernel_size :, :]
             else:
-                cache[0] = mx.concatenate(
-                    [current_conv_state[:, seq_len:, :], conv_input], axis=1
-                )
-
-            left_padding = current_conv_state[:, -(self.conv_kernel_size - 1) :, :]
-            padded_input = mx.concatenate([left_padding, conv_input], axis=1)
+                conv_state = cache[0]
+            padded_input = mx.concatenate([conv_state, conv_input], axis=1)
+            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :, :]
         else:
             padded_input = mx.pad(
                 conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
             )
 
-        conv_output = self.conv1d(padded_input)[:, :seq_len, :]
+        conv_output = self.conv1d(padded_input)
         return nn.silu(conv_output)
 
     def _ssm(
@@ -152,47 +139,31 @@ class Mamba2Block(nn.Module):
             batch_size, seq_len, self.num_heads, self.head_dim
         )
 
-        B = mx.repeat(
-            B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-            self.heads_per_group,
-            axis=2,
-        )
-        C = mx.repeat(
-            C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size),
-            self.heads_per_group,
-            axis=2,
-        )
-        A = -mx.exp(self.A_log.astype(mx.float32))
+        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        B = mx.repeat(B, self.heads_per_group, axis=2)
+        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        C = mx.repeat(C, self.heads_per_group, axis=2)
 
-        if cache is not None:
-            h = (
-                cache[1]
-                if cache[1] is not None
-                else mx.zeros(
-                    (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
-                )
-            )
+        A = -mx.exp(self.A_log.astype(mx.float32)).astype(hidden_states.dtype)
+
+        if cache is not None and cache[1] is not None:
+            h = cache[1]
         else:
             h = mx.zeros(
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
+                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
+                dtype=hidden_states.dtype,
             )
 
         outputs = []
-
         for t in range(seq_len):
-            dt_t = dt[:, t, :, None, None]
-            dA = mx.exp(
-                mx.einsum(
-                    "bh,bhds->bhds",
-                    dt_t.squeeze(-1).squeeze(-1) * A[None, :],
-                    mx.ones_like(h),
-                )
-            )
-            dB_x = mx.einsum("bh,bhs,bhd->bhds", dt[:, t], B[:, t], hidden_states[:, t])
-            h = mx.einsum("bhds,bhds->bhds", dA, h) + dB_x
-            y_t = mx.einsum("bhs,bhds->bhd", C[:, t], h) + mx.einsum(
-                "h,bhd->bhd", self.D, hidden_states[:, t]
-            )
+            dt_t = dt[:, t, :]
+            dA = mx.exp(dt_t * A)[..., None, None]
+            dB = (dt_t[..., None] * B[:, t])[..., None, :]
+
+            h = dA * h + dB * hidden_states[:, t, :, :, None]
+            y_t = (h @ C[:, t, :, :, None]).squeeze(-1) + self.D[
+                :, None
+            ] * hidden_states[:, t]
             outputs.append(y_t)
 
         if cache is not None:
