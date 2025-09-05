@@ -125,6 +125,7 @@ def linear_to_lora_layers(
         "gpt_oss",
         "ernie4_5_moe",
         "granitemoe",
+        "longcat_flash",
         "seed_oss",
         "apertus",
     }:
@@ -136,6 +137,8 @@ def linear_to_lora_layers(
             keys.add("mlp.shared_expert_gate")
         if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
             keys.add("mlp.gate")
+        if model.model_type in ["longcat_flash"]:
+            keys.add("mlp.router.classifier")
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
@@ -154,7 +157,12 @@ def linear_to_lora_layers(
         keys = {"norm_attn_norm.attn.Wqkv", "ffn.router.layer"}
     elif model.model_type == "internlm2":
         keys = {"attention.wqkv", "attention.wo"}
-    elif model.model_type in {"deepseek_v2", "deepseek_v3", "minicpm3"}:
+    elif model.model_type in {
+        "deepseek_v2",
+        "deepseek_v3",
+        "longcat_flash",
+        "minicpm3",
+    }:
         keys = {
             "self_attn.q_proj",
             "self_attn.q_a_proj",
