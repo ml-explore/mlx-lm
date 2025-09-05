@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
+from .losses import dpo_loss
 
 
 def grad_checkpoint(layer):
@@ -339,3 +340,384 @@ def train(
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
         print(f"Saved final weights to {args.adapter_file}.")
+
+
+def dpo_iterate_batches(
+    dataset,
+    batch_size,
+    max_seq_length,
+    train=False,
+):
+    """
+    Iterate over batches for DPO training.
+    Each batch contains chosen and rejected sequences.
+    """
+    # Sort by the maximum sequence length between chosen and rejected
+    if isinstance(dataset, CacheDataset):
+        len_fn = lambda idx: max(
+            len(dataset._data.process(dataset._data[idx])["chosen_tokens"]),
+            len(dataset._data.process(dataset._data[idx])["rejected_tokens"]),
+        )
+    else:
+        len_fn = lambda idx: max(
+            len(dataset.process(dataset[idx])["chosen_tokens"]),
+            len(dataset.process(dataset[idx])["rejected_tokens"]),
+        )
+
+    idx = sorted(range(len(dataset)), key=len_fn)
+    if len(dataset) < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size}"
+            f" examples but only has {len(dataset)}."
+        )
+
+    # Distributed training setup
+    offset = mx.distributed.init().rank()
+    step = mx.distributed.init().size()
+    if batch_size % step != 0:
+        raise ValueError("The batch size must be divisible by the number of workers")
+
+    # Make the batches:
+    batch_idx = [
+        idx[i + offset : i + offset + batch_size : step]
+        for i in range(0, len(idx) - batch_size + 1, batch_size)
+    ]
+
+    while True:
+        indices = np.random.permutation(len(batch_idx))
+        for i in indices:
+            batch_data = [dataset[j] for j in batch_idx[i]]
+
+            # Process each item in the batch
+            # CacheDataset returns already processed data, raw dataset needs processing
+            if isinstance(dataset, CacheDataset):
+                processed_batch = batch_data  # Already processed by CacheDataset
+            else:
+                processed_batch = [dataset.process(item) for item in batch_data]
+
+            chosen_sequences = [item["chosen_tokens"] for item in processed_batch]
+            rejected_sequences = [item["rejected_tokens"] for item in processed_batch]
+            prompt_lengths = [item["prompt_length"] for item in processed_batch]
+
+            # Get maximum sequence lengths
+            max_chosen_len = max(len(seq) for seq in chosen_sequences)
+            max_rejected_len = max(len(seq) for seq in rejected_sequences)
+            max_len = max(max_chosen_len, max_rejected_len)
+
+            if max_len > max_seq_length:
+                print(
+                    f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
+                    f"The longest sentence {max_len} will be truncated to {max_seq_length}. "
+                    "Consider pre-splitting your data to save memory."
+                )
+
+            # Pad to nearest multiple of 32 or the maximum length
+            pad_to = 32
+            max_length_in_batch = 1 + pad_to * ((max_len + pad_to - 1) // pad_to)
+            max_length_in_batch = min(max_length_in_batch, max_seq_length)
+
+            # Create padded arrays
+            chosen_batch = np.zeros((batch_size // step, max_length_in_batch), np.int32)
+            rejected_batch = np.zeros(
+                (batch_size // step, max_length_in_batch), np.int32
+            )
+
+            chosen_lengths = []
+            rejected_lengths = []
+
+            for j in range(batch_size // step):
+                # Pad chosen sequence
+                chosen_seq = chosen_sequences[j]
+                chosen_len = min(len(chosen_seq), max_seq_length)
+                chosen_batch[j, :chosen_len] = chosen_seq[:chosen_len]
+                chosen_lengths.append(chosen_len)
+
+                # Pad rejected sequence
+                rejected_seq = rejected_sequences[j]
+                rejected_len = min(len(rejected_seq), max_seq_length)
+                rejected_batch[j, :rejected_len] = rejected_seq[:rejected_len]
+                rejected_lengths.append(rejected_len)
+
+            yield {
+                "chosen_tokens": mx.array(chosen_batch),
+                "rejected_tokens": mx.array(rejected_batch),
+                "chosen_lengths": mx.array(chosen_lengths),
+                "rejected_lengths": mx.array(rejected_lengths),
+                "prompt_lengths": mx.array(prompt_lengths),
+            }
+
+        if not train:
+            break
+
+
+def dpo_loss_fn(
+    policy_model,
+    reference_model,
+    batch,
+    beta: float = 0.1,
+):
+    """
+    DPO loss function for training.
+
+    Args:
+        policy_model: The model being trained
+        reference_model: The frozen reference model
+        batch: Batch dictionary with chosen/rejected tokens and lengths
+        beta: Temperature parameter for DPO
+
+    Returns:
+        loss: DPO loss value
+        ntoks: Number of tokens processed
+    """
+    chosen_tokens = batch["chosen_tokens"]
+    rejected_tokens = batch["rejected_tokens"]
+    chosen_lengths = batch["chosen_lengths"]
+    rejected_lengths = batch["rejected_lengths"]
+    prompt_lengths = batch["prompt_lengths"]
+
+    # Forward pass through policy model
+    chosen_inputs = chosen_tokens[:, :-1]
+    chosen_targets = chosen_tokens[:, 1:]
+    policy_chosen_logits = policy_model(chosen_inputs)
+
+    rejected_inputs = rejected_tokens[:, :-1]
+    rejected_targets = rejected_tokens[:, 1:]
+    policy_rejected_logits = policy_model(rejected_inputs)
+
+    # Forward pass through reference model (no gradients needed since model is frozen)
+    reference_chosen_logits = reference_model(chosen_inputs)
+    reference_rejected_logits = reference_model(rejected_inputs)
+
+    # Compute DPO loss
+    loss = dpo_loss(
+        policy_chosen_logits=policy_chosen_logits,
+        policy_rejected_logits=policy_rejected_logits,
+        reference_chosen_logits=reference_chosen_logits,
+        reference_rejected_logits=reference_rejected_logits,
+        chosen_labels=chosen_targets,
+        rejected_labels=rejected_targets,
+        beta=beta,
+    )
+
+    # Calculate total number of tokens for reporting
+    ntoks = mx.sum(chosen_lengths) + mx.sum(rejected_lengths)
+
+    return loss, ntoks
+
+
+def dpo_evaluate(
+    policy_model,
+    reference_model,
+    dataset,
+    batch_size,
+    num_batches,
+    max_seq_length=2048,
+    beta: float = 0.1,
+):
+    """
+    Evaluate DPO model on validation set.
+    """
+    policy_model.eval()
+    reference_model.eval()
+
+    all_losses = mx.array(0.0)
+    ntokens = mx.array(0)
+
+    index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
+
+    for _, batch in tqdm(
+        zip(
+            index_iterator,
+            dpo_iterate_batches(
+                dataset=dataset,
+                batch_size=batch_size,
+                max_seq_length=max_seq_length,
+            ),
+        ),
+        desc="Evaluating DPO...",
+        total=min(len(dataset) // batch_size, num_batches),
+    ):
+        losses, toks = dpo_loss_fn(policy_model, reference_model, batch, beta)
+        all_losses += losses * toks
+        ntokens += toks
+        mx.eval(all_losses, ntokens)
+
+    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
+    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+
+    return (all_losses / ntokens).item()
+
+
+def train_dpo(
+    policy_model,
+    reference_model,
+    optimizer,
+    train_dataset,
+    val_dataset,
+    args: TrainingArgs = TrainingArgs(),
+    beta: float = 0.1,
+    training_callback: TrainingCallback = None,
+):
+    """
+    Train a model using Direct Preference Optimization (DPO).
+
+    Args:
+        policy_model: The model being trained
+        reference_model: The frozen reference model
+        optimizer: Optimizer for the policy model
+        train_dataset: Training dataset with preference pairs
+        val_dataset: Validation dataset with preference pairs
+        args: Training arguments
+        beta: Temperature parameter for DPO
+        training_callback: Optional callback for logging
+    """
+    if mx.metal.is_available():
+        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+    print(f"Starting DPO training..., iters: {args.iters}, beta: {beta}")
+
+    world = mx.distributed.init()
+    world_size = world.size()
+    rank = world.rank()
+    if world_size > 1:
+        print(f"Node {rank} of {world_size}")
+
+    if args.grad_checkpoint:
+        grad_checkpoint(policy_model.layers[0])
+
+    # Freeze reference model completely
+    reference_model.freeze()
+
+    # Create loss function with reference model
+    def loss_fn(batch):
+        return dpo_loss_fn(policy_model, reference_model, batch, beta)
+
+    state = [policy_model.state, optimizer.state, mx.random.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(batch):
+        # Forward and backward pass
+        (lvalue, toks), grad = loss_value_and_grad(batch)
+
+        # All reduce the gradients if running in distributed mode
+        grad = average_gradients(grad)
+
+        # Model update
+        optimizer.update(policy_model, grad)
+
+        return lvalue, toks
+
+    loss_value_and_grad = nn.value_and_grad(policy_model, loss_fn)
+
+    policy_model.train()
+    losses = 0
+    n_tokens = 0
+    steps = 0
+    trained_tokens = 0
+    train_time = 0
+
+    # Main training loop
+    for it, batch in zip(
+        range(1, args.iters + 1),
+        dpo_iterate_batches(
+            dataset=train_dataset,
+            batch_size=args.batch_size,
+            max_seq_length=args.max_seq_length,
+            train=True,
+        ),
+    ):
+        tic = time.perf_counter()
+        # Report validation loss if needed
+        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+            tic = time.perf_counter()
+            val_loss = dpo_evaluate(
+                policy_model=policy_model,
+                reference_model=reference_model,
+                dataset=val_dataset,
+                batch_size=args.batch_size,
+                num_batches=args.val_batches,
+                max_seq_length=args.max_seq_length,
+                beta=beta,
+            )
+            policy_model.train()
+            val_time = time.perf_counter() - tic
+            if rank == 0:
+                print(
+                    f"Iter {it}: "
+                    f"Val loss {val_loss:.3f}, "
+                    f"Val took {val_time:.3f}s",
+                    flush=True,
+                )
+
+            if training_callback is not None:
+                val_info = {
+                    "iteration": it - 1,
+                    "val_loss": val_loss,
+                    "val_time": val_time,
+                }
+                training_callback.on_val_loss_report(val_info)
+
+            tic = time.perf_counter()
+
+        lvalue, toks = step(batch)
+        losses += lvalue
+        n_tokens += toks
+        steps += 1
+        mx.eval(state, losses, n_tokens)
+        train_time += time.perf_counter() - tic
+
+        # Report training loss if needed
+        if it % args.steps_per_report == 0 or it == args.iters:
+            train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
+            train_loss /= steps * world_size
+            n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+            learning_rate = optimizer.learning_rate.item()
+            it_sec = args.steps_per_report / train_time
+            tokens_sec = float(n_tokens) / train_time
+            trained_tokens += n_tokens
+            peak_mem = mx.get_peak_memory() / 1e9
+            if rank == 0:
+                print(
+                    f"Iter {it}: Train loss {train_loss:.3f}, "
+                    f"Learning Rate {learning_rate:.3e}, "
+                    f"It/sec {it_sec:.3f}, "
+                    f"Tokens/sec {tokens_sec:.3f}, "
+                    f"Trained Tokens {trained_tokens}, "
+                    f"Peak mem {peak_mem:.3f} GB",
+                    flush=True,
+                )
+
+            if training_callback is not None:
+                train_info = {
+                    "iteration": it,
+                    "train_loss": train_loss,
+                    "learning_rate": learning_rate,
+                    "iterations_per_second": it_sec,
+                    "tokens_per_second": tokens_sec,
+                    "trained_tokens": trained_tokens,
+                    "peak_memory": peak_mem,
+                }
+                training_callback.on_train_loss_report(train_info)
+
+            losses = 0
+            n_tokens = 0
+            steps = 0
+            train_time = 0
+
+        # Save adapter weights
+        if it % args.steps_per_save == 0 and rank == 0:
+            adapter_weights = dict(tree_flatten(policy_model.trainable_parameters()))
+            mx.save_safetensors(str(args.adapter_file), adapter_weights)
+            checkpoint = (
+                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+            )
+            mx.save_safetensors(str(checkpoint), adapter_weights)
+            print(
+                f"Iter {it}: Saved adapter weights to "
+                f"{args.adapter_file} and {checkpoint}."
+            )
+
+    # Save final weights
+    if rank == 0:
+        adapter_weights = dict(tree_flatten(policy_model.trainable_parameters()))
+        mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        print(f"Saved final DPO weights to {args.adapter_file}.")
