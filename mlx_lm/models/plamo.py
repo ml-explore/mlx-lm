@@ -174,15 +174,13 @@ class PlamoModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None for _ in range(len(self.layers.layers))]
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers.layers, cache):
             h = layer(h, mask, cache=c)
@@ -204,9 +202,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     @property

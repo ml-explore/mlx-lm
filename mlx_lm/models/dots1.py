@@ -22,10 +22,9 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     vocab_size: int
     max_position_embeddings: Optional[int]
-    num_key_value_heads: Optional[int]
+    num_key_value_heads: int
     first_k_dense_replace: int
     moe_intermediate_size: int
-    moe_layer_freq: int
     n_routed_experts: int
     n_shared_experts: int
     norm_topk_prob: bool
@@ -48,7 +47,6 @@ class Dots1Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
         head_dim = args.head_dim or args.hidden_size // n_heads
@@ -254,16 +252,14 @@ class Dots1Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ) -> mx.array:
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -283,10 +279,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

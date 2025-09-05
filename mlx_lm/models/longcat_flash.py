@@ -271,6 +271,9 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = x
         shortcut_mlp_output = None
 
+        if cache is None:
+            cache = (None, None)
+
         for i in range(2):
             residual = hidden_states
 
@@ -304,18 +307,14 @@ class LongcatFlashModel(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
         h = self.embed_tokens(x)
 
-        if mask is None:
-            mask = create_attention_mask(
-                h, [cache[0][0]] if cache is not None else None
-            )
-
         if cache is None:
-            cache = [None] * self.num_layers
+            cache = [(None, None)] * self.num_layers
+
+        mask = create_attention_mask(h, cache[0][0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -334,10 +333,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     @property
