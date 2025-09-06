@@ -10,6 +10,7 @@ import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
+    BatchKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
@@ -417,6 +418,26 @@ class TestPromptCache(unittest.TestCase):
         )
         cmask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
         self.assertTrue(mx.array_equal(cmask, mask))
+
+    def test_batch_kv_cache(self):
+        cache = BatchKVCache(left_padding=[2, 3, 4])
+        k, v = mx.zeros((3, 1, 4, 8)), mx.zeros((3, 1, 4, 8))
+        # Update works
+        k, v = cache.update_and_fetch(k, v)
+        self.assertEqual(k.shape, (3, 1, 4, 8))
+
+        # State can be evaluated
+        mx.eval(cache.state)
+
+        # State can be set
+        cache.state = cache.state
+
+        cache.filter([0, 1])
+        self.assertEqual(cache.state[0].shape, (2, 1, 4, 8))
+
+        mask = cache.make_mask(1)
+        self.assertEqual(mask[0].squeeze().tolist(), [False, False, True, True, True])
+        self.assertEqual(mask[1].squeeze().tolist(), [False, False, False, True, True])
 
 
 if __name__ == "__main__":

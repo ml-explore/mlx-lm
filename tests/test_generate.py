@@ -3,7 +3,10 @@
 import unittest
 from typing import List
 
+import mlx.core as mx
+
 from mlx_lm.generate import (
+    BatchGenerator,
     GenerationResponse,
     generate,
     stream_generate,
@@ -150,6 +153,42 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(
             num_embeddings / prefill_step_size < num_prompt_processing_callbacks
         )
+
+    def test_batch_matches_single(self):
+
+        prompts = [
+            "Write a story about Einstein",
+            "Hi",
+            "What time is it?",
+            "How tall is Mt Everest?",
+        ]
+        self.model.set_dtype(mx.float32)
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        gen = BatchGenerator(
+            self.model, stop_tokens=self.tokenizer.eos_token_ids, max_tokens=1
+        )
+        uids = gen.insert(prompts)
+        batch_responses = {r.uid: r for r in gen.next()}
+
+        # Do a test for each prompt the logits are close
+        for e, prompt in enumerate(prompts):
+
+            for response in stream_generate(
+                self.model, self.tokenizer, prompt, max_tokens=1
+            ):
+                blp = batch_responses[uids[e]].logprobs
+                lp = response.logprobs
+                self.assertTrue(mx.allclose(blp, lp))
+                break
+        self.model.set_dtype(mx.float16)
 
 
 if __name__ == "__main__":

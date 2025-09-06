@@ -24,6 +24,7 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .models.cache import (
+    BatchKVCache,
     QuantizedKVCache,
     load_prompt_cache,
 )
@@ -769,6 +770,216 @@ def generate(
         )
         print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
+
+
+def _left_pad_prompts(prompts, max_length=None):
+    if max_length is None:
+        max_length = max(len(p) for p in prompts)
+    return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
+
+
+@dataclass
+class CompletionResponse:
+    uid: int
+    token: int
+    logprobs: mx.array
+    finish_reason: Optional[str]
+
+
+@dataclass
+class BatchStats:
+    """
+    An data object to hold generation stats.
+
+    Args:
+        prompt_tokens (int): The number of prompt tokens processed.
+        prompt_tps (float): The prompt processing tokens-per-second.
+        prompt_time (float): The time in seconds spent in prompt processing.
+        generation_tokens (int): The number of generated tokens.
+        generation_tps (float): The tokens-per-second for generation.
+        generation_time (float): The time in seconds spent in generation .
+        peak_memory (float): The peak memory used so far in GB.
+    """
+
+    prompt_tokens: int = 0
+    prompt_tps: float = 0
+    prompt_time: float = 0
+    generation_tokens: int = 0
+    generation_tps: float = 0
+    generation_time: float = 0
+    peak_memory: float = 0
+
+
+class BatchGenerator:
+    def __init__(self, model, max_tokens=128, stop_tokens=None, sampler=None):
+        self.model = model
+        self.all_prompts = set()
+        self.unprocessed_prompts = []
+        self.max_tokens = max_tokens
+        self.stop_tokens = stop_tokens or set()
+        self.sampler = sampler or (lambda x: mx.argmax(x, keepdims=True, axis=-1))
+        self.uid_count = 0
+        # TODO tune these values to reasonable defaults possibly unique per
+        # machine
+        self.prompt_tokens_per_batch = 2**14
+        self.completion_batch_size = 32
+        self._stats = BatchStats()
+
+        self._reset_state()
+
+    def insert(self, prompts):
+        uids = []
+        for p in prompts:
+            self.unprocessed_prompts.append((self.uid_count, p))
+            uids.append(self.uid_count)
+            self.uid_count += 1
+        # sort in ascending order of length
+        self.unprocessed_prompts = sorted(
+            self.unprocessed_prompts, key=lambda x: len(x[1])
+        )
+        self.all_prompts.update(uids)
+        return uids
+
+    def _forward(self, input_tokens):
+        return self.model(input_tokens, cache=self.prompt_cache)
+
+    def _process_prompts(self, prompts):
+        lengths = [len(p) for p in prompts]
+        self._stats.prompt_tokens += sum(lengths)
+        max_length = max(lengths)
+        left_padding = [max_length - l for l in lengths]
+        prefill_step_size = self.prompt_tokens_per_batch // self.completion_batch_size
+        batch_size = len(prompts)
+        while (2 * batch_size * prefill_step_size) < self.prompt_tokens_per_batch:
+            prefill_step_size *= 2
+
+        input_tokens = _left_pad_prompts(prompts, max_length=max_length)
+        # TODO the model may not use a regular KV Cache
+        self.prompt_cache = [BatchKVCache(left_padding) for _ in self.model.layers]
+
+        with mx.stream(generation_stream):
+            while input_tokens.shape[1] > 1:
+                n_to_process = min(prefill_step_size, input_tokens.shape[1] - 1)
+                self._forward(input_tokens[:, :n_to_process])
+                mx.eval([c.state for c in self.prompt_cache])
+                input_tokens = input_tokens[:, n_to_process:]
+                mx.clear_cache()
+
+        y, logprobs = self._step(input_tokens)
+        mx.async_eval(y, logprobs)
+        self.next_y, self.next_logprobs = y, logprobs
+
+    def _step(self, input_tokens: mx.array):
+        with mx.stream(generation_stream):
+            logits = self._forward(input_tokens)
+            logits = logits[:, -1, :]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            sampled = self.sampler(logprobs).squeeze(1)
+            return sampled, logprobs
+
+    def _reset_state(self):
+        self.active_prompts = []
+        self.prompt_cache = None
+        self.n_complete = 0
+        self.next_y = None
+        self.next_logprobs = None
+
+    def stats(self):
+        self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
+        self._stats.generation_tps = (
+            self._stats.generation_tokens / self._stats.generation_time
+        )
+        self._stats.peak_memory = mx.get_peak_memory() / 1e9
+        return self._stats
+
+    def next(self):
+        tic = time.perf_counter()
+        if len(self.active_prompts) == 0:
+            # Process prompts
+            prompts = self.unprocessed_prompts[: self.completion_batch_size]
+            if len(prompts) == 0:
+                return []
+            uids, prompts = zip(*prompts)
+            self.active_prompts.extend(uids)
+            self._process_prompts(prompts)
+            self.unprocessed_prompts = self.unprocessed_prompts[
+                self.completion_batch_size :
+            ]
+
+        y, logprobs = self.next_y, self.next_logprobs
+
+        if (self.n_complete + 1) < self.max_tokens:
+            self.next_y, self.next_logprobs = self._step(y[:, None])
+            mx.async_eval(self.next_y, self.next_logprobs)
+
+        self.n_complete += 1
+
+        mx.eval(y)
+        toc = time.perf_counter()
+        if self.n_complete == 1:
+            self._stats.prompt_time += toc - tic
+        else:
+            self._stats.generation_time += toc - tic
+        y = y.tolist()
+        keep_idx = []
+        end_idx = []
+        responses = []
+
+        finish_reason = None
+        if self.n_complete == self.max_tokens:
+            finish_reason = "length"
+
+        for e, (t, uid) in enumerate(zip(y, self.active_prompts)):
+            if t in self.stop_tokens:
+                end_idx.append(e)
+                responses.append(CompletionResponse(uid, t, logprobs[e], "stop"))
+            else:
+                responses.append(CompletionResponse(uid, t, logprobs[e], finish_reason))
+                keep_idx.append(e)
+
+        # Remove any finished completions
+        if len(end_idx):
+            self.active_prompts = [self.active_prompts[k] for k in keep_idx]
+            if len(keep_idx) > 0:
+                keep_idx = mx.array(keep_idx)
+                self.next_y = self.next_y[keep_idx]
+                self.next_logprobs = self.next_logprobs[keep_idx]
+                for c in self.prompt_cache:
+                    c.filter(keep_idx)
+
+        if self.n_complete == self.max_tokens:
+            self._reset_state()
+
+        # Periodically clear out allocator cache
+        if self.n_complete % 256 == 0:
+            mx.clear_cache()
+
+        self._stats.generation_tokens += len(responses)
+        return responses
+
+
+def batch_generate(
+    model, tokenizer, prompts: List[int], verbose: bool = False, **kwargs
+):
+    gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
+    uids = gen.insert(prompts)
+    results = {uid: [] for uid in uids}
+    while responses := gen.next():
+        for response in responses:
+            results[response.uid].append(response.token)
+    # Return results in correct order
+    texts = [tokenizer.decode(results[uid]) for uid in uids]
+    if verbose:
+        stats = gen.stats()
+        print(
+            f"Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"Generation: {stats.generation_tokens} tokens, "
+            f"{stats.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"Peak memory: {stats.peak_memory:.3f} GB")
+    return texts
 
 
 def main():

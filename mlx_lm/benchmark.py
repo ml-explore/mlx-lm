@@ -5,7 +5,7 @@ import argparse
 import mlx.core as mx
 
 from mlx_lm import stream_generate
-from mlx_lm.generate import DEFAULT_MODEL
+from mlx_lm.generate import DEFAULT_MODEL, BatchGenerator
 from mlx_lm.tokenizer_utils import load_tokenizer
 from mlx_lm.utils import (
     fetch_from_hub,
@@ -45,6 +45,13 @@ def setup_arg_parser():
         type=int,
     )
     parser.add_argument(
+        "--batch-size",
+        "-b",
+        default=1,
+        help="Batch size",
+        type=int,
+    )
+    parser.add_argument(
         "--num-trials",
         "-n",
         default=5,
@@ -71,20 +78,38 @@ def main():
 
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
-    prompt = mx.random.randint(0, config["vocab_size"], (prompt_tokens,))
+    batch_size = args.batch_size
+    prompts = mx.random.randint(
+        0, config["vocab_size"], (batch_size, prompt_tokens)
+    ).tolist()
+    prompt = prompts[0]
 
-    def _bench():
+    def single_bench():
         for response in stream_generate(
             model, tokenizer, prompt, max_tokens=generation_tokens
         ):
             pass
         return response
 
+    def batch_bench():
+        gen = BatchGenerator(model, stop_tokens={}, max_tokens=generation_tokens)
+        uids = gen.insert(prompts)
+        results = {uid: [] for uid in uids}
+        while responses := gen.next():
+            for response in responses:
+                results[response.uid].append(response.token)
+        return gen.stats()
+
+    if batch_size == 1:
+        _bench = single_bench
+    else:
+        _bench = batch_bench
+
     print("Running warmup..")
     _bench()
 
     report_keys = ["prompt_tps", "generation_tps", "peak_memory"]
-    print(f"Timing with {prompt_tokens=} and {generation_tokens=}.")
+    print(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
         response = _bench()
