@@ -609,3 +609,97 @@ class CacheList(KVCache):
             l = len(c.state)
             c.state = v[start : start + l]
             start += l
+
+
+class BatchKVCache(_BaseCache):
+    def __init__(self, left_padding: List[int]):
+        """
+        The BatchKV cache expects inputs to be left-padded.
+
+        E.g. the following prompts:
+
+            [1, 3, 5]
+            [7]
+            [2, 6, 8, 9]
+
+        Should be padded like so:
+
+            [0, 1, 3, 5]
+            [0, 0, 0, 7]
+            [2, 6, 8, 9]
+
+        And ``left_padding`` specifies the amount of padding for each.
+        In this case, ``left_padding = [1, 3, 0]``.
+        """
+        self.keys = None
+        self.values = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-l for l in left_padding])
+        self._idx = 0
+        self.step = 256
+
+    def update_and_fetch(self, keys, values):
+        prev = self._idx
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.offset += keys.shape[2]
+        self._idx += keys.shape[2]
+        self.keys[..., prev : self._idx, :] = keys
+        self.values[..., prev : self._idx, :] = values
+        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+
+    @property
+    def state(self):
+        if self._idx == self.keys.shape[2]:
+            return self.keys, self.values, self.offset, self.left_padding
+        else:
+            return (
+                self.keys[..., : self._idx, :],
+                self.values[..., : self._idx, :],
+                self.offset,
+                self.left_padding,
+            )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.offset, self.left_padding = v
+        self._idx = self.keys.shape[2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
+
+    def filter(self, batch_indices):
+        """
+        Only keep the given indices in the cache.
+        """
+        self.keys = self.keys[batch_indices]
+        self.values = self.values[batch_indices]
+        if isinstance(self.offset, mx.array):
+            self.offset = self.offset[batch_indices]
+            self.left_padding = self.left_padding[batch_indices]

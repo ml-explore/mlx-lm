@@ -80,7 +80,9 @@ To see a description of all the arguments you can do:
 
 Check out the [generation
 example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/generate_response.py)
-to see how to use the API in more detail.
+to see how to use the API in more detail. Check out the [batch generation
+example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
+to see how to efficiently generate continuations for a batch of prompts.
 
 The `mlx-lm` package also comes with functionality to quantize and optionally
 upload models to the Hugging Face Hub.
