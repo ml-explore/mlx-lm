@@ -77,7 +77,7 @@ class Lille130mAttention(nn.Module):
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return x + self.out_proj(output)
+        return self.out_proj(output)
 
 
 class Lille130mMLP(nn.Module):
@@ -92,7 +92,7 @@ class Lille130mMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         h = self.norm(x)
-        return x + self.down_proj(nn.silu(self.gate_proj(h)) * self.up_proj(h))
+        return self.down_proj(nn.silu(self.gate_proj(h)) * self.up_proj(h))
 
 
 class Lille130Block(nn.Module):
@@ -107,7 +107,9 @@ class Lille130Block(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        return self.feed_forward(self.attention(x, mask=mask, cache=cache))
+        h = x + self.attention(x, mask, cache)
+        out = h + self.feed_forward(h)
+        return out
 
 
 class Lille130(nn.Module):
