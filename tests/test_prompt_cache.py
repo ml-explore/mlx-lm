@@ -9,6 +9,7 @@ import mlx.core as mx
 
 from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import (
+    CacheList,
     ChunkedKVCache,
     KVCache,
     MambaCache,
@@ -308,6 +309,10 @@ class TestPromptCache(unittest.TestCase):
             i += 1
             self.assertEqual(tok, toks[i])
             self.assertTrue(mx.allclose(logits, all_logits[i], rtol=4e-2))
+
+    def test_CacheList_trim(self):
+        c = CacheList(KVCache(), KVCache())
+        assert not c.is_trimmable() or c.trim(0) == 0
 
 
 if __name__ == "__main__":

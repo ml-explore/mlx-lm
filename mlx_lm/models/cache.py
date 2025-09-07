@@ -536,6 +536,9 @@ class CacheList(KVCache):
     def __getitem__(self, idx):
         return self.caches[idx]
 
+    def is_trimmable(self):
+        return False
+
     @property
     def state(self):
         return [s for c in self.caches for s in c.state]
