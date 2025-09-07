@@ -21,6 +21,7 @@ class TestGenerate(unittest.TestCase):
     def setUpClass(cls):
         cls.HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
+        cls.model.set_dtype(mx.float32)
 
     def test_generate(self):
         # Simple test that generation runs
@@ -162,7 +163,6 @@ class TestGenerate(unittest.TestCase):
             "What time is it?",
             "How tall is Mt Everest?",
         ]
-        self.model.set_dtype(mx.float32)
         prompts = [
             self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": p}],
@@ -190,6 +190,59 @@ class TestGenerate(unittest.TestCase):
                 break
         self.model.set_dtype(mx.float16)
 
+    def test_batch_many_batches(self):
 
+        prompts = [
+            "Write a story about Einstein",
+            "Hi",
+            "What time is it?",
+            "How tall is Mt Everest?",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prefill_batch_size=2,
+            prefill_step_size=8,
+            completion_batch_size=3,
+        )
+        uids = gen.insert(prompts)
+        batch_responses = {}
+        not_in = True
+        iters = 0
+        while responses := gen.next():
+            for r in responses:
+                not_in &= r.uid not in batch_responses
+                batch_responses[r.uid] = r
+            iters += 1
+        # only one token per prompt means only one response per prompt
+        self.assertTrue(not_in)
+
+        # completion batch size is too small for a single iteration
+        self.assertTrue(iters > 1)
+
+        # Do a test for each prompt the logits are close
+        for e, prompt in enumerate(prompts):
+
+            for response in stream_generate(
+                self.model, self.tokenizer, prompt, max_tokens=1
+            ):
+                blp = batch_responses[uids[e]].logprobs
+                lp = response.logprobs
+                self.assertTrue(mx.allclose(blp, lp))
+                break
+
+
+if __name__ == "__main__":
+    unittest.main()
 if __name__ == "__main__":
     unittest.main()

@@ -811,18 +811,27 @@ class BatchStats:
 
 
 class BatchGenerator:
-    def __init__(self, model, max_tokens=128, stop_tokens=None, sampler=None):
+    def __init__(
+        self,
+        model,
+        max_tokens: int = 128,
+        stop_tokens: Optional[set] = None,
+        sampler: Optional[Callable[mx.array, mx.array]] = None,
+        completion_batch_size: int = 32,
+        prefill_batch_size: int = 8,
+        prefill_step_size: int = 2048,
+    ):
         self.model = model
-        self.all_prompts = set()
         self.unprocessed_prompts = []
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
         self.sampler = sampler or (lambda x: mx.argmax(x, keepdims=True, axis=-1))
         self.uid_count = 0
-        # TODO tune these values to reasonable defaults possibly unique per
+        # TODO tune these values to reasonable defaults possibly per
         # machine
-        self.prompt_tokens_per_batch = 2**14
-        self.completion_batch_size = 32
+        self.prefill_step_size = prefill_step_size
+        self.prefill_batch_size = prefill_batch_size
+        self.completion_batch_size = completion_batch_size
         self._stats = BatchStats()
 
         self._reset_state()
@@ -837,41 +846,56 @@ class BatchGenerator:
         self.unprocessed_prompts = sorted(
             self.unprocessed_prompts, key=lambda x: len(x[1])
         )
-        self.all_prompts.update(uids)
         return uids
 
-    def _forward(self, input_tokens):
-        return self.model(input_tokens, cache=self.prompt_cache)
-
-    def _process_prompts(self, prompts):
+    def _process_prompt_batch(self, prompts):
+        # TODO the model may not use a regular KV Cache
         lengths = [len(p) for p in prompts]
         self._stats.prompt_tokens += sum(lengths)
         max_length = max(lengths)
         left_padding = [max_length - l for l in lengths]
-        prefill_step_size = self.prompt_tokens_per_batch // self.completion_batch_size
-        batch_size = len(prompts)
-        while (2 * batch_size * prefill_step_size) < self.prompt_tokens_per_batch:
-            prefill_step_size *= 2
-
         input_tokens = _left_pad_prompts(prompts, max_length=max_length)
-        # TODO the model may not use a regular KV Cache
-        self.prompt_cache = [BatchKVCache(left_padding) for _ in self.model.layers]
+        prompt_cache = [BatchKVCache(left_padding) for _ in self.model.layers]
 
         with mx.stream(generation_stream):
             while input_tokens.shape[1] > 1:
-                n_to_process = min(prefill_step_size, input_tokens.shape[1] - 1)
-                self._forward(input_tokens[:, :n_to_process])
-                mx.eval([c.state for c in self.prompt_cache])
+                n_to_process = min(self.prefill_step_size, input_tokens.shape[1] - 1)
+                self.model(input_tokens[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
                 input_tokens = input_tokens[:, n_to_process:]
                 mx.clear_cache()
+        return prompt_cache
 
+    def _process_prompts(self, prompts):
+        max_length = max(len(p) for p in prompts)
+        batch_size = self.prefill_batch_size
+        tok_limit = self.prefill_step_size * batch_size
+
+        # Dynamically increase batch size when processing
+        # lots of short prompts
+        while (2 * batch_size * max_length) < tok_limit and batch_size < len(prompts):
+            batch_size *= 2
+
+        if batch_size >= len(prompts):
+            self.prompt_cache = self._process_prompt_batch(prompts)
+        else:
+            # TODO possibly better to process steps in the outer loop without
+            # clearing cache and maybe with mx.compile and batches in the
+            # inner loop
+            caches = [
+                self._process_prompt_batch(prompts[b : b + batch_size])
+                for b in range(0, len(prompts), batch_size)
+            ]
+            self.prompt_cache = [cs[0].concatenate(cs) for cs in zip(*caches)]
+
+        input_tokens = mx.array([p[-1:] for p in prompts])
         y, logprobs = self._step(input_tokens)
         mx.async_eval(y, logprobs)
         self.next_y, self.next_logprobs = y, logprobs
 
     def _step(self, input_tokens: mx.array):
         with mx.stream(generation_stream):
-            logits = self._forward(input_tokens)
+            logits = self.model(input_tokens, cache=self.prompt_cache)
             logits = logits[:, -1, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             sampled = self.sampler(logprobs).squeeze(1)
@@ -983,8 +1007,8 @@ def batch_generate(
 
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
+    stats = gen.stats()
     if verbose:
-        stats = gen.stats()
         print(
             f"Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
         )

@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import copy
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -703,3 +704,35 @@ class BatchKVCache(_BaseCache):
         if isinstance(self.offset, mx.array):
             self.offset = self.offset[batch_indices]
             self.left_padding = self.left_padding[batch_indices]
+
+    @classmethod
+    def concatenate(cls, caches):
+        """
+        Only keep the given indices in the cache.
+        """
+        max_idx = max(c._idx for c in caches)
+        max_size = max(c.keys.shape[2] for c in caches)
+        cache = cls([0])
+
+        # Pad the keys and values so they are right-justified
+        # with the index and the same size
+        def pad(c):
+            left = max_idx - c._idx
+            right = max_size - c.keys.shape[2] - left
+            if right < 0:
+                k = c.keys[..., :right, :]
+                v = c.values[..., :right, :]
+                right = 0
+            else:
+                k, v = c.keys, c.values
+            pad = [(0, 0), (0, 0), (left, right), (0, 0)]
+            k = mx.pad(k, pad)
+            v = mx.pad(v, pad)
+            left_padding = c.left_padding + left
+            return k, v, c.offset, left_padding
+
+        cache._idx = max_idx
+        cache.keys, cache.values, cache.offset, cache.left_padding = map(
+            mx.concatenate, zip(*(pad(c) for c in caches))
+        )
+        return cache

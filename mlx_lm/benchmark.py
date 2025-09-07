@@ -4,8 +4,8 @@ import argparse
 
 import mlx.core as mx
 
-from mlx_lm import stream_generate
-from mlx_lm.generate import DEFAULT_MODEL, BatchGenerator
+from mlx_lm import batch_generate, stream_generate
+from mlx_lm.generate import DEFAULT_MODEL
 from mlx_lm.tokenizer_utils import load_tokenizer
 from mlx_lm.utils import (
     fetch_from_hub,
