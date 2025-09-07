@@ -92,13 +92,10 @@ def main():
         return response
 
     def batch_bench():
-        gen = BatchGenerator(model, stop_tokens={}, max_tokens=generation_tokens)
-        uids = gen.insert(prompts)
-        results = {uid: [] for uid in uids}
-        while responses := gen.next():
-            for response in responses:
-                results[response.uid].append(response.token)
-        return gen.stats()
+        texts, stats = batch_generate(
+            model, tokenizer, prompts, max_tokens=generation_tokens
+        )
+        return stats
 
     if batch_size == 1:
         _bench = single_bench

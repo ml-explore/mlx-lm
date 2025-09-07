@@ -962,11 +962,25 @@ def batch_generate(
     model, tokenizer, prompts: List[int], verbose: bool = False, **kwargs
 ):
     gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
-    uids = gen.insert(prompts)
-    results = {uid: [] for uid in uids}
-    while responses := gen.next():
-        for response in responses:
-            results[response.uid].append(response.token)
+    num_samples = len(prompts)
+    fin = 0
+    if verbose:
+        print(f"[batch_generate]: Finished processing 0/{num_samples}", end="\r")
+
+    with wired_limit(model, [generation_stream]):
+        uids = gen.insert(prompts)
+        results = {uid: [] for uid in uids}
+        while responses := gen.next():
+            for r in responses:
+                if verbose and r.finish_reason != None:
+                    fin += 1
+                    print(
+                        f"[batch_generate]: Finished processing {fin}/{num_samples}",
+                        end="\r",
+                    )
+                if r.finish_reason != "stop":
+                    results[r.uid].append(r.token)
+
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     if verbose:
@@ -979,7 +993,7 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"Peak memory: {stats.peak_memory:.3f} GB")
-    return texts
+    return texts, stats
 
 
 def main():
