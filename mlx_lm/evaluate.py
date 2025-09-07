@@ -23,8 +23,7 @@ from lm_eval.api.registry import register_model
 from lm_eval.models import huggingface
 from tqdm import tqdm
 
-from .generate import stream_generate
-from .models.base import create_causal_mask
+from .generate import batch_generate
 from .models.cache import make_prompt_cache
 from .utils import common_prefix_len, load
 
@@ -69,7 +68,7 @@ class MLXLM(LM):
     def __init__(
         self,
         path_or_hf_repo: str,
-        max_tokens: Optional[int] = None,
+        max_tokens: int,
         use_chat_template: Optional[bool] = None,
         trust_remote_code: bool = False,
     ) -> None:
@@ -78,7 +77,7 @@ class MLXLM(LM):
         self._model, self.tokenizer = load(
             path_or_hf_repo, tokenizer_config=tokenizer_config
         )
-        self._max_tokens = max_tokens or self.tokenizer.model_max_length
+        self._max_tokens = max_tokens
         self._batch_size = 8
         self.use_chat_template = use_chat_template
         if use_chat_template is None:
@@ -307,30 +306,34 @@ class MLXLM(LM):
         """
         logging.info("Generating continuation for %d sequences." % len(requests))
         contexts, options = zip(*[req.args for req in requests])
-        # contrary to the doc the second element of the tuple contains
+        # The second element of the tuple contains:
         # {'do_sample': False, 'until': ['\n\n'], 'temperature': 0}
         completions = []
 
-        for context, opt in tqdm(zip(contexts, options), total=len(contexts)):
-            until = opt["until"]
-            context = self.tokenizer.encode(
+        # Tokenize all contexts
+        contexts = [
+            self.tokenizer.encode(
                 context, add_special_tokens=not self.use_chat_template
             )
-            max_tokens = min(
-                opt.get("max_gen_tokens", self._max_tokens),
-                self.tokenizer.model_max_length - len(context),
-            )
-            text = ""
-            for response in stream_generate(
-                self._model, self.tokenizer, prompt=context, max_tokens=max_tokens
-            ):
-                text += response.text
-                if any(u in text for u in until):
-                    text = _rstrip_until(text, until)
-                    completions.append(text)
-                    break
-            else:
-                completions.append(text)
+            for context in contexts
+        ]
+
+        # TODO assuming all options are the same
+        # TODO consider multi-token, per-prompt stop conditions
+        max_tokens = options[0].get("max_gen_toks", self._max_tokens)
+
+        completions, _ = batch_generate(
+            model=self._model,
+            tokenizer=self.tokenizer,
+            prompts=contexts,
+            max_tokens=max_tokens,
+            verbose=True,
+        )
+
+        for e, (text, opt) in enumerate(zip(completions, options)):
+            until = opt["until"]
+            if any(u in text for u in until):
+                completions[e] = _rstrip_until(text, until)
         return completions
 
 
@@ -349,6 +352,7 @@ def main():
         "--max-tokens",
         type=int,
         help="Maximum nunber of tokens to generate. Defaults to the model's max context length.",
+        default=8912,
     )
     parser.add_argument(
         "--limit",

@@ -190,7 +190,7 @@ class TestGenerate(unittest.TestCase):
                 break
         self.model.set_dtype(mx.float16)
 
-    def test_batch_many_batches(self):
+    def test_many_batches(self):
 
         prompts = [
             "Write a story about Einstein",
@@ -242,7 +242,5 @@ class TestGenerate(unittest.TestCase):
                 break
 
 
-if __name__ == "__main__":
-    unittest.main()
 if __name__ == "__main__":
     unittest.main()

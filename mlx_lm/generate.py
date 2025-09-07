@@ -919,6 +919,7 @@ class BatchGenerator:
     def next(self):
         tic = time.perf_counter()
         if len(self.active_prompts) == 0:
+            self._reset_state()
             # Process prompts
             prompts = self.unprocessed_prompts[: self.completion_batch_size]
             if len(prompts) == 0:
@@ -949,17 +950,17 @@ class BatchGenerator:
         end_idx = []
         responses = []
 
-        finish_reason = None
-        if self.n_complete == self.max_tokens:
-            finish_reason = "length"
-
         for e, (t, uid) in enumerate(zip(y, self.active_prompts)):
             if t in self.stop_tokens:
+                finish_reason = "stop"
                 end_idx.append(e)
-                responses.append(CompletionResponse(uid, t, logprobs[e], "stop"))
+            elif self.n_complete == self.max_tokens:
+                finish_reason = "length"
+                end_idx.append(e)
             else:
-                responses.append(CompletionResponse(uid, t, logprobs[e], finish_reason))
+                finish_reason = None
                 keep_idx.append(e)
+            responses.append(CompletionResponse(uid, t, logprobs[e], finish_reason))
 
         # Remove any finished completions
         if len(end_idx):
@@ -970,9 +971,6 @@ class BatchGenerator:
                 self.next_logprobs = self.next_logprobs[keep_idx]
                 for c in self.prompt_cache:
                     c.filter(keep_idx)
-
-        if self.n_complete == self.max_tokens:
-            self._reset_state()
 
         # Periodically clear out allocator cache
         if self.n_complete % 256 == 0:
