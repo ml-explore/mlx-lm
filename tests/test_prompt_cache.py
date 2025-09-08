@@ -310,9 +310,18 @@ class TestPromptCache(unittest.TestCase):
             self.assertEqual(tok, toks[i])
             self.assertTrue(mx.allclose(logits, all_logits[i], rtol=4e-2))
 
-    def test_CacheList_trim(self):
+    def test_cache_list(self):
         c = CacheList(KVCache(), KVCache())
-        assert not c.is_trimmable() or c.trim(0) == 0
+        self.assertTrue(c.is_trimmable())
+        k = mx.zeros((1, 2, 8, 8))
+        v = mx.zeros((1, 2, 8, 8))
+        c[0].update_and_fetch(k, v)
+        c[1].update_and_fetch(k, v)
+        m = c.trim(5)
+        self.assertEqual(m, 5)
+
+        c = CacheList(MambaCache(), KVCache())
+        self.assertFalse(c.is_trimmable())
 
 
 if __name__ == "__main__":

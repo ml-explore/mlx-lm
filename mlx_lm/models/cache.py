@@ -162,6 +162,14 @@ class ConcatenateKVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[-2]
 
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
 
 class QuantizedKVCache(_BaseCache):
     def __init__(self, group_size: int = 64, bits: int = 8):
@@ -537,7 +545,12 @@ class CacheList(KVCache):
         return self.caches[idx]
 
     def is_trimmable(self):
-        return False
+        return all(c.is_trimmable() for c in self.caches)
+
+    def trim(self, n):
+        for c in self.caches:
+            m = c.trim(n)
+        return m
 
     @property
     def state(self):
