@@ -41,6 +41,23 @@ class TestGenerate(unittest.TestCase):
         )
         self.assertEqual(text, "!!!!!")
 
+    def test_stream_generate_max_tokens(self):
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Write a story about Einstein"}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+
+        tokens = []
+        for response in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=4,
+        ):
+            tokens.append(response.token)
+        self.assertEqual(len(tokens), 4)
+
     def test_generate_with_processor(self):
         init_toks = self.tokenizer.encode("hello")
 
@@ -188,7 +205,6 @@ class TestGenerate(unittest.TestCase):
                 lp = response.logprobs
                 self.assertTrue(mx.allclose(blp, lp))
                 break
-        self.model.set_dtype(mx.float16)
 
     def test_many_batches(self):
 
@@ -240,6 +256,50 @@ class TestGenerate(unittest.TestCase):
                 lp = response.logprobs
                 self.assertTrue(mx.allclose(blp, lp))
                 break
+
+    def test_batch_unique_max_toks(self):
+        prompts = [
+            "Write a story about Einstein",
+            "Hi",
+            "What time is it?",
+            "How tall is Mt Everest?",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            prefill_batch_size=2,
+            prefill_step_size=8,
+            completion_batch_size=3,
+        )
+        num_toks = [2, 3, 4, 5]
+        uids = gen.insert(prompts, max_tokens=num_toks)
+        batch_responses = {uid: [] for uid in uids}
+        while responses := gen.next():
+            for r in responses:
+                batch_responses[r.uid].append(r.token)
+
+        # Do a test for each prompt the logits are close
+        for e, prompt in enumerate(prompts):
+
+            tokens = []
+            for response in stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt,
+                max_tokens=num_toks[e],
+            ):
+                tokens.append(response.token)
+            batch_tokens = batch_responses[uids[e]]
+            self.assertEqual(tokens, batch_tokens)
 
 
 if __name__ == "__main__":

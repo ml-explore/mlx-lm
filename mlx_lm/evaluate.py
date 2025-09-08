@@ -318,9 +318,8 @@ class MLXLM(LM):
             for context in contexts
         ]
 
-        # TODO assuming all options are the same
         # TODO consider multi-token, per-prompt stop conditions
-        max_tokens = options[0].get("max_gen_toks", self._max_tokens)
+        max_tokens = [opt.get("max_gen_toks", self._max_tokens) for opt in options]
 
         completions, _ = batch_generate(
             model=self._model,

@@ -464,7 +464,7 @@ def speculative_generate_step(
     model: nn.Module,
     draft_model: nn.Module,
     *,
-    num_draft_tokens=2,
+    num_draft_tokens: int = 2,
     max_tokens: int = 256,
     sampler: Optional[Callable[mx.array, mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
@@ -638,6 +638,7 @@ def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
+    max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
@@ -649,6 +650,8 @@ def stream_generate(
         tokenizer (PreTrainedTokenizer): The tokenizer.
         prompt (Union[str, mx.array, List[int]]): The input prompt string or
           integer tokens.
+        max_tokens (int): The maximum number of tokens to generate.
+          Default: ``256``.
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
@@ -672,6 +675,8 @@ def stream_generate(
         prompt = mx.array(prompt)
 
     detokenizer = tokenizer.detokenizer
+
+    kwargs["max_tokens"] = max_tokens
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
@@ -697,6 +702,8 @@ def stream_generate(
                 break
 
             detokenizer.add_token(token)
+            if (n + 1) == max_tokens:
+                break
 
             yield GenerationResponse(
                 text=detokenizer.last_segment,
@@ -836,10 +843,14 @@ class BatchGenerator:
 
         self._reset_state()
 
-    def insert(self, prompts):
+    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
         uids = []
-        for p in prompts:
-            self.unprocessed_prompts.append((self.uid_count, p))
+
+        if max_tokens is None or isinstance(max_tokens, int):
+            max_tokens = [max_tokens or self.max_tokens] * len(prompts)
+
+        for p, m in zip(prompts, max_tokens):
+            self.unprocessed_prompts.append((self.uid_count, p, m))
             uids.append(self.uid_count)
             self.uid_count += 1
         # sort in ascending order of length
@@ -904,7 +915,6 @@ class BatchGenerator:
     def _reset_state(self):
         self.active_prompts = []
         self.prompt_cache = None
-        self.n_complete = 0
         self.next_y = None
         self.next_logprobs = None
 
@@ -918,30 +928,30 @@ class BatchGenerator:
 
     def next(self):
         tic = time.perf_counter()
+
+        prompt_processing = False
         if len(self.active_prompts) == 0:
             self._reset_state()
             # Process prompts
             prompts = self.unprocessed_prompts[: self.completion_batch_size]
             if len(prompts) == 0:
                 return []
-            uids, prompts = zip(*prompts)
-            self.active_prompts.extend(uids)
-            self._process_prompts(prompts)
+            inputs = [p for _, p, _ in prompts]
+            self.active_prompts.extend([uid, 0, max_tok] for uid, _, max_tok in prompts)
+            self._process_prompts(inputs)
             self.unprocessed_prompts = self.unprocessed_prompts[
                 self.completion_batch_size :
             ]
+            prompt_processing = True
 
         y, logprobs = self.next_y, self.next_logprobs
 
-        if (self.n_complete + 1) < self.max_tokens:
-            self.next_y, self.next_logprobs = self._step(y[:, None])
-            mx.async_eval(self.next_y, self.next_logprobs)
-
-        self.n_complete += 1
+        self.next_y, self.next_logprobs = self._step(y[:, None])
+        mx.async_eval(self.next_y, self.next_logprobs)
 
         mx.eval(y)
         toc = time.perf_counter()
-        if self.n_complete == 1:
+        if prompt_processing:
             self._stats.prompt_time += toc - tic
         else:
             self._stats.generation_time += toc - tic
@@ -950,11 +960,15 @@ class BatchGenerator:
         end_idx = []
         responses = []
 
-        for e, (t, uid) in enumerate(zip(y, self.active_prompts)):
+        for e, (t, (uid, n_complete, max_tok)) in enumerate(
+            zip(y, self.active_prompts)
+        ):
+            n_complete += 1
+            self.active_prompts[e][1] = n_complete
             if t in self.stop_tokens:
                 finish_reason = "stop"
                 end_idx.append(e)
-            elif self.n_complete == self.max_tokens:
+            elif n_complete >= max_tok:
                 finish_reason = "length"
                 end_idx.append(e)
             else:
@@ -972,49 +986,52 @@ class BatchGenerator:
                 for c in self.prompt_cache:
                     c.filter(keep_idx)
 
-        # Periodically clear out allocator cache
-        if self.n_complete % 256 == 0:
-            mx.clear_cache()
-
         self._stats.generation_tokens += len(responses)
         return responses
 
 
 def batch_generate(
-    model, tokenizer, prompts: List[int], verbose: bool = False, **kwargs
+    model,
+    tokenizer,
+    prompts: List[int],
+    max_tokens: Union[int, List[int]] = 128,
+    verbose: bool = False,
+    **kwargs,
 ):
     gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
     num_samples = len(prompts)
     fin = 0
     if verbose:
-        print(f"[batch_generate]: Finished processing 0/{num_samples}", end="\r")
+        print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
     with wired_limit(model, [generation_stream]):
-        uids = gen.insert(prompts)
+        uids = gen.insert(prompts, max_tokens)
         results = {uid: [] for uid in uids}
         while responses := gen.next():
             for r in responses:
                 if verbose and r.finish_reason != None:
                     fin += 1
                     print(
-                        f"[batch_generate]: Finished processing {fin}/{num_samples}",
+                        f"[batch_generate] Finished processing {fin}/{num_samples} ...",
                         end="\r",
                     )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+    if verbose:
+        print(f"[batch_generate] Finished processing {fin}/{num_samples}")
 
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     stats = gen.stats()
     if verbose:
         print(
-            f"Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
+            f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
         )
         print(
-            f"Generation: {stats.generation_tokens} tokens, "
+            f"[batch_generate] Generation: {stats.generation_tokens} tokens, "
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
-        print(f"Peak memory: {stats.peak_memory:.3f} GB")
+        print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
     return texts, stats
 
 
