@@ -123,7 +123,7 @@ class KlearSparseMoeBlock(nn.Module):
         scores = scores.astype(x.dtype)
         expert_out = self.experts(x, inds)
         y_experts = (expert_out * scores[..., None]).sum(axis=-2)
-        coef = nn.softmax(self.coefficient(x), axis=-1, precise=True)
+        coef = nn.softmax(self.coefficient(x), axis=-1)
         shared = self.shared_experts(x)
         y = y_experts * coef[..., :1] + shared * coef[..., 1:]
         return y
