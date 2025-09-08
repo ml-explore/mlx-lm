@@ -128,6 +128,7 @@ def linear_to_lora_layers(
         "longcat_flash",
         "seed_oss",
         "apertus",
+        "Klear",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
@@ -135,7 +136,7 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
+        if model.model_type in ["olmoe", "qwen3_moe", "dots1", "Klear"]:
             keys.add("mlp.gate")
         if model.model_type in ["longcat_flash"]:
             keys.add("mlp.router.classifier")
