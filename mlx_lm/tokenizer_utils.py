@@ -5,6 +5,20 @@ from typing import List
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+# Import Mistral utilities if available
+try:
+    from .tokenizer_mistral_utils import (
+        MISTRAL_AVAILABLE,
+        MistralStreamingDetokenizer,
+        MistralTokenizerWrapper,
+        load_mistral_tokenizer,
+    )
+except ImportError:
+    MISTRAL_AVAILABLE = False
+    MistralStreamingDetokenizer = None  # type: ignore
+    MistralTokenizerWrapper = None  # type: ignore
+    load_mistral_tokenizer = None  # type: ignore
+
 
 class StreamingDetokenizer:
     """The streaming detokenizer interface so that we can detokenize one token at a time.
@@ -66,6 +80,8 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
 
     def __init__(self, tokenizer):
         self._tokenizer = tokenizer
+        # Handle tokenizers that don't have clean_up_tokenization_spaces
+        self._clean_up_spaces = getattr(tokenizer, "clean_up_tokenization_spaces", True)
         self._tokenizer.decode([0])
         self.reset()
 
@@ -90,7 +106,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
             if self._current_text.endswith("\ufffd") or (
-                self._tokenizer.clean_up_tokenization_spaces
+                self._clean_up_spaces
                 and len(self._current_text) > 0
                 and self._current_text[-1] == " "
             ):
@@ -263,10 +279,25 @@ class TokenizerWrapper:
     ):
         self._tokenizer = tokenizer
         self._detokenizer = detokenizer_class(tokenizer)
+
+        # Initialize Mistral wrapper if needed
+        self._mistral_wrapper = None
+        if MISTRAL_AVAILABLE and MistralTokenizerWrapper is not None:
+            mistral_wrapper = MistralTokenizerWrapper(tokenizer)
+            if mistral_wrapper.is_mistral_tokenizer(tokenizer):
+                self._mistral_wrapper = mistral_wrapper
+
+        # Handle different tokenizer APIs for eos_token_id
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is None and self._mistral_wrapper is not None:
+            eos_token_id = self._mistral_wrapper.get_eos_token_id(tokenizer)
+
         self._eos_token_ids = (
             set(eos_token_ids)
             if eos_token_ids is not None
-            else {tokenizer.eos_token_id}
+            else {eos_token_id}
+            if eos_token_id is not None
+            else set()
         )
         self._think_start = None
         self._think_end = None
@@ -274,20 +305,54 @@ class TokenizerWrapper:
         self._tool_call_end = None
 
         THINK_TOKENS = [("<think>", "</think>")]
-        TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
+        TOOL_CALL_TOKENS = [
+            ("<tool_call>", "</tool_call>"),  # ChatML style
+        ]
+        MISTRAL_TOOL_CALL_START = (
+            "[TOOL_CALLS]"  # MistralTokenizer style - no end token
+        )
 
-        vocab = tokenizer.get_vocab()
+        # Get vocabulary
+        vocab = {}
+        if self._mistral_wrapper is not None:
+            vocab = self._mistral_wrapper.get_vocab(tokenizer)
+
+        if not vocab and hasattr(tokenizer, "get_vocab"):
+            vocab = tokenizer.get_vocab()
+
         for think_start, think_end in THINK_TOKENS:
             if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
                 self._think_end = think_end
                 break
-        if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
-            for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
-                if tool_call_start in vocab and tool_call_end in vocab:
-                    self._tool_call_start = tool_call_start
-                    self._tool_call_end = tool_call_end
-                    break
+
+        # Check for tool calling support
+        has_chat_template_with_tools = (
+            hasattr(tokenizer, "chat_template")
+            and tokenizer.chat_template
+            and '"tool"' in tokenizer.chat_template
+        )
+
+        # For MistralTokenizer, tool calling is supported if tool tokens exist
+        is_mistral_tokenizer = self._mistral_wrapper is not None
+
+        if has_chat_template_with_tools or is_mistral_tokenizer:
+            self._tool_call_start = ""
+            self._tool_call_end = ""
+
+            # Check for MistralTokenizer style first
+            if is_mistral_tokenizer and MISTRAL_TOOL_CALL_START in vocab:
+                self._tool_call_start = MISTRAL_TOOL_CALL_START
+                self._tool_call_end = ""
+                # No tool-calling end token for Mistral: it emits </s> (eos)
+                # after tool calls, which stops the generation loop.
+            else:
+                # Check for ChatML style tokens
+                for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
+                    if tool_call_start in vocab and tool_call_end in vocab:
+                        self._tool_call_start = tool_call_start
+                        self._tool_call_end = tool_call_end
+                        break
 
     def add_eos_token(self, token: str):
         token_id = None
@@ -300,6 +365,36 @@ class TokenizerWrapper:
             raise ValueError(f"'{token}' is not a token for this tokenizer")
 
         self._eos_token_ids.add(token_id)
+
+    def encode(self, text, add_special_tokens=True, **kwargs):
+        """Custom encode method that works with both HF and Mistral tokenizers."""
+        if self._mistral_wrapper is not None:
+            return self._mistral_wrapper.encode(
+                self._tokenizer, text, add_special_tokens, **kwargs
+            )
+        else:
+            return self._tokenizer.encode(
+                text, add_special_tokens=add_special_tokens, **kwargs
+            )
+
+    def apply_chat_template(
+        self, messages, add_generation_prompt=True, tools=None, **kwargs
+    ):
+        """Apply chat template with automatic tokenizer detection."""
+        # Try Mistral tokenizer first
+        if self._mistral_wrapper is not None:
+            try:
+                return self._mistral_wrapper.apply_mistral_chat_template(
+                    self._tokenizer, messages, add_generation_prompt, tools
+                )
+            except Exception:
+                # Fall through to HF handling
+                pass
+
+        # For HuggingFace tokenizers, use the standard method
+        return self._tokenizer.apply_chat_template(
+            messages, add_generation_prompt=add_generation_prompt, tools=tools, **kwargs
+        )
 
     @property
     def has_thinking(self):
@@ -324,6 +419,39 @@ class TokenizerWrapper:
     @property
     def tool_call_end(self):
         return self._tool_call_end
+
+    @property
+    def bos_token(self):
+        """Get BOS token, handling both HF and Mistral tokenizers."""
+        if self._mistral_wrapper is not None:
+            bos = self._mistral_wrapper.get_bos_token(self._tokenizer)
+            if bos is not None:
+                return bos
+
+        if hasattr(self._tokenizer, "bos_token"):
+            return self._tokenizer.bos_token
+        return None
+
+    @property
+    def eos_token(self):
+        """Get EOS token, handling both HF and Mistral tokenizers."""
+        if self._mistral_wrapper is not None:
+            eos = self._mistral_wrapper.get_eos_token(self._tokenizer)
+            if eos is not None:
+                return eos
+
+        if hasattr(self._tokenizer, "eos_token"):
+            return self._tokenizer.eos_token
+        return None
+
+    def save_pretrained(self, save_directory, **kwargs):
+        """Save the tokenizer, handling both HF and Mistral tokenizers."""
+        if self._mistral_wrapper is not None:
+            return self._mistral_wrapper.save_pretrained(
+                self._tokenizer, save_directory, **kwargs
+            )
+        else:
+            return self._tokenizer.save_pretrained(save_directory, **kwargs)
 
     def __getattr__(self, attr):
         if attr == "detokenizer":
@@ -359,11 +487,11 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
     def _postprocess_text(self, text):
         return text.replace("<n>", "\n")
 
-    def encode(self, text, **kwargs):
+    def encode(self, text, **kwargs):  # type: ignore
         return super().encode(self._preprocess_text(text), **kwargs)
 
     def encode_batch(self, texts, **kwargs):
-        return super().encode_batch([self._preprocess_text(t) for t in texts], **kwargs)
+        return super().encode_batch([self._preprocess_text(t) for t in texts], **kwargs)  # type: ignore
 
     def decode(self, *args, **kwargs):
         return self._postprocess_text(super().decode(*args, **kwargs))
@@ -377,7 +505,7 @@ AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer
 
 
 def _match(a, b):
-    if type(a) != type(b):
+    if type(a) is not type(b):
         return False
     if isinstance(a, dict):
         return len(a) == len(b) and all(k in b and _match(a[k], b[k]) for k in a)
@@ -419,7 +547,7 @@ def _is_bpe_decoder(decoder):
 def load_tokenizer(
     model_path, tokenizer_config_extra={}, return_tokenizer=True, eos_token_ids=None
 ):
-    """Load a huggingface tokenizer and try to infer the type of streaming
+    """Load a huggingface or mistral tokenizer and try to infer the type of streaming
     detokenizer to use.
 
     Note, to use a fast streaming tokenizer, pass a local file path rather than
@@ -427,6 +555,22 @@ def load_tokenizer(
     """
     detokenizer_class = NaiveStreamingDetokenizer
 
+    # Try to load Mistral tokenizer first
+    if MISTRAL_AVAILABLE and load_mistral_tokenizer is not None:
+        mistral_tokenizer, mistral_detokenizer_class, mistral_eos_token_ids = (
+            load_mistral_tokenizer(model_path, eos_token_ids)
+        )
+        if mistral_tokenizer is not None:
+            if return_tokenizer:
+                return TokenizerWrapper(
+                    mistral_tokenizer,
+                    mistral_detokenizer_class,  # type: ignore
+                    eos_token_ids=mistral_eos_token_ids,
+                )
+            else:
+                return mistral_detokenizer_class
+
+    # Fall back to HuggingFace tokenizer
     tokenizer_file = model_path / "tokenizer.json"
     if tokenizer_file.exists():
         with open(tokenizer_file, "r", encoding="utf-8") as fid:
@@ -449,7 +593,7 @@ def load_tokenizer(
     if return_tokenizer:
         return TokenizerWrapper(
             AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
-            detokenizer_class,
+            detokenizer_class,  # type: ignore
             eos_token_ids=eos_token_ids,
         )
     else:
