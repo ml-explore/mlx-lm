@@ -132,7 +132,7 @@ class KlearSparseMoeBlock(nn.Module):
 class KlearDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.self_attn = KlearAttention(args, layer_idx)
+        self.self_attn = KlearAttention(args)
 
         if (layer_idx not in args.mlp_only_layers) and (
             args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
@@ -205,17 +205,25 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
-            return weights
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
-                        for e in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+            for name in ["gate_proj", "up_proj", "down_proj"]:
+                target_key = f"{prefix}.mlp.experts.{name}.weight"
+                
+                for pattern in [
+                    f"{prefix}.mlp.experts.{{e}}.{name}.weight",
+                    f"{prefix}.mlp.switch_mlp.experts.{{e}}.{name}.weight"
+                ]:
+                    key0 = pattern.format(e=0)
+                    if key0 in weights:
+                        stacked = [weights.pop(pattern.format(e=e)) for e in range(self.args.num_experts)]
+                        weights[target_key] = mx.stack(stacked)
+                        break
+                else:
+                    single_key = f"{prefix}.mlp.switch_mlp.{name}.weight"
+                    if single_key in weights:
+                        weights[target_key] = weights.pop(single_key)
+        
         return weights
 
     @property
