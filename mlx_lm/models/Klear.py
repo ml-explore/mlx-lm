@@ -28,11 +28,8 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     num_key_value_heads: int
     rope_theta: float
-    tie_word_embeddings: bool
     max_position_embeddings: int
     norm_topk_prob: bool
-    routed_scaling_factor: float
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
 class KlearAttention(nn.Module):
