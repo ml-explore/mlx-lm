@@ -41,10 +41,26 @@ class KlearAttention(nn.Module):
         self.head_dim = args.hidden_size // args.num_attention_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(args.hidden_size, self.num_attention_heads * self.head_dim, bias=args.attention_bias)
-        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
-        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
-        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, args.hidden_size, bias=args.attention_bias)
+        self.q_proj = nn.Linear(
+            args.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_attention_heads * self.head_dim,
+            args.hidden_size,
+            bias=args.attention_bias,
+        )
 
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
@@ -65,13 +81,15 @@ class KlearAttention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = self.q_norm(queries.reshape(B, L, self.num_attention_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
+        queries = self.q_norm(
+            queries.reshape(B, L, self.num_attention_heads, -1)
+        ).transpose(0, 2, 1, 3)
         keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
             0, 2, 1, 3
         )
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -107,8 +125,13 @@ class KlearSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
-        self.experts = SwitchGLU(args.hidden_size, args.moe_intermediate_size, args.num_experts)
-        self.shared_experts = KlearMLP(args.hidden_size, hidden_dim=args.moe_intermediate_size * args.n_shared_experts)
+        self.experts = SwitchGLU(
+            args.hidden_size, args.moe_intermediate_size, args.num_experts
+        )
+        self.shared_experts = KlearMLP(
+            args.hidden_size,
+            hidden_dim=args.moe_intermediate_size * args.n_shared_experts,
+        )
         self.coefficient = nn.Linear(args.hidden_size, 2)
         self.expert_bias = mx.zeros((self.num_experts,), dtype=mx.float32)
 
@@ -116,7 +139,9 @@ class KlearSparseMoeBlock(nn.Module):
         routing_weights = mx.sigmoid(self.gate(x).astype(mx.float32))
         biased_weights = routing_weights + self.expert_bias.reshape((1, 1, -1))
         k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k])
+        inds = mx.stop_gradient(
+            mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
+        )
         scores = mx.take_along_axis(routing_weights, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / mx.sum(scores, axis=-1, keepdims=True)
@@ -140,9 +165,11 @@ class KlearDecoderLayer(nn.Module):
             self.mlp = KlearSparseMoeBlock(args)
         else:
             self.mlp = KlearMLP(args.hidden_size, args.intermediate_size)
-        
+
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
     def __call__(
         self,
@@ -209,21 +236,24 @@ class Model(nn.Module):
             prefix = f"model.layers.{l}"
             for name in ["gate_proj", "up_proj", "down_proj"]:
                 target_key = f"{prefix}.mlp.experts.{name}.weight"
-                
+
                 for pattern in [
                     f"{prefix}.mlp.experts.{{e}}.{name}.weight",
-                    f"{prefix}.mlp.switch_mlp.experts.{{e}}.{name}.weight"
+                    f"{prefix}.mlp.switch_mlp.experts.{{e}}.{name}.weight",
                 ]:
                     key0 = pattern.format(e=0)
                     if key0 in weights:
-                        stacked = [weights.pop(pattern.format(e=e)) for e in range(self.args.num_experts)]
+                        stacked = [
+                            weights.pop(pattern.format(e=e))
+                            for e in range(self.args.num_experts)
+                        ]
                         weights[target_key] = mx.stack(stacked)
                         break
                 else:
                     single_key = f"{prefix}.mlp.switch_mlp.{name}.weight"
                     if single_key in weights:
                         weights[target_key] = weights.pop(single_key)
-        
+
         return weights
 
     @property
