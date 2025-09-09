@@ -206,11 +206,9 @@ class GptOssMoeModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        ga = self.ga_idx
-        sa = self.swa_idx
-        full_mask = create_attention_mask(x, cache[ga : ga + 1])
+        full_mask = create_attention_mask(x, cache[self.ga_idx])
         swa_mask = create_attention_mask(
-            x, cache[sa : sa + 1], window_size=self.window_size
+            x, cache[self.swa_idx], window_size=self.window_size
         )
 
         for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
