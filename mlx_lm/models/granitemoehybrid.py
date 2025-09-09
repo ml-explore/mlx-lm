@@ -208,34 +208,23 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
 class GraniteMoeHybridAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.hidden_size = args.hidden_size
-        self.num_heads = args.num_attention_heads
-        self.head_dim = args.hidden_size // args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
 
-        # Use attention_multiplier as the scale instead of 1/sqrt(head_dim)
+        dim = args.hidden_size
+        self.n_heads = n_heads = args.num_attention_heads
+        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+
+        self.head_dim = head_dim = args.hidden_size // n_heads
+
         self.scale = args.attention_multiplier
-
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
-        )
+        attention_bias = args.attention_bias
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
 
         # Check if RoPE should be used based on position_embedding_type
         # If position_embedding_type is "nope", don't use RoPE
-        use_rope = getattr(args, 'position_embedding_type', 'rope') != 'nope'
+        use_rope = getattr(args, "position_embedding_type", "rope") != "nope"
         if use_rope:
             self.rope = initialize_rope(
                 self.head_dim,
@@ -255,17 +244,11 @@ class GraniteMoeHybridAttention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries = self.q_proj(x).reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-        keys = (
-            self.k_proj(x)
-            .reshape(B, L, self.num_key_value_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
-        values = (
-            self.v_proj(x)
-            .reshape(B, L, self.num_key_value_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         # Apply RoPE only if enabled
         if self.rope is not None:
@@ -309,10 +292,7 @@ class GraniteMoeHybridMoE(nn.Module):
         super().__init__()
 
         self.input_size = args.hidden_size
-        # From weight analysis: input_linear is (62, 1024, 1536), so expert hidden_size = 1024
-        # But SwitchGLU expects hidden_size = 512 (half for gate, half for up)
-        self.hidden_size = 512  # This should match the output_linear second dim
-        # Use SwitchGLU directly like in granitemoe
+        self.hidden_size = args.intermediate_size
         self.switch_mlp = SwitchGLU(
             self.input_size, self.hidden_size, args.num_local_experts
         )
@@ -331,8 +311,6 @@ class GraniteMoeHybridMoE(nn.Module):
 class GraniteMoeHybridSharedMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        # From weight inspection: input (2048, 1536) = (2*hidden_size, input_size)
-        # output (1536, 1024) = (input_size, hidden_size)
         self.input_linear = nn.Linear(args.hidden_size, args.shared_intermediate_size * 2, bias=False)
         self.output_linear = nn.Linear(args.shared_intermediate_size, args.hidden_size, bias=False)
 
@@ -357,16 +335,12 @@ class GraniteMoeHybridLayer(nn.Module):
                 args.hidden_size, eps=args.rms_norm_eps
             )
             self.block_sparse_moe = GraniteMoeHybridMoE(args)
-            # Add shared_mlp for all layers (will be used based on config)
-            self.shared_mlp = GraniteMoeHybridSharedMLP(args)
         else:
             raise ValueError(f"Unknown layer type: {layer_type}")
 
-        # Add shared_mlp and block_sparse_moe for all layers (even if not used by mamba layers)
-        # This matches the expected weight structure
         self.shared_mlp = GraniteMoeHybridSharedMLP(args)
         self.block_sparse_moe = GraniteMoeHybridMoE(args)
-        if not hasattr(self, 'post_attention_layernorm'):
+        if not hasattr(self, "post_attention_layernorm"):
             self.post_attention_layernorm = nn.RMSNorm(
                 args.hidden_size, eps=args.rms_norm_eps
             )
@@ -435,7 +409,7 @@ class GraniteMoeHybridModel(nn.Module):
             attn_cache = None
             if cache is not None:
                 cache_idx = 0
-                for i, layer_type in enumerate(self.args.layer_types):
+                for layer_type in self.args.layer_types:
                     if layer_type == "attention":
                         attn_cache = cache[cache_idx]
                         break
@@ -518,7 +492,7 @@ class Model(nn.Module):
                     # The weight is (num_experts, expert_hidden, input_size)
                     # For (62, 1024, 1536): expert_hidden=1024, so gate/up should be 512 each
                     input_weight = weights.pop(input_key)
-                    num_experts, expert_hidden, input_size = input_weight.shape
+                    _, expert_hidden, _ = input_weight.shape
 
                     # Split into gate and up projections (each half of expert_hidden)
                     gate_proj = input_weight[:, :expert_hidden//2, :]  # (num_experts, 512, 1536)
