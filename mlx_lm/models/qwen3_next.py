@@ -108,9 +108,6 @@ class Qwen3NextAttention(nn.Module):
 class Qwen3NextDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.hidden_size = args.hidden_size
-        
-        # token mixer
         self.layer_type = args.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3NextGatedDeltaNet(args, layer_idx)
@@ -146,3 +143,33 @@ class Qwen3NextDecoderLayer(nn.Module):
             r, _ = r
         out = h + r
         return out
+
+
+class Qwen3NextModel(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [
+            Qwen3NextDecoderLayer(args=args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ):
+        h = self.embed_tokens(inputs)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c)
+
+        return self.norm(h)
