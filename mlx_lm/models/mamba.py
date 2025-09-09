@@ -124,20 +124,15 @@ class MambaBlock(nn.Module):
         B, T, D = x.shape
         xz = self.in_proj(x)
         x, z = xz.split(indices_or_sections=2, axis=-1)
-
         K = self.conv_kernel_size
         if conv_cache is not None:
             x_full = mx.concatenate([conv_cache, x], axis=1)
         else:
             x_full = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
-
         conv_out = self.conv1d(x_full)
         new_conv_cache = x_full[:, - (K - 1) :, :]
-
         x = nn.silu(conv_out)
         A = -mx.exp(self.A_log)
-
-        outputs = []
         current_state = state_cache
         y = []
         for t in range(T):
@@ -217,3 +212,9 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.backbone.layers
+
+    def sanitize(self, weights):
+        for k, v in weights.items():
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+        return weights
