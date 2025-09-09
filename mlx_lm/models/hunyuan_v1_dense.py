@@ -209,6 +209,8 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = HunyuanV1DenseModel(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -217,8 +219,16 @@ class Model(nn.Module):
         cache=None,
     ):
         out = self.model(inputs, mask, cache)
-        return self.model.embed_tokens.as_linear(out)
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(out)
+        else:
+            return self.lm_head(out)
 
     @property
     def layers(self):
         return self.model.layers
+
+    def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        return weights
