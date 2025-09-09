@@ -389,26 +389,44 @@ class Qwen3NextModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
+        self.fa_idx = 0
+        for b in args.layer_types:
+            if b == "linear_attention":
+                break
+            elif b == "full_attention":
+                self.fa_idx += 1
+
     def __call__(
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        h = self.embed_tokens(inputs)
+        hidden_states = self.embed_tokens(inputs)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
-        
-        # TODO add linear mask
+            attn_mask = create_attention_mask(
+                hidden_states, cache[self.fa_idx : self.fa_idx + 1]
+            )
 
         if cache is None:
             cache = [None] * len(self.layers)
+        
+        cache_counter = 0
+        for layer in self.layers:
+            if layer.layer_type == "linear_attention" or layer.layer_type == "linear_attention":
+                c = cache[cache_counter]
+                cache_counter += 1
+            else:
+                c = None
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+            if layer.layer_type == "full_attention":
+                mask_to_use = attn_mask
+            else:
+                mask_to_use = None
+            hidden_states = layer(hidden_states, mask=mask_to_use, cache=c)
 
-        return self.norm(h)
+        return self.norm(hidden_states)
 
 
 class Model(nn.Module):
