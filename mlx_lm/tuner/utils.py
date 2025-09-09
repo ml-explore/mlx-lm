@@ -128,6 +128,7 @@ def linear_to_lora_layers(
         "longcat_flash",
         "seed_oss",
         "apertus",
+        "qwen3_next",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
@@ -181,6 +182,10 @@ def linear_to_lora_layers(
         keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
     elif model.model_type == "bailing_moe":
         keys = {"attention.query_key_value", "attention.dense"}
+    elif model.model_type == "qwen3_next":
+        keys.add("self_attn.in_proj_qkvz")
+        keys.add("self_attn.in_proj_ba")
+        keys.add("self_attn.out_proj")
     elif model.model_type == "nemotron_h":
         keys.add("mixer.in_proj")
         keys.add("mixer.out_proj")
