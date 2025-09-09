@@ -17,6 +17,11 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
+    linear_num_value_heads: int
+    linear_num_key_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
     num_experts: int
     num_experts_per_tok: int
     decoder_sparse_step: int
@@ -34,7 +39,65 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
-class MambaRMSNormGated(nn.Module):
+def recurrent_gated_delta_rule(
+    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+):
+    initial_dtype = query.dtype
+    if use_qk_l2norm_in_kernel:
+        query_norm = mx.sqrt(mx.sum(query**2, axis=-1, keepdims=True) + 1e-12)
+        query = query / query_norm
+        key_norm = mx.sqrt(mx.sum(key**2, axis=-1, keepdims=True) + 1e-12)
+        key = key / key_norm
+    
+    query, key, value, beta, g = [
+        mx.transpose(x, (0, 2, 1, 3)).astype(mx.float32) for x in (query, key, value, beta, g)
+    ]
+    
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+    
+    core_attn_out = mx.zeros((batch_size, num_heads, sequence_length, v_head_dim), dtype=value.dtype)
+    last_recurrent_state = (
+        mx.zeros((batch_size, sequence_length, k_head_dim, v_head_dim), dtype=value.dtype)
+        if initial_state is None
+        else initial_state.astype(value.dtype)
+    )
+    
+    for i in range(num_heads):
+        q_t = query[:, i, :, :]
+        k_t = key[:, i, :, :]
+        v_t = value[:, i, :, :]
+        g_t = mx.exp(g[:, i, :]).reshape(batch_size, sequence_length, 1, 1)
+        beta_t = beta[:, i, :].reshape(batch_size, sequence_length, 1)
+        
+        last_recurrent_state = last_recurrent_state * g_t
+        kv_mem = mx.sum(last_recurrent_state * k_t.reshape(batch_size, sequence_length, k_head_dim, 1), axis=-2)
+        delta = (v_t - kv_mem) * beta_t
+        last_recurrent_state = last_recurrent_state + k_t.reshape(batch_size, sequence_length, k_head_dim, 1) * delta.reshape(batch_size, sequence_length, 1, v_head_dim)
+        core_attn_out = core_attn_out.at[:, i, :, :].set(
+            mx.sum(last_recurrent_state * q_t.reshape(batch_size, sequence_length, k_head_dim, 1), axis=-2)
+        )
+    
+    if not output_final_state:
+        last_recurrent_state = None
+    
+    core_attn_out = mx.transpose(core_attn_out, (0, 2, 1, 3)).astype(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+def apply_mask_to_padding_states(hidden_states: mx.array, attention_mask: mx.array):
+    if (
+        attention_mask is not None
+        and attention_mask.shape[0] > 1
+        and attention_mask.shape[1] > 1
+    ):
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).astype(dtype)
+
+    return hidden_states
+
+class Qwen3NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -114,6 +177,119 @@ class Qwen3NextMLP(nn.Module):
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Qwen3NextGatedDeltaNet(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_v_heads = config.linear_num_value_heads
+        self.num_k_heads = config.linear_num_key_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+
+        projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
+        projection_size_ba = self.num_v_heads * 2
+        self.in_proj_qkvz = nn.Linear(self.hidden_size, projection_size_qkvz, bias=False)
+        self.in_proj_ba = nn.Linear(self.hidden_size, projection_size_ba, bias=False)
+
+        self.dt_bias = mx.ones(self.num_v_heads)
+
+        A = mx.random.uniform(low=0, high=16, shape=(self.num_v_heads,))
+        self.A_log = mx.log(A)
+
+        self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+    
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ):
+        hidden_states = apply_mask_to_padding_states(inputs, mask)
+        
+        # Set up dimensions for reshapes later
+        batch_size, seq_len, _ = hidden_states.shape
+        conv_state, recurrent_state = None, None
+        
+        # getting projected states from cache if it exists
+        if cache is not None:
+            # decoding
+            conv_state = cache.conv_states[self.layer_idx]
+            recurrent_state = cache.recurrent_states[self.layer_idx]
+        
+        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        projected_states_ba = self.in_proj_ba(hidden_states)
+        query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
+        query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
+        
+        mixed_qkv = mx.concatenate((query, key, value), axis=-1)
+        mixed_qkv = mx.transpose(mixed_qkv, (0, 2, 1))
+        
+        if cache is not None:
+            conv_state = mx.pad(mixed_qkv, [(0, 0), (0, 0), (self.conv_kernel_size - mixed_qkv.shape[-1], 0)])
+            cache.conv_states[self.layer_idx] = conv_state
+        else:
+            mixed_qkv = mx.sigmoid(self.conv1d(mixed_qkv)[:, :, :seq_len])
+        
+        mixed_qkv = mx.transpose(mixed_qkv, (0, 2, 1))
+        query, key, value = mx.split(
+            mixed_qkv,
+            [
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+            ],
+            axis=-1,
+        )
+        query = query.reshape(query.shape[0], query.shape[1], -1, self.head_k_dim)
+        key = key.reshape(key.shape[0], key.shape[1], -1, self.head_k_dim)
+        value = value.reshape(value.shape[0], value.shape[1], -1, self.head_v_dim)
+        
+        beta = mx.sigmoid(b)
+        # If the model is loaded in fp16, without the .astype(mx.float32) here, A might be -inf
+        g = -mx.exp(self.A_log.astype(mx.float32)) * mx.softplus(a.astype(mx.float32) + self.dt_bias)
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = mx.repeat(query, self.num_v_heads // self.num_k_heads, axis=2)
+            key = mx.repeat(key, self.num_v_heads // self.num_k_heads, axis=2)
+        
+        core_attn_out, _ = recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=recurrent_state is not None,
+            use_qk_l2norm_in_kernel=True,
+        )
+        
+        z_shape_og = z.shape
+        # reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+        
+        return self.out_proj(core_attn_out)
 
 
 class Qwen3NextDecoderLayer(nn.Module):
