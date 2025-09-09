@@ -43,81 +43,48 @@ class ModelArgs(BaseModelArgs):
 
 @mx.compile
 def recurrent_gated_delta_rule(
-    query: mx.array,
-    key: mx.array, 
-    value: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    initial_state: Optional[mx.array] = None,
-    output_final_state: bool = False,
+    query: mx.array, key: mx.array, value: mx.array, g: mx.array, beta: mx.array,
+    initial_state: Optional[mx.array] = None, output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False
 ) -> Tuple[mx.array, Optional[mx.array]]:
+    
+    initial_dtype = query.dtype
+    
     if use_qk_l2norm_in_kernel:
         query = query / mx.linalg.norm(query, axis=-1, keepdims=True)
         key = key / mx.linalg.norm(key, axis=-1, keepdims=True)
     
-    # Transpose and convert to float32
-    query = mx.transpose(query, (0, 2, 1, 3)).astype(mx.float32)
-    key = mx.transpose(key, (0, 2, 1, 3)).astype(mx.float32)
-    value = mx.transpose(value, (0, 2, 1, 3)).astype(mx.float32)
-    g = mx.transpose(g, (0, 2, 1, 3)).astype(mx.float32)
-    beta = mx.transpose(beta, (0, 2, 1, 3)).astype(mx.float32)
-    
-    # Scale query
-    query = query / (key.shape[-1] ** 0.5)
+    # Transpose to match PyTorch: (B, H, T, D)
+    query, key, value, beta, g = [mx.transpose(x, (0, 2, 1, 3)).astype(mx.float32) 
+                                  for x in (query, key, value, beta, g)]
     
     B, H, T, Dk = key.shape
-    _, _, _, Dv = value.shape
+    Dv = value.shape[-1]
+    scale = 1.0 / (query.shape[-1] ** 0.5)
+    query = query * scale
     
-    # Initialize state
     if initial_state is None:
-        s = mx.zeros((B, H, Dk, Dv), dtype=mx.float32)
+        state = mx.zeros((B, H, Dk, Dv), dtype=mx.float32)
     else:
-        s = initial_state.astype(mx.float32)
-        # Ensure s has the correct shape
-        if s.shape != (B, H, Dk, Dv):
-            s = s.reshape(B, H, Dk, Dv)
+        state = initial_state.astype(mx.float32)
+        if len(state.shape) == 4 and state.shape[1] == T:
+            state = state[:, -1, :, :].reshape(B, H, Dk, Dv)
+        else:
+            state = state.reshape(B, H, Dk, Dv)
     
-    out = []
-    
+    outputs = []
     for t in range(T):
-        k_t = key[:, :, t]    # (B, H, Dk)
-        v_t = value[:, :, t]  # (B, H, Dv)
-        q_t = query[:, :, t]  # (B, H, Dk)
-        b_t = beta[:, :, t]   # (B, H, 1) or (B, H,)
-        g_t = g[:, :, t]      # (B, H, 1) or (B, H,)
+        g_t = mx.exp(g[:, :, t, :])  # exp of g, not -exp
+        g_t = mx.expand_dims(g_t, -1)  # (B, H, Dv, 1)
         
-        # Ensure beta and g have correct shapes for broadcasting
-        if b_t.ndim == 2:  # (B, H,)
-            b_t = b_t[:, :, None]  # (B, H, 1)
-        if g_t.ndim == 2:  # (B, H,)
-            g_t = g_t[:, :, None, None]  # (B, H, 1, 1)
-        elif g_t.ndim == 3:  # (B, H, 1)
-            g_t = g_t[:, :, :, None]  # (B, H, 1, 1)
-        
-        # Decay (forget gate) - ensure g_t broadcasts correctly
-        s = s * mx.exp(g_t)
-        
-        # Read - this should work with s: (B, H, Dk, Dv) and k_t: (B, H, Dk)
-        mem = mx.einsum("bhkd,bhk->bhd", s, k_t)  # (B, H, Dv)
-        
-        # Write
-        delta = (v_t - mem) * b_t  # (B, H, Dv)
-        
-        # Update state: k_t[:,:,:,None] is (B, H, Dk, 1), delta[:,:,None,:] is (B, H, 1, Dv)
-        s = s + k_t[:, :, :, None] * delta[:, :, None, :]
-        
-        # Project to output
-        output_t = mx.einsum("bhkd,bhk->bhd", s, q_t)  # (B, H, Dv)
-        out.append(output_t)
+        state = state * g_t
+        mem = mx.einsum("bhkv,bhk->bhv", state, key[:, :, t])
+        delta = (value[:, :, t] - mem) * beta[:, :, t]
+        state = state + mx.einsum("bhk,bhv->bhkv", key[:, :, t], delta)
+        outputs.append(mx.einsum("bhkv,bhk->bhv", state, query[:, :, t]))
     
-    # Stack outputs and transpose back
-    output = mx.stack(out, axis=2)  # (B, H, T, Dv)
-    output = mx.transpose(output, (0, 2, 1, 3))  # (B, T, H, Dv)
-    
-    final_state = s if output_final_state else None
-    
-    return output, final_state
+    out = mx.transpose(mx.stack(outputs, axis=2), (0, 2, 1, 3))
+    return out.astype(initial_dtype), state if output_final_state else None
 
 
 @mx.compile
@@ -230,6 +197,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.layer_norm_epsilon = config.rms_norm_eps
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
+
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -285,7 +253,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             recurrent_state = cache[1]
         else:
             recurrent_state = mx.zeros(
-                (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
+                (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim),
                 dtype=hidden_states.dtype,
             )
 
@@ -306,12 +274,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 conv_state = cache[0]
             padded_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
             cache[0] = padded_input[:, -(self.conv_kernel_size - 1):, :]
+            mixed_qkv = nn.silu(self.conv1d(padded_input))
         else:
-            padded_input = mx.pad(
-                mixed_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
-            )
-
-        mixed_qkv = mx.sigmoid(self.conv1d(padded_input))
+            padded_input = mx.pad(mixed_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
+            conv_output = self.conv1d(padded_input)
+            mixed_qkv = nn.silu(conv_output[:, :seq_len, :])
 
         query, key, value = mx.split(
             mixed_qkv,
