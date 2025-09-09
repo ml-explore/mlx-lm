@@ -1,7 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
@@ -10,7 +9,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, MambaCache
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU, SwitchLinear
+from .switch_layers import SwitchGLU
 
 
 @dataclass
@@ -24,18 +23,18 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     num_key_value_heads: int
     attention_bias: bool
-    
+
     # Scalar multipliers
     embedding_multiplier: float
     attention_multiplier: float
     logits_scaling: float
     residual_multiplier: float
-    
+
     # MoE parameters
     num_local_experts: int
     num_experts_per_tok: int
     shared_intermediate_size: int
-    
+
     # Mamba parameters
     mamba_n_heads: int
     mamba_d_head: int
@@ -43,9 +42,8 @@ class ModelArgs(BaseModelArgs):
     mamba_d_state: int
     mamba_d_conv: int
     mamba_n_groups: int
-    mamba_chunk_size: int
     mamba_conv_bias: bool
-    
+
     # Other parameters
     layer_types: List[str]
     rms_norm_eps: float
@@ -214,7 +212,7 @@ class GraniteMoeHybridAttention(nn.Module):
         self.num_heads = args.num_attention_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
-        
+
         # Use attention_multiplier as the scale instead of 1/sqrt(head_dim)
         self.scale = args.attention_multiplier
 
@@ -277,7 +275,7 @@ class GraniteMoeHybridAttention(nn.Module):
             else:
                 queries = self.rope(queries)
                 keys = self.rope(keys)
-        
+
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
@@ -309,7 +307,7 @@ class GraniteMoeHybridTopKGating(nn.Module):
 class GraniteMoeHybridMoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        
+
         self.input_size = args.hidden_size
         # From weight analysis: input_linear is (62, 1024, 1536), so expert hidden_size = 1024
         # But SwitchGLU expects hidden_size = 512 (half for gate, half for up)
@@ -334,10 +332,10 @@ class GraniteMoeHybridSharedMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         # From weight inspection: input (2048, 1536) = (2*hidden_size, input_size)
-        # output (1536, 1024) = (input_size, hidden_size)  
+        # output (1536, 1024) = (input_size, hidden_size)
         self.input_linear = nn.Linear(args.hidden_size, args.shared_intermediate_size * 2, bias=False)
         self.output_linear = nn.Linear(args.shared_intermediate_size, args.hidden_size, bias=False)
-        
+
     def __call__(self, x: mx.array) -> mx.array:
         gate, up = mx.split(self.input_linear(x), 2, axis=-1)
         return self.output_linear(nn.silu(gate) * up)
@@ -348,9 +346,9 @@ class GraniteMoeHybridLayer(nn.Module):
         super().__init__()
         self.layer_type = layer_type
         self.residual_multiplier = args.residual_multiplier
-        
+
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        
+
         if layer_type == "mamba":
             self.mamba = GraniteMoeHybridMamba2Mixer(args)
         elif layer_type == "attention":
@@ -363,7 +361,7 @@ class GraniteMoeHybridLayer(nn.Module):
             self.shared_mlp = GraniteMoeHybridSharedMLP(args)
         else:
             raise ValueError(f"Unknown layer type: {layer_type}")
-            
+
         # Add shared_mlp and block_sparse_moe for all layers (even if not used by mamba layers)
         # This matches the expected weight structure
         self.shared_mlp = GraniteMoeHybridSharedMLP(args)
@@ -382,25 +380,25 @@ class GraniteMoeHybridLayer(nn.Module):
         # First block: either Mamba or Attention
         residual = x
         hidden_states = self.input_layernorm(x)
-        
+
         if self.layer_type == "mamba":
             hidden_states = self.mamba(hidden_states, cache=cache)
         else:
             hidden_states = self.self_attn(hidden_states, mask=mask, cache=cache)
-            
+
         hidden_states = residual + hidden_states * self.residual_multiplier
-        
+
         # Second block: MoE + shared_mlp (for ALL layers)
         residual = hidden_states
         normed = self.post_attention_layernorm(hidden_states)
-        
+
         # Apply both sparse MoE and shared MLP, then sum them
         moe_out = self.block_sparse_moe(normed)
         shared_out = self.shared_mlp(normed)
         mlp_out = moe_out + shared_out
-        
+
         hidden_states = residual + mlp_out * self.residual_multiplier
-        
+
         return hidden_states
 
 
@@ -415,7 +413,7 @@ class GraniteMoeHybridModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.embedding_multiplier = args.embedding_multiplier
-        
+
         # Find first attention layer index for mask creation
         self.fa_idx = 0
         for layer_type in args.layer_types:
@@ -460,7 +458,7 @@ class GraniteMoeHybridModel(nn.Module):
                 mask_to_use = attn_mask
             else:
                 mask_to_use = None
-                
+
             hidden_states = layer(hidden_states, mask=mask_to_use, cache=c)
 
         return self.norm(hidden_states)
@@ -482,12 +480,12 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         out = self.model(inputs, mask=mask, cache=cache)
-        
+
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-            
+
         return out / self.logits_scaling
 
     @property
@@ -508,12 +506,12 @@ class Model(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-        
+
         # Handle MoE weight transformation from 3D expert weights to SwitchGLU format
         if "model.layers.0.block_sparse_moe.input_linear.weight" in weights:
             for l in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{l}.block_sparse_moe"
-                
+
                 # Transform input_linear: from (num_experts, expert_hidden, input) to SwitchGLU format
                 input_key = f"{prefix}.input_linear.weight"
                 if input_key in weights:
@@ -521,14 +519,14 @@ class Model(nn.Module):
                     # For (62, 1024, 1536): expert_hidden=1024, so gate/up should be 512 each
                     input_weight = weights.pop(input_key)
                     num_experts, expert_hidden, input_size = input_weight.shape
-                    
+
                     # Split into gate and up projections (each half of expert_hidden)
                     gate_proj = input_weight[:, :expert_hidden//2, :]  # (num_experts, 512, 1536)
                     up_proj = input_weight[:, expert_hidden//2:, :]    # (num_experts, 512, 1536)
-                    
+
                     weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_proj
                     weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_proj
-                
+
                 # Transform output_linear: from (num_experts, input, expert_hidden/2) to down_proj
                 output_key = f"{prefix}.output_linear.weight"
                 if output_key in weights:
@@ -536,5 +534,5 @@ class Model(nn.Module):
                     # Shape should be (num_experts, input_size, expert_hidden/2) = (62, 1536, 512)
                     # This is already in the right format for down_proj
                     weights[f"{prefix}.switch_mlp.down_proj.weight"] = output_weight
-        
+
         return weights
