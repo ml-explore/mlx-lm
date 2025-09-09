@@ -78,8 +78,9 @@ def recurrent_gated_delta_rule(
         kv_mem = mx.sum(last_recurrent_state * k_t.reshape(batch_size, sequence_length, k_head_dim, 1), axis=-2)
         delta = (v_t - kv_mem) * beta_t
         last_recurrent_state = last_recurrent_state + k_t.reshape(batch_size, sequence_length, k_head_dim, 1) * delta.reshape(batch_size, sequence_length, 1, v_head_dim)
-        core_attn_out = core_attn_out.at[:, i, :, :].set(
-            mx.sum(last_recurrent_state * q_t.reshape(batch_size, sequence_length, k_head_dim, 1), axis=-2)
+        core_attn_out[:, i, :, :] = mx.sum(
+            last_recurrent_state * q_t.reshape(batch_size, sequence_length, k_head_dim, 1),
+            axis=-2,
         )
     
     if not output_final_state:
