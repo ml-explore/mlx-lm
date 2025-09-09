@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -30,16 +31,14 @@ class Lille130mAttention(nn.Module):
         self.head_dim = args.n_embd // args.n_head
         self.scale = self.head_dim**-0.5
 
-        self.qkv_proj = nn.Linear(args.n_embd, (args.n_head + 2 * args.n_kv_heads) * self.head_dim, bias=False)
+        self.qkv_proj = nn.Linear(
+            args.n_embd, (args.n_head + 2 * args.n_kv_heads) * self.head_dim, bias=False
+        )
         self.out_proj = nn.Linear(args.n_head * self.head_dim, args.n_embd, bias=False)
 
         self.norm = nn.RMSNorm(args.n_embd, eps=args.layer_norm_eps)
 
-        self.rope = nn.RoPE(
-            args.n_embd // args.n_head,
-            True,
-            args.rope_theta
-        )
+        self.rope = nn.RoPE(args.n_embd // args.n_head, True, args.rope_theta)
 
     def __call__(
         self,
@@ -50,15 +49,11 @@ class Lille130mAttention(nn.Module):
         B, L, D = x.shape
 
         qkv = self.qkv_proj(self.norm(x))
-        
+
         q_size = self.n_head * self.head_dim
         kv_size = self.n_kv_heads * self.head_dim
-        
-        queries, keys, values = mx.split(
-            qkv, 
-            [q_size, q_size + kv_size], 
-            axis=-1
-        )
+
+        queries, keys, values = mx.split(qkv, [q_size, q_size + kv_size], axis=-1)
 
         queries = queries.reshape(B, L, self.n_head, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -100,7 +95,7 @@ class Lille130Block(nn.Module):
         super().__init__()
         self.attention = Lille130mAttention(args)
         self.feed_forward = Lille130mMLP(args)
-    
+
     def __call__(
         self,
         x: mx.array,
@@ -116,11 +111,9 @@ class Lille130(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.n_embd)
-        self.layers = [
-            Lille130Block(args=args) for _ in range(args.n_layer)
-        ]
+        self.layers = [Lille130Block(args=args) for _ in range(args.n_layer)]
         self.norm = nn.RMSNorm(args.n_embd, eps=args.layer_norm_eps)
-    
+
     def __call__(
         self,
         inputs: mx.array,
@@ -139,7 +132,7 @@ class Lille130(nn.Module):
             h = layer(h, mask, cache=c)
 
         return self.tok_embeddings.as_linear(self.norm(h))
-    
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -159,10 +152,8 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.transformer.layers
-    
+
     def sanitize(self, weights):
-        weights = {
-            k: v for k, v in weights.items() if "rotary_emb" not in k
-        }
+        weights = {k: v for k, v in weights.items() if "rotary_emb" not in k}
         weights.pop("lm_head.weight", None)
         return weights
