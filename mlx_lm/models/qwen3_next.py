@@ -165,6 +165,8 @@ class Qwen3NextModel(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
+        
+        # TODO add linear mask
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -173,3 +175,25 @@ class Qwen3NextModel(nn.Module):
             h = layer(h, mask, c)
 
         return self.norm(h)
+
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.model = Qwen3NextModel(args)
+        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ):
+        out = self.model(inputs, mask, cache)
+        return self.lm_head(out)
+
+    @property
+    def layers(self):
+        return self.model.layers
