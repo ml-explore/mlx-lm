@@ -30,6 +30,7 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int
     norm_topk_prob: bool
     attention_bias: bool
+    layer_types: Optional[List[str]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
@@ -102,3 +103,46 @@ class Qwen3NextAttention(nn.Module):
         output = output * mx.sigmoid(gate)
         
         return self.o_proj(output)
+
+
+class Qwen3NextDecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        
+        # token mixer
+        self.layer_type = args.layer_types[layer_idx]
+        if self.layer_type == "linear_attention":
+            self.linear_attn = Qwen3NextGatedDeltaNet(args, layer_idx)
+        elif self.layer_type == "full_attention":
+            self.self_attn = Qwen3NextAttention(args, layer_idx)
+        
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.args = args
+        
+        if (layer_idx not in args.mlp_only_layers) and (
+            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3NextSparseMoeBlock(args)
+        else:
+            self.mlp = Qwen3NextMLP(args.hidden_size, args.intermediate_size)
+    
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        if self.layer_type == "linear_attention":
+            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+        elif self.layer_type == "full_attention":
+            r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        r = self.mlp(self.post_attention_layernorm(h))
+        if isinstance(r, tuple):
+            r, _ = r
+        out = h + r
+        return out
