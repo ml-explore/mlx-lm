@@ -104,8 +104,7 @@ class TestGenerate(unittest.TestCase):
             drafted.append(generation_result.from_draft)
             results.append(generation_result)
 
-        self.assertEqual(len(results), 6)
-        drafted.pop()
+        self.assertEqual(len(results), 5)
         # since num_draft_tokens is 2 and draft model is the same, the
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts
@@ -298,6 +297,7 @@ class TestGenerate(unittest.TestCase):
                 max_tokens=num_toks[e],
             ):
                 tokens.append(response.token)
+
             batch_tokens = batch_responses[uids[e]]
             self.assertEqual(tokens, batch_tokens)
 

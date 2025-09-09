@@ -736,3 +736,17 @@ class BatchKVCache(_BaseCache):
             mx.concatenate, zip(*(pad(c) for c in caches))
         )
         return cache
+
+    def split(self, idx):
+        """
+        Split the cache into two sub-caches at the
+        provided index.
+        """
+        l_cache = BatchKVCache([0])
+        r_cache = BatchKVCache([0])
+        l_cache.keys, r_cache.keys = mx.split(self.keys, (idx,))
+        l_cache.values, r_cache.values = mx.split(self.values, (idx,))
+        l_cache._idx = r_cache._idx = self._idx
+        l_cache.offset, r_cache.offset = mx.split(self.offset, (idx,))
+        l_cache.left_padding, r_cache.left_padding = mx.split(self.left_padding, (idx,))
+        return l_cache, r_cache

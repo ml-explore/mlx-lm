@@ -458,6 +458,10 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache.left_padding.tolist(), [2, 1, 2, 7, 4])
 
+        cache_a, cache_b = cache.split(3)
+        self.assertEqual(cache_a.keys.shape[0], 3)
+        self.assertEqual(cache_b.keys.shape[0], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

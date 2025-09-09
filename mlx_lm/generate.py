@@ -786,14 +786,6 @@ def _left_pad_prompts(prompts, max_length=None):
 
 
 @dataclass
-class CompletionResponse:
-    uid: int
-    token: int
-    logprobs: mx.array
-    finish_reason: Optional[str]
-
-
-@dataclass
 class BatchStats:
     """
     An data object to hold generation stats.
@@ -817,7 +809,58 @@ class BatchStats:
     peak_memory: float = 0
 
 
+@dataclass
+class Batch:
+    uids: List[int]
+    y: mx.array
+    logprobs: mx.array
+    max_tokens: List[int]
+    num_tokens: List[int]
+    cache: List[Any]
+
+    def __len__(self):
+        return len(self.uids)
+
+    def filter(self, keep_idx: List[int]):
+        self.uids = [self.uids[k] for k in keep_idx]
+        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
+        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        keep_idx = mx.array(keep_idx, mx.int32)
+        self.y = self.y[keep_idx]
+        self.logprobs = self.logprobs[keep_idx]
+        for c in self.cache:
+            c.filter(keep_idx)
+
+    def extend(self, other):
+        self.uids.extend(other.uids)
+        self.y = mx.concatenate([self.y, other.y])
+        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
+        self.num_tokens.extend(other.num_tokens)
+        self.max_tokens.extend(other.max_tokens)
+        self.cache = [c.concatenate([c, o]) for c, o in zip(self.cache, other.cache)]
+
+    def split(self, idx):
+        l_uid, r_uid = self.uids[:idx], self.uids[idx:]
+        l_max_tokens, r_max_tokens = self.max_tokens[:idx], self.max_tokens[idx:]
+        l_num_tokens, r_num_tokens = self.num_tokens[:idx], self.num_tokens[idx:]
+        l_y, r_y = mx.split(self.y, (idx,))
+        l_logprobs, r_logprobs = mx.split(self.logprobs, (idx,))
+        l_cache, r_cache = zip(*(c.split(idx) for c in self.cache))
+        return (
+            Batch(l_uid, l_y, l_logprobs, l_max_tokens, l_num_tokens, l_cache),
+            Batch(r_uid, r_y, r_logprobs, r_max_tokens, r_num_tokens, r_cache),
+        )
+
+
 class BatchGenerator:
+
+    @dataclass
+    class Response:
+        uid: int
+        token: int
+        logprobs: mx.array
+        finish_reason: Optional[str]
+
     def __init__(
         self,
         model,
@@ -853,7 +896,7 @@ class BatchGenerator:
             self.unprocessed_prompts.append((self.uid_count, p, m))
             uids.append(self.uid_count)
             self.uid_count += 1
-        # sort in ascending order of length
+        # Sort in ascending order of length
         self.unprocessed_prompts = sorted(
             self.unprocessed_prompts, key=lambda x: len(x[1])
         )
@@ -878,7 +921,8 @@ class BatchGenerator:
         return prompt_cache
 
     def _process_prompts(self, prompts):
-        max_length = max(len(p) for p in prompts)
+        uids, inputs, max_tokens = zip(*prompts)
+        max_length = max(len(p) for p in inputs)
         batch_size = self.prefill_batch_size
         tok_limit = self.prefill_step_size * batch_size
 
@@ -888,35 +932,35 @@ class BatchGenerator:
             batch_size *= 2
 
         if batch_size >= len(prompts):
-            self.prompt_cache = self._process_prompt_batch(prompts)
+            prompt_cache = self._process_prompt_batch(inputs)
         else:
             # TODO possibly better to process steps in the outer loop without
             # clearing cache and maybe with mx.compile and batches in the
             # inner loop
             caches = [
-                self._process_prompt_batch(prompts[b : b + batch_size])
+                self._process_prompt_batch(inputs[b : b + batch_size])
                 for b in range(0, len(prompts), batch_size)
             ]
-            self.prompt_cache = [cs[0].concatenate(cs) for cs in zip(*caches)]
+            prompt_cache = [cs[0].concatenate(cs) for cs in zip(*caches)]
 
-        input_tokens = mx.array([p[-1:] for p in prompts])
-        y, logprobs = self._step(input_tokens)
+        inputs = mx.array([p[-1:] for p in inputs])
+        y, logprobs = self._step(inputs, prompt_cache)
         mx.async_eval(y, logprobs)
-        self.next_y, self.next_logprobs = y, logprobs
+        return Batch(
+            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+        )
 
-    def _step(self, input_tokens: mx.array):
+    def _step(self, input_tokens: mx.array, prompt_cache: List[Any]):
         with mx.stream(generation_stream):
-            logits = self.model(input_tokens, cache=self.prompt_cache)
+            logits = self.model(input_tokens, cache=prompt_cache)
             logits = logits[:, -1, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             sampled = self.sampler(logprobs).squeeze(1)
             return sampled, logprobs
 
     def _reset_state(self):
-        self.active_prompts = []
-        self.prompt_cache = None
-        self.next_y = None
-        self.next_logprobs = None
+        self.active_batch = None
+        self.processed_batch = None
 
     def stats(self):
         self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
@@ -930,24 +974,55 @@ class BatchGenerator:
         tic = time.perf_counter()
 
         prompt_processing = False
-        if len(self.active_prompts) == 0:
-            self._reset_state()
-            # Process prompts
-            prompts = self.unprocessed_prompts[: self.completion_batch_size]
-            if len(prompts) == 0:
-                return []
-            inputs = [p for _, p, _ in prompts]
-            self.active_prompts.extend([uid, 0, max_tok] for uid, _, max_tok in prompts)
-            self._process_prompts(inputs)
-            self.unprocessed_prompts = self.unprocessed_prompts[
-                self.completion_batch_size :
-            ]
-            prompt_processing = True
+        batch = self.active_batch
+        num_active = len(batch) if batch else 0
+        num_to_add = self.completion_batch_size - num_active
+        while num_to_add > 0:
+            if self.processed_batch is not None:
+                if num_to_add < len(self.processed_batch):
+                    to_add, self.processed_batch = self.processed_batch.split(
+                        num_to_add
+                    )
+                else:
+                    to_add, self.processed_batch = self.processed_batch, None
+                num_to_add -= len(to_add)
 
-        y, logprobs = self.next_y, self.next_logprobs
+                if batch is None:
+                    batch = self.active_batch = to_add
+                else:
+                    batch.extend(to_add)
+            else:
+                prompts = self.unprocessed_prompts[: self.completion_batch_size]
+                # Finish processing the last examples of the last batch
+                if len(prompts) == 0 and num_active > 0:
+                    break
+                # All done
+                elif len(prompts) == 0:
+                    self._reset_state()
+                    return []
+                # Process prompts
+                if self.active_batch is not None:
+                    # Finish any active completion tokens
+                    mx.eval(self.active_batch.y, self.active_batch.logprobs)
+                    self._stats.generation_time += time.perf_counter() - tic
+                    tic = time.perf_counter()
 
-        self.next_y, self.next_logprobs = self._step(y[:, None])
-        mx.async_eval(self.next_y, self.next_logprobs)
+                next_batch = self._process_prompts(prompts)
+                self.unprocessed_prompts = self.unprocessed_prompts[
+                    self.completion_batch_size :
+                ]
+                prompt_processing = True
+                # If there was no active batch, set it and break
+                if self.active_batch is None:
+                    self.active_batch = next_batch
+                    break
+                # Otherwise store the processed batch to pull from
+                self.processed_batch = next_batch
+
+        batch = self.active_batch
+        y, logprobs = batch.y, batch.logprobs
+        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
+        mx.async_eval(batch.y, batch.logprobs)
 
         mx.eval(y)
         toc = time.perf_counter()
@@ -960,31 +1035,28 @@ class BatchGenerator:
         end_idx = []
         responses = []
 
-        for e, (t, (uid, n_complete, max_tok)) in enumerate(
-            zip(y, self.active_prompts)
+        for e, (t, uid, num_tok, max_tok) in enumerate(
+            zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
         ):
-            n_complete += 1
-            self.active_prompts[e][1] = n_complete
+            num_tok += 1
+            batch.num_tokens[e] = num_tok
             if t in self.stop_tokens:
                 finish_reason = "stop"
                 end_idx.append(e)
-            elif n_complete >= max_tok:
+            elif num_tok >= max_tok:
                 finish_reason = "length"
                 end_idx.append(e)
             else:
                 finish_reason = None
                 keep_idx.append(e)
-            responses.append(CompletionResponse(uid, t, logprobs[e], finish_reason))
+            responses.append(self.Response(uid, t, logprobs[e], finish_reason))
 
         # Remove any finished completions
         if len(end_idx):
-            self.active_prompts = [self.active_prompts[k] for k in keep_idx]
             if len(keep_idx) > 0:
-                keep_idx = mx.array(keep_idx)
-                self.next_y = self.next_y[keep_idx]
-                self.next_logprobs = self.next_logprobs[keep_idx]
-                for c in self.prompt_cache:
-                    c.filter(keep_idx)
+                batch.filter(keep_idx)
+            else:
+                self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
         return responses
