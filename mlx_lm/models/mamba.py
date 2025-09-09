@@ -131,8 +131,7 @@ class MambaBlock(nn.Module):
         else:
             x_full = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
 
-        conv_full = self.conv1d(x_full)
-        conv_out = conv_full[:, -T:, :]
+        conv_out = self.conv1d(x_full)
         new_conv_cache = x_full[:, - (K - 1) :, :]
 
         x = nn.silu(conv_out)
