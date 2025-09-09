@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -40,58 +40,88 @@ class ModelArgs(BaseModelArgs):
     layer_types: Optional[List[str]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
+
 @mx.compile
 def recurrent_gated_delta_rule(
-    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
-):
-    initial_dtype = query.dtype
+    query: mx.array,
+    key: mx.array, 
+    value: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    initial_state: Optional[mx.array] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False
+) -> Tuple[mx.array, Optional[mx.array]]:
     if use_qk_l2norm_in_kernel:
-        query_norm = mx.sqrt(mx.sum(query**2, axis=-1, keepdims=True) + 1e-12)
-        query = query / query_norm
-        key_norm = mx.sqrt(mx.sum(key**2, axis=-1, keepdims=True) + 1e-12)
-        key = key / key_norm
+        query = query / mx.linalg.norm(query, axis=-1, keepdims=True)
+        key = key / mx.linalg.norm(key, axis=-1, keepdims=True)
     
-    query, key, value, beta, g = [
-        mx.transpose(x, (0, 2, 1, 3)).astype(mx.float32) for x in (query, key, value, beta, g)
-    ]
+    # Transpose and convert to float32
+    query = mx.transpose(query, (0, 2, 1, 3)).astype(mx.float32)
+    key = mx.transpose(key, (0, 2, 1, 3)).astype(mx.float32)
+    value = mx.transpose(value, (0, 2, 1, 3)).astype(mx.float32)
+    g = mx.transpose(g, (0, 2, 1, 3)).astype(mx.float32)
+    beta = mx.transpose(beta, (0, 2, 1, 3)).astype(mx.float32)
     
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    scale = 1 / (query.shape[-1] ** 0.5)
-    query = query * scale
+    # Scale query
+    query = query / (key.shape[-1] ** 0.5)
     
-    core_attn_out = mx.zeros((batch_size, num_heads, sequence_length, v_head_dim), dtype=value.dtype)
-    last_recurrent_state = (
-        mx.zeros((batch_size, sequence_length, k_head_dim, v_head_dim), dtype=value.dtype)
-        if initial_state is None
-        else initial_state.astype(value.dtype)
-    )
+    B, H, T, Dk = key.shape
+    _, _, _, Dv = value.shape
     
-    for i in range(num_heads):
-        q_t = query[:, i, :, :]
-        k_t = key[:, i, :, :]
-        v_t = value[:, i, :, :]
-        g_t = mx.exp(g[:, i, :]).reshape(batch_size, sequence_length, 1, 1)
-        beta_t = beta[:, i, :].reshape(batch_size, sequence_length, 1)
+    # Initialize state
+    if initial_state is None:
+        s = mx.zeros((B, H, Dk, Dv), dtype=mx.float32)
+    else:
+        s = initial_state.astype(mx.float32)
+        # Ensure s has the correct shape
+        if s.shape != (B, H, Dk, Dv):
+            s = s.reshape(B, H, Dk, Dv)
+    
+    out = []
+    
+    for t in range(T):
+        k_t = key[:, :, t]    # (B, H, Dk)
+        v_t = value[:, :, t]  # (B, H, Dv)
+        q_t = query[:, :, t]  # (B, H, Dk)
+        b_t = beta[:, :, t]   # (B, H, 1) or (B, H,)
+        g_t = g[:, :, t]      # (B, H, 1) or (B, H,)
         
-        last_recurrent_state = last_recurrent_state * g_t
-        kv_mem = mx.sum(last_recurrent_state * k_t.reshape(batch_size, sequence_length, k_head_dim, 1), axis=-2)
-        delta = (v_t - kv_mem) * beta_t
-        last_recurrent_state = last_recurrent_state + k_t.reshape(batch_size, sequence_length, k_head_dim, 1) * delta.reshape(batch_size, sequence_length, 1, v_head_dim)
-        core_attn_out[:, i, :, :] = mx.sum(
-            last_recurrent_state * q_t.reshape(batch_size, sequence_length, k_head_dim, 1),
-            axis=-2,
-        )
+        # Ensure beta and g have correct shapes for broadcasting
+        if b_t.ndim == 2:  # (B, H,)
+            b_t = b_t[:, :, None]  # (B, H, 1)
+        if g_t.ndim == 2:  # (B, H,)
+            g_t = g_t[:, :, None, None]  # (B, H, 1, 1)
+        elif g_t.ndim == 3:  # (B, H, 1)
+            g_t = g_t[:, :, :, None]  # (B, H, 1, 1)
+        
+        # Decay (forget gate) - ensure g_t broadcasts correctly
+        s = s * mx.exp(g_t)
+        
+        # Read - this should work with s: (B, H, Dk, Dv) and k_t: (B, H, Dk)
+        mem = mx.einsum("bhkd,bhk->bhd", s, k_t)  # (B, H, Dv)
+        
+        # Write
+        delta = (v_t - mem) * b_t  # (B, H, Dv)
+        
+        # Update state: k_t[:,:,:,None] is (B, H, Dk, 1), delta[:,:,None,:] is (B, H, 1, Dv)
+        s = s + k_t[:, :, :, None] * delta[:, :, None, :]
+        
+        # Project to output
+        output_t = mx.einsum("bhkd,bhk->bhd", s, q_t)  # (B, H, Dv)
+        out.append(output_t)
     
-    if not output_final_state:
-        last_recurrent_state = None
+    # Stack outputs and transpose back
+    output = mx.stack(out, axis=2)  # (B, H, T, Dv)
+    output = mx.transpose(output, (0, 2, 1, 3))  # (B, T, H, Dv)
     
-    core_attn_out = mx.transpose(core_attn_out, (0, 2, 1, 3)).astype(initial_dtype)
-    return core_attn_out, last_recurrent_state
+    final_state = s if output_final_state else None
+    
+    return output, final_state
 
 
 @mx.compile
-def apply_mask_to_padding_states(hidden_states: mx.array, attention_mask: mx.array):
+def apply_mask_to_padding_states(hidden_states: mx.array, attention_mask: mx.array) -> mx.array:
     if (
         attention_mask is not None
         and attention_mask.shape[0] > 1
@@ -223,23 +253,48 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
     
+    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
+        nq, nk, nv, dv = self.num_k_heads, self.head_k_dim, self.num_v_heads, self.head_v_dim
+        mixed_qkvz = mixed_qkvz.reshape(mixed_qkvz.shape[:-1] + (nq, 2*nk + 2*nv*dv//nq))
+        mixed_ba = mixed_ba.reshape(mixed_ba.shape[:-1] + (nq, 2*nv//nq))
+        
+        # Split indices are cumulative positions
+        q, k, v, z = mx.split(mixed_qkvz, [nk, 2*nk, 2*nk + nv//nq*dv], axis=-1)
+        b, a = mx.split(mixed_ba, [nv//nq], axis=-1)
+        
+        v = v.reshape(v.shape[0], v.shape[1], -1, dv)
+        z = z.reshape(z.shape[0], z.shape[1], -1, dv)
+        b = b.reshape(b.shape[0], b.shape[1], nv)
+        a = a.reshape(a.shape[0], a.shape[1], nv)
+        return q, k, v, z, b, a
+    
     def __call__(
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        hidden_states = apply_mask_to_padding_states(inputs, mask)
-        
+        if mask is not None:
+            hidden_states = apply_mask_to_padding_states(inputs, mask)
+        else:
+            hidden_states = inputs
+
         batch_size, seq_len, _ = hidden_states.shape
-        recurrent_state = cache[1] if cache is not None else None
-        
+
+        if cache is not None and cache[1] is not None:
+            recurrent_state = cache[1]
+        else:
+            recurrent_state = mx.zeros(
+                (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
+                dtype=hidden_states.dtype,
+            )
+
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
         query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
-        
-        mixed_qkv = mx.concatenate((query, key, value), axis=-1)  # (batch_size, seq_len, self.conv_dim)
+
+        mixed_qkv = mx.concatenate((query, key, value), axis=-1)
 
         if cache is not None:
             if cache[0] is None:
@@ -256,28 +311,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 mixed_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
             )
 
-        # Depthwise conv, keep length = seq_len
         mixed_qkv = mx.sigmoid(self.conv1d(padded_input))
+
         query, key, value = mx.split(
             mixed_qkv,
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-            ],
+            [self.key_dim, self.key_dim + self.key_dim],
             axis=-1,
         )
         query = query.reshape(query.shape[0], query.shape[1], -1, self.head_k_dim)
         key = key.reshape(key.shape[0], key.shape[1], -1, self.head_k_dim)
         value = value.reshape(value.shape[0], value.shape[1], -1, self.head_v_dim)
-        
-        beta = mx.sigmoid(b)
 
-        g = -mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(a.astype(mx.float32) + self.dt_bias)
+        beta = mx.sigmoid(b).reshape(batch_size, seq_len, -1, 1)
+        g = (
+            -mx.exp(self.A_log.astype(mx.float32))
+            * nn.softplus(a.astype(mx.float32) + self.dt_bias)
+        ).reshape(batch_size, seq_len, -1, 1)
         if self.num_v_heads // self.num_k_heads > 1:
             query = mx.repeat(query, self.num_v_heads // self.num_k_heads, axis=2)
             key = mx.repeat(key, self.num_v_heads // self.num_k_heads, axis=2)
-        
+
         core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
             query,
             key,
@@ -288,9 +341,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             output_final_state=True if cache is not None else False,
             use_qk_l2norm_in_kernel=True,
         )
+        # Updated storage of new_recurrent_state
         if cache is not None:
             cache[1] = new_recurrent_state
-        
+        else:
+            new_recurrent_state = None
+
         z_shape_og = z.shape
 
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
@@ -298,7 +354,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
-        
+
         return self.out_proj(core_attn_out)
 
 
@@ -406,16 +462,18 @@ class Qwen3NextModel(nn.Module):
         hidden_states = self.embed_tokens(inputs)
 
         if mask is None:
-            attn_mask = create_attention_mask(
-                hidden_states, cache[self.fa_idx : self.fa_idx + 1]
-            )
+            kv_cache = next(c for c in cache if isinstance(c, KVCache))
+            attn_mask = create_attention_mask(hidden_states, [kv_cache])
 
         if cache is None:
             cache = [None] * len(self.layers)
         
         cache_counter = 0
         for layer in self.layers:
-            if layer.layer_type == "linear_attention" or layer.layer_type == "linear_attention":
+            if layer.layer_type == "linear_attention":
+                c = cache[cache_counter]
+                cache_counter += 1
+            elif layer.layer_type == "full_attention":
                 c = cache[cache_counter]
                 cache_counter += 1
             else:
@@ -459,3 +517,20 @@ class Model(nn.Module):
             elif l.layer_type == "full_attention":
                 caches.append(KVCache())
         return caches
+    
+    def sanitize(self, weights):
+        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+            return weights
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}"
+            for n in ["up_proj", "down_proj", "gate_proj"]:
+                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
+                        for e in range(self.args.num_experts)
+                    ]
+                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+        for k, v in weights.items():
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+        return weights
