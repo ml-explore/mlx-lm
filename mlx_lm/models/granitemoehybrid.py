@@ -50,6 +50,7 @@ class ModelArgs(BaseModelArgs):
     layer_types: List[str]
     rms_norm_eps: float
     rope_theta: float
+    position_embedding_type: str = "rope"  # Can be "rope", "nope", etc.
     tie_word_embeddings: bool = True
     time_step_limit: Tuple[float, float] = (0.001, 100.0)
 
@@ -234,13 +235,19 @@ class GraniteMoeHybridAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
         )
 
-        self.rope = initialize_rope(
-            self.head_dim,
-            args.rope_theta,
-            False,
-            None,  # rope_scaling
-            args.max_position_embeddings,
-        )
+        # Check if RoPE should be used based on position_embedding_type
+        # If position_embedding_type is "nope", don't use RoPE
+        use_rope = getattr(args, 'position_embedding_type', 'rope') != 'nope'
+        if use_rope:
+            self.rope = initialize_rope(
+                self.head_dim,
+                args.rope_theta,
+                False,
+                None,  # rope_scaling
+                args.max_position_embeddings,
+            )
+        else:
+            self.rope = None
 
     def __call__(
         self,
@@ -262,13 +269,17 @@ class GraniteMoeHybridAttention(nn.Module):
             .transpose(0, 2, 1, 3)
         )
 
+        # Apply RoPE only if enabled
+        if self.rope is not None:
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
+        
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -368,21 +379,29 @@ class GraniteMoeHybridLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        # First block: either Mamba or Attention
+        residual = x
+        hidden_states = self.input_layernorm(x)
+        
         if self.layer_type == "mamba":
-            # Mamba layer: just the mamba mixer
-            normed = self.input_layernorm(x)
-            hidden_states = self.mamba(normed, cache=cache)
-            return x + hidden_states * self.residual_multiplier
+            hidden_states = self.mamba(hidden_states, cache=cache)
         else:
-            # Attention layer: attention + MoE
-            normed = self.input_layernorm(x)
-            hidden_states = self.self_attn(normed, mask=mask, cache=cache)
-            h = x + hidden_states * self.residual_multiplier
+            hidden_states = self.self_attn(hidden_states, mask=mask, cache=cache)
             
-            # MoE block
-            normed = self.post_attention_layernorm(h)
-            moe_out = self.block_sparse_moe(normed)
-            return h + moe_out * self.residual_multiplier
+        hidden_states = residual + hidden_states * self.residual_multiplier
+        
+        # Second block: MoE + shared_mlp (for ALL layers)
+        residual = hidden_states
+        normed = self.post_attention_layernorm(hidden_states)
+        
+        # Apply both sparse MoE and shared MLP, then sum them
+        moe_out = self.block_sparse_moe(normed)
+        shared_out = self.shared_mlp(normed)
+        mlp_out = moe_out + shared_out
+        
+        hidden_states = residual + mlp_out * self.residual_multiplier
+        
+        return hidden_states
 
 
 class GraniteMoeHybridModel(nn.Module):
