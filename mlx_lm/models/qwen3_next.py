@@ -423,7 +423,6 @@ class Qwen3NextModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
         hidden_states = self.embed_tokens(inputs)
@@ -432,10 +431,9 @@ class Qwen3NextModel(nn.Module):
             cache = [None] * len(self.layers)
 
         attn_mask = None
-        if mask is None:
-            kv_caches = [c for c in cache if isinstance(c, KVCache)]
-            if kv_caches:
-                attn_mask = create_attention_mask(hidden_states, kv_caches)
+        kv_caches = [c for c in cache if isinstance(c, KVCache)]
+        if kv_caches:
+            attn_mask = create_attention_mask(hidden_states, kv_caches)
 
         cache_counter = 0
         for layer in self.layers:
@@ -450,8 +448,6 @@ class Qwen3NextModel(nn.Module):
 
             if layer.layer_type == "full_attention":
                 mask_to_use = attn_mask
-            elif layer.layer_type == "linear_attention":
-                mask_to_use = mask
             else:
                 mask_to_use = None
             hidden_states = layer(hidden_states, mask=mask_to_use, cache=c)
@@ -470,10 +466,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     @property
