@@ -139,16 +139,14 @@ class KlearSparseMoeBlock(nn.Module):
         routing_weights = mx.sigmoid(self.gate(x).astype(mx.float32))
         biased_weights = routing_weights + self.expert_bias.reshape((1, 1, -1))
         k = self.top_k
-        inds = mx.stop_gradient(
-            mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
-        )
+        inds = mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
         scores = mx.take_along_axis(routing_weights, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / mx.sum(scores, axis=-1, keepdims=True)
         scores = scores.astype(x.dtype)
         expert_out = self.experts(x, inds)
         y_experts = (expert_out * scores[..., None]).sum(axis=-2)
-        coef = nn.softmax(self.coefficient(x), axis=-1)
+        coef = mx.softmax(self.coefficient(x), axis=-1, precise=True)
         shared = self.shared_experts(x)
         y = y_experts * coef[..., :1] + shared * coef[..., 1:]
         return y
@@ -197,16 +195,14 @@ class KlearModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -225,37 +221,42 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for name in ["gate_proj", "up_proj", "down_proj"]:
-                target_key = f"{prefix}.mlp.experts.{name}.weight"
+        if "model.layers.0.mlp.experts.0.gate_proj.weight" not in weights:
+            return weights
 
-                for pattern in [
-                    f"{prefix}.mlp.experts.{{e}}.{name}.weight",
-                    f"{prefix}.mlp.switch_mlp.experts.{{e}}.{name}.weight",
-                ]:
-                    key0 = pattern.format(e=0)
-                    if key0 in weights:
-                        stacked = [
-                            weights.pop(pattern.format(e=e))
-                            for e in range(self.args.num_experts)
-                        ]
-                        weights[target_key] = mx.stack(stacked)
-                        break
-                else:
-                    single_key = f"{prefix}.mlp.switch_mlp.{name}.weight"
-                    if single_key in weights:
-                        weights[target_key] = weights.pop(single_key)
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.mlp.experts"
+            for name in ["gate_proj", "up_proj", "down_proj"]:
+                stacked = [
+                    weights.pop(f"{prefix}.{e}.{name}.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.{name}.weight"] = mx.stack(stacked)
 
         return weights
 
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
+
+        return predicate
