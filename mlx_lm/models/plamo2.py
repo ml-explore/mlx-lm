@@ -531,18 +531,16 @@ class PlamoModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache=None,
     ):
         batch_size, seq_length = inputs.shape
 
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, [cache[1]] if cache is not None else None)
-
         if cache is None:
             cache = [None] * len(self.layers.layers)
+
+        mask = create_attention_mask(h, cache[1])
 
         # decoder layers
         out = self.layers(
@@ -579,12 +577,9 @@ class Model(nn.Module):
         # full_attn = self.layer_idx in self.config.full_attention_idx
         return [MambaCache() if l.is_mamba else KVCache() for l in self.layers]
 
-    def __call__(
-        self, inputs: mx.array, mask: Optional[mx.array] = None, cache=None
-    ) -> mx.array:
+    def __call__(self, inputs: mx.array, cache=None) -> mx.array:
         outputs = self.model(
             inputs=inputs,
-            mask=None,
             cache=cache,
         )
         if self.config.tie_word_embeddings:

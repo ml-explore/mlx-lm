@@ -129,6 +129,8 @@ def linear_to_lora_layers(
         "seed_oss",
         "apertus",
         "qwen3_next",
+        "Klear",
+        "lille-130m",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
@@ -136,10 +138,16 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
+        if model.model_type in ["olmoe", "qwen3_moe", "dots1", "Klear"]:
             keys.add("mlp.gate")
         if model.model_type in ["longcat_flash"]:
             keys.add("mlp.router.classifier")
+        if model.model_type == "lille-130m":
+            keys.add("attention.qkv_proj")
+            keys.add("attention.out_proj")
+            keys.add("feed_forward.gate_proj")
+            keys.add("feed_forward.up_proj")
+            keys.add("feed_forward.down_proj")
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":

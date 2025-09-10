@@ -196,16 +196,14 @@ class DBRX(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.wte(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.blocks)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.blocks, cache):
             h = layer(h, mask, c)
@@ -224,10 +222,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.transformer(inputs, mask, cache)
+        out = self.transformer(inputs, cache)
         return self.lm_head(out)
 
     @property

@@ -17,7 +17,6 @@ class TextArgs(BaseModelArgs):
     attention_bias: bool
     attention_chunk_size: int
     head_dim: int
-    hidden_act: str
     hidden_size: int
     interleave_moe_layer_step: int
     intermediate_size: int
@@ -153,6 +152,7 @@ class MoE(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.top_k = args.num_experts_per_tok
+        assert self.top_k == 1, "Only 1 expert per token supported"
         self.num_experts = args.num_local_experts
         self.experts = SwitchGLU(
             args.hidden_size, args.intermediate_size, self.num_experts
@@ -219,7 +219,6 @@ class LlamaModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
@@ -242,21 +241,15 @@ class LlamaModel(nn.Module):
         token_pos = linds <= rinds
         chunk_mask = (block_pos == 0) & token_pos
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-        else:
-            chunk_mask &= mask
-
         if cache is None:
             cache = [None] * len(self.layers)
 
+        global_mask = create_attention_mask(h, cache[3])
+
         for idx, (layer, c) in enumerate(zip(self.layers, cache)):
             use_chunked_attention = (idx + 1) % 4 != 0
-            if use_chunked_attention:
-                local_mask = chunk_mask
-            else:
-                local_mask = mask
-            h = layer(h, local_mask, cache=c)
+            mask = chunk_mask if use_chunked_attention else global_mask
+            h = layer(h, mask, cache=c)
 
         return self.norm(h)
 
@@ -274,10 +267,9 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
 
@@ -291,10 +283,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        return self.language_model(inputs, mask, cache)
+        return self.language_model(inputs, cache)
 
     def sanitize(self, weights):
         def to_remove(k):

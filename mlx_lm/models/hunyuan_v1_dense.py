@@ -186,17 +186,14 @@ class HunyuanV1DenseModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
 
+        mask = create_attention_mask(h, cache[0])
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
@@ -209,16 +206,25 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = HunyuanV1DenseModel(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
-        return self.model.embed_tokens.as_linear(out)
+        out = self.model(inputs, cache)
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(out)
+        else:
+            return self.lm_head(out)
 
     @property
     def layers(self):
         return self.model.layers
+
+    def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        return weights
