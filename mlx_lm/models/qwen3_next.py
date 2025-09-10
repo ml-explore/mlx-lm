@@ -7,8 +7,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, MambaCache
+from .rope_utils import initialize_rope
+from .cache import KVCache, ArraysCache
 from .switch_layers import SwitchGLU
+
+
+class MambaCache(ArraysCache):
+    def __init__(self):
+        super().__init__(size=2)
 
 
 @dataclass
@@ -55,6 +61,7 @@ def recurrent_gated_delta_rule(
     """Minimal recurrent gated delta rule in MLX matching the Torch reference.
     Expects query/key/value shapes (B, S, H, D*) and g/beta shapes (B, S, H) or (B, S, H, 1).
     """
+    orig_dtype = query.dtype
     # Optional L2 normalization on last dim for query/key
     if use_qk_l2norm_in_kernel:
         # Normalize along the feature dimension
@@ -115,7 +122,7 @@ def recurrent_gated_delta_rule(
         out[:, t] = mx.einsum("bhd,bhdv->bhv", q_t, state)
 
     # Return (B, H, S, Dv) like Torch's out.transpose(1, 2)
-    out = mx.transpose(out, (0, 2, 1, 3)).astype(query.dtype)
+    out = mx.transpose(out, (0, 2, 1, 3)).astype(orig_dtype)
 
     if not output_final_state:
         state = None
@@ -131,7 +138,7 @@ class Qwen3NextRMSNormGated(nn.Module):
     def __call__(self, hidden_states: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
             hidden_states = hidden_states * nn.silu(gate)
-        return mx.fast.rms_norm(hidden_states, self.weight, self.eps)
+        return mx.fast.rms_norm(hidden_states, 1.0 + self.weight, self.eps)
 
 
 class Qwen3NextAttention(nn.Module):
@@ -143,17 +150,19 @@ class Qwen3NextAttention(nn.Module):
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(args.hidden_size, self.num_attention_heads * self.head_dim * 2, bias=args.attention_bias)
-        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
+        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, args.hidden_size, bias=args.attention_bias)
 
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-        self.rope = nn.RoPE(
+        self.rope = initialize_rope(
             self.head_dim,
-            traditional=False,
             base=args.rope_theta,
+            traditional=False,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -219,14 +228,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.layer_norm_epsilon = config.rms_norm_eps
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
-
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
             bias=False,
             kernel_size=self.conv_kernel_size,
             groups=self.conv_dim,
-            padding=0,
+            padding=self.conv_kernel_size - 1,
         )
 
         projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
@@ -244,10 +252,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
     
     def apply_mask_to_padding_states(self, hidden_states, attention_mask):
-        """
-        Applies the mask to hidden_states like Torch reference.
-        If attention_mask is not None and has more than 1 row and column, multiply and cast.
-        """
         if attention_mask is not None:
             if attention_mask.shape[0] > 1 and attention_mask.shape[1] > 1:
                 dtype = hidden_states.dtype
@@ -271,49 +275,96 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
     
     def __call__(self, inputs: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None):
-        # Apply attention mask to inputs, if provided and valid
-        if mask is not None:
-            # mask shape (B, 1, 1, S) or similar
-            mask_2d = mask.squeeze(1).squeeze(1)
-        else:
-            mask_2d = None
+        # Derive a 2D (B, S) mask for padding if an array was provided; ignore string sentinels like 'causal'.
+        mask_2d = None
+        if isinstance(mask, mx.array):
+            if mask.ndim >= 4:
+                mask_2d = mask.squeeze(1).squeeze(1)
+            elif mask.ndim == 2:
+                mask_2d = mask
+        
         inputs = self.apply_mask_to_padding_states(inputs, mask_2d)
 
-        B,L,_ = inputs.shape
-        qkvz, ba = self.in_proj_qkvz(inputs), self.in_proj_ba(inputs)
-        q,k,v,z,b,a = self.fix_query_key_value_ordering(qkvz, ba)
-        q,k,v = (x.reshape(B,L,-1) for x in (q,k,v))
-        mixed_qkv = mx.concatenate((q,k,v),-1)
+        B, S, _ = inputs.shape
 
+        # Split cache into conv_state and recurrent_state if provided
         if cache is not None:
-            conv_state, rec_state = cache
-            if conv_state is None:
-                conv_state = mx.zeros((B,self.conv_kernel_size-1,self.conv_dim),dtype=inputs.dtype)
-            padded = mx.concatenate([conv_state,mixed_qkv],1)
-            cache[0] = padded[:,-(self.conv_kernel_size-1):]
-            mixed_qkv = nn.silu(self.conv1d(padded)[:,:L])
+            conv_state, recurrent_state = cache
         else:
-            padded = mx.pad(mixed_qkv,[(0,0),(self.conv_kernel_size-1,0),(0,0)])
-            mixed_qkv = nn.silu(self.conv1d(padded)[:,:L]); rec_state=None
+            conv_state = None
+            recurrent_state = None
 
-        q,k,v = mx.split(mixed_qkv,[self.key_dim,2*self.key_dim],-1)
-        q = q.reshape(B,L,-1,self.head_k_dim); k = k.reshape(B,L,-1,self.head_k_dim); v = v.reshape(B,L,-1,self.head_v_dim)
+        # Project to QKVZ and BA then fix ordering
+        qkvz = self.in_proj_qkvz(inputs)
+        ba = self.in_proj_ba(inputs)
+        q, k, v, z, b, a = self.fix_query_key_value_ordering(qkvz, ba)
 
-        beta = mx.sigmoid(b).reshape(B,L,-1,1)
-        g = (-mx.exp(self.A_log.astype(mx.float32))*nn.softplus(a.astype(mx.float32)+self.dt_bias)).reshape(B,L,-1,1)
-        if self.num_v_heads//self.num_k_heads>1:
-            q = mx.repeat(q,self.num_v_heads//self.num_k_heads,axis=2)
-            k = mx.repeat(k,self.num_v_heads//self.num_k_heads,axis=2)
+        # Reshape q, k, v to (B, S, -1)
+        q = q.reshape(B, S, -1)
+        k = k.reshape(B, S, -1)
+        v = v.reshape(B, S, -1)
+        # Concatenate for conv1d
+        x_qkv = mx.concatenate([q, k, v], axis=-1)
 
-        if rec_state is None:
-            rec_state = mx.zeros((B,self.num_v_heads,self.head_k_dim,self.head_v_dim),dtype=inputs.dtype)
-        out,new_state = recurrent_gated_delta_rule(q,k,v,g,beta,rec_state,cache is not None,True)
+        # Convolutional state/caching logic
+        if cache is not None:
+            # OG Torch: if conv_state is None, allocate zeros
+            if conv_state is None:
+                conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
+            # If S == 1, use causal conv update (append new token to cache, run conv1d on last window)
+            if S == 1:
+                # "Causal conv1d update" -- append new x_qkv to conv_state and apply conv1d to the window
+                padded = mx.concatenate([conv_state, x_qkv], axis=1)
+                # Keep last (kernel_size-1) for next time
+                cache[0] = padded[:, -(self.conv_kernel_size - 1):]
+                conv_out = self.conv1d(padded)[:, -S:]  # take only the last position
+                conv_out = nn.silu(conv_out)
+            else:
+                # For sequence, pad and apply conv1d
+                padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
+                conv_out = self.conv1d(padded)[:, :S]
+                conv_out = nn.silu(conv_out)
+                cache[0] = x_qkv[:, -(self.conv_kernel_size - 1):]  # update cache
+        else:
+            # No cache: pad and apply conv1d
+            padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
+            conv_out = self.conv1d(padded)[:, :S]
+            conv_out = nn.silu(conv_out)
+            recurrent_state = None
 
-        if cache is not None: cache[1]=new_state
-        else: new_state=None
+        # Split conv_out back to q, k, v and reshape to (B, S, heads, head_dim)
+        q_c, k_c, v_c = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
+        q = q_c.reshape(B, S, self.num_k_heads, self.head_k_dim)
+        k = k_c.reshape(B, S, self.num_k_heads, self.head_k_dim)
+        v = v_c.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
-        out = self.norm(out.reshape(-1,out.shape[-1]),z.reshape(-1,z.shape[-1])).reshape(z.shape[0],z.shape[1],-1)
-        return self.out_proj(out)
+        # beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
+        beta = mx.sigmoid(b)
+        g = -mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(a.astype(mx.float32) + self.dt_bias)
+        # No .reshape(...,1): keep as (B,S,H)
+
+        # If num_v_heads > num_k_heads, repeat q/k accordingly (along the heads axis)
+        if self.num_v_heads // self.num_k_heads > 1:
+            repeat_factor = self.num_v_heads // self.num_k_heads
+            q = mx.repeat(q, repeat_factor, axis=2)
+            k = mx.repeat(k, repeat_factor, axis=2)
+
+        # Choose the recurrent rule: if step size is 1 and recurrent_state exists, use recurrent_gated_delta_rule, else same (no chunked variant in MLX)
+        if recurrent_state is None:
+            recurrent_state = mx.zeros((B, self.num_v_heads, self.head_k_dim, self.head_v_dim), dtype=inputs.dtype)
+        # (B, S, H, Dk), (B, S, H, Dk), (B, S, H, Dv), (B, S, H), (B, S, H)
+        out, new_state = recurrent_gated_delta_rule(
+            q, k, v, g, beta, recurrent_state, output_final_state=True, use_qk_l2norm_in_kernel=True
+        )
+        # Update cache recurrent_state if cache exists
+        if cache is not None:
+            cache[1] = new_state
+
+        # Apply norm on (B*S, dim), then reshape back (B, S, -1)
+        out_reshaped = out.reshape(-1, out.shape[-1])
+        z_reshaped = z.reshape(-1, z.shape[-1])
+        core_out = self.norm(out_reshaped, z_reshaped).reshape(z.shape[0], z.shape[1], -1)
+        return self.out_proj(core_out)
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -387,8 +438,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         elif self.layer_type == "full_attention":
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
+        out = h + self.mlp(self.post_attention_layernorm(h))
         return out
 
 
@@ -412,25 +462,14 @@ class Qwen3NextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        cache_counter = 0
-        for layer in self.layers:
-            if layer.layer_type == "linear_attention":
-                c = cache[cache_counter]
-                cache_counter += 1
-            elif layer.layer_type == "full_attention":
-                c = cache[cache_counter]
-                cache_counter += 1
-            else:
-                c = None
+        causal_mask = create_attention_mask(hidden_states, cache)
+        linear_mask = None
+        if cache and len(cache) > 0:
+            linear_mask = cache[0]
 
-            # Compute attention mask per layer as needed
-            if layer.layer_type == "full_attention":
-                mask_to_use = create_attention_mask(hidden_states, c)
-            elif layer.layer_type == "linear_attention":
-                mask_to_use = None
-            else:
-                mask_to_use = None
-            hidden_states = layer(hidden_states, mask=mask_to_use, cache=c)
+        for i, layer in enumerate(self.layers):
+            layer_mask = linear_mask if getattr(layer, "layer_type", None) == "linear_attention" else causal_mask
+            hidden_states = layer(hidden_states, mask=layer_mask, cache=cache[i])
 
         return self.norm(hidden_states)
 
@@ -441,7 +480,8 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = Qwen3NextModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -449,7 +489,11 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
     ):
         out = self.model(inputs, cache)
-        return self.lm_head(out)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
 
     @property
     def layers(self):
@@ -479,4 +523,18 @@ class Model(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        norm_keys = (
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            ".norm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
+        )
+        for k in list(weights.keys()):
+            if any(sfx in k for sfx in norm_keys):
+                v = weights[k]
+                if len(v.shape) == 1:
+                    weights[k] = v + 1.0
         return weights
