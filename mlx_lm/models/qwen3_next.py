@@ -57,7 +57,6 @@ def recurrent_gated_delta_rule(
     initial_state: Optional[mx.array] = None,
     use_qk_l2norm_in_kernel: bool = False,
 ):
-    """Minimal recurrent gated delta rule in MLX, same inputs/outputs as Torch."""
     if use_qk_l2norm_in_kernel:
         query /= mx.maximum(mx.linalg.norm(query, axis=-1, keepdims=True), 1e-12)
         key   /= mx.maximum(mx.linalg.norm(key,   axis=-1, keepdims=True), 1e-12)
