@@ -7,14 +7,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import ArraysCache, KVCache
+from .cache import MambaCache, KVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
-
-
-class MambaCache(ArraysCache):
-    def __init__(self):
-        super().__init__(size=2)
 
 
 @dataclass
