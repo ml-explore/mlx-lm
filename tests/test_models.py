@@ -1651,6 +1651,26 @@ class TestModels(unittest.TestCase):
                 "num_key_value_heads": 2,
                 "head_dim": 64,
             },
+            {
+                "model_type": "Klear",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "attention_bias": False,
+                "mlp_only_layers": [0],
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 2,
+                "n_shared_experts": 1,
+                "moe_intermediate_size": 128,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 4,
+                "rope_theta": 1000.0,
+                "max_position_embeddings": 1000,
+                "norm_topk_prob": True,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
