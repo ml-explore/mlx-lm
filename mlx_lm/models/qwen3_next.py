@@ -43,26 +43,83 @@ class ModelArgs(BaseModelArgs):
 
 @mx.compile
 def recurrent_gated_delta_rule(
-    query: mx.array, key: mx.array, value: mx.array, g: mx.array, beta: mx.array,
-    initial_state: Optional[mx.array] = None, output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False
+    query: mx.array,
+    key: mx.array,
+    value: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    initial_state: Optional[mx.array] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> Tuple[mx.array, Optional[mx.array]]:
+    """Minimal recurrent gated delta rule in MLX matching the Torch reference.
+    Expects query/key/value shapes (B, S, H, D*) and g/beta shapes (B, S, H) or (B, S, H, 1).
+    """
+    # Optional L2 normalization on last dim for query/key
     if use_qk_l2norm_in_kernel:
-        query /= mx.linalg.norm(query, axis=-1, keepdims=True)
-        key /= mx.linalg.norm(key, axis=-1, keepdims=True)
-    query, key, value, beta, g = [mx.transpose(x, (0,2,1,3)).astype(mx.float32) for x in (query,key,value,beta,g)]
-    B,H,T,Dk = key.shape; Dv = value.shape[-1]; scale = 1.0 / (query.shape[-1]**0.5)
-    query *= scale
-    state = mx.zeros((B,H,Dk,Dv), dtype=mx.float32) if initial_state is None else initial_state.astype(mx.float32).reshape(B,H,Dk,Dv)
-    outs = []
-    for t in range(T):
-        state = state * mx.expand_dims(mx.exp(g[:, :, t, :]), -1)
-        mem = mx.einsum("bhkv,bhk->bhv", state, key[:,:,t])
-        delta = (value[:,:,t] - mem) * beta[:,:,t]
-        state += mx.einsum("bhk,bhv->bhkv", key[:,:,t], delta)
-        outs.append(mx.einsum("bhkv,bhk->bhv", state, query[:,:,t]))
-    out = mx.transpose(mx.stack(outs, axis=2), (0,2,1,3)).astype(query.dtype)
-    return out, (state if output_final_state else None)
+        # Normalize along the feature dimension
+        query = query / mx.maximum(mx.linalg.norm(query, axis=-1, keepdims=True), 1e-12)
+        key = key / mx.maximum(mx.linalg.norm(key, axis=-1, keepdims=True), 1e-12)
+
+    # Cast to float32 for numerical stability (like Torch .to(torch.float32))
+    query = query.astype(mx.float32)
+    key = key.astype(mx.float32)
+    value = value.astype(mx.float32)
+    beta = beta.astype(mx.float32)
+    g = g.astype(mx.float32)
+
+    # Allow beta and g to come with an extra trailing singleton dim: (B,S,H,1)
+    if beta.ndim == 4 and beta.shape[-1] == 1:
+        beta = beta.squeeze(-1)
+    if g.ndim == 4 and g.shape[-1] == 1:
+        g = g.squeeze(-1)
+
+    B, S, H, Dk = key.shape
+    Dv = value.shape[-1]
+
+    # Scale queries by 1/sqrt(Dq) (Dq == last dim of query)
+    scale = 1.0 / mx.sqrt(mx.array(query.shape[-1], dtype=mx.float32))
+    query = query * scale
+
+    # Precompute value*beta and key*beta to match the Torch reference
+    v_beta = value * beta[..., None]
+    k_beta = key * beta[..., None]
+
+    # Initialize state: (B, H, Dk, Dv)
+    if initial_state is None:
+        state = mx.zeros((B, H, Dk, Dv), dtype=value.dtype)
+    else:
+        state = initial_state.astype(value.dtype)
+        if state.shape != (B, H, Dk, Dv):
+            state = state.reshape(B, H, Dk, Dv)
+
+    # Output buffer: (B, S, H, Dv)
+    out = mx.zeros((B, S, H, Dv), dtype=value.dtype)
+
+    for t in range(S):
+        q_t = query[:, t]       # (B, H, Dk)
+        k_t = k_beta[:, t]      # (B, H, Dk)
+        v_t = v_beta[:, t]      # (B, H, Dv)
+        g_t = g[:, t]           # (B, H)
+
+        # decay = exp(g_t)
+        decay = mx.exp(g_t)[..., None]  # (B, H, 1)
+
+        # state = state * decay.unsqueeze(-1) + k_t.unsqueeze(-1) @ v_t.unsqueeze(-2)
+        state = state * decay[..., None] + mx.matmul(
+            k_t[..., None],            # (B, H, Dk, 1)
+            v_t[..., None, :],         # (B, H, 1,  Dv)
+        )
+
+        # out[:, t] = einsum("bhd,bhdv->bhv", q_t, state)
+        out[:, t] = mx.einsum("bhd,bhdv->bhv", q_t, state)
+
+    # Return (B, H, S, Dv) like Torch's out.transpose(1, 2)
+    out = mx.transpose(out, (0, 2, 1, 3)).astype(query.dtype)
+
+    if not output_final_state:
+        state = None
+    return out, state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
