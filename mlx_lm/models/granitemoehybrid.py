@@ -44,11 +44,10 @@ class ModelArgs(BaseModelArgs):
     mamba_n_groups: int
     mamba_conv_bias: bool
 
-    # Other parameters
     layer_types: List[str]
     rms_norm_eps: float
     rope_theta: float
-    position_embedding_type: str = "rope"  # Can be "rope", "nope", etc.
+    position_embedding_type: str = "rope"
     tie_word_embeddings: bool = True
     time_step_limit: Tuple[float, float] = (0.001, 100.0)
 
@@ -108,20 +107,18 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
     def _apply_conv(
         self, conv_input: mx.array, cache: Optional[MambaCache] = None
     ) -> mx.array:
-        if cache is not None:
-            if cache[0] is None:
-                conv_state = mx.zeros(
-                    (conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim),
-                    dtype=conv_input.dtype,
-                )
-            else:
-                conv_state = cache[0]
-            padded_input = mx.concatenate([conv_state, conv_input], axis=1)
-            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :, :]
-        else:
-            padded_input = mx.pad(
-                conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+        if cache is None or cache[0] is None:
+            conv_state = mx.zeros(
+                (conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim),
+                dtype=conv_input.dtype,
             )
+        else:
+            conv_state = cache[0]
+
+        padded_input = mx.concatenate([conv_state, conv_input], axis=1)
+
+        if cache is not None:
+            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :]
 
         conv_output = self.conv1d(padded_input)
         return nn.silu(conv_output)
@@ -224,7 +221,7 @@ class GraniteMoeHybridAttention(nn.Module):
 
         # Check if RoPE should be used based on position_embedding_type
         # If position_embedding_type is "nope", don't use RoPE
-        use_rope = getattr(args, "position_embedding_type", "rope") != "nope"
+        use_rope = args.position_embedding_type != "nope"
         if use_rope:
             self.rope = initialize_rope(
                 self.head_dim,
@@ -283,7 +280,7 @@ class GraniteMoeHybridTopKGating(nn.Module):
             ..., -self.top_k :
         ]
         top_k_logits = mx.take_along_axis(logits, top_k_idx, axis=-1)
-        top_k_gates = mx.softmax(top_k_logits.astype(mx.float32), axis=-1)
+        top_k_gates = mx.softmax(top_k_logits, precise=True, axis=-1)
         return top_k_idx, top_k_gates
 
 
@@ -305,14 +302,18 @@ class GraniteMoeHybridMoE(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         token_ids, gates = self.router(x)
         y = self.switch_mlp(x, token_ids)
-        return (y * gates[..., None]).sum(axis=-2).astype(y.dtype)
+        return (y * gates[..., None]).sum(axis=-2)
 
 
 class GraniteMoeHybridSharedMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.input_linear = nn.Linear(args.hidden_size, args.shared_intermediate_size * 2, bias=False)
-        self.output_linear = nn.Linear(args.shared_intermediate_size, args.hidden_size, bias=False)
+        self.input_linear = nn.Linear(
+            args.hidden_size, args.shared_intermediate_size * 2, bias=False
+        )
+        self.output_linear = nn.Linear(
+            args.shared_intermediate_size, args.hidden_size, bias=False
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         gate, up = mx.split(self.input_linear(x), 2, axis=-1)
@@ -331,19 +332,14 @@ class GraniteMoeHybridLayer(nn.Module):
             self.mamba = GraniteMoeHybridMamba2Mixer(args)
         elif layer_type == "attention":
             self.self_attn = GraniteMoeHybridAttention(args)
-            self.post_attention_layernorm = nn.RMSNorm(
-                args.hidden_size, eps=args.rms_norm_eps
-            )
-            self.block_sparse_moe = GraniteMoeHybridMoE(args)
         else:
             raise ValueError(f"Unknown layer type: {layer_type}")
 
         self.shared_mlp = GraniteMoeHybridSharedMLP(args)
         self.block_sparse_moe = GraniteMoeHybridMoE(args)
-        if not hasattr(self, "post_attention_layernorm"):
-            self.post_attention_layernorm = nn.RMSNorm(
-                args.hidden_size, eps=args.rms_norm_eps
-            )
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
     def __call__(
         self,
@@ -362,11 +358,10 @@ class GraniteMoeHybridLayer(nn.Module):
 
         hidden_states = residual + hidden_states * self.residual_multiplier
 
-        # Second block: MoE + shared_mlp (for ALL layers)
+        # Second block: MoE + shared_mlp
         residual = hidden_states
         normed = self.post_attention_layernorm(hidden_states)
 
-        # Apply both sparse MoE and shared MLP, then sum them
         moe_out = self.block_sparse_moe(normed)
         shared_out = self.shared_mlp(normed)
         mlp_out = moe_out + shared_out
@@ -382,58 +377,29 @@ class GraniteMoeHybridModel(nn.Module):
         self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            GraniteMoeHybridLayer(args, layer_type)
-            for layer_type in args.layer_types
+            GraniteMoeHybridLayer(args, layer_type) for layer_type in args.layer_types
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.embedding_multiplier = args.embedding_multiplier
-
-        # Find first attention layer index for mask creation
-        self.fa_idx = 0
-        for layer_type in args.layer_types:
-            if layer_type == "attention":
-                break
-            elif layer_type == "mamba":
-                self.fa_idx += 1
+        self.fa_idx = args.layer_types.index("attention")
+        self.layer_types = args.layer_types
 
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
         hidden_states = self.embed_tokens(inputs) * self.embedding_multiplier
 
-        if mask is None:
-            # Create mask using first attention layer cache
-            attn_cache = None
-            if cache is not None:
-                cache_idx = 0
-                for layer_type in self.args.layer_types:
-                    if layer_type == "attention":
-                        attn_cache = cache[cache_idx]
-                        break
-                    elif layer_type == "mamba":
-                        cache_idx += 1
-            attn_mask = create_attention_mask(hidden_states, [attn_cache] if attn_cache else None)
-
         if cache is None:
             cache = [None] * len(self.layers)
 
+        attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+
         cache_counter = 0
-        for layer in self.layers:
-            if layer.layer_type in ["mamba", "attention"]:
-                c = cache[cache_counter]
-                cache_counter += 1
-            else:
-                c = None
-
-            if layer.layer_type == "attention":
-                mask_to_use = attn_mask
-            else:
-                mask_to_use = None
-
-            hidden_states = layer(hidden_states, mask=mask_to_use, cache=c)
+        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+            mask = attn_mask if layer.layer_type == "attention" else None
+            hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         return self.norm(hidden_states)
 
@@ -442,6 +408,7 @@ class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        self.model_type = args.model_type
         self.model = GraniteMoeHybridModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -450,10 +417,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        out = self.model(inputs, mask=mask, cache=cache)
+        out = self.model(inputs, cache=cache)
 
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
@@ -476,37 +442,36 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
-        # Handle conv1d weights (similar to nemotron_h)
+        # Handle conv1d weights
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
-        # Handle MoE weight transformation from 3D expert weights to SwitchGLU format
+        # Handle MoE weight transformation to SwitchGLU format
         if "model.layers.0.block_sparse_moe.input_linear.weight" in weights:
             for l in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{l}.block_sparse_moe"
 
-                # Transform input_linear: from (num_experts, expert_hidden, input) to SwitchGLU format
-                input_key = f"{prefix}.input_linear.weight"
-                if input_key in weights:
-                    # The weight is (num_experts, expert_hidden, input_size)
-                    # For (62, 1024, 1536): expert_hidden=1024, so gate/up should be 512 each
-                    input_weight = weights.pop(input_key)
-                    _, expert_hidden, _ = input_weight.shape
+                input_weight = weights.pop(f"{prefix}.input_linear.weight")
+                _, expert_hidden, _ = input_weight.shape
 
-                    # Split into gate and up projections (each half of expert_hidden)
-                    gate_proj = input_weight[:, :expert_hidden//2, :]  # (num_experts, 512, 1536)
-                    up_proj = input_weight[:, expert_hidden//2:, :]    # (num_experts, 512, 1536)
+                # Split into gate and up projections (each half of expert_hidden)
+                gate_proj = input_weight[:, : expert_hidden // 2, :]
+                up_proj = input_weight[:, expert_hidden // 2 :, :]
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_proj
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_proj
 
-                    weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_proj
-                    weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_proj
-
-                # Transform output_linear: from (num_experts, input, expert_hidden/2) to down_proj
-                output_key = f"{prefix}.output_linear.weight"
-                if output_key in weights:
-                    output_weight = weights.pop(output_key)
-                    # Shape should be (num_experts, input_size, expert_hidden/2) = (62, 1536, 512)
-                    # This is already in the right format for down_proj
-                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = output_weight
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                    f"{prefix}.output_linear.weight"
+                )
 
         return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("router.layer"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
