@@ -8,8 +8,13 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
-from .cache import KVCache, MambaCache
+from .cache import KVCache, ArraysCache
 from .switch_layers import SwitchGLU
+
+
+class MambaCache(ArraysCache):
+    def __init__(self):
+        super().__init__(size=2)
 
 
 @dataclass
@@ -51,74 +56,30 @@ def recurrent_gated_delta_rule(
     beta: mx.array,
     initial_state: Optional[mx.array] = None,
     use_qk_l2norm_in_kernel: bool = False,
-) -> Tuple[mx.array, Optional[mx.array]]:
-    """Minimal recurrent gated delta rule in MLX matching the Torch reference.
-    Expects query/key/value shapes (B, S, H, D*) and g/beta shapes (B, S, H) or (B, S, H, 1).
-    """
-    orig_dtype = query.dtype
-    # Optional L2 normalization on last dim for query/key
+):
+    """Minimal recurrent gated delta rule in MLX, same inputs/outputs as Torch."""
     if use_qk_l2norm_in_kernel:
-        # Normalize along the feature dimension
-        query = query / mx.maximum(mx.linalg.norm(query, axis=-1, keepdims=True), 1e-12)
-        key = key / mx.maximum(mx.linalg.norm(key, axis=-1, keepdims=True), 1e-12)
+        query /= mx.maximum(mx.linalg.norm(query, axis=-1, keepdims=True), 1e-12)
+        key   /= mx.maximum(mx.linalg.norm(key,   axis=-1, keepdims=True), 1e-12)
 
-    # Cast to float32 for numerical stability (like Torch .to(torch.float32))
-    query = query.astype(mx.float32)
-    key = key.astype(mx.float32)
-    value = value.astype(mx.float32)
-    beta = beta.astype(mx.float32)
-    g = g.astype(mx.float32)
-
-    # Allow beta and g to come with an extra trailing singleton dim: (B,S,H,1)
-    if beta.ndim == 4 and beta.shape[-1] == 1:
-        beta = beta.squeeze(-1)
-    if g.ndim == 4 and g.shape[-1] == 1:
-        g = g.squeeze(-1)
+    if beta.ndim == 4: beta = beta.squeeze(-1)
+    if g.ndim == 4:    g = g.squeeze(-1)
 
     B, S, H, Dk = key.shape
     Dv = value.shape[-1]
+    query *= 1.0 / mx.sqrt(mx.array(query.shape[-1]))
 
-    # Scale queries by 1/sqrt(Dq) (Dq == last dim of query)
-    scale = 1.0 / mx.sqrt(mx.array(query.shape[-1], dtype=mx.float32))
-    query = query * scale
-
-    # Precompute value*beta and key*beta to match the Torch reference
-    v_beta = value * beta[..., None]
-    k_beta = key * beta[..., None]
-
-    # Initialize state: (B, H, Dk, Dv)
-    if initial_state is None:
-        state = mx.zeros((B, H, Dk, Dv), dtype=value.dtype)
-    else:
-        state = initial_state.astype(value.dtype)
-        if state.shape != (B, H, Dk, Dv):
-            state = state.reshape(B, H, Dk, Dv)
-
-    # Output buffer: (B, S, H, Dv)
-    out = mx.zeros((B, S, H, Dv), dtype=value.dtype)
+    v_beta, k_beta = value * beta[..., None], key * beta[..., None]
+    state = mx.zeros((B, H, Dk, Dv), dtype=value.dtype) if initial_state is None else initial_state.reshape(B, H, Dk, Dv)
+    out   = mx.zeros((B, S, H, Dv), dtype=value.dtype)
 
     for t in range(S):
-        q_t = query[:, t]       # (B, H, Dk)
-        k_t = k_beta[:, t]      # (B, H, Dk)
-        v_t = v_beta[:, t]      # (B, H, Dv)
-        g_t = g[:, t]           # (B, H)
-
-        # decay = exp(g_t)
-        decay = mx.exp(g_t)[..., None]  # (B, H, 1)
-
-        # state = state * decay.unsqueeze(-1) + k_t.unsqueeze(-1) @ v_t.unsqueeze(-2)
-        state = state * decay[..., None] + mx.matmul(
-            k_t[..., None],            # (B, H, Dk, 1)
-            v_t[..., None, :],         # (B, H, 1,  Dv)
+        state = state * mx.exp(g[:, t])[..., None, None] + mx.matmul(
+            k_beta[:, t][..., None], v_beta[:, t][..., None, :]
         )
+        out[:, t] = mx.einsum("bhd,bhdv->bhv", query[:, t], state)
 
-        # out[:, t] = einsum("bhd,bhdv->bhv", q_t, state)
-        out[:, t] = mx.einsum("bhd,bhdv->bhv", q_t, state)
-
-    # Return (B, H, S, Dv) like Torch's out.transpose(1, 2)
-    out = mx.transpose(out, (0, 2, 1, 3)).astype(orig_dtype)
-
-    return out
+    return mx.transpose(out, (0, 2, 1, 3))
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -269,14 +230,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     
     def __call__(self, inputs: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None):
         B, S, _ = inputs.shape
-
-        # Split cache into conv_state and recurrent_state if provided
-        if cache is not None:
-            conv_state, recurrent_state = cache
-        else:
-            conv_state = None
-            recurrent_state = None
-
         # Project to QKVZ and BA then fix ordering
         qkvz = self.in_proj_qkvz(inputs)
         ba = self.in_proj_ba(inputs)
@@ -290,16 +243,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         x_qkv = mx.concatenate([q, k, v], axis=-1)
 
         # Convolutional state/caching logic
-        if cache is not None:
-            padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
-            conv_out = self.conv1d(padded)[:, :S]
-            conv_out = nn.silu(conv_out)
-            cache[0] = x_qkv[:, -(self.conv_kernel_size - 1):]
-        else:
-            padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
-            conv_out = self.conv1d(padded)[:, :S]
-            conv_out = nn.silu(conv_out)
-            recurrent_state = None
+        padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
+        conv_out = self.conv1d(padded)[:, :S]
+        conv_out = nn.silu(conv_out)
+        recurrent_state = None
 
         # Split conv_out back to q, k, v and reshape to (B, S, heads, head_dim)
         q_c, k_c, v_c = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
