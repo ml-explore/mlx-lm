@@ -8,13 +8,8 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
-from .cache import KVCache, ArraysCache
+from .cache import KVCache, MambaCache
 from .switch_layers import SwitchGLU
-
-
-class MambaCache(ArraysCache):
-    def __init__(self):
-        super().__init__(size=2)
 
 
 @dataclass
@@ -55,7 +50,6 @@ def recurrent_gated_delta_rule(
     g: mx.array,
     beta: mx.array,
     initial_state: Optional[mx.array] = None,
-    output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> Tuple[mx.array, Optional[mx.array]]:
     """Minimal recurrent gated delta rule in MLX matching the Torch reference.
@@ -124,9 +118,7 @@ def recurrent_gated_delta_rule(
     # Return (B, H, S, Dv) like Torch's out.transpose(1, 2)
     out = mx.transpose(out, (0, 2, 1, 3)).astype(orig_dtype)
 
-    if not output_final_state:
-        state = None
-    return out, state
+    return out
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -135,15 +127,11 @@ class Qwen3NextRMSNormGated(nn.Module):
         self.eps = eps
         self.weight = mx.ones(hidden_size)
 
-    def __call__(self, hidden_states: mx.array, gate: Optional[mx.array] = None) -> mx.array:
-        input_dtype = hidden_states.dtype
-        x = hidden_states.astype(mx.float32)
-        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
-        x = x * mx.rsqrt(variance + self.eps)
-        x = (1.0 + self.weight.astype(mx.float32)) * x
+    def __call__(self, hidden_states: mx.array, gate: mx.array | None = None) -> mx.array:
+        x = mx.fast.rms_norm(hidden_states, None, self.eps) * (1.0 + self.weight)
         if gate is not None:
-            x = x * nn.silu(gate.astype(mx.float32))
-        return x.astype(input_dtype)
+            x = x * nn.silu(gate)
+        return x
 
 
 class Qwen3NextRMSNorm(nn.Module):
@@ -151,13 +139,9 @@ class Qwen3NextRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = mx.zeros(dim)
-        
+
     def __call__(self, x: mx.array) -> mx.array:
-        x = x.astype(mx.float32)
-        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
-        output = x * mx.rsqrt(variance + self.eps)
-        output = output * (1.0 + self.weight.astype(mx.float32))
-        return output.astype(x.dtype)
+        return mx.fast.rms_norm(x, None, self.eps) * (1.0 + self.weight)
 
 
 class Qwen3NextAttention(nn.Module):
@@ -256,10 +240,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             padding=self.conv_kernel_size - 1,
         )
 
-        projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
-        projection_size_ba = self.num_v_heads * 2
-        self.in_proj_qkvz = nn.Linear(self.hidden_size, projection_size_qkvz, bias=False)
-        self.in_proj_ba = nn.Linear(self.hidden_size, projection_size_ba, bias=False)
+        self.in_proj_qkvz = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim * 2, bias=False)
+        self.in_proj_ba = nn.Linear(self.hidden_size, self.num_v_heads * 2, bias=False)
 
         self.dt_bias = mx.ones(self.num_v_heads)
 
@@ -269,14 +251,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
-    
-    def apply_mask_to_padding_states(self, hidden_states, attention_mask):
-        if attention_mask is not None:
-            if attention_mask.shape[0] > 1 and attention_mask.shape[1] > 1:
-                dtype = hidden_states.dtype
-                # Mask shape: (B, S), hidden_states: (B, S, ...)
-                hidden_states = (hidden_states * attention_mask[:, :, None]).astype(dtype)
-        return hidden_states
     
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         nq, nk, nv, dv = self.num_k_heads, self.head_k_dim, self.num_v_heads, self.head_v_dim
@@ -294,16 +268,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
     
     def __call__(self, inputs: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None):
-        # Derive a 2D (B, S) mask for padding if an array was provided; ignore string sentinels like 'causal'.
-        mask_2d = None
-        if isinstance(mask, mx.array):
-            if mask.ndim >= 4:
-                mask_2d = mask.squeeze(1).squeeze(1)
-            elif mask.ndim == 2:
-                mask_2d = mask
-        
-        inputs = self.apply_mask_to_padding_states(inputs, mask_2d)
-
         B, S, _ = inputs.shape
 
         # Split cache into conv_state and recurrent_state if provided
@@ -327,25 +291,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # Convolutional state/caching logic
         if cache is not None:
-            # OG Torch: if conv_state is None, allocate zeros
-            if conv_state is None:
-                conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
-            # If S == 1, use causal conv update (append new token to cache, run conv1d on last window)
-            if S == 1:
-                # "Causal conv1d update" -- append new x_qkv to conv_state and apply conv1d to the window
-                padded = mx.concatenate([conv_state, x_qkv], axis=1)
-                # Keep last (kernel_size-1) for next time
-                cache[0] = padded[:, -(self.conv_kernel_size - 1):]
-                conv_out = self.conv1d(padded)[:, -S:]  # take only the last position
-                conv_out = nn.silu(conv_out)
-            else:
-                # For sequence, pad and apply conv1d
-                padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
-                conv_out = self.conv1d(padded)[:, :S]
-                conv_out = nn.silu(conv_out)
-                cache[0] = x_qkv[:, -(self.conv_kernel_size - 1):]  # update cache
+            padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
+            conv_out = self.conv1d(padded)[:, :S]
+            conv_out = nn.silu(conv_out)
+            cache[0] = x_qkv[:, -(self.conv_kernel_size - 1):]
         else:
-            # No cache: pad and apply conv1d
             padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
             conv_out = self.conv1d(padded)[:, :S]
             conv_out = nn.silu(conv_out)
@@ -359,7 +309,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
         beta = mx.sigmoid(b)
-        g = -mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(a.astype(mx.float32) + self.dt_bias)
+        g = -mx.exp(self.A_log) * nn.softplus(a + self.dt_bias)
         # No .reshape(...,1): keep as (B,S,H)
 
         # If num_v_heads > num_k_heads, repeat q/k accordingly (along the heads axis)
@@ -372,13 +322,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if recurrent_state is None:
             recurrent_state = mx.zeros((B, self.num_v_heads, self.head_k_dim, self.head_v_dim), dtype=inputs.dtype)
         # (B, S, H, Dk), (B, S, H, Dk), (B, S, H, Dv), (B, S, H), (B, S, H)
-        out, new_state = recurrent_gated_delta_rule(
-            q, k, v, g, beta, recurrent_state, output_final_state=True, use_qk_l2norm_in_kernel=True
+        out = recurrent_gated_delta_rule(
+            q, k, v, g, beta, recurrent_state, use_qk_l2norm_in_kernel=True
         )
-        # Update cache recurrent_state if cache exists
-        if cache is not None:
-            cache[1] = new_state
-
         # Apply norm on (B*S, dim), then reshape back (B, S, -1)
         out_reshaped = out.reshape(-1, out.shape[-1])
         z_reshaped = z.reshape(-1, z.shape[-1])
@@ -482,13 +428,9 @@ class Qwen3NextModel(nn.Module):
             cache = [None] * len(self.layers)
 
         causal_mask = create_attention_mask(hidden_states, cache)
-        linear_mask = None
-        if cache and len(cache) > 0:
-            linear_mask = cache[0]
 
         for i, layer in enumerate(self.layers):
-            layer_mask = linear_mask if getattr(layer, "layer_type", None) == "linear_attention" else causal_mask
-            hidden_states = layer(hidden_states, mask=layer_mask, cache=cache[i])
+            hidden_states = layer(hidden_states, mask=causal_mask, cache=cache[i])
 
         return self.norm(hidden_states)
 
