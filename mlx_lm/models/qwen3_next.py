@@ -249,14 +249,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
 
-        if cache is not None and cache[1] is not None:
-            recurrent_state = cache[1]
-        else:
-            recurrent_state = mx.zeros(
-                (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                dtype=hidden_states.dtype,
-            )
-
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
@@ -264,21 +256,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         mixed_qkv = mx.concatenate((query, key, value), axis=-1)
 
+        # Explicit cache separation and handling
         if cache is not None:
-            if cache[0] is None:
+            conv_state, recurrent_state = cache
+
+            # Conv-State handling
+            if conv_state is None:
                 conv_state = mx.zeros(
                     (batch_size, self.conv_kernel_size - 1, self.conv_dim),
                     dtype=hidden_states.dtype,
                 )
-            else:
-                conv_state = cache[0]
             padded_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-            cache[0] = padded_input[:, -(self.conv_kernel_size - 1):, :]
-            mixed_qkv = nn.silu(self.conv1d(padded_input))
+            conv_state = padded_input[:, -(self.conv_kernel_size - 1):, :]
+            conv_out = self.conv1d(padded_input)
+            mixed_qkv = nn.silu(conv_out[:, :seq_len, :])
+
+            # Update conv_state in cache
+            cache[0] = conv_state
         else:
             padded_input = mx.pad(mixed_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
-            conv_output = self.conv1d(padded_input)
-            mixed_qkv = nn.silu(conv_output[:, :seq_len, :])
+            conv_out = self.conv1d(padded_input)
+            mixed_qkv = nn.silu(conv_out[:, :seq_len, :])
+            recurrent_state = None
 
         query, key, value = mx.split(
             mixed_qkv,
@@ -298,6 +297,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query = mx.repeat(query, self.num_v_heads // self.num_k_heads, axis=2)
             key = mx.repeat(key, self.num_v_heads // self.num_k_heads, axis=2)
 
+        # Recurrent state explicit handling
+        if recurrent_state is None:
+            recurrent_state = mx.zeros(
+                (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                dtype=hidden_states.dtype,
+            )
         core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
             query,
             key,
@@ -308,6 +313,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             output_final_state=True if cache is not None else False,
             use_qk_l2norm_in_kernel=True,
         )
+
         # Updated storage of new_recurrent_state
         if cache is not None:
             cache[1] = new_recurrent_state
@@ -397,8 +403,6 @@ class Qwen3NextDecoderLayer(nn.Module):
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        if isinstance(r, tuple):
-            r, _ = r
         out = h + r
         return out
 
