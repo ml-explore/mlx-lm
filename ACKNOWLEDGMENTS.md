@@ -14,7 +14,7 @@ MLX LM was developed with contributions from the following individuals:
    `Bailing MoE e.g. Ling-family`, Klear team - Kuaishou Technology's `Klear`,
    IBM's `Granite MoE`, Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's
    `Apertus`, Nikity's `Lille130m`, and Allenai's `OLMoE`; Added support for the
-   following training algorithms: `Full Weight Fine-Tuning`, and the `Muon`
+   following training algorithms: `Full Weight Fine-Tuning`, `Gradient Accumulation`, and the `Muon`
    optimizer; Added support for the following other features: `Multiple Optimizers
    to choose for training`, and `reporting training metrics to WandB (Weights &
    Biases)`.
