@@ -163,13 +163,11 @@ class OlmoeModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-        mask=None,
     ):
         h = self.embed_tokens(inputs)
-        if mask is None:
-            mask = create_attention_mask(h, cache)
         if cache is None:
             cache = [None] * len(self.layers)
+        mask = create_attention_mask(h, cache[0])
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
         return self.norm(h)
@@ -188,9 +186,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-        mask=None,
     ):
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
