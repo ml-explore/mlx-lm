@@ -837,19 +837,8 @@ class Batch:
         self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
-        self.cache = [c.concatenate([c, o]) for c, o in zip(self.cache, other.cache)]
-
-    def split(self, idx):
-        l_uid, r_uid = self.uids[:idx], self.uids[idx:]
-        l_max_tokens, r_max_tokens = self.max_tokens[:idx], self.max_tokens[idx:]
-        l_num_tokens, r_num_tokens = self.num_tokens[:idx], self.num_tokens[idx:]
-        l_y, r_y = mx.split(self.y, (idx,))
-        l_logprobs, r_logprobs = mx.split(self.logprobs, (idx,))
-        l_cache, r_cache = zip(*(c.split(idx) for c in self.cache))
-        return (
-            Batch(l_uid, l_y, l_logprobs, l_max_tokens, l_num_tokens, l_cache),
-            Batch(r_uid, r_y, r_logprobs, r_max_tokens, r_num_tokens, r_cache),
-        )
+        for c, o in zip(self.cache, other.cache):
+            c.extend(o)
 
 
 class BatchGenerator:
@@ -884,7 +873,7 @@ class BatchGenerator:
         self.completion_batch_size = completion_batch_size
         self._stats = BatchStats()
 
-        self._reset_state()
+        self.active_batch = None
 
     def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
         uids = []
@@ -902,48 +891,26 @@ class BatchGenerator:
         )
         return uids
 
-    def _process_prompt_batch(self, prompts):
-        # TODO the model may not use a regular KV Cache
-        lengths = [len(p) for p in prompts]
-        self._stats.prompt_tokens += sum(lengths)
+    def _process_prompts(self, prompts):
+        uids, inputs, max_tokens = zip(*prompts)
+        lengths = [len(p) for p in inputs]
         max_length = max(lengths)
+        batch_size = self.prefill_batch_size
+        self._stats.prompt_tokens += sum(lengths)
         left_padding = [max_length - l for l in lengths]
-        input_tokens = _left_pad_prompts(prompts, max_length=max_length)
+        inputs = _left_pad_prompts(inputs, max_length=max_length)
+
+        # TODO use other types of cache here.
         prompt_cache = [BatchKVCache(left_padding) for _ in self.model.layers]
 
         with mx.stream(generation_stream):
-            while input_tokens.shape[1] > 1:
-                n_to_process = min(self.prefill_step_size, input_tokens.shape[1] - 1)
-                self.model(input_tokens[:, :n_to_process], cache=prompt_cache)
+            while inputs.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
-                input_tokens = input_tokens[:, n_to_process:]
+                inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
-        return prompt_cache
 
-    def _process_prompts(self, prompts):
-        uids, inputs, max_tokens = zip(*prompts)
-        max_length = max(len(p) for p in inputs)
-        batch_size = self.prefill_batch_size
-        tok_limit = self.prefill_step_size * batch_size
-
-        # Dynamically increase batch size when processing
-        # lots of short prompts
-        while (2 * batch_size * max_length) < tok_limit and batch_size < len(prompts):
-            batch_size *= 2
-
-        if batch_size >= len(prompts):
-            prompt_cache = self._process_prompt_batch(inputs)
-        else:
-            # TODO possibly better to process steps in the outer loop without
-            # clearing cache and maybe with mx.compile and batches in the
-            # inner loop
-            caches = [
-                self._process_prompt_batch(inputs[b : b + batch_size])
-                for b in range(0, len(prompts), batch_size)
-            ]
-            prompt_cache = [cs[0].concatenate(cs) for cs in zip(*caches)]
-
-        inputs = mx.array([p[-1:] for p in inputs])
         y, logprobs = self._step(inputs, prompt_cache)
         mx.async_eval(y, logprobs)
         return Batch(
@@ -957,10 +924,6 @@ class BatchGenerator:
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             sampled = self.sampler(logprobs).squeeze(1)
             return sampled, logprobs
-
-    def _reset_state(self):
-        self.active_batch = None
-        self.processed_batch = None
 
     def stats(self):
         self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
@@ -977,47 +940,35 @@ class BatchGenerator:
         batch = self.active_batch
         num_active = len(batch) if batch else 0
         num_to_add = self.completion_batch_size - num_active
-        while num_to_add > 0:
-            if self.processed_batch is not None:
-                if num_to_add < len(self.processed_batch):
-                    to_add, self.processed_batch = self.processed_batch.split(
-                        num_to_add
-                    )
-                else:
-                    to_add, self.processed_batch = self.processed_batch, None
-                num_to_add -= len(to_add)
+        while num_to_add >= self.prefill_batch_size:
+            prompts = self.unprocessed_prompts[: self.prefill_batch_size]
+            # Finish processing the last examples of the last batch
+            if len(prompts) == 0 and num_active > 0:
+                break
+            # No more prompts and no more completions, all done
+            elif len(prompts) == 0:
+                self.active_batch = None
+                return []
+            # Process prompts
+            if batch is not None and not prompt_processing:
+                # Finish any active completion tokens
+                mx.eval(batch.y, batch.logprobs)
+                self._stats.generation_time += time.perf_counter() - tic
+                tic = time.perf_counter()
 
-                if batch is None:
-                    batch = self.active_batch = to_add
-                else:
-                    batch.extend(to_add)
+            batch = self._process_prompts(prompts)
+            self.unprocessed_prompts = self.unprocessed_prompts[
+                self.prefill_batch_size :
+            ]
+            prompt_processing = True
+            # If there was no active batch, set it
+            if self.active_batch is None:
+                self.active_batch = batch
             else:
-                prompts = self.unprocessed_prompts[: self.completion_batch_size]
-                # Finish processing the last examples of the last batch
-                if len(prompts) == 0 and num_active > 0:
-                    break
-                # All done
-                elif len(prompts) == 0:
-                    self._reset_state()
-                    return []
-                # Process prompts
-                if self.active_batch is not None:
-                    # Finish any active completion tokens
-                    mx.eval(self.active_batch.y, self.active_batch.logprobs)
-                    self._stats.generation_time += time.perf_counter() - tic
-                    tic = time.perf_counter()
+                self.active_batch.extend(batch)
 
-                next_batch = self._process_prompts(prompts)
-                self.unprocessed_prompts = self.unprocessed_prompts[
-                    self.completion_batch_size :
-                ]
-                prompt_processing = True
-                # If there was no active batch, set it and break
-                if self.active_batch is None:
-                    self.active_batch = next_batch
-                    break
-                # Otherwise store the processed batch to pull from
-                self.processed_batch = next_batch
+            num_active = len(self.active_batch)
+            num_to_add -= len(batch)
 
         batch = self.active_batch
         y, logprobs = batch.y, batch.logprobs

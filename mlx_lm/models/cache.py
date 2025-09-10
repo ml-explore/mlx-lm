@@ -1,6 +1,5 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import copy
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -666,15 +665,11 @@ class BatchKVCache(_BaseCache):
 
     @property
     def state(self):
-        if self._idx == self.keys.shape[2]:
-            return self.keys, self.values, self.offset, self.left_padding
-        else:
-            return (
-                self.keys[..., : self._idx, :],
-                self.values[..., : self._idx, :],
-                self.offset,
-                self.left_padding,
-            )
+        k, v = self.keys, self.values
+        if self._idx < k.shape[2]:
+            k = k[..., : self._idx, :]
+            v = v[..., : self._idx, :]
+        return k, v, self.offset, self.left_padding
 
     @state.setter
     def state(self, v):
@@ -697,7 +692,7 @@ class BatchKVCache(_BaseCache):
 
     def filter(self, batch_indices):
         """
-        Only keep the given indices in the cache.
+        In-place filter to keep just the given indices in the cache.
         """
         self.keys = self.keys[batch_indices]
         self.values = self.values[batch_indices]
@@ -705,48 +700,39 @@ class BatchKVCache(_BaseCache):
             self.offset = self.offset[batch_indices]
             self.left_padding = self.left_padding[batch_indices]
 
-    @classmethod
-    def concatenate(cls, caches):
+        # Shift left to reduce padding
+        min_left_pad = self.left_padding.min().item()
+        if min_left_pad > 0:
+            self.keys = self.keys[..., min_left_pad:, :]
+            self.values = self.values[..., min_left_pad:, :]
+            self._idx -= min_left_pad
+            self.left_padding -= min_left_pad
+
+    def extend(self, other):
         """
-        Only keep the given indices in the cache.
+        In-place extend this cache with the other cache.
         """
-        max_idx = max(c._idx for c in caches)
-        max_size = max(c.keys.shape[2] for c in caches)
-        cache = cls([0])
+        max_idx = max(self._idx, other._idx)
+        max_size = max(self.keys.shape[2], other.keys.shape[2])
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
         def pad(c):
             left = max_idx - c._idx
             right = max_size - c.keys.shape[2] - left
+            k, v = c.keys, c.values
             if right < 0:
-                k = c.keys[..., :right, :]
-                v = c.values[..., :right, :]
+                k = k[..., :right, :]
+                v = v[..., :right, :]
                 right = 0
-            else:
-                k, v = c.keys, c.values
-            pad = [(0, 0), (0, 0), (left, right), (0, 0)]
-            k = mx.pad(k, pad)
-            v = mx.pad(v, pad)
+            if left != 0 or right != 0:
+                pad = [(0, 0), (0, 0), (left, right), (0, 0)]
+                k = mx.pad(k, pad)
+                v = mx.pad(v, pad)
             left_padding = c.left_padding + left
             return k, v, c.offset, left_padding
 
-        cache._idx = max_idx
-        cache.keys, cache.values, cache.offset, cache.left_padding = map(
-            mx.concatenate, zip(*(pad(c) for c in caches))
+        self.keys, self.values, self.offset, self.left_padding = map(
+            mx.concatenate, zip(*(pad(self), pad(other)))
         )
-        return cache
-
-    def split(self, idx):
-        """
-        Split the cache into two sub-caches at the
-        provided index.
-        """
-        l_cache = BatchKVCache([0])
-        r_cache = BatchKVCache([0])
-        l_cache.keys, r_cache.keys = mx.split(self.keys, (idx,))
-        l_cache.values, r_cache.values = mx.split(self.values, (idx,))
-        l_cache._idx = r_cache._idx = self._idx
-        l_cache.offset, r_cache.offset = mx.split(self.offset, (idx,))
-        l_cache.left_padding, r_cache.left_padding = mx.split(self.left_padding, (idx,))
-        return l_cache, r_cache
+        self._idx = max_idx

@@ -350,7 +350,7 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        help="Maximum nunber of tokens to generate. Defaults to the model's max context length.",
+        help="Maximum number of tokens to generate.",
         default=8912,
     )
     parser.add_argument(

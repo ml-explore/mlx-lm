@@ -434,13 +434,15 @@ class TestPromptCache(unittest.TestCase):
 
         # Test filtering
         cache.filter([0, 1])
-        self.assertEqual(cache.state[0].shape, (2, 1, 4, 8))
+
+        # In this case filtering left shifts the cache so it has zero padding
+        self.assertEqual(cache.state[0].shape, (2, 1, 2, 8))
 
         mask = cache.make_mask(1)
-        self.assertEqual(mask[0].squeeze().tolist(), [False, False, True, True, True])
-        self.assertEqual(mask[1].squeeze().tolist(), [False, False, False, True, True])
+        self.assertEqual(mask[0].squeeze().tolist(), [True, True, True])
+        self.assertEqual(mask[1].squeeze().tolist(), [False, True, True])
 
-        # Test concatenation
+        # Test extension
         cache_a = BatchKVCache(left_padding=[2, 1, 2])
         cache_b = BatchKVCache(left_padding=[3, 0])
 
@@ -452,15 +454,11 @@ class TestPromptCache(unittest.TestCase):
         v = mx.zeros((2, 1, 4, 1))
         cache_b.update_and_fetch(k, v)
 
-        cache = BatchKVCache.concatenate([cache_a, cache_b])
-        self.assertEqual(cache.keys.shape[0], 5)
-        self.assertEqual(cache.values.shape[0], 5)
-        self.assertEqual(cache.offset.tolist(), [6, 7, 6, 1, 4])
-        self.assertEqual(cache.left_padding.tolist(), [2, 1, 2, 7, 4])
-
-        cache_a, cache_b = cache.split(3)
-        self.assertEqual(cache_a.keys.shape[0], 3)
-        self.assertEqual(cache_b.keys.shape[0], 2)
+        cache_a.extend(cache_b)
+        self.assertEqual(cache_a.keys.shape[0], 5)
+        self.assertEqual(cache_a.values.shape[0], 5)
+        self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
+        self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
 
 
 if __name__ == "__main__":
