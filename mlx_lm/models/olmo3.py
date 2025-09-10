@@ -27,9 +27,14 @@ class ModelArgs(BaseModelArgs):
     layer_types: List[str]
     sliding_window: int
     rope_traditional: bool = False
+    num_key_value_heads: Optional[int] = None
     head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
+
+    def __post_init__(self):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
 
 
 class Olmo3Attention(nn.Module):
@@ -95,3 +100,100 @@ class Olmo3Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
+    
+
+class Olmo3MLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Olmo3DecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        self.self_attn = Olmo3Attention(args)
+        self.mlp = Olmo3MLP(args)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.args = args
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.post_attention_layernorm(self.self_attn(x, mask, cache))
+        h = x + r
+        r = self.post_feedforward_layernorm(self.mlp(h))
+        out = h + r
+        return out
+
+
+class Olmo3Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [
+            Olmo3DecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        h = self.embed_tokens(inputs)
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
+
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, cache=c)
+
+        return self.norm(h)
+    
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.model = Olmo3Model(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        out = self.model(inputs, cache)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
+
+    def sanitize(self, weights):
+        return {
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+        }
+
+    @property
+    def layers(self):
+        return self.model.layers
