@@ -1,4 +1,4 @@
-# Copyright © 2023-2025 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -117,16 +117,14 @@ class Lille130(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
         h = self.tok_embeddings(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -144,16 +142,13 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        return self.transformer(inputs, mask=mask, cache=cache)
+        return self.transformer(inputs, cache=cache)
 
     @property
     def layers(self):
         return self.transformer.layers
 
     def sanitize(self, weights):
-        weights = {k: v for k, v in weights.items() if "rotary_emb" not in k}
-        weights.pop("lm_head.weight", None)
-        return weights
+        return {k: v for k, v in weights.items() if "rotary_emb" not in k}

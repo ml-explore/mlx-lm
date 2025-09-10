@@ -1671,6 +1671,18 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
                 "norm_topk_prob": True,
             },
+            {
+                "model_type": "lille-130m",
+                "block_size": 128,
+                "num_hidden_layers": 4,
+                "n_layer": 4,
+                "n_head": 4,
+                "n_kv_heads": 4,
+                "n_embd": 128,
+                "vocab_size": 1000,
+                "rope_theta": 1000,
+                "layer_norm_eps": 1e-5,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
