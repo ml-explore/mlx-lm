@@ -251,11 +251,6 @@ class NemotronHAttention(nn.Module):
         return self.o_proj(output)
 
 
-@partial(mx.compile, shapeless=True)
-def relu2(x):
-    return mx.square(nn.relu(x))
-
-
 class NemotronHMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -267,7 +262,7 @@ class NemotronHMLP(nn.Module):
         )
 
     def __call__(self, x):
-        return self.down_proj(relu2(self.up_proj(x)))
+        return self.down_proj(nn.relu2(self.up_proj(x)))
 
 
 class NemotronHBlock(nn.Module):
