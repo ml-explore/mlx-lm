@@ -243,6 +243,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
     
+    def apply_mask_to_padding_states(self, hidden_states, attention_mask):
+        """
+        Applies the mask to hidden_states like Torch reference.
+        If attention_mask is not None and has more than 1 row and column, multiply and cast.
+        """
+        if attention_mask is not None:
+            if attention_mask.shape[0] > 1 and attention_mask.shape[1] > 1:
+                dtype = hidden_states.dtype
+                # Mask shape: (B, S), hidden_states: (B, S, ...)
+                hidden_states = (hidden_states * attention_mask[:, :, None]).astype(dtype)
+        return hidden_states
+    
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         nq, nk, nv, dv = self.num_k_heads, self.head_k_dim, self.num_v_heads, self.head_v_dim
         mixed_qkvz = mixed_qkvz.reshape(*mixed_qkvz.shape[:-1], nq, 2*nk + 2*nv*dv//nq)
@@ -258,8 +270,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             a.reshape(a.shape[0], a.shape[1], nv),
         )
     
-    
     def __call__(self, inputs: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None):
+        # Apply attention mask to inputs, if provided and valid
+        if mask is not None:
+            # mask shape (B, 1, 1, S) or similar
+            mask_2d = mask.squeeze(1).squeeze(1)
+        else:
+            mask_2d = None
+        inputs = self.apply_mask_to_padding_states(inputs, mask_2d)
+
         B,L,_ = inputs.shape
         qkvz, ba = self.in_proj_qkvz(inputs), self.in_proj_ba(inputs)
         q,k,v,z,b,a = self.fix_query_key_value_ordering(qkvz, ba)
