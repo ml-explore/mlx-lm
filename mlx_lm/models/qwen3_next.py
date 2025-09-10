@@ -135,10 +135,29 @@ class Qwen3NextRMSNormGated(nn.Module):
         self.eps = eps
         self.weight = mx.ones(hidden_size)
 
-    def __call__(self, hidden_states: mx.array, gate: mx.array = None) -> mx.array:
+    def __call__(self, hidden_states: mx.array, gate: Optional[mx.array] = None) -> mx.array:
+        input_dtype = hidden_states.dtype
+        x = hidden_states.astype(mx.float32)
+        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
+        x = x * mx.rsqrt(variance + self.eps)
+        x = (1.0 + self.weight.astype(mx.float32)) * x
         if gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
-        return mx.fast.rms_norm(hidden_states, 1.0 + self.weight, self.eps)
+            x = x * nn.silu(gate.astype(mx.float32))
+        return x.astype(input_dtype)
+
+
+class Qwen3NextRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = mx.zeros(dim)
+        
+    def __call__(self, x: mx.array) -> mx.array:
+        x = x.astype(mx.float32)
+        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
+        output = x * mx.rsqrt(variance + self.eps)
+        output = output * (1.0 + self.weight.astype(mx.float32))
+        return output.astype(x.dtype)
 
 
 class Qwen3NextAttention(nn.Module):
@@ -154,8 +173,8 @@ class Qwen3NextAttention(nn.Module):
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
         self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, args.hidden_size, bias=args.attention_bias)
 
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -414,8 +433,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(args)
         
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
+        self.input_layernorm = Qwen3NextRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3NextRMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
@@ -450,7 +469,7 @@ class Qwen3NextModel(nn.Module):
             Qwen3NextDecoderLayer(args=args, layer_idx=i)
             for i in range(args.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = Qwen3NextRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
