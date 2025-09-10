@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional, List, Dict, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -44,14 +44,18 @@ class Olmo3Attention(nn.Module):
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.head_dim =  args.head_dim or args.hidden_size // n_heads
+        self.head_dim = args.head_dim or args.hidden_size // n_heads
         self.layer_idx = layer_idx
 
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=args.attention_bias)
-        self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=args.attention_bias)
-        self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=args.attention_bias)
+        self.k_proj = nn.Linear(
+            dim, n_kv_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            dim, n_kv_heads * self.head_dim, bias=args.attention_bias
+        )
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=args.attention_bias)
 
         self.q_norm = nn.RMSNorm(dims=self.head_dim, eps=args.rms_norm_eps)
@@ -60,13 +64,15 @@ class Olmo3Attention(nn.Module):
 
         rope_base = args.rope_theta
         if self.is_sliding:
-            self.rope = nn.RoPE(self.head_dim, traditional=args.rope_traditional, base=rope_base)
+            self.rope = nn.RoPE(
+                self.head_dim, traditional=args.rope_traditional, base=rope_base
+            )
         else:
             self.rope = nn.RoPE(
                 self.head_dim,
                 traditional=args.rope_traditional,
                 base=rope_base,
-                scale=args.rope_scaling if hasattr(args, "rope_scaling") else 1.0
+                scale=args.rope_scaling if hasattr(args, "rope_scaling") else 1.0,
             )
 
     def __call__(
@@ -100,14 +106,20 @@ class Olmo3Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-    
+
 
 class Olmo3MLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+        self.gate_proj = nn.Linear(
+            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
+        )
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -166,7 +178,7 @@ class Olmo3Model(nn.Module):
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
-    
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
