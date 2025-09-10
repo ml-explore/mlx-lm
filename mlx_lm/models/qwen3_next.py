@@ -229,53 +229,32 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     
     def __call__(self, inputs: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None):
         B, S, _ = inputs.shape
-        # Project to QKVZ and BA then fix ordering
-        qkvz = self.in_proj_qkvz(inputs)
-        ba = self.in_proj_ba(inputs)
-        q, k, v, z, b, a = self.fix_query_key_value_ordering(qkvz, ba)
+        q, k, v, z, b, a = self.fix_query_key_value_ordering(self.in_proj_qkvz(inputs), self.in_proj_ba(inputs))
 
-        # Reshape q, k, v to (B, S, -1)
-        q = q.reshape(B, S, -1)
-        k = k.reshape(B, S, -1)
-        v = v.reshape(B, S, -1)
-        # Concatenate for conv1d
-        x_qkv = mx.concatenate([q, k, v], axis=-1)
+        # Conv1d on concatenated q/k/v
+        conv_out = nn.silu(self.conv1d(mx.pad(mx.concatenate(
+            [q.reshape(B, S, -1), k.reshape(B, S, -1), v.reshape(B, S, -1)], -1
+        ), [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]))[:, :S])
 
-        # Convolutional state/caching logic
-        padded = mx.pad(x_qkv, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)])
-        conv_out = self.conv1d(padded)[:, :S]
-        conv_out = nn.silu(conv_out)
-        recurrent_state = None
+        q, k, v = [t.reshape(B, S, h, d) for t, h, d in zip(
+            mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+            [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+            [self.head_k_dim, self.head_k_dim, self.head_v_dim]
+        )]
 
-        # Split conv_out back to q, k, v and reshape to (B, S, heads, head_dim)
-        q_c, k_c, v_c = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
-        q = q_c.reshape(B, S, self.num_k_heads, self.head_k_dim)
-        k = k_c.reshape(B, S, self.num_k_heads, self.head_k_dim)
-        v = v_c.reshape(B, S, self.num_v_heads, self.head_v_dim)
+        beta, g = mx.sigmoid(b), -mx.exp(self.A_log) * nn.softplus(a + self.dt_bias)
 
-        # beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
-        beta = mx.sigmoid(b)
-        g = -mx.exp(self.A_log) * nn.softplus(a + self.dt_bias)
-        # No .reshape(...,1): keep as (B,S,H)
+        if self.num_v_heads > self.num_k_heads:
+            f = self.num_v_heads // self.num_k_heads
+            q, k = mx.repeat(q, f, 2), mx.repeat(k, f, 2)
 
-        # If num_v_heads > num_k_heads, repeat q/k accordingly (along the heads axis)
-        if self.num_v_heads // self.num_k_heads > 1:
-            repeat_factor = self.num_v_heads // self.num_k_heads
-            q = mx.repeat(q, repeat_factor, axis=2)
-            k = mx.repeat(k, repeat_factor, axis=2)
-
-        # Choose the recurrent rule: if step size is 1 and recurrent_state exists, use recurrent_gated_delta_rule, else same (no chunked variant in MLX)
-        if recurrent_state is None:
-            recurrent_state = mx.zeros((B, self.num_v_heads, self.head_k_dim, self.head_v_dim), dtype=inputs.dtype)
-        # (B, S, H, Dk), (B, S, H, Dk), (B, S, H, Dv), (B, S, H), (B, S, H)
         out = recurrent_gated_delta_rule(
-            q, k, v, g, beta, recurrent_state, use_qk_l2norm_in_kernel=True
+            q, k, v, g, beta,
+            mx.zeros((B, self.num_v_heads, self.head_k_dim, self.head_v_dim), dtype=inputs.dtype),
+            use_qk_l2norm_in_kernel=True
         )
-        # Apply norm on (B*S, dim), then reshape back (B, S, -1)
-        out_reshaped = out.reshape(-1, out.shape[-1])
-        z_reshaped = z.reshape(-1, z.shape[-1])
-        core_out = self.norm(out_reshaped, z_reshaped).reshape(z.shape[0], z.shape[1], -1)
-        return self.out_proj(core_out)
+        out = self.norm(out.reshape(-1, out.shape[-1]), z.reshape(-1, z.shape[-1]))
+        return self.out_proj(out.reshape(B, S, -1))
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
