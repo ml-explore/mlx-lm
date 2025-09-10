@@ -221,8 +221,6 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
-        else:
-            raise ValueError(f"Unknown quantization method {quant_method}.")
 
     model.load_weights(list(weights.items()), strict=strict)
 

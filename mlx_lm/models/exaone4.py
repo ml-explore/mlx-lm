@@ -149,23 +149,35 @@ class ExaoneModel(nn.Module):
             )
             for i in range(args.num_hidden_layers)
         ]
+        if pattern:
+            self.swa_idx = pattern.index("L")
+            self.full_idx = pattern.index("G")
+        else:
+            self.swa_idx = None
+            self.full_idx = 0
+
+        self.window_size = args.sliding_window
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+        global_mask = create_attention_mask(h, cache[self.full_idx])
+        if self.swa_idx is not None:
+            swa_mask = create_attention_mask(
+                h, cache[self.swa_idx], window_size=self.window_size
+            )
+        else:
+            swa_mask = None
 
         for layer, c in zip(self.layers, cache):
+            mask = swa_mask if layer.self_attn.is_local else global_mask
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -183,10 +195,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

@@ -35,8 +35,8 @@ class ModelArgs(BaseModelArgs):
     use_bias: bool
     use_conv_bias: bool
     residual_in_fp32: bool
+    hybrid_override_pattern: List[str]
     head_dim: Optional[int] = None
-    hybrid_override_pattern: Optional[List[str]] = None
 
 
 class MambaRMSNormGated(nn.Module):
@@ -321,18 +321,14 @@ class NemotronHModel(nn.Module):
     def __call__(
         self,
         inputs,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
         hidden_states = self.embeddings(inputs)
 
-        if mask is None:
-            attn_mask = create_attention_mask(
-                hidden_states, cache[self.fa_idx : self.fa_idx + 1]
-            )
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
 
         cache_counter = 0
         for layer in self.layers:
@@ -357,14 +353,14 @@ class Model(nn.Module):
         self.args = args
         self.backbone = NemotronHModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model_type = args.model_type
 
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        out = self.backbone(inputs, mask=mask, cache=cache)
+        out = self.backbone(inputs, cache=cache)
         return self.lm_head(out)
 
     @property

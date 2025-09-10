@@ -137,22 +137,19 @@ class GPTBigCodeModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         B, L = inputs.shape
 
         hidden_states = self.wte(inputs)
 
-        mask = None
-        if mask is not None and hidden_states.shape[1] > 1:
-            mask = create_attention_mask(hidden_states, cache)
-
         if cache is None:
             cache = [None] * len(self.h)
             position_ids = mx.array(np.arange(L))
         else:
             position_ids = mx.array(np.arange(cache[0].offset, cache[0].offset + L))
+
+        mask = create_attention_mask(hidden_states, cache[0])
 
         hidden_states += self.wpe(position_ids)
 
@@ -174,10 +171,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.transformer(inputs, mask, cache)
+        out = self.transformer(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.transformer.wte.as_linear(out)
         else:

@@ -686,7 +686,6 @@ def stream_generate(
             prompt, model, draft_model, **kwargs
         )
     with wired_limit(model, [generation_stream]):
-        detokenizer.reset()
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
@@ -731,7 +730,6 @@ def generate(
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, List[int]],
     verbose: bool = False,
-    formatter: Optional[Callable] = None,
     **kwargs,
 ) -> str:
     """
@@ -746,11 +744,6 @@ def generate(
        kwargs: The remaining options get passed to :func:`stream_generate`.
           See :func:`stream_generate` for more details.
     """
-    if formatter is not None:
-        print(
-            "[Warning] Text formatting is deprecated and no longer used. "
-            "The argument will be removed in a future version."
-        )
     if verbose:
         print("=" * 10)
 

@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,46 +17,56 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
+    attention_bias: bool
+    mlp_only_layers: List[int]
     num_experts: int
     num_experts_per_tok: int
     decoder_sparse_step: int
-    mlp_only_layers: List[int]
+    n_shared_experts: int
     moe_intermediate_size: int
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
-    head_dim: int
     rope_theta: float
-    tie_word_embeddings: bool
     max_position_embeddings: int
     norm_topk_prob: bool
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
-class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, layer_idx: int):
+class KlearAttention(nn.Module):
+    def __init__(self, args: ModelArgs):
         super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.scale = self.head_dim**-0.5
 
-        head_dim = getattr(
-            args, "head_dim", args.hidden_size // args.num_attention_heads
+        self.q_proj = nn.Linear(
+            args.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            bias=args.attention_bias,
         )
-        self.scale = head_dim**-0.5
+        self.k_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_attention_heads * self.head_dim,
+            args.hidden_size,
+            bias=args.attention_bias,
+        )
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
-
-        self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
         self.rope = nn.RoPE(
-            head_dim,
+            self.head_dim,
             traditional=False,
             base=args.rope_theta,
         )
@@ -71,14 +81,15 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
-        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
+        queries = self.q_norm(
+            queries.reshape(B, L, self.num_attention_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
             0, 2, 1, 3
         )
-        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -95,7 +106,7 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
+class KlearMLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -106,56 +117,57 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen3MoeSparseMoeBlock(nn.Module):
+class KlearSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        dim = args.hidden_size
-        intermediate_size = args.moe_intermediate_size
-
-        self.num_experts = num_experts = args.num_experts
-        self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
+        self.num_experts = args.num_experts
+        self.top_k = args.num_experts_per_tok
 
-        self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
+        self.experts = SwitchGLU(
+            args.hidden_size, args.moe_intermediate_size, args.num_experts
+        )
+        self.shared_experts = KlearMLP(
+            args.hidden_size,
+            hidden_dim=args.moe_intermediate_size * args.n_shared_experts,
+        )
+        self.coefficient = nn.Linear(args.hidden_size, 2)
+        self.expert_bias = mx.zeros((self.num_experts,), dtype=mx.float32)
 
-    def __call__(
-        self,
-        x: mx.array,
-    ):
-        gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
-
+    def __call__(self, x: mx.array) -> mx.array:
+        routing_weights = mx.sigmoid(self.gate(x).astype(mx.float32))
+        biased_weights = routing_weights + self.expert_bias.reshape((1, 1, -1))
         k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
+        inds = mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(routing_weights, inds, axis=-1)
         if self.norm_topk_prob:
-            scores /= mx.sum(scores, axis=-1, keepdims=True)
-
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
-
+            scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+        scores = scores.astype(x.dtype)
+        expert_out = self.experts(x, inds)
+        y_experts = (expert_out * scores[..., None]).sum(axis=-2)
+        coef = mx.softmax(self.coefficient(x), axis=-1, precise=True)
+        shared = self.shared_experts(x)
+        y = y_experts * coef[..., :1] + shared * coef[..., 1:]
         return y
 
 
-class Qwen3MoeDecoderLayer(nn.Module):
+class KlearDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args, layer_idx)
+        self.self_attn = KlearAttention(args)
+
+        if (layer_idx not in args.mlp_only_layers) and (
+            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
+        ):
+            self.mlp = KlearSparseMoeBlock(args)
+        else:
+            self.mlp = KlearMLP(args.hidden_size, args.intermediate_size)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.args = args
-
-        if (layer_idx not in args.mlp_only_layers) and (
-            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
-        ):
-            self.mlp = Qwen3MoeSparseMoeBlock(args)
-        else:
-            self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -170,16 +182,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return out
 
 
-class Qwen3MoeModel(nn.Module):
+class KlearModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
-        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen3MoeDecoderLayer(args=args, layer_idx=i)
+            KlearDecoderLayer(args=args, layer_idx=i)
             for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -187,8 +195,8 @@ class Qwen3MoeModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-    ):
+        cache: Optional[Any] = None,
+    ) -> mx.array:
         h = self.embed_tokens(inputs)
 
         if cache is None:
@@ -207,30 +215,35 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen3MoeModel(args)
+        self.model = KlearModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
+        cache: Optional[Any] = None,
     ):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+        if "model.layers.0.mlp.experts.0.gate_proj.weight" not in weights:
             return weights
+
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
-                        for e in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+            prefix = f"model.layers.{l}.mlp.experts"
+            for name in ["gate_proj", "up_proj", "down_proj"]:
+                stacked = [
+                    weights.pop(f"{prefix}.{e}.{name}.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.{name}.weight"] = mx.stack(stacked)
+
         return weights
+
+    @property
+    def layers(self):
+        return self.model.layers
 
     @property
     def quant_predicate(self):
@@ -242,5 +255,8 @@ class Model(nn.Module):
         return predicate
 
     @property
-    def layers(self):
-        return self.model.layers
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
+
+        return predicate

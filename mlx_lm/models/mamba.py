@@ -50,32 +50,6 @@ class ModelArgs(BaseModelArgs):
             self.use_bcdt_rms = True
 
 
-class DepthWiseConv1d(nn.Module):
-    def __init__(self, channels, kernel_size, bias=True, padding=0):
-        super().__init__()
-        self.channels = channels
-        self.kernel_size = kernel_size
-        self.padding = padding
-        self.weight = mx.random.normal((self.channels, kernel_size, 1))
-        self.bias = mx.zeros((channels,)) if bias else None
-
-    def __call__(self, x, cache=None):
-        B, L, C = x.shape
-        groups, K, _ = self.weight.shape
-
-        if cache is not None:
-            x = mx.concatenate([cache, x], axis=1)
-        else:
-            x = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
-
-        y = mx.conv_general(x, self.weight, groups=groups)
-
-        if self.bias is not None:
-            y = y + self.bias
-
-        return y, x[:, -K + 1 :, :]
-
-
 class MambaBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -97,11 +71,13 @@ class MambaBlock(nn.Module):
             self.hidden_size, self.intermediate_size * 2, bias=args.use_bias
         )
 
-        self.conv1d = DepthWiseConv1d(
-            channels=self.intermediate_size,
+        self.conv1d = nn.Conv1d(
+            in_channels=self.intermediate_size,
+            out_channels=self.intermediate_size,
             kernel_size=self.conv_kernel_size,
+            groups=self.intermediate_size,
             bias=self.use_conv_bias,
-            padding=self.conv_kernel_size - 1,
+            padding=0,
         )
 
         self.x_proj = nn.Linear(
@@ -148,13 +124,15 @@ class MambaBlock(nn.Module):
         B, T, D = x.shape
         xz = self.in_proj(x)
         x, z = xz.split(indices_or_sections=2, axis=-1)
-
-        conv_out, new_conv_cache = self.conv1d(x, conv_cache)
+        K = self.conv_kernel_size
+        if conv_cache is not None:
+            x_full = mx.concatenate([conv_cache, x], axis=1)
+        else:
+            x_full = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
+        conv_out = self.conv1d(x_full)
+        new_conv_cache = x_full[:, -(K - 1) :, :]
         x = nn.silu(conv_out)
-
         A = -mx.exp(self.A_log)
-
-        outputs = []
         current_state = state_cache
         y = []
         for t in range(T):
@@ -228,15 +206,15 @@ class Model(nn.Module):
 
         return logits
 
-    def sanitize(self, weights):
-        for k, v in weights.items():
-            if "conv1d.weight" in k and v.shape[-1] != 1:
-                weights[k] = v.moveaxis(2, 1)
-        return weights
-
     def make_cache(self):
         return [MambaCache() for _ in range(len(self.layers))]
 
     @property
     def layers(self):
         return self.backbone.layers
+
+    def sanitize(self, weights):
+        for k, v in weights.items():
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+        return weights
