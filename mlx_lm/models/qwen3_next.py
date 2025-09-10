@@ -160,9 +160,7 @@ class Qwen3NextAttention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         
-        output = output * mx.sigmoid(gate)
-        
-        return self.o_proj(output)
+        return self.o_proj(output * mx.sigmoid(gate))
 
 
 class Qwen3NextMLP(nn.Module):
