@@ -488,4 +488,9 @@ class Model(nn.Module):
                 v = weights[k]
                 if len(v.shape) == 1:
                     weights[k] = v + 1.0
+        weights = {
+            key: value
+            for key, value in weights.items()
+            if "mtp." not in key
+        }
         return weights
