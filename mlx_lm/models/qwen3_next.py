@@ -39,22 +39,8 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     attention_bias: bool = False
     head_dim: Optional[int] = None
-    layer_types: Optional[List[str]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
-
-    def __post_init__(self):
-        if self.layer_types is None:
-            self.layer_types = [
-                (
-                    "linear_attention"
-                    if (i + 1) % self.full_attention_interval
-                    else "full_attention"
-                )
-                for i in range(self.num_hidden_layers)
-            ]
-        if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
 
 
 @mx.compile
@@ -369,29 +355,25 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
-        shared_expert_output = self.shared_expert(x)
-        shared_expert_output = (
-            mx.sigmoid(self.shared_expert_gate(x)) * shared_expert_output
-        )
+        shared_y = self.shared_expert(x)
+        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
 
-        return y + shared_expert_output
+        return y + shared_y
 
 
 class Qwen3NextDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.layer_type = args.layer_types[layer_idx]
-        if self.layer_type == "linear_attention":
+        self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
+        if self.is_linear:
             self.linear_attn = Qwen3NextGatedDeltaNet(args)
-        elif self.layer_type == "full_attention":
+        else:
             self.self_attn = Qwen3NextAttention(args)
 
         self.input_layernorm = Qwen3NextRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = Qwen3NextRMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.args = args
-
         if (layer_idx not in args.mlp_only_layers) and (
             args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
         ):
@@ -405,9 +387,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        if self.layer_type == "linear_attention":
+        if self.is_linear:
             r = self.linear_attn(self.input_layernorm(x), mask, cache)
-        elif self.layer_type == "full_attention":
+        else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
@@ -423,6 +405,7 @@ class Qwen3NextModel(nn.Module):
             for i in range(args.num_hidden_layers)
         ]
         self.norm = Qwen3NextRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fa_idx = args.full_attention_interval - 1
 
     def __call__(
         self,
@@ -434,14 +417,10 @@ class Qwen3NextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        causal_mask = create_attention_mask(hidden_states, cache)
+        mask = create_attention_mask(hidden_states, cache[self.fa_idx])
 
-        for i, layer in enumerate(self.layers):
-            hidden_states = layer(
-                hidden_states,
-                mask=causal_mask,
-                cache=cache[i] if cache is not None else None,
-            )
+        for layer, c in zip(self.layers, cache):
+            hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         return self.norm(hidden_states)
 
@@ -472,31 +451,25 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        caches = []
-        for l in self.layers:
-            if l.layer_type == "linear_attention":
-                caches.append(MambaCache())
-            elif l.layer_type == "full_attention":
-                caches.append(KVCache())
-        return caches
+        return [MambaCache() if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
             return weights
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
-                        for e in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
-        for k, v in weights.items():
-            if "conv1d.weight" in k and v.shape[-1] != 1:
-                weights[k] = v.moveaxis(2, 1)
+        weights = {key: value for key, value in weights.items() if "mtp." not in key}
+
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.mlp"
+            for n in ["up_proj", "down_proj", "gate_proj"]:
+                to_join = [
+                    weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+
         norm_keys = (
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
@@ -504,10 +477,19 @@ class Model(nn.Module):
             ".q_norm.weight",
             ".k_norm.weight",
         )
-        for k in list(weights.keys()):
-            if any(sfx in k for sfx in norm_keys):
-                v = weights[k]
-                if len(v.shape) == 1:
+        for k, v in weights.items():
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+            if any(k.endswith(sfx) for sfx in norm_keys):
+                if v.ndim == 1:
                     weights[k] = v + 1.0
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
         return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
