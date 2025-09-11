@@ -40,6 +40,14 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
     layer_types: Optional[List[str]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    full_attention_interval: int = 4
+
+    def __post_init__(self):
+        if self.layer_types is None:
+            self.layer_types = [
+                "linear_attention" if (i + 1) % self.full_attention_interval else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
 
 
 @mx.compile
