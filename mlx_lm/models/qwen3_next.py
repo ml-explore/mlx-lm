@@ -34,10 +34,10 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     num_key_value_heads: int
     rope_theta: float
-    tie_word_embeddings: bool
     max_position_embeddings: int
-    norm_topk_prob: bool
-    attention_bias: bool
+    norm_topk_prob: bool = False
+    tie_word_embeddings: bool = False
+    attention_bias: bool = False
     layer_types: Optional[List[str]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
