@@ -46,7 +46,11 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.layer_types is None:
             self.layer_types = [
-                "linear_attention" if (i + 1) % self.full_attention_interval else "full_attention"
+                (
+                    "linear_attention"
+                    if (i + 1) % self.full_attention_interval
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
         if self.head_dim is None:
@@ -90,7 +94,8 @@ def recurrent_gated_delta_rule(
         )
         out[:, t] = mx.einsum("bhd,bhdv->bhv", query[:, t], state)
 
-    return mx.transpose(out, (0, 2, 1, 3))
+    out_transposed = mx.transpose(out, (0, 2, 1, 3))
+    return out_transposed, state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -281,7 +286,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.in_proj_qkvz(inputs), self.in_proj_ba(inputs)
         )
 
-        # Conv1d on concatenated q/k/v
         conv_out = nn.silu(
             self.conv1d(
                 mx.pad(
@@ -309,18 +313,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             f = self.num_v_heads // self.num_k_heads
             q, k = mx.repeat(q, f, 2), mx.repeat(k, f, 2)
 
-        out = recurrent_gated_delta_rule(
+        initial_state = None
+        if cache is not None:
+            initial_state = cache[0]
+        out, new_state = recurrent_gated_delta_rule(
             q,
             k,
             v,
             g,
             beta,
-            mx.zeros(
-                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                dtype=inputs.dtype,
+            (
+                initial_state
+                if initial_state is not None
+                else mx.zeros(
+                    (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                    dtype=inputs.dtype,
+                )
             ),
             use_qk_l2norm_in_kernel=True,
         )
+
+        if cache is not None:
+            cache[0] = new_state
         out = self.norm(out.reshape(-1, out.shape[-1]), z.reshape(-1, z.shape[-1]))
         return self.out_proj(out.reshape(B, S, -1))
 
@@ -423,7 +437,11 @@ class Qwen3NextModel(nn.Module):
         causal_mask = create_attention_mask(hidden_states, cache)
 
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, mask=causal_mask, cache=cache[i])
+            hidden_states = layer(
+                hidden_states,
+                mask=causal_mask,
+                cache=cache[i] if cache is not None else None,
+            )
 
         return self.norm(hidden_states)
 
@@ -491,9 +509,5 @@ class Model(nn.Module):
                 v = weights[k]
                 if len(v.shape) == 1:
                     weights[k] = v + 1.0
-        weights = {
-            key: value
-            for key, value in weights.items()
-            if "mtp." not in key
-        }
+        weights = {key: value for key, value in weights.items() if "mtp." not in key}
         return weights
