@@ -34,6 +34,16 @@ class ModelArgs(BaseModelArgs):
     use_qkv_bias: bool = False
     norm_head: bool = False
     norm_softmax: bool = False
+    use_qk_norm: bool = True
+    tie_word_embeddings: bool = False
+    partial_rotary_factor: float = 1.0
+    moe_router_enable_expert_bias: bool = True
+    moe_router_enable_routed_scaling: bool = True
+    routed_scaling_factor: float = 1.0
+    n_group: int = 8
+    topk_group: int = 4
+    moe_shared_expert_intermediate_size: int = 512
+    moe_router_enable_shared_expert: bool = True
 
 
 class BailingMoeMLP(nn.Module):
@@ -62,6 +72,7 @@ class BailingMoeMLP(nn.Module):
 class BailingMoeAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.use_qk_norm = args.use_qk_norm
         self.num_attention_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
         self.head_dim = args.hidden_size // self.num_attention_heads
@@ -78,8 +89,12 @@ class BailingMoeAttention(nn.Module):
             bias=args.use_bias,
         )
 
+        if args.use_qk_norm:
+            self.key_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+            self.query_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+
         self.rope = initialize_rope(
-            self.head_dim,
+            int(self.head_dim * args.partial_rotary_factor),
             args.rope_theta,
             traditional=False,
             scaling_config=args.rope_scaling,
@@ -110,6 +125,10 @@ class BailingMoeAttention(nn.Module):
             0, 2, 1, 3
         )
 
+        if self.use_qk_norm:
+            queries = self.query_layernorm(queries)
+            keys = self.key_layernorm(keys)
+
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
@@ -127,31 +146,62 @@ class BailingMoeAttention(nn.Module):
 
 
 class BailingMoeGate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_experts
-        self.norm_topk_prob = config.norm_topk_prob
-        self.gating_dim = config.hidden_size
+        self.norm_topk_prob = args.norm_topk_prob
 
-        self.gate_proj = nn.Linear(self.gating_dim, self.num_experts, bias=False)
+        self.top_k = args.num_experts_per_tok
+        self.n_group = args.n_group
+        self.topk_group = args.topk_group
+        self.routed_scaling_factor = args.routed_scaling_factor
+        self.enable_routed_scaling = args.moe_router_enable_routed_scaling
+
+        self.gate_proj = nn.Linear(args.hidden_size, args.num_experts, bias=False)
+        self.expert_bias = (
+            mx.zeros((args.num_experts,)) if args.moe_router_enable_expert_bias else None
+        )
+
+    def group_limited_topk(self, scores: mx.array):
+        N, E = scores.shape
+        # Group-Scores berechnen
+        group_scores = mx.sum(
+            mx.topk(scores.reshape(N, self.n_group, -1), k=2, axis=-1)[0], axis=-1
+        )
+        # Top-Gruppen wählen
+        group_idx = mx.argpartition(group_scores, kth=-self.topk_group, axis=-1)[..., -self.topk_group :]  # (N, topk_group)
+
+        # One-hot Maske selber bauen
+        arange_idx = mx.arange(self.n_group)[None, None, :]              # (1,1,n_group)
+        group_idx_exp = group_idx[..., None]                             # (N,topk_group,1)
+        group_mask = mx.sum(mx.equal(arange_idx, group_idx_exp), axis=1) # (N,n_group)
+
+        # Expand auf Experten
+        score_mask = mx.tile(group_mask, (1, E // self.n_group))  # (N, E)
+        masked_scores = mx.where(score_mask.astype(mx.bool_), scores, -mx.inf)
+
+        # Top-k Werte und Indizes
+        top_indices = mx.argsort(masked_scores, axis=-1)[..., -self.top_k:]
+        top_scores = mx.take_along_axis(masked_scores, top_indices, axis=-1)
+        return top_scores, top_indices
 
     def __call__(self, hidden_states):
         B, L, D = hidden_states.shape
         x = hidden_states.reshape(-1, D)
 
         logits = self.gate_proj(x)
-        scores = mx.softmax(logits, axis=-1, precise=True)
+        scores = mx.sigmoid(logits)
+        if self.expert_bias is not None:
+            scores = scores + self.expert_bias
 
-        topk_idx = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k :]
-        topk_scores = mx.take_along_axis(scores, topk_idx, axis=-1)
+        top_scores, topk_idx = self.group_limited_topk(scores)
 
         if self.top_k > 1 and self.norm_topk_prob:
-            denom = mx.sum(topk_scores, axis=-1, keepdims=True)
-            topk_scores = topk_scores / mx.maximum(denom, 1e-9)
+            denom = mx.sum(top_scores, axis=-1, keepdims=True)
+            top_scores = top_scores / mx.maximum(denom, 1e-9)
 
-        return topk_idx, topk_scores
+        if self.routed_scaling_factor is not None and getattr(self, "enable_routed_scaling", True):
+            top_scores = top_scores * self.routed_scaling_factor
+        return topk_idx, top_scores
 
 
 class BailingMoeSparseMoeBlock(nn.Module):
@@ -159,42 +209,33 @@ class BailingMoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.args = args
         self.num_experts_per_tok = args.num_experts_per_tok
-
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             args.moe_intermediate_size,
             args.num_experts,
             bias=args.use_bias,
         )
-
-        self.gate = BailingMoeGate(config=args)
-
-        if args.num_shared_experts > 0:
-            self.shared_experts = BailingMoeMLP(
+        self.gate = BailingMoeGate(args)
+        self.shared_experts = (
+            BailingMoeMLP(
                 args=args,
-                intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
+                intermediate_size=args.moe_shared_expert_intermediate_size * args.num_shared_experts,
             )
-        else:
-            self.shared_experts = None
+            if args.num_shared_experts > 0 and args.moe_router_enable_shared_expert
+            else None
+        )
 
     def __call__(self, hidden_states):
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-
+        bsz, seq_len, h = hidden_states.shape
+        x = hidden_states.reshape(-1, h)
+        topk_idx, topk_weight = self.gate(hidden_states)
+        expert_outputs = self.switch_mlp(x, topk_idx)
+        out = (
+            expert_outputs.reshape(*topk_idx.shape, -1) * topk_weight[..., None]
+        ).sum(axis=1).reshape(bsz, seq_len, h)
         if self.shared_experts is not None:
-            identity = hidden_states
-
-        x = hidden_states.reshape(-1, hidden_dim)
-
-        expert_indices, expert_weights = self.gate(hidden_states)
-        expert_outputs = self.switch_mlp(x, expert_indices)
-
-        weighted_output = mx.sum(expert_outputs * expert_weights[..., None], axis=-2)
-        output = weighted_output.reshape(batch_size, seq_len, hidden_dim)
-
-        if self.shared_experts is not None:
-            output = output + self.shared_experts(hidden_states)
-
-        return output
+            out = out + self.shared_experts(hidden_states)
+        return out
 
 
 class BailingMoeDecoderLayer(nn.Module):
@@ -261,17 +302,25 @@ class Model(nn.Module):
         self.norm_head = args.norm_head
         self.model_type = args.model_type
         self.model = BailingMoeModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
     ):
-        h = self.model(inputs, cache)
-        return self.lm_head(h)
+        out = self.model(inputs, cache)
+        if self.args.tie_word_embeddings:
+            out = self.model.word_embeddings.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
 
     def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+            
         if self.norm_head:
             w = weights["lm_head.weight"]
             dtype = w.dtype
@@ -308,10 +357,9 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            if path.endswith("mlp.gate"):
+            if path.endswith("mlp.gate.gate_proj.weight"):
                 return {"group_size": 64, "bits": 8}
             return True
-
         return predicate
 
     @property
