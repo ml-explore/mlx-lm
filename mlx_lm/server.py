@@ -176,11 +176,6 @@ class ModelProvider:
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path, adapter_path, draft_model_path = map(
-            lambda s: s.lower() if s else None,
-            (model_path, adapter_path, draft_model_path),
-        )
-
         model_path = self.default_model_map.get(model_path, model_path)
         if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
@@ -364,10 +359,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.adapter,
                 self.requested_draft_model,
             )
-        except:
+        except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(b"Not Found")
+            self.wfile.write((f"{e}").encode())
             return
 
         # Get stop id sequences, if provided
