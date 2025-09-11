@@ -38,6 +38,7 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool = False
     tie_word_embeddings: bool = False
     attention_bias: bool = False
+    head_dim: Optional[int] = None
     layer_types: Optional[List[str]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
@@ -48,6 +49,8 @@ class ModelArgs(BaseModelArgs):
                 "linear_attention" if (i + 1) % self.full_attention_interval else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
 
 
 @mx.compile
@@ -120,7 +123,7 @@ class Qwen3NextAttention(nn.Module):
         super().__init__()
         self.num_key_value_heads = args.num_key_value_heads
         self.num_attention_heads = args.num_attention_heads
-        self.head_dim = args.hidden_size // self.num_attention_heads
+        self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
