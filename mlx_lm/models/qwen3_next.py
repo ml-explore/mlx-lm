@@ -34,6 +34,7 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     num_key_value_heads: int
     rope_theta: float
+    partial_rotary_factor: float
     max_position_embeddings: int
     norm_topk_prob: bool = False
     tie_word_embeddings: bool = False
@@ -50,29 +51,27 @@ def recurrent_gated_delta_rule(
     value: mx.array,
     g: mx.array,
     beta: mx.array,
-    initial_state: Optional[mx.array] = None,
+    initial_state: mx.array,
     use_qk_l2norm_in_kernel: bool = False,
 ):
+    B, S, H, Dk = key.shape
+    inv_scale = Dk**-0.5
     if use_qk_l2norm_in_kernel:
-        query /= mx.maximum(mx.linalg.norm(query, axis=-1, keepdims=True), 1e-12)
-        key /= mx.maximum(mx.linalg.norm(key, axis=-1, keepdims=True), 1e-12)
+        query = inv_scale * mx.fast.rms_norm(query, None, 1e-6)
+        key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
 
     if beta.ndim == 4:
         beta = beta.squeeze(-1)
     if g.ndim == 4:
         g = g.squeeze(-1)
 
-    B, S, H, Dk = key.shape
     Dv = value.shape[-1]
-    query *= 1.0 / mx.sqrt(mx.array(query.shape[-1]))
+    query = inv_scale * query
 
     v_beta, k_beta = value * beta[..., None], key * beta[..., None]
-    state = (
-        mx.zeros((B, H, Dk, Dv), dtype=value.dtype)
-        if initial_state is None
-        else initial_state.reshape(B, H, Dk, Dv)
-    )
     out = mx.zeros((B, S, H, Dv), dtype=value.dtype)
+
+    state = initial_state
 
     for t in range(S):
         state = state * mx.exp(g[:, t])[..., None, None] + mx.matmul(
@@ -80,8 +79,7 @@ def recurrent_gated_delta_rule(
         )
         out[:, t] = mx.einsum("bhd,bhdv->bhv", query[:, t], state)
 
-    out_transposed = mx.transpose(out, (0, 2, 1, 3))
-    return out_transposed, state
+    return out, state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -93,20 +91,10 @@ class Qwen3NextRMSNormGated(nn.Module):
     def __call__(
         self, hidden_states: mx.array, gate: mx.array | None = None
     ) -> mx.array:
-        x = mx.fast.rms_norm(hidden_states, None, self.eps) * (1.0 + self.weight)
+        x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
             x = x * nn.silu(gate)
         return x
-
-
-class Qwen3NextRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = mx.zeros(dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, None, self.eps) * (1.0 + self.weight)
 
 
 class Qwen3NextAttention(nn.Module):
@@ -138,11 +126,11 @@ class Qwen3NextAttention(nn.Module):
             bias=args.attention_bias,
         )
 
-        self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
         self.rope = initialize_rope(
-            self.head_dim,
+            int(self.head_dim * args.partial_rotary_factor),
             base=args.rope_theta,
             traditional=False,
             scaling_config=args.rope_scaling,
@@ -222,7 +210,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             bias=False,
             kernel_size=self.conv_kernel_size,
             groups=self.conv_dim,
-            padding=self.conv_kernel_size - 1,
+            padding=0,
         )
 
         self.in_proj_qkvz = nn.Linear(
@@ -272,17 +260,21 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.in_proj_qkvz(inputs), self.in_proj_ba(inputs)
         )
 
-        conv_out = nn.silu(
-            self.conv1d(
-                mx.pad(
-                    mx.concatenate(
-                        [q.reshape(B, S, -1), k.reshape(B, S, -1), v.reshape(B, S, -1)],
-                        -1,
-                    ),
-                    [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)],
-                )
-            )[:, :S]
+        if cache is not None and cache[0] is not None:
+            conv_state = cache[0]
+        else:
+            conv_state = mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim),
+                dtype=inputs.dtype,
+            )
+
+        mixed_qkv = mx.concatenate(
+            [q.reshape(B, S, -1), k.reshape(B, S, -1), v.reshape(B, S, -1)], axis=-1
         )
+        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+        if cache is not None:
+            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+        conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
             t.reshape(B, S, h, d)
@@ -299,29 +291,27 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             f = self.num_v_heads // self.num_k_heads
             q, k = mx.repeat(q, f, 2), mx.repeat(k, f, 2)
 
-        initial_state = None
-        if cache is not None:
-            initial_state = cache[0]
+        if cache is not None and cache[1] is not None:
+            initial_state = cache[1]
+        else:
+            initial_state = mx.zeros(
+                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                dtype=inputs.dtype,
+            )
+
         out, new_state = recurrent_gated_delta_rule(
             q,
             k,
             v,
             g,
             beta,
-            (
-                initial_state
-                if initial_state is not None
-                else mx.zeros(
-                    (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                    dtype=inputs.dtype,
-                )
-            ),
+            initial_state,
             use_qk_l2norm_in_kernel=True,
         )
 
         if cache is not None:
-            cache[0] = new_state
-        out = self.norm(out.reshape(-1, out.shape[-1]), z.reshape(-1, z.shape[-1]))
+            cache[1] = new_state
+        out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
 
 
@@ -332,6 +322,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         intermediate_size = args.moe_intermediate_size
         shared_expert_intermediate_size = args.shared_expert_intermediate_size
 
+        self.norm_topk_prob = args.norm_topk_prob
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
 
@@ -351,6 +342,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         k = self.top_k
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
@@ -370,8 +363,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             self.self_attn = Qwen3NextAttention(args)
 
-        self.input_layernorm = Qwen3NextRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3NextRMSNorm(
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         if (layer_idx not in args.mlp_only_layers) and (
@@ -404,7 +397,7 @@ class Qwen3NextModel(nn.Module):
             Qwen3NextDecoderLayer(args=args, layer_idx=i)
             for i in range(args.num_hidden_layers)
         ]
-        self.norm = Qwen3NextRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.fa_idx = args.full_attention_interval - 1
 
     def __call__(
@@ -473,7 +466,7 @@ class Model(nn.Module):
         norm_keys = (
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
-            ".norm.weight",
+            "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
         )
