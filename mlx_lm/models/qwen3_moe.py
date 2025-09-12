@@ -127,7 +127,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)

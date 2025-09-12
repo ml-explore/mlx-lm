@@ -48,31 +48,43 @@ def recurrent_gated_delta_rule(
     query: mx.array,
     key: mx.array,
     value: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    initial_state: mx.array,
-    use_qk_l2norm_in_kernel: bool = False,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    a: mx.array,
+    b: mx.array,
+    initial_state: Optional[mx.array],
+    use_qk_l2norm_in_kernel: bool,
 ) -> Tuple[mx.array, mx.array]:
-    B, S, H, Dk = key.shape
+
+    input_type = query.dtype
+    B, S, Hk, Dk = key.shape
+    Hv, Dv = value.shape[-2:]
+    beta = mx.sigmoid(b)
+    g = -mx.exp(A_log) * nn.softplus(a + dt_bias)
+    initial_state = mx.zeros((B, Hv, Dk, Dv), dtype=input_type)
+
     inv_scale = Dk**-0.5
     if use_qk_l2norm_in_kernel:
         query = inv_scale * mx.fast.rms_norm(query, None, 1e-6)
         key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
-    input_type = query.dtype
     query = inv_scale * query
-    out = mx.zeros((B, H, S, value.shape[-1]), dtype=value.dtype)
+    if (repeat_factor := (Hv // Hk)) > 1:
+        query = mx.repeat(query, repeat_factor, 2)
+        key = mx.repeat(key, repeat_factor, 2)
+
+    out = mx.zeros((B, S, Hv, Dv), dtype=value.dtype)
     g = mx.exp(g)
     query, key, value, beta, g = [
-        x.swapaxes(1, 2).astype(mx.float32) for x in (query, key, value, beta, g)
+        x.astype(mx.float32) for x in (query, key, value, beta, g)
     ]
     state = initial_state
     for i in range(S):
-        state *= g[:, :, i, None, None]
-        kv_mem = mx.einsum('bhkv,bhk->bhv', state, key[:, :, i])
-        delta = (value[:, :, i] - kv_mem) * beta[:, :, i, None]
-        state += mx.einsum('bhk,bhv->bhkv', key[:, :, i], delta)
-        out[:, :, i] = mx.einsum('bhkv,bhk->bhv', state, query[:, :, i])
-    return out.swapaxes(1, 2).astype(input_type), state
+        state = state * g[:, i, :, None, None]
+        kv_mem = mx.einsum("bhkv,bhk->bhv", state, key[:, i, :])
+        delta = (value[:, i, :] - kv_mem) * beta[:, i, :, None]
+        state += mx.einsum("bhk,bhv->bhkv", key[:, i, :], delta)
+        out[:, i, :] = mx.einsum("bhkv,bhk->bhv", state, query[:, i, :])
+    return out.astype(input_type), state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -195,7 +207,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             raise ValueError(
                 f"num_v_heads ({self.num_v_heads}) must be divisible by num_k_heads ({self.num_k_heads})"
             )
-        self.repeat_factor = self.num_v_heads // self.num_k_heads
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_norm_epsilon = config.rms_norm_eps
@@ -224,26 +235,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-    def fix_query_key_value_ordering(self, mixed_qkvz: mx.array, mixed_ba: mx.array) -> mx.array:
-        nq, nk, nv, dv = (
+    def fix_query_key_value_ordering(
+        self, mixed_qkvz: mx.array, mixed_ba: mx.array
+    ) -> mx.array:
+        nk, dn, nv, dv = (
             self.num_k_heads,
             self.head_k_dim,
             self.num_v_heads,
             self.head_v_dim,
         )
-        mixed_qkvz = mixed_qkvz.reshape(
-            *mixed_qkvz.shape[:-1], nq, 2 * nk + 2 * nv * dv // nq
-        )
-        mixed_ba = mixed_ba.reshape(*mixed_ba.shape[:-1], nq, 2 * nv // nq)
-        q, k, v, z = mx.split(mixed_qkvz, [nk, 2 * nk, 2 * nk + nv // nq * dv], axis=-1)
-        b, a = mx.split(mixed_ba, [nv // nq], axis=-1)
+        mixed_qkvz = mixed_qkvz.reshape(*mixed_qkvz.shape[:-1], nk, -1)
+        mixed_ba = mixed_ba.reshape(*mixed_ba.shape[:-1], nk, -1)
+        q, k, v, z = mx.split(mixed_qkvz, [dn, 2 * dn, 2 * dn + nv // nk * dv], axis=-1)
+        b, a = mx.split(mixed_ba, [nv // nk], axis=-1)
         return (
             q,
             k,
-            v.reshape(v.shape[0], v.shape[1], -1, dv),
-            z.reshape(z.shape[0], z.shape[1], -1, dv),
-            b.reshape(b.shape[0], b.shape[1], nv),
-            a.reshape(a.shape[0], a.shape[1], nv),
+            v.reshape(*v.shape[:2], -1, dv),
+            z.reshape(*z.shape[:2], -1, dv),
+            b.reshape(*b.shape[:2], nv),
+            a.reshape(*a.shape[:2], nv),
         )
 
     def __call__(
@@ -282,26 +293,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         ]
 
-        beta = mx.sigmoid(b)
-        g = -mx.exp(self.A_log) * nn.softplus(a + self.dt_bias)
-
-        if self.repeat_factor > 1:
-            q, k = mx.repeat(q, self.repeat_factor, 2), mx.repeat(k, self.repeat_factor, 2)
-
-        if cache is not None and cache[1] is not None:
+        if cache is not None:
             initial_state = cache[1]
         else:
-            initial_state = mx.zeros(
-                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                dtype=inputs.dtype,
-            )
+            initial_state = None
 
         out, new_state = recurrent_gated_delta_rule(
             q,
             k,
             v,
-            g,
-            beta,
+            self.A_log,
+            self.dt_bias,
+            a,
+            b,
             initial_state,
             use_qk_l2norm_in_kernel=True,
         )
@@ -337,7 +341,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
