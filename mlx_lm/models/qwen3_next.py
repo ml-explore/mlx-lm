@@ -44,7 +44,6 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
 
 
-@mx.compile
 def recurrent_gated_delta_rule(
     query: mx.array,
     key: mx.array,
@@ -60,25 +59,33 @@ def recurrent_gated_delta_rule(
         query = inv_scale * mx.fast.rms_norm(query, None, 1e-6)
         key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
 
-    if beta.ndim == 4:
-        beta = beta.squeeze(-1)
-    if g.ndim == 4:
-        g = g.squeeze(-1)
+    input_type = query.dtype
 
     Dv = value.shape[-1]
     query = inv_scale * query
 
-    v_beta, k_beta = value * beta[..., None], key * beta[..., None]
-    out = mx.zeros((B, S, H, Dv), dtype=value.dtype)
+    out = mx.zeros((B, H, S, Dv), dtype=value.dtype)
+
+    query, key, value, beta, g = [
+        x.swapaxes(1, 2).astype(mx.float32) for x in (query, key, value, beta, g)
+    ]
 
     state = initial_state
+    g = mx.exp(g)
 
-    for t in range(S):
-        state = state * mx.exp(g[:, t])[..., None, None] + mx.matmul(
-            k_beta[:, t][..., None], v_beta[:, t][..., None, :]
-        )
-        out[:, t] = mx.einsum("bhd,bhdv->bhv", query[:, t], state)
+    for i in range(S):
+        q_t = query[:, :, i][..., None]
+        k_t = key[:, :, i][..., None]
+        v_t = value[:, :, i]
+        g_t = g[:, :, i][..., None, None]
+        beta_t = beta[:, :, i][..., None]
 
+        state = state * g_t
+        kv_mem = (state * k_t).sum(axis=-2)
+        delta = (v_t - kv_mem) * beta_t
+        state = state + k_t * delta[..., None, :]
+        out[:, :, i] = (state * q_t).sum(axis=-2)
+    out = out.swapaxes(1, 2).astype(input_type)
     return out, state
 
 
@@ -147,10 +154,9 @@ class Qwen3NextAttention(nn.Module):
 
         q_proj_output = self.q_proj(x)
         queries, gate = mx.split(
-            q_proj_output.reshape(B, L, self.num_attention_heads, -1, 2), 2, axis=-1
+            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
         )
-        queries = queries.squeeze(-1)
-        gate = gate.squeeze(-1).reshape(B, L, -1)
+        gate = gate.reshape(B, L, -1)
 
         keys, values = self.k_proj(x), self.v_proj(x)
 
@@ -285,7 +291,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         ]
 
-        beta, g = mx.sigmoid(b), -mx.exp(self.A_log) * nn.softplus(a + self.dt_bias)
+        beta = mx.sigmoid(b)
+        g = -mx.exp(self.A_log) * nn.softplus(a + self.dt_bias)
 
         if self.num_v_heads > self.num_k_heads:
             f = self.num_v_heads // self.num_k_heads
