@@ -52,39 +52,37 @@ def recurrent_gated_delta_rule(
     beta: mx.array,
     initial_state: mx.array,
     use_qk_l2norm_in_kernel: bool = False,
-):
+) -> Tuple[mx.array, mx.array]:
     B, S, H, Dk = key.shape
     inv_scale = Dk**-0.5
     if use_qk_l2norm_in_kernel:
         query = inv_scale * mx.fast.rms_norm(query, None, 1e-6)
         key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
-
     input_type = query.dtype
-
     Dv = value.shape[-1]
     query = inv_scale * query
-
     out = mx.zeros((B, H, S, Dv), dtype=value.dtype)
-
     query, key, value, beta, g = [
         x.swapaxes(1, 2).astype(mx.float32) for x in (query, key, value, beta, g)
     ]
-
     state = initial_state
     g = mx.exp(g)
-
-    for i in range(S):
-        q_t = query[:, :, i][..., None]
-        k_t = key[:, :, i][..., None]
-        v_t = value[:, :, i]
-        g_t = g[:, :, i][..., None, None]
-        beta_t = beta[:, :, i][..., None]
-
+    q_splits = mx.split(query, S, axis=2)
+    k_splits = mx.split(key, S, axis=2)
+    v_splits = mx.split(value, S, axis=2)
+    g_splits = mx.split(g, S, axis=2)
+    beta_splits = mx.split(beta, S, axis=2)
+    for i, (q_t, k_t, v_t, g_t, beta_t) in enumerate(zip(q_splits, k_splits, v_splits, g_splits, beta_splits)):
+        q_t = q_t.squeeze(2)[..., None]
+        k_t = k_t.squeeze(2)[..., None]
+        v_t = v_t.squeeze(2)
+        g_t = g_t.squeeze(2)[..., None, None]
+        beta_t = beta_t.squeeze(2)[..., None]
         state = state * g_t
-        kv_mem = (state * k_t).sum(axis=-2)
+        kv_mem = mx.einsum('bhkv,bhk->bhv', state, k_t.squeeze(-1))
         delta = (v_t - kv_mem) * beta_t
-        state = state + k_t * delta[..., None, :]
-        out[:, :, i] = (state * q_t).sum(axis=-2)
+        state = state + mx.einsum('bhk,bhv->bhkv', k_t.squeeze(-1), delta)
+        out[:, :, i] = mx.einsum('bhkv,bhk->bhv', state, q_t.squeeze(-1))
     out = out.swapaxes(1, 2).astype(input_type)
     return out, state
 
@@ -238,7 +236,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
+    def fix_query_key_value_ordering(self, mixed_qkvz: mx.array, mixed_ba: mx.array) -> mx.array:
         nq, nk, nv, dv = (
             self.num_k_heads,
             self.head_k_dim,
@@ -265,7 +263,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ):
+    ) -> mx.array:
         B, S, _ = inputs.shape
         q, k, v, z, b, a = self.fix_query_key_value_ordering(
             self.in_proj_qkvz(inputs), self.in_proj_ba(inputs)
@@ -346,7 +344,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
-    ):
+    ) -> mx.array:
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
@@ -415,7 +413,7 @@ class Qwen3NextModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-    ):
+    ) -> mx.array:
         hidden_states = self.embed_tokens(inputs)
 
         if cache is None:
@@ -442,7 +440,7 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-    ):
+    ) -> mx.array:
         out = self.model(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
