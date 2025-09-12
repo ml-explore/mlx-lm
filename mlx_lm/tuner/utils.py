@@ -130,6 +130,7 @@ def linear_to_lora_layers(
         "apertus",
         "Klear",
         "lille-130m",
+        "olmo3",
     }:
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
