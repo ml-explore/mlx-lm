@@ -10,6 +10,7 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.ssm import ssm_step, ssm_step_ops
 
 
 class TestModels(unittest.TestCase):
@@ -1724,6 +1725,25 @@ class TestModels(unittest.TestCase):
                     config["vocab_size"],
                     config["num_hidden_layers"],
                 )
+
+    def test_ssm(self):
+        num_heads = 48
+        head_dim = 64
+        state_dim = 128
+
+        hidden_states = mx.random.normal(shape=(1, 1, num_heads, head_dim))
+        B = mx.random.normal(shape=(1, 1, state_dim))
+        C = mx.random.normal(shape=(1, 1, state_dim))
+        dt = mx.random.normal(shape=(1, 1, num_heads))
+        dt_bias = mx.random.normal(shape=(num_heads,))
+        A_log = mx.random.normal(shape=(num_heads,))
+        D = mx.random.normal(shape=(num_heads,))
+        state = mx.random.normal(shape=(1, num_heads, head_dim, state_dim))
+
+        out, out_state = ssm_step_ops(hidden_states, A_log, B, C, D, dt, dt_bias, state)
+        out_c, out_state_c = ssm_step(hidden_states, A_log, B, C, D, dt, dt_bias, state)
+        self.assertTrue(mx.allclose(out, out_c, atol=1e-4, rtol=1e-4))
+        self.assertTrue(mx.allclose(out_state, out_state_c, atol=1e-4, rtol=1e-4))
 
 
 if __name__ == "__main__":
