@@ -59,32 +59,20 @@ def recurrent_gated_delta_rule(
         query = inv_scale * mx.fast.rms_norm(query, None, 1e-6)
         key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
     input_type = query.dtype
-    Dv = value.shape[-1]
     query = inv_scale * query
-    out = mx.zeros((B, H, S, Dv), dtype=value.dtype)
+    out = mx.zeros((B, H, S, value.shape[-1]), dtype=value.dtype)
+    g = mx.exp(g)
     query, key, value, beta, g = [
         x.swapaxes(1, 2).astype(mx.float32) for x in (query, key, value, beta, g)
     ]
     state = initial_state
-    g = mx.exp(g)
-    q_splits = mx.split(query, S, axis=2)
-    k_splits = mx.split(key, S, axis=2)
-    v_splits = mx.split(value, S, axis=2)
-    g_splits = mx.split(g, S, axis=2)
-    beta_splits = mx.split(beta, S, axis=2)
-    for i, (q_t, k_t, v_t, g_t, beta_t) in enumerate(zip(q_splits, k_splits, v_splits, g_splits, beta_splits)):
-        q_t = q_t.squeeze(2)[..., None]
-        k_t = k_t.squeeze(2)[..., None]
-        v_t = v_t.squeeze(2)
-        g_t = g_t.squeeze(2)[..., None, None]
-        beta_t = beta_t.squeeze(2)[..., None]
-        state = state * g_t
-        kv_mem = mx.einsum('bhkv,bhk->bhv', state, k_t.squeeze(-1))
-        delta = (v_t - kv_mem) * beta_t
-        state = state + mx.einsum('bhk,bhv->bhkv', k_t.squeeze(-1), delta)
-        out[:, :, i] = mx.einsum('bhkv,bhk->bhv', state, q_t.squeeze(-1))
-    out = out.swapaxes(1, 2).astype(input_type)
-    return out, state
+    for i in range(S):
+        state *= g[:, :, i, None, None]
+        kv_mem = mx.einsum('bhkv,bhk->bhv', state, key[:, :, i])
+        delta = (value[:, :, i] - kv_mem) * beta[:, :, i, None]
+        state += mx.einsum('bhk,bhv->bhkv', key[:, :, i], delta)
+        out[:, :, i] = mx.einsum('bhkv,bhk->bhv', state, query[:, :, i])
+    return out.swapaxes(1, 2).astype(input_type), state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
