@@ -135,7 +135,7 @@ def linear_to_lora_layers(
         keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
             keys.add("block_sparse_moe.gate")
-        if model.model_type == "qwen2_moe":
+        if model.model_type in ["qwen2_moe", "qwen3_next"]:
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
         if model.model_type in ["olmoe", "qwen3_moe", "dots1", "Klear"]:
@@ -148,6 +148,15 @@ def linear_to_lora_layers(
             keys.add("feed_forward.gate_proj")
             keys.add("feed_forward.up_proj")
             keys.add("feed_forward.down_proj")
+        elif model.model_type == "qwen3_next":
+            keys.add("linear_attn.in_proj_qkvz")
+            keys.add("linear_attn.out_proj")
+            keys.add("linear_attn.in_proj_ba")
+            keys.add("linear_attn.dt_bias")
+            keys.add("self_attn.q_proj")
+            keys.add("self_attn.k_proj")
+            keys.add("self_attn.v_proj")
+            keys.add("self_attn.o_proj")
     elif model.model_type == "gpt_bigcode":
         keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
@@ -190,10 +199,6 @@ def linear_to_lora_layers(
         keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
     elif model.model_type == "bailing_moe":
         keys = {"attention.query_key_value", "attention.dense"}
-    elif model.model_type == "qwen3_next":
-        keys.add("self_attn.in_proj_qkvz")
-        keys.add("self_attn.in_proj_ba")
-        keys.add("self_attn.out_proj")
     elif model.model_type == "nemotron_h":
         keys.add("mixer.in_proj")
         keys.add("mixer.out_proj")
