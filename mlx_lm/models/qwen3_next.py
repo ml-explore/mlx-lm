@@ -205,6 +205,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        if self.num_v_heads % self.num_k_heads != 0:
+            raise ValueError(
+                f"num_v_heads ({self.num_v_heads}) must be divisible by num_k_heads ({self.num_k_heads})"
+            )
+        self.repeat_factor = self.num_v_heads // self.num_k_heads
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_norm_epsilon = config.rms_norm_eps
@@ -294,9 +299,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         beta = mx.sigmoid(b)
         g = -mx.exp(self.A_log) * nn.softplus(a + self.dt_bias)
 
-        if self.num_v_heads > self.num_k_heads:
-            f = self.num_v_heads // self.num_k_heads
-            q, k = mx.repeat(q, f, 2), mx.repeat(k, f, 2)
+        if self.repeat_factor > 1:
+            q, k = mx.repeat(q, self.repeat_factor, 2), mx.repeat(k, self.repeat_factor, 2)
 
         if cache is not None and cache[1] is not None:
             initial_state = cache[1]
