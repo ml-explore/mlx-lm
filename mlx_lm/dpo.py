@@ -74,7 +74,7 @@ CONFIG_DEFAULTS = {
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "beta": 0.1,
     "reference_model": None,
-    "reference_adapter_path": None,
+    "reference_model_adapters": None,
     "report_to": None,
     "project_name": None,
 }
@@ -195,7 +195,7 @@ def build_parser():
         help="Path to reference model (defaults to initial policy model).",
     )
     parser.add_argument(
-        "--reference-adapter-path",
+        "--reference-model-adapters",
         type=str,
         default=None,
         help="Path to adapters for the reference model.",
@@ -385,10 +385,11 @@ def load_reference_model(args):
     """
     if args.reference_model:
         print(f"Loading reference model from {args.reference_model}")
+        print(f"Reference model adapters: {args.reference_model_adapters}")
         reference_model, _ = load(
             args.reference_model,
             tokenizer_config={"trust_remote_code": True},
-            adapter_path=args.reference_adapter_path,
+            adapter_path=args.reference_model_adapters,
         )
     else:
         print("Using policy model as reference model")
