@@ -93,11 +93,6 @@ class Attention(nn.Module):
         return output
 
 
-@partial(mx.compile, shapeless=True)
-def relu2(x):
-    return mx.square(nn.relu(x))
-
-
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -116,7 +111,7 @@ class MLP(nn.Module):
         self.ffn_sub_norm = nn.RMSNorm(args.intermediate_size, eps=args.rms_norm_eps)
 
     def __call__(self, x) -> mx.array:
-        x = relu2(self.gate_proj(x)) * self.up_proj(x)
+        x = nn.relu2(self.gate_proj(x)) * self.up_proj(x)
         x = self.ffn_sub_norm(x)
         x = self.down_proj(x)
         return x
