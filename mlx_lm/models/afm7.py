@@ -350,17 +350,15 @@ class AFMModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embedding(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
             cache[-1] = ConcatenateKVCache()
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -382,10 +380,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         out = self.model.embedding.as_linear(out)
         return out
 

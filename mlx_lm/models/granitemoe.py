@@ -166,16 +166,14 @@ class GraniteMoEModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs) * self.embedding_multiplier
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -196,10 +194,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -220,8 +217,18 @@ class Model(nn.Module):
             weights[key.replace("output_linear", "switch_mlp.down_proj")] = weights.pop(
                 key
             )
-
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
         return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("block_sparse_moe.router.layer"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     @property
     def layers(self):

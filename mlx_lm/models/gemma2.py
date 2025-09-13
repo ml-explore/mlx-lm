@@ -165,17 +165,15 @@ class GemmaModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
         h = h * (self.args.hidden_size**0.5)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache, return_array=True)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -194,10 +192,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         out = self.model.embed_tokens.as_linear(out)
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping

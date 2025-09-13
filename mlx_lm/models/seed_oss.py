@@ -136,16 +136,14 @@ class SeedModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -156,6 +154,8 @@ class SeedModel(nn.Module):
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.args = args
+        self.model_type = args.model_type
         self.model = SeedModel(args)
         self.tie_word_embeddings = args.tie_word_embeddings
         if not args.tie_word_embeddings:
@@ -164,10 +164,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        h = self.model(inputs, mask=mask, cache=cache)
+        h = self.model(inputs, cache=cache)
         if self.tie_word_embeddings:
             return h @ self.model.embed_tokens.weight.T
         else:

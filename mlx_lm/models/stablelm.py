@@ -174,10 +174,12 @@ class StableLM(nn.Module):
         self.layers = [DecoderLayer(config) for i in range(config.num_hidden_layers)]
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def __call__(self, x, mask, cache):
+    def __call__(self, x, cache):
         x = self.embed_tokens(x)
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(x, cache[0])
 
         for layer, c in zip(self.layers, cache):
             x = layer(x, mask, cache=c)
@@ -196,14 +198,9 @@ class Model(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: mx.array = None,
         cache=None,
     ) -> mx.array:
-
-        if mask is None:
-            mask = create_attention_mask(x, cache)
-
-        y = self.model(x, mask, cache)
+        y = self.model(x, cache)
         return self.lm_head(y)
 
     @property

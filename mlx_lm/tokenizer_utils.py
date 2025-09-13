@@ -203,7 +203,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token):
         self.tokens.append(token)
-        v = self.tokenmap[token]
+        v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
         self._unflushed += v
         text = self._decode_bytes(self._unflushed)
 
@@ -262,7 +262,7 @@ class TokenizerWrapper:
         self, tokenizer, detokenizer_class=NaiveStreamingDetokenizer, eos_token_ids=None
     ):
         self._tokenizer = tokenizer
-        self._detokenizer = detokenizer_class(tokenizer)
+        self._detokenizer_class = detokenizer_class
         self._eos_token_ids = (
             set(eos_token_ids)
             if eos_token_ids is not None
@@ -324,6 +324,13 @@ class TokenizerWrapper:
     @property
     def tool_call_end(self):
         return self._tool_call_end
+
+    @property
+    def detokenizer(self):
+        """
+        Get a stateful streaming detokenizer.
+        """
+        return self._detokenizer_class(self)
 
     def __getattr__(self, attr):
         if attr == "detokenizer":

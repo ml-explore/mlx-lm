@@ -120,14 +120,12 @@ class QwenModel(nn.Module):
         self.h = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
         self.ln_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
 
-    def __call__(self, inputs, mask=None, cache=None):
+    def __call__(self, inputs, cache=None):
         x = self.wte(inputs)
-
-        if mask is None:
-            mask = create_attention_mask(x, cache)
 
         if cache is None:
             cache = [None] * len(self.h)
+        mask = create_attention_mask(x, cache[0])
 
         for layer, c in zip(self.h, cache):
             x = layer(x, mask, c)
@@ -148,10 +146,9 @@ class Model(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: mx.array = None,
         cache=None,
     ) -> mx.array:
-        y = self.transformer(x, mask, cache)
+        y = self.transformer(x, cache)
         return self.lm_head(y)
 
     @property
