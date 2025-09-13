@@ -79,7 +79,6 @@ def recurrent_gated_delta_rule(
 
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
-
     out = mx.zeros((B, S, Hv, Dv), dtype=input_type)
     for i in range(S):
         state *= g[:, i, :, None, None]
