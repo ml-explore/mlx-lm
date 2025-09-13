@@ -8,7 +8,7 @@ def compute_dt(dt, dt_bias, time_step_limit):
     return mx.clip(dt, time_step_limit[0], time_step_limit[1])
 
 
-def ssm_step_ops(
+def ssm_update_ops(
     hidden_states: mx.array,
     A_log: mx.array,
     B: mx.array,
@@ -20,14 +20,13 @@ def ssm_step_ops(
     time_step_limit=(0.001, 100.0),
 ) -> mx.array:
     batch_size, seq_len, num_heads, head_dim = hidden_states.shape
-    state_size = B.shape[-1]
+    n_group, state_size = B.shape[-2:]
     dt = compute_dt(dt, dt_bias, time_step_limit)
     A = -mx.exp(A_log.astype(mx.float32)).astype(hidden_states.dtype)
-    B = B.reshape(batch_size, seq_len, 1, state_size)
-    C = C.reshape(batch_size, seq_len, 1, state_size)
-    C = mx.repeat(C, num_heads, axis=2)
+    n_repeats = num_heads // n_group
+    C = mx.repeat(C, n_repeats, axis=2)
     dA = mx.exp(dt * A)
-    dB = dt[..., None] * mx.repeat(B, num_heads, axis=2)
+    dB = dt[..., None] * mx.repeat(B, n_repeats, axis=2)
     dB_h = dB[..., None, :] * hidden_states[..., None]
     hs = []
     for t in range(seq_len):
@@ -44,15 +43,18 @@ def make_ssm_kernel():
     source = """
         auto n = thread_position_in_grid.z;
         auto h_idx = n % H;
-        auto b_idx = n / H;
+        auto g_idx = n / G;
         constexpr int n_per_t = Ds / 32;
 
         auto x = X + n * Dh;
         out += n * Dh;
         auto i_state = state_in + n * Dh * Ds;
         auto o_state = state_out + n * Dh * Ds;
-        auto C_ = C + b_idx * Ds;
-        auto B_ = B + b_idx * Ds;
+
+        // C and B have shape [batch, group, state_dim]
+        // C and B need to be offset by group size
+        auto C_ = C + g_idx * Ds;
+        auto B_ = B + g_idx * Ds;
 
         auto ds_idx = thread_position_in_threadgroup.x;
         auto d_idx = thread_position_in_grid.y;
@@ -88,7 +90,7 @@ def make_ssm_kernel():
 _ssm_kernel = make_ssm_kernel()
 
 
-def ssm_step(
+def ssm_update_kernel(
     hidden_states: mx.array,
     A_log: mx.array,
     B: mx.array,
@@ -99,28 +101,44 @@ def ssm_step(
     state: mx.array,
     time_step_limit=(0.001, 100.0),
 ):
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return ssm_step_ops(
-            hidden_states,
-            A_log,
-            B,
-            C,
-            D,
-            dt,
-            dt_bias,
-            state,
-            time_step_limit,
-        )
-
-    input_type = hidden_states.dtype
     n, _, h, d = hidden_states.shape
-    ds = B.shape[-1]
+    input_type = hidden_states.dtype
+    hb, ds = B.shape[-2:]
     dt = compute_dt(dt, dt_bias, time_step_limit)
     return _ssm_kernel(
         inputs=[hidden_states, A_log, B, C, D, dt, state],
-        template=[("T", input_type), ("Dh", d), ("Ds", ds), ("H", h)],
+        template=[("T", input_type), ("Dh", d), ("Ds", ds), ("H", h), ("G", h // hb)],
         grid=(32, d, h * n),
         threadgroup=(32, 8, 1),
         output_shapes=[(n, 1, h, d), state.shape],
         output_dtypes=[input_type, input_type],
+    )
+
+
+def ssm_update(
+    hidden_states: mx.array,
+    A_log: mx.array,
+    B: mx.array,
+    C: mx.array,
+    D: mx.array,
+    dt: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    time_step_limit=(0.001, 100.0),
+):
+    seq_len = hidden_states.shape[1]
+    if seq_len > 1 or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        fn = ssm_update_ops
+    else:
+        fn = ssm_update_kernel
+    return fn(
+        hidden_states,
+        A_log,
+        B,
+        C,
+        D,
+        dt,
+        dt_bias,
+        state,
+        time_step_limit,
     )

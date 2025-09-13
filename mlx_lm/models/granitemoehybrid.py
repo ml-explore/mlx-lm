@@ -9,7 +9,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, MambaCache
 from .rope_utils import initialize_rope
-from .ssm import ssm_step, ssm_step_ops
+from .ssm import ssm_update
 from .switch_layers import SwitchGLU
 
 
@@ -137,6 +137,8 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
+        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
 
         if cache is not None and cache[1] is not None:
             state = cache[1]
@@ -146,8 +148,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
                 hidden_states.dtype,
             )
 
-        ssm_fn = ssm_step if seq_len == 1 else ssm_step_ops
-        y, state = ssm_fn(
+        y, state = ssm_update(
             hidden_states,
             self.A_log,
             B,
