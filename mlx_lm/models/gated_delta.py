@@ -63,18 +63,75 @@ def _make_gated_delta_kernel_step():
 
 
 def _make_gated_delta_kernel_prefill():
-    # TODO: Implement Metal kernel for prompt prefill loop over T tokens.
-    # The kernel should iterate time inside the kernel to avoid O(T) launches
-    # and retain only O(1) state.
-    # Pseudocode per (b,h,dv):
-    #   for t in 0..T-1:
-    #     decay state by g[b,h,t]
-    #     kv_mem = sum_d state[d,:] * K[b,h,t,d]
-    #     delta = (V[b,h,t,dv] - kv_mem[dv]) * beta[b,h,t]
-    #     state[:,dv] += K[b,h,t,:] * delta
-    #     Y[b,h,t,dv] = sum_d state[d,dv] * Q[b,h,t,d]
-    # return mx.fast.metal_kernel(name="gated_delta_prefill", ...)
-    return None
+    if not mx.metal.is_available():
+        return None
+    source = """
+        // Grid: (x=32 lanes over Dk, y=Dv, z=B*H)
+        // Iterate time inside to avoid O(T) kernel launches.
+
+        auto n = thread_position_in_grid.z;  // packs (b,h)
+        auto ds_lane = thread_position_in_threadgroup.x; // 0..31 over Dk
+        auto dv_idx = thread_position_in_grid.y;          // 0..Dv-1
+        auto simd_idx = thread_index_in_simdgroup;
+
+        // Shapes:
+        //   Q,K:   [B,H,Tt,Dk]
+        //   V,Y:   [B,H,Tt,Dv]
+        //   G,BETA:[B,H,Tt]
+        //   state: [B,H,Dk,Dv]
+        auto Q_ = Q + n * Tt * Dk;
+        auto K_ = K + n * Tt * Dk;
+        auto V_ = V + n * Tt * Dv;
+        auto Y_ = Y + n * Tt * Dv;
+        auto G_ = G + n * Tt;
+        auto BETA_ = BETA + n * Tt;
+        auto i_state = state_in + n * Dk * Dv;
+        auto o_state = state_out + n * Dk * Dv;
+
+        for (int t = 0; t < Tt; ++t) {
+            float g_val = static_cast<float>(G_[t]);
+            float beta_val = static_cast<float>(BETA_[t]);
+
+            // First pass: kv_acc using decayed state
+            float kv_acc = 0.0f;
+            for (int s = ds_lane; s < Dk; s += 32) {
+                int idx = s * Dv + dv_idx;
+                // For t==0 read from input state; afterwards read updated output state
+                float st_prev = static_cast<float>((t == 0) ? i_state[idx] : o_state[idx]);
+                float st = g_val * st_prev;
+                float k_val = static_cast<float>(K_[t * Dk + s]);
+                kv_acc += st * k_val;
+            }
+            kv_acc = simd_sum(kv_acc);
+            float delta = (static_cast<float>(V_[t * Dv + dv_idx]) - kv_acc) * beta_val;
+
+            // Second pass: update state and accumulate y
+            float y_acc = 0.0f;
+            for (int s = ds_lane; s < Dk; s += 32) {
+                int idx = s * Dv + dv_idx;
+                float st_prev = static_cast<float>((t == 0) ? i_state[idx] : o_state[idx]);
+                float st = g_val * st_prev;
+                float k_val = static_cast<float>(K_[t * Dk + s]);
+                st = st + k_val * delta;
+                o_state[idx] = static_cast<T>(st);
+                float q_val = static_cast<float>(Q_[t * Dk + s]);
+                y_acc += st * q_val;
+            }
+            y_acc = simd_sum(y_acc);
+            if (simd_idx == 0) {
+                Y_[t * Dv + dv_idx] = static_cast<T>(y_acc);
+            }
+
+            // No barrier needed: same threads read/write their own (b,h,dv) slice across t
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="gated_delta_prefill",
+        input_names=["Q", "K", "V", "G", "BETA", "state_in"],
+        output_names=["Y", "state_out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
 
 
 _kernel_step = _make_gated_delta_kernel_step()
@@ -194,20 +251,42 @@ def gated_delta_prefill(
     Dispatch to Metal kernel if available and enabled; otherwise use the ops-based reference path.
     See gated_delta_prefill_ops for shapes.
     """
-    if _use_kernel() and _kernel_step is not None:
-        # Use the step kernel in a host-side loop to preserve O(1) state.
+    if _use_kernel():
         input_type = Q.dtype
         B, H, T, Dk = Q.shape
         Dv = V.shape[-1]
         if state is None:
             state = mx.zeros((B, H, Dk, Dv), dtype=input_type)
-        ys = []
-        for t in range(T):
-            y, state = gated_delta_step(
-                Q[..., t, :], K[..., t, :], V[..., t, :], G[..., t], BETA[..., t], state
+
+        if _kernel_prefill is not None:
+            return _kernel_prefill(
+                inputs=[Q, K, V, G, BETA, state],
+                template=[
+                    ("T", input_type),
+                    ("Dk", Dk),
+                    ("Dv", Dv),
+                    ("H", H),
+                    ("Tt", T),
+                ],
+                grid=(32, Dv, B * H),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(B, H, T, Dv), state.shape],
+                output_dtypes=[input_type, input_type],
             )
-            ys.append(y)
-        Y = mx.stack(ys, axis=2)
-        return Y, state
+        elif _kernel_step is not None:
+            # Use the step kernel in a host-side loop to preserve O(1) state.
+            ys = []
+            for t in range(T):
+                y, state = gated_delta_step(
+                    Q[..., t, :],
+                    K[..., t, :],
+                    V[..., t, :],
+                    G[..., t],
+                    BETA[..., t],
+                    state,
+                )
+                ys.append(y)
+            Y = mx.stack(ys, axis=2)
+            return Y, state
     else:
         return gated_delta_prefill_ops(Q, K, V, G, BETA, state)
