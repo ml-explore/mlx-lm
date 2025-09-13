@@ -25,8 +25,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
     mlp_bias: bool = False
     rope_theta: float = 10000
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_traditional: bool = True
     tie_word_embeddings: bool = True
 
     def __post_init__(self):
@@ -34,7 +33,7 @@ class ModelArgs(BaseModelArgs):
             self.num_key_value_heads = self.num_attention_heads
 
 
-class Attention(nn.Module):
+class GLMAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.hidden_size = args.hidden_size
@@ -43,17 +42,27 @@ class Attention(nn.Module):
         self.head_dim = args.head_dim or args.hidden_size // self.num_attention_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=args.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias)
-        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            self.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_attention_heads * self.head_dim, self.hidden_size, bias=False
+        )
 
-        self.rope = initialize_rope(
-            self.head_dim,
-            args.rope_theta,
-            args.rope_traditional,
-            args.rope_scaling,
-            args.max_position_embeddings,
+        self.rope = nn.RoPE(
+            dims=self.head_dim, traditional=args.rope_traditional, base=args.rope_theta
         )
 
     def __call__(
@@ -66,9 +75,13 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(
+            0, 2, 1, 3
+        )
         keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -86,10 +99,12 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
+class GLMMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_up_proj = nn.Linear(args.hidden_size, 2 * args.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(
+            args.hidden_size, 2 * args.intermediate_size, bias=False
+        )
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
     def __call__(self, x) -> mx.array:
@@ -98,11 +113,11 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(gate) * x)
 
 
-class TransformerBlock(nn.Module):
+class GLMBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args)
+        self.self_attn = GLMAttention(args)
+        self.mlp = GLMMLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
@@ -121,13 +136,11 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class LlamaModel(nn.Module):
+class GLMModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
-        ]
+        self.layers = [GLMBlock(args=args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
@@ -143,7 +156,7 @@ class LlamaModel(nn.Module):
         mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask=mask, cache=c)
+            h = layer(h, mask, c)
 
         return self.norm(h)
 
@@ -153,7 +166,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = LlamaModel(args)
+        self.model = GLMModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
