@@ -132,21 +132,29 @@ class TestModels(unittest.TestCase):
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
 
-    def test_causal_mask_lengths(self):
-        mx.random.seed(8)
-        B, N_q, T_q, N_kv, T_kv, D = (4, 8, 3, 2, 3, 2)
-        lengths = mx.array([1, 2, 3, 1])
-        q = mx.random.uniform(shape=(B, N_q, T_q, D))
-        k = mx.random.uniform(shape=(B, N_kv, T_kv, D))
-        v = k
-        mask = create_causal_mask(T_q, 0, lengths=lengths)
+    def test_causal_mask_padding(self):
+        right_padding = mx.array([2, 1, 0])
+        mask = create_causal_mask(3, right_padding=right_padding)
 
-        out1 = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
-        q[1, :, 2:] = mx.ones_like(q[1, :, 2:])
-        k[1, :, 2:] = mx.ones_like(k[1, :, 2:])
-        v[1, :, 2:] = mx.ones_like(v[1, :, 2:])
-        out2 = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
-        self.assertTrue(mx.allclose(out1[1, :, :2], out2[1, :, :2]))
+        causal_mask = create_causal_mask(3)
+        self.assertTrue(
+            mx.array_equal(mask[0, 0], causal_mask & mx.array([True, False, False]))
+        )
+        self.assertTrue(
+            mx.array_equal(mask[1, 0], causal_mask & mx.array([True, True, False]))
+        )
+        self.assertTrue(mx.array_equal(mask[2, 0], causal_mask))
+
+        left_padding = mx.array([2, 1, 0])
+        mask = create_causal_mask(3, left_padding=left_padding)
+
+        self.assertTrue(
+            mx.array_equal(mask[0, 0], causal_mask & mx.array([False, False, True]))
+        )
+        self.assertTrue(
+            mx.array_equal(mask[1, 0], causal_mask & mx.array([False, True, True]))
+        )
+        self.assertTrue(mx.array_equal(mask[2, 0], causal_mask))
 
     def test_mask_with_window(self):
         mask = create_causal_mask(5, 0, window_size=3)
