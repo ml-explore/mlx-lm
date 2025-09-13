@@ -305,23 +305,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 dtype=inputs.dtype,
             )
 
-<<<<<<< HEAD
-        out, state = recurrent_gated_delta_rule(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            use_qk_l2norm_in_kernel=True,
-=======
         use_delta_kernel = os.getenv("MLXLM_DELTA_KERNEL", "0").lower() in (
             "1",
             "true",
             "yes",
->>>>>>> 545fea0 (feat(kernel): gated-delta kernel scaffolding with CPU fallbacks and tests; integrate in Qwen3Next behind flag)
         )
 
         if use_delta_kernel:
