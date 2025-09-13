@@ -1727,23 +1727,28 @@ class TestModels(unittest.TestCase):
                 )
 
     def test_ssm(self):
-        num_heads = 48
-        head_dim = 64
-        state_dim = 128
+        for batch_size in [1, 2]:
+            num_heads = 48
+            head_dim = 64
+            state_dim = 128
 
-        hidden_states = mx.random.normal(shape=(1, 1, num_heads, head_dim))
-        B = mx.random.normal(shape=(1, 1, state_dim))
-        C = mx.random.normal(shape=(1, 1, state_dim))
-        dt = mx.random.normal(shape=(1, 1, num_heads))
-        dt_bias = mx.random.normal(shape=(num_heads,))
-        A_log = mx.random.normal(shape=(num_heads,))
-        D = mx.random.normal(shape=(num_heads,))
-        state = mx.random.normal(shape=(1, num_heads, head_dim, state_dim))
+            hidden_states = mx.random.normal(shape=(batch_size, 1, num_heads, head_dim))
+            B = mx.random.normal(shape=(batch_size, 1, state_dim))
+            C = mx.random.normal(shape=(batch_size, 1, state_dim))
+            dt = mx.random.normal(shape=(batch_size, 1, num_heads))
+            dt_bias = mx.random.normal(shape=(num_heads,))
+            A_log = mx.random.normal(shape=(num_heads,))
+            D = mx.random.normal(shape=(num_heads,))
+            state = mx.random.normal(shape=(batch_size, num_heads, head_dim, state_dim))
 
-        out, out_state = ssm_step_ops(hidden_states, A_log, B, C, D, dt, dt_bias, state)
-        out_c, out_state_c = ssm_step(hidden_states, A_log, B, C, D, dt, dt_bias, state)
-        self.assertTrue(mx.allclose(out, out_c, atol=1e-4, rtol=1e-4))
-        self.assertTrue(mx.allclose(out_state, out_state_c, atol=1e-4, rtol=1e-4))
+            out, out_state = ssm_step_ops(
+                hidden_states, A_log, B, C, D, dt, dt_bias, state
+            )
+            out_c, out_state_c = ssm_step(
+                hidden_states, A_log, B, C, D, dt, dt_bias, state
+            )
+            self.assertTrue(mx.allclose(out, out_c, atol=1e-4, rtol=1e-4))
+            self.assertTrue(mx.allclose(out_state, out_state_c, atol=1e-4, rtol=1e-4))
 
 
 if __name__ == "__main__":

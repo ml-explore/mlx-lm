@@ -138,9 +138,9 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             batch_size, seq_len, self.num_heads, self.head_dim
         )
 
-        if cache is not None:
+        if cache is not None and cache[1] is not None:
             state = cache[1]
-        if state is None:
+        else:
             state = mx.zeros(
                 (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
                 hidden_states.dtype,

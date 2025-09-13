@@ -39,21 +39,26 @@ def ssm_step_ops(
 
 
 def make_ssm_kernel():
-    source = f"""
-        // TODO this needs a fix for batching
+    if not mx.metal.is_available():
+        return None
+    source = """
         auto n = thread_position_in_grid.z;
+        auto h_idx = n % H;
+        auto b_idx = n / H;
         constexpr int n_per_t = Ds / 32;
 
         auto x = X + n * Dh;
         out += n * Dh;
         auto i_state = state_in + n * Dh * Ds;
         auto o_state = state_out + n * Dh * Ds;
+        auto C_ = C + b_idx * Ds;
+        auto B_ = B + b_idx * Ds;
 
         auto ds_idx = thread_position_in_threadgroup.x;
         auto d_idx = thread_position_in_grid.y;
 
         auto dt_ = static_cast<float>(dt[n]);
-        auto A = -fast::exp(static_cast<float>(A_log[n]));
+        auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
         auto dA = fast::exp(A * dt_);
 
         float acc = 0.0;
@@ -62,14 +67,14 @@ def make_ssm_kernel():
         for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * ds_idx + i;
             auto idx = d_idx * Ds + s_idx;
-            auto dB_by_x = x_ * dt_ * static_cast<float>(B[s_idx]);
+            auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
             auto state = dA * i_state[idx] + dB_by_x;
             o_state[idx] = static_cast<T>(state);
-            acc += state * C[s_idx];
+            acc += state * C_[s_idx];
         }}
         acc = simd_sum(acc);
         if (thread_index_in_simdgroup == 0) {{
-            out[d_idx] = static_cast<T>(acc + x_ * D[n]);
+            out[d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
         }}
     """
     return mx.fast.metal_kernel(
@@ -94,6 +99,19 @@ def ssm_step(
     state: mx.array,
     time_step_limit=(0.001, 100.0),
 ):
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return ssm_step_ops(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            time_step_limit,
+        )
+
     input_type = hidden_states.dtype
     n, _, h, d = hidden_states.shape
     ds = B.shape[-1]
