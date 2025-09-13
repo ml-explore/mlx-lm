@@ -66,6 +66,7 @@ def recurrent_gated_delta_rule(
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     inv_scale = Dk**-0.5
+
     if use_qk_l2norm_in_kernel:
         query = (inv_scale**2) * mx.fast.rms_norm(query, None, 1e-6)
         key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
@@ -79,14 +80,14 @@ def recurrent_gated_delta_rule(
 
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
-    outs = []
+
+    out = mx.zeros((B, S, Hv, Dv), dtype=input_type)
     for i in range(S):
+        state *= g[:, i, :, None, None]
         kv_mem = (state * key[:, i, :, :, None]).sum(axis=-2)
         delta = (value[:, i] - kv_mem) * beta[:, i, :, None]
         state += key[:, i, :, :, None] * delta[..., None, :]
-        out = (state * query[:, i, :, :, None]).sum(axis=-2)
-        outs.append(out)
-    out = mx.stack(outs, axis=1).astype(input_type)
+        out[:, i] = (state * query[:, i, :, :, None]).sum(axis=-2)
     return out, state
 
 
@@ -304,7 +305,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 dtype=inputs.dtype,
             )
 
-        out, new_state = recurrent_gated_delta_rule(
+        out, state = recurrent_gated_delta_rule(
             q,
             k,
             v,
