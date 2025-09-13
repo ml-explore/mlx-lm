@@ -176,6 +176,7 @@ def initialize_rope(
         return YarnRoPE(
             dims=dims,
             max_position_embeddings=max_position_embeddings,
+            scaling_factor=scaling_factor,
             traditional=traditional,
             base=base,
             **rope_kwargs,

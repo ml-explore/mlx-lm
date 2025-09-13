@@ -113,6 +113,7 @@ def convert(
 
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+    print("[INFO] Model path:", model_path)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     if isinstance(quant_predicate, str):
