@@ -78,17 +78,9 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        print(f"[DEBUG] queries: {queries.shape}, {type(queries)}")
-        print(f"[DEBUG] keys: {keys.shape}, {type(keys)}")
-        print(f"[DEBUG] values: {values.shape}, {type(values)}")
-        print(f"[DEBUG] mask: {mask}, type: {type(mask)}")
-        print(f"[DEBUG] cache type: {type(cache)}")
-
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
-
-        print(f"[DEBUG] attn output: {output.shape}")
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -151,7 +143,7 @@ class LlamaModel(nn.Module):
         mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, cache=c)
+            h = layer(h, mask=mask, cache=c)
 
         return self.norm(h)
 
