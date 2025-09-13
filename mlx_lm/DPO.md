@@ -63,6 +63,28 @@ mlx_lm.dpo \
     --data <preference_data>
 ```
 
+### Using Finetuned Adapters as Reference Model (`--reference-adapter-path`)
+You can use previously finetuned LoRA adapters as the reference model for DPO training. This allows you to chain multiple fine-tuning stages:
+
+```shell
+# Use a finetuned adapter as reference model
+mlx_lm.dpo \
+    --model mlx-community/Meta-Llama-3-8B-Instruct-4bit \
+    --reference-model mlx-community/Meta-Llama-3-8B-Instruct-4bit \
+    --reference-adapter-path /path/to/previous/adapters \
+    --train \
+    --data <preference_data>
+```
+
+**Use cases:**
+- **Multi-stage fine-tuning**: First fine-tune with LoRA, then use that as reference for DPO
+- **Domain adaptation + preference alignment**: Use domain-adapted model as reference
+- **Iterative improvement**: Use previous DPO results as reference for further optimization
+
+**Requirements:**
+- Adapter directory must contain `adapter_config.json` and `adapters.safetensors`
+- Base model specified in `--reference-model` should match the original model used for the adapters
+
 ### Fine-Tuning Types (`--fine-tune-type`)
 Choose how much of the model to update:
 
@@ -120,7 +142,7 @@ fine_tune_type: "lora"
 ### Memory-Optimized Config
 ```yaml
 model: "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
-train: true  
+train: true
 data: "preference_data/"
 beta: 0.1
 batch_size: 1
@@ -129,6 +151,20 @@ learning_rate: 1e-6
 max_seq_length: 512
 num_layers: 4
 grad_checkpoint: true
+```
+
+### Multi-Stage Fine-Tuning Config
+```yaml
+model: "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
+reference_model: "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
+reference_adapter_path: "models/checkpoints/lora_adapters"
+train: true
+data: "preference_data/"
+beta: 0.1
+batch_size: 4
+iters: 1000
+learning_rate: 1e-6
+fine_tune_type: "lora"
 ```
 
 ## DPO vs RLHF
