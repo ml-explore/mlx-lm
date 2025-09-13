@@ -130,7 +130,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache] = None,
+        state: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -139,14 +139,6 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         )
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
-
-        if cache is not None and cache[1] is not None:
-            state = cache[1]
-        else:
-            state = mx.zeros(
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
-                hidden_states.dtype,
-            )
 
         y, state = ssm_update(
             hidden_states,
@@ -160,9 +152,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             self.time_step_limit,
         )
 
-        if cache is not None:
-            cache[1] = state
-        return y.reshape(batch_size, seq_len, self.intermediate_size)
+        return y.reshape(batch_size, seq_len, self.intermediate_size), state
 
     def __call__(
         self,
@@ -188,7 +178,10 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             ],
             axis=-1,
         )
-        y = self._ssm(hidden_states_ssm, B, C, dt, cache)
+        state = cache[1] if cache else None
+        y, state = self._ssm(hidden_states_ssm, B, C, dt, state)
+        if cache:
+            cache[1] = state
         y = self.norm(y, gate)
         return self.out_proj(y)
 

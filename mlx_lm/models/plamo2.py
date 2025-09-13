@@ -125,12 +125,6 @@ class Mamba(nn.Module):
         B = B.reshape(batch_size, seq_len, 1, self.d_state)
         C = C.reshape(batch_size, seq_len, 1, self.d_state)
 
-        if state is None:
-            state = mx.zeros(
-                (batch_size, self.num_heads, self.hidden_size_per_head, self.d_state),
-                dtype=x.dtype,
-            )
-
         y, state = ssm_update(
             x,
             self.A_log,

@@ -1,3 +1,5 @@
+from typing import Optional, Tuple
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -6,35 +8,6 @@ import mlx.nn as nn
 def compute_dt(dt, dt_bias, time_step_limit):
     dt = nn.softplus(dt + dt_bias)
     return mx.clip(dt, time_step_limit[0], time_step_limit[1])
-
-
-def ssm_update_ops(
-    hidden_states: mx.array,
-    A_log: mx.array,
-    B: mx.array,
-    C: mx.array,
-    D: mx.array,
-    dt: mx.array,
-    dt_bias: mx.array,
-    state: mx.array,
-    time_step_limit=(0.001, 100.0),
-) -> mx.array:
-    batch_size, seq_len, num_heads, head_dim = hidden_states.shape
-    n_group, state_size = B.shape[-2:]
-    dt = compute_dt(dt, dt_bias, time_step_limit)
-    A = -mx.exp(A_log.astype(mx.float32)).astype(hidden_states.dtype)
-    n_repeats = num_heads // n_group
-    C = mx.repeat(C, n_repeats, axis=2)
-    dA = mx.exp(dt * A)
-    dB = dt[..., None] * mx.repeat(B, n_repeats, axis=2)
-    dB_h = dB[..., None, :] * hidden_states[..., None]
-    hs = []
-    for t in range(seq_len):
-        state = dA[:, t, :, None, None] * state + dB_h[:, t]
-        hs.append(state)
-    Dh = D[:, None] * hidden_states
-    y = (mx.stack(hs, axis=1) @ C[..., None]).squeeze(-1) + Dh
-    return y, state
 
 
 def make_ssm_kernel():
@@ -99,7 +72,7 @@ def ssm_update_kernel(
     dt: mx.array,
     dt_bias: mx.array,
     state: mx.array,
-    time_step_limit=(0.001, 100.0),
+    time_step_limit: Tuple[float, float],
 ):
     n, _, h, d = hidden_states.shape
     input_type = hidden_states.dtype
@@ -115,6 +88,82 @@ def ssm_update_kernel(
     )
 
 
+def segsum(x):
+    l = x.shape[-1]
+    x = mx.repeat(x[..., None], l, axis=-1)
+    x = mx.tril(x, -1)
+    x_segsum = mx.cumsum(x, axis=-2)
+    return x_segsum
+
+
+def ssm_attn(
+    x: mx.array,
+    A_log: mx.array,
+    B: mx.array,
+    C: mx.array,
+    D: mx.array,
+    dt: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array] = None,
+    time_step_limit: Tuple[float, float] = (0.001, 100.0),
+) -> Tuple[mx.array, mx.array]:
+    """SSD-SSM forward pass.
+
+    Args:
+        x: Input of shape (batch_size, seq_len, num_heads, head_dim).
+        dt: Time deltas of shape (seq_len, num_heads,).
+        A_log: State transition of shape (num_heads,).
+        B: Input mixing of shape (batch_size, seq_len, num_groups, n).
+        C: Output mixing of shape (batch_size, seq_len, num_groups, n).
+        D: Residual connection.
+        dt_bias: Bias for time deltas of shape (num_heads,).
+        time_step_limit: Minimum and maximum value for time deltas.
+
+    Code modified from
+    https://github.com/cartesia-ai/edge/blob/main/cartesia-mlx/cartesia_mlx/layers/ssd/ops.py
+
+    """
+    b, l, h, dh = x.shape
+    _, _, g, d = B.shape
+
+    dt = compute_dt(dt, dt_bias, time_step_limit)
+    repeats = h // g
+    A = -mx.exp(A_log)
+    B = mx.transpose(B, (0, 2, 3, 1))
+
+    # A * s + B * C
+    CB = mx.swapaxes(C, 1, 2) @ B
+    CB = mx.repeat(CB, repeats, axis=1)
+
+    dtA = dt * A.reshape(1, 1, -1)
+
+    decay = mx.exp(segsum(dtA.swapaxes(1, 2)))
+
+    surrogate_attention_matrix = mx.tril(CB * decay, 0)
+
+    dtx = dt.reshape(b, l, h, 1) * x
+    y = surrogate_attention_matrix @ dtx.swapaxes(1, 2)
+    y = mx.swapaxes(y, 1, 2)
+
+    decay = decay[:, :, -1:, :].transpose(0, 3, 1, 2)
+    B = mx.repeat(B, h // g, axis=1).swapaxes(2, 3)
+    dtxdecay = dtx * decay
+    dtxdecay = dtxdecay.swapaxes(1, 2).swapaxes(2, 3)
+
+    next_state = dtxdecay @ B
+
+    if state is not None:
+        exp_dtA_cumsum = mx.exp(mx.cumsum(dtA, axis=-2))
+        next_state += exp_dtA_cumsum[:, -1, :, None, None] * state
+        state = state.reshape((b, 1, g, repeats, dh, d))
+        C = C.reshape(b, l, g, 1, d, 1)
+        y_prev = (state @ C).squeeze(-1).flatten(2, 3)
+        y += exp_dtA_cumsum[..., None] * y_prev
+
+    y += x * D.reshape(1, 1, h, 1)
+    return y, next_state
+
+
 def ssm_update(
     hidden_states: mx.array,
     A_log: mx.array,
@@ -123,12 +172,17 @@ def ssm_update(
     D: mx.array,
     dt: mx.array,
     dt_bias: mx.array,
-    state: mx.array,
-    time_step_limit=(0.001, 100.0),
+    state: Optional[mx.array] = None,
+    time_step_limit: Tuple[float, float] = (0.001, 100.0),
 ):
     seq_len = hidden_states.shape[1]
-    if seq_len > 1 or mx.default_device() != mx.gpu or not mx.metal.is_available():
-        fn = ssm_update_ops
+    if (
+        seq_len > 1
+        or state is None
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+    ):
+        fn = ssm_attn
     else:
         fn = ssm_update_kernel
     return fn(

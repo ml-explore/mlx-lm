@@ -10,7 +10,7 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
-from mlx_lm.models.ssm import ssm_update, ssm_update_ops
+from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
@@ -1746,7 +1746,7 @@ class TestModels(unittest.TestCase):
                     shape=(batch_size, num_heads, head_dim, state_dim)
                 )
 
-                out, out_state = ssm_update_ops(
+                out, out_state = ssm_attn(
                     hidden_states, A_log, B, C, D, dt, dt_bias, state
                 )
                 out_c, out_state_c = ssm_update(
