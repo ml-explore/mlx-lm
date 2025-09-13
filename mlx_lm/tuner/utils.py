@@ -116,6 +116,7 @@ def linear_to_lora_layers(
         "olmoe",
         "internlm3",
         "glm4",
+        "glm",
         "mimo",
         "ernie4_5",
         "dots1",
