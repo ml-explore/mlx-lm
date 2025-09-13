@@ -10,6 +10,7 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.ssm import ssm_step, ssm_step_ops
 
 
 class TestModels(unittest.TestCase):
@@ -1683,6 +1684,34 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 1000,
                 "layer_norm_eps": 1e-5,
             },
+            {
+                "model_type": "granitemoehybrid",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "attention_bias": False,
+                "embedding_multiplier": 1.0,
+                "attention_multiplier": 1.0,
+                "logits_scaling": 1.0,
+                "residual_multiplier": 1.0,
+                "num_local_experts": 8,
+                "num_experts_per_tok": 2,
+                "shared_intermediate_size": 128,
+                "mamba_n_heads": 8,
+                "mamba_d_head": 16,
+                "mamba_proj_bias": False,
+                "mamba_d_state": 128,
+                "mamba_d_conv": 4,
+                "mamba_n_groups": 1,
+                "mamba_conv_bias": False,
+                "layer_types": ["mamba", "attention", "mamba", "attention"],
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000.0,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -1696,6 +1725,30 @@ class TestModels(unittest.TestCase):
                     config["vocab_size"],
                     config["num_hidden_layers"],
                 )
+
+    def test_ssm(self):
+        for batch_size in [1, 2]:
+            num_heads = 48
+            head_dim = 64
+            state_dim = 128
+
+            hidden_states = mx.random.normal(shape=(batch_size, 1, num_heads, head_dim))
+            B = mx.random.normal(shape=(batch_size, 1, state_dim))
+            C = mx.random.normal(shape=(batch_size, 1, state_dim))
+            dt = mx.random.normal(shape=(batch_size, 1, num_heads))
+            dt_bias = mx.random.normal(shape=(num_heads,))
+            A_log = mx.random.normal(shape=(num_heads,))
+            D = mx.random.normal(shape=(num_heads,))
+            state = mx.random.normal(shape=(batch_size, num_heads, head_dim, state_dim))
+
+            out, out_state = ssm_step_ops(
+                hidden_states, A_log, B, C, D, dt, dt_bias, state
+            )
+            out_c, out_state_c = ssm_step(
+                hidden_states, A_log, B, C, D, dt, dt_bias, state
+            )
+            self.assertTrue(mx.allclose(out, out_c, atol=1e-4, rtol=1e-4))
+            self.assertTrue(mx.allclose(out_state, out_state_c, atol=1e-4, rtol=1e-4))
 
 
 if __name__ == "__main__":

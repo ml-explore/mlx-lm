@@ -217,7 +217,8 @@ class Model(nn.Module):
             weights[key.replace("output_linear", "switch_mlp.down_proj")] = weights.pop(
                 key
             )
-
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
         return weights
 
     @property

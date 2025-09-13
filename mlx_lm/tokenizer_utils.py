@@ -203,7 +203,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token):
         self.tokens.append(token)
-        v = self.tokenmap[token]
+        v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
         self._unflushed += v
         text = self._decode_bytes(self._unflushed)
 
