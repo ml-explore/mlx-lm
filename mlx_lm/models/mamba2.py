@@ -7,6 +7,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs
 from .cache import MambaCache
+from .ssm import ssm_step
 
 
 @dataclass
@@ -131,45 +132,44 @@ class Mamba2Block(nn.Module):
         cache: Optional[MambaCache] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
-
-        dt = nn.softplus(dt + self.dt_bias)
-        dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
-
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         B = mx.repeat(B, self.heads_per_group, axis=2)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         C = mx.repeat(C, self.heads_per_group, axis=2)
-
-        A = -mx.exp(self.A_log.astype(mx.float32)).astype(hidden_states.dtype)
-
         if cache is not None and cache[1] is not None:
-            h = cache[1]
+            state = cache[1]
         else:
-            h = mx.zeros(
+            state = mx.zeros(
                 (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
                 dtype=hidden_states.dtype,
             )
-
+        
         outputs = []
+        current_state = state
+        
         for t in range(seq_len):
-            dt_t = dt[:, t, :]
-            dA = mx.exp(dt_t * A)[..., None, None]
-            dB = (dt_t[..., None] * B[:, t])[..., None, :]
-
-            h = dA * h + dB * hidden_states[:, t, :, :, None]
-            y_t = (h @ C[:, t, :, :, None]).squeeze(-1) + self.D[
-                :, None
-            ] * hidden_states[:, t]
+            h_t = hidden_states[:, t:t+1, :, :]
+            B_t = B[:, t:t+1, :, :]
+            C_t = C[:, t:t+1, :, :]
+            dt_t = dt[:, t:t+1, :]
+            y_t, current_state = ssm_step(
+                hidden_states=h_t,
+                A_log=self.A_log,
+                B=B_t,
+                C=C_t,
+                D=self.D,
+                dt=dt_t,
+                dt_bias=self.dt_bias,
+                state=current_state,
+                time_step_limit=self.time_step_limit,
+            )
             outputs.append(y_t)
-
+        y = mx.concatenate(outputs, axis=1)
         if cache is not None:
-            cache[1] = h
-
-        y = mx.stack(outputs, axis=1)
+            cache[1] = current_state
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
