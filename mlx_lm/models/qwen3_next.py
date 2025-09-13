@@ -317,7 +317,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         if cache is not None:
-            cache[1] = state
+            cache[1] = new_state
 
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
