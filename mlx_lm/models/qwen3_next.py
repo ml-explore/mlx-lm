@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -44,47 +45,49 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
 
 
+@partial(mx.compile, shapeless=True)
+def compute_g(A_log, a, dt_bias):
+    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias)).astype(
+        A_log.dtype
+    )
+
+
 def recurrent_gated_delta_rule(
     query: mx.array,
     key: mx.array,
     value: mx.array,
-    A_log: mx.array,
-    dt_bias: mx.array,
     a: mx.array,
     b: mx.array,
-    initial_state: Optional[mx.array],
-    use_qk_l2norm_in_kernel: bool,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> Tuple[mx.array, mx.array]:
-
-    input_type = query.dtype
     B, S, Hk, Dk = key.shape
-    Hv, Dv = value.shape[-2:]
-    beta = mx.sigmoid(b)
-    g = -mx.exp(A_log) * nn.softplus(a + dt_bias)
-    initial_state = mx.zeros((B, Hv, Dk, Dv), dtype=input_type)
-
+    Hv, Dv = value.shape[2:]
     inv_scale = Dk**-0.5
     if use_qk_l2norm_in_kernel:
-        query = inv_scale * mx.fast.rms_norm(query, None, 1e-6)
+        query = (inv_scale**2) * mx.fast.rms_norm(query, None, 1e-6)
         key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
-    query = inv_scale * query
-    if (repeat_factor := (Hv // Hk)) > 1:
+    else:
+        query = inv_scale * query
+
+    input_type = query.dtype
+    if (repeat_factor := Hv // Hk) > 1:
         query = mx.repeat(query, repeat_factor, 2)
         key = mx.repeat(key, repeat_factor, 2)
 
-    out = mx.zeros((B, S, Hv, Dv), dtype=value.dtype)
-    g = mx.exp(g)
-    query, key, value, beta, g = [
-        x.astype(mx.float32) for x in (query, key, value, beta, g)
-    ]
-    state = initial_state
+    beta = mx.sigmoid(b)
+    g = compute_g(A_log, a, dt_bias)
+    outs = []
     for i in range(S):
-        state = state * g[:, i, :, None, None]
-        kv_mem = mx.einsum("bhkv,bhk->bhv", state, key[:, i, :])
-        delta = (value[:, i, :] - kv_mem) * beta[:, i, :, None]
-        state += mx.einsum("bhk,bhv->bhkv", key[:, i, :], delta)
-        out[:, i, :] = mx.einsum("bhkv,bhk->bhv", state, query[:, i, :])
-    return out.astype(input_type), state
+        kv_mem = (state * key[:, i, :, :, None]).sum(axis=-2)
+        delta = (value[:, i] - kv_mem) * beta[:, i, :, None]
+        state += key[:, i, :, :, None] * delta[..., None, :]
+        out = (state * query[:, i, :, :, None]).sum(axis=-2)
+        outs.append(out)
+    out = mx.stack(outs, axis=1).astype(input_type)
+    return out, state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -293,25 +296,29 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         ]
 
-        if cache is not None:
-            initial_state = cache[1]
+        if cache is not None and cache[1] is not None:
+            state = cache[1]
         else:
-            initial_state = None
+            state = mx.zeros(
+                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                dtype=inputs.dtype,
+            )
 
         out, new_state = recurrent_gated_delta_rule(
             q,
             k,
             v,
-            self.A_log,
-            self.dt_bias,
             a,
             b,
-            initial_state,
+            self.A_log,
+            self.dt_bias,
+            state,
             use_qk_l2norm_in_kernel=True,
         )
 
         if cache is not None:
-            cache[1] = new_state
+            cache[1] = state
+
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
 
