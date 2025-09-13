@@ -81,16 +81,14 @@ def recurrent_gated_delta_rule(
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
     
-    outs = []
+    out = mx.zeros((B, S, Hv, Dv), dtype=input_type)
     for i in range(S):
         state *= g[:, i, :, None, None]
         kv_mem = (state * key[:, i, :, :, None]).sum(axis=-2)
         delta = (value[:, i] - kv_mem) * beta[:, i, :, None]
         state += key[:, i, :, :, None] * delta[..., None, :]
-        out = (state * query[:, i, :, :, None]).sum(axis=-2)
-        outs.append(out)
-    
-    return mx.stack(outs, axis=1).astype(input_type), state
+        out[:, i] = (state * query[:, i, :, :, None]).sum(axis=-2)
+    return out, state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
