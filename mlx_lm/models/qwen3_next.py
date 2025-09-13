@@ -66,7 +66,6 @@ def recurrent_gated_delta_rule(
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     inv_scale = Dk**-0.5
-
     if use_qk_l2norm_in_kernel:
         query = (inv_scale**2) * mx.fast.rms_norm(query, None, 1e-6)
         key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
