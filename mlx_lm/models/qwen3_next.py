@@ -419,7 +419,8 @@ class Qwen3NextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        fa_cache = cache[self.fa_idx] if cache is not None else None
+        mask = create_attention_mask(hidden_states, [fa_cache])
 
         for layer, c in zip(self.layers, cache):
             hidden_states = layer(hidden_states, mask=mask, cache=c)
