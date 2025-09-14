@@ -601,7 +601,12 @@ def train_dpo(
     def loss_fn(batch):
         return dpo_loss_fn(policy_model, reference_model, batch, beta)
 
-    state = [policy_model.state, optimizer.state, mx.random.state]
+    state = [
+        policy_model.state,
+        optimizer.state,
+        mx.random.state,
+        reference_model.state,
+    ]
 
     @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
