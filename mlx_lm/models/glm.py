@@ -19,18 +19,12 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    head_dim: Optional[int] = None
+    head_dim: int
+    num_key_value_heads: int
     max_position_embeddings: Optional[int] = None
-    num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
-    mlp_bias: bool = False
     rope_theta: float = 10000
-    rope_traditional: bool = True
     tie_word_embeddings: bool = True
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
 
 
 class GLMAttention(nn.Module):
@@ -61,9 +55,7 @@ class GLMAttention(nn.Module):
             self.num_attention_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.rope = nn.RoPE(
-            dims=self.head_dim, traditional=args.rope_traditional, base=args.rope_theta
-        )
+        self.rope = nn.RoPE(dims=self.head_dim, traditional=True, base=args.rope_theta)
 
     def __call__(
         self,

@@ -1712,6 +1712,17 @@ class TestModels(unittest.TestCase):
                 "rms_norm_eps": 1e-5,
                 "rope_theta": 1000.0,
             },
+            {
+                "model_type": "glm",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "head_dim": 32,
+                "num_key_value_heads": 2,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
