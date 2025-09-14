@@ -514,9 +514,7 @@ def dpo_evaluate(
     max_seq_length=2048,
     beta: float = 0.1,
 ):
-    """
-    Evaluate DPO model on validation set.
-    """
+    """Evaluate DPO model on validation set with loss and accuracy."""
     policy_model.eval()
     reference_model.eval()
 
@@ -544,8 +542,20 @@ def dpo_evaluate(
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+    loss = (all_losses / ntokens).item()
 
-    return (all_losses / ntokens).item()
+    # Compute accuracy
+    accuracy, margin = compute_preference_accuracy(
+        policy_model,
+        reference_model,
+        dataset,
+        batch_size,
+        num_batches,
+        max_seq_length,
+        beta,
+    )
+
+    return {"loss": loss, "accuracy": accuracy, "avg_margin": margin}
 
 
 def train_dpo(
@@ -627,9 +637,10 @@ def train_dpo(
     ):
         tic = time.perf_counter()
         # Report validation loss if needed
+        # Replace the validation reporting section with:
         if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             tic = time.perf_counter()
-            val_loss = dpo_evaluate(
+            val_results = dpo_evaluate(
                 policy_model=policy_model,
                 reference_model=reference_model,
                 dataset=val_dataset,
@@ -640,10 +651,13 @@ def train_dpo(
             )
             policy_model.train()
             val_time = time.perf_counter() - tic
+
             if rank == 0:
                 print(
                     f"Iter {it}: "
-                    f"Val loss {val_loss:.3f}, "
+                    f"Val loss {val_results['loss']:.3f}, "
+                    f"Val accuracy {val_results.get('accuracy', 0):.3f}, "
+                    f"Val margin {val_results.get('avg_margin', 0):.3f}, "
                     f"Val took {val_time:.3f}s",
                     flush=True,
                 )
@@ -651,7 +665,9 @@ def train_dpo(
             if training_callback is not None:
                 val_info = {
                     "iteration": it - 1,
-                    "val_loss": val_loss,
+                    "val_loss": val_results["loss"],
+                    "val_accuracy": val_results.get("accuracy", 0),
+                    "val_avg_margin": val_results.get("avg_margin", 0),
                     "val_time": val_time,
                 }
                 training_callback.on_val_loss_report(val_info)
@@ -721,3 +737,89 @@ def train_dpo(
         adapter_weights = dict(tree_flatten(policy_model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
         print(f"Saved final DPO weights to {args.adapter_file}.")
+
+
+def compute_preference_accuracy(
+    policy_model,
+    reference_model,
+    dataset,
+    batch_size,
+    num_batches,
+    max_seq_length=2048,
+    beta: float = 0.1,
+):
+    """Compute preference accuracy - how often policy prefers chosen over rejected."""
+    policy_model.eval()
+    reference_model.eval()
+
+    correct_preferences = mx.array(0.0)
+    total_examples = mx.array(0)
+    total_margin = mx.array(0.0)
+
+    index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
+
+    for _, batch in zip(
+        index_iterator,
+        dpo_iterate_batches(
+            dataset=dataset,
+            batch_size=batch_size,
+            max_seq_length=max_seq_length,
+        ),
+    ):
+        chosen_tokens = batch["chosen_tokens"]
+        rejected_tokens = batch["rejected_tokens"]
+
+        # Forward pass
+        chosen_inputs = chosen_tokens[:, :-1]
+        chosen_targets = chosen_tokens[:, 1:]
+        policy_chosen_logits = policy_model(chosen_inputs)
+        reference_chosen_logits = reference_model(chosen_inputs)
+
+        rejected_inputs = rejected_tokens[:, :-1]
+        rejected_targets = rejected_tokens[:, 1:]
+        policy_rejected_logits = policy_model(rejected_inputs)
+        reference_rejected_logits = reference_model(rejected_inputs)
+
+        # Compute log probabilities
+        from .losses import _log_prob_from_logits_and_labels
+
+        policy_chosen_logprobs = _log_prob_from_logits_and_labels(
+            policy_chosen_logits, chosen_targets
+        )
+        policy_rejected_logprobs = _log_prob_from_logits_and_labels(
+            policy_rejected_logits, rejected_targets
+        )
+        reference_chosen_logprobs = _log_prob_from_logits_and_labels(
+            reference_chosen_logits, chosen_targets
+        )
+        reference_rejected_logprobs = _log_prob_from_logits_and_labels(
+            reference_rejected_logits, rejected_targets
+        )
+
+        # Compute rewards
+        policy_chosen_rewards = beta * (
+            policy_chosen_logprobs - reference_chosen_logprobs
+        )
+        policy_rejected_rewards = beta * (
+            policy_rejected_logprobs - reference_rejected_logprobs
+        )
+
+        # Check preferences
+        reward_margin = policy_chosen_rewards - policy_rejected_rewards
+        correct = (reward_margin > 0).astype(mx.float32)
+
+        correct_preferences += mx.sum(correct)
+        total_examples += chosen_tokens.shape[0]
+        total_margin += mx.sum(reward_margin)
+
+        mx.eval(correct_preferences, total_examples, total_margin)
+
+    # Aggregate across distributed processes
+    correct_preferences = mx.distributed.all_sum(correct_preferences, stream=mx.cpu)
+    total_examples = mx.distributed.all_sum(total_examples, stream=mx.cpu)
+    total_margin = mx.distributed.all_sum(total_margin, stream=mx.cpu)
+
+    accuracy = (correct_preferences / total_examples).item()
+    avg_margin = (total_margin / total_examples).item()
+
+    return accuracy, avg_margin

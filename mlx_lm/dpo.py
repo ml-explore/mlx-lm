@@ -378,10 +378,10 @@ def train_model(
     )
 
 
-def load_reference_model(args):
+def load_reference_model(args, policy_model=None):
     """
     Load the reference model for DPO training.
-    If no reference model path is provided, use the initial policy model.
+    If no reference model path is provided, use shared weights from policy model.
     """
     if args.reference_model:
         print(f"Loading reference model from {args.reference_model}")
@@ -392,11 +392,17 @@ def load_reference_model(args):
             adapter_path=args.reference_model_adapters,
         )
     else:
-        print("Using policy model as reference model")
-        # Load the same model as reference - it will be frozen
-        reference_model, _ = load(
-            args.model, tokenizer_config={"trust_remote_code": True}
-        )
+        if policy_model is not None:
+            print("Using shared weights for reference model (memory efficient)")
+            import copy
+
+            reference_model = copy.deepcopy(policy_model)
+            reference_model.freeze()
+        else:
+            print("Using policy model as reference model")
+            reference_model, _ = load(
+                args.model, tokenizer_config={"trust_remote_code": True}
+            )
 
     return reference_model
 
@@ -407,7 +413,7 @@ def evaluate_model(args, policy_model: nn.Module, reference_model: nn.Module, te
     """
     from .tuner.trainer import dpo_evaluate
 
-    test_loss = dpo_evaluate(
+    test_results = dpo_evaluate(
         policy_model=policy_model,
         reference_model=reference_model,
         dataset=CacheDataset(test_set),
@@ -417,7 +423,11 @@ def evaluate_model(args, policy_model: nn.Module, reference_model: nn.Module, te
         beta=args.beta,
     )
 
-    print(f"Test loss {test_loss:.3f}.")
+    print(
+        f"Test loss {test_results['loss']:.3f}, "
+        f"Test accuracy {test_results.get('accuracy', 0):.3f}, "
+        f"Test margin {test_results.get('avg_margin', 0):.3f}."
+    )
 
 
 def run(args, training_callback: TrainingCallback = None):
@@ -435,7 +445,7 @@ def run(args, training_callback: TrainingCallback = None):
     )
 
     print("Loading reference model")
-    reference_model = load_reference_model(args)
+    reference_model = load_reference_model(args, policy_model=policy_model)
 
     print("Loading preference datasets")
     train_set, valid_set, test_set = load_preference_dataset(args, tokenizer)
