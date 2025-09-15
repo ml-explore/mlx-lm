@@ -29,7 +29,7 @@ conda install -c conda-forge mlx-lm
 
 ### Quick Start
 
-To generate text with an LLM use:
+To generate text with an LLM (the default LLM is `mlx-community/Llama-3.2-3B-Instruct-4bit`) use:
 
 ```bash
 mlx_lm.generate --prompt "How tall is Mt Everest?"
