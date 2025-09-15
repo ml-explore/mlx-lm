@@ -903,13 +903,12 @@ class BatchGenerator:
         # TODO use other types of cache here.
         prompt_cache = [BatchKVCache(left_padding) for _ in self.model.layers]
 
-        with mx.stream(generation_stream):
-            while inputs.shape[1] > 1:
-                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-                self.model(inputs[:, :n_to_process], cache=prompt_cache)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                mx.clear_cache()
+        while inputs.shape[1] > 1:
+            n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+            self.model(inputs[:, :n_to_process], cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            inputs = inputs[:, n_to_process:]
+            mx.clear_cache()
 
         y, logprobs = self._step(inputs, prompt_cache)
         mx.async_eval(y, logprobs)
@@ -918,12 +917,11 @@ class BatchGenerator:
         )
 
     def _step(self, input_tokens: mx.array, prompt_cache: List[Any]):
-        with mx.stream(generation_stream):
-            logits = self.model(input_tokens, cache=prompt_cache)
-            logits = logits[:, -1, :]
-            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            sampled = self.sampler(logprobs).squeeze(1)
-            return sampled, logprobs
+        logits = self.model(input_tokens, cache=prompt_cache)
+        logits = logits[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampled = self.sampler(logprobs).squeeze(1)
+        return sampled, logprobs
 
     def stats(self):
         self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
@@ -933,7 +931,7 @@ class BatchGenerator:
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
 
-    def next(self):
+    def _next(self):
         tic = time.perf_counter()
 
         prompt_processing = False
@@ -975,13 +973,12 @@ class BatchGenerator:
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
         mx.async_eval(batch.y, batch.logprobs)
 
-        mx.eval(y)
+        y = y.tolist()
         toc = time.perf_counter()
         if prompt_processing:
             self._stats.prompt_time += toc - tic
         else:
             self._stats.generation_time += toc - tic
-        y = y.tolist()
         keep_idx = []
         end_idx = []
         responses = []
@@ -1011,6 +1008,10 @@ class BatchGenerator:
 
         self._stats.generation_tokens += len(responses)
         return responses
+
+    def next(self):
+        with mx.stream(generation_stream):
+            return self._next()
 
 
 def batch_generate(
