@@ -25,6 +25,7 @@ from transformers import PreTrainedTokenizer
 from .models import cache
 from .models.cache import (
     BatchKVCache,
+    KVCache,
     QuantizedKVCache,
     load_prompt_cache,
 )
@@ -251,7 +252,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
             mx.set_wired_limit(old_limit)
 
 
-@dataclass(slots=True)
+@dataclass
 class GenerationResponse:
     """
     The output of :func:`stream_generate`.
@@ -785,7 +786,7 @@ def _left_pad_prompts(prompts, max_length=None):
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
-@dataclass(slots=True)
+@dataclass
 class BatchStats:
     """
     An data object to hold generation stats.
@@ -809,7 +810,7 @@ class BatchStats:
     peak_memory: float = 0
 
 
-@dataclass(slots=True)
+@dataclass
 class BatchResponse:
     """
     An data object to hold a batch generation response.
@@ -823,7 +824,7 @@ class BatchResponse:
     stats: BatchStats
 
 
-@dataclass(slots=True)
+@dataclass
 class Batch:
     uids: List[int]
     y: mx.array
@@ -855,9 +856,26 @@ class Batch:
             c.extend(o)
 
 
+def _make_cache(model, left_padding):
+    """
+    Convert a list of regular caches into their corresponding
+    batch-aware caches.
+    """
+    if hasattr(model, "make_cache"):
+        cache = model.make_cache()
+        batch_cache = []
+        for c in cache:
+            if not isinstance(c, KVCache):
+                raise ValueError(f"{type(c)} does not yet support batching")
+            # Convert cache to batched cache
+            batch_cache.append(BatchKVCache(left_padding))
+    else:
+        return [BatchKVCache(left_padding) for _ in model.layers]
+
+
 class BatchGenerator:
 
-    @dataclass(slots=True)
+    @dataclass
     class Response:
         uid: int
         token: int
@@ -912,8 +930,7 @@ class BatchGenerator:
         left_padding = [max_length - l for l in lengths]
         inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        # TODO use other types of cache here.
-        prompt_cache = [BatchKVCache(left_padding) for _ in self.model.layers]
+        prompt_cache = _make_cache(self.model, left_padding)
 
         while inputs.shape[1] > 1:
             n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
