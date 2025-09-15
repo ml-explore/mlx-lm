@@ -92,15 +92,11 @@ def main():
         return response
 
     def batch_bench():
-        texts, stats = batch_generate(
+        return batch_generate(
             model, tokenizer, prompts, max_tokens=generation_tokens
-        )
-        return stats
+        ).stats
 
-    if batch_size == 1:
-        _bench = single_bench
-    else:
-        _bench = batch_bench
+    _bench = batch_bench
 
     print("Running warmup..")
     _bench()

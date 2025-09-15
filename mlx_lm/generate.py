@@ -251,7 +251,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
             mx.set_wired_limit(old_limit)
 
 
-@dataclass
+@dataclass(slots=True)
 class GenerationResponse:
     """
     The output of :func:`stream_generate`.
@@ -785,7 +785,7 @@ def _left_pad_prompts(prompts, max_length=None):
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
-@dataclass
+@dataclass(slots=True)
 class BatchStats:
     """
     An data object to hold generation stats.
@@ -809,7 +809,21 @@ class BatchStats:
     peak_memory: float = 0
 
 
-@dataclass
+@dataclass(slots=True)
+class BatchResponse:
+    """
+    An data object to hold a batch generation response.
+
+    Args:
+        texts: (List[str]): The generated text for each prompt.
+        stats (BatchStats): Statistics about the generation.
+    """
+
+    texts: List[str]
+    stats: BatchStats
+
+
+@dataclass(slots=True)
 class Batch:
     uids: List[int]
     y: mx.array
@@ -843,7 +857,7 @@ class Batch:
 
 class BatchGenerator:
 
-    @dataclass
+    @dataclass(slots=True)
     class Response:
         uid: int
         token: int
@@ -866,8 +880,6 @@ class BatchGenerator:
         self.stop_tokens = stop_tokens or set()
         self.sampler = sampler or (lambda x: mx.argmax(x, keepdims=True, axis=-1))
         self.uid_count = 0
-        # TODO tune these values to reasonable defaults possibly per
-        # machine
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
@@ -1021,7 +1033,22 @@ def batch_generate(
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     **kwargs,
-):
+) -> BatchResponse:
+    """
+    Generate responses for the given batch of prompts.
+
+    Args:
+       model (nn.Module): The language model.
+       tokenizer (PreTrainedTokenizer): The tokenizer.
+       prompt (List[List[int]]): The input prompts.
+       verbose (bool): If ``True``, print tokens and timing information.
+          Default: ``False``.
+       max_tokens (Union[int, List[int]): Maximum number of output tokens. This
+          can be per prompt if a list is provided.
+       kwargs: The remaining options get passed to :obj:`BatchGenerator`.
+          See :obj:`BatchGenerator` for more details.
+    """
+
     gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
     num_samples = len(prompts)
     fin = 0
@@ -1056,7 +1083,7 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return texts, stats
+    return BatchResponse(texts, stats)
 
 
 def main():

@@ -26,8 +26,7 @@ prompts = [
 ]
 
 # Set `verbose=True` to see generation statistics
-texts, stats = batch_generate(model, tokenizer, prompts, verbose=False, max_tokens=128)
+result = batch_generate(model, tokenizer, prompts, verbose=False, max_tokens=128)
 
-# The returned `texts` is a list of continuations in the same order as prompts
-print(prompts[0])
-print(texts[0])
+# The returned result contains texts completions in the same order as prompts
+print(result.texts[0])

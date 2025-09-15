@@ -321,13 +321,13 @@ class MLXLM(LM):
         # TODO consider multi-token, per-prompt stop conditions
         max_tokens = [opt.get("max_gen_toks", self._max_tokens) for opt in options]
 
-        completions, _ = batch_generate(
+        completions = batch_generate(
             model=self._model,
             tokenizer=self.tokenizer,
             prompts=contexts,
             max_tokens=max_tokens,
             verbose=True,
-        )
+        ).texts
 
         for e, (text, opt) in enumerate(zip(completions, options)):
             until = opt["until"]
