@@ -507,8 +507,9 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
-    def __init__(self, size):
+    def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
+        self.left_padding = left_padding
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -524,10 +525,35 @@ class ArraysCache(_BaseCache):
     def state(self, v):
         self.cache = v
 
+    def filter(self, batch_indices):
+        """
+        In-place filter to keep just the given indices in the cache.
+        """
+        self.cache = [c[batch_indices] for c in self.cache]
+        self.left_padding = None
+
+    def extend(self, other):
+        """
+        In-place extend this cache with the other cache.
+        """
+        self.cache = map(mx.concatenate, zip(self.cache, other.cache))
+        self.left_padding = None
+
+    def make_mask(
+        self,
+        N: int,
+        *args,
+        **kwargs,
+    ):
+        if self.cache[0] is None:
+            return mx.arange(N) >= self.left_padding[:, None]
+        else:
+            return None
+
 
 class MambaCache(ArraysCache):
-    def __init__(self):
-        super().__init__(size=2)
+    def __init__(self, left_padding: Optional[List[int]] = None):
+        super().__init__(size=2, left_padding=left_padding)
 
 
 class ChunkedKVCache(KVCache):
@@ -696,9 +722,8 @@ class BatchKVCache(_BaseCache):
         """
         self.keys = self.keys[batch_indices]
         self.values = self.values[batch_indices]
-        if isinstance(self.offset, mx.array):
-            self.offset = self.offset[batch_indices]
-            self.left_padding = self.left_padding[batch_indices]
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()

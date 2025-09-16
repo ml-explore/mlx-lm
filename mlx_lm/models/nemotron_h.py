@@ -157,7 +157,7 @@ class NemotronHMamba2Mixer(nn.Module):
             axis=-1,
         )
         if mask is not None:
-            conv_input = mx.where(mask, conv_input, 0)
+            conv_input = mx.where(mask[..., None], conv_input, 0)
 
         conv_output = self._apply_conv(conv_input, cache)
 
@@ -291,11 +291,17 @@ class NemotronHModel(nn.Module):
         ]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.fa_idx = 0
+        self.ssm_idx = 0
         for b in args.hybrid_override_pattern:
             if b == "*":
                 break
             elif b == "M":
                 self.fa_idx += 1
+        for b in args.hybrid_override_pattern:
+            if b == "*":
+                self.ssm_idx += 1
+            elif b == "M":
+                break
 
     def __call__(
         self,
@@ -306,9 +312,8 @@ class NemotronHModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
-
         attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        ssm_mask = create_attention_mask(hidden_states, cache[self.ssm_idx])
 
         cache_counter = 0
         for layer in self.layers:

@@ -88,11 +88,15 @@ def ssm_update_kernel(
     )
 
 
-def segsum(x):
+def segsum(x, mask=None):
     l = x.shape[-1]
+    if mask is not None:
+        x = x * mask
     x = mx.repeat(x[..., None], l, axis=-1)
     x = mx.tril(x, -1)
     x_segsum = mx.cumsum(x, axis=-2)
+    if mask is not None:
+        x_segsum = mx.where(mask * mask[..., None], x_segsum, -float("inf"))
     return x_segsum
 
 
@@ -106,6 +110,7 @@ def ssm_attn(
     dt_bias: mx.array,
     state: Optional[mx.array] = None,
     time_step_limit: Tuple[float, float] = (0.001, 100.0),
+    mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """SSD-SSM forward pass.
 
@@ -118,6 +123,7 @@ def ssm_attn(
         D: Residual connection.
         dt_bias: Bias for time deltas of shape (num_heads,).
         time_step_limit: Minimum and maximum value for time deltas.
+        mask: Optional multiplicative mask.
 
     Code modified from
     https://github.com/cartesia-ai/edge/blob/main/cartesia-mlx/cartesia_mlx/layers/ssd/ops.py
@@ -136,8 +142,7 @@ def ssm_attn(
     CB = mx.repeat(CB, repeats, axis=1)
 
     dtA = dt * A.reshape(1, 1, -1)
-
-    decay = mx.exp(segsum(dtA.swapaxes(1, 2)))
+    decay = mx.exp(segsum(dtA.swapaxes(1, 2), mask=mask))
 
     surrogate_attention_matrix = mx.tril(CB * decay, 0)
 
@@ -174,6 +179,7 @@ def ssm_update(
     dt_bias: mx.array,
     state: Optional[mx.array] = None,
     time_step_limit: Tuple[float, float] = (0.001, 100.0),
+    mask: Optional[mx.array] = None,
 ):
     seq_len = hidden_states.shape[1]
     if (
@@ -182,17 +188,27 @@ def ssm_update(
         or mx.default_device() != mx.gpu
         or not mx.metal.is_available()
     ):
-        fn = ssm_attn
+        return ssm_attn(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            time_step_limit,
+            mask=mask,
+        )
     else:
-        fn = ssm_update_kernel
-    return fn(
-        hidden_states,
-        A_log,
-        B,
-        C,
-        D,
-        dt,
-        dt_bias,
-        state,
-        time_step_limit,
-    )
+        return ssm_update_kernel(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            time_step_limit,
+        )

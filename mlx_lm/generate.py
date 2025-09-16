@@ -24,6 +24,7 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .models.cache import (
+    ArraysCache,
     BatchKVCache,
     KVCache,
     QuantizedKVCache,
@@ -865,10 +866,14 @@ def _make_cache(model, left_padding):
         cache = model.make_cache()
         batch_cache = []
         for c in cache:
-            if not isinstance(c, KVCache):
+            if isinstance(c, KVCache):
+                batch_cache.append(BatchKVCache(left_padding))
+            elif isinstance(c, ArraysCache):
+                c.left_padding = mx.array(left_padding)
+                batch_cache.append(c)
+            else:
                 raise ValueError(f"{type(c)} does not yet support batching")
-            # Convert cache to batched cache
-            batch_cache.append(BatchKVCache(left_padding))
+        return batch_cache
     else:
         return [BatchKVCache(left_padding) for _ in model.layers]
 
