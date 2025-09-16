@@ -545,7 +545,7 @@ class ArraysCache(_BaseCache):
         *args,
         **kwargs,
     ):
-        if self.cache[0] is None:
+        if self.cache[0] is None and self.left_padding is not None:
             return mx.arange(N) >= self.left_padding[:, None]
         else:
             return None

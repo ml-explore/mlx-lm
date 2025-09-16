@@ -118,6 +118,7 @@ class Mamba(nn.Module):
         C: mx.array,
         dt: mx.array,
         state: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = x.shape
 
@@ -134,6 +135,7 @@ class Mamba(nn.Module):
             dt,
             self.dt_bias,
             state,
+            mask=mask,
         )
         return y.reshape(batch_size, seq_len, self.intermediate_size), state
 
@@ -166,6 +168,8 @@ class Mamba(nn.Module):
         )
 
         x = x.reshape(bsize, -1, self.num_heads * self.hidden_size_per_head)
+        if mask is not None:
+            x = mx.where(mask[..., None], x, 0)
         x, conv_state = causal_conv1d_update(conv_state, x, self.conv1d.weight)
         BCdt = self.bcdt_proj(x)
         B, C, dt = mx.split(BCdt, [self.d_state, self.d_state * 2], axis=-1)
@@ -183,6 +187,7 @@ class Mamba(nn.Module):
             C,
             dt,
             cache[1] if cache else None,
+            mask,
         )
         out = out * nn.silu(z.flatten(-2))
         if cache is not None:
@@ -354,13 +359,27 @@ class PlamoDecoder(nn.Module):
             PlamoDecoderLayer(config, is_mamba=is_mamba(config, i))
             for i in range(config.num_hidden_layers)
         ]
+        self.ssm_idx = 0 if config.mamba_enabled else None
+        self.fa_idx = config.mamba_step // 2
 
-    def __call__(self, x: mx.array, mask: mx.array, cache):
-        for i, decoder_layer in enumerate(self.layers):
-            x = decoder_layer(
+    def __call__(self, x: mx.array, cache):
+        if cache is None:
+            cache = [None] * len(self.layers.layers)
+
+        attn_mask = create_attention_mask(x, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            mamba_mask = create_attention_mask(x, cache[self.ssm_idx])
+        else:
+            mamba_mask = None
+
+        for (
+            l,
+            c,
+        ) in zip(self.layers, cache):
+            x = l(
                 x,
-                mask=mask,
-                cache=cache[i],
+                mask=mamba_mask if l.is_mamba else attn_mask,
+                cache=c,
             )
         return x
 
@@ -385,15 +404,8 @@ class PlamoModel(nn.Module):
 
         h = self.embed_tokens(inputs)
 
-        if cache is None:
-            cache = [None] * len(self.layers.layers)
-
-        mask = create_attention_mask(h, cache[1])
-
-        # decoder layers
         out = self.layers(
             h,
-            mask,
             cache,
         )
 
