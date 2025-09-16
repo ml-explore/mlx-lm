@@ -55,6 +55,12 @@ def create_attention_mask(
     return "causal"
 
 
+def create_ssm_mask(h, cache=None):
+    if cache and hasattr(cache, "make_mask"):
+        return cache.make_mask(h.shape[1])
+    return None
+
+
 def quantized_scaled_dot_product_attention(
     queries: mx.array,
     q_keys: tuple[mx.array, mx.array, mx.array],

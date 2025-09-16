@@ -539,12 +539,7 @@ class ArraysCache(_BaseCache):
         self.cache = map(mx.concatenate, zip(self.cache, other.cache))
         self.left_padding = None
 
-    def make_mask(
-        self,
-        N: int,
-        *args,
-        **kwargs,
-    ):
+    def make_mask(self, N: int):
         if self.cache[0] is None and self.left_padding is not None:
             return mx.arange(N) >= self.left_padding[:, None]
         else:

@@ -7,7 +7,12 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, MambaCache
 from .ssm import ssm_update
 
@@ -315,7 +320,7 @@ class NemotronHModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_attention_mask(hidden_states, cache[self.ssm_idx])
+        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
         cache_counter = 0
         for layer in self.layers:

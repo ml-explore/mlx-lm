@@ -7,7 +7,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.models.base import BaseModelArgs, create_attention_mask
+from mlx_lm.models.base import BaseModelArgs, create_attention_mask, create_ssm_mask
 
 from .cache import KVCache, MambaCache
 from .ssm import ssm_update
@@ -364,11 +364,11 @@ class PlamoDecoder(nn.Module):
 
     def __call__(self, x: mx.array, cache):
         if cache is None:
-            cache = [None] * len(self.layers.layers)
+            cache = [None] * len(self.layers)
 
         attn_mask = create_attention_mask(x, cache[self.fa_idx])
         if self.ssm_idx is not None:
-            mamba_mask = create_attention_mask(x, cache[self.ssm_idx])
+            mamba_mask = create_ssm_mask(x, cache[self.ssm_idx])
         else:
             mamba_mask = None
 
