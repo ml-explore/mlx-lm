@@ -119,6 +119,7 @@ class NemotronHMamba2Mixer(nn.Module):
         C: mx.array,
         dt: mx.array,
         state: Optional[mx.array],
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -138,6 +139,7 @@ class NemotronHMamba2Mixer(nn.Module):
             self.dt_bias,
             state,
             self.time_step_limit,
+            mask,
         )
 
         return y.reshape(batch_size, seq_len, self.intermediate_size), state
@@ -170,7 +172,7 @@ class NemotronHMamba2Mixer(nn.Module):
             axis=-1,
         )
         state = cache[1] if cache else None
-        y, state = self._ssm(hidden_states_ssm, B, C, dt, state)
+        y, state = self._ssm(hidden_states_ssm, B, C, dt, state, mask)
         if cache:
             cache[1] = state
         y = self.norm(y, gate)

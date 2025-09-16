@@ -91,12 +91,15 @@ def ssm_update_kernel(
 def segsum(x, mask=None):
     l = x.shape[-1]
     if mask is not None:
+        mask = mx.expand_dims(mask, 1)
         x = x * mask
     x = mx.repeat(x[..., None], l, axis=-1)
     x = mx.tril(x, -1)
     x_segsum = mx.cumsum(x, axis=-2)
     if mask is not None:
-        x_segsum = mx.where(mask * mask[..., None], x_segsum, -float("inf"))
+        x_segsum = mx.where(
+            mask[..., None, :] * mask[..., None], x_segsum, -float("inf")
+        )
     return x_segsum
 
 

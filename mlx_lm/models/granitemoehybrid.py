@@ -131,6 +131,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         C: mx.array,
         dt: mx.array,
         state: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -150,6 +151,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             self.dt_bias,
             state,
             self.time_step_limit,
+            mask,
         )
 
         return y.reshape(batch_size, seq_len, self.intermediate_size), state
@@ -157,6 +159,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
         cache: Optional[MambaCache] = None,
     ) -> mx.array:
 
@@ -168,6 +171,8 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             axis=-1,
         )
 
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
         conv_output = self._apply_conv(conv_input, cache)
 
         hidden_states_ssm, B, C = mx.split(
@@ -179,7 +184,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             axis=-1,
         )
         state = cache[1] if cache else None
-        y, state = self._ssm(hidden_states_ssm, B, C, dt, state)
+        y, state = self._ssm(hidden_states_ssm, B, C, dt, state, mask)
         if cache:
             cache[1] = state
         y = self.norm(y, gate)
@@ -336,7 +341,7 @@ class GraniteMoeHybridLayer(nn.Module):
         hidden_states = self.input_layernorm(x)
 
         if self.layer_type == "mamba":
-            hidden_states = self.mamba(hidden_states, cache=cache)
+            hidden_states = self.mamba(hidden_states, mask=mask, cache=cache)
         else:
             hidden_states = self.self_attn(hidden_states, mask=mask, cache=cache)
 
@@ -366,6 +371,7 @@ class GraniteMoeHybridModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.embedding_multiplier = args.embedding_multiplier
         self.fa_idx = args.layer_types.index("attention")
+        self.ssm_idx = args.layer_types.index("mamba")
         self.layer_types = args.layer_types
 
     def __call__(
@@ -379,10 +385,11 @@ class GraniteMoeHybridModel(nn.Module):
             cache = [None] * len(self.layers)
 
         attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        mamba_mask = create_attention_mask(hidden_states, cache[self.ssm_idx])
 
         cache_counter = 0
         for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
-            mask = attn_mask if layer.layer_type == "attention" else None
+            mask = attn_mask if layer.layer_type == "attention" else mamba_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         return self.norm(hidden_states)

@@ -1803,7 +1803,7 @@ class TestModels(unittest.TestCase):
             dt[:, pad:],
             dt_bias,
         )
-        mask = mx.array([False] * pad + [True] * seq_len)
+        mask = mx.array([[False] * pad + [True] * seq_len])
         out_m, out_state_m = ssm_attn(
             hidden_states, A_log, B, C, D, dt, dt_bias, mask=mask
         )
