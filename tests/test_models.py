@@ -1731,6 +1731,23 @@ class TestModels(unittest.TestCase):
                 "head_dim": 32,
                 "num_key_value_heads": 2,
             },
+            {
+                "model_type": "llama4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "head_dim": 32,
+                "num_key_value_heads": 2,
+                "intermediate_size_mlp": 128,
+                "rope_theta": 1000.0,
+                "head_dim": 8,
+                "tie_word_embeddings": False,
+                "no_rope_layers": [0, 0, 1, 1],
+                "use_qk_norm": True,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
