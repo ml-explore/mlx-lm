@@ -1,3 +1,5 @@
+# Copyright © 2025 Apple Inc.
+
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -5,9 +7,9 @@ from typing import Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs
+from .base import BaseModelArgs, create_ssm_mask
 from .cache import MambaCache
-from .ssm import ssm_update  # Old version not existing
+from .ssm import ssm_update
 
 
 @dataclass
@@ -17,32 +19,21 @@ class ModelArgs(BaseModelArgs):
     head_dim: int
     vocab_size: int
     hidden_size: int
+    intermediate_size: int
     state_size: int
     num_hidden_layers: int
     layer_norm_epsilon: float
-    expand: int
     conv_kernel: int
     n_groups: int
     use_bias: bool
     use_conv_bias: bool
-    initializer_range: float
-    residual_in_fp32: bool
-    chunk_size: int
     tie_word_embeddings: bool
     time_step_limit: Tuple[float, float]
     time_step_rank: Union[int, str]
-    time_step_min: float
-    time_step_max: float
-    time_step_floor: float
-    ssm_state_size: int = None
-    norm_before_gate: bool = True
+    ssm_state_size: Optional[int] = None
     max_position_embeddings: int = 2056
 
     def __post_init__(self):
-        if not hasattr(self, "intermediate_size"):
-            self.intermediate_size = int(self.expand * self.hidden_size)
-        if not hasattr(self, "head_dim"):
-            self.head_dim = self.hidden_size // self.num_heads
         if self.time_step_rank == "auto":
             self.time_step_rank = math.ceil(self.hidden_size / 16)
         if self.ssm_state_size is None:
@@ -129,51 +120,34 @@ class Mamba2Block(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache] = None,
+        state: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
-        B = mx.repeat(B, self.heads_per_group, axis=2)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
-        C = mx.repeat(C, self.heads_per_group, axis=2)
-        if cache is not None and cache[1] is not None:
-            state = cache[1]
-        else:
-            state = mx.zeros(
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
-                dtype=hidden_states.dtype,
-            )
-
-        outputs = []
-        current_state = state
-
-        for t in range(seq_len):
-            h_t = hidden_states[:, t : t + 1, :, :]
-            B_t = B[:, t : t + 1, :, :]
-            C_t = C[:, t : t + 1, :, :]
-            dt_t = dt[:, t : t + 1, :]
-            y_t, current_state = ssm_update(
-                hidden_states=h_t,
-                A_log=self.A_log,
-                B=B_t,
-                C=C_t,
-                D=self.D,
-                dt=dt_t,
-                dt_bias=self.dt_bias,
-                state=current_state,
-                time_step_limit=self.time_step_limit,
-            )
-            outputs.append(y_t)
-        y = mx.concatenate(outputs, axis=1)
-        if cache is not None:
-            cache[1] = current_state
-        return y.reshape(batch_size, seq_len, self.intermediate_size)
+        y, state = ssm_update(
+            hidden_states,
+            self.A_log,
+            B,
+            C,
+            self.D,
+            dt,
+            self.dt_bias,
+            state,
+            self.time_step_limit,
+            mask,
+        )
+        return y.reshape(batch_size, seq_len, self.intermediate_size), state
 
     def __call__(
-        self, hidden_states: mx.array, cache: Optional[MambaCache] = None
+        self,
+        hidden_states: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[MambaCache] = None,
     ) -> mx.array:
         projected = self.in_proj(hidden_states)
         gate, conv_input, dt = mx.split(
@@ -181,6 +155,8 @@ class Mamba2Block(nn.Module):
             [self.intermediate_size, self.intermediate_size + self.conv_dim],
             axis=-1,
         )
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
         conv_output = self._apply_conv(conv_input, cache)
         hidden_states, B, C = mx.split(
             conv_output,
@@ -190,7 +166,10 @@ class Mamba2Block(nn.Module):
             ],
             axis=-1,
         )
-        y = self._ssm(hidden_states, B, C, dt, cache)
+        state = cache[1] if cache else None
+        y, state = self._ssm(hidden_states, B, C, dt, state, mask=mask)
+        if cache:
+            cache[1] = state
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -198,15 +177,13 @@ class Mamba2Block(nn.Module):
 class ResidualBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.residual_in_fp32 = args.residual_in_fp32
         self.mixer = Mamba2Block(args, layer_idx)
         self.norm = nn.RMSNorm(args.hidden_size)
 
-    def __call__(self, x: mx.array, cache: Optional[MambaCache] = None) -> mx.array:
-        if self.residual_in_fp32:
-            x = x.astype(mx.float32)
-
-        output = self.mixer(self.norm(x), cache)
+    def __call__(
+        self, x: mx.array, mask: Optional[mx.array], cache: Optional[MambaCache] = None
+    ) -> mx.array:
+        output = self.mixer(self.norm(x), mask, cache)
         return output + x
 
 
@@ -221,12 +198,14 @@ class Mamba2(nn.Module):
     def __call__(
         self, x: mx.array, cache: Optional[list[MambaCache]] = None
     ) -> mx.array:
-        x = self.embeddings(x)
-        hidden = x
+        hidden = self.embeddings(x)
 
-        for i, layer in enumerate(self.layers):
-            layer_cache = cache[i] if cache else None
-            hidden = layer(hidden, layer_cache)
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask = create_ssm_mask(hidden, cache[0])
+        for layer, c in zip(self.layers, cache):
+            hidden = layer(hidden, mask, c)
 
         return self.norm_f(hidden)
 
@@ -250,7 +229,6 @@ class Model(nn.Module):
             logits = self.backbone.embeddings.as_linear(hidden)
         else:
             logits = self.lm_head(hidden)
-
         return logits
 
     def make_cache(self, batch_size: int = 1) -> list[MambaCache]:

@@ -152,7 +152,7 @@ class NemotronHMamba2Mixer(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
-        mask: mx.array,
+        mask: Optional[mx.array],
         cache: Optional[MambaCache] = None,
     ) -> mx.array:
 

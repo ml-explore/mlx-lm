@@ -1748,6 +1748,25 @@ class TestModels(unittest.TestCase):
                 "no_rope_layers": [0, 0, 1, 1],
                 "use_qk_norm": True,
             },
+            {
+                "model_type": "mamba2",
+                "num_heads": 8,
+                "head_dim": 16,
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "state_size": 32,
+                "num_hidden_layers": 4,
+                "layer_norm_epsilon": 1e-4,
+                "conv_kernel": 3,
+                "n_groups": 4,
+                "use_bias": False,
+                "use_conv_bias": False,
+                "chunk_size": 32,
+                "tie_word_embeddings": True,
+                "time_step_limit": (0.01, 10),
+                "time_step_rank": "auto",
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
