@@ -98,30 +98,28 @@ class MLXLM(LM):
         inputs, targets = inputs[..., :-1], inputs[..., 1:]
 
         cache = cache or make_prompt_cache(self._model)
-        first_cache = cache[0] if cache else None
-        if first_cache is not None and hasattr(first_cache, "offset"):
-            lengths += first_cache.offset
-
+        offset = 0
         scores, is_greedy = [], []
         for i in range(0, inputs.shape[1], step_size):
             inp = inputs[:, i : i + step_size]
             T = inp.shape[1]
 
-            offset = getattr(cache[0], "offset", 0)
             logits = self._model(inp, cache=cache)
             log_probs = nn.log_softmax(logits.astype(mx.float32))
 
             score = mx.take_along_axis(
                 log_probs, targets[:, i : i + step_size, mx.newaxis], axis=-1
             )[..., 0]
+
             ig = targets[:, i : i + step_size] == mx.argmax(logits, axis=-1)
-            ig = mx.where(mx.arange(T) + offset < lengths[:, None], ig, False)
+            ig = mx.where(mx.arange(offset, T + offset) < lengths[:, None], ig, False)
 
             mx.eval(score, ig)
             mx.clear_cache()
 
             is_greedy.append(ig)
             scores.append(score)
+            offset += T
 
         scores = mx.concatenate(scores, axis=1)
         is_greedy = mx.concatenate(is_greedy, axis=1)
