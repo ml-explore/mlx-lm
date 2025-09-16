@@ -901,7 +901,7 @@ class BatchGenerator:
         self.unprocessed_prompts = []
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
-        self.sampler = sampler or (lambda x: mx.argmax(x, keepdims=True, axis=-1))
+        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
@@ -954,7 +954,7 @@ class BatchGenerator:
         logits = self.model(input_tokens, cache=prompt_cache)
         logits = logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs).squeeze(1)
+        sampled = self.sampler(logprobs)
         return sampled, logprobs
 
     def stats(self):
