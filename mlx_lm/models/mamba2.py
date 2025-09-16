@@ -7,7 +7,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs
 from .cache import MambaCache
-from .ssm import ssm_update # Old version not existing
+from .ssm import ssm_update  # Old version not existing
 
 
 @dataclass
@@ -146,15 +146,15 @@ class Mamba2Block(nn.Module):
                 (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
                 dtype=hidden_states.dtype,
             )
-        
+
         outputs = []
         current_state = state
-        
+
         for t in range(seq_len):
-            h_t = hidden_states[:, t:t+1, :, :]
-            B_t = B[:, t:t+1, :, :]
-            C_t = C[:, t:t+1, :, :]
-            dt_t = dt[:, t:t+1, :]
+            h_t = hidden_states[:, t : t + 1, :, :]
+            B_t = B[:, t : t + 1, :, :]
+            C_t = C[:, t : t + 1, :, :]
+            dt_t = dt[:, t : t + 1, :]
             y_t, current_state = ssm_update(
                 hidden_states=h_t,
                 A_log=self.A_log,
