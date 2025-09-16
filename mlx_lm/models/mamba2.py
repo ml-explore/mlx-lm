@@ -7,7 +7,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs
 from .cache import MambaCache
-from .ssm import ssm_step
+from .ssm import ssm_update # Old version not existing
 
 
 @dataclass
@@ -155,7 +155,7 @@ class Mamba2Block(nn.Module):
             B_t = B[:, t:t+1, :, :]
             C_t = C[:, t:t+1, :, :]
             dt_t = dt[:, t:t+1, :]
-            y_t, current_state = ssm_step(
+            y_t, current_state = ssm_update(
                 hidden_states=h_t,
                 A_log=self.A_log,
                 B=B_t,
