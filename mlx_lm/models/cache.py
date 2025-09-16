@@ -536,7 +536,7 @@ class ArraysCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
-        self.cache = map(mx.concatenate, zip(self.cache, other.cache))
+        self.cache = [mx.concatenate([c, o]) for c, o in zip(self.cache, other.cache)]
         self.left_padding = None
 
     def make_mask(self, N: int):

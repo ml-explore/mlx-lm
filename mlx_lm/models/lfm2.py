@@ -226,7 +226,7 @@ class Lfm2Model(nn.Module):
         self.conv_idx = 0
         for i in range(args.num_hidden_layers):
             if i in args.full_attn_idxs:
-                self.conv_idx += i
+                self.conv_idx += 1
             else:
                 break
 
