@@ -98,14 +98,16 @@ class MLXLM(LM):
         inputs, targets = inputs[..., :-1], inputs[..., 1:]
 
         cache = cache or make_prompt_cache(self._model)
-        lengths += cache[0].offset
+        first_cache = cache[0] if cache else None
+        if first_cache is not None and hasattr(first_cache, "offset"):
+            lengths += first_cache.offset
 
         scores, is_greedy = [], []
         for i in range(0, inputs.shape[1], step_size):
             inp = inputs[:, i : i + step_size]
             T = inp.shape[1]
 
-            offset = cache[0].offset
+            offset = getattr(cache[0], "offset", 0)
             logits = self._model(inp, cache=cache)
             log_probs = nn.log_softmax(logits.astype(mx.float32))
 
