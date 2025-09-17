@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, List, Optional, Union, Dict
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -182,7 +182,9 @@ class TransformerBlock(nn.Module):
             )
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
     def __call__(
         self,
@@ -201,7 +203,10 @@ class Llama4TextModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [TransformerBlock(args=args, layer_idx=i) for i in range(args.num_hidden_layers)]
+        self.layers = [
+            TransformerBlock(args=args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
+        ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.attention_chunk_size = args.attention_chunk_size
 
@@ -241,7 +246,7 @@ class Llama4TextModel(nn.Module):
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
-        
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
