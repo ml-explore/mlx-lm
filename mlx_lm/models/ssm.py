@@ -39,18 +39,18 @@ def make_ssm_kernel():
         float acc = 0.0;
         auto x_ = static_cast<float>(x[d_idx]);
 
-        for (int i = 0; i < n_per_t; ++i) {{
+        for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * ds_idx + i;
             auto idx = d_idx * Ds + s_idx;
             auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
             auto state = dA * i_state[idx] + dB_by_x;
             o_state[idx] = static_cast<T>(state);
             acc += state * C_[s_idx];
-        }}
+        }
         acc = simd_sum(acc);
-        if (thread_index_in_simdgroup == 0) {{
+        if (thread_index_in_simdgroup == 0) {
             out[d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
-        }}
+        }
     """
     return mx.fast.metal_kernel(
         name="ssm_kernel",

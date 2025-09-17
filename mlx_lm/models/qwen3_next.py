@@ -1,8 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
-import os
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -10,7 +8,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, MambaCache
-from .gated_delta import gated_delta_prefill, gated_delta_step
+from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -45,50 +43,6 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
-
-
-@partial(mx.compile, shapeless=True)
-def compute_g(A_log, a, dt_bias):
-    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias)).astype(
-        A_log.dtype
-    )
-
-
-def recurrent_gated_delta_rule(
-    query: mx.array,
-    key: mx.array,
-    value: mx.array,
-    a: mx.array,
-    b: mx.array,
-    A_log: mx.array,
-    dt_bias: mx.array,
-    state: mx.array,
-    use_qk_l2norm_in_kernel: bool = False,
-) -> Tuple[mx.array, mx.array]:
-    B, S, Hk, Dk = key.shape
-    Hv, Dv = value.shape[2:]
-    inv_scale = Dk**-0.5
-    if use_qk_l2norm_in_kernel:
-        query = (inv_scale**2) * mx.fast.rms_norm(query, None, 1e-6)
-        key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
-    else:
-        query = inv_scale * query
-
-    input_type = query.dtype
-    if (repeat_factor := Hv // Hk) > 1:
-        query = mx.repeat(query, repeat_factor, 2)
-        key = mx.repeat(key, repeat_factor, 2)
-
-    beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
-    out = mx.zeros((B, S, Hv, Dv), dtype=input_type)
-    for i in range(S):
-        state *= g[:, i, :, None, None]
-        kv_mem = (state * key[:, i, :, :, None]).sum(axis=-2)
-        delta = (value[:, i] - kv_mem) * beta[:, i, :, None]
-        state += key[:, i, :, :, None] * delta[..., None, :]
-        out[:, i] = (state * query[:, i, :, :, None]).sum(axis=-2)
-    return out, state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -297,61 +251,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         ]
 
-        if cache is not None and cache[1] is not None:
+        if cache is not None:
             state = cache[1]
-        else:
-            state = mx.zeros(
-                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                dtype=inputs.dtype,
-            )
 
-        use_delta_kernel = os.getenv("MLXLM_DELTA_KERNEL", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        if use_delta_kernel:
-            # Match normalization and head expansion used in the sequential path
-            inv_scale = self.head_k_dim**-0.5
-            qn = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-            kn = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-            if self.num_v_heads // self.num_k_heads > 1:
-                rf = self.num_v_heads // self.num_k_heads
-                qn = mx.repeat(qn, rf, 2)
-                kn = mx.repeat(kn, rf, 2)
-            beta = mx.sigmoid(b)
-            g = compute_g(self.A_log, a, self.dt_bias)
-
-            if S > 1:
-                # Prefill path: [B,H,S,D] ordering for kernels
-                Q = qn.transpose(0, 2, 1, 3)
-                Kb = kn.transpose(0, 2, 1, 3)
-                Vb = v.transpose(0, 2, 1, 3)
-                Gb = g.transpose(0, 2, 1)
-                Bb = beta.transpose(0, 2, 1)
-                Y, new_state = gated_delta_prefill(Q, Kb, Vb, Gb, Bb, state)
-                out = Y.transpose(0, 2, 1, 3)
-            else:
-                y, new_state = gated_delta_step(
-                    qn[:, 0], kn[:, 0], v[:, 0], g[:, 0], beta[:, 0], state
-                )
-                out = y[:, None, ...]
-        else:
-            out, new_state = recurrent_gated_delta_rule(
-                q,
-                k,
-                v,
-                a,
-                b,
-                self.A_log,
-                self.dt_bias,
-                state,
-                use_qk_l2norm_in_kernel=True,
-            )
+        out, state = gated_delta_update(q, k, v, a, b, self.A_log, self.dt_bias, state)
 
         if cache is not None:
-            cache[1] = new_state
+            cache[1] = state
 
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))

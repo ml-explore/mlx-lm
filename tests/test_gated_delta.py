@@ -9,26 +9,6 @@ from mlx_lm.models.gated_delta import (
 
 
 class TestGatedDelta(unittest.TestCase):
-    def test_step_matches_manual(self):
-        B, H, Dk, Dv = 2, 3, 4, 5
-        q = mx.random.uniform(shape=(B, H, Dk))
-        k = mx.random.uniform(shape=(B, H, Dk))
-        v = mx.random.uniform(shape=(B, H, Dv))
-        g = mx.random.uniform(shape=(B, H))
-        beta = mx.random.uniform(shape=(B, H))
-        state = mx.random.uniform(shape=(B, H, Dk, Dv))
-
-        y_op, st_op = gated_delta_step_ops(q, k, v, g, beta, state)
-
-        st = state * g[..., None, None]
-        kv_mem = (st * k[..., :, None]).sum(axis=-2)
-        delta = (v - kv_mem) * beta[..., None]
-        st = st + k[..., :, None] * delta[..., None, :]
-        y = (st * q[..., :, None]).sum(axis=-2)
-
-        self.assertTrue(mx.allclose(y_op, y))
-        self.assertTrue(mx.allclose(st_op, st))
-
     def test_prefill_matches_step_loop(self):
         B, H, T, Dk, Dv = 1, 2, 6, 4, 3
         Q = mx.random.uniform(shape=(B, H, T, Dk))
