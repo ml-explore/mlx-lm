@@ -1852,7 +1852,6 @@ class TestModels(unittest.TestCase):
         mx.random.seed(0)
         for B in [1, 2]:
             for T in [1, 2]:
-                B = 1
                 Hk = 16
                 Hv = 32
                 Dk = 128
@@ -1869,6 +1868,37 @@ class TestModels(unittest.TestCase):
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_masked(self):
+        B = 1
+        T = 3
+        Hk = 16
+        Hv = 32
+        Dk = 128
+        Dv = 128
+
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(B, T, Hk, Dk))
+        k = mx.random.normal(shape=(B, T, Hk, Dk))
+        v = mx.random.normal(shape=(B, T, Hv, Dv))
+        g = mx.random.normal(shape=(B, T, Hv))
+        mask = mx.array([[False, True, True]])
+        beta = mx.random.normal(shape=(B, T, Hv))
+        state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+        y_gt, st_gt = gated_delta_ops(
+            q[:, 1:],
+            k[:, 1:],
+            v[:, 1:],
+            g[:, 1:],
+            beta[:, 1:],
+            state,
+        )
+        for fn in [gated_delta_ops, gated_delta_kernel]:
+            y, st = fn(q, k, v, g, beta, state, mask)
+            y = y[:, 1:]
+            self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+            self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":
