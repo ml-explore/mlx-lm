@@ -414,6 +414,8 @@ class DeepseekV2Model(nn.Module):
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         # Broadcast h while keeping it in the graph
         h = mx.distributed.all_gather(h)[: h.shape[0]]
