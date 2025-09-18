@@ -819,10 +819,14 @@ class BatchResponse:
     Args:
         texts: (List[str]): The generated text for each prompt.
         stats (BatchStats): Statistics about the generation.
+        tokens: (Optional[List[List[int]]]): The generated tokens for each prompt.
+        logprobs: (Optional[List[mx.array]]): The log probabilities for each token.
     """
 
     texts: List[str]
     stats: BatchStats
+    tokens: Optional[List[List[int]]] = None
+    logprobs: Optional[List[mx.array]] = None
 
 
 @dataclass
@@ -1054,6 +1058,8 @@ def batch_generate(
     prompts: List[int],
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
+    return_tokens: bool = False,
+    return_logprobs: bool = False,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1069,6 +1075,9 @@ def batch_generate(
           can be per prompt if a list is provided.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
+       return_tokens: when true returns the tokens.
+       return_logprobs: when true returns the logprobs.
+
     """
 
     gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
@@ -1080,6 +1089,8 @@ def batch_generate(
     with wired_limit(model, [generation_stream]):
         uids = gen.insert(prompts, max_tokens)
         results = {uid: [] for uid in uids}
+        logprobs_results = {uid: [] for uid in uids} if return_logprobs else {}
+
         while responses := gen.next():
             for r in responses:
                 if verbose and r.finish_reason != None:
@@ -1090,6 +1101,8 @@ def batch_generate(
                     )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+                    if return_logprobs:
+                        logprobs_results[r.uid].append(r.logprobs)
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
 
@@ -1105,7 +1118,14 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return BatchResponse(texts, stats)
+    
+    
+    tokens = [results[uid] for uid in uids] if return_tokens else None 
+    logprobs = [
+        mx.stack(logprobs_results[uid]) for uid in uids if uid in logprobs_results and logprobs_results[uid]
+    ] if return_logprobs else None
+    
+    return BatchResponse(texts, stats, tokens, logprobs)
 
 
 def main():

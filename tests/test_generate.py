@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import unittest
+from unittest.mock import patch, MagicMock
 from typing import List
 
 import mlx.core as mx
@@ -10,6 +11,7 @@ from mlx_lm.generate import (
     GenerationResponse,
     generate,
     stream_generate,
+    batch_generate
 )
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
@@ -301,6 +303,93 @@ class TestGenerate(unittest.TestCase):
             batch_tokens = batch_responses[uids[e]]
             self.assertEqual(tokens, batch_tokens)
 
+
+    @patch('mlx_lm.generate.BatchGenerator')
+    def test_batch_generate_with_return_tokens(self, mock_batch_generator_class):
+        """
+        Verify that when return_tokens=True, the BatchResponse object
+        contains the correct list of generated token IDs, excluding the stop token.
+        """
+        # --- Arrange ---
+        mock_generator_instance = mock_batch_generator_class.return_value
+        mock_generator_instance.insert.return_value = [0, 1]
+        
+        mock_generator_instance.next.side_effect = [
+            [
+                MagicMock(uid=0, token=101, finish_reason=None),
+                MagicMock(uid=1, token=201, finish_reason=None)
+            ],
+            [
+                MagicMock(uid=0, token=102, finish_reason="stop"), # This token will be excluded
+                MagicMock(uid=1, token=202, finish_reason="length") # This one will be included
+            ],
+            []
+        ]
+        mock_generator_instance.stats.return_value = MagicMock()
+        
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.decode.side_effect = ["text 1", "text 2"]
+        
+        prompts = [[1], [2]]
+
+        # --- Act ---
+        response = batch_generate(
+            self.model, mock_tokenizer, prompts, return_tokens=True
+        )
+
+        # --- Assert ---
+        self.assertIsNotNone(response.tokens)
+        self.assertEqual(len(response.tokens), 2)
+        # The test now correctly expects only the non-stop tokens
+        self.assertEqual(response.tokens[0], [101]) 
+        self.assertEqual(response.tokens[1], [201, 202])
+        self.assertIsNone(response.logprobs)
+
+    @patch('mlx_lm.generate.BatchGenerator')
+    def test_batch_generate_with_return_logprobs(self, mock_batch_generator_class):
+        """
+        Verify that when return_logprobs=True, the BatchResponse object
+        contains the correct log probabilities, excluding the stop token.
+        """
+        # --- Arrange ---
+        logprob1 = mx.array([-0.1, -2.3])
+        logprob2 = mx.array([-0.5, -1.5])
+        logprob3 = mx.array([-0.2, -2.0]) # This one will be excluded
+        logprob4 = mx.array([-0.8, -1.2])
+
+        mock_generator_instance = mock_batch_generator_class.return_value
+        mock_generator_instance.insert.return_value = [0, 1]
+        
+        mock_generator_instance.next.side_effect = [
+            [
+                MagicMock(uid=0, token=101, logprobs=logprob1, finish_reason=None),
+                MagicMock(uid=1, token=201, logprobs=logprob2, finish_reason=None)
+            ],
+            [
+                MagicMock(uid=0, token=102, logprobs=logprob3, finish_reason="stop"),
+                MagicMock(uid=1, token=202, logprobs=logprob4, finish_reason="length")
+            ],
+            []
+        ]
+        mock_generator_instance.stats.return_value = MagicMock()
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.decode.side_effect = ["text 1", "text 2"]
+
+        prompts = [[1], [2]]
+
+        # --- Act ---
+        response = batch_generate(
+            self.model, mock_tokenizer, prompts, return_logprobs=True
+        )
+
+        # --- Assert ---
+        self.assertIsNotNone(response.logprobs)
+        self.assertEqual(len(response.logprobs), 2)
+        # The test now correctly expects only the logprobs of the non-stop tokens
+        self.assertTrue(mx.allclose(response.logprobs[0], mx.stack([logprob1])))
+        self.assertTrue(mx.allclose(response.logprobs[1], mx.stack([logprob2, logprob4])))
+        self.assertIsNone(response.tokens)
 
 if __name__ == "__main__":
     unittest.main()
