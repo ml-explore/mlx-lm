@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -55,10 +56,10 @@ class Attention(nn.Module):
 
     def __call__(
         self,
-        x,
-        mask=None,
-        cache=None,
-    ):
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
         B, L, D = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
@@ -79,23 +80,21 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
 
 class MLP(nn.Module):
-    """Standard LLaMA-style gated MLP (SwiGLU)."""
-
     def __init__(self, dim, intermediate_size, activation=nn.silu):
         super().__init__()
         self.gate_proj = nn.Linear(dim, intermediate_size, bias=False)
         self.up_proj = nn.Linear(dim, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, dim, bias=False)
 
-    def __call__(self, x):
+    def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -114,12 +113,13 @@ class TransformerBlock(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
 
-    def __call__(self, x, mask=None, cache=None):
-        r = self.self_attn(
-            self.input_layernorm(x),
-            mask,
-            cache,
-        )
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.feed_forward(self.post_attention_layernorm(h))
         return h + r
@@ -131,14 +131,17 @@ class LanguageModel(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        # Plain Python list is fine in MLX
         self.layers = [
             TransformerBlock(args=args, use_rope=args.no_rope_layers[i])
             for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs, cache=None):
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
         h = self.embed_tokens(inputs)
 
         if cache is None:
@@ -165,8 +168,8 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-    ):
+        cache: Optional[Any] = None,
+    ) -> mx.array:
         h = self.model(inputs, cache)
         if self.tie_word_embeddings:
             return h @ self.model.embed_tokens.weight.T

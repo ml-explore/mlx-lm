@@ -10,6 +10,7 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
 from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
@@ -1846,6 +1847,27 @@ class TestModels(unittest.TestCase):
         out_m = out_m[:, pad:]
         self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
+
+    def test_gated_delta(self):
+        for B in [1, 2]:
+            for T in [1, 2]:
+                B = 1
+                Hk = 16
+                Hv = 32
+                Dk = 128
+                Dv = 128
+
+                q = mx.random.normal(shape=(B, T, Hk, Dk))
+                k = mx.random.normal(shape=(B, T, Hk, Dk))
+                v = mx.random.normal(shape=(B, T, Hv, Dv))
+                g = mx.random.normal(shape=(B, T, Hv))
+                beta = mx.random.normal(shape=(B, T, Hv))
+                state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+                y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
+                y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
+                self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":
