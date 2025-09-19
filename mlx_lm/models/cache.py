@@ -89,7 +89,7 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
     return all(c.is_trimmable() for c in cache)
 
 
-def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
+def trim_prompt_cache(cache: List[Any], num_tokens: int) -> int:
     """
     Trim the model's cache by the given number of tokens.
 

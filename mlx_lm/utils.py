@@ -132,9 +132,36 @@ def load_config(model_path: Path) -> dict:
     try:
         with open(model_path / "config.json", "r") as f:
             config = json.load(f)
+            add_generation_config(model_path, config)
     except FileNotFoundError:
-        logging.error(f"Config file not found in {model_path}")
+        logging.error(f"Config file not found in {model_path}: config.json")
         raise
+    return config
+
+
+def add_generation_config(model_path: Path, config: dict) -> dict:
+    """
+    Add keys like "temperature" from generation_config to config, skipping already configured keys (additive).
+    """
+    try:
+        with open(model_path / "generation_config.json") as f:
+            generation_config = json.load(f)
+            differences = {}
+            for k, v in generation_config.items():
+                # skip hidden keys like _from_model_config and already configured keys
+                if k.startswith('_'):  # hidden key
+                    continue
+                if k in config:  # key already configured
+                    if config[k] != v:
+                        differences[k] = (v, config[k])
+                else:
+                    config[k] = v
+            if differences:
+                diff = [f"{k}: {v1} -> {v2}" for k, (v1, v2) in sorted(differences.items())]
+                # See transformers.configuration_utils.PretrainedConfig.save_pretrained()
+                logging.warning(f"Non-default generation parameters in config.json override generation_config.json:\n{'\n'.join(diff)}")
+    except FileNotFoundError:
+        logging.info(f"Config file not found in {model_path}: generation_config.json")
     return config
 
 
