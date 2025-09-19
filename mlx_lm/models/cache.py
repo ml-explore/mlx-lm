@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import copy
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -73,7 +74,7 @@ def load_prompt_cache(file_name, return_metadata=False):
     arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
-    cache = [globals()[c]() for c in classes]
+    cache = [globals()[c].__new__(globals()[c]) for c in classes]
     for c, state, meta_state in zip(cache, arrays, info):
         c.state = state
         c.meta_state = meta_state
@@ -188,11 +189,12 @@ class ConcatenateKVCache(_BaseCache):
 
 
 class QuantizedKVCache(_BaseCache):
+    step = 256
+
     def __init__(self, group_size: int = 64, bits: int = 8):
         self.keys = None
         self.values = None
         self.offset = 0
-        self.step = 256
         self.group_size = group_size
         self.bits = bits
 
@@ -254,11 +256,11 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.step, self.offset, self.group_size, self.bits)))
+        return tuple(map(str, (self.offset, self.group_size, self.bits)))
 
     @meta_state.setter
     def meta_state(self, v):
-        self.step, self.offset, self.group_size, self.bits = map(int, v)
+        self.offset, self.group_size, self.bits = map(int, v)
 
     def is_trimmable(self):
         return True
@@ -273,11 +275,12 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
+    step = 256
+
     def __init__(self):
         self.keys = None
         self.values = None
         self.offset = 0
-        self.step = 256
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
@@ -341,14 +344,14 @@ class KVCache(_BaseCache):
 
 
 class RotatingKVCache(_BaseCache):
+    step = 256
 
-    def __init__(self, max_size=None, keep=0, step=256):
+    def __init__(self, max_size, keep=0):
         self.keep = keep
         self.keys = None
         self.values = None
         self.offset = 0
         self.max_size = max_size
-        self.step = step
         self._idx = 0
 
     def _trim(self, trim_size, v, append=None):
@@ -389,9 +392,9 @@ class RotatingKVCache(_BaseCache):
             self.keys = self._temporal_order(self.keys)
             self.values = self._temporal_order(self.values)
 
-            # The largest size is self.max_size + S to ensure
+            # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
-            trim_size = self._idx - self.max_size
+            trim_size = self._idx - self.max_size + 1
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
         self.offset += keys.shape[2]
@@ -459,13 +462,11 @@ class RotatingKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(
-            map(str, (self.keep, self.max_size, self.step, self.offset, self._idx))
-        )
+        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
 
     @meta_state.setter
     def meta_state(self, v):
-        self.keep, self.max_size, self.step, self.offset, self._idx = map(
+        self.keep, self.max_size, self.offset, self._idx = map(
             int,
             v,
         )
@@ -487,7 +488,7 @@ class RotatingKVCache(_BaseCache):
     ):
         if N > 1:
             window_size = window_size or self.max_size
-            offset = min(self.max_size, self.offset)
+            offset = min(self.max_size - 1, self.offset)
             if offset + N > window_size or return_array:
                 return create_causal_mask(N, offset, window_size=window_size)
             else:
@@ -509,7 +510,7 @@ class RotatingKVCache(_BaseCache):
 class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
-        self.left_padding = left_padding
+        self.left_padding = mx.array(left_padding) if left_padding else None
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -552,7 +553,7 @@ class MambaCache(ArraysCache):
 
 
 class ChunkedKVCache(KVCache):
-    def __init__(self, chunk_size=None):
+    def __init__(self, chunk_size):
         super().__init__()
         self.chunk_size = chunk_size
         self.start_position = 0
@@ -633,6 +634,8 @@ class CacheList(KVCache):
 
 
 class BatchKVCache(_BaseCache):
+    step = 256
+
     def __init__(self, left_padding: List[int]):
         """
         The BatchKV cache expects inputs to be left-padded.
@@ -657,7 +660,6 @@ class BatchKVCache(_BaseCache):
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-l for l in left_padding])
         self._idx = 0
-        self.step = 256
 
     def update_and_fetch(self, keys, values):
         prev = self._idx
@@ -753,6 +755,229 @@ class BatchKVCache(_BaseCache):
             return k, v, c.offset, left_padding
 
         self.keys, self.values, self.offset, self.left_padding = map(
+            mx.concatenate, zip(*(pad(self), pad(other)))
+        )
+        self._idx = max_idx
+
+
+class BatchRotatingKVCache(_BaseCache):
+    step = 256
+
+    def __init__(self, max_size, left_padding: List[int]):
+        self.keys = None
+        self.values = None
+
+        self.pad_end = mx.array(left_padding)
+        self.pad_start = mx.zeros_like(self.pad_end)
+        self.offset = mx.array([-l for l in left_padding])
+
+        self.max_size = max_size
+        self._idx = 0
+        self._offset = 0
+        self.rotated = False
+
+    def _trim(self, trim_size, v, append=None):
+        if trim_size > 0:
+            v = v[..., trim_size:, :]
+        if append is not None:
+            return mx.concatenate([v, append], axis=2)
+        return v
+
+    def _temporal_order(self):
+        """
+        Rearrange the cache into temporal order.
+        """
+        if self.rotated:
+            self.keys = mx.roll(self.keys, self._idx, axis=2)
+            self.values = mx.roll(self.values, self._idx, axis=2)
+            self.pad_start -= self._idx
+            self.pad_end -= self._idx
+            self._idx = self.keys.shape[2]
+            self.rotated = False
+
+    def _update_concat(self, keys, values):
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+        else:
+            # Put the keys/values in temporal order to
+            # preserve context
+            self._temporal_order()
+
+            # Slice off the end if needed
+            if self.keys.shape[2] > self._idx:
+                self.keys = self.keys[..., : self._idx, :]
+                self.values = self.values[..., : self._idx, :]
+
+            # The largest size is self.max_size + S - 1 to ensure
+            # every token gets at least self.max_size context
+            trim_size = self._idx - self.max_size + 1
+            self.pad_end -= trim_size
+            self.keys = self._trim(trim_size, self.keys, keys)
+            self.values = self._trim(trim_size, self.values, values)
+        self.offset += keys.shape[2]
+        self._offset += keys.shape[2]
+        self._idx = self.keys.shape[2]
+        return self.keys, self.values
+
+    def _update_in_place(self, keys, values):
+        # May not have hit the max size yet, so potentially
+        # keep growing the cache
+        B, n_kv_heads, S, k_head_dim = keys.shape
+        prev = self._offset
+        if self.keys is None or (
+            prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size
+        ):
+            v_head_dim = values.shape[3]
+            new_size = min(self.step, self.max_size - prev)
+            k_shape = (B, n_kv_heads, new_size, k_head_dim)
+            v_shape = (B, n_kv_heads, new_size, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+            self._idx = prev
+
+        # Trim if needed
+        trim_size = self.keys.shape[2] - self.max_size
+        if trim_size > 0:
+            self.keys = self._trim(trim_size, self.keys)
+            self.values = self._trim(trim_size, self.values)
+            self._idx = self.max_size
+            self.pad_end -= trim_size
+
+        # Rotate
+        if self._idx == self.max_size:
+            self.rotated = True
+            self._idx = 0
+        if self.rotated:
+            self.pad_start += S
+
+        # Assign
+        self.keys[..., self._idx : self._idx + S, :] = keys
+        self.values[..., self._idx : self._idx + S, :] = values
+        self._offset += S
+        self.offset += S
+        self._idx += S
+
+        # If the buffer is not full, slice off the end
+        if self._offset < self.max_size:
+            return (
+                self.keys[..., : self._offset, :],
+                self.values[..., : self._offset, :],
+            )
+        return self.keys, self.values
+
+    def update_and_fetch(self, keys, values):
+        if keys.shape[2] == 1:
+            return self._update_in_place(keys, values)
+        return self._update_concat(keys, values)
+
+    @property
+    def state(self):
+        k, v = self.keys, self.values
+        if self._offset < k.shape[2]:
+            k, v = k[..., : self._offset, :], v[..., : self._offset, :]
+        return k, v, self.offset, self.pad_start, self.pad_end
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.offset, self.pad_start, self.pad_end = v
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.max_size, self._offset, self._idx, self.rotated)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.max_size, self._offset, self._idx = map(
+            int,
+            v[:3],
+        )
+        self.rotated = bool(v[3])
+
+    def is_trimmable(self):
+        return self._offset < self.max_size
+
+    def trim(self, n):
+        n = min(self._offset, n)
+        self._offset -= n
+        self._idx -= n
+        self.offset -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        raise NotImplementedError("BatchRotatingKVCache Quantization NYI")
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        pad_end = self.pad_end
+        pad_start = self.pad_start
+
+        # Compute the padding after the next update of size N
+        trim_size = self._idx - self.max_size + int(N > 1)
+        if trim_size > 0:
+            pad_end = pad_end - trim_size
+        if N == 1 and (self.rotated or self._idx >= self.max_size):
+            pad_start = pad_start + 1
+        # TODO if N > 1 and it's rotated, the padding will change drastically
+
+        window_size = window_size or self.max_size
+        offset = min(self.max_size - 1, self._offset)
+
+        rinds = mx.arange(offset + N)
+        linds = mx.arange(offset, offset + N) if offset else rinds
+        linds = linds[:, None]
+        rinds = rinds[None]
+        mask = linds >= rinds
+        mask &= linds < rinds + window_size
+        mask &= (rinds < mx.expand_dims(pad_start, (1, 2, 3))) | (
+            rinds >= mx.expand_dims(pad_end, (1, 2, 3))
+        )
+        return mask
+
+    def filter(self, batch_indices):
+        """
+        In-place filter to keep just the given indices in the cache.
+        """
+        self.keys = self.keys[batch_indices]
+        self.values = self.values[batch_indices]
+        self.offset = self.offset[batch_indices]
+        self.pad_start = self.pad_start[batch_indices]
+        self.pad_end = self.pad_end[batch_indices]
+
+    def extend(self, other):
+        """
+        In-place extend this cache with the other cache.
+        """
+        if self._idx != other._idx:
+            self._temporal_order()
+            other._temporal_order()
+
+        max_idx = max(self._idx, other._idx)
+        max_size = max(self.keys.shape[2], other.keys.shape[2])
+
+        def pad(c):
+            left = max_idx - c._idx
+            right = max_size - c.keys.shape[2] - left
+            k, v = c.keys, c.values
+            if right < 0:
+                k = k[..., :right, :]
+                v = v[..., :right, :]
+                right = 0
+            if left != 0 or right != 0:
+                pad = [(0, 0), (0, 0), (left, right), (0, 0)]
+                k = mx.pad(k, pad)
+                v = mx.pad(v, pad)
+            pad_start = c.pad_start
+            pad_end = c.pad_end + left
+            return k, v, c.offset, pad_start, pad_end
+
+        self.keys, self.values, self.offset, self.pad_start, self.pad_end = map(
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx

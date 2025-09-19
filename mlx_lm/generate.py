@@ -26,8 +26,10 @@ from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchRotatingKVCache,
     KVCache,
     QuantizedKVCache,
+    RotatingKVCache,
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
@@ -866,6 +868,12 @@ def _make_cache(model, left_padding):
             elif isinstance(c, ArraysCache):
                 c.left_padding = mx.array(left_padding)
                 batch_cache.append(c)
+            elif isinstance(c, RotatingKVCache):
+                if c.keep > 0:
+                    raise ValueError(
+                        "RotatingKVCache with keep tokens is not supported."
+                    )
+                batch_cache.append(BatchRotatingKVCache(c.max_size, left_padding))
             else:
                 raise ValueError(f"{type(c)} does not yet support batching")
         return batch_cache

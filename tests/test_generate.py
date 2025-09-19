@@ -11,6 +11,7 @@ from mlx_lm.generate import (
     generate,
     stream_generate,
 )
+from mlx_lm.models.cache import RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -300,6 +301,53 @@ class TestGenerate(unittest.TestCase):
 
             batch_tokens = batch_responses[uids[e]]
             self.assertEqual(tokens, batch_tokens)
+
+    def test_batch_sliding_window(self):
+        prompts = [
+            "Write a story about Einstein",
+            "Hi",
+            "What time is it?",
+            "How tall is Mt Everest?",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        self.model.make_cache = lambda: [
+            RotatingKVCache(max_size=4) for _ in self.model.layers
+        ]
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=10,
+            prefill_batch_size=2,
+            prefill_step_size=8,
+        )
+        uids = batch_gen.insert(prompts)
+        batch_responses = []
+        while responses := batch_gen.next():
+            for r in responses:
+                if r.uid == uids[2]:
+                    batch_responses.append(r.logprobs)
+
+        for i, response in enumerate(
+            stream_generate(
+                self.model,
+                self.tokenizer,
+                prompts[2],
+                max_tokens=10,
+            )
+        ):
+            batch_logprobs = batch_responses[i]
+            logprobs = response.logprobs
+            self.assertTrue(mx.allclose(batch_logprobs, logprobs))
+
+        del self.model.make_cache
 
 
 if __name__ == "__main__":
