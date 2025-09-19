@@ -187,11 +187,11 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        global_mask = create_attention_mask(h, cache[0])
+        global_mask = create_attention_mask(h, cache[self.sliding_window_pattern - 1])
 
         sliding_window_mask = create_attention_mask(
             h,
-            cache[self.sliding_window_pattern - 1],
+            cache[0],
             window_size=self.window_size,
         )
 

@@ -25,7 +25,8 @@ def create_causal_mask(
     N: int,
     offset: int = 0,
     window_size: Optional[int] = None,
-    lengths: Optional[mx.array] = None,
+    right_padding: Optional[mx.array] = None,
+    left_padding: Optional[mx.array] = None,
 ):
     rinds = mx.arange(offset + N)
     linds = mx.arange(offset, offset + N) if offset else rinds
@@ -34,9 +35,10 @@ def create_causal_mask(
     mask = linds >= rinds
     if window_size is not None:
         mask = mask & (linds < rinds + window_size)
-    if lengths is not None:
-        lengths = lengths[:, None, None, None]
-        mask = mask & (rinds < lengths)
+    if right_padding is not None:
+        mask = mask & (rinds < mx.expand_dims((offset + N) - right_padding, (1, 2, 3)))
+    if left_padding is not None:
+        mask = mask & (mx.expand_dims(left_padding, (1, 2, 3)) <= rinds)
     return mask
 
 
@@ -51,6 +53,12 @@ def create_attention_mask(
     if return_array or (window_size and N > window_size):
         return create_causal_mask(N, window_size=window_size)
     return "causal"
+
+
+def create_ssm_mask(h, cache=None):
+    if cache and hasattr(cache, "make_mask"):
+        return cache.make_mask(h.shape[1])
+    return None
 
 
 def quantized_scaled_dot_product_attention(

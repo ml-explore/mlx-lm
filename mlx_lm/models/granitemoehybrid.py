@@ -6,10 +6,15 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, MambaCache
 from .rope_utils import initialize_rope
-from .ssm import ssm_step, ssm_step_ops
+from .ssm import ssm_update
 from .switch_layers import SwitchGLU
 
 
@@ -130,24 +135,18 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache] = None,
+        state: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
+        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
 
-        if cache is not None and cache[1] is not None:
-            state = cache[1]
-        else:
-            state = mx.zeros(
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
-                hidden_states.dtype,
-            )
-
-        ssm_fn = ssm_step if seq_len == 1 else ssm_step_ops
-        y, state = ssm_fn(
+        y, state = ssm_update(
             hidden_states,
             self.A_log,
             B,
@@ -157,15 +156,15 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             self.dt_bias,
             state,
             self.time_step_limit,
+            mask,
         )
 
-        if cache is not None:
-            cache[1] = state
-        return y.reshape(batch_size, seq_len, self.intermediate_size)
+        return y.reshape(batch_size, seq_len, self.intermediate_size), state
 
     def __call__(
         self,
         hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
         cache: Optional[MambaCache] = None,
     ) -> mx.array:
 
@@ -177,6 +176,8 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             axis=-1,
         )
 
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
         conv_output = self._apply_conv(conv_input, cache)
 
         hidden_states_ssm, B, C = mx.split(
@@ -187,7 +188,10 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             ],
             axis=-1,
         )
-        y = self._ssm(hidden_states_ssm, B, C, dt, cache)
+        state = cache[1] if cache else None
+        y, state = self._ssm(hidden_states_ssm, B, C, dt, state, mask)
+        if cache:
+            cache[1] = state
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -342,7 +346,7 @@ class GraniteMoeHybridLayer(nn.Module):
         hidden_states = self.input_layernorm(x)
 
         if self.layer_type == "mamba":
-            hidden_states = self.mamba(hidden_states, cache=cache)
+            hidden_states = self.mamba(hidden_states, mask=mask, cache=cache)
         else:
             hidden_states = self.self_attn(hidden_states, mask=mask, cache=cache)
 
@@ -372,6 +376,7 @@ class GraniteMoeHybridModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.embedding_multiplier = args.embedding_multiplier
         self.fa_idx = args.layer_types.index("attention")
+        self.ssm_idx = args.layer_types.index("mamba")
         self.layer_types = args.layer_types
 
     def __call__(
@@ -385,10 +390,11 @@ class GraniteMoeHybridModel(nn.Module):
             cache = [None] * len(self.layers)
 
         attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        mamba_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
         cache_counter = 0
         for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
-            mask = attn_mask if layer.layer_type == "attention" else None
+            mask = attn_mask if layer.layer_type == "attention" else mamba_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         return self.norm(hidden_states)

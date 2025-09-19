@@ -88,6 +88,7 @@ def linear_to_lora_layers(
         "mistral",
         "mistral3",
         "llama",
+        "llama4_text",
         "lfm2",
         "phi",
         "mixtral",
@@ -116,6 +117,7 @@ def linear_to_lora_layers(
         "olmoe",
         "internlm3",
         "glm4",
+        "glm",
         "mimo",
         "ernie4_5",
         "dots1",
@@ -193,6 +195,11 @@ def linear_to_lora_layers(
             "mixer.in_proj",
             "mixer.x_proj",
             "mixer.dt_proj",
+            "mixer.out_proj",
+        }
+    elif model.model_type == "mamba2":
+        keys = {
+            "mixer.in_proj",
             "mixer.out_proj",
         }
     elif model.model_type == "exaone":

@@ -455,9 +455,7 @@ def quantize_model(
     group_size: int,
     bits: int,
     mode: str = "affine",
-    quant_predicate: Optional[
-        Callable[[str, nn.Module, dict], Union[bool, dict]]
-    ] = None,
+    quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
@@ -468,11 +466,10 @@ def quantize_model(
         group_size (int): Group size for quantization.
         bits (int): Bits per weight for quantization.
         mode (str): The quantization mode.
-        quant_predicate (Callable): A callable that decides how
-            to quantize each layer based on the path.
-            Accepts the layer `path`, the `module` and the model `config`.
-            Returns either a bool to signify quantize/no quantize or
-            a dict of quantization parameters to pass to `to_quantized`.
+        quant_predicate (Callable): A callable that decides how to quantize
+          each layer based on the path. Accepts the layer `path` and the
+          `module`. Returns either a bool to signify quantize/no quantize or
+          a dict of quantization parameters to pass to `to_quantized`.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
