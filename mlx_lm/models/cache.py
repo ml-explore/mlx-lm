@@ -788,8 +788,8 @@ class BatchRotatingKVCache(_BaseCache):
         Rearrange the cache into temporal order.
         """
         if self.rotated:
-            self.keys = mx.roll(self.keys, self._idx, axis=2)
-            self.values = mx.roll(self.values, self._idx, axis=2)
+            self.keys = mx.roll(self.keys, -self._idx, axis=2)
+            self.values = mx.roll(self.values, -self._idx, axis=2)
             self.pad_start -= self._idx
             self.pad_end -= self._idx
             self._idx = self.keys.shape[2]
@@ -954,7 +954,7 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
-        if self._idx != other._idx:
+        if (self.rotated != other.rotated) or self._idx != other._idx:
             self._temporal_order()
             other._temporal_order()
 
@@ -981,3 +981,4 @@ class BatchRotatingKVCache(_BaseCache):
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx
+        self._offset = max(self._offset, other._offset)
