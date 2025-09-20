@@ -30,6 +30,8 @@ To see a full list of options run:
 mlx_lm.server --help
 ```
 
+## Chat completions API
+
 You can make a request to the model by running:
 
 ```shell
@@ -128,7 +130,23 @@ curl localhost:8080/v1/chat/completions \
     - `completion_tokens`: The number of tokens generated.
     - `total_tokens`: The total number of tokens, i.e. the sum of the above two fields.
 
-### List Models
+## Responses API
+
+The responses API follows the [OpenAI responses API
+spec](https://platform.openai.com/docs/quickstart?api-mode=responses)
+
+To make a request, use the `/reponses` endpoint. For exapmle:
+
+```shell
+curl localhost:8080/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+     "input": [{"role": "user", "content": "Say this is a test!"}],
+     "temperature": 0.7
+   }'
+```
+
+## Models API
 
 Use the `v1/models` endpoint to list available models:
 

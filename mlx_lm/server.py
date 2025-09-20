@@ -279,6 +279,8 @@ class APIHandler(BaseHTTPRequestHandler):
         endpoints = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
+            "/responses": self.handle_responses,
+            "/v1/responses": self.handle_responses,
             "/chat/completions": self.handle_chat_completions,
         }
 
@@ -328,6 +330,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self.max_tokens = self.body.get(
                 "max_tokens", self.model_provider.cli_args.max_tokens
             )
+
         self.temperature = self.body.get(
             "temperature", self.model_provider.cli_args.temp
         )
@@ -492,6 +495,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 "id": None,
             }
 
+        if self.stream and self.object_type == "response" and finish_reason is None:
+            return {
+                "type": "response.output_text.delta",
+                "delta": text,
+                # TODO, these need valid values
+                "sequence_number": None,
+                "item_id": None,
+                "output_index": 1,
+                "content_index": 0,
+                "logprobs": [],
+            }
+
         # Static response
         response = {
             "id": self.request_id,
@@ -499,13 +514,27 @@ class APIHandler(BaseHTTPRequestHandler):
             "object": self.object_type,
             "model": self.requested_model,
             "created": self.created,
-            "choices": [
-                {
-                    "index": 0,
-                    "finish_reason": finish_reason,
-                },
-            ],
         }
+
+        if self.object_type == "response":
+            response["output"] = [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"text": text, "type": "output_text"}],
+                }
+            ]
+            if self.stream:
+                return {"response": response, "type": "response.completed"}
+
+            return response
+
+        response["choices"] = [
+            {
+                "index": 0,
+                "finish_reason": finish_reason,
+            },
+        ]
 
         if token_logprobs or top_logprobs or tokens:
             response["choices"][0]["logprobs"] = {
@@ -862,6 +891,36 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt = convert_chat(body["messages"], body.get("role_mapping"))
             prompt = self.tokenizer.encode(prompt)
 
+        return prompt
+
+    def handle_responses(self) -> List[int]:
+        body = self.body
+        system_prompt = body.get("instructions")
+        prompt = body["input"]
+        tools = body.get("tools")
+        messages = []
+        if system_prompt:
+            messages = [{"role": "system", "content": system_prompt}]
+        if isinstance(prompt, list):
+            for message in prompt:
+                content = message["content"]
+                if isinstance(content, list):
+                    if len(content) != 1 or content[0]["type"] != "input_text":
+                        raise ValueError("Unsupported content type.")
+                    message["content"] = content[0]["text"]
+                messages.append(message)
+        else:
+            messages.append({"role": "user", "content": prompt})
+
+        # Determine response type
+        self.request_id = f"resp_{uuid.uuid4()}"
+        self.object_type = "response"
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            **self.model_provider.cli_args.chat_template_args,
+        )
         return prompt
 
     def handle_text_completions(self) -> List[int]:
