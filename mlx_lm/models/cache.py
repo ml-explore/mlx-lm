@@ -501,10 +501,13 @@ class RotatingKVCache(_BaseCache):
                 idx = self._idx
                 if idx >= self.max_size:
                     idx = 0
-                mask_size = min(self.max_size, self.offset)
+                if self.offset < self.max_size:
+                    mask_size = self.offset + 1
+                else:
+                    mask_size = self.max_size
                 mask = mx.arange(mask_size) >= (mask_size - window_size)
                 mask = mx.roll(mask, shift=idx + 1)
-                return mask[:, None]
+                return mask
 
 
 class ArraysCache(_BaseCache):
@@ -812,7 +815,8 @@ class BatchRotatingKVCache(_BaseCache):
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
             trim_size = self._idx - self.max_size + 1
-            self.pad_end -= trim_size
+            if trim_size > 0:
+                self.pad_end -= trim_size
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
         self.offset += keys.shape[2]
@@ -917,7 +921,6 @@ class BatchRotatingKVCache(_BaseCache):
     ):
         pad_end = self.pad_end
         pad_start = self.pad_start
-
         # Compute the padding after the next update of size N
         trim_size = self._idx - self.max_size + int(N > 1)
         if trim_size > 0:
@@ -935,6 +938,13 @@ class BatchRotatingKVCache(_BaseCache):
         rinds = rinds[None]
         mask = linds >= rinds
         mask &= linds < rinds + window_size
+
+        if N == 1 and (self.rotated or self._idx >= self.max_size):
+            idx = self._idx
+            if idx >= self.max_size:
+                idx = 0
+            mask = mx.roll(mask, shift=idx + 1)
+
         mask &= (rinds < mx.expand_dims(pad_start, (1, 2, 3))) | (
             rinds >= mx.expand_dims(pad_end, (1, 2, 3))
         )

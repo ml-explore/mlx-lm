@@ -406,7 +406,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(mask, None)
 
         mask = cache.make_mask(1, window_size=5)
-        self.assertEqual(mask.squeeze(1).tolist(), [True] + [False] * 3 + [True] * 4)
+        self.assertEqual(mask.tolist(), [True] + [False] * 3 + [True] * 4)
         cmask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
         self.assertTrue(mx.array_equal(cmask, mask))
 
@@ -414,9 +414,7 @@ class TestPromptCache(unittest.TestCase):
         cache.update_and_fetch(kv, kv)
 
         mask = cache.make_mask(1, window_size=5)
-        self.assertEqual(
-            mask.squeeze(1).tolist(), [True] * 2 + [False] * 3 + [True] * 3
-        )
+        self.assertEqual(mask.tolist(), [True] * 2 + [False] * 3 + [True] * 3)
         cmask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
         self.assertTrue(mx.array_equal(cmask, mask))
 
