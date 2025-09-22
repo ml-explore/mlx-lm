@@ -37,7 +37,7 @@ class TestModels(unittest.TestCase):
 
     def test_rotating_kv_cache(self):
         b, h, d = 1, 2, 32
-        cache = RotatingKVCache(max_size=8, step=4)
+        cache = RotatingKVCache(max_size=8)
 
         k = mx.random.uniform(shape=(b, h, 2, d))
         v = mx.random.uniform(shape=(b, h, 2, d))
@@ -70,7 +70,7 @@ class TestModels(unittest.TestCase):
             idx %= 8
 
         # Try with nonzero keep
-        cache = RotatingKVCache(max_size=8, step=4, keep=2)
+        cache = RotatingKVCache(max_size=8, keep=2)
 
         # Check a large update
         k = mx.random.uniform(shape=(b, h, 20, d))
@@ -98,7 +98,7 @@ class TestModels(unittest.TestCase):
         # alternating prompt/prefill with generation
         d = 4
         h = 2
-        cache = RotatingKVCache(max_size=18, step=4)
+        cache = RotatingKVCache(max_size=18)
 
         x = mx.random.uniform(shape=(1, h, 8, d))
         k, v = cache.update_and_fetch(x, x)

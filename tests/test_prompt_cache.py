@@ -509,6 +509,28 @@ class TestPromptCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
         cache.extend(other)
 
+        # Check mask when going from prompt -> extend -> prompt
+        cache = BatchRotatingKVCache(max_size=8, left_padding=[4])
+        k, v = mx.zeros((1, 1, 8, 8)), mx.zeros((1, 1, 8, 8))
+        cache.update_and_fetch(k, v)
+
+        mask = cache.make_mask(1)
+        self.assertEqual(
+            mask.squeeze().tolist(), [True, False, False, False, True, True, True, True]
+        )
+
+        k, v = mx.zeros((1, 1, 1, 8)), mx.zeros((1, 1, 1, 8))
+        cache.update_and_fetch(k, v)
+
+        mask = cache.make_mask(2)
+        expected = mx.array(
+            [
+                [False, False, False, True, True, True, True, True, False],
+                [False, False, False, True, True, True, True, True, True],
+            ]
+        )
+        self.assertTrue(mx.array_equal(mask.squeeze(), expected))
+
     def test_save_load_batch_caches(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 

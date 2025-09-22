@@ -792,7 +792,6 @@ class BatchRotatingKVCache(_BaseCache):
         if self.rotated:
             self.keys = mx.roll(self.keys, -self._idx, axis=2)
             self.values = mx.roll(self.values, -self._idx, axis=2)
-            self.left_padding -= self._idx
             self._idx = self.keys.shape[2]
             self.rotated = False
 
@@ -918,12 +917,8 @@ class BatchRotatingKVCache(_BaseCache):
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
     ):
         left_padding = self.left_padding
-        # Compute the padding after the next update of size N
-        # TODO if N > 1 and it's rotated, the padding will change drastically
-
         window_size = window_size or self.max_size
         offset = min(self.max_size - 1, self._offset)
-
         rinds = mx.arange(offset + N)
         linds = mx.arange(offset, offset + N) if offset else rinds
         linds = linds[:, None]
