@@ -325,27 +325,30 @@ class TestGenerate(unittest.TestCase):
             self.model,
             stop_tokens=self.tokenizer.eos_token_ids,
             max_tokens=10,
-            prefill_batch_size=2,
+            prefill_batch_size=1,
             prefill_step_size=8,
+            completion_batch_size=2,
         )
         uids = batch_gen.insert(prompts)
-        batch_responses = []
+        batch_responses = {uid: [] for uid in uids}
         while responses := batch_gen.next():
             for r in responses:
-                if r.uid == uids[2]:
-                    batch_responses.append(r.logprobs)
+                batch_responses[r.uid].append(r.logprobs)
 
-        for i, response in enumerate(
-            stream_generate(
-                self.model,
-                self.tokenizer,
-                prompts[2],
-                max_tokens=10,
-            )
-        ):
-            batch_logprobs = batch_responses[i]
-            logprobs = response.logprobs
-            self.assertTrue(mx.allclose(batch_logprobs, logprobs))
+        for e, uid in enumerate(uids):
+            for i, response in enumerate(
+                stream_generate(
+                    self.model,
+                    self.tokenizer,
+                    prompts[e],
+                    max_tokens=10,
+                )
+            ):
+                batch_logprobs = batch_responses[uid][i]
+                logprobs = response.logprobs
+                self.assertTrue(
+                    mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
+                )
 
         del self.model.make_cache
 

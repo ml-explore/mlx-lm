@@ -770,8 +770,7 @@ class BatchRotatingKVCache(_BaseCache):
         self.keys = None
         self.values = None
 
-        self.pad_end = mx.array(left_padding)
-        self.pad_start = mx.zeros_like(self.pad_end)
+        self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-l for l in left_padding])
 
         self.max_size = max_size
@@ -793,8 +792,7 @@ class BatchRotatingKVCache(_BaseCache):
         if self.rotated:
             self.keys = mx.roll(self.keys, -self._idx, axis=2)
             self.values = mx.roll(self.values, -self._idx, axis=2)
-            self.pad_start -= self._idx
-            self.pad_end -= self._idx
+            self.left_padding -= self._idx
             self._idx = self.keys.shape[2]
             self.rotated = False
 
@@ -816,7 +814,7 @@ class BatchRotatingKVCache(_BaseCache):
             # every token gets at least self.max_size context
             trim_size = self._idx - self.max_size + 1
             if trim_size > 0:
-                self.pad_end -= trim_size
+                self.left_padding -= trim_size
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
         self.offset += keys.shape[2]
@@ -851,14 +849,14 @@ class BatchRotatingKVCache(_BaseCache):
             self.keys = self._trim(trim_size, self.keys)
             self.values = self._trim(trim_size, self.values)
             self._idx = self.max_size
-            self.pad_end -= trim_size
+            self.left_padding -= trim_size
 
         # Rotate
         if self._idx == self.max_size:
             self.rotated = True
             self._idx = 0
         if self.rotated:
-            self.pad_start += S
+            self.left_padding -= S
 
         # Assign
         self.keys[..., self._idx : self._idx + S, :] = keys
@@ -885,11 +883,11 @@ class BatchRotatingKVCache(_BaseCache):
         k, v = self.keys, self.values
         if self._offset < k.shape[2]:
             k, v = k[..., : self._offset, :], v[..., : self._offset, :]
-        return k, v, self.offset, self.pad_start, self.pad_end
+        return k, v, self.offset, self.left_padding
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset, self.pad_start, self.pad_end = v
+        self.keys, self.values, self.offset, self.left_padding = v
 
     @property
     def meta_state(self):
@@ -919,14 +917,8 @@ class BatchRotatingKVCache(_BaseCache):
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
     ):
-        pad_end = self.pad_end
-        pad_start = self.pad_start
+        left_padding = self.left_padding
         # Compute the padding after the next update of size N
-        trim_size = self._idx - self.max_size + int(N > 1)
-        if trim_size > 0:
-            pad_end = pad_end - trim_size
-        if N == 1 and (self.rotated or self._idx >= self.max_size):
-            pad_start = pad_start + 1
         # TODO if N > 1 and it's rotated, the padding will change drastically
 
         window_size = window_size or self.max_size
@@ -938,16 +930,21 @@ class BatchRotatingKVCache(_BaseCache):
         rinds = rinds[None]
         mask = linds >= rinds
         mask &= linds < rinds + window_size
+        if (trim_size := self._idx - self.max_size + int(N > 1)) > 0:
+            left_padding = left_padding - trim_size
 
-        if N == 1 and (self.rotated or self._idx >= self.max_size):
+        rotated = N == 1 and (self.rotated or self._idx >= self.max_size)
+        if rotated:
+            left_padding = left_padding - 1
+
+        mask = mask & (rinds >= mx.expand_dims(left_padding, (1, 2, 3)))
+
+        if rotated:
             idx = self._idx
             if idx >= self.max_size:
                 idx = 0
-            mask = mx.roll(mask, shift=idx + 1)
+            mask = mx.roll(mask, shift=idx + 1, axis=-1)
 
-        mask &= (rinds < mx.expand_dims(pad_start, (1, 2, 3))) | (
-            rinds >= mx.expand_dims(pad_end, (1, 2, 3))
-        )
         return mask
 
     def filter(self, batch_indices):
@@ -957,8 +954,7 @@ class BatchRotatingKVCache(_BaseCache):
         self.keys = self.keys[batch_indices]
         self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
-        self.pad_start = self.pad_start[batch_indices]
-        self.pad_end = self.pad_end[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
 
     def extend(self, other):
         """
@@ -983,11 +979,10 @@ class BatchRotatingKVCache(_BaseCache):
                 pad = [(0, 0), (0, 0), (left, right), (0, 0)]
                 k = mx.pad(k, pad)
                 v = mx.pad(v, pad)
-            pad_start = c.pad_start
-            pad_end = c.pad_end + left
-            return k, v, c.offset, pad_start, pad_end
+            left_padding = c.left_padding + left
+            return k, v, c.offset, left_padding
 
-        self.keys, self.values, self.offset, self.pad_start, self.pad_end = map(
+        self.keys, self.values, self.offset, self.left_padding = map(
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx

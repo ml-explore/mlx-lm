@@ -530,10 +530,7 @@ class TestPromptCache(unittest.TestCase):
         loaded_cache = load_prompt_cache(cache_file)
         left_padding = mx.array([1, 2])
         for c, lc in zip(cache, loaded_cache):
-            if isinstance(c, BatchRotatingKVCache):
-                self.assertTrue(mx.array_equal(c.pad_end, left_padding))
-            else:
-                self.assertTrue(mx.array_equal(c.left_padding, left_padding))
+            self.assertTrue(mx.array_equal(c.left_padding, left_padding))
 
 
 if __name__ == "__main__":
