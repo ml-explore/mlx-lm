@@ -20,7 +20,7 @@ class ModelArgs(BaseModelArgs):
     def from_dict(cls, params):
         if "text_config" not in params:
             return cls(model_type=params["model_type"], text_config=params)
-        return cls(**params)
+        return super().from_dict(params)
 
 
 class Model(nn.Module):
