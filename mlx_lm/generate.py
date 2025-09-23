@@ -284,16 +284,11 @@ class GenerationResponse:
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
-    if (
-        kv_bits is not None
-        and not isinstance(prompt_cache[0], cache.QuantizedKVCache)
-        and prompt_cache[0].offset > quantized_kv_start
-    ):
-        for i in range(len(prompt_cache)):
-            if isinstance(prompt_cache[i], cache.KVCache):
-                prompt_cache[i] = prompt_cache[i].to_quantized(
-                    group_size=kv_group_size, bits=kv_bits
-                )
+    if kv_bits is None:
+        return
+    for e, c in enumerate(prompt_cache):
+        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
 def generate_step(
