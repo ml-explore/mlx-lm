@@ -251,14 +251,22 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         ]
 
-        if cache is not None:
-            state = cache[1]
-
+        state = cache[1] if cache else None
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(q, k, v, a, b, self.A_log, self.dt_bias, state)
+        out, state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            use_kernel=not self.training,
+        )
 
         if cache is not None:
             cache[1] = state

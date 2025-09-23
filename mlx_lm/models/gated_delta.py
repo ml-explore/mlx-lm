@@ -92,6 +92,7 @@ def _make_gated_delta_kernel():
 _gated_delta_kernel = _make_gated_delta_kernel()
 
 
+@mx.compile
 def _gated_delta_step_ops(
     q: mx.array,
     k: mx.array,
@@ -203,6 +204,7 @@ def gated_delta_update(
     A_log: mx.array,
     dt_bias: mx.array,
     state: Optional[mx.array] = None,
+    use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
 
     beta = mx.sigmoid(b)
@@ -213,7 +215,7 @@ def gated_delta_update(
         if state is None:
             state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
 
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state)
     else:
         return gated_delta_kernel(q, k, v, g, beta, state)
