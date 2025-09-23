@@ -1849,6 +1849,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
 
     def test_gated_delta(self):
+        mx.random.seed(0)
         for B in [1, 2]:
             for T in [1, 2]:
                 B = 1
@@ -1860,14 +1861,14 @@ class TestModels(unittest.TestCase):
                 q = mx.random.normal(shape=(B, T, Hk, Dk))
                 k = mx.random.normal(shape=(B, T, Hk, Dk))
                 v = mx.random.normal(shape=(B, T, Hv, Dv))
-                g = mx.random.normal(shape=(B, T, Hv))
-                beta = mx.random.normal(shape=(B, T, Hv))
+                g = mx.random.uniform(shape=(B, T, Hv))
+                beta = mx.random.uniform(shape=(B, T, Hv))
                 state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
                 y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
-                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-3))
+                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
 
 
 if __name__ == "__main__":

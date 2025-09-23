@@ -31,8 +31,19 @@ class ModelArgs(BaseModelArgs):
     block_multiple_of: int
     block_ffn_dim_multiplier: float
     block_auto_adjust_ff_dim: bool
-    full_attn_idxs: List[int]
     rope_theta: float
+    full_attn_idxs: Optional[List[int]] = None
+    layer_types: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+        if self.full_attn_idxs is None:
+            self.full_attn_idxs = [
+                i
+                for i, layer_type in enumerate(self.layer_types)
+                if layer_type == "full_attention"
+            ]
 
 
 class Attention(nn.Module):
