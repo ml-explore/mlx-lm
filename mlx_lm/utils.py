@@ -261,7 +261,7 @@ def load(
     """
     model_path, _ = get_model_path(path_or_hf_repo)
 
-    model, config = load_model(model_path, lazy)
+    model, config = load_model(model_path, lazy, model_config=model_config)
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
