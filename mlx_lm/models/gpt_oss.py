@@ -8,7 +8,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_causal_mask, scaled_dot_product_attention
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -102,80 +102,6 @@ class AttentionBlock(nn.Module):
             scaling_config=config.rope_scaling,
         )
 
-        # Cache the mask so we don't have to create it every time
-        self._previous_mask = None
-
-    def get_causal_mask(self, x, cache):
-        _, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
-        offset = max(1, offset)
-
-        def _make_mask(L, offset):
-            zero = mx.array(0, dtype=x.dtype)
-            neginf = mx.array(-mx.inf, dtype=x.dtype)
-            mask = mx.where(create_causal_mask(L, offset - 1), zero, neginf)
-            mask = mask.reshape(1, 1, L, -1)
-            mask = mx.tile(mask, (1, self.num_attention_heads, 1, 1))
-            sinks = mx.tile(self.sinks.reshape(1, -1, 1, 1), (1, 1, L, 1))
-            mask = mx.concatenate([sinks, mask], axis=-1)
-            return mask
-
-        # When training re-create the mask so that gradients flow to the sinks.
-        # When L is large then recreate the mask because otherwise it will take
-        # a pretty significant chunk of memory.
-        if self.training or L > 8:
-            self._previous_mask = None
-            return _make_mask(L, offset)
-
-        # Create the mask once and try to reuse it. For this reason we round up
-        # to the closest multiple of 512 so we can reuse the mask several times.
-        length = ((L + offset + 511) // 512) * 512
-        if (
-            self._previous_mask is None
-            or self._previous_mask.shape[-1] < length
-            or self._previous_mask.shape[-2] != L
-        ):
-            self._previous_mask = _make_mask(L, length - L)
-
-        return self._previous_mask[..., : L + offset]
-
-    def get_sliding_window_mask(self, x, cache, window_size):
-        _, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
-        offset = max(1, offset)
-
-        def _make_mask(L, offset):
-            zero = mx.array(0, dtype=x.dtype)
-            neginf = mx.array(-mx.inf, dtype=x.dtype)
-            mask = create_causal_mask(L, offset - 1, window_size)
-            mask = mx.where(mask, zero, neginf)
-            mask = mask.reshape(1, 1, L, -1)
-            mask = mx.tile(mask, (1, self.num_attention_heads, 1, 1))
-            sinks = mx.tile(self.sinks.reshape(1, -1, 1, 1), (1, 1, L, 1))
-            mask = mx.concatenate([sinks, mask], axis=-1)
-            return mask
-
-        # If we are training then simply re-create the mask every time to make
-        # sure gradients flow to the sinks.
-        #
-        # For simplicity also re-create the mask if we have more than 1 query
-        # for now.
-        if self.training or L > 1:
-            self._previous_mask = None
-            return _make_mask(L, min(window_size + 1, offset))
-
-        # We are in inference so cache the mask and try to reuse it
-        if self._previous_mask is None:
-            self._previous_mask = _make_mask(L, window_size)
-
-        return self._previous_mask[..., : min(L + offset, window_size + 1)]
-
-    def get_mask(self, x, cache, window_size):
-        if window_size is not None:
-            return self.get_sliding_window_mask(x, cache, window_size)
-        else:
-            return self.get_causal_mask(x, cache)
-
     def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
         B, L, _ = x.shape
         D = self.head_dim
@@ -185,26 +111,17 @@ class AttentionBlock(nn.Module):
         k = self.k_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
         v = self.v_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
 
-        # If cache is None or the cache offset is 0 then we need to add a 0 key
-        # and value to make some space for the sink
-        if cache is None or cache.offset == 0:
+        if cache is not None:
+            q = self.rope(q, offset=cache.offset)
+            k = self.rope(k, offset=cache.offset)
+            k, v = cache.update_and_fetch(k, v)
+        else:
             q = self.rope(q)
             k = self.rope(k)
 
-            zeros = mx.zeros((B, Hk, 1, D), dtype=k.dtype)
-            k = mx.concatenate([zeros, k], axis=2)
-            v = mx.concatenate([zeros, v], axis=2)
-            if cache is not None:
-                k, v = cache.update_and_fetch(k, v)
-
-        # We have already put the 0 in the cache no need to do anything special
-        else:
-            q = self.rope(q, offset=cache.offset - 1)
-            k = self.rope(k, offset=cache.offset - 1)
-            k, v = cache.update_and_fetch(k, v)
-
-        # NOTE: mask should contain the sink weights already
-        v_hat = scaled_dot_product_attention(q, k, v, cache, self.sm_scale, mask=mask)
+        v_hat = scaled_dot_product_attention(
+            q, k, v, cache, self.sm_scale, mask=mask, sinks=self.sinks
+        )
 
         return self.o_proj(v_hat.swapaxes(1, 2).reshape(B, L, -1))
 
@@ -272,6 +189,8 @@ class GptOssMoeModel(nn.Module):
         ] * (args.num_hidden_layers // 2)
         self.layers = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
         self.window_size = args.sliding_window
+        self.swa_idx = self.layer_types.index("sliding_attention")
+        self.ga_idx = self.layer_types.index("full_attention")
 
     def __call__(
         self,
@@ -287,15 +206,14 @@ class GptOssMoeModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        masks = [
-            l.self_attn.get_mask(
-                x, c, self.window_size if lt == "sliding_attention" else None
-            )
-            for (l, c, lt) in zip(self.layers, cache, self.layer_types)
-        ]
+        full_mask = create_attention_mask(x, cache[self.ga_idx])
+        swa_mask = create_attention_mask(
+            x, cache[self.swa_idx], window_size=self.window_size
+        )
 
-        for i, (layer, c, m) in enumerate(zip(self.layers, cache, masks)):
-            x = layer(x, m, c)
+        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+            mask = full_mask if layer_type == "full_attention" else swa_mask
+            x = layer(x, mask, c)
         x = self.norm(x)
         return x
 
@@ -369,7 +287,5 @@ class Model(nn.Module):
             if lt == "full_attention":
                 caches.append(KVCache())
             else:
-                caches.append(
-                    RotatingKVCache(max_size=self.args.sliding_window + 1, keep=1)
-                )
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches

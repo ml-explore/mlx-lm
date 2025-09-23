@@ -10,6 +10,8 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
@@ -131,21 +133,29 @@ class TestModels(unittest.TestCase):
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
 
-    def test_causal_mask_lengths(self):
-        mx.random.seed(8)
-        B, N_q, T_q, N_kv, T_kv, D = (4, 8, 3, 2, 3, 2)
-        lengths = mx.array([1, 2, 3, 1])
-        q = mx.random.uniform(shape=(B, N_q, T_q, D))
-        k = mx.random.uniform(shape=(B, N_kv, T_kv, D))
-        v = k
-        mask = create_causal_mask(T_q, 0, lengths=lengths)
+    def test_causal_mask_padding(self):
+        right_padding = mx.array([2, 1, 0])
+        mask = create_causal_mask(3, right_padding=right_padding)
 
-        out1 = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
-        q[1, :, 2:] = mx.ones_like(q[1, :, 2:])
-        k[1, :, 2:] = mx.ones_like(k[1, :, 2:])
-        v[1, :, 2:] = mx.ones_like(v[1, :, 2:])
-        out2 = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
-        self.assertTrue(mx.allclose(out1[1, :, :2], out2[1, :, :2]))
+        causal_mask = create_causal_mask(3)
+        self.assertTrue(
+            mx.array_equal(mask[0, 0], causal_mask & mx.array([True, False, False]))
+        )
+        self.assertTrue(
+            mx.array_equal(mask[1, 0], causal_mask & mx.array([True, True, False]))
+        )
+        self.assertTrue(mx.array_equal(mask[2, 0], causal_mask))
+
+        left_padding = mx.array([2, 1, 0])
+        mask = create_causal_mask(3, left_padding=left_padding)
+
+        self.assertTrue(
+            mx.array_equal(mask[0, 0], causal_mask & mx.array([False, False, True]))
+        )
+        self.assertTrue(
+            mx.array_equal(mask[1, 0], causal_mask & mx.array([False, True, True]))
+        )
+        self.assertTrue(mx.array_equal(mask[2, 0], causal_mask))
 
     def test_mask_with_window(self):
         mask = create_causal_mask(5, 0, window_size=3)
@@ -1683,6 +1693,81 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 1000,
                 "layer_norm_eps": 1e-5,
             },
+            {
+                "model_type": "granitemoehybrid",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "attention_bias": False,
+                "embedding_multiplier": 1.0,
+                "attention_multiplier": 1.0,
+                "logits_scaling": 1.0,
+                "residual_multiplier": 1.0,
+                "num_local_experts": 8,
+                "num_experts_per_tok": 2,
+                "shared_intermediate_size": 128,
+                "mamba_n_heads": 8,
+                "mamba_d_head": 16,
+                "mamba_proj_bias": False,
+                "mamba_d_state": 128,
+                "mamba_d_conv": 4,
+                "mamba_n_groups": 1,
+                "mamba_conv_bias": False,
+                "layer_types": ["mamba", "attention", "mamba", "attention"],
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000.0,
+            },
+            {
+                "model_type": "glm",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "head_dim": 32,
+                "num_key_value_heads": 2,
+            },
+            {
+                "model_type": "llama4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "head_dim": 32,
+                "num_key_value_heads": 2,
+                "intermediate_size_mlp": 128,
+                "rope_theta": 1000.0,
+                "head_dim": 8,
+                "tie_word_embeddings": False,
+                "no_rope_layers": [0, 0, 1, 1],
+                "use_qk_norm": True,
+            },
+            {
+                "model_type": "mamba2",
+                "num_heads": 8,
+                "head_dim": 16,
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "state_size": 32,
+                "num_hidden_layers": 4,
+                "layer_norm_epsilon": 1e-4,
+                "conv_kernel": 3,
+                "n_groups": 4,
+                "use_bias": False,
+                "use_conv_bias": False,
+                "chunk_size": 32,
+                "tie_word_embeddings": True,
+                "time_step_limit": (0.01, 10),
+                "time_step_rank": "auto",
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -1696,6 +1781,93 @@ class TestModels(unittest.TestCase):
                     config["vocab_size"],
                     config["num_hidden_layers"],
                 )
+
+    def test_ssm(self):
+        for batch_size in [1, 2]:
+            for n_group in [1, 4]:
+                num_heads = 48
+                head_dim = 64
+                state_dim = 128
+
+                hidden_states = mx.random.normal(
+                    shape=(batch_size, 1, num_heads, head_dim)
+                )
+                B = mx.random.normal(shape=(batch_size, 1, n_group, state_dim))
+                C = mx.random.normal(shape=(batch_size, 1, n_group, state_dim))
+                dt = mx.random.normal(shape=(batch_size, 1, num_heads))
+                dt_bias = mx.random.normal(shape=(num_heads,))
+                A_log = mx.random.normal(shape=(num_heads,))
+                D = mx.random.normal(shape=(num_heads,))
+                state = mx.random.normal(
+                    shape=(batch_size, num_heads, head_dim, state_dim)
+                )
+
+                out, out_state = ssm_attn(
+                    hidden_states, A_log, B, C, D, dt, dt_bias, state
+                )
+                out_c, out_state_c = ssm_update(
+                    hidden_states, A_log, B, C, D, dt, dt_bias, state
+                )
+                self.assertTrue(mx.allclose(out, out_c, atol=1e-4, rtol=1e-4))
+                self.assertTrue(
+                    mx.allclose(out_state, out_state_c, atol=1e-4, rtol=1e-4)
+                )
+
+    def test_ssm_masked(self):
+        batch_size = 1
+        n_group = 1
+        num_heads = 48
+        head_dim = 64
+        state_dim = 128
+        seq_len = 4
+        pad = 2
+
+        hidden_states = mx.random.normal(
+            shape=(batch_size, seq_len + pad, num_heads, head_dim)
+        )
+        B = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        C = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        dt = mx.random.normal(shape=(batch_size, seq_len + pad, num_heads))
+        dt_bias = mx.random.normal(shape=(num_heads,))
+        A_log = mx.random.normal(shape=(num_heads,))
+        D = mx.random.normal(shape=(num_heads,))
+        out, out_state = ssm_attn(
+            hidden_states[:, pad:],
+            A_log,
+            B[:, pad:],
+            C[:, pad:],
+            D,
+            dt[:, pad:],
+            dt_bias,
+        )
+        mask = mx.array([[False] * pad + [True] * seq_len])
+        out_m, out_state_m = ssm_attn(
+            hidden_states, A_log, B, C, D, dt, dt_bias, mask=mask
+        )
+        out_m = out_m[:, pad:]
+        self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
+        self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
+
+    def test_gated_delta(self):
+        for B in [1, 2]:
+            for T in [1, 2]:
+                B = 1
+                Hk = 16
+                Hv = 32
+                Dk = 128
+                Dv = 128
+
+                q = mx.random.normal(shape=(B, T, Hk, Dk))
+                k = mx.random.normal(shape=(B, T, Hk, Dk))
+                v = mx.random.normal(shape=(B, T, Hv, Dv))
+                g = mx.random.normal(shape=(B, T, Hv))
+                beta = mx.random.normal(shape=(B, T, Hv))
+                state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+                y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
+                y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
+                self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":

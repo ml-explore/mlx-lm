@@ -10,6 +10,7 @@ import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
+    BatchKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
@@ -417,6 +418,47 @@ class TestPromptCache(unittest.TestCase):
         )
         cmask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
         self.assertTrue(mx.array_equal(cmask, mask))
+
+    def test_batch_kv_cache(self):
+        cache = BatchKVCache(left_padding=[2, 3, 4])
+        k, v = mx.zeros((3, 1, 4, 8)), mx.zeros((3, 1, 4, 8))
+        # Update works
+        k, v = cache.update_and_fetch(k, v)
+        self.assertEqual(k.shape, (3, 1, 4, 8))
+
+        # State can be evaluated
+        mx.eval(cache.state)
+
+        # State can be set
+        cache.state = cache.state
+
+        # Test filtering
+        cache.filter([0, 1])
+
+        # In this case filtering left shifts the cache so it has zero padding
+        self.assertEqual(cache.state[0].shape, (2, 1, 2, 8))
+
+        mask = cache.make_mask(1)
+        self.assertEqual(mask[0].squeeze().tolist(), [True, True, True])
+        self.assertEqual(mask[1].squeeze().tolist(), [False, True, True])
+
+        # Test extension
+        cache_a = BatchKVCache(left_padding=[2, 1, 2])
+        cache_b = BatchKVCache(left_padding=[3, 0])
+
+        k = mx.zeros((3, 1, 8, 1))
+        v = mx.zeros((3, 1, 8, 1))
+        cache_a.update_and_fetch(k, v)
+
+        k = mx.zeros((2, 1, 4, 1))
+        v = mx.zeros((2, 1, 4, 1))
+        cache_b.update_and_fetch(k, v)
+
+        cache_a.extend(cache_b)
+        self.assertEqual(cache_a.keys.shape[0], 5)
+        self.assertEqual(cache_a.values.shape[0], 5)
+        self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
+        self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
 
 
 if __name__ == "__main__":

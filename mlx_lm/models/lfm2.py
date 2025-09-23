@@ -5,7 +5,12 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from .cache import ArraysCache, KVCache
 
 
@@ -114,13 +119,15 @@ class ShortConv(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
         seqlen = x.shape[1]
         BCx = self.in_proj(x)
         B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x
-
+        if mask is not None:
+            Bx = mx.where(mask[..., None], Bx, 0)
         state = None
         if cache is not None:
             state = cache[0]
@@ -194,6 +201,7 @@ class Lfm2DecoderLayer(nn.Module):
         else:
             r = self.conv(
                 self.operator_norm(x),
+                mask=mask,
                 cache=cache,
             )
         h = x + r
@@ -214,6 +222,14 @@ class Lfm2Model(nn.Module):
 
         self.embedding_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
 
+        self.fa_idx = args.full_attn_idxs[0]
+        self.conv_idx = 0
+        for i in range(args.num_hidden_layers):
+            if i in args.full_attn_idxs:
+                self.conv_idx += 1
+            else:
+                break
+
     def __call__(
         self,
         inputs: mx.array,
@@ -228,9 +244,11 @@ class Lfm2Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[self.args.full_attn_idxs[0]])
+        attn_mask = create_attention_mask(h, cache[self.fa_idx])
+        conv_mask = create_ssm_mask(h, cache[self.conv_idx])
 
         for layer, c in zip(self.layers, cache):
+            mask = attn_mask if layer.is_attention_layer else conv_mask
             h = layer(h, mask, cache=c)
 
         return self.embedding_norm(h)

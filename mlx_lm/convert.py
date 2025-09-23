@@ -19,10 +19,9 @@ from .utils import (
 
 
 def mixed_quant_predicate_builder(
-    recipe: str, model: nn.Module
+    recipe: str, model: nn.Module, group_size: int = 64
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
     high_bits = 6
-    group_size = 64
 
     if recipe == "mixed_2_6":
         low_bits = 2
@@ -34,7 +33,7 @@ def mixed_quant_predicate_builder(
     elif recipe == "mixed_4_6":
         low_bits = 4
     else:
-        raise ValueError("Invalid quant recipe {recipe}")
+        raise ValueError(f"Invalid quant recipe {recipe}")
 
     down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
     if len(down_keys) == 0:
@@ -114,7 +113,9 @@ def convert(
     )
 
     if isinstance(quant_predicate, str):
-        quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
+        quant_predicate = mixed_quant_predicate_builder(
+            quant_predicate, model, q_group_size
+        )
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)

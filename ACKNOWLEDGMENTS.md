@@ -9,15 +9,15 @@ MLX LM was developed with contributions from the following individuals:
 
 - Shunta Saito: Added support for PLaMo models.
 - Gökdeniz Gülmez: Added support for the following architectures: OpenBMB's
-  `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's`Mamba v1`, Z.ai &
-   THUKEG's `GLM4`, Rednote `dots.llm1`, Baisu's `Ernie4.5 MoE`, inclusionAI's
+  `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's `Mamba v1`, `Mamba v2`, Z.ai &
+   THUKEG's `GLM`, `GLM4`, Rednote `dots.llm1`, Baisu's `Ernie4.5 MoE`, inclusionAI's
    `Bailing MoE e.g. Ling-family`, Klear team - Kuaishou Technology's `Klear`,
    IBM's `Granite MoE`, Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's
-   `Apertus`, Nikity's `Lille130m`, and Allenai's `OLMoE` adn `OLMo3`; Added support for the
-   following training algorithms: `Full Weight Fine-Tuning`, and the `Muon`
+   `Apertus`, Nikity's `Lille130m`, Alibaba Qwen's `Qwen3Next`, and Allenai's `OLMoE` and `OLMo3`;
+   Helped add support for the following model architectures: Alibaba Qwen's `Qwen3 & Qwen3MoE)`;
+   Added support for the following training algorithms: `Full Weight Fine-Tuning`, and the `Muon`
    optimizer; Added support for the following other features: `Multiple Optimizers
-   to choose for training`, and `reporting training metrics to WandB (Weights &
-   Biases)`.
+   to choose for training`, and `reporting training metrics to WandB (Weights & Biases)`.
 - Prince Canuma: Helped add support for the following model architectures:
   HuggingFace's `Starcoder2`, Cohere's `Cohere (1 and 2)`, Alibaba Qwen's `Qwen
   (2, 3 and MoE)`, Microsoft's `Phi (3 and 3.5 MoE)`, `BitNet1.58`, Meta's `Llama
