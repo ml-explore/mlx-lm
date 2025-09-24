@@ -74,10 +74,10 @@ def load_prompt_cache(file_name, return_metadata=False):
     arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
-    cache = [globals()[c].__new__(globals()[c]) for c in classes]
-    for c, state, meta_state in zip(cache, arrays, info):
-        c.state = state
-        c.meta_state = meta_state
+    cache = [
+        globals()[c].from_state(state, meta_state)
+        for c, state, meta_state in zip(classes, arrays, info)
+    ]
     if return_metadata:
         return cache, metadata
     return cache
@@ -141,6 +141,14 @@ class _BaseCache:
 
     def is_trimmable(self):
         return False
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # Create an instance of cls without calling __init__
+        obj = cls.__new__(cls)
+        obj.state = state
+        obj.meta_state = meta_state
+        return obj
 
 
 class ConcatenateKVCache(_BaseCache):
