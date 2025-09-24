@@ -107,7 +107,7 @@ def _gated_delta_step_ops(
     g: mx.array,
     beta: mx.array,
     state: mx.array,
-    mask: Optional[mx.array],
+    mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for a single recurrent step.
@@ -200,15 +200,25 @@ def gated_delta_ops(
 
     ys = []
     for t in range(T):
-        y, state = _gated_delta_step_ops(
-            q[:, t],
-            k[:, t],
-            v[:, t],
-            g[:, t],
-            beta[:, t],
-            state,
-            mask[:, t] if mask is not None else None,
-        )
+        if mask is not None:
+            y, state = _gated_delta_step_ops(
+                q[:, t],
+                k[:, t],
+                v[:, t],
+                g[:, t],
+                beta[:, t],
+                state,
+                mask[:, t],
+            )
+        else:
+            y, state = _gated_delta_step_ops(
+                q[:, t],
+                k[:, t],
+                v[:, t],
+                g[:, t],
+                beta[:, t],
+                state,
+            )
         ys.append(y)
     y = mx.stack(ys, axis=1)
     return y, state
