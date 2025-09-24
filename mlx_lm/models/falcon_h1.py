@@ -1,12 +1,20 @@
+# Copyright © 2025 Apple Inc.
+
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from .cache import CacheList, KVCache, MambaCache
 from .rope_utils import initialize_rope
+from .ssm import ssm_update
 
 
 @dataclass
@@ -16,7 +24,6 @@ class ModelArgs(BaseModelArgs):
     attention_out_multiplier: float = 0.9375
     embedding_multiplier: float = 5.656854249492381
     head_dim: int = 64
-    hidden_act: str = "silu"
     hidden_size: int = 1024
     initializer_range: float = 0.02
     intermediate_size: int = 2048
@@ -45,8 +52,6 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int = 8
     num_hidden_layers: int = 36
     num_key_value_heads: int = 2
-    num_logits_to_keep: int = 1
-    pad_token_id: int = 0
     projectors_bias: bool = False
     rms_norm_eps: float = 1e-05
     rope_traditional: bool = False
@@ -63,7 +68,6 @@ class ModelArgs(BaseModelArgs):
         ]
     )
     ssm_out_multiplier: float = 0.23570226039551587
-    tie_word_embeddings: bool = False
     vocab_size: int = 32784
 
 
@@ -109,7 +113,7 @@ def compute_mup_vector(args):
 
 class FalconH1Attention(nn.Module):
 
-    def __init__(self, args, layer_idx: int):
+    def __init__(self, args):
         super().__init__()
 
         self.hidden_size = args.hidden_size
@@ -117,9 +121,6 @@ class FalconH1Attention(nn.Module):
         self.num_kv_heads = args.num_key_value_heads
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
-
-        self.layer_idx = layer_idx
-        self.key_multiplier = args.key_multiplier
 
         self.q_proj = nn.Linear(
             self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
@@ -154,10 +155,7 @@ class FalconH1Attention(nn.Module):
         values = self.v_proj(x)
 
         queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-        keys = (
-            keys.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
-            * self.key_multiplier
-        )
+        keys = keys.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
@@ -176,54 +174,14 @@ class FalconH1Attention(nn.Module):
         return self.o_proj(output)
 
 
-def pad_tensor_by_size(tensor, pad_size):
-    if pad_size > 0:
-        pad_shape = list(tensor.shape)
-        pad_shape[1] = pad_size
-        padding = mx.zeros(pad_shape, dtype=tensor.dtype)
-        tensor = mx.concatenate([tensor, padding], axis=1)
-    return tensor
-
-
-def reshape_into_chunks(tensor, pad_size, chunk_size):
-
-    if pad_size > 0:
-        tensor = pad_tensor_by_size(tensor, pad_size)
-
-    batch_size, seq_len = tensor.shape[:2]
-    num_chunks = seq_len // chunk_size
-    new_shape = [batch_size, num_chunks, chunk_size] + list(tensor.shape[2:])
-    return mx.reshape(tensor, new_shape)
-
-
-def segment_sum(input_tensor):
-    chunk_size = input_tensor.shape[-1]
-
-    input_tensor = mx.expand_dims(input_tensor, axis=-1)
-    input_tensor = mx.broadcast_to(
-        input_tensor, input_tensor.shape[:-1] + (chunk_size,)
-    )
-
-    mask = mx.tri(chunk_size, k=-1, dtype=mx.bool_)
-    input_tensor = mx.where(mask, input_tensor, 0)
-
-    tensor_segsum = mx.cumsum(input_tensor, axis=-2)
-
-    mask = mx.tri(chunk_size, k=0, dtype=mx.bool_)
-    tensor_segsum = mx.where(mask, tensor_segsum, -mx.inf)
-
-    return tensor_segsum
-
-
 class FalconH1Mixer(nn.Module):
-    def __init__(self, args, layer_idx: int, mup_vector: mx.array):
+    def __init__(self, args):
         super().__init__()
         self.num_heads = args.mamba_n_heads
         self.hidden_size = args.hidden_size
         self.ssm_state_size = args.mamba_d_state
         self.conv_kernel_size = args.mamba_d_conv
         self.intermediate_size = args.mamba_d_ssm
-        self.layer_idx = layer_idx
         self.use_conv_bias = args.mamba_conv_bias
 
         self.layer_norm_epsilon = args.rms_norm_eps
@@ -273,178 +231,89 @@ class FalconH1Mixer(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.projectors_bias
         )
 
-        self.ssm_in_multiplier = args.ssm_in_multiplier
-        self._mup_vector = mup_vector
+    def _apply_conv(
+        self, conv_input: mx.array, cache: Optional[MambaCache] = None
+    ) -> mx.array:
+        if cache is None or cache[0] is None:
+            conv_state = mx.zeros(
+                (conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim),
+                dtype=conv_input.dtype,
+            )
+        else:
+            conv_state = cache[0]
 
-    def __call__(self, input_states, cache=None):
-        batch_size, seq_len, _ = input_states.shape
-
-        input_states = input_states * self.ssm_in_multiplier
-        projected_states = self.in_proj(input_states)
-
-        projected_states = (projected_states * self._mup_vector).astype(
-            projected_states.dtype
-        )
-
-        gate, hidden_states_B_C, dt = mx.split(
-            projected_states,
-            (self.intermediate_size, self.intermediate_size + self.conv_dim),
-            axis=-1,
-        )
+        padded_input = mx.concatenate([conv_state, conv_input], axis=1)
 
         if cache is not None:
-            conv_state, ssm_state = cache[0], cache[1]
-        else:
-            conv_state, ssm_state = None, None
+            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :]
 
-        if conv_state is None:
-            conv_state = mx.zeros(
-                (batch_size, self.conv_kernel_size - 1, hidden_states_B_C.shape[-1]),
-                hidden_states_B_C.dtype,
-            )
-        hidden_states_B_C = mx.concatenate([conv_state, hidden_states_B_C], axis=1)
-        cache[0] = hidden_states_B_C[:, -self.conv_kernel_size + 1 :]
-        hidden_states_B_C = nn.silu(self.conv1d(hidden_states_B_C))
+        conv_output = self.conv1d(padded_input)
+        return nn.silu(conv_output)
 
-        hidden_states, B, C = mx.split(
-            hidden_states_B_C,
-            (
-                self.intermediate_size,
-                self.intermediate_size + self.n_groups * self.ssm_state_size,
-            ),
+    def _ssm(
+        self,
+        hidden_states: mx.array,
+        B: mx.array,
+        C: mx.array,
+        dt: mx.array,
+        state: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        hidden_states = hidden_states.reshape(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        )
+        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+
+        y, state = ssm_update(
+            hidden_states,
+            self.A_log,
+            B,
+            C,
+            self.D,
+            dt,
+            self.dt_bias,
+            state,
+            self.time_step_limit,
+            mask,
+        )
+
+        return y.reshape(batch_size, seq_len, self.intermediate_size), state
+
+    def __call__(self, input_states, cache=None, mask: Optional[mx.array] = None):
+        projected_states = self.in_proj(input_states)
+
+        gate, conv_input, dt = mx.split(
+            projected_states,
+            [self.intermediate_size, self.intermediate_size + self.conv_dim],
             axis=-1,
         )
 
-        A = -mx.exp(self.A_log)
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
+        conv_output = self._apply_conv(conv_input, cache)
 
-        if seq_len == 1 and cache is not None and cache[1] is not None:
-            dt = (dt + self.dt_bias).squeeze(1)
-            dt = nn.softplus(dt)
-            dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-            dA = mx.exp(dt * A)
-            B = mx.reshape(B, (batch_size, self.n_groups, -1))
-            dB = B * mx.expand_dims(dt, axis=-1)
-            hidden_states = mx.reshape(hidden_states, (batch_size, -1, self.head_dim))
-            dBx = mx.expand_dims(dB, axis=-2) * mx.expand_dims(hidden_states, axis=-1)
-
-            ssm_state = cache[1] * mx.expand_dims(dA, axis=(2, 3)) + dBx
-            cache[1] = ssm_state
-
-            C = mx.reshape(C, (batch_size, self.n_groups, 1, -1, 1))
-            ssm_state = mx.expand_dims(ssm_state, axis=1)
-            y = mx.reshape(ssm_state @ C, (batch_size, self.num_heads, self.head_dim))
-            y = y + hidden_states * self.D[:, None]
-            y = mx.reshape(y, (batch_size, 1, -1))
-        else:
-            dt = nn.softplus(dt + self.dt_bias)
-            dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
-            hidden_states = mx.reshape(
-                hidden_states, (batch_size, seq_len, -1, self.head_dim)
-            )
-            B = mx.reshape(B, (batch_size, seq_len, -1, self.ssm_state_size))
-            C = mx.reshape(C, (batch_size, seq_len, -1, self.ssm_state_size))
-
-            B = mx.repeat(B, self.num_heads // self.n_groups, axis=2)
-            C = mx.repeat(C, self.num_heads // self.n_groups, axis=2)
-
-            pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
-
-            D_residual = mx.expand_dims(self.D, axis=-1) * pad_tensor_by_size(
-                hidden_states, pad_size
-            )
-
-            hidden_states = hidden_states * mx.expand_dims(dt, axis=-1)
-            A = A * dt
-
-            hidden_states, A, B, C = [
-                reshape_into_chunks(t, pad_size, self.chunk_size)
-                for t in (hidden_states, A, B, C)
-            ]
-
-            A = mx.transpose(A, [0, 3, 1, 2])
-            A_cumsum = mx.cumsum(A, axis=-1)
-
-            L = mx.exp(segment_sum(A))
-
-            C_expanded = mx.expand_dims(C, axis=3)
-            B_expanded = mx.expand_dims(B, axis=2)
-            G_intermediate = C_expanded * B_expanded
-            G = mx.sum(G_intermediate, axis=-1)
-
-            L_permuted = mx.transpose(L, [0, 2, 3, 4, 1])
-            M_intermediate = mx.expand_dims(G, axis=-1) * mx.expand_dims(
-                L_permuted, axis=-1
-            )
-            M = mx.sum(M_intermediate, axis=-1)
-
-            hidden_states_expanded = mx.expand_dims(hidden_states, axis=2)
-            M_expanded = mx.expand_dims(M, axis=-1)
-            Y_diag = mx.sum(M_expanded * hidden_states_expanded, axis=3)
-
-            decay_states = mx.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
-            decay_states_permuted = mx.transpose(decay_states, [0, 2, 3, 1])
-            B_decay = B * mx.expand_dims(decay_states_permuted, axis=-1)
-
-            B_decay_expanded = mx.expand_dims(B_decay, axis=-2)
-            hidden_states_expanded = mx.expand_dims(hidden_states, axis=-1)
-            states = mx.sum(B_decay_expanded * hidden_states_expanded, axis=2)
-
-            if cache is not None and cache[1] is not None:
-                previous_states = mx.expand_dims(cache[1], axis=1)
-            else:
-                previous_states = mx.zeros_like(states[:, :1])
-
-            states = mx.concatenate([previous_states, states], axis=1)
-
-            A_cumsum_last = A_cumsum[:, :, :, -1]
-            pad_width = [
-                (0, 0),
-                (0, 0),
-                (1, 0),
-            ]
-            padded = mx.pad(A_cumsum_last, pad_width)
-            decay_chunk = mx.exp(segment_sum(padded))
-            decay_chunk = mx.transpose(decay_chunk, [0, 3, 2, 1])
-
-            decay_expanded = mx.expand_dims(
-                mx.expand_dims(decay_chunk, axis=-1), axis=-1
-            )
-            states_expanded = mx.expand_dims(states, axis=2)
-            new_states = mx.sum(decay_expanded * states_expanded, axis=1)
-
-            states = new_states[:, :-1]
-            ssm_state = new_states[:, -1]
-
-            state_decay_out = mx.exp(A_cumsum)
-            C_expanded = mx.expand_dims(C, axis=-2)
-            states_expanded = mx.expand_dims(states, axis=2)
-            C_times_states = C_expanded * states_expanded
-
-            state_decay_out_permuted = mx.transpose(state_decay_out, [0, 2, 3, 1])
-            C_times_states_sum = mx.sum(C_times_states, axis=-1)
-            Y_off = C_times_states_sum * mx.expand_dims(
-                state_decay_out_permuted, axis=-1
-            )
-
-            y = Y_diag + Y_off
-
-            y = mx.reshape(y, (batch_size, -1, self.num_heads, self.head_dim))
-            y = y + D_residual
-
-            if pad_size > 0:
-                y = y[:, :seq_len, :, :]
-            y = mx.reshape(y, (batch_size, seq_len, -1))
-
-            if cache is not None:
-                cache[1] = ssm_state
+        hidden_states_ssm, B, C = mx.split(
+            conv_output,
+            [
+                self.intermediate_size,
+                self.intermediate_size + self.n_groups * self.ssm_state_size,
+            ],
+            axis=-1,
+        )
+        state = cache[1] if cache else None
+        y, state = self._ssm(hidden_states_ssm, B, C, dt, state, mask)
+        if cache:
+            cache[1] = state
 
         if self.mamba_rms_norm:
-            scan_output = self.norm(y, gate)
+            y = self.norm(y, gate)
         else:
-            scan_output = y * nn.silu(gate)
+            y = y * nn.silu(gate)
 
-        contextualized_states = self.out_proj(scan_output)
-        return contextualized_states
+        return self.out_proj(y)
 
 
 class FalconH1MLP(nn.Module):
@@ -458,16 +327,15 @@ class FalconH1MLP(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=args.mlp_bias)
-        self.gate_multiplier, self.down_multiplier = args.mlp_multipliers
 
     def __call__(self, x):
-        y = self.up_proj(x) * nn.silu(self.gate_proj(x) * self.gate_multiplier)
-        y = self.down_proj(y) * self.down_multiplier
+        y = self.up_proj(x) * nn.silu(self.gate_proj(x))
+        y = self.down_proj(y)
         return y
 
 
 class FalconH1DecoderLayer(nn.Module):
-    def __init__(self, args, layer_idx: int, mup_vector: mx.array):
+    def __init__(self, args):
         super().__init__()
         self.feed_forward = FalconH1MLP(args)
 
@@ -477,48 +345,38 @@ class FalconH1DecoderLayer(nn.Module):
             + 2 * args.num_key_value_heads * head_dim
         )
 
-        self.mamba = FalconH1Mixer(
-            args=args, layer_idx=layer_idx, mup_vector=mup_vector
-        )
+        self.mamba = FalconH1Mixer(args=args)
 
-        self.self_attn = FalconH1Attention(args, layer_idx)
-
-        self.attention_in_multiplier = args.attention_in_multiplier
-        self.ssm_out_multiplier = args.ssm_out_multiplier
-        self.attn_out_multiplier = args.attention_out_multiplier
+        self.self_attn = FalconH1Attention(args)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_ff_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
-        hidden_states: mx.array,
+        h: mx.array,
         cache,
-        mask: mx.array,
+        attn_mask: Optional[mx.array],
+        mamba_mask: Optional[mx.array],
     ) -> mx.array:
 
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        residual = h
+        h = self.input_layernorm(h)
 
-        mamba_hidden_states = self.mamba(input_states=hidden_states, cache=cache[0])
+        mamba_h = self.mamba(input_states=h, cache=cache[0], mask=mamba_mask)
 
-        attention_hidden_states = self.self_attn(
-            hidden_states * self.attention_in_multiplier,
-            mask=mask,
+        attn_h = self.self_attn(
+            h,
+            mask=attn_mask,
             cache=cache[1],
         )
 
-        # TODO maybe compile that
-        mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
-        attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
-        hidden_states = residual + mamba_hidden_states + attention_hidden_states
+        h = residual + mamba_h + attn_h
 
-        residual = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
-        hidden_states = self.feed_forward(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        residual = h
+        h = self.pre_ff_layernorm(h)
+        h = self.feed_forward(h)
+        return residual + h
 
 
 class FalconH1Model(nn.Module):
@@ -531,38 +389,36 @@ class FalconH1Model(nn.Module):
 
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_size)
 
-        mup_vector = compute_mup_vector(args)
+        self._mup_vector = compute_mup_vector(args)
         self.layers = [
-            FalconH1DecoderLayer(args, layer_idx=layer_idx, mup_vector=mup_vector)
-            for layer_idx in range(args.num_hidden_layers)
+            FalconH1DecoderLayer(args) for _ in range(args.num_hidden_layers)
         ]
         self.final_layernorm = nn.RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs, mask=None, cache=None):
+    def __call__(self, inputs, cache=None):
 
         h = self.embed_tokens(inputs)
 
-        h = h * self.args.embedding_multiplier
-
-        if mask is None:
-            c = [cache[0][1]] if cache is not None else None
-            mask = create_attention_mask(h, c, return_array=False)
+        h = h
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [(None, None) * len(self.layers)]
+
+        mamba_mask = create_ssm_mask(h, cache[0][0])
+        attn_mask = create_attention_mask(h, cache[0][1])
 
         for layer, c in zip(self.layers, cache):
             h = layer(
                 h,
                 cache=c,
-                mask=mask,
+                attn_mask=attn_mask,
+                mamba_mask=mamba_mask,
             )
 
         return self.final_layernorm(h)
 
 
 class Model(nn.Module):
-    """Falcon-H1 model with language modeling head"""
 
     def __init__(self, args):
         super().__init__()
@@ -571,19 +427,44 @@ class Model(nn.Module):
         self.model = FalconH1Model(args=args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs, mask=None, cache=None):
-        hidden_states = self.model(inputs, mask=mask, cache=cache)
-        logits = self.lm_head(hidden_states)
-        return logits * self.args.lm_head_multiplier
+    def __call__(self, inputs, cache=None):
+        hidden_states = self.model(inputs, cache=cache)
+        return self.lm_head(hidden_states)
 
     def sanitize(self, weights):
-        sanitized_weights = {}
-        for name, param in weights.items():
-            if "conv1d.weight" in name:
-                # MLX Conv1d expects [out_channels, in_channels, kernel_size] format
-                if param.shape[-1] > param.shape[1]:
-                    param = param.transpose(0, 2, 1)
+        # Check if needs sanitization
+        c1d = weights["model.layers.0.mamba.conv1d.weight"]
+        if c1d.shape[-1] <= c1d.shape[1]:
+            return weights
 
+        sanitized_weights = {}
+        args = self.args
+
+        for name, param in weights.items():
+            # Fold-in multipliers
+            if name.endswith("embed_tokens.weight"):
+                param *= args.embedding_multiplier
+            elif name.endswith("lm_head.weight"):
+                param *= args.lm_head_multiplier
+            elif name.endswith("q_proj.weight") or name.endswith("k_proj.weight"):
+                param *= args.attention_in_multiplier
+            elif name.endswith("key_proj.weight"):
+                param *= args.attention_in_multiplier * args.key_multiplier
+            elif name.endswith("o_proj.weight"):
+                param *= args.attention_out_multiplier
+            elif name.endswith("out_proj.weight"):
+                param *= args.ssm_out_multiplier
+            elif name.endswith("gate_proj.weight"):
+                param *= args.mlp_multipliers[0]
+            elif name.endswith("down_proj.weight"):
+                param *= args.mlp_multipliers[1]
+            elif name.endswith("in_proj.weight"):
+                param *= (
+                    args.ssm_in_multiplier
+                    * self.model._mup_vector.astype(param.dtype)[:, None]
+                )
+            elif "conv1d.weight" in name:
+                param = param.transpose(0, 2, 1)
             sanitized_weights[name] = param
         return sanitized_weights
 
