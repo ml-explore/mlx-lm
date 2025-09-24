@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optimizers
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_map
 from tqdm import tqdm
 
 from mlx_lm.tuner.datasets import load_dataset
@@ -24,25 +24,6 @@ from mlx_lm.utils import (
 )
 
 
-class Catcher(nn.Module):
-    def __init__(self, module):
-        super().__init__()
-        self.module = module
-
-    def __call__(self, *args, **kwargs):
-        outputs = self.module(*args, **kwargs)
-        self.outputs = outputs[0] if isinstance(outputs, tuple) else outputs
-        return outputs
-
-    def __getattr__(self, key: str):
-        if (value := self.get(key)) is not None:
-            return value
-        elif (m := self.get("module")) is not None:
-            return getattr(m, key)
-        else:
-            super(nn.Module, self).__getattribute__(key)
-
-
 def dwq_quantize(
     model,
     q_model,
@@ -51,10 +32,9 @@ def dwq_quantize(
     valid_data,
     batch_size: int = 2,
     max_seq_length: int = 2048,
-    activation_layer_step: float = 0.25,
-    activation_loss_weight: float = 1.0,
     dtype: mx.Dtype = mx.bfloat16,
     gradient_checkpoint: bool = False,
+    temperature: float = 2.0,
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -65,52 +45,35 @@ def dwq_quantize(
             tqdm.write(*args, **kwargs)
 
     def unfreeze(_, m):
-        if hasattr(m, "bits") and hasattr(m, "group_size") and m.mode == "affine":
+        if (
+            hasattr(m, "bits")
+            and hasattr(m, "group_size")
+            and m.mode == "affine"
+            and m.bits < 8
+        ):
             m.unfreeze(keys=["scales", "biases"], recurse=False)
 
     q_model.train()
     q_model.apply_to_modules(unfreeze)
     print_trainable_parameters(q_model)
 
-    layer_id_step = max(int(activation_layer_step * len(model.layers)), 1)
-    layer_ids = list(range(len(model.layers)))[layer_id_step::layer_id_step]
-
-    for lid in layer_ids:
-        model.layers[lid] = Catcher(model.layers[lid])
-        q_model.layers[lid] = Catcher(q_model.layers[lid])
-
     if gradient_checkpoint:
         grad_checkpoint(q_model.layers[0])
 
-    def forward(model, inputs):
-        logits = model(inputs)
-        extra_targets = [
-            model.layers[lid].outputs.astype(mx.float32) for lid in layer_ids
-        ]
-        for lid in layer_ids:
-            model.layers[lid].outputs = None
-        return logits, extra_targets
+    scale = 1 / temperature
 
-    def loss_fn(params, x, targets, extra_targets, lengths):
+    def loss_fn(params, x, targets, lengths):
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
-        logits, q_extra_targets = forward(q_model, x)
-        losses = kl_div_loss(logits, targets)
+        logits = q_model(x)
+        losses = kl_div_loss(scale * logits, scale * targets)
         mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
-        kl_loss = (mask * losses).sum() / ntoks
-        act_loss = mx.stack(
-            [
-                (mask * (qe - e).abs().mean(axis=-1)).sum() / ntoks
-                for qe, e in zip(q_extra_targets, extra_targets)
-            ]
-        )
-        act_loss = act_loss.mean()
-        loss = kl_loss + activation_loss_weight * act_loss
-        return loss, ntoks, kl_loss, act_loss
+        loss = (mask * losses).sum() / ntoks
+        return loss, ntoks
 
-    def step(inputs, targets, extra_targets, lengths, params):
-        (loss, ntoks, *_), grads = mx.value_and_grad(loss_fn)(
-            params, inputs, targets, extra_targets, lengths
+    def step(inputs, targets, lengths, params):
+        (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
+            params, inputs, targets, lengths
         )
         grads = nn.average_gradients(grads)
         params = opt.apply_gradients(grads, params)
@@ -118,36 +81,24 @@ def dwq_quantize(
 
     def validate(params, it):
         v_loss = 0.0
-        v_kl_loss = 0.0
-        v_act_loss = 0.0
         v_tokens = 0
-        for it, (batch, lengths) in tqdm(
-            enumerate(iterate_batches(valid_data, batch_size, max_seq_length)),
+        for batch, lengths in tqdm(
+            iterate_batches(valid_data, batch_size, max_seq_length),
             total=len(valid_data) // batch_size,
             desc="Computing validation loss",
             leave=False,
         ):
             batch = batch[:, :-1]
-            targets, extra_targets = forward(model, batch)
-            mx.eval(targets, extra_targets)
-            loss, ntoks, kl_loss, act_loss = loss_fn(
-                params, batch, targets, extra_targets, lengths
-            )
+            targets = model(batch)
+            mx.eval(targets)
+            loss, ntoks = loss_fn(params, batch, targets, lengths)
             mx.eval(loss, ntoks)
             loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
-            kl_loss = mx.distributed.all_sum(kl_loss, stream=mx.cpu).item() / world_size
-            act_loss = (
-                mx.distributed.all_sum(act_loss, stream=mx.cpu).item() / world_size
-            )
             ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
             v_tokens += ntoks
             v_loss += loss * ntoks
-            v_kl_loss += kl_loss * ntoks
-            v_act_loss += act_loss * ntoks
         loss = v_loss / v_tokens
-        kl_loss = v_kl_loss / v_tokens
-        act_loss = v_act_loss / v_tokens
-        rprint(f"Validation: {it=}, {loss=:.3f}, {kl_loss=:.3f}, {act_loss=:.3f}")
+        rprint(f"Validation: {it=}, {loss=:.3f}")
         return loss
 
     # Accumulate learned weights in higher precision
@@ -172,9 +123,9 @@ def dwq_quantize(
         )
     ):
         batch = batch[:, :-1]
-        targets, extra_targets = forward(model, batch)
-        mx.eval(targets, extra_targets)
-        loss, ntoks, params = step(batch, targets, extra_targets, lengths, params)
+        targets = model(batch)
+        mx.eval(targets)
+        loss, ntoks, params = step(batch, targets, lengths, params)
         mx.eval(loss, params)
         loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
         ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
@@ -206,8 +157,6 @@ def dwq_quantize(
         )
 
     q_model.update(tree_map(lambda x: x.astype(dtype), params))
-    for lid in layer_ids:
-        q_model.layers[lid] = q_model.layers[lid].module
 
 
 def load_data(
@@ -273,7 +222,7 @@ def main():
         default=2048,
         help="Number of samples to use for training.",
     )
-    parser.add_argument("--max-seq-length", type=int, default=2049)
+    parser.add_argument("--max-seq-length", type=int, default=1025)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--batch-size", type=int, default=4)
