@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,11 +31,12 @@ class QuantizedSwitchLinear(nn.Module):
         bias: bool = True,
         group_size: int = 64,
         bits: int = 4,
+        mode: str = "affine",
     ):
         super().__init__()
 
         scale = math.sqrt(1 / input_dims)
-        self.weight, self.scales, self.biases = mx.quantize(
+        self.weight, self.scales, *biases = mx.quantize(
             mx.random.uniform(
                 low=-scale,
                 high=scale,
@@ -42,22 +44,19 @@ class QuantizedSwitchLinear(nn.Module):
             ),
             group_size=group_size,
             bits=bits,
+            mode=mode,
         )
+        self.biases = biases[0] if biases else None
 
         if bias:
             self.bias = mx.zeros((num_experts, output_dims))
 
         self.group_size = group_size
         self.bits = bits
+        self.mode = mode
 
         # Freeze this model's parameters
         self.freeze()
-
-    def unfreeze(self, *args, **kwargs):
-        """Wrap unfreeze so that we unfreeze any layers we might contain but
-        our parameters will remain frozen."""
-        super().unfreeze(*args, **kwargs)
-        self.freeze(recurse=False)
 
     @property
     def input_dims(self):
@@ -76,11 +75,12 @@ class QuantizedSwitchLinear(nn.Module):
             x,
             self["weight"],
             self["scales"],
-            self["biases"],
+            self.get("biases"),
             rhs_indices=indices,
             transpose=True,
             group_size=self.group_size,
             bits=self.bits,
+            mode=self.mode,
             sorted_indices=sorted_indices,
         )
         if "bias" in self:
@@ -126,15 +126,38 @@ class SwitchLinear(nn.Module):
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4):
+    def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):
         num_experts, output_dims, input_dims = self.weight.shape
         ql = QuantizedSwitchLinear(
-            input_dims, output_dims, num_experts, False, group_size, bits
+            input_dims,
+            output_dims,
+            num_experts,
+            False,
+            group_size,
+            bits,
+            mode=mode,
         )
-        ql.weight, ql.scales, ql.biases = mx.quantize(self.weight, group_size, bits)
+        ql.weight, ql.scales, *biases = mx.quantize(
+            self.weight, group_size, bits, mode=mode
+        )
+        ql.biases = biases[0] if biases else None
+
         if "bias" in self:
             ql.bias = self.bias
         return ql
+
+
+@partial(mx.compile, shapeless=True)
+def swiglu(x, gate):
+    return nn.silu(gate) * x
+
+
+class SwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, x, gate):
+        return swiglu(x, gate)
 
 
 class SwitchGLU(nn.Module):
@@ -143,7 +166,7 @@ class SwitchGLU(nn.Module):
         input_dims: int,
         hidden_dims: int,
         num_experts: int,
-        activation=nn.SiLU(),
+        activation=SwiGLU(),
         bias: bool = False,
     ):
         super().__init__()
@@ -163,11 +186,12 @@ class SwitchGLU(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-
+        if self.training:
+            idx = mx.stop_gradient(idx)
         x_up = self.up_proj(x, idx, sorted_indices=do_sort)
         x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
-            self.activation(x_gate) * x_up,
+            self.activation(x_up, x_gate),
             idx,
             sorted_indices=do_sort,
         )
@@ -203,7 +227,8 @@ class SwitchMLP(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-
+        if self.training:
+            idx = mx.stop_gradient(idx)
         x = self.fc1(x, idx, sorted_indices=do_sort)
         x = self.activation(x)
         x = self.fc2(x, idx, sorted_indices=do_sort)

@@ -52,6 +52,12 @@ options for a command, e.g.:
 mlx_lm.generate -h
 ```
 
+The default model for generation and chat is
+`mlx-community/Llama-3.2-3B-Instruct-4bit`.  You can specify any MLX-compatible
+model with the `--model` flag. Thousands are available in the
+[MLX Community](https://huggingface.co/mlx-community) Hugging Face
+organization.
+
 ### Python API
 
 You can use `mlx-lm` as a module:
@@ -79,7 +85,9 @@ To see a description of all the arguments you can do:
 
 Check out the [generation
 example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/generate_response.py)
-to see how to use the API in more detail.
+to see how to use the API in more detail. Check out the [batch generation
+example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
+to see how to efficiently generate continuations for a batch of prompts.
 
 The `mlx-lm` package also comes with functionality to quantize and optionally
 upload models to the Hugging Face Hub.

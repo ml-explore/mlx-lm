@@ -93,11 +93,6 @@ class Attention(nn.Module):
         return output
 
 
-@partial(mx.compile, shapeless=True)
-def relu2(x):
-    return mx.square(nn.relu(x))
-
-
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -112,10 +107,11 @@ class MLP(nn.Module):
         self.gate_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
         self.down_proj = BitLinear(hidden_dim, dim, bias=mlp_bias)
         self.up_proj = BitLinear(dim, hidden_dim, bias=mlp_bias)
+
         self.ffn_sub_norm = nn.RMSNorm(args.intermediate_size, eps=args.rms_norm_eps)
 
     def __call__(self, x) -> mx.array:
-        x = relu2(self.gate_proj(x)) * self.up_proj(x)
+        x = nn.relu2(self.gate_proj(x)) * self.up_proj(x)
         x = self.ffn_sub_norm(x)
         x = self.down_proj(x)
         return x
@@ -162,16 +158,14 @@ class LlamaModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -191,10 +185,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

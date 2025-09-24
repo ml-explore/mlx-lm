@@ -33,9 +33,9 @@ class ModelArgs(BaseModelArgs):
     topk_method: str = "noaux_tc"
     scoring_func: str = "sigmoid"
     norm_topk_prob: bool = True
-    n_group: Optional[int] = None
-    topk_group: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
+    n_group: int = 1
+    topk_group: int = 1
+    num_experts_per_tok: int = 1
     moe_layer_freq: int = 1
     first_k_dense_replace: int = 0
     max_position_embeddings: int = 2048
@@ -122,20 +122,6 @@ class DeepseekV3YarnRotaryEmbedding(nn.Module):
             offset=offset,
             freqs=self._freqs,
         )
-
-
-# A clipped silu to prevent fp16 from overflowing
-@partial(mx.compile, shapeless=True)
-def clipped_silu(x):
-    return mx.clip(x * mx.sigmoid(x), a_min=-100, a_max=100)
-
-
-class ClippedSilu(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def __call__(self, x):
-        return clipped_silu(x)
 
 
 class DeepseekV3Attention(nn.Module):
@@ -295,16 +281,18 @@ def group_expert_select(
     norm_topk_prob,
 ):
 
-    k = top_k
     scores = mx.sigmoid(gates.astype(mx.float32))
     orig_scores = scores
     scores = scores + e_score_correction_bias
-    scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-    group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-    k = n_group - topk_group
-    group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-    scores = mx.put_along_axis(scores, group_idx, mx.array(0.0), axis=-2)
-    scores = mx.flatten(scores, -2, -1)
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        scores = mx.flatten(scores, -2, -1)
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
@@ -352,7 +340,6 @@ class DeepseekV3MoE(nn.Module):
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
-            activation=ClippedSilu(),
         )
 
         self.gate = MoEGate(config)
@@ -438,17 +425,15 @@ class DeepseekV3Model(nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = self.embed_tokens(x)
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
-        if mask is None:
-            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * self.num_layers
+        mask = create_attention_mask(h, cache[0])
 
         # Receive from the previous process in the pipeline
 
@@ -480,9 +465,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     def sanitize(self, weights):

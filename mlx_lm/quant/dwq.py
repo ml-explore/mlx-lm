@@ -13,7 +13,8 @@ from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 from mlx_lm.tuner.datasets import load_dataset
-from mlx_lm.tuner.trainer import iterate_batches
+from mlx_lm.tuner.losses import kl_div_loss
+from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
     fetch_from_hub,
@@ -29,29 +30,45 @@ class Catcher(nn.Module):
         self.module = module
 
     def __call__(self, *args, **kwargs):
-        self.outputs = self.module(*args, **kwargs)
-        return self.outputs
+        outputs = self.module(*args, **kwargs)
+        self.outputs = outputs[0] if isinstance(outputs, tuple) else outputs
+        return outputs
+
+    def __getattr__(self, key: str):
+        if (value := self.get(key)) is not None:
+            return value
+        elif (m := self.get("module")) is not None:
+            return getattr(m, key)
+        else:
+            super(nn.Module, self).__getattribute__(key)
 
 
 def dwq_quantize(
     model,
     q_model,
     opt,
-    data,
+    train_data,
+    valid_data,
     batch_size: int = 2,
     max_seq_length: int = 2048,
     activation_layer_step: float = 0.25,
     activation_loss_weight: float = 1.0,
     dtype: mx.Dtype = mx.bfloat16,
+    gradient_checkpoint: bool = False,
 ):
     group = mx.distributed.init()
     world_size = group.size()
     rank = group.rank()
 
+    def rprint(*args, **kwargs):
+        if rank == 0:
+            tqdm.write(*args, **kwargs)
+
     def unfreeze(_, m):
-        if hasattr(m, "bits") and hasattr(m, "group_size"):
+        if hasattr(m, "bits") and hasattr(m, "group_size") and m.mode == "affine":
             m.unfreeze(keys=["scales", "biases"], recurse=False)
 
+    q_model.train()
     q_model.apply_to_modules(unfreeze)
     print_trainable_parameters(q_model)
 
@@ -62,22 +79,22 @@ def dwq_quantize(
         model.layers[lid] = Catcher(model.layers[lid])
         q_model.layers[lid] = Catcher(q_model.layers[lid])
 
-    def log_norm(x):
-        return x - mx.logsumexp(x, axis=-1, keepdims=True)
+    if gradient_checkpoint:
+        grad_checkpoint(q_model.layers[0])
 
     def forward(model, inputs):
-        logprobs = log_norm(model(inputs).astype(mx.float32))
+        logits = model(inputs)
         extra_targets = [
             model.layers[lid].outputs.astype(mx.float32) for lid in layer_ids
         ]
         for lid in layer_ids:
             model.layers[lid].outputs = None
-        return logprobs, extra_targets
+        return logits, extra_targets
 
     def loss_fn(params, x, targets, extra_targets, lengths):
         q_model.update(tree_map(lambda x: x.astype(dtype), params))
-        logprobs, q_extra_targets = forward(q_model, x)
-        losses = nn.losses.kl_div_loss(logprobs, targets, reduction="none")
+        logits, q_extra_targets = forward(q_model, x)
+        losses = kl_div_loss(logits, targets)
         mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
         kl_loss = (mask * losses).sum() / ntoks
@@ -87,16 +104,51 @@ def dwq_quantize(
                 for qe, e in zip(q_extra_targets, extra_targets)
             ]
         )
-        loss = kl_loss + activation_loss_weight * act_loss.mean()
-        return loss, ntoks
+        act_loss = act_loss.mean()
+        loss = kl_loss + activation_loss_weight * act_loss
+        return loss, ntoks, kl_loss, act_loss
 
     def step(inputs, targets, extra_targets, lengths, params):
-        (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
+        (loss, ntoks, *_), grads = mx.value_and_grad(loss_fn)(
             params, inputs, targets, extra_targets, lengths
         )
         grads = nn.average_gradients(grads)
         params = opt.apply_gradients(grads, params)
         return loss, ntoks, params
+
+    def validate(params, it):
+        v_loss = 0.0
+        v_kl_loss = 0.0
+        v_act_loss = 0.0
+        v_tokens = 0
+        for it, (batch, lengths) in tqdm(
+            enumerate(iterate_batches(valid_data, batch_size, max_seq_length)),
+            total=len(valid_data) // batch_size,
+            desc="Computing validation loss",
+            leave=False,
+        ):
+            batch = batch[:, :-1]
+            targets, extra_targets = forward(model, batch)
+            mx.eval(targets, extra_targets)
+            loss, ntoks, kl_loss, act_loss = loss_fn(
+                params, batch, targets, extra_targets, lengths
+            )
+            mx.eval(loss, ntoks)
+            loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
+            kl_loss = mx.distributed.all_sum(kl_loss, stream=mx.cpu).item() / world_size
+            act_loss = (
+                mx.distributed.all_sum(act_loss, stream=mx.cpu).item() / world_size
+            )
+            ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
+            v_tokens += ntoks
+            v_loss += loss * ntoks
+            v_kl_loss += kl_loss * ntoks
+            v_act_loss += act_loss * ntoks
+        loss = v_loss / v_tokens
+        kl_loss = v_kl_loss / v_tokens
+        act_loss = v_act_loss / v_tokens
+        rprint(f"Validation: {it=}, {loss=:.3f}, {kl_loss=:.3f}, {act_loss=:.3f}")
+        return loss
 
     # Accumulate learned weights in higher precision
     params = tree_map(
@@ -107,11 +159,16 @@ def dwq_quantize(
     total_loss = 0.0
     total_tokens = 0
     tokens = 0
+
     tic = time.time()
+
+    # Compute initial validation loss
+    initial_valid_loss = valid_loss = validate(params, it=0)
+
     for it, (batch, lengths) in (
         pbar := tqdm(
-            enumerate(iterate_batches(data, batch_size, max_seq_length)),
-            total=len(data) // batch_size,
+            enumerate(iterate_batches(train_data, batch_size, max_seq_length)),
+            total=len(train_data) // batch_size,
         )
     ):
         batch = batch[:, :-1]
@@ -130,42 +187,74 @@ def dwq_quantize(
                 peak_memory_gb = mx.get_peak_memory() / 1e9
                 avg_loss = total_loss / tokens
                 total_tokens += tokens
-                tqdm.write(
+                rprint(
                     f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
                     f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
                 )
                 tic = time.time()
                 tokens = 0
                 total_loss = 0
+        if (it + 1) % 200 == 0:
+            valid_loss = validate(params, it=it)
+
+    valid_loss = validate(params, it=it)
+    if initial_valid_loss < valid_loss:
+        rprint(
+            f"❌❌❌\n[WARNING] Final validation loss {valid_loss:.3f} is "
+            f"worse than initial validation loss {initial_valid_loss:.3f}."
+            " Model quality will likely be degraded.\n❌❌❌"
+        )
+
     q_model.update(tree_map(lambda x: x.astype(dtype), params))
     for lid in layer_ids:
         q_model.layers[lid] = q_model.layers[lid].module
 
 
-def load_data(tokenizer, data_path: str, num_samples: int, max_seq_length: int):
+def load_data(
+    tokenizer,
+    data_path: str,
+    num_samples: int,
+    max_seq_length: int,
+    num_valid_samples: int = 32,
+):
     args = types.SimpleNamespace(
         hf_dataset={
             "path": data_path,
-            "train_split": f"train",
+            "train_split": "train",
             "valid_split": "train[:1]",
         },
         train=True,
         test=False,
     )
     dataset = load_dataset(args, tokenizer)[0]
-    perm = np.random.permutation(len(dataset))[:num_samples].tolist()
+    perm = np.random.permutation(len(dataset))
+    train_perm = perm[:num_samples].tolist()
+    valid_perm = perm[num_samples : num_samples + num_valid_samples].tolist()
 
     def process(idx):
         tokens, offset = dataset.process(dataset[idx])
         return (tokens[:max_seq_length], offset)
 
-    return [process(i) for i in perm]
+    train = [process(i) for i in train_perm]
+    valid = [process(i) for i in valid_perm]
+    return train, valid
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", "-m", default="Qwen/Qwen3-4B")
-    parser.add_argument("--quantized-model", default=None)
+    parser.add_argument(
+        "--model",
+        "-m",
+        help="A model to distill from for DWQ. If `quantized-model` is not"
+        " given the student model will be this model quantized according"
+        " to `bits` and `group-size`.",
+        required=True,
+    )
+    parser.add_argument(
+        "--quantized-model",
+        default=None,
+        help="An already quantized model (the student model) to improve with DWQ.",
+    )
     parser.add_argument(
         "--mlx-path", default="mlx_model", help="Path to save the quantized model."
     )
@@ -194,6 +283,11 @@ def main():
         default="allenai/tulu-3-sft-mixture",
         help="A Hugging Face dataset which is compatible with an mlx-lm dataset format.",
     )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Use gradient checkpointing to reduce memory use.",
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -206,32 +300,44 @@ def main():
     mx.random.seed(args.seed)
 
     model_path, hf_repo = get_model_path(args.model, revision=None)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+    model, config, tokenizer = fetch_from_hub(
+        model_path, lazy=True, trust_remote_code=True
+    )
 
-    calibration_data = load_data(
+    train_data, valid_data = load_data(
         tokenizer, args.data_path, args.num_samples, args.max_seq_length
     )
 
     if args.quantized_model is not None:
-        q_model_path = get_model_path(args.quantized_model, revision=None)
-        q_model, config, _ = fetch_from_hub(q_model_path, lazy=True)
+        q_model_path, _ = get_model_path(args.quantized_model, revision=None)
+        q_model, config, _ = fetch_from_hub(
+            q_model_path, lazy=True, trust_remote_code=True
+        )
+        if "quantization" not in config:
+            raise ValueError("Quantized model must already be quantized.")
     else:
         q_model = copy.deepcopy(model)
         _, config = quantize_model(
             q_model,
             config,
-            q_group_size=args.group_size,
-            q_bits=args.bits,
+            group_size=args.group_size,
+            bits=args.bits,
         )
+
+    if mx.metal.is_available():
+        max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+        mx.set_wired_limit(max_rec_size)
 
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)
     dwq_quantize(
         model,
         q_model,
         opt,
-        calibration_data,
+        train_data,
+        valid_data,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
+        gradient_checkpoint=args.grad_checkpoint,
     )
     save(
         args.mlx_path,

@@ -29,6 +29,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     use_cla: bool
     cla_share_factor: 2
+    moe_intermediate_size: Optional[Union[int, list]] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
 
@@ -38,6 +39,12 @@ class ModelArgs(BaseModelArgs):
             required_keys = {"factor", "type"}
             if not all(key in self.rope_scaling for key in required_keys):
                 raise ValueError(f"rope_scaling must contain keys {required_keys}")
+
+
+def _int_or_list(arg, idx):
+    if isinstance(arg, list):
+        return arg[idx]
+    return arg
 
 
 class DynamicNTKAlphaRoPE(nn.Module):
@@ -154,20 +161,29 @@ class Gate(nn.Module):
 
 
 class MoeBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int = 0):
         super().__init__()
         dim = args.hidden_size
         intermediate_size = args.intermediate_size
         self.use_shared_mlp = args.use_mixed_mlp_moe
 
         if args.use_mixed_mlp_moe:
-            self.shared_mlp = MLP(dim, intermediate_size * args.num_shared_expert)
+            num_shared = _int_or_list(args.num_shared_expert, layer_idx)
+            self.shared_mlp = MLP(dim, int(intermediate_size * num_shared))
 
         self.num_experts = num_experts = args.num_experts
-        self.top_k = args.moe_topk
+        self.top_k = _int_or_list(args.moe_topk, layer_idx)
 
         self.gate = Gate(dim, num_experts)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+
+        # Use moe_intermediate_size if available, otherwise use intermediate_size
+        expert_intermediate_size = intermediate_size
+        if args.moe_intermediate_size is not None:
+            expert_intermediate_size = _int_or_list(
+                args.moe_intermediate_size, layer_idx
+            )
+
+        self.switch_mlp = SwitchGLU(dim, expert_intermediate_size, num_experts)
 
     def __call__(
         self,
@@ -181,7 +197,7 @@ class MoeBlock(nn.Module):
         scores = mx.take_along_axis(gates, inds, axis=-1)
 
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
 
         if self.use_shared_mlp:
             shared_expert_output = self.shared_mlp(x)
@@ -191,14 +207,14 @@ class MoeBlock(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, kv_proj: bool):
+    def __init__(self, args: ModelArgs, kv_proj: bool, layer_idx: int = 0):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(kv_proj, args)
         if args.num_experts == 1:
             self.mlp = MLP(args.hidden_size, args.intermediate_size)
         else:
-            self.mlp = MoeBlock(args)
+            self.mlp = MoeBlock(args, layer_idx)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -234,6 +250,7 @@ class HunYuanModel(nn.Module):
             DecoderLayer(
                 args=args,
                 kv_proj=(not args.use_cla) or (i % args.cla_share_factor) == 0,
+                layer_idx=i,
             )
             for i in range(args.num_hidden_layers)
         ]
@@ -242,17 +259,14 @@ class HunYuanModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
 
+        mask = create_attention_mask(h, cache[0])
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             if (not self.args.use_cla) or i % self.args.cla_share_factor == 0:
                 shared_kv_states = None
@@ -271,10 +285,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         return self.model.embed_tokens.as_linear(out)
 
     def sanitize(self, weights):

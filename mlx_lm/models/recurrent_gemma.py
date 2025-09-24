@@ -385,11 +385,12 @@ class Griffin(nn.Module):
             for i in range(config.num_hidden_layers)
         ]
         self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.window_size = config.attention_window_size
+        self.swa_idx = block_types.index("attention")
 
     def __call__(
         self,
         tokens,
-        mask: mx.array = None,
         cache=None,
     ):
         x = self.embed_tokens(tokens)
@@ -399,12 +400,9 @@ class Griffin(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        for i, block in enumerate(self.layers):
-            if block.temporal_block_type != "recurrent":
-                mask_cache = [cache[i]]
-
-        if mask is None:
-            mask = create_attention_mask(x, mask_cache)
+        mask = create_attention_mask(
+            x, cache[self.swa_idx], window_size=self.window_size
+        )
 
         for i, block in enumerate(self.layers):
             x = block(x, mask=mask, cache=cache[i])
@@ -420,12 +418,8 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def __call__(self, tokens: mx.array, mask: mx.array = None, cache=None) -> mx.array:
-        """
-        Args:
-          tokens: Sequence of input tokens.
-        """
-        logits = self.model(tokens, mask=mask, cache=cache)
+    def __call__(self, tokens: mx.array, cache=None) -> mx.array:
+        logits = self.model(tokens, cache=cache)
         if "lm_head" in self:
             logits = self.lm_head(logits)
         else:

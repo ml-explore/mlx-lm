@@ -87,8 +87,6 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         # Sliding window
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[..., -keys.shape[-2] :]
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
@@ -160,6 +158,8 @@ class Gemma3Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        self.window_size = args.sliding_window
+        self.sliding_window_pattern = args.sliding_window_pattern
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
         assert self.vocab_size > 0
@@ -173,7 +173,6 @@ class Gemma3Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
@@ -186,24 +185,19 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            j = self.args.sliding_window_pattern
-            full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
+        global_mask = create_attention_mask(h, cache[self.sliding_window_pattern - 1])
 
+        sliding_window_mask = create_attention_mask(
+            h,
+            cache[0],
+            window_size=self.window_size,
+        )
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
-                i % self.args.sliding_window_pattern
-                == self.args.sliding_window_pattern - 1
+                i % self.sliding_window_pattern == self.sliding_window_pattern - 1
             )
-
-            local_mask = mask
-            if mask is None and is_global:
-                local_mask = full_mask
-            elif mask is None:
-                local_mask = sliding_window_mask
-
-            h = layer(h, local_mask, c)
+            mask = global_mask if is_global else sliding_window_mask
+            h = layer(h, mask, c)
 
         return self.norm(h)
 
@@ -215,22 +209,25 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = Gemma3Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.tie_word_embeddings = False
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
-        mask: Optional[mx.array] = None,
         input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache, input_embeddings)
-        out = self.lm_head(out)
+        out = self.model(inputs, cache, input_embeddings)
+        if self.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
         return out
 
     def sanitize(self, weights):
-        weights = dict(weights)
         if "lm_head.weight" not in weights:
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+            self.tie_word_embeddings = True
+            self.pop("lm_head")
         return weights
 
     @property
@@ -246,7 +243,5 @@ class Model(nn.Module):
             ):
                 caches.append(KVCache())
             else:
-                caches.append(
-                    RotatingKVCache(max_size=self.args.sliding_window, keep=0)
-                )
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches

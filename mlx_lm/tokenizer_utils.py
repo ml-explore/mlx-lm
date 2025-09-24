@@ -89,7 +89,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if (
+            if self._current_text.endswith("\ufffd") or (
                 self._tokenizer.clean_up_tokenization_spaces
                 and len(self._current_text) > 0
                 and self._current_text[-1] == " "
@@ -203,7 +203,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token):
         self.tokens.append(token)
-        v = self.tokenmap[token]
+        v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
         self._unflushed += v
         text = self._decode_bytes(self._unflushed)
 
@@ -262,7 +262,7 @@ class TokenizerWrapper:
         self, tokenizer, detokenizer_class=NaiveStreamingDetokenizer, eos_token_ids=None
     ):
         self._tokenizer = tokenizer
-        self._detokenizer = detokenizer_class(tokenizer)
+        self._detokenizer_class = detokenizer_class
         self._eos_token_ids = (
             set(eos_token_ids)
             if eos_token_ids is not None
@@ -283,8 +283,6 @@ class TokenizerWrapper:
                 self._think_end = think_end
                 break
         if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
-            self._tool_call_start = ""
-            self._tool_call_end = ""
             for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
                 if tool_call_start in vocab and tool_call_end in vocab:
                     self._tool_call_start = tool_call_start
@@ -326,6 +324,13 @@ class TokenizerWrapper:
     @property
     def tool_call_end(self):
         return self._tool_call_end
+
+    @property
+    def detokenizer(self):
+        """
+        Get a stateful streaming detokenizer.
+        """
+        return self._detokenizer_class(self)
 
     def __getattr__(self, attr):
         if attr == "detokenizer":

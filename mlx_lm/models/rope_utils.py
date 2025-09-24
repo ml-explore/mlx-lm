@@ -236,6 +236,7 @@ def initialize_rope(
             dims=dims,
             max_position_embeddings=max_position_embeddings,
             traditional=traditional,
+            scaling_factor=scaling_factor,
             base=base,
             **rope_kwargs,
         )
@@ -250,6 +251,11 @@ def initialize_rope(
             short_factor=scaling_config["short_factor"],
             long_factor=scaling_config["long_factor"],
         )
-
+    elif rope_type == "mrope":
+        mrope_section = scaling_config.get("mrope_section", [])
+        assert (
+            len(mrope_section) == 3
+        ), f"MRoPE currently only supports 3 sections, got {len(mrope_section)}."
+        return nn.RoPE(dims, traditional=traditional, base=base)
     else:
         raise ValueError(f"Unsupported RoPE type {rope_type}")

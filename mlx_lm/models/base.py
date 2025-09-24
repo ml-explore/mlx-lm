@@ -7,8 +7,6 @@ from typing import Any, Optional
 import mlx.core as mx
 from mlx.utils import tree_map
 
-from .cache import QuantizedKVCache
-
 
 @dataclass
 class BaseModelArgs:
@@ -27,7 +25,8 @@ def create_causal_mask(
     N: int,
     offset: int = 0,
     window_size: Optional[int] = None,
-    lengths: Optional[mx.array] = None,
+    right_padding: Optional[mx.array] = None,
+    left_padding: Optional[mx.array] = None,
 ):
     rinds = mx.arange(offset + N)
     linds = mx.arange(offset, offset + N) if offset else rinds
@@ -35,34 +34,31 @@ def create_causal_mask(
     rinds = rinds[None]
     mask = linds >= rinds
     if window_size is not None:
-        mask = mask & (linds <= rinds + window_size)
-    if lengths is not None:
-        lengths = lengths[:, None, None, None]
-        mask = mask & (rinds < lengths)
+        mask = mask & (linds < rinds + window_size)
+    if right_padding is not None:
+        mask = mask & (rinds < mx.expand_dims((offset + N) - right_padding, (1, 2, 3)))
+    if left_padding is not None:
+        mask = mask & (mx.expand_dims(left_padding, (1, 2, 3)) <= rinds)
     return mask
 
 
 def create_attention_mask(
-    h: mx.array, cache: Optional[Any] = None, return_array: bool = False
+    h, cache=None, window_size: Optional[int] = None, return_array: bool = False
 ):
-    T = h.shape[1]
-    if T > 1:
-        offset = 0
-        window_size = None
-        if cache is not None and cache[0] is not None:
-            c = cache[0]
-            offset = c.offset
-            if hasattr(c, "max_size"):
-                window_size = c.max_size
-                offset = min(window_size, offset)
-                return_array = return_array or offset + T > window_size
-        if return_array:
-            return create_causal_mask(T, offset, window_size=window_size)
-        else:
-            return "causal"
-    else:
-        mask = None
-    return mask
+    N = h.shape[1]
+    if cache and hasattr(cache, "make_mask"):
+        return cache.make_mask(N, return_array=return_array, window_size=window_size)
+    if N == 1:
+        return None
+    if return_array or (window_size and N > window_size):
+        return create_causal_mask(N, window_size=window_size)
+    return "causal"
+
+
+def create_ssm_mask(h, cache=None):
+    if cache and hasattr(cache, "make_mask"):
+        return cache.make_mask(h.shape[1])
+    return None
 
 
 def quantized_scaled_dot_product_attention(
@@ -116,8 +112,11 @@ def scaled_dot_product_attention(
     cache,
     scale: float,
     mask: Optional[mx.array],
+    sinks: Optional[mx.array] = None,
 ) -> mx.array:
-    if isinstance(cache, QuantizedKVCache):
+    if hasattr(cache, "bits"):
+        if sinks is not None:
+            raise ValueError("Quantized SDPA does not support attention sinks.")
         return quantized_scaled_dot_product_attention(
             queries,
             keys,
@@ -129,5 +128,10 @@ def scaled_dot_product_attention(
         )
     else:
         return mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=scale, mask=mask
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
         )

@@ -84,10 +84,12 @@ def linear_to_lora_layers(
     keys = config.get("keys", None)
     if keys is not None:
         keys = set(keys)
-    elif model.model_type in [
+    elif model.model_type in {
         "mistral",
         "mistral3",
         "llama",
+        "llama4_text",
+        "lfm2",
         "phi",
         "mixtral",
         "nemotron",
@@ -116,27 +118,56 @@ def linear_to_lora_layers(
         "olmoe",
         "internlm3",
         "glm4",
+        "glm",
         "mimo",
         "ernie4_5",
         "dots1",
-    ]:
-        keys = set(["self_attn.q_proj", "self_attn.v_proj"])
+        "smollm3",
+        "exaone4",
+        "hunyuan_v1_dense",
+        "gpt_oss",
+        "ernie4_5_moe",
+        "granitemoe",
+        "longcat_flash",
+        "seed_oss",
+        "apertus",
+        "qwen3_next",
+        "Klear",
+        "lille-130m",
+    }:
+        keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
             keys.add("block_sparse_moe.gate")
-        if model.model_type == "qwen2_moe":
+        if model.model_type in ["qwen2_moe", "qwen3_next"]:
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
+        if model.model_type in ["olmoe", "qwen3_moe", "dots1", "Klear"]:
             keys.add("mlp.gate")
-
+        if model.model_type in ["longcat_flash"]:
+            keys.add("mlp.router.classifier")
+        if model.model_type == "lille-130m":
+            keys.add("attention.qkv_proj")
+            keys.add("attention.out_proj")
+            keys.add("feed_forward.gate_proj")
+            keys.add("feed_forward.up_proj")
+            keys.add("feed_forward.down_proj")
+        elif model.model_type == "qwen3_next":
+            keys.add("linear_attn.in_proj_qkvz")
+            keys.add("linear_attn.out_proj")
+            keys.add("linear_attn.in_proj_ba")
+            keys.add("linear_attn.dt_bias")
+            keys.add("self_attn.q_proj")
+            keys.add("self_attn.k_proj")
+            keys.add("self_attn.v_proj")
+            keys.add("self_attn.o_proj")
     elif model.model_type == "gpt_bigcode":
-        keys = set(["attn.c_attn"])
+        keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
-        keys = set(["attn.c_attn"])
+        keys = {"attn.c_attn"}
     elif model.model_type == "gpt_neox":
-        keys = set(["attention.query_key_value"])
+        keys = {"attention.query_key_value"}
     elif model.model_type == "olmo":
-        keys = set(["att_proj"])
+        keys = {"att_proj"}
     elif model.model_type == "openelm":
         keys = set(["attn.qkv_proj"])
 
@@ -153,36 +184,51 @@ def linear_to_lora_layers(
             # For MoE
             "block_sparse_moe.gate"
         ])
-
+        keys = {"attn.qkv_proj"}
     elif model.model_type == "phi3":
-        keys = set(["self_attn.qkv_proj"])
+        keys = {"self_attn.qkv_proj"}
     elif model.model_type == "phi-msft":
-        keys = set(["mixer.Wqkv", "moe.gate"])
+        keys = {"mixer.Wqkv", "moe.gate"}
     elif model.model_type == "dbrx":
-        keys = set(["norm_attn_norm.attn.Wqkv", "ffn.router.layer"])
+        keys = {"norm_attn_norm.attn.Wqkv", "ffn.router.layer"}
     elif model.model_type == "internlm2":
-        keys = set(["attention.wqkv", "attention.wo"])
-    elif model.model_type == "deepseek_v2" or model.model_type == "minicpm3":
-        keys = set(
-            [
-                "self_attn.q_proj",
-                "self_attn.q_a_proj",
-                "self_attn.q_b_proj",
-                "self_attn.kv_a_proj_with_mqa",
-                "self_attn.kv_b_proj",
-            ]
-        )
+        keys = {"attention.wqkv", "attention.wo"}
+    elif model.model_type in {
+        "deepseek_v2",
+        "deepseek_v3",
+        "longcat_flash",
+        "minicpm3",
+    }:
+        keys = {
+            "self_attn.q_proj",
+            "self_attn.q_a_proj",
+            "self_attn.q_b_proj",
+            "self_attn.kv_a_proj_with_mqa",
+            "self_attn.kv_b_proj",
+        }
     elif model.model_type == "mamba":
-        keys = set(
-            [
-                "mixer.in_proj",
-                "mixer.x_proj",
-                "mixer.dt_proj",
-                "mixer.out_proj",
-            ]
-        )
+        keys = {
+            "mixer.in_proj",
+            "mixer.x_proj",
+            "mixer.dt_proj",
+            "mixer.out_proj",
+        }
+    elif model.model_type == "mamba2":
+        keys = {
+            "mixer.in_proj",
+            "mixer.out_proj",
+        }
     elif model.model_type == "exaone":
-        keys = set(["attn.attention.q_proj", "attn.attention.v_proj"])
+        keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
+    elif model.model_type == "bailing_moe":
+        keys = {"attention.query_key_value", "attention.dense"}
+    elif model.model_type == "nemotron_h":
+        keys.add("mixer.in_proj")
+        keys.add("mixer.out_proj")
+        keys.add("mixer.q_proj")
+        keys.add("mixer.k_proj")
+        keys.add("mixer.v_proj")
+        keys.add("mixer.o_proj")
     else:
         raise ValueError(f"Lora does not support {model.model_type}")
 

@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import http
+import io
 import json
 import threading
 import unittest
@@ -79,15 +80,21 @@ class TestServer(unittest.TestCase):
             "top_p": 0.9,
             "repetition_penalty": 1.1,
             "repetition_context_size": 20,
+            "seed": 999,
             "stop": "stop sequence",
         }
 
         response = requests.post(url, json=post_data)
 
-        response_body = response.text
+        response_body = json.loads(response.text)
 
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+        first_text = response_body["choices"][0]["text"]
+        self.assertEqual(
+            first_text,
+            json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
+        )
 
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
@@ -506,6 +513,56 @@ class TestGetPromptCache(unittest.TestCase):
         mock_make_cache.assert_called_once()
         self.assertEqual(self.handler.prompt_cache.cache, "new_cache_obj_model_change")
         self.assertEqual(self.handler.prompt_cache.model_key, ("model_v2", None, None))
+
+
+class TestKeepalive(unittest.TestCase):
+
+    def test_keepalive_callback(self):
+        """Test keepalive callback sends SSE comments and handles errors"""
+        from unittest.mock import Mock
+
+        # Mock handler
+        mock_wfile = io.BytesIO()
+        handler = Mock()
+        handler.wfile = mock_wfile
+
+        # Test callback logic (same as in server.py)
+        def keepalive_callback(processed_tokens, total_tokens):
+            if handler.stream:
+                try:
+                    handler.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    handler.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+        # Test streaming enabled
+        handler.stream = True
+        keepalive_callback(1024, 4096)
+
+        output = mock_wfile.getvalue().decode("utf-8")
+        self.assertEqual(output, ": keepalive 1024/4096\n\n")
+
+        # Test streaming disabled
+        handler.stream = False
+        mock_wfile.seek(0)
+        mock_wfile.truncate(0)
+        keepalive_callback(2048, 4096)
+
+        output = mock_wfile.getvalue().decode("utf-8")
+        self.assertEqual(output, "")
+
+        # Test error handling
+        handler.stream = True
+        handler.wfile = Mock()
+        handler.wfile.write.side_effect = BrokenPipeError("Connection broken")
+
+        # Should not raise exception
+        try:
+            keepalive_callback(3072, 4096)
+        except Exception as e:
+            self.fail(f"Callback should handle BrokenPipeError: {e}")
 
 
 if __name__ == "__main__":

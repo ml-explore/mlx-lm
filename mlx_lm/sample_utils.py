@@ -16,7 +16,7 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: List[int] = [],
-) -> Callable[mx.array, mx.array]:
+) -> Callable[[mx.array], mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
 
@@ -48,8 +48,6 @@ def make_sampler(
 
     # Create sampler chain
     sampling_methods = []
-    if top_k > 0:
-        sampling_methods.append(lambda x: apply_top_k(x, top_k))
     if top_p > 0 and top_p < 1.0:
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
@@ -58,14 +56,15 @@ def make_sampler(
         sampling_methods.append(
             lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
         )
+    if top_k > 0:
+        sampling_methods.append(lambda x: apply_top_k(x, top_k))
 
     # Apply the sampling methods
-    def sampler(logits):
+    def sampler(logprobs):
         for method in sampling_methods:
-            logits = method(logits)
-
+            logprobs = method(logprobs)
         # Return the sampled token
-        return categorical_sampling(logits, temp)
+        return categorical_sampling(logprobs, temp)
 
     return sampler
 

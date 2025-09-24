@@ -144,16 +144,14 @@ class Glm4Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -172,10 +170,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     @property

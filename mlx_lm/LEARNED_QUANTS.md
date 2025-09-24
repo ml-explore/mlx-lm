@@ -5,13 +5,15 @@ To reduce the quality loss from quantization MLX LM has several options:
 - Distilled Weight Quantization (DWQ)
 - Activation-aware Weight Quantization (AWQ)[^1]
 - Dynamic quantization
+- GPT Quantization (GPTQ)[^2]
 
 All methods use calibration data to tune parameters or hyper-parameters of the
 model. DWQ fine-tunes non-quantized parameters (including quantization scales
 and biases) using the non-quantized model as a teacher. AWQ scales and clips
 the weights prior to quantization. Dynamic quantization estimates the
 sensitivity of a model's outputs to each layer and uses a higher precision for
-layers which have higher sensitivity.
+layers which have higher sensitivity. GPTQ finds quantized weights which
+minimize the squared error of each layer's output given the provided input.
 
 Dynamic quantization is the fastest to run. DWQ takes longer but typically
 yields better results. You can also cascade methods. For example a dynamically
@@ -20,7 +22,7 @@ quantized model can be further refined with DWQ.
 To get started, first install the requirements:
 
 ```
-pip install mlx-lm[quant]
+pip install "mlx-lm[train]"
 ```
 
 ### DWQ
@@ -28,7 +30,7 @@ pip install mlx-lm[quant]
 Use `mlx_lm.dwq` to run DWQ on a given model. For example:
 
 ```bash
-mlx_lm.dwq --model mistralai/Mistral-7B-Instruct-v0.3
+mlx_lm.dwq --model Qwen/Qwen3-0.6B
 ```
 
 Some important options, along with their default values are:
@@ -77,7 +79,7 @@ Use `mlx_lm.dynamic_quant` to generate a dynamic quantization of given model.
 For example:
 
 ```bash
-mlx_lm.dynamic_quant --model mistralai/Mistral-7B-Instruct-v0.3
+mlx_lm.dynamic_quant --model Qwen/Qwen3-0.6B
 ```
 
 The script will estimate the sensitivity for each quantizable layer in the
@@ -101,7 +103,7 @@ Some important options are:
 Use `mlx_lm.awq` to run AWQ on a given model. For example:
 
 ```bash
-mlx_lm.awq --model mistralai/Mistral-7B-Instruct-v0.3
+mlx_lm.awq --model Qwen/Qwen3-0.6B
 ```
 
 The script can take anywhere form a few minutes to several hours to run
@@ -122,10 +124,27 @@ For a full list of options run:
 mlx_lm.awq --help
 ```
 
+### GPTQ
+
+Use `mlx_lm.gptq` to run GPTQ on a given model. For example:
+
+```bash
+mlx_lm.awq --model Qwen/Qwen3-0.6B
+```
+
+The script can take anywhere from a few minutes to several hours depending on
+the model size.
+
+Some important options, along with their default values, are:
+
+- `--mlx-path mlx_model`: The location to save the AWQ model.
+- `--bits 4`: Precision of the quantization.
+
+
 ### Evaluate
 
-Once the training script finishes, you can evaluate the quality of the model
-on downstream tasks using `mlx_lm.evaluate`. For example:
+Once the quantization training finishes, you can evaluate the quality of the
+model on downstream tasks using `mlx_lm.evaluate`. For example:
 
 ```bash
 mlx_lm.evaluate \
@@ -146,4 +165,6 @@ mlx_lm.upload \
 
 [^1]: Refer to the [paper](https://arxiv.org/abs/2306.00978)
 and [github repository](https://github.com/mit-han-lab/llm-awq) for more
-details.
+details on AWQ.
+[^2]: Refer to the [paper](https://arxiv.org/abs/2210.17323) for more details
+on GPTQ.

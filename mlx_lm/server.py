@@ -162,18 +162,14 @@ class ModelProvider:
         self.draft_model = None
 
         # Preload the default model if it is provided
+        self.default_model_map = {}
         if self.cli_args.model is not None:
-            self.load("default_model", draft_model_path="default_model")
-
-    def _validate_model_path(self, model_path: str):
-        model_path = Path(model_path)
-        if model_path.exists() and not model_path.is_relative_to(Path.cwd()):
-            raise RuntimeError(
-                "Local models must be relative to the current working dir."
-            )
+            self.default_model_map[self.cli_args.model] = "default_model"
+            self.load(self.cli_args.model, draft_model_path="default_model")
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
+        model_path = self.default_model_map.get(model_path, model_path)
         if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
 
@@ -196,15 +192,13 @@ class ModelProvider:
                     "A model path has to be given as a CLI "
                     "argument or in the HTTP request"
                 )
+            adapter_path = adapter_path or self.cli_args.adapter_path
             model, tokenizer = load(
                 self.cli_args.model,
-                adapter_path=(
-                    adapter_path if adapter_path else self.cli_args.adapter_path
-                ),  # if the user doesn't change the model but adds an adapter path
+                adapter_path=adapter_path,
                 tokenizer_config=tokenizer_config,
             )
         else:
-            self._validate_model_path(model_path)
             model, tokenizer = load(
                 model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
             )
@@ -297,7 +291,23 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = int(self.headers["Content-Length"])
         raw_body = self.rfile.read(content_length)
-        self.body = json.loads(raw_body.decode())
+        try:
+            self.body = json.loads(raw_body.decode())
+        except json.JSONDecodeError as e:
+            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
+            # Set appropriate headers based on streaming requirement
+            if self.stream:
+                self._set_stream_headers(400)
+                self.wfile.write(
+                    f"data: {json.dumps({'error': f'Invalid JSON in request body: {e}'})}\n\n".encode()
+                )
+            else:
+                self._set_completion_headers(400)
+                self.wfile.write(
+                    json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+                )
+            return
+
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
         assert isinstance(
@@ -330,7 +340,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
+        self.seed = self.body.get("seed", None)
         self.validate_model_parameters()
+        if self.seed is not None:
+            mx.random.seed(self.seed)
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(
@@ -338,10 +351,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.adapter,
                 self.requested_draft_model,
             )
-        except:
+        except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(b"Not Found")
+            self.wfile.write((f"{e}").encode())
             return
 
         # Get stop id sequences, if provided
@@ -427,6 +440,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("model must be a string")
         if self.adapter is not None and not isinstance(self.adapter, str):
             raise ValueError("adapter must be a string")
+        if self.seed is not None and not isinstance(self.seed, int):
+            raise ValueError("seed must be an integer")
 
     def generate_response(
         self,
@@ -487,15 +502,17 @@ class APIHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
-                    "logprobs": {
-                        "token_logprobs": token_logprobs,
-                        "top_logprobs": top_logprobs,
-                        "tokens": tokens,
-                    },
                     "finish_reason": finish_reason,
                 },
             ],
         }
+
+        if token_logprobs or top_logprobs or tokens:
+            response["choices"][0]["logprobs"] = {
+                "token_logprobs": token_logprobs,
+                "top_logprobs": top_logprobs,
+                "tokens": tokens,
+            }
 
         if not self.stream:
             if not (
@@ -525,7 +542,7 @@ class APIHandler(BaseHTTPRequestHandler):
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
-            ValueError(f"Unsupported response type: {self.object_type}")
+            raise ValueError(f"Unsupported response type: {self.object_type}")
 
         return response
 
@@ -662,6 +679,23 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         in_tool_call = False
         segment = ""
+
+        # Create keepalive callback to send SSE comments during long prompt processing
+        def keepalive_callback(processed_tokens, total_tokens):
+            logging.info(
+                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+            )
+            if self.stream:
+                try:
+                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
+                    self.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # Client disconnected, ignore
+                    pass
+
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -672,6 +706,7 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache=self.prompt_cache.cache,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
+            prompt_progress_callback=keepalive_callback,
         ):
             logging.debug(gen_response.text)
 
@@ -693,6 +728,7 @@ class APIHandler(BaseHTTPRequestHandler):
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
+            self.prompt_cache.tokens.append(token)
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
@@ -735,7 +771,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     segment = ""
                     tool_calls = []
 
-        self.prompt_cache.tokens.extend(tokens)
+        if gen_response.finish_reason is not None:
+            finish_reason = gen_response.finish_reason
 
         logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
         logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
@@ -748,7 +785,12 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(prompt), len(tokens))
+                original_prompt_length = (
+                    len(self.prompt_cache.tokens) - len(tokens) + len(prompt)
+                )
+                response = self.completion_usage_response(
+                    original_prompt_length, len(tokens)
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
@@ -839,7 +881,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path == "/v1/models":
+        if self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -867,10 +909,17 @@ class APIHandler(BaseHTTPRequestHandler):
 
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
+        parts = self.path.split("/")
+        filter_repo_id = None
+        if len(parts) > 3:
+            filter_repo_id = "/".join(parts[3:])
+
         def probably_mlx_lm(repo):
             if repo.repo_type != "model":
                 return False
             if "main" not in repo.refs:
+                return False
+            if filter_repo_id is not None and repo.repo_id != filter_repo_id:
                 return False
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)
