@@ -38,23 +38,6 @@ class ModelArgs(BaseModelArgs):
 
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
-        else:
-            self.layer_types = [lt.lower() for lt in self.layer_types]
-
-        if len(self.layer_types) != self.num_hidden_layers:
-            raise ValueError(
-                "layer_types length must match num_hidden_layers for llama models"
-            )
-
-        if any(lt == "sliding_attention" for lt in self.layer_types):
-            if self.sliding_window is None:
-                raise ValueError(
-                    "sliding_window must be set when using sliding_attention layers"
-                )
-
-    @property
-    def has_sliding_layers(self) -> bool:
-        return any(lt == "sliding_attention" for lt in self.layer_types)
 
 
 class Attention(nn.Module):
@@ -174,12 +157,16 @@ class LlamaModel(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            TransformerBlock(
-                args=args, use_sliding=layer_type == "sliding_attention"
-            )
+            TransformerBlock(args=args, use_sliding=layer_type == "sliding_attention")
             for layer_type in self.layer_types
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fa_idx = self.layer_types.index("full_attention")
+        self.swa_idx = None
+        for e, l in enumerate(self.layers):
+            if l.use_sliding:
+                self.swa_idx = e
+                break
 
     def __call__(
         self,
@@ -195,19 +182,15 @@ class LlamaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if not self.args.has_sliding_layers:
-            mask = create_attention_mask(h, cache[0])
-            for layer, layer_cache in zip(self.layers, cache):
-                h = layer(h, mask, cache=layer_cache)
-        else:
-            for layer, layer_type, layer_cache in zip(
-                self.layers, self.layer_types, cache
-            ):
-                window = (
-                    self.sliding_window if layer_type == "sliding_attention" else None
-                )
-                mask = create_attention_mask(h, layer_cache, window_size=window)
-                h = layer(h, mask, cache=layer_cache)
+        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        if self.swa_idx is not None:
+            swa_mask = create_attention_mask(
+                h, cache[self.swa_idx], window_size=self.sliding_window
+            )
+
+        for layer, cache in zip(self.layers, cache):
+            mask = swa_mask if layer.use_sliding else fa_mask
+            h = layer(h, mask, cache=cache)
 
         return self.norm(h)
 
@@ -248,15 +231,11 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        if not self.args.has_sliding_layers:
-            return [KVCache() for _ in self.layers]
-
-        caches = []
-        for layer in self.layers:
-            if getattr(layer, "use_sliding", False):
-                caches.append(
-                    RotatingKVCache(max_size=self.model.sliding_window, keep=0)
-                )
-            else:
-                caches.append(KVCache())
-        return caches
+        return [
+            (
+                RotatingKVCache(max_size=self.model.sliding_window)
+                if layer.use_sliding
+                else KVCache()
+            )
+            for layer in self.layers
+        ]
