@@ -399,6 +399,7 @@ class RotatingKVCache(_BaseCache):
             # preserve context
             self.keys = self._temporal_order(self.keys)
             self.values = self._temporal_order(self.values)
+            self._idx = self.keys.shape[2]
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
