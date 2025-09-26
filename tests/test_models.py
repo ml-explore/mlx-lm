@@ -175,6 +175,49 @@ class TestModels(unittest.TestCase):
         sums = mask.sum(axis=1)
         self.assertTrue(mx.array_equal(sums, expected_sums))
 
+    def test_llama_model_sliding_attention(self):
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+        )
+        model = llama.Model(args)
+
+        tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        out = model(tokens)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 5, args.vocab_size))
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        caches = model.make_cache()
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        step = model(tokens[:, 2:3], cache=caches)
+        mx.eval(step)
+        self.assertEqual(caches[0].offset, 3)
+        self.assertEqual(caches[1].offset, 3)
+
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
         self.assertTrue(isinstance(rope, nn.RoPE))
