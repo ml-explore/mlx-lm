@@ -63,7 +63,9 @@ def mixed_quant_predicate_builder(
             or index >= 7 * num_layers // 8
             or (index - num_layers // 8) % 3 == 2
         )
-        if "v_proj" in path and use_more_bits:
+        if (
+            "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
+        ) and use_more_bits:
             return {"group_size": group_size, "bits": high_bits}
         if "down_proj" in path and use_more_bits:
             return {"group_size": group_size, "bits": high_bits}
