@@ -67,6 +67,9 @@ max_seq_length: 2048
 # Use gradient checkpointing to reduce memory use.
 grad_checkpoint: false
 
+# Stop training when validation loss increases between evaluations.
+early_stopping: false
+
 # LoRA parameters can only be specified in a config file
 lora_parameters:
   # The layer keys to apply LoRA to.
@@ -89,4 +92,3 @@ lora_parameters:
 #  valid_split: "train[-100:]"
 #  prompt_feature: "text"
 #  completion_feature: "summary"
-

@@ -82,6 +82,13 @@ You can specify the output location with `--adapter-path`.
 You can resume fine-tuning with an existing adapter with
 `--resume-adapter-file <path_to_adapters.safetensors>`.
 
+#### Early stopping
+
+Pass `--early-stopping` (or set `early_stopping: true` in a config file) to
+skip further training once the validation loss increases between evaluation
+checkpoints. This is useful when you want to avoid overfitting without manually
+monitoring the run.
+
 #### Logging
 
 You can log training metrics to Weights & Biases by passing a project name with

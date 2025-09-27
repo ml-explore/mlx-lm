@@ -67,6 +67,7 @@ CONFIG_DEFAULTS = {
     "max_seq_length": 2048,
     "config": None,
     "grad_checkpoint": False,
+    "early_stopping": False,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
