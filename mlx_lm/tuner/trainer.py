@@ -66,8 +66,11 @@ class TrainingArgs:
     )
     early_stopping: bool = field(
         default=False,
-        metadata={"help": "Whether to stop when the evaluation loss increases, and overfitting starts."},
+        metadata={
+            "help": "Whether to stop when the evaluation loss increases, and overfitting starts."
+        },
     )
+
 
 def default_loss(model, batch, lengths):
     inputs = batch[:, :-1]
