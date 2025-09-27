@@ -68,6 +68,7 @@ CONFIG_DEFAULTS = {
     "max_seq_length": 2048,
     "config": None,
     "grad_checkpoint": False,
+    "early_stopping": False,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -206,6 +207,12 @@ def build_parser():
         default=None,
         help="Project name for logging. Defaults to the name of the root directory.",
     )
+    parser.add_argument(
+        "--early-stopping",
+        help="Stop when the evaluation loss increases, and overfitting starts.",
+        action="store_true",
+    )
+
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
 
@@ -265,6 +272,7 @@ def train_model(
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
+        early_stopping=args.early_stopping,
     )
 
     # Initialize the selected optimizer
