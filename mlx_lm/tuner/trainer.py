@@ -347,7 +347,7 @@ def train(
 
     # Save final weights
     if rank == 0:
-        if not args.early_stopping:  # if early stopping is not used, save the final weights, otherwise the last checkpoint is the best model
+        if not args.early_stopping or val_loss < last_validation_loss:
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
         print(f"Saved final weights to {args.adapter_file}.")
