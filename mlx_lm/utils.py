@@ -44,6 +44,7 @@ MODEL_REMAPPING = {
     "mistral": "llama",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "minimax_m1": "minimax_text_01",
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
 }
