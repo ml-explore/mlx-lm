@@ -70,6 +70,12 @@ grad_checkpoint: false
 # Stop training when validation loss increases between evaluations.
 early_stopping: false
 
+# Number of validation evaluations without improvement to allow before stopping.
+early_stopping_patience: 0
+
+# Minimum decrease in validation loss required to reset the patience counter.
+early_stopping_min_delta: 0.0
+
 # LoRA parameters can only be specified in a config file
 lora_parameters:
   # The layer keys to apply LoRA to.

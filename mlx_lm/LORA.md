@@ -86,8 +86,11 @@ You can resume fine-tuning with an existing adapter with
 
 Pass `--early-stopping` (or set `early_stopping: true` in a config file) to
 skip further training once the validation loss increases between evaluation
-checkpoints. This is useful when you want to avoid overfitting without manually
-monitoring the run.
+checkpoints. Combine it with `--early-stopping-patience` to wait for N
+consecutive evaluations without sufficient improvement and
+`--early-stopping-min-delta` to require a minimum validation-loss decrease
+before the patience counter resets. This is useful when you want to avoid
+overfitting without manually monitoring the run.
 
 #### Logging
 

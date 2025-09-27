@@ -68,6 +68,8 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "early_stopping": False,
+    "early_stopping_patience": 0,
+    "early_stopping_min_delta": 0.0,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -194,6 +196,16 @@ def build_parser():
         help="Stop when the evaluation loss increases, and overfitting starts.",
         action="store_true",
     )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        help="Number of validation runs without improvement to wait before stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        help="Minimum validation loss decrease needed to reset the patience counter.",
+    )
 
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
@@ -255,6 +267,8 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         early_stopping=args.early_stopping,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
 
     # Initialize the selected optimizer

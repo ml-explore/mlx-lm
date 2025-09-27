@@ -70,6 +70,20 @@ class TrainingArgs:
             "help": "Whether to stop when the evaluation loss increases, and overfitting starts."
         },
     )
+    early_stopping_patience: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of evaluations without sufficient improvement to allow before stopping."
+            ),
+        },
+    )
+    early_stopping_min_delta: float = field(
+        default=0.0,
+        metadata={
+            "help": "Minimum decrease in validation loss required to qualify as an improvement.",
+        },
+    )
 
 
 def default_loss(model, batch, lengths):
@@ -240,6 +254,8 @@ def train(
     train_time = 0
     # Main training loop
     last_validation_loss = float("inf")
+    best_validation_loss = float("inf")
+    bad_evals = 0
     for it, batch in zip(
         range(1, args.iters + 1),
         iterate_batches(
@@ -280,12 +296,32 @@ def train(
                     "val_time": val_time,
                 }
                 training_callback.on_val_loss_report(val_info)
-            if args.early_stopping and val_loss > last_validation_loss:
-                print(
-                    f"Early stopping at iteration {it}, "
-                    f"validation loss {val_loss} is higher than the previous loss {last_validation_loss}."
+            stop_early = False
+            if args.early_stopping:
+                improved = val_loss < (
+                    best_validation_loss - args.early_stopping_min_delta
                 )
+                if improved or best_validation_loss == float("inf"):
+                    best_validation_loss = val_loss
+                    bad_evals = 0
+                else:
+                    bad_evals += 1
+                    if bad_evals > args.early_stopping_patience:
+                        if rank == 0:
+                            print(
+                                f"Early stopping at iteration {it}, validation loss "
+                                f"{val_loss:.3f} has not improved over the best loss "
+                                f"{best_validation_loss:.3f} by at least {args.early_stopping_min_delta} "
+                                f"for {bad_evals} evaluations (patience={args.early_stopping_patience})."
+                            )
+                        stop_early = True
+            else:
+                if val_loss < best_validation_loss:
+                    best_validation_loss = val_loss
+
+            if stop_early:
                 break
+
             last_validation_loss = val_loss
 
             tic = time.perf_counter()
