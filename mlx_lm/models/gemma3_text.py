@@ -87,8 +87,6 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         # Sliding window
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[..., -keys.shape[-2] :]
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
@@ -194,7 +192,6 @@ class Gemma3Model(nn.Module):
             cache[0],
             window_size=self.window_size,
         )
-
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
                 i % self.sliding_window_pattern == self.sliding_window_pattern - 1
@@ -246,7 +243,5 @@ class Model(nn.Module):
             ):
                 caches.append(KVCache())
             else:
-                caches.append(
-                    RotatingKVCache(max_size=self.args.sliding_window, keep=0)
-                )
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches

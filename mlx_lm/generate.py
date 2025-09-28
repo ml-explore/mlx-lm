@@ -26,8 +26,11 @@ from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchRotatingKVCache,
+    CacheList,
     KVCache,
     QuantizedKVCache,
+    RotatingKVCache,
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
@@ -284,16 +287,11 @@ class GenerationResponse:
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
-    if (
-        kv_bits is not None
-        and not isinstance(prompt_cache[0], cache.QuantizedKVCache)
-        and prompt_cache[0].offset > quantized_kv_start
-    ):
-        for i in range(len(prompt_cache)):
-            if isinstance(prompt_cache[i], cache.KVCache):
-                prompt_cache[i] = prompt_cache[i].to_quantized(
-                    group_size=kv_group_size, bits=kv_bits
-                )
+    if kv_bits is None:
+        return
+    for e, c in enumerate(prompt_cache):
+        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
 def generate_step(
@@ -862,18 +860,25 @@ def _make_cache(model, left_padding):
     Convert a list of regular caches into their corresponding
     batch-aware caches.
     """
+
+    def to_batch_cache(c):
+        if isinstance(c, KVCache):
+            return BatchKVCache(left_padding)
+        elif isinstance(c, ArraysCache):
+            c.left_padding = mx.array(left_padding)
+            return c
+        elif isinstance(c, RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError("RotatingKVCache with keep tokens is not supported.")
+            return BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, CacheList):
+            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        else:
+            raise ValueError(f"{type(c)} does not yet support batching")
+
     if hasattr(model, "make_cache"):
         cache = model.make_cache()
-        batch_cache = []
-        for c in cache:
-            if isinstance(c, KVCache):
-                batch_cache.append(BatchKVCache(left_padding))
-            elif isinstance(c, ArraysCache):
-                c.left_padding = mx.array(left_padding)
-                batch_cache.append(c)
-            else:
-                raise ValueError(f"{type(c)} does not yet support batching")
-        return batch_cache
+        return [to_batch_cache(c) for c in cache]
     else:
         return [BatchKVCache(left_padding) for _ in model.layers]
 

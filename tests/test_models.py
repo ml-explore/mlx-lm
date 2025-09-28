@@ -37,7 +37,7 @@ class TestModels(unittest.TestCase):
 
     def test_rotating_kv_cache(self):
         b, h, d = 1, 2, 32
-        cache = RotatingKVCache(max_size=8, step=4)
+        cache = RotatingKVCache(max_size=8)
 
         k = mx.random.uniform(shape=(b, h, 2, d))
         v = mx.random.uniform(shape=(b, h, 2, d))
@@ -70,7 +70,7 @@ class TestModels(unittest.TestCase):
             idx %= 8
 
         # Try with nonzero keep
-        cache = RotatingKVCache(max_size=8, step=4, keep=2)
+        cache = RotatingKVCache(max_size=8, keep=2)
 
         # Check a large update
         k = mx.random.uniform(shape=(b, h, 20, d))
@@ -98,7 +98,7 @@ class TestModels(unittest.TestCase):
         # alternating prompt/prefill with generation
         d = 4
         h = 2
-        cache = RotatingKVCache(max_size=18, step=4)
+        cache = RotatingKVCache(max_size=18)
 
         x = mx.random.uniform(shape=(1, h, 8, d))
         k, v = cache.update_and_fetch(x, x)
@@ -174,6 +174,49 @@ class TestModels(unittest.TestCase):
         expected_sums = mx.array([3, 3, 3, 3, 3])
         sums = mask.sum(axis=1)
         self.assertTrue(mx.array_equal(sums, expected_sums))
+
+    def test_llama_model_sliding_attention(self):
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+        )
+        model = llama.Model(args)
+
+        tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        out = model(tokens)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 5, args.vocab_size))
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        caches = model.make_cache()
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        step = model(tokens[:, 2:3], cache=caches)
+        mx.eval(step)
+        self.assertEqual(caches[0].offset, 3)
+        self.assertEqual(caches[1].offset, 3)
 
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
@@ -662,6 +705,19 @@ class TestModels(unittest.TestCase):
             time_step_rank=48,
         )
         model = mamba.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_falcon_h1(self):
+        from mlx_lm.models import falcon_h1
+
+        args = falcon_h1.ModelArgs(
+            model_type="falcon_h1",
+            num_hidden_layers=12,
+            vocab_size=10000,
+        )
+        model = falcon_h1.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -1849,9 +1905,9 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
 
     def test_gated_delta(self):
+        mx.random.seed(0)
         for B in [1, 2]:
             for T in [1, 2]:
-                B = 1
                 Hk = 16
                 Hv = 32
                 Dk = 128
@@ -1860,14 +1916,45 @@ class TestModels(unittest.TestCase):
                 q = mx.random.normal(shape=(B, T, Hk, Dk))
                 k = mx.random.normal(shape=(B, T, Hk, Dk))
                 v = mx.random.normal(shape=(B, T, Hv, Dv))
-                g = mx.random.normal(shape=(B, T, Hv))
-                beta = mx.random.normal(shape=(B, T, Hv))
+                g = mx.random.uniform(shape=(B, T, Hv))
+                beta = mx.random.uniform(shape=(B, T, Hv))
                 state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
                 y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
-                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-3))
+                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_masked(self):
+        B = 1
+        T = 3
+        Hk = 16
+        Hv = 32
+        Dk = 128
+        Dv = 128
+
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(B, T, Hk, Dk))
+        k = mx.random.normal(shape=(B, T, Hk, Dk))
+        v = mx.random.normal(shape=(B, T, Hv, Dv))
+        g = mx.random.normal(shape=(B, T, Hv))
+        mask = mx.array([[False, True, True]])
+        beta = mx.random.normal(shape=(B, T, Hv))
+        state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+        y_gt, st_gt = gated_delta_ops(
+            q[:, 1:],
+            k[:, 1:],
+            v[:, 1:],
+            g[:, 1:],
+            beta[:, 1:],
+            state,
+        )
+        for fn in [gated_delta_ops, gated_delta_kernel]:
+            y, st = fn(q, k, v, g, beta, state, mask)
+            y = y[:, 1:]
+            self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+            self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":

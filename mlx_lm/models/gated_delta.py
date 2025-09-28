@@ -12,10 +12,11 @@ def compute_g(A_log, a, dt_bias):
     )
 
 
-def _make_gated_delta_kernel():
+def _make_gated_delta_kernel(has_mask=False):
     if not mx.metal.is_available():
         return None
-    source = """
+    mask_source = "mask[b_idx * T + t]" if has_mask else "true"
+    source = f"""
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
@@ -38,36 +39,38 @@ def _make_gated_delta_kernel():
         auto o_state = state_out + (n * Dv + dv_idx) * Dk;
 
         float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
-           auto s_idx = n_per_t * dk_idx + i;
-           state[i] = static_cast<float>(i_state[s_idx]);
-        }
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }}
 
         // beta, g: [B, T, Hv]
         auto g_ = g + b_idx * T * Hv;
         auto beta_ = beta + b_idx * T * Hv;
 
-        for (int t = 0; t < T; ++t) {
-          float kv_mem = 0.0f;
-          for (int i = 0; i < n_per_t; ++i) {
-            auto s_idx = n_per_t * dk_idx + i;
-            state[i] = state[i] * g_[hv_idx];
-            kv_mem += state[i] * k_[s_idx];
-          }
-          kv_mem = simd_sum(kv_mem);
+        for (int t = 0; t < T; ++t) {{
+          if ({mask_source}) {{
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] * g_[hv_idx];
+              kv_mem += state[i] * k_[s_idx];
+            }}
+            kv_mem = simd_sum(kv_mem);
 
-          auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
 
-          float out = 0.0f;
-          for (int i = 0; i < n_per_t; ++i) {
-            auto s_idx = n_per_t * dk_idx + i;
-            state[i] = state[i] + k_[s_idx] * delta;
-            out += state[i] * q_[s_idx];
-          }
-          out = simd_sum(out);
-          if (thread_index_in_simdgroup == 0) {
-            y[dv_idx] = static_cast<InT>(out);
-          }
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] + k_[s_idx] * delta;
+              out += state[i] * q_[s_idx];
+            }}
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {{
+              y[dv_idx] = static_cast<InT>(out);
+            }}
+          }}
           // Increment data pointers to next time step
           q_ += Hk * Dk;
           k_ += Hk * Dk;
@@ -75,23 +78,28 @@ def _make_gated_delta_kernel():
           y += Hv * Dv;
           g_ += Hv;
           beta_ += Hv;
-        }
-        for (int i = 0; i < n_per_t; ++i) {
+        }}
+        for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
           o_state[s_idx] = static_cast<InT>(state[i]);
-        }
+        }}
     """
+    inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
+    if has_mask:
+        inputs.append("mask")
     return mx.fast.metal_kernel(
-        name="gated_delta_step",
-        input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
+        name="gated_delta_step" + "_mask" if has_mask else "",
+        input_names=inputs,
         output_names=["y", "state_out"],
         source=source,
     )
 
 
 _gated_delta_kernel = _make_gated_delta_kernel()
+_gated_delta_kernel_masked = _make_gated_delta_kernel(True)
 
 
+@mx.compile
 def _gated_delta_step_ops(
     q: mx.array,
     k: mx.array,
@@ -99,6 +107,7 @@ def _gated_delta_step_ops(
     g: mx.array,
     beta: mx.array,
     state: mx.array,
+    mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for a single recurrent step.
@@ -114,12 +123,15 @@ def _gated_delta_step_ops(
     """
 
     # Decay
+    old_state = state
     state = state * g[..., None, None]
     kv_mem = (state * k[..., None, :]).sum(axis=-1)  # [B, H, Dv]
     delta = (v - kv_mem) * beta[..., None]  # [B, H, Dv]
     state = state + k[..., None, :] * delta[..., None]
     # Output projection along key dim with q
     y = (state * q[..., None, :]).sum(axis=-1)  # [B, H, Dv]
+    if mask is not None:
+        state = mx.where(mask, state, old_state)
     return y, state
 
 
@@ -130,12 +142,18 @@ def gated_delta_kernel(
     g: mx.array,
     beta: mx.array,
     state: mx.array,
+    mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
-    return _gated_delta_kernel(
-        inputs=[q, k, v, g, beta, state, T],
+    kernel = _gated_delta_kernel
+    inputs = [q, k, v, g, beta, state, T]
+    if mask is not None:
+        kernel = _gated_delta_kernel_masked
+        inputs.append(mask)
+    return kernel(
+        inputs=inputs,
         template=[
             ("InT", input_type),
             ("Dk", Dk),
@@ -157,6 +175,7 @@ def gated_delta_ops(
     g: mx.array,
     beta: mx.array,
     state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
@@ -181,14 +200,25 @@ def gated_delta_ops(
 
     ys = []
     for t in range(T):
-        y, state = _gated_delta_step_ops(
-            q[:, t],
-            k[:, t],
-            v[:, t],
-            g[:, t],
-            beta[:, t],
-            state,
-        )
+        if mask is not None:
+            y, state = _gated_delta_step_ops(
+                q[:, t],
+                k[:, t],
+                v[:, t],
+                g[:, t],
+                beta[:, t],
+                state,
+                mask[:, t],
+            )
+        else:
+            y, state = _gated_delta_step_ops(
+                q[:, t],
+                k[:, t],
+                v[:, t],
+                g[:, t],
+                beta[:, t],
+                state,
+            )
         ys.append(y)
     y = mx.stack(ys, axis=1)
     return y, state
@@ -203,6 +233,8 @@ def gated_delta_update(
     A_log: mx.array,
     dt_bias: mx.array,
     state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+    use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
 
     beta = mx.sigmoid(b)
@@ -213,7 +245,7 @@ def gated_delta_update(
         if state is None:
             state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
 
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return gated_delta_ops(q, k, v, g, beta, state)
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
     else:
-        return gated_delta_kernel(q, k, v, g, beta, state)
+        return gated_delta_kernel(q, k, v, g, beta, state, mask)

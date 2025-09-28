@@ -18,11 +18,6 @@ class ModelArgs(BaseModelArgs):
 
     def __post_init__(self):
         self.text_config["tie_word_embeddings"] = False
-        self.text_config["full_attn_idxs"] = [
-            i
-            for i, layer_type in enumerate(self.text_config["layer_types"])
-            if layer_type == "full_attention"
-        ]
 
 
 class Model(nn.Module):

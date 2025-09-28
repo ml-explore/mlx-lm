@@ -96,7 +96,10 @@ def main():
             model, tokenizer, prompts, max_tokens=generation_tokens
         ).stats
 
-    _bench = batch_bench
+    if batch_size == 1:
+        _bench = single_bench
+    else:
+        _bench = batch_bench
 
     print("Running warmup..")
     _bench()

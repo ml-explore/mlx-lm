@@ -1,12 +1,13 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 
 
@@ -28,10 +29,15 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
+    layer_types: Optional[List[str]] = None
+    sliding_window: Optional[int] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
 
 class Attention(nn.Module):
@@ -114,10 +120,11 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, use_sliding: bool = False):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
+        self.use_sliding = use_sliding
         self.self_attn = Attention(args)
         self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -145,12 +152,21 @@ class LlamaModel(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
+        self.layer_types = args.layer_types
+        self.sliding_window = args.sliding_window
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(args=args, use_sliding=layer_type == "sliding_attention")
+            for layer_type in self.layer_types
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fa_idx = self.layer_types.index("full_attention")
+        self.swa_idx = None
+        for e, l in enumerate(self.layers):
+            if l.use_sliding:
+                self.swa_idx = e
+                break
 
     def __call__(
         self,
@@ -166,10 +182,15 @@ class LlamaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        if self.swa_idx is not None:
+            swa_mask = create_attention_mask(
+                h, cache[self.swa_idx], window_size=self.sliding_window
+            )
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, cache=c)
+        for layer, cache in zip(self.layers, cache):
+            mask = swa_mask if layer.use_sliding else fa_mask
+            h = layer(h, mask, cache=cache)
 
         return self.norm(h)
 
@@ -208,3 +229,13 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def make_cache(self):
+        return [
+            (
+                RotatingKVCache(max_size=self.model.sliding_window)
+                if layer.use_sliding
+                else KVCache()
+            )
+            for layer in self.layers
+        ]
