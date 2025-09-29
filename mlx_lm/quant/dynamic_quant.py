@@ -230,7 +230,7 @@ def main():
         high_group_size=args.high_group_size,
     )
 
-    def quant_predicate(p, m, _):
+    def quant_predicate(p, m):
         if not hasattr(m, "to_quantized"):
             return False
         if sensitivities[p] > threshold:
@@ -240,8 +240,8 @@ def main():
     model, config = quantize_model(
         model,
         config,
-        q_group_size=args.low_group_size,
-        q_bits=args.low_bits,
+        group_size=args.low_group_size,
+        bits=args.low_bits,
         quant_predicate=quant_predicate,
     )
 

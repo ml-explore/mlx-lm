@@ -5,7 +5,12 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from .cache import ArraysCache, KVCache
 
 
@@ -26,8 +31,19 @@ class ModelArgs(BaseModelArgs):
     block_multiple_of: int
     block_ffn_dim_multiplier: float
     block_auto_adjust_ff_dim: bool
-    full_attn_idxs: List[int]
     rope_theta: float
+    full_attn_idxs: Optional[List[int]] = None
+    layer_types: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+        if self.full_attn_idxs is None:
+            self.full_attn_idxs = [
+                i
+                for i, layer_type in enumerate(self.layer_types)
+                if layer_type == "full_attention"
+            ]
 
 
 class Attention(nn.Module):
@@ -114,13 +130,15 @@ class ShortConv(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
         seqlen = x.shape[1]
         BCx = self.in_proj(x)
         B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x
-
+        if mask is not None:
+            Bx = mx.where(mask[..., None], Bx, 0)
         state = None
         if cache is not None:
             state = cache[0]
@@ -194,6 +212,7 @@ class Lfm2DecoderLayer(nn.Module):
         else:
             r = self.conv(
                 self.operator_norm(x),
+                mask=mask,
                 cache=cache,
             )
         h = x + r
@@ -214,10 +233,17 @@ class Lfm2Model(nn.Module):
 
         self.embedding_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
 
+        self.fa_idx = args.full_attn_idxs[0]
+        self.conv_idx = 0
+        for i in range(args.num_hidden_layers):
+            if i in args.full_attn_idxs:
+                self.conv_idx += 1
+            else:
+                break
+
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
@@ -226,15 +252,14 @@ class Lfm2Model(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
-        if mask is None:
-            first_attn_idx = self.args.full_attn_idxs[0]
-            c = [cache[first_attn_idx]] if cache is not None else None
-            mask = create_attention_mask(h, c)
-
         if cache is None:
             cache = [None] * len(self.layers)
 
+        attn_mask = create_attention_mask(h, cache[self.fa_idx])
+        conv_mask = create_ssm_mask(h, cache[self.conv_idx])
+
         for layer, c in zip(self.layers, cache):
+            mask = attn_mask if layer.is_attention_layer else conv_mask
             h = layer(h, mask, cache=c)
 
         return self.embedding_norm(h)
@@ -250,11 +275,10 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache, input_embeddings)
+        out = self.model(inputs, cache, input_embeddings)
         return self.model.embed_tokens.as_linear(out)
 
     def sanitize(self, weights):

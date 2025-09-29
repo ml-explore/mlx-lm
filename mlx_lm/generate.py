@@ -24,7 +24,13 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
     QuantizedKVCache,
+    RotatingKVCache,
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
@@ -281,16 +287,11 @@ class GenerationResponse:
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
-    if (
-        kv_bits is not None
-        and not isinstance(prompt_cache[0], cache.QuantizedKVCache)
-        and prompt_cache[0].offset > quantized_kv_start
-    ):
-        for i in range(len(prompt_cache)):
-            if isinstance(prompt_cache[i], cache.KVCache):
-                prompt_cache[i] = prompt_cache[i].to_quantized(
-                    group_size=kv_group_size, bits=kv_bits
-                )
+    if kv_bits is None:
+        return
+    for e, c in enumerate(prompt_cache):
+        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
 def generate_step(
@@ -415,22 +416,24 @@ def generate_step(
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
-        while total_prompt_tokens - prompt_processed_tokens > prefill_step_size:
+        prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        while total_prompt_tokens - prompt_processed_tokens > 1:
+            n_to_process = min(prefill_step_size, prompt.size - 1)
             _model_call(
-                input_tokens=prompt[:prefill_step_size][None],
+                input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
-                    input_embeddings[:prefill_step_size][None]
+                    input_embeddings[:n_to_process][None]
                     if input_embeddings is not None
                     else None
                 ),
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
+            prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-            prompt_processed_tokens += prefill_step_size
-            prompt = prompt[prefill_step_size:]
+            prompt = prompt[n_to_process:]
             input_embeddings = (
-                input_embeddings[prefill_step_size:]
+                input_embeddings[n_to_process:]
                 if input_embeddings is not None
                 else input_embeddings
             )
@@ -461,7 +464,7 @@ def speculative_generate_step(
     model: nn.Module,
     draft_model: nn.Module,
     *,
-    num_draft_tokens=2,
+    num_draft_tokens: int = 2,
     max_tokens: int = 256,
     sampler: Optional[Callable[mx.array, mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
@@ -635,6 +638,7 @@ def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
+    max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
@@ -646,6 +650,8 @@ def stream_generate(
         tokenizer (PreTrainedTokenizer): The tokenizer.
         prompt (Union[str, mx.array, List[int]]): The input prompt string or
           integer tokens.
+        max_tokens (int): The maximum number of tokens to generate.
+          Default: ``256``.
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
@@ -670,6 +676,8 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
+    kwargs["max_tokens"] = max_tokens
+
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
@@ -684,7 +692,6 @@ def stream_generate(
             prompt, model, draft_model, **kwargs
         )
     with wired_limit(model, [generation_stream]):
-        detokenizer.reset()
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
@@ -695,6 +702,8 @@ def stream_generate(
                 break
 
             detokenizer.add_token(token)
+            if (n + 1) == max_tokens:
+                break
 
             yield GenerationResponse(
                 text=detokenizer.last_segment,
@@ -729,7 +738,6 @@ def generate(
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, List[int]],
     verbose: bool = False,
-    formatter: Optional[Callable] = None,
     **kwargs,
 ) -> str:
     """
@@ -744,11 +752,6 @@ def generate(
        kwargs: The remaining options get passed to :func:`stream_generate`.
           See :func:`stream_generate` for more details.
     """
-    if formatter is not None:
-        print(
-            "[Warning] Text formatting is deprecated and no longer used. "
-            "The argument will be removed in a future version."
-        )
     if verbose:
         print("=" * 10)
 
@@ -774,6 +777,340 @@ def generate(
         )
         print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
+
+
+def _left_pad_prompts(prompts, max_length=None):
+    if max_length is None:
+        max_length = max(len(p) for p in prompts)
+    return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
+
+
+@dataclass
+class BatchStats:
+    """
+    An data object to hold generation stats.
+
+    Args:
+        prompt_tokens (int): The number of prompt tokens processed.
+        prompt_tps (float): The prompt processing tokens-per-second.
+        prompt_time (float): The time in seconds spent in prompt processing.
+        generation_tokens (int): The number of generated tokens.
+        generation_tps (float): The tokens-per-second for generation.
+        generation_time (float): The time in seconds spent in generation .
+        peak_memory (float): The peak memory used so far in GB.
+    """
+
+    prompt_tokens: int = 0
+    prompt_tps: float = 0
+    prompt_time: float = 0
+    generation_tokens: int = 0
+    generation_tps: float = 0
+    generation_time: float = 0
+    peak_memory: float = 0
+
+
+@dataclass
+class BatchResponse:
+    """
+    An data object to hold a batch generation response.
+
+    Args:
+        texts: (List[str]): The generated text for each prompt.
+        stats (BatchStats): Statistics about the generation.
+    """
+
+    texts: List[str]
+    stats: BatchStats
+
+
+@dataclass
+class Batch:
+    uids: List[int]
+    y: mx.array
+    logprobs: mx.array
+    max_tokens: List[int]
+    num_tokens: List[int]
+    cache: List[Any]
+
+    def __len__(self):
+        return len(self.uids)
+
+    def filter(self, keep_idx: List[int]):
+        self.uids = [self.uids[k] for k in keep_idx]
+        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
+        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        keep_idx = mx.array(keep_idx, mx.int32)
+        self.y = self.y[keep_idx]
+        self.logprobs = self.logprobs[keep_idx]
+        for c in self.cache:
+            c.filter(keep_idx)
+
+    def extend(self, other):
+        self.uids.extend(other.uids)
+        self.y = mx.concatenate([self.y, other.y])
+        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
+        self.num_tokens.extend(other.num_tokens)
+        self.max_tokens.extend(other.max_tokens)
+        for c, o in zip(self.cache, other.cache):
+            c.extend(o)
+
+
+def _make_cache(model, left_padding):
+    """
+    Convert a list of regular caches into their corresponding
+    batch-aware caches.
+    """
+
+    def to_batch_cache(c):
+        if isinstance(c, KVCache):
+            return BatchKVCache(left_padding)
+        elif isinstance(c, ArraysCache):
+            c.left_padding = mx.array(left_padding)
+            return c
+        elif isinstance(c, RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError("RotatingKVCache with keep tokens is not supported.")
+            return BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, CacheList):
+            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        else:
+            raise ValueError(f"{type(c)} does not yet support batching")
+
+    if hasattr(model, "make_cache"):
+        cache = model.make_cache()
+        return [to_batch_cache(c) for c in cache]
+    else:
+        return [BatchKVCache(left_padding) for _ in model.layers]
+
+
+class BatchGenerator:
+
+    @dataclass
+    class Response:
+        uid: int
+        token: int
+        logprobs: mx.array
+        finish_reason: Optional[str]
+
+    def __init__(
+        self,
+        model,
+        max_tokens: int = 128,
+        stop_tokens: Optional[set] = None,
+        sampler: Optional[Callable[mx.array, mx.array]] = None,
+        completion_batch_size: int = 32,
+        prefill_batch_size: int = 8,
+        prefill_step_size: int = 2048,
+    ):
+        self.model = model
+        self.unprocessed_prompts = []
+        self.max_tokens = max_tokens
+        self.stop_tokens = stop_tokens or set()
+        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.uid_count = 0
+        self.prefill_step_size = prefill_step_size
+        self.prefill_batch_size = prefill_batch_size
+        self.completion_batch_size = completion_batch_size
+        self._stats = BatchStats()
+
+        self.active_batch = None
+
+    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+        uids = []
+
+        if max_tokens is None or isinstance(max_tokens, int):
+            max_tokens = [max_tokens or self.max_tokens] * len(prompts)
+
+        for p, m in zip(prompts, max_tokens):
+            self.unprocessed_prompts.append((self.uid_count, p, m))
+            uids.append(self.uid_count)
+            self.uid_count += 1
+        # Sort in ascending order of length
+        self.unprocessed_prompts = sorted(
+            self.unprocessed_prompts, key=lambda x: len(x[1])
+        )
+        return uids
+
+    def _process_prompts(self, prompts):
+        uids, inputs, max_tokens = zip(*prompts)
+        lengths = [len(p) for p in inputs]
+        max_length = max(lengths)
+        batch_size = self.prefill_batch_size
+        self._stats.prompt_tokens += sum(lengths)
+        left_padding = [max_length - l for l in lengths]
+        inputs = _left_pad_prompts(inputs, max_length=max_length)
+
+        prompt_cache = _make_cache(self.model, left_padding)
+
+        while inputs.shape[1] > 1:
+            n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+            self.model(inputs[:, :n_to_process], cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            inputs = inputs[:, n_to_process:]
+            mx.clear_cache()
+
+        y, logprobs = self._step(inputs, prompt_cache)
+        mx.async_eval(y, logprobs)
+        return Batch(
+            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+        )
+
+    def _step(self, input_tokens: mx.array, prompt_cache: List[Any]):
+        logits = self.model(input_tokens, cache=prompt_cache)
+        logits = logits[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampled = self.sampler(logprobs)
+        return sampled, logprobs
+
+    def stats(self):
+        self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
+        self._stats.generation_tps = (
+            self._stats.generation_tokens / self._stats.generation_time
+        )
+        self._stats.peak_memory = mx.get_peak_memory() / 1e9
+        return self._stats
+
+    def _next(self):
+        tic = time.perf_counter()
+
+        prompt_processing = False
+        batch = self.active_batch
+        num_active = len(batch) if batch else 0
+        num_to_add = self.completion_batch_size - num_active
+        while num_to_add >= self.prefill_batch_size:
+            prompts = self.unprocessed_prompts[: self.prefill_batch_size]
+            # Finish processing the last examples of the last batch
+            if len(prompts) == 0 and num_active > 0:
+                break
+            # No more prompts and no more completions, all done
+            elif len(prompts) == 0:
+                self.active_batch = None
+                return []
+            # Process prompts
+            if batch is not None and not prompt_processing:
+                # Finish any active completion tokens
+                mx.eval(batch.y, batch.logprobs)
+                self._stats.generation_time += time.perf_counter() - tic
+                tic = time.perf_counter()
+
+            batch = self._process_prompts(prompts)
+            self.unprocessed_prompts = self.unprocessed_prompts[
+                self.prefill_batch_size :
+            ]
+            prompt_processing = True
+            # If there was no active batch, set it
+            if self.active_batch is None:
+                self.active_batch = batch
+            else:
+                self.active_batch.extend(batch)
+
+            num_active = len(self.active_batch)
+            num_to_add -= len(batch)
+
+        batch = self.active_batch
+        y, logprobs = batch.y, batch.logprobs
+        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
+        mx.async_eval(batch.y, batch.logprobs)
+
+        y = y.tolist()
+        toc = time.perf_counter()
+        if prompt_processing:
+            self._stats.prompt_time += toc - tic
+        else:
+            self._stats.generation_time += toc - tic
+        keep_idx = []
+        end_idx = []
+        responses = []
+
+        for e, (t, uid, num_tok, max_tok) in enumerate(
+            zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
+        ):
+            num_tok += 1
+            batch.num_tokens[e] = num_tok
+            if t in self.stop_tokens:
+                finish_reason = "stop"
+                end_idx.append(e)
+            elif num_tok >= max_tok:
+                finish_reason = "length"
+                end_idx.append(e)
+            else:
+                finish_reason = None
+                keep_idx.append(e)
+            responses.append(self.Response(uid, t, logprobs[e], finish_reason))
+
+        # Remove any finished completions
+        if len(end_idx):
+            if len(keep_idx) > 0:
+                batch.filter(keep_idx)
+            else:
+                self.active_batch = None
+
+        self._stats.generation_tokens += len(responses)
+        return responses
+
+    def next(self):
+        with mx.stream(generation_stream):
+            return self._next()
+
+
+def batch_generate(
+    model,
+    tokenizer,
+    prompts: List[int],
+    max_tokens: Union[int, List[int]] = 128,
+    verbose: bool = False,
+    **kwargs,
+) -> BatchResponse:
+    """
+    Generate responses for the given batch of prompts.
+
+    Args:
+       model (nn.Module): The language model.
+       tokenizer (PreTrainedTokenizer): The tokenizer.
+       prompt (List[List[int]]): The input prompts.
+       verbose (bool): If ``True``, print tokens and timing information.
+          Default: ``False``.
+       max_tokens (Union[int, List[int]): Maximum number of output tokens. This
+          can be per prompt if a list is provided.
+       kwargs: The remaining options get passed to :obj:`BatchGenerator`.
+          See :obj:`BatchGenerator` for more details.
+    """
+
+    gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
+    num_samples = len(prompts)
+    fin = 0
+    if verbose:
+        print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
+
+    with wired_limit(model, [generation_stream]):
+        uids = gen.insert(prompts, max_tokens)
+        results = {uid: [] for uid in uids}
+        while responses := gen.next():
+            for r in responses:
+                if verbose and r.finish_reason != None:
+                    fin += 1
+                    print(
+                        f"[batch_generate] Finished processing {fin}/{num_samples} ...",
+                        end="\r",
+                    )
+                if r.finish_reason != "stop":
+                    results[r.uid].append(r.token)
+    if verbose:
+        print(f"[batch_generate] Finished processing {fin}/{num_samples}")
+
+    # Return results in correct order
+    texts = [tokenizer.decode(results[uid]) for uid in uids]
+    stats = gen.stats()
+    if verbose:
+        print(
+            f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"[batch_generate] Generation: {stats.generation_tokens} tokens, "
+            f"{stats.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
+    return BatchResponse(texts, stats)
 
 
 def main():

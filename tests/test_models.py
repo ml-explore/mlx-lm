@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 import copy
+import importlib
 import unittest
 
 import mlx.core as mx
@@ -9,10 +10,11 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
-
     def test_kv_cache(self):
         cache = KVCache()
 
@@ -35,7 +37,7 @@ class TestModels(unittest.TestCase):
 
     def test_rotating_kv_cache(self):
         b, h, d = 1, 2, 32
-        cache = RotatingKVCache(max_size=8, step=4)
+        cache = RotatingKVCache(max_size=8)
 
         k = mx.random.uniform(shape=(b, h, 2, d))
         v = mx.random.uniform(shape=(b, h, 2, d))
@@ -68,7 +70,7 @@ class TestModels(unittest.TestCase):
             idx %= 8
 
         # Try with nonzero keep
-        cache = RotatingKVCache(max_size=8, step=4, keep=2)
+        cache = RotatingKVCache(max_size=8, keep=2)
 
         # Check a large update
         k = mx.random.uniform(shape=(b, h, 20, d))
@@ -96,7 +98,7 @@ class TestModels(unittest.TestCase):
         # alternating prompt/prefill with generation
         d = 4
         h = 2
-        cache = RotatingKVCache(max_size=18, step=4)
+        cache = RotatingKVCache(max_size=18)
 
         x = mx.random.uniform(shape=(1, h, 8, d))
         k, v = cache.update_and_fetch(x, x)
@@ -131,21 +133,90 @@ class TestModels(unittest.TestCase):
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
 
-    def test_causal_mask_lengths(self):
-        mx.random.seed(8)
-        B, N_q, T_q, N_kv, T_kv, D = (4, 8, 3, 2, 3, 2)
-        lengths = mx.array([1, 2, 3, 1])
-        q = mx.random.uniform(shape=(B, N_q, T_q, D))
-        k = mx.random.uniform(shape=(B, N_kv, T_kv, D))
-        v = k
-        mask = create_causal_mask(T_q, 0, lengths=lengths)
+    def test_causal_mask_padding(self):
+        right_padding = mx.array([2, 1, 0])
+        mask = create_causal_mask(3, right_padding=right_padding)
 
-        out1 = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
-        q[1, :, 2:] = mx.ones_like(q[1, :, 2:])
-        k[1, :, 2:] = mx.ones_like(k[1, :, 2:])
-        v[1, :, 2:] = mx.ones_like(v[1, :, 2:])
-        out2 = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
-        self.assertTrue(mx.allclose(out1[1, :, :2], out2[1, :, :2]))
+        causal_mask = create_causal_mask(3)
+        self.assertTrue(
+            mx.array_equal(mask[0, 0], causal_mask & mx.array([True, False, False]))
+        )
+        self.assertTrue(
+            mx.array_equal(mask[1, 0], causal_mask & mx.array([True, True, False]))
+        )
+        self.assertTrue(mx.array_equal(mask[2, 0], causal_mask))
+
+        left_padding = mx.array([2, 1, 0])
+        mask = create_causal_mask(3, left_padding=left_padding)
+
+        self.assertTrue(
+            mx.array_equal(mask[0, 0], causal_mask & mx.array([False, False, True]))
+        )
+        self.assertTrue(
+            mx.array_equal(mask[1, 0], causal_mask & mx.array([False, True, True]))
+        )
+        self.assertTrue(mx.array_equal(mask[2, 0], causal_mask))
+
+    def test_mask_with_window(self):
+        mask = create_causal_mask(5, 0, window_size=3)
+        expected_sums = mx.array([1, 2, 3, 3, 3])
+        sums = mask.sum(axis=1)
+        self.assertTrue(mx.array_equal(sums, expected_sums))
+
+        mask = create_causal_mask(5, 1, window_size=3)
+        self.assertEqual(mask.shape, (5, 6))
+        expected_sums = mx.array([2, 3, 3, 3, 3])
+        sums = mask.sum(axis=1)
+        self.assertTrue(mx.array_equal(sums, expected_sums))
+
+        mask = create_causal_mask(5, 2, window_size=3)
+        self.assertEqual(mask.shape, (5, 7))
+        expected_sums = mx.array([3, 3, 3, 3, 3])
+        sums = mask.sum(axis=1)
+        self.assertTrue(mx.array_equal(sums, expected_sums))
+
+    def test_llama_model_sliding_attention(self):
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+        )
+        model = llama.Model(args)
+
+        tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        out = model(tokens)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 5, args.vocab_size))
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        caches = model.make_cache()
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        step = model(tokens[:, 2:3], cache=caches)
+        mx.eval(step)
+        self.assertEqual(caches[0].offset, 3)
+        self.assertEqual(caches[1].offset, 3)
 
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
@@ -204,7 +275,6 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
-
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
 
@@ -221,15 +291,14 @@ class TestModels(unittest.TestCase):
             self.assertEqual(outputs.shape, (1, 2, vocab_size))
             self.assertEqual(outputs.dtype, t)
 
-            if model_type not in ("mamba", "plamo2", "gpt_oss"):
-                mask = create_causal_mask(inputs.shape[1], 0).astype(t)
-                outputs = model(inputs, mask=mask)
-                self.assertEqual(outputs.shape, (1, 2, vocab_size))
-                self.assertEqual(outputs.dtype, t)
-
             outputs = model(mx.argmax(outputs[0, -1:, :], keepdims=True), cache=cache)
             self.assertEqual(outputs.shape, (1, 1, vocab_size))
             self.assertEqual(outputs.dtype, t)
+
+        # Test batch size > 1
+        inputs = mx.array([[0, 1], [2, 3]])
+        outputs = model(inputs)
+        self.assertEqual(outputs.shape, (2, 2, vocab_size))
 
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
@@ -636,6 +705,19 @@ class TestModels(unittest.TestCase):
             time_step_rank=48,
         )
         model = mamba.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_falcon_h1(self):
+        from mlx_lm.models import falcon_h1
+
+        args = falcon_h1.ModelArgs(
+            model_type="falcon_h1",
+            num_hidden_layers=12,
+            vocab_size=10000,
+        )
+        model = falcon_h1.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -1184,6 +1266,695 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_all_models(self):
+        test_configs = [
+            {
+                "model_type": "afm7",
+                "vocab_size": 1000,
+                "hidden_dim": 256,
+                "num_layers": 16,
+                "num_hidden_layers": 16,
+                "num_kv_reuse_layers": 8,
+                "num_heads": 8,
+                "num_kv_heads": 4,
+            },
+            {
+                "model_type": "apertus",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "mlp_bias": True,
+                "num_attention_heads": 8,
+                "attention_bias": False,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 1000,
+                "rope_theta": 1000,
+                "post_norm": True,
+                "qk_norm": True,
+                "tie_word_embeddings": False,
+            },
+            {
+                "model_type": "baichuan_m1",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "rope_theta": 1000,
+                "sliding_window": 128,
+                "sliding_window_layers": [0, 2],
+                "conv_window": 2,
+                "rms_norm_eps": 1e-5,
+            },
+            {
+                "model_type": "bailing_moe",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "max_position_embeddings": 1000,
+                "moe_intermediate_size": 128,
+                "num_experts": 4,
+                "num_shared_experts": 1,
+                "norm_topk_prob": True,
+                "num_attention_heads": 4,
+                "num_experts_per_tok": 2,
+                "num_hidden_layers": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "vocab_size": 1000,
+                "first_k_dense_replace": 2,
+            },
+            {
+                "model_type": "dots1",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "max_position_embeddings": None,
+                "num_key_value_heads": 2,
+                "first_k_dense_replace": 1,
+                "moe_intermediate_size": 64,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "norm_topk_prob": True,
+                "num_experts_per_tok": 1,
+                "rope_theta": 1000,
+                "routed_scaling_factor": 1.0,
+            },
+            {
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "model_type": "ernie4_5",
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": None,
+                "num_hidden_layers": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "rope_theta": 10000,
+                "use_bias": False,
+                "tie_word_embeddings": True,
+            },
+            {
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "model_type": "ernie4_5_moe",
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "rope_theta": 1000,
+                "use_bias": False,
+                "tie_word_embeddings": False,
+                "moe_num_experts": 4,
+            },
+            {
+                "model_type": "exaone4",
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "vocab_size": 1000,
+                "rms_norm_eps": 1e-5,
+                "num_hidden_layers": 4,
+                "max_position_embeddings": 1000,
+                "rope_theta": 10000,
+                "layer_norm_epsilon": 1e-5,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "tie_word_embeddings": False,
+                "rope_scaling": None,
+                "sliding_window": 8,
+                "sliding_window_pattern": "LLGL",
+            },
+            {
+                "model_type": "gemma3n",
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+                "text_config": {
+                    "model_type": "gemma3n",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "head_dim": 32,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 1000,
+                    "num_key_value_heads": 2,
+                    "num_kv_shared_layers": 2,
+                    "vocab_size_per_layer_input": 1000,
+                    "sliding_window": 8,
+                    "max_position_embeddings": 1000,
+                    "rope_local_base_freq": 1.0,
+                    "rope_theta": 1000.0,
+                    "final_logit_softcapping": 1.0,
+                    "layer_types": [
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                    "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+                    "hidden_size_per_layer_input": 256,
+                    "altup_num_inputs": 4,
+                    "altup_coef_clip": 1.0,
+                    "altup_correct_scale": True,
+                    "altup_active_idx": 0,
+                    "laurel_rank": 8,
+                },
+            },
+            {
+                "model_type": "glm4",
+                "hidden_size": 256,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "attention_bias": False,
+                "head_dim": 64,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 2,
+                "partial_rotary_factor": 0,
+                "rope_theta": 1000,
+            },
+            {
+                "model_type": "glm4_moe",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "max_position_embeddings": 1000,
+                "moe_intermediate_size": 128,
+                "norm_topk_prob": True,
+                "num_attention_heads": 4,
+                "n_group": 2,
+                "head_dim": 32,
+                "topk_group": 1,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "routed_scaling_factor": 1.0,
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 1,
+                "num_hidden_layers": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "rope_scaling": None,
+                "use_qk_norm": True,
+                "tie_word_embeddings": False,
+                "attention_bias": False,
+                "partial_rotary_factor": 0.0,
+            },
+            {
+                "model_type": "granite",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "logits_scaling": 1.0,
+                "attention_multiplier": 1.0,
+                "embedding_multiplier": 1.0,
+                "residual_multiplier": 1.0,
+                "max_position_embeddings": 1000,
+                "num_key_value_heads": 2,
+                "attention_bias": False,
+                "mlp_bias": False,
+                "rope_theta": 1000,
+            },
+            {
+                "model_type": "granitemoe",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "logits_scaling": 1.0,
+                "attention_multiplier": 1.0,
+                "embedding_multiplier": 1.0,
+                "residual_multiplier": 1.0,
+                "max_position_embeddings": 1000,
+                "num_key_value_heads": 2,
+                "attention_bias": False,
+                "rope_theta": 1000,
+                "num_local_experts": 4,
+                "num_experts_per_tok": 2,
+            },
+            {
+                "hidden_size": 256,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "attention_bias": False,
+                "head_dim": 64,
+                "max_position_embeddings": 1000,
+                "mlp_bias": False,
+                "model_type": "helium",
+                "rope_theta": 1000,
+                "tie_word_embeddings": False,
+            },
+            {
+                "text_config": {
+                    "vocab_size": 1000,
+                    "hidden_size": 128,
+                    "intermediate_size": 128,
+                    "moe_intermediate_size": 128,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "n_shared_experts": 1,
+                    "n_routed_experts": 4,
+                    "kv_lora_rank": 32,
+                    "q_lora_rank": 32,
+                    "qk_rope_head_dim": 8,
+                    "v_head_dim": 16,
+                    "qk_nope_head_dim": 16,
+                },
+                "model_type": "kimi_vl",
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+            },
+            {
+                "model_type": "lfm2-vl",
+                "vocab_size": 1000,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "model_type": "lfm2",
+                    "vocab_size": 1000,
+                    "hidden_size": 128,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "max_position_embeddings": 1000,
+                    "norm_eps": 1e-5,
+                    "conv_bias": False,
+                    "conv_L_cache": 3,
+                    "block_dim": 128,
+                    "block_ff_dim": 128,
+                    "block_multiple_of": 4,
+                    "block_ffn_dim_multiplier": 2,
+                    "block_auto_adjust_ff_dim": True,
+                    "layer_types": ["full_attention", "", "full_attention", ""],
+                    "rope_theta": 1000,
+                },
+            },
+            {
+                "model_type": "llama4",
+                "text_config": {
+                    "attention_bias": False,
+                    "attention_chunk_size": 8,
+                    "head_dim": 32,
+                    "hidden_size": 128,
+                    "interleave_moe_layer_step": 2,
+                    "intermediate_size": 128,
+                    "intermediate_size_mlp": 128,
+                    "max_position_embeddings": 1000,
+                    "model_type": "llama4",
+                    "num_attention_heads": 4,
+                    "num_experts_per_tok": 1,
+                    "num_hidden_layers": 4,
+                    "num_key_value_heads": 2,
+                    "num_local_experts": 2,
+                    "rms_norm_eps": 1e-4,
+                    "rope_scaling": None,
+                    "rope_theta": 1000,
+                    "use_qk_norm": True,
+                    "vocab_size": 1000,
+                },
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+            },
+            {
+                "model_type": "longcat_flash",
+                "attention_method": "MLA",
+                "zero_expert_type": "identity",
+                "hidden_size": 128,
+                "ffn_hidden_size": 128,
+                "moe_topk": 2,
+                "expert_ffn_hidden_size": 128,
+                "n_routed_experts": 2,
+                "zero_expert_num": 2,
+                "num_layers": 4,
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 4,
+                "kv_lora_rank": 16,
+                "q_lora_rank": 16,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "routed_scaling_factor": 1.0,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "mla_scale_q_lora": True,
+                "mla_scale_kv_lora": True,
+                "attention_bias": False,
+            },
+            {
+                "model_type": "mimo",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 2,
+            },
+            {
+                "model_type": "nemotron-nas",
+                "hidden_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 128256,
+                "block_configs": [
+                    {
+                        "attention": {
+                            "n_heads_in_group": 8,
+                            "no_op": False,
+                            "replace_with_linear": False,
+                        },
+                        "ffn": {
+                            "ffn_mult": 1.3125,
+                            "no_op": False,
+                            "replace_with_linear": False,
+                        },
+                    },
+                ]
+                * 4,
+            },
+            {
+                "model_type": "nemotron_h",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "attention_bias": False,
+                "mamba_num_heads": 8,
+                "mamba_head_dim": 64,
+                "mamba_proj_bias": False,
+                "ssm_state_size": 128,
+                "conv_kernel": 3,
+                "n_groups": 4,
+                "time_step_limit": [1.0, 2.0],
+                "mlp_bias": False,
+                "layer_norm_epsilon": 1e-4,
+                "rms_norm_eps": 1e-5,
+                "use_bias": True,
+                "use_conv_bias": True,
+                "residual_in_fp32": True,
+                "hybrid_override_pattern": ["*", "M", "*", "M"],
+            },
+            {
+                "model_type": "olmoe",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+            },
+            {
+                "model_type": "pixtral",
+                "text_config": {
+                    "model_type": "llama",
+                    "hidden_size": 1024,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 2048,
+                    "num_attention_heads": 4,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 1000,
+                },
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+            },
+            {
+                "model_type": "seed_oss",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+            },
+            {
+                "model_type": "Klear",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "attention_bias": False,
+                "mlp_only_layers": [0],
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 2,
+                "n_shared_experts": 1,
+                "moe_intermediate_size": 128,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 4,
+                "rope_theta": 1000.0,
+                "max_position_embeddings": 1000,
+                "norm_topk_prob": True,
+            },
+            {
+                "model_type": "lille-130m",
+                "block_size": 128,
+                "num_hidden_layers": 4,
+                "n_layer": 4,
+                "n_head": 4,
+                "n_kv_heads": 4,
+                "n_embd": 128,
+                "vocab_size": 1000,
+                "rope_theta": 1000,
+                "layer_norm_eps": 1e-5,
+            },
+            {
+                "model_type": "granitemoehybrid",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "attention_bias": False,
+                "embedding_multiplier": 1.0,
+                "attention_multiplier": 1.0,
+                "logits_scaling": 1.0,
+                "residual_multiplier": 1.0,
+                "num_local_experts": 8,
+                "num_experts_per_tok": 2,
+                "shared_intermediate_size": 128,
+                "mamba_n_heads": 8,
+                "mamba_d_head": 16,
+                "mamba_proj_bias": False,
+                "mamba_d_state": 128,
+                "mamba_d_conv": 4,
+                "mamba_n_groups": 1,
+                "mamba_conv_bias": False,
+                "layer_types": ["mamba", "attention", "mamba", "attention"],
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000.0,
+            },
+            {
+                "model_type": "glm",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "head_dim": 32,
+                "num_key_value_heads": 2,
+            },
+            {
+                "model_type": "llama4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "head_dim": 32,
+                "num_key_value_heads": 2,
+                "intermediate_size_mlp": 128,
+                "rope_theta": 1000.0,
+                "head_dim": 8,
+                "tie_word_embeddings": False,
+                "no_rope_layers": [0, 0, 1, 1],
+                "use_qk_norm": True,
+            },
+            {
+                "model_type": "mamba2",
+                "num_heads": 8,
+                "head_dim": 16,
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "state_size": 32,
+                "num_hidden_layers": 4,
+                "layer_norm_epsilon": 1e-4,
+                "conv_kernel": 3,
+                "n_groups": 4,
+                "use_bias": False,
+                "use_conv_bias": False,
+                "chunk_size": 32,
+                "tie_word_embeddings": True,
+                "time_step_limit": (0.01, 10),
+                "time_step_rank": "auto",
+            },
+        ]
+        for config in test_configs:
+            model_type = config["model_type"]
+            with self.subTest(f"Testing {model_type}", model_type=model_type):
+                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                args = arch.ModelArgs.from_dict(config)
+                model = arch.Model(args)
+                self.model_test_runner(
+                    model,
+                    args.model_type,
+                    config["vocab_size"],
+                    config["num_hidden_layers"],
+                )
+
+    def test_ssm(self):
+        for batch_size in [1, 2]:
+            for n_group in [1, 4]:
+                num_heads = 48
+                head_dim = 64
+                state_dim = 128
+
+                hidden_states = mx.random.normal(
+                    shape=(batch_size, 1, num_heads, head_dim)
+                )
+                B = mx.random.normal(shape=(batch_size, 1, n_group, state_dim))
+                C = mx.random.normal(shape=(batch_size, 1, n_group, state_dim))
+                dt = mx.random.normal(shape=(batch_size, 1, num_heads))
+                dt_bias = mx.random.normal(shape=(num_heads,))
+                A_log = mx.random.normal(shape=(num_heads,))
+                D = mx.random.normal(shape=(num_heads,))
+                state = mx.random.normal(
+                    shape=(batch_size, num_heads, head_dim, state_dim)
+                )
+
+                out, out_state = ssm_attn(
+                    hidden_states, A_log, B, C, D, dt, dt_bias, state
+                )
+                out_c, out_state_c = ssm_update(
+                    hidden_states, A_log, B, C, D, dt, dt_bias, state
+                )
+                self.assertTrue(mx.allclose(out, out_c, atol=1e-4, rtol=1e-4))
+                self.assertTrue(
+                    mx.allclose(out_state, out_state_c, atol=1e-4, rtol=1e-4)
+                )
+
+    def test_ssm_masked(self):
+        batch_size = 1
+        n_group = 1
+        num_heads = 48
+        head_dim = 64
+        state_dim = 128
+        seq_len = 4
+        pad = 2
+
+        hidden_states = mx.random.normal(
+            shape=(batch_size, seq_len + pad, num_heads, head_dim)
+        )
+        B = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        C = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        dt = mx.random.normal(shape=(batch_size, seq_len + pad, num_heads))
+        dt_bias = mx.random.normal(shape=(num_heads,))
+        A_log = mx.random.normal(shape=(num_heads,))
+        D = mx.random.normal(shape=(num_heads,))
+        out, out_state = ssm_attn(
+            hidden_states[:, pad:],
+            A_log,
+            B[:, pad:],
+            C[:, pad:],
+            D,
+            dt[:, pad:],
+            dt_bias,
+        )
+        mask = mx.array([[False] * pad + [True] * seq_len])
+        out_m, out_state_m = ssm_attn(
+            hidden_states, A_log, B, C, D, dt, dt_bias, mask=mask
+        )
+        out_m = out_m[:, pad:]
+        self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
+        self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
+
+    def test_gated_delta(self):
+        mx.random.seed(0)
+        for B in [1, 2]:
+            for T in [1, 2]:
+                Hk = 16
+                Hv = 32
+                Dk = 128
+                Dv = 128
+
+                q = mx.random.normal(shape=(B, T, Hk, Dk))
+                k = mx.random.normal(shape=(B, T, Hk, Dk))
+                v = mx.random.normal(shape=(B, T, Hv, Dv))
+                g = mx.random.uniform(shape=(B, T, Hv))
+                beta = mx.random.uniform(shape=(B, T, Hv))
+                state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+                y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
+                y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
+                self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_masked(self):
+        B = 1
+        T = 3
+        Hk = 16
+        Hv = 32
+        Dk = 128
+        Dv = 128
+
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(B, T, Hk, Dk))
+        k = mx.random.normal(shape=(B, T, Hk, Dk))
+        v = mx.random.normal(shape=(B, T, Hv, Dv))
+        g = mx.random.normal(shape=(B, T, Hv))
+        mask = mx.array([[False, True, True]])
+        beta = mx.random.normal(shape=(B, T, Hv))
+        state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+        y_gt, st_gt = gated_delta_ops(
+            q[:, 1:],
+            k[:, 1:],
+            v[:, 1:],
+            g[:, 1:],
+            beta[:, 1:],
+            state,
+        )
+        for fn in [gated_delta_ops, gated_delta_kernel]:
+            y, st = fn(q, k, v, g, beta, state, mask)
+            y = y[:, 1:]
+            self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+            self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":

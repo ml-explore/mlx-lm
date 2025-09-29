@@ -45,6 +45,7 @@ MODEL_REMAPPING = {
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
     "kimi_k2": "deepseek_v3",
+    "qwen2_5_vl": "qwen2_vl",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -188,8 +189,7 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    if (quantization := config.get("quantization", None)) is not None:
-
+    def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -202,8 +202,13 @@ def load_model(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+
+    if (quantization := config.get("quantization", None)) is not None:
+        _quantize(quantization)
+
     elif quantization_config := config.get("quantization_config", False):
         # Handle legacy quantization config
         quant_method = quantization_config["quant_method"]
@@ -211,6 +216,11 @@ def load_model(
             from .models.bitlinear_layers import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
+        elif quant_method == "mxfp4":
+            quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -251,7 +261,7 @@ def load(
     """
     model_path, _ = get_model_path(path_or_hf_repo)
 
-    model, config = load_model(model_path, lazy)
+    model, config = load_model(model_path, lazy, model_config=model_config)
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -442,11 +452,10 @@ def save_model(
 def quantize_model(
     model: nn.Module,
     config: dict,
-    q_group_size: int,
-    q_bits: int,
-    quant_predicate: Optional[
-        Callable[[str, nn.Module, dict], Union[bool, dict]]
-    ] = None,
+    group_size: int,
+    bits: int,
+    mode: str = "affine",
+    quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
@@ -454,45 +463,49 @@ def quantize_model(
     Args:
         model (nn.Module): The model to be quantized.
         config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
-        quant_predicate (Callable): A callable that decides how
-            to quantize each layer based on the path.
-            Accepts the layer `path`, the `module` and the model `config`.
-            Returns either a bool to signify quantize/no quantize or
-            a dict of quantization parameters to pass to `to_quantized`.
+        group_size (int): Group size for quantization.
+        bits (int): Bits per weight for quantization.
+        mode (str): The quantization mode.
+        quant_predicate (Callable): A callable that decides how to quantize
+          each layer based on the path. Accepts the layer `path` and the
+          `module`. Returns either a bool to signify quantize/no quantize or
+          a dict of quantization parameters to pass to `to_quantized`.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
     """
-    if "quantization" in config:
-        raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
+    if "quantization" in quantized_config:
+        # If the model is already partially quantized, return params so that
+        # the config is set on a per-layer basis
+        fine_grained_config = True
+    else:
+        fine_grained_config = False
+        quantized_config["quantization"] = quant_params
 
-    def base_predicate(path, module):
+    def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
-        if module.weight.shape[-1] % q_group_size != 0:
+        if module.weight.shape[-1] % group_size != 0:
             return False
-        return True
-
-    # Add any custom quantization parameters to the config as we go
-    def wrapped_predicate(p, m):
-        bool_or_params = base_predicate(p, m)
-        if bool_or_params:
-            bool_or_params = quant_predicate(p, m)
+        bool_or_params = True
+        if quant_predicate is not None:
+            bool_or_params = quant_predicate(path, module)
         if isinstance(bool_or_params, dict):
-            quantized_config["quantization"][p] = bool_or_params
+            quantized_config["quantization"][path] = bool_or_params
+        elif fine_grained_config and bool_or_params:
+            quantized_config["quantization"][path] = quant_params
         return bool_or_params
 
     nn.quantize(
         model,
-        q_group_size,
-        q_bits,
-        class_predicate=wrapped_predicate if quant_predicate else base_predicate,
+        group_size,
+        bits,
+        mode=mode,
+        class_predicate=wrapped_predicate,
     )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]

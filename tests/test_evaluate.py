@@ -19,7 +19,7 @@ class TestMLXLM(unittest.TestCase):
 
         with patch("mlx_lm.evaluate.load") as mock_load:
             mock_load.return_value = (self.mock_model, self.mock_tokenizer)
-            self.mlx_lm = MLXLM("test_model")
+            self.mlx_lm = MLXLM("test_model", max_tokens=128)
 
     def test_loglikelihood_rolling_processes_all_inputs(self):
         """Test that loglikelihood_rolling processes all inputs correctly when batching."""

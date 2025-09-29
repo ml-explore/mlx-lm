@@ -33,9 +33,9 @@ class ModelArgs(BaseModelArgs):
     topk_method: str = "noaux_tc"
     scoring_func: str = "sigmoid"
     norm_topk_prob: bool = True
-    n_group: Optional[int] = None
-    topk_group: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
+    n_group: int = 1
+    topk_group: int = 1
+    num_experts_per_tok: int = 1
     moe_layer_freq: int = 1
     first_k_dense_replace: int = 0
     max_position_embeddings: int = 2048
@@ -281,18 +281,18 @@ def group_expert_select(
     norm_topk_prob,
 ):
 
-    k = top_k
     scores = mx.sigmoid(gates.astype(mx.float32))
     orig_scores = scores
     scores = scores + e_score_correction_bias
-    scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-    group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-    k = n_group - topk_group
-    group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-    scores = mx.put_along_axis(
-        scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-    )
-    scores = mx.flatten(scores, -2, -1)
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        scores = mx.flatten(scores, -2, -1)
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
@@ -425,17 +425,15 @@ class DeepseekV3Model(nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = self.embed_tokens(x)
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
-        if mask is None:
-            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * self.num_layers
+        mask = create_attention_mask(h, cache[0])
 
         # Receive from the previous process in the pipeline
 
@@ -448,6 +446,8 @@ class DeepseekV3Model(nn.Module):
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         # Broadcast h while keeping it in the graph
         h = mx.distributed.all_gather(h)[: h.shape[0]]
@@ -467,9 +467,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     def sanitize(self, weights):

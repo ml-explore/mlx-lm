@@ -394,17 +394,15 @@ class DeepseekV2Model(nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = self.embed_tokens(x)
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
-        if mask is None:
-            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * self.num_layers
+        mask = create_attention_mask(h, cache[0])
 
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
@@ -416,6 +414,8 @@ class DeepseekV2Model(nn.Module):
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         # Broadcast h while keeping it in the graph
         h = mx.distributed.all_gather(h)[: h.shape[0]]
@@ -435,9 +435,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     def sanitize(self, weights):
