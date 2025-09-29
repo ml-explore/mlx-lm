@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, Tuple
 import math
 
 import mlx.core as mx
@@ -55,7 +55,7 @@ class ModelArgs(BaseModelArgs):
 def fused_recurrent_simple_gla(
     q: mx.array,
     k: mx.array,
-    v: mx.array, 
+    v: mx.array,
     g: mx.array,
     scale: float = None
 ) -> mx.array:
@@ -66,7 +66,6 @@ def fused_recurrent_simple_gla(
     if scale is None:
         scale = K ** -0.5
     
-    # Handle GQA
     if Hq != Hv:
         assert Hq % Hv == 0
         repeat_factor = Hq // Hv
@@ -76,22 +75,17 @@ def fused_recurrent_simple_gla(
     
     h = mx.zeros((B, Hv, K, V), dtype=q.dtype)
     outputs = []
-    
     for t in range(L):
         q_t = q[:, :, t:t+1] * scale
         k_t = k[:, :, t:t+1]
-        v_t = v[:, :, t:t+1] 
+        v_t = v[:, :, t:t+1]
         g_t = g[:, :, t]
-        
-        # Output using current hidden state
         o_t = mx.matmul(q_t, h)
         outputs.append(o_t)
-        
-        # Update hidden state
-        g_decay = mx.exp(g_t)
-        h = h * g_decay[:, :, None, None]
+        g_decay = mx.exp(g_t)[:, :, None, None]
+        h = h * g_decay
         h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
-        
+
     return mx.concatenate(outputs, axis=2)
 
 
@@ -101,12 +95,14 @@ class BailingMoeLinearV2GroupRMSNorm(nn.Module):
         self.weight = mx.ones((dims,))
         self.groups = groups
         self.eps = eps
-    
+
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape
-        x = x.reshape(shape[:-1] + (self.groups, -1))
-        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
-        return self.weight * x.reshape(shape)
+        group_shape = shape[:-1] + (self.groups, shape[-1] // self.groups)
+        x = mx.reshape(x, group_shape).astype(mx.float32)
+        x = x * mx.rsqrt(mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps)
+        
+        return self.weight * mx.reshape(x, shape)
 
 
 class BailingMoeLinearMLP(nn.Module):
@@ -159,7 +155,7 @@ class BailingMoeLinearAttention(nn.Module):
         self.rope = initialize_rope(
             int(self.head_dim * args.partial_rotary_factor),
             args.rope_theta,
-            traditional=False,
+            traditional=True,
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
@@ -221,7 +217,6 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.mode = 'chunk'
 
-        # Keep the doubled projection as it matches the weights
         self.query_key_value = nn.Linear(
             args.hidden_size,
             (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim * 2,
@@ -252,21 +247,24 @@ class BailingMoeLinearLinearAttention(nn.Module):
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
-      
+
     @property
     def slope(self):
-        base_slope = -self.make_slope(self.num_attention_heads)
-        layer_factor = (1 - (self.layer_idx - 1) / (self.num_hidden_layers - 1) + 1e-5)
-        return base_slope * layer_factor
+        slopes = self._get_slopes(self.num_attention_heads)
+        layer_factor = 1 - (self.layer_idx - 1) / (self.num_hidden_layers - 1) + 1e-5
+        return -slopes * layer_factor
+
+    def _get_slopes(self, n: int) -> mx.array:
+        def power_of_2_slopes(n):
+            return [2 ** (-(2 ** -(math.log2(n) - 3)) * (i + 1)) for i in range(n)]
         
-    def make_slope(self, n: int) -> mx.array:
-        def slopes(n):
-            if math.log2(n).is_integer():
-                s = 2 ** (-(2 ** -(math.log2(n) - 3)))
-                return [s * s ** i for i in range(n)]
+        if math.log2(n).is_integer():
+            slopes = power_of_2_slopes(n)
+        else:
             p = 2 ** math.floor(math.log2(n))
-            return slopes(p) + slopes(2 * p)[0::2][:n - p]
-        return mx.array(slopes(n))
+            slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][:n - p]
+        
+        return mx.array(slopes, dtype=mx.float32)
 
     def __call__(
         self,
@@ -275,25 +273,22 @@ class BailingMoeLinearLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
-          
+        
         qkv = self.query_key_value(x)
         qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads) * 2, self.head_dim)
           
         if mask is not None and isinstance(mask, mx.array):
             qkv = mx.where(mask[..., None], qkv, 0)
           
-        # Split into first and second halves
-        qkv_first = qkv[:, :, :(self.num_attention_heads + 2 * self.num_key_value_heads)]
-        qkv_second = qkv[:, :, (self.num_attention_heads + 2 * self.num_key_value_heads):]
+        qkv_mix = qkv[:, :, :(self.num_attention_heads + 2 * self.num_key_value_heads)]
           
-        # Extract Q, K, V from first half
-        q = qkv_first[:, :, :self.num_attention_heads]
-        k = qkv_first[:, :, self.num_attention_heads:self.num_attention_heads + self.num_key_value_heads]
-        v = qkv_first[:, :, self.num_attention_heads + self.num_key_value_heads:]
+        q = qkv_mix[:, :, :self.num_attention_heads]
+        k = qkv_mix[:, :, self.num_attention_heads:self.num_attention_heads + self.num_key_value_heads]
+        v = qkv_mix[:, :, self.num_attention_heads + self.num_key_value_heads:]
           
-        queries = q.transpose(0, 2, 1, 3)  # (B, H, L, D)
-        keys = k.transpose(0, 2, 1, 3)    # (B, H_kv, L, D)
-        values = v.transpose(0, 2, 1, 3)  # (B, H_kv, L, D)
+        queries = q.transpose(0, 2, 1, 3)
+        keys = k.transpose(0, 2, 1, 3)
+        values = v.transpose(0, 2, 1, 3)
 
         if self.use_qk_norm:
             queries = self.query_layernorm(queries)
@@ -311,35 +306,30 @@ class BailingMoeLinearLinearAttention(nn.Module):
             keys = mx.repeat(keys, self.num_key_value_groups, axis=1)
             values = mx.repeat(values, self.num_key_value_groups, axis=1)
 
-        # Use slope-based gating instead of extracting from qkv_second
-        # This matches the PyTorch implementation
-        slope = self.slope  # Shape: (num_attention_heads,)
-        gating = mx.broadcast_to(slope[None, None, :], (B, L, self.num_attention_heads))
-        gating = gating.transpose(0, 2, 1)  # (B, H, L)
+        g = mx.broadcast_to(self.slope[None, :, None], (B, self.num_attention_heads, L))
 
         output = fused_recurrent_simple_gla(
             q=queries,
             k=keys,
             v=values,
-            g=gating,
+            g=g,
+            scale=self.scale,
         )
-          
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
         return self.dense(output)
 
 
 def group_expert_select(
-    gates,
-    e_score_correction_bias,
-    top_k,
-    n_group,
-    topk_group,
-    routed_scaling_factor,
-    norm_topk_prob,
-    score_function,
-):
-
+    gates: mx.array,
+    e_score_correction_bias: mx.array,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    score_function: str,
+) -> Tuple[mx.array, mx.array]:
     in_type = gates.dtype
     if score_function == "sigmoid":
         scores = mx.sigmoid(gates.astype(mx.float32))
