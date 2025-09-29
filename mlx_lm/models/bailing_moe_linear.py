@@ -7,7 +7,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, create_ssm_mask, scaled_dot_product_attention
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -52,89 +52,59 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
 
 
-def chunk_simple_gla(q: mx.array, k: mx.array, v: mx.array, g: mx.array) -> mx.array:
-    B, H, L, K = q.shape
+def fused_recurrent_simple_gla(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array, 
+    g: mx.array,
+    scale: float = None
+) -> mx.array:
+    B, Hq, L, K = q.shape
+    Hv = k.shape[1]
     V = v.shape[-1]
-    chunk_size = 64
-    h = mx.zeros((B, H, K, V), dtype=q.dtype)
-    g = g.transpose(0, 2, 1)
-    outputs = []
-    num_chunks = (L + chunk_size - 1) // chunk_size
     
-    for chunk_idx in range(num_chunks):
-        start_idx = chunk_idx * chunk_size
-        end_idx = min(start_idx + chunk_size, L)
-        chunk_len = end_idx - start_idx
-        q_chunk = q[:, :, start_idx:end_idx]
-        k_chunk = k[:, :, start_idx:end_idx]
-        v_chunk = v[:, :, start_idx:end_idx]
-        g_chunk = g[:, :, start_idx:end_idx]
-        last_idx = end_idx - 1
-        g_last = g[:, :, last_idx:last_idx+1]
-        h = h * mx.exp(g_last[:, :, :, None])
-        
-        chunk_output = []
-        for t in range(chunk_len):
-            q_t = q_chunk[:, :, t:t+1]
-            o_h = mx.matmul(q_t, h)
-            o_local = mx.zeros((B, H, 1, V), dtype=q.dtype)
-            for s in range(t + 1):
-                k_s = k_chunk[:, :, s:s+1]
-                v_s = v_chunk[:, :, s:s+1]
-                g_decay = mx.exp(g_chunk[:, :, t:t+1] - g_chunk[:, :, s:s+1])
-                score = mx.matmul(q_t, k_s.transpose(0, 1, 3, 2))
-                o_local = o_local + score * v_s * g_decay[:, :, :, None]
-            
-            chunk_output.append(o_h + o_local)
-            k_t = k_chunk[:, :, t:t+1]
-            v_t = v_chunk[:, :, t:t+1]
-            g_decay = mx.exp(g_last - g_chunk[:, :, t:t+1])
-            h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t * g_decay[:, :, :, None])
-        
-        outputs.append(mx.concatenate(chunk_output, axis=2))
+    if scale is None:
+        scale = K ** -0.5
     
-    return mx.concatenate(outputs, axis=2)
-
-
-def fused_recurrent_simple_gla(q: mx.array, k: mx.array, v: mx.array, g: mx.array) -> mx.array:  
-    B, Hq, L, K = q.shape  
-    Hv = k.shape[1]  
-    V = v.shape[-1]
-
+    # Handle GQA
     if Hq != Hv:
-        assert Hq % Hv == 0, f"Query heads {Hq} must be divisible by key/value heads {Hv}"
+        assert Hq % Hv == 0
         repeat_factor = Hq // Hv
         k = mx.repeat(k, repeat_factor, axis=1)
         v = mx.repeat(v, repeat_factor, axis=1)
         Hv = Hq
-    h = mx.zeros((B, Hv, K, V), dtype=q.dtype)  
-    g = g.transpose(0, 2, 1)  
-      
-    outputs = []  
-    for t in range(L):  
-        q_t = q[:, :, t:t+1]
+    
+    h = mx.zeros((B, Hv, K, V), dtype=q.dtype)
+    outputs = []
+    
+    for t in range(L):
+        q_t = q[:, :, t:t+1] * scale
         k_t = k[:, :, t:t+1]
-        v_t = v[:, :, t:t+1]
-        g_t = g[:, :, t:t+1]
+        v_t = v[:, :, t:t+1] 
+        g_t = g[:, :, t]
+        
+        # Output using current hidden state
         o_t = mx.matmul(q_t, h)
-        outputs.append(o_t)  
-        g_decay = mx.exp(g_t.mean(axis=1, keepdims=True))
-        h = h * g_decay[:, :, :, None]
-        h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)  
-      
-    return mx.concatenate(outputs, axis=2)  
+        outputs.append(o_t)
+        
+        # Update hidden state
+        g_decay = mx.exp(g_t)
+        h = h * g_decay[:, :, None, None]
+        h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
+        
+    return mx.concatenate(outputs, axis=2)
 
 
 class BailingMoeLinearV2GroupRMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5, group: int = 1):
+    def __init__(self, dims: int, eps: float = 1e-5, groups: int = 1):
         super().__init__()
         self.weight = mx.ones((dims,))
-        self.group = group
+        self.groups = groups
         self.eps = eps
     
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape
-        x = x.reshape(shape[:-1] + (self.group, -1))
+        x = x.reshape(shape[:-1] + (self.groups, -1))
         x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
         return self.weight * x.reshape(shape)
 
@@ -251,6 +221,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.mode = 'chunk'
 
+        # Keep the doubled projection as it matches the weights
         self.query_key_value = nn.Linear(
             args.hidden_size,
             (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim * 2,
@@ -263,16 +234,17 @@ class BailingMoeLinearLinearAttention(nn.Module):
             bias=args.use_bias,
         )
 
-        self.g_proj = self.g_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.g_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.g_norm = BailingMoeLinearV2GroupRMSNorm(
-            args.num_attention_heads * self.head_dim, 
-            eps=args.rms_norm_eps, 
-            group=args.group_norm_size
+            args.num_attention_heads * self.head_dim,
+            eps=args.rms_norm_eps,
+            groups=args.group_norm_size
         )
+
         if args.use_qk_norm:
             self.key_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
             self.query_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        
+          
         self.rope = initialize_rope(
             int(self.head_dim * args.partial_rotary_factor),
             args.rope_theta,
@@ -280,13 +252,13 @@ class BailingMoeLinearLinearAttention(nn.Module):
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
-    
+      
     @property
     def slope(self):
-        base_slope = - self.make_slope(self.num_attention_heads)
+        base_slope = -self.make_slope(self.num_attention_heads)
         layer_factor = (1 - (self.layer_idx - 1) / (self.num_hidden_layers - 1) + 1e-5)
         return base_slope * layer_factor
-      
+        
     def make_slope(self, n: int) -> mx.array:
         def slopes(n):
             if math.log2(n).is_integer():
@@ -303,70 +275,55 @@ class BailingMoeLinearLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
-
-        mode = "fused_recurrent" if x.shape[1] <= 64 else self.mode
+          
         qkv = self.query_key_value(x)
-
-        # The QKV output is doubled in size, so we need to handle this correctly
-        total_heads = self.num_attention_heads + 2 * self.num_key_value_heads
-        qkv = qkv.reshape(B, L, total_heads, self.head_dim * 2)  # Note: head_dim * 2
-        
-        if mask is not None:
+        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads) * 2, self.head_dim)
+          
+        if mask is not None and isinstance(mask, mx.array):
             qkv = mx.where(mask[..., None], qkv, 0)
-        
-        q = qkv[:, :, :self.num_attention_heads]  # First num_attention_heads
-        k = qkv[:, :, self.num_attention_heads:self.num_attention_heads + self.num_key_value_heads]  # Next num_key_value_heads
-        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads:]  # Remaining num_key_value_heads
-        
-        # Now we need to split each of Q, K, V to get the actual values
-        # Assuming the doubling means we take the first half of each
-        q = q[..., :self.head_dim]  # Take first half
-        k = k[..., :self.head_dim]  # Take first half  
-        v = v[..., :self.head_dim]  # Take first half
-        
-        queries = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        keys = k.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        values = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
+          
+        # Split into first and second halves
+        qkv_first = qkv[:, :, :(self.num_attention_heads + 2 * self.num_key_value_heads)]
+        qkv_second = qkv[:, :, (self.num_attention_heads + 2 * self.num_key_value_heads):]
+          
+        # Extract Q, K, V from first half
+        q = qkv_first[:, :, :self.num_attention_heads]
+        k = qkv_first[:, :, self.num_attention_heads:self.num_attention_heads + self.num_key_value_heads]
+        v = qkv_first[:, :, self.num_attention_heads + self.num_key_value_heads:]
+          
+        queries = q.transpose(0, 2, 1, 3)  # (B, H, L, D)
+        keys = k.transpose(0, 2, 1, 3)    # (B, H_kv, L, D)
+        values = v.transpose(0, 2, 1, 3)  # (B, H_kv, L, D)
 
         if self.use_qk_norm:
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
-
+              
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)
+            queries = self.rope(queries)    
             keys = self.rope(keys)
-
-        slope_expanded = mx.tile(self.slope[None, None, :], (B, L, 1))
 
         if self.num_key_value_groups > 1:
             keys = mx.repeat(keys, self.num_key_value_groups, axis=1)
             values = mx.repeat(values, self.num_key_value_groups, axis=1)
 
-        if mode == "fused_recurrent":
-            output = fused_recurrent_simple_gla(
-                q=queries,
-                k=keys,
-                v=values,
-                g=slope_expanded,
-            )
-        else:
-            output = chunk_simple_gla(
-                q=queries,
-                k=keys,
-                v=values,
-                g=slope_expanded,
-            )
+        # Use slope-based gating instead of extracting from qkv_second
+        # This matches the PyTorch implementation
+        slope = self.slope  # Shape: (num_attention_heads,)
+        gating = mx.broadcast_to(slope[None, None, :], (B, L, self.num_attention_heads))
+        gating = gating.transpose(0, 2, 1)  # (B, H, L)
 
+        output = fused_recurrent_simple_gla(
+            q=queries,
+            k=keys,
+            v=values,
+            g=gating,
+        )
+          
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
         return self.dense(output)
@@ -522,18 +479,6 @@ class BailingMoeLinearModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        self.fa_idx = []
-        self.la_idx = []
-
-        for i, layer in enumerate(self.layers):
-            if layer.attention_layer_type == "attention":
-                self.fa_idx.append(i)
-            else:
-                self.la_idx.append(i)
-                
-        self.fa_idx = self.fa_idx[0] if self.fa_idx else 0
-        self.la_idx = self.la_idx[0] if self.la_idx else 0
-
     def __call__(
         self,
         inputs: mx.array,
@@ -544,11 +489,14 @@ class BailingMoeLinearModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
-        # ssm_mask = create_ssm_mask(h, cache[self.la_idx])
+        fa_mask = create_attention_mask(h, cache[0])
+        if isinstance(fa_mask, mx.array):
+            la_mask = fa_mask[-1:, :] if fa_mask.ndim > 1 else fa_mask
+        else:
+            la_mask = fa_mask
 
         for layer, c in zip(self.layers, cache):
-            mask = fa_mask if layer.attention_layer_type == "attention" else None
+            mask = fa_mask if layer.attention_layer_type == "attention" else la_mask
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -590,29 +538,6 @@ class Model(nn.Module):
 
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            
-            # Fix linear attention QKV weights that were incorrectly doubled
-            layer = self.model.layers[l]
-            if hasattr(layer, 'attention') and hasattr(layer.attention, 'attention_layer_type'):
-                if layer.attention_layer_type == "linear_attention":
-                    qkv_key = f"{prefix}.attention.query_key_value.weight"
-                    if qkv_key in weights:
-                        qkv_weight = weights[qkv_key]
-                        expected_size = (self.args.num_attention_heads + 2 * self.args.num_key_value_heads) * (self.args.hidden_size // self.args.num_attention_heads)
-                        
-                        # If the weight is doubled, take only the first half
-                        if qkv_weight.shape[0] == expected_size * 2:
-                            weights[qkv_key] = qkv_weight[:expected_size, :]
-                        
-                    # Same for bias if it exists
-                    qkv_bias_key = f"{prefix}.attention.query_key_value.bias"
-                    if qkv_bias_key in weights:
-                        qkv_bias = weights[qkv_bias_key]
-                        expected_size = (self.args.num_attention_heads + 2 * self.args.num_key_value_heads) * (self.args.hidden_size // self.args.num_attention_heads)
-                        
-                        if qkv_bias.shape[0] == expected_size * 2:
-                            weights[qkv_bias_key] = qkv_bias[:expected_size]
-
             # Handle MoE layers
             if l >= self.args.first_k_dense_replace:
                 for m in ["gate_proj", "down_proj", "up_proj"]:
