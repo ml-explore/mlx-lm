@@ -2,22 +2,25 @@
 
 import math
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import CacheList, KCache, KVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "deepseek_v3"
+    model_type: str = "deepseek_v32"
     vocab_size: int = 102400
     hidden_size: int = 4096
+    index_head_dim: int = 128
+    index_n_heads: int = 64
+    index_topk: int = 2048
     intermediate_size: int = 11008
     moe_intermediate_size: int = 1407
     num_hidden_layers: int = 30
@@ -46,7 +49,70 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
 
 
-class DeepseekV3Attention(nn.Module):
+class Indexer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.hidden_size
+        self.n_heads = args.index_n_heads
+        self.head_dim = args.index_head_dim
+        self.rope_head_dim = args.qk_rope_head_dim
+        self.index_topk = args.index_topk
+        self.q_lora_rank = args.q_lora_rank
+        self.wq_b = nn.Linear(
+            self.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
+        self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
+        self.softmax_scale = self.head_dim**-0.5
+        self.rope = initialize_rope(
+            dims=args.qk_rope_head_dim,
+            base=args.rope_theta,
+            traditional=True,
+            max_position_embeddings=args.max_position_embeddings,
+            scaling_config=args.rope_scaling,
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any] = None,
+    ):
+        # Computes top_k indices for attention
+        b, s, _ = x.shape
+        q = self.wq_b(qr)
+        q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
+        q_pe, q_nope = mx.split(q, [self.rope_head_dim], axis=-1)
+
+        offset = cache.offset if cache is not None else 0
+
+        q_pe = self.rope(q_pe, offset=offset)
+        q = mx.concatenate([q_pe, q_nope], axis=-1)
+
+        k = self.wk(x)
+        k = self.k_norm(k)
+        k = mx.reshape(k, (b, 1, s, self.head_dim))
+        k_pe, k_nope = mx.split(k, [self.rope_head_dim], axis=-1)
+        k_pe = self.rope(k_pe, offset=offset)
+        k = mx.concatenate([k_pe, k_nope], axis=-1)
+        if cache is not None:
+            k = cache.update_and_fetch(k)
+        if k.shape[2] <= self.index_topk:
+            return None
+        weights = self.weights_proj(x) * (self.n_heads**-0.5)
+        weights = (weights * self.softmax_scale).swapaxes(-1, -2)[..., None]
+        q_scaled = q * weights
+        scores = (q * weights) @ k.swapaxes(-1, -2)
+        if mask is not None:
+            scores = mx.where(mask, scores, -float("inf"))
+        return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
+            ..., -self.index_topk :
+        ]
+
+
+class DeepseekV32Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -103,6 +169,7 @@ class DeepseekV3Attention(nn.Module):
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
 
+        self.indexer = Indexer(config)
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -122,7 +189,8 @@ class DeepseekV3Attention(nn.Module):
         if self.q_lora_rank is None:
             q = self.q_proj(x)
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            qr = self.q_a_layernorm(self.q_a_proj(x))
+            q = self.q_b_proj(qr)
 
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
@@ -135,20 +203,38 @@ class DeepseekV3Attention(nn.Module):
         k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
 
         if cache is not None:
-            q_pe = self.rope(q_pe, cache.offset)
-            k_pe = self.rope(k_pe, cache.offset)
+            q_pe = self.rope(q_pe, cache[0].offset)
+            k_pe = self.rope(k_pe, cache[0].offset)
             k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache.update_and_fetch(
+            keys, values = cache[0].update_and_fetch(
                 mx.concatenate([k_nope, k_pe], axis=-1), values
             )
         else:
+            cache = [None] * 2
             q_pe = self.rope(q_pe)
             k_pe = self.rope(k_pe)
             k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
             keys = mx.concatenate([k_nope, k_pe], axis=-1)
 
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
-
+        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        if topk_indices is not None:
+            repeats = self.num_heads // self.config.index_n_heads
+            if L == 1:
+                topk_indices = mx.repeat(topk_indices, repeats, axis=1).squeeze(-2)[
+                    ..., None
+                ]
+                keys = mx.take_along_axis(keys, topk_indices, axis=-2)
+                values = mx.take_along_axis(values, topk_indices, axis=-2)
+            else:
+                topk_mask = mx.zeros(
+                    (B, self.config.index_n_heads, *mask.shape[-2:]), mx.bool_
+                )
+                topk_mask = mx.put_along_axis(
+                    topk_mask, topk_indices, mx.array(True), axis=-1
+                )
+                mask = mask & topk_mask
+                mask = mx.repeat(mask, repeats, axis=1)
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
@@ -156,7 +242,7 @@ class DeepseekV3Attention(nn.Module):
         return self.o_proj(output)
 
 
-class DeepseekV3MLP(nn.Module):
+class DeepseekV32MLP(nn.Module):
     def __init__(
         self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
     ):
@@ -237,7 +323,7 @@ class MoEGate(nn.Module):
         )
 
 
-class DeepseekV3MoE(nn.Module):
+class DeepseekV32MoE(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -251,7 +337,7 @@ class DeepseekV3MoE(nn.Module):
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV3MLP(
+            self.shared_experts = DeepseekV32MLP(
                 config=config, intermediate_size=intermediate_size
             )
 
@@ -265,18 +351,18 @@ class DeepseekV3MoE(nn.Module):
         return y
 
 
-class DeepseekV3DecoderLayer(nn.Module):
+class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekV3Attention(config)
+        self.self_attn = DeepseekV32Attention(config)
         self.mlp = (
-            DeepseekV3MoE(config)
+            DeepseekV32MoE(config)
             if (
                 config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0
             )
-            else DeepseekV3MLP(config)
+            else DeepseekV32MLP(config)
         )
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -295,13 +381,13 @@ class DeepseekV3DecoderLayer(nn.Module):
         return h + r
 
 
-class DeepseekV3Model(nn.Module):
+class DeepseekV32Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            DeepseekV3DecoderLayer(config, idx)
+            DeepseekV32DecoderLayer(config, idx)
             for idx in range(config.num_hidden_layers)
         ]
         self.start_idx = 0
@@ -339,7 +425,9 @@ class DeepseekV3Model(nn.Module):
 
         if cache is None:
             cache = [None] * self.num_layers
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(
+            h, cache[0][0] if cache[0] else None, return_array=True
+        )
 
         # Receive from the previous process in the pipeline
 
@@ -366,7 +454,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = config
         self.model_type = config.model_type
-        self.model = DeepseekV3Model(config)
+        self.model = DeepseekV32Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
@@ -435,3 +523,6 @@ class Model(nn.Module):
             return "e_score_correction_bias" not in k
 
         return predicate
+
+    def make_cache(self):
+        return [CacheList(KVCache(), KCache()) for _ in self.layers]

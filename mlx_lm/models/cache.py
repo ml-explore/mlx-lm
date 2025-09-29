@@ -659,6 +659,55 @@ class CacheList(_BaseCache):
             c.extend(other)
 
 
+class KCache(_BaseCache):
+    step = 256
+
+    def __init__(self):
+        self.keys = None
+        self.offset = 0
+
+    def update_and_fetch(self, k):
+        prev = self.offset
+        if self.keys is None or (prev + k.shape[2]) > self.keys.shape[2]:
+            B, n_heads, _, head_dim = k.shape
+            n_steps = (self.step + k.shape[2] - 1) // self.step
+            shape = (B, n_heads, n_steps * self.step, head_dim)
+            new_k = mx.zeros(shape, k.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+            else:
+                self.keys = new_k
+
+        self.offset += k.shape[2]
+        self.keys[..., prev : self.offset, :] = k
+        return self.keys[..., : self.offset, :]
+
+    @property
+    def state(self):
+        if self.offset == self.keys.shape[2]:
+            return self.keys
+        else:
+            return (self.keys[..., : self.offset, :],)
+
+    @state.setter
+    def state(self, v):
+        self.keys = v
+        self.offset = self.keys.shape[2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+
 class BatchKVCache(_BaseCache):
     step = 256
 
