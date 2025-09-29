@@ -217,23 +217,30 @@ def train(
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
-    state = [model.state, optimizer.state, mx.random.state]
-
-    @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch):
-        # Forward and backward pass
-        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
-
-        # All reduce the gradients if running in distributed mode
-        grad = average_gradients(grad)
-
-        return lvalue, toks, grad
-
     grad_accum_steps = args.gradient_accumulation_steps
     if grad_accum_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
 
-    grad_accum = None
+    zero_grad = tree_map(lambda p: mx.zeros_like(p), model.trainable_parameters())
+
+    state = [model.state, optimizer.state, mx.random.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(batch, prev_grad, accum_steps_for_update, do_update):
+        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
+
+        grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+
+        if do_update:
+            grad = average_gradients(grad)
+            if accum_steps_for_update > 1:
+                grad = tree_map(lambda x: x / accum_steps_for_update, grad)
+            optimizer.update(model, grad)
+            grad = tree_map(lambda x: x * 0, grad)
+
+        return lvalue, toks, grad
+
+    grad_accum = zero_grad
     accumulated_steps = 0
 
     model.train()
@@ -286,21 +293,22 @@ def train(
 
             tic = time.perf_counter()
 
-        lvalue, toks, grad = step(batch)
+        prev_grad = grad_accum
+        accumulated_steps += 1
+        do_update = False
+        steps_for_update = accumulated_steps
 
         if grad_accum_steps == 1:
-            optimizer.update(model, grad)
-        else:
-            if grad_accum is None:
-                grad_accum = grad
-            else:
-                grad_accum = tree_map(lambda acc, g: acc + g, grad_accum, grad)
-            accumulated_steps += 1
-            if accumulated_steps == grad_accum_steps or it == args.iters:
-                scaled_grad = tree_map(lambda g: g / accumulated_steps, grad_accum)
-                optimizer.update(model, scaled_grad)
-                grad_accum = None
-                accumulated_steps = 0
+            do_update = True
+            steps_for_update = 1
+        elif accumulated_steps == grad_accum_steps or it == args.iters:
+            do_update = True
+
+        lvalue, toks, grad_accum = step(batch, prev_grad, steps_for_update, do_update)
+
+        if do_update:
+            grad_accum = zero_grad
+            accumulated_steps = 0
 
         losses += lvalue
         n_tokens += toks
