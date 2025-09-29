@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 from .callbacks import TrainingCallback
@@ -63,6 +63,12 @@ class TrainingArgs:
     grad_checkpoint: bool = field(
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
+    )
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={
+            "help": "Number of steps to accumulate gradients before applying an optimizer update."
+        },
     )
 
 
@@ -209,6 +215,8 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
+    loss_value_and_grad = nn.value_and_grad(model, loss)
+
     state = [model.state, optimizer.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
@@ -219,12 +227,14 @@ def train(
         # All reduce the gradients if running in distributed mode
         grad = average_gradients(grad)
 
-        # Model update
-        optimizer.update(model, grad)
+        return lvalue, toks, grad
 
-        return lvalue, toks
+    grad_accum_steps = args.gradient_accumulation_steps
+    if grad_accum_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
 
-    loss_value_and_grad = nn.value_and_grad(model, loss)
+    grad_accum = None
+    accumulated_steps = 0
 
     model.train()
     losses = 0
@@ -276,7 +286,22 @@ def train(
 
             tic = time.perf_counter()
 
-        lvalue, toks = step(batch)
+        lvalue, toks, grad = step(batch)
+
+        if grad_accum_steps == 1:
+            optimizer.update(model, grad)
+        else:
+            if grad_accum is None:
+                grad_accum = grad
+            else:
+                grad_accum = tree_map(lambda acc, g: acc + g, grad_accum, grad)
+            accumulated_steps += 1
+            if accumulated_steps == grad_accum_steps or it == args.iters:
+                scaled_grad = tree_map(lambda g: g / accumulated_steps, grad_accum)
+                optimizer.update(model, scaled_grad)
+                grad_accum = None
+                accumulated_steps = 0
+
         losses += lvalue
         n_tokens += toks
         steps += 1

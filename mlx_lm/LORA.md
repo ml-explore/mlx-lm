@@ -82,6 +82,10 @@ You can specify the output location with `--adapter-path`.
 You can resume fine-tuning with an existing adapter with
 `--resume-adapter-file <path_to_adapters.safetensors>`.
 
+If you need an effective batch size larger than what fits in memory, set
+`--gradient-accumulation-steps <N>` to accumulate gradients across `N`
+micro-batches before each optimizer update.
+
 #### Logging
 
 You can log training metrics to Weights & Biases using `--report-to wandb`, or
