@@ -1,6 +1,6 @@
 # Copyright © 2024 Apple Inc.
-
 import math
+import re
 import sys
 import unittest
 from contextlib import contextmanager
@@ -12,11 +12,11 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten
 
-from mlx_lm import lora, tuner
+from mlx_lm import tuner
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
-from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
+from mlx_lm.tuner.lora import LoRAEmbedding, LoRASwitchLinear
 from mlx_lm.tuner.trainer import evaluate
-from mlx_lm.tuner.utils import build_schedule
+from mlx_lm.tuner.utils import build_schedule, should_convert_to_lora
 
 
 @contextmanager
@@ -25,6 +25,59 @@ def swapped_with_identity(obj, func):
     setattr(obj, func, lambda x, **kwargs: x)
     yield
     setattr(obj, func, old_func)
+
+
+class TestShouldConvertToLoRa(unittest.TestCase):
+    def setUp(self):
+        self.capturedOutput = StringIO()
+        sys.stdout = self.capturedOutput
+
+    def tearDown(self):
+        sys.stdout = sys.__stdout__
+
+    def test_all_linear_with_non_linear(self):
+        quantized_linear = MagicMock(spec=nn.QuantizedEmbedding)
+        self.assertFalse(
+            should_convert_to_lora("", quantized_linear, set(), all_linear_layers=True)
+        )
+
+    def test_all_linear_with_linear_and_switch(self):
+        linear = MagicMock(spec=nn.Linear)
+        switch_linear = MagicMock(spec=LoRASwitchLinear)
+        for layer in [linear, switch_linear]:
+            self.assertTrue(
+                should_convert_to_lora("", layer, set(), all_linear_layers=True)
+            )
+
+    def test_not_all_linear_with_empty_keys(self):
+        switch_linear = MagicMock(spec=LoRASwitchLinear)
+        self.assertFalse(
+            should_convert_to_lora("self_attn.q_proj", switch_linear, set())
+        )
+
+    def test_not_all_linear_pattern_key_matching(self):
+        linear = MagicMock(spec=nn.Linear)
+        self.assertFalse(
+            should_convert_to_lora(
+                "self_attn.q_proj", linear, set(), key_patterns=[re.compile(r"^.+mlp")]
+            )
+        )
+        self.assertTrue(
+            should_convert_to_lora(
+                "self_attn.q_proj",
+                linear,
+                set(),
+                key_patterns=[re.compile(r"^.+q_proj")],
+            )
+        )
+        self.assertTrue(
+            should_convert_to_lora(
+                "mlp.up_proj",
+                linear,
+                set(),
+                key_patterns=[re.compile(r"^.*mlp\.up.+$")],
+            )
+        )
 
 
 class TestLora(unittest.TestCase):

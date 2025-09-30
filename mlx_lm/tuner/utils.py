@@ -1,8 +1,10 @@
 # Copyright © 2024 Apple Inc.
 import json
+import re
 import types
+from functools import partial
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Pattern, Set
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -32,6 +34,54 @@ def build_schedule(schedule_config: Dict):
         )
     else:
         return bound_schedule_fn
+
+
+def should_convert_to_lora(
+    layer_key: str,
+    module: nn.Module,
+    keys: Set[str] = None,
+    all_linear_layers: bool = False,
+    key_patterns: Set[Pattern] = None,
+) -> bool:
+    """
+    Determines whether a given module should be converted to a LoRA layer
+
+    Returns True if `layer_key` is in the set of keys, all_linear_layers is True
+    and the related module is a linear layer, or any of the patterns in key_patterns match layer_key
+
+    Args:
+        layer_key (str): The layer key for the module
+        module (nn.Module): The corresponding module
+        keys (set): The indicated layer keys to convert (if all_linear_layers is False)
+        all_linear_layers (bool): Whether or not to convert all linear layers (defaults to False).
+        key_patterns (set): Set of regex patterns to match against layer keys that should be converted to LoRA.
+
+    Returns:
+        bool: A boolean indicating whether the module should be converted to LoRA
+    """
+    if key_patterns is None:
+        key_patterns = set()
+    if keys is None:
+        keys = set()
+
+    convertible_layers = (
+        nn.QuantizedLinear,
+        nn.Linear,
+        LoRASwitchLinear,
+        SwitchLinear,
+        QuantizedSwitchLinear,
+    )
+    is_convertible = isinstance(module, convertible_layers) or hasattr(
+        module, "to_lora"
+    )
+    should_convert = (
+        all_linear_layers
+        or layer_key in keys
+        or (any(p.match(layer_key) for p in key_patterns))
+    )
+    if (key_patterns or all_linear_layers) and should_convert:
+        print(f"Converting {layer_key} to LoRA")
+    return is_convertible and should_convert
 
 
 def linear_to_lora_layers(
@@ -82,6 +132,7 @@ def linear_to_lora_layers(
         )
 
     keys = config.get("keys", None)
+    key_patterns = set([re.compile(p) for p in config.get("key_patterns", [])])
     if keys is not None:
         keys = set(keys)
     elif model.model_type in {
@@ -215,13 +266,27 @@ def linear_to_lora_layers(
         keys.add("mixer.o_proj")
     else:
         raise ValueError(f"Lora does not support {model.model_type}")
-
+    all_linear_layers = "all" in keys
+    should_convert = partial(
+        should_convert_to_lora,
+        keys=keys,
+        all_linear_layers=all_linear_layers,
+        key_patterns=key_patterns,
+    )
+    if all_linear_layers:
+        print("Applying LoRA to all linear layers")
     for l in model.layers[-max(num_layers, 0) :]:
-        lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
+        lora_layers = [
+            (k, to_lora(m)) for k, m in l.named_modules() if should_convert(k, m)
+        ]
         if lora_layers:
             l.update_modules(tree_unflatten(lora_layers))
 
-    lora_modules = [(k, to_lora(m)) for k, m in model.named_modules() if k in keys]
+    lora_modules = [
+        (k, to_lora(m))
+        for k, m in model.named_modules()
+        if should_convert_to_lora(k, m, keys, all_linear_layers=all_linear_layers)
+    ]
     if lora_modules:
         model.update_modules(tree_unflatten(lora_modules))
 

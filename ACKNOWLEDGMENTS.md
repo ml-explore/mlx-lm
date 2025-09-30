@@ -22,3 +22,6 @@ MLX LM was developed with contributions from the following individuals:
   HuggingFace's `Starcoder2`, Cohere's `Cohere (1 and 2)`, Alibaba Qwen's `Qwen
   (2, 3 and MoE)`, Microsoft's `Phi (3 and 3.5 MoE)`, `BitNet1.58`, Meta's `Llama
   (3 and 4)`, Google DeepMind's `Gemma 3`, and InterLM's `InternLM 2.5`.
+- Chimezie Ogbuji: Added support for `YAML` configuration for mlx_lm.lora, fewshot and apply chat template 
+  for lm_eval, HF dataset collections, prompt-masking, `Min P` sampling, parameterized batching function to 
+  trainer, LoRA on all linear (or by pattern), and Configurable LR schedulers 
