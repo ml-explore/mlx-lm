@@ -82,10 +82,6 @@ You can specify the output location with `--adapter-path`.
 You can resume fine-tuning with an existing adapter with
 `--resume-adapter-file <path_to_adapters.safetensors>`.
 
-If you need an effective batch size larger than what fits in memory, set
-`--gradient-accumulation-steps <N>` to accumulate gradients across `N`
-micro-batches before each optimizer update.
-
 #### Logging
 
 You can log training metrics to Weights & Biases using `--report-to wandb`, or
@@ -375,7 +371,10 @@ of memory. Here are some tips to reduce memory use should you need to do so:
 
 2. Try using a smaller batch size with `--batch-size`. The default is `4` so
    setting this to `2` or `1` will reduce memory consumption. This may slow
-   things down a little, but will also reduce the memory use.
+   things down a little, but will also reduce the memory use. You can increase
+   the effective batch size without increasing the memory use by accumulating
+   gradients using `--grad-accumulation-steps <N>` which will accumulate the
+   gradient of `<N>` batches before updating the parameters.
 
 3. Reduce the number of layers to fine-tune with `--num-layers`. The default
    is `16`, so you can try `8` or `4`. This reduces the amount of memory
