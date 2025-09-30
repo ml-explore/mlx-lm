@@ -168,9 +168,7 @@ class YarnRoPE(nn.Module):
             scaling_factor, mscale_all_dim
         )
         freq_extra = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
-        freq_inter = scaling_factor * base ** (
-            mx.arange(0, dims, 2, dtype=mx.float32) / dims
-        )
+        freq_inter = scaling_factor * freq_extra
         low, high = yarn_find_correction_range()
         freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dims // 2)
         self._freqs = (freq_inter * freq_extra) / (
