@@ -64,7 +64,7 @@ class TrainingArgs:
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
     )
-    gradient_accumulation_steps: int = field(
+    grad_accumulation_steps: int = field(
         default=1,
         metadata={
             "help": "Number of steps to accumulate gradients before applying an optimizer update."
@@ -217,31 +217,27 @@ def train(
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
-    grad_accum_steps = args.gradient_accumulation_steps
+    grad_accum_steps = args.grad_accumulation_steps
     if grad_accum_steps < 1:
-        raise ValueError("gradient_accumulation_steps must be at least 1")
-
-    zero_grad = tree_map(lambda p: mx.zeros_like(p), model.trainable_parameters())
+        raise ValueError("grad_accumulation_steps must be at least 1")
 
     state = [model.state, optimizer.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch, prev_grad, accum_steps_for_update, do_update):
+    def step(batch, prev_grad, do_update):
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
 
-        grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+        if prev_grad is not None:
+            grad = tree_map(lambda x, y: x + y, grad, prev_grad)
 
         if do_update:
             grad = average_gradients(grad)
-            if accum_steps_for_update > 1:
-                grad = tree_map(lambda x: x / accum_steps_for_update, grad)
+            if grad_accum_steps > 1:
+                grad = tree_map(lambda x: x / grad_accum_steps, grad)
             optimizer.update(model, grad)
-            grad = tree_map(lambda x: x * 0, grad)
+            grad = None
 
         return lvalue, toks, grad
-
-    grad_accum = zero_grad
-    accumulated_steps = 0
 
     model.train()
     losses = 0
@@ -249,6 +245,8 @@ def train(
     steps = 0
     trained_tokens = 0
     train_time = 0
+    grad_accum = None
+
     # Main training loop
     for it, batch in zip(
         range(1, args.iters + 1),
@@ -293,27 +291,16 @@ def train(
 
             tic = time.perf_counter()
 
-        prev_grad = grad_accum
-        accumulated_steps += 1
-        do_update = False
-        steps_for_update = accumulated_steps
-
-        if grad_accum_steps == 1:
-            do_update = True
-            steps_for_update = 1
-        elif accumulated_steps == grad_accum_steps or it == args.iters:
-            do_update = True
-
-        lvalue, toks, grad_accum = step(batch, prev_grad, steps_for_update, do_update)
-
-        if do_update:
-            grad_accum = zero_grad
-            accumulated_steps = 0
+        lvalue, toks, grad_accum = step(
+            batch,
+            grad_accum,
+            it % grad_accum_steps == 0,
+        )
 
         losses += lvalue
         n_tokens += toks
         steps += 1
-        mx.eval(state, losses, n_tokens)
+        mx.eval(state, losses, n_tokens, grad_accum)
         train_time += time.perf_counter() - tic
 
         # Report training loss if needed

@@ -48,7 +48,7 @@ steps_per_report: 10
 steps_per_eval: 200
 
 # Number of micro-steps to accumulate before each optimizer update.
-gradient_accumulation_steps: 1
+grad_accumulation_steps: 1
 
 # Load path to resume training with the given adapter weights.
 resume_adapter_file: null
