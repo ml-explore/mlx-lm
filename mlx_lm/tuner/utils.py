@@ -7,7 +7,7 @@ from typing import Dict
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map_with_path, tree_unflatten
 
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .dora import DoRAEmbedding, DoRALinear
@@ -81,140 +81,23 @@ def linear_to_lora_layers(
             dropout=config["dropout"],
         )
 
-    keys = config.get("keys", None)
-    if keys is not None:
-        keys = set(keys)
-    elif model.model_type in {
-        "mistral",
-        "mistral3",
-        "llama",
-        "llama4_text",
-        "lfm2",
-        "phi",
-        "mixtral",
-        "nemotron",
-        "stablelm",
-        "hunyuan",
-        "qwen2",
-        "qwen2_moe",
-        "qwen3",
-        "qwen3_moe",
-        "phimoe",
-        "gemma",
-        "gemma2",
-        "gemma3",
-        "gemma3_text",
-        "granite",
-        "helium",
-        "starcoder2",
-        "cohere",
-        "cohere2",
-        "minicpm",
-        "minicpm3",
-        "minicpm4",
-        "deepseek",
-        "olmo2",
-        "olmoe",
-        "internlm3",
-        "glm4",
-        "glm",
-        "mimo",
-        "ernie4_5",
-        "dots1",
-        "smollm3",
-        "exaone4",
-        "hunyuan_v1_dense",
-        "gpt_oss",
-        "ernie4_5_moe",
-        "granitemoe",
-        "longcat_flash",
-        "seed_oss",
-        "apertus",
-        "qwen3_next",
-        "Klear",
-        "lille-130m",
-    }:
-        keys = {"self_attn.q_proj", "self_attn.v_proj"}
-        if model.model_type in ["mixtral", "phimoe"]:
-            keys.add("block_sparse_moe.gate")
-        if model.model_type in ["qwen2_moe", "qwen3_next"]:
-            keys.add("mlp.gate")
-            keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe", "dots1", "Klear"]:
-            keys.add("mlp.gate")
-        if model.model_type in ["longcat_flash"]:
-            keys.add("mlp.router.classifier")
-        if model.model_type == "lille-130m":
-            keys.add("attention.qkv_proj")
-            keys.add("attention.out_proj")
-            keys.add("feed_forward.gate_proj")
-            keys.add("feed_forward.up_proj")
-            keys.add("feed_forward.down_proj")
-        elif model.model_type == "qwen3_next":
-            keys.add("linear_attn.in_proj_qkvz")
-            keys.add("linear_attn.out_proj")
-            keys.add("linear_attn.in_proj_ba")
-            keys.add("linear_attn.dt_bias")
-            keys.add("self_attn.q_proj")
-            keys.add("self_attn.k_proj")
-            keys.add("self_attn.v_proj")
-            keys.add("self_attn.o_proj")
-    elif model.model_type == "gpt_bigcode":
-        keys = {"attn.c_attn"}
-    elif model.model_type == "gpt2":
-        keys = {"attn.c_attn"}
-    elif model.model_type == "gpt_neox":
-        keys = {"attention.query_key_value"}
-    elif model.model_type == "olmo":
-        keys = {"att_proj"}
-    elif model.model_type == "openelm":
-        keys = {"attn.qkv_proj"}
-    elif model.model_type == "phi3":
-        keys = {"self_attn.qkv_proj"}
-    elif model.model_type == "phi-msft":
-        keys = {"mixer.Wqkv", "moe.gate"}
-    elif model.model_type == "dbrx":
-        keys = {"norm_attn_norm.attn.Wqkv", "ffn.router.layer"}
-    elif model.model_type == "internlm2":
-        keys = {"attention.wqkv", "attention.wo"}
-    elif model.model_type in {
-        "deepseek_v2",
-        "deepseek_v3",
-        "longcat_flash",
-        "minicpm3",
-    }:
-        keys = {
-            "self_attn.q_proj",
-            "self_attn.q_a_proj",
-            "self_attn.q_b_proj",
-            "self_attn.kv_a_proj_with_mqa",
-            "self_attn.kv_b_proj",
-        }
-    elif model.model_type == "mamba":
-        keys = {
-            "mixer.in_proj",
-            "mixer.x_proj",
-            "mixer.dt_proj",
-            "mixer.out_proj",
-        }
-    elif model.model_type == "mamba2":
-        keys = {
-            "mixer.in_proj",
-            "mixer.out_proj",
-        }
-    elif model.model_type == "exaone":
-        keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
-    elif model.model_type == "bailing_moe":
-        keys = {"attention.query_key_value", "attention.dense"}
-    elif model.model_type == "nemotron_h":
-        keys.add("mixer.in_proj")
-        keys.add("mixer.out_proj")
-        keys.add("mixer.q_proj")
-        keys.add("mixer.k_proj")
-        keys.add("mixer.v_proj")
-        keys.add("mixer.o_proj")
-    else:
-        raise ValueError(f"Lora does not support {model.model_type}")
+    if (keys := config.get("keys", None)) is None:
+        keys = set()
+
+        def get_keys_for_lora(p, m):
+            types = (
+                nn.Linear,
+                nn.QuantizedLinear,
+                SwitchLinear,
+                QuantizedSwitchLinear,
+                nn.Embedding,
+                nn.QuantizedEmbedding,
+            )
+            if hasattr(m, "to_lora") or isinstance(m, types):
+                keys.add(p)
+
+        for l in model.layers:
+            l.apply_to_modules(get_keys_for_lora)
 
     for l in model.layers[-max(num_layers, 0) :]:
         lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
