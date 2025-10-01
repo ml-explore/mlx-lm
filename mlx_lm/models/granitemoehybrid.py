@@ -64,7 +64,7 @@ class ModelArgs(BaseModelArgs):
     # Mode flags - inferred from num_local_experts
     @property
     def use_moe(self) -> bool:
-        return self.num_local_experts is not None and self.num_local_experts > 0
+        return bool(self.num_local_experts)
 
 
 class GraniteMoeHybridRMSNormGated(nn.Module):
@@ -411,18 +411,16 @@ class GraniteMoeHybridModel(nn.Module):
         self.embedding_multiplier = args.embedding_multiplier
 
         # Handle hybrid vs non-hybrid mode
-        if "attention" in args.layer_types:
-            self.fa_idx = args.layer_types.index("attention")
-        else:
-            self.fa_idx = None
-
-        if "mamba" in args.layer_types:
-            self.ssm_idx = args.layer_types.index("mamba")
-        else:
-            self.ssm_idx = None
-
-        self.layer_types = args.layer_types
-        self.is_hybrid = "mamba" in args.layer_types
+        self.fa_idx = (
+            args.layer_types.index("attention")
+            if "attention" in args.layer_types
+            else None
+        )
+        self.ssm_idx = (
+            args.layer_types.index("mamba")
+            if "mamba" in args.layer_types
+            else None
+        )
 
     def __call__(
         self,
@@ -443,13 +441,8 @@ class GraniteMoeHybridModel(nn.Module):
         if self.ssm_idx is not None:
             mamba_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
-            if layer.layer_type == "attention":
-                mask = attn_mask
-            elif layer.layer_type == "mamba":
-                mask = mamba_mask
-            else:
-                mask = None
+        for layer, c in zip(self.layers, cache):
+            mask = attn_mask if layer.layer_type == "attention" else mamba_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         return self.norm(hidden_states)
@@ -490,8 +483,6 @@ class Model(nn.Module):
                 caches.append(MambaCache())
             elif layer.layer_type == "attention":
                 caches.append(KVCache())
-            else:
-                caches.append(None)
         return caches
 
     def sanitize(self, weights):
