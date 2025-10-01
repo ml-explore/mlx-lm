@@ -65,7 +65,7 @@ class Olmo3Attention(nn.Module):
         self.is_full = args.layer_types[layer_idx] == "full_attention"
 
         if self.is_full:
-            self.rope = initialize_rope(
+            self.rope = nn.RoPE(
                 self.head_dim, traditional=args.rope_traditional, base=args.rope_theta
             )
         else:
@@ -165,10 +165,7 @@ class Olmo3Model(nn.Module):
 
         self.swa_idx = args.layer_types.index("sliding_attention")
         self.ga_idx = args.layer_types.index("full_attention")
-        self.layer_types = args.layer_types or [
-            "sliding_attention",
-            "full_attention",
-        ] * (args.num_hidden_layers // 2)
+        self.layer_types = args.layer_types
 
     def __call__(
         self,
