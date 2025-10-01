@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .rope_utils import initialize_rope
 
 
 @dataclass
@@ -18,13 +19,12 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    max_position_embeddings: Optional[int]
-    num_key_value_heads: Optional[int]
-    attention_bias: bool
-    mlp_bias: bool
-    rope_theta: float
-    layer_types: Optional[List[str]] = None
+    max_position_embeddings: int
     sliding_window: int
+    rope_theta: float
+    attention_bias: bool = False
+    mlp_bias: bool = False
+    layer_types: Optional[List[str]] = None
     rope_traditional: bool = False
     num_key_value_heads: Optional[int] = None
     head_dim: Optional[int] = None
@@ -44,26 +44,24 @@ class ModelArgs(BaseModelArgs):
 class Olmo3Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.head_dim = args.head_dim or args.hidden_size // n_heads
+        self.num_attention_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
         self.layer_idx = layer_idx
 
+        self.head_dim = args.head_dim or args.hidden_size // args.num_attention_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=args.attention_bias)
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=args.attention_bias)
         self.k_proj = nn.Linear(
-            dim, n_kv_heads * self.head_dim, bias=args.attention_bias
+            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=args.attention_bias
         )
         self.v_proj = nn.Linear(
-            dim, n_kv_heads * self.head_dim, bias=args.attention_bias
+            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=args.attention_bias
         )
-        self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=args.attention_bias)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=args.attention_bias)
 
-        self.q_norm = nn.RMSNorm(dims=self.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(dims=self.head_dim, eps=args.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(args.num_attention_heads * self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(args.num_key_value_heads * self.head_dim, eps=args.rms_norm_eps)
         self.is_sliding = args.layer_types[layer_idx] == "sliding_attention"
 
         rope_base = args.rope_theta
@@ -72,11 +70,12 @@ class Olmo3Attention(nn.Module):
                 self.head_dim, traditional=args.rope_traditional, base=rope_base
             )
         else:
-            self.rope = nn.RoPE(
+            self.rope = initialize_rope(
                 self.head_dim,
                 traditional=args.rope_traditional,
                 base=rope_base,
-                scale=args.rope_scaling if hasattr(args, "rope_scaling") else 1.0,
+                scaling_config=args.rope_scaling,
+                max_position_embeddings=args.max_position_embeddings
             )
 
     def __call__(
@@ -86,14 +85,13 @@ class Olmo3Attention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        queries = self.q_norm(self.q_proj(x))
+        keys = self.k_norm(self.k_proj(x))
+        values = self.v_proj(x)
 
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        queries = self.q_norm(queries)
-        keys = self.k_norm(keys)
+        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -130,11 +128,11 @@ class Olmo3MLP(nn.Module):
 
 
 class Olmo3DecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
-        self.self_attn = Olmo3Attention(args)
+        self.self_attn = Olmo3Attention(args, layer_idx=layer_idx)
         self.mlp = Olmo3MLP(args)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
@@ -162,7 +160,7 @@ class Olmo3Model(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Olmo3DecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            Olmo3DecoderLayer(args=args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
