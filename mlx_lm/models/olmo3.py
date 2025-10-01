@@ -62,18 +62,17 @@ class Olmo3Attention(nn.Module):
 
         self.q_norm = nn.RMSNorm(args.num_attention_heads * self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(args.num_key_value_heads * self.head_dim, eps=args.rms_norm_eps)
-        self.is_sliding = args.layer_types[layer_idx] == "sliding_attention"
+        self.is_full = args.layer_types[layer_idx] == "full_attention"
 
-        rope_base = args.rope_theta
-        if self.is_sliding:
-            self.rope = nn.RoPE(
-                self.head_dim, traditional=args.rope_traditional, base=rope_base
+        if self.is_full:
+            self.rope = initialize_rope(
+                self.head_dim, traditional=args.rope_traditional, base=args.rope_theta
             )
         else:
             self.rope = initialize_rope(
                 self.head_dim,
                 traditional=args.rope_traditional,
-                base=rope_base,
+                base=args.rope_theta,
                 scaling_config=args.rope_scaling,
                 max_position_embeddings=args.max_position_embeddings
             )
@@ -101,8 +100,6 @@ class Olmo3Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[..., -keys.shape[-2] :]
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
@@ -123,7 +120,7 @@ class Olmo3MLP(nn.Module):
             args.hidden_size, args.intermediate_size, bias=args.mlp_bias
         )
 
-    def __call__(self, x) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -158,11 +155,20 @@ class Olmo3DecoderLayer(nn.Module):
 class Olmo3Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.sliding_window = args.sliding_window
+
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             Olmo3DecoderLayer(args=args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+        self.swa_idx = args.layer_types.index("sliding_attention")
+        self.ga_idx = args.layer_types.index("full_attention")
+        self.layer_types = args.layer_types or [
+            "sliding_attention",
+            "full_attention",
+        ] * (args.num_hidden_layers // 2)
 
     def __call__(
         self,
@@ -174,9 +180,13 @@ class Olmo3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        full_mask = create_attention_mask(h, cache[self.ga_idx])
+        sliding_window_mask = create_attention_mask(
+            h, cache[self.swa_idx], window_size=self.sliding_window
+        )
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+            mask = full_mask if layer_type == "full_attention" else sliding_window_mask
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
@@ -202,11 +212,6 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
-
-    def sanitize(self, weights):
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
 
     @property
     def layers(self):
