@@ -51,17 +51,33 @@ class Olmo3Attention(nn.Module):
         self.head_dim = args.head_dim or args.hidden_size // args.num_attention_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=args.attention_bias)
+        self.q_proj = nn.Linear(
+            args.hidden_size,
+            args.num_attention_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
         self.k_proj = nn.Linear(
-            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=args.attention_bias
+            args.hidden_size,
+            args.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
         )
         self.v_proj = nn.Linear(
-            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=args.attention_bias
+            args.hidden_size,
+            args.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
         )
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=args.attention_bias)
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim,
+            args.hidden_size,
+            bias=args.attention_bias,
+        )
 
-        self.q_norm = nn.RMSNorm(args.num_attention_heads * self.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(args.num_key_value_heads * self.head_dim, eps=args.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(
+            args.num_attention_heads * self.head_dim, eps=args.rms_norm_eps
+        )
+        self.k_norm = nn.RMSNorm(
+            args.num_key_value_heads * self.head_dim, eps=args.rms_norm_eps
+        )
         self.is_full = args.layer_types[layer_idx] == "full_attention"
 
         if self.is_full:
@@ -74,7 +90,7 @@ class Olmo3Attention(nn.Module):
                 traditional=args.rope_traditional,
                 base=args.rope_theta,
                 scaling_config=args.rope_scaling,
-                max_position_embeddings=args.max_position_embeddings
+                max_position_embeddings=args.max_position_embeddings,
             )
 
     def __call__(
@@ -88,9 +104,13 @@ class Olmo3Attention(nn.Module):
         keys = self.k_norm(self.k_proj(x))
         values = self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(
+            0, 2, 1, 3
+        )
         keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -159,7 +179,8 @@ class Olmo3Model(nn.Module):
 
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Olmo3DecoderLayer(args=args, layer_idx=i) for i in range(args.num_hidden_layers)
+            Olmo3DecoderLayer(args=args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
