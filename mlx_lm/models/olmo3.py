@@ -23,9 +23,7 @@ class ModelArgs(BaseModelArgs):
     sliding_window: int
     rope_theta: float
     attention_bias: bool = False
-    mlp_bias: bool = False
     layer_types: Optional[List[str]] = None
-    rope_traditional: bool = False
     num_key_value_heads: Optional[int] = None
     head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -81,13 +79,11 @@ class Olmo3Attention(nn.Module):
         self.is_full = args.layer_types[layer_idx] == "full_attention"
 
         if self.is_full:
-            self.rope = nn.RoPE(
-                self.head_dim, traditional=args.rope_traditional, base=args.rope_theta
-            )
+            self.rope = nn.RoPE(self.head_dim, traditional=False, base=args.rope_theta)
         else:
             self.rope = initialize_rope(
                 self.head_dim,
-                traditional=args.rope_traditional,
+                traditional=False,
                 base=args.rope_theta,
                 scaling_config=args.rope_scaling,
                 max_position_embeddings=args.max_position_embeddings,
@@ -130,15 +126,9 @@ class Olmo3Attention(nn.Module):
 class Olmo3MLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
-        )
-        self.up_proj = nn.Linear(
-            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
-        )
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
