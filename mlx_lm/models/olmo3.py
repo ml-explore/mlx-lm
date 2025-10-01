@@ -60,7 +60,7 @@ class Olmo3Attention(nn.Module):
 
         self.q_norm = nn.RMSNorm(dims=self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(dims=self.head_dim, eps=args.rms_norm_eps)
-        self.is_sliding = (layer_idx + 1) % args.layer_types[layer_idx] != 0
+        self.is_sliding = args.layer_types[layer_idx] == "sliding_attention"
 
         rope_base = args.rope_theta
         if self.is_sliding:
