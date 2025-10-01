@@ -235,7 +235,7 @@ class LongcatFlashMoE(nn.Module):
 
         regular_outputs = self.switch_mlp(hidden_states, topk_indices)
 
-        weighted_outputs = regular_outputs * topk_weights[..., None]
+        weighted_outputs = regular_outputs * regular_weights[..., None]
 
         # Add identity expert contribution if needed
         assert self.zero_expert_type == "identity"

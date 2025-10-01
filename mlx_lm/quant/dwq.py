@@ -324,6 +324,10 @@ def main():
             bits=args.bits,
         )
 
+    if mx.metal.is_available():
+        max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+        mx.set_wired_limit(max_rec_size)
+
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)
     dwq_quantize(
         model,
