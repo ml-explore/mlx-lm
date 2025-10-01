@@ -30,7 +30,7 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: Optional[int] = None
     head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
