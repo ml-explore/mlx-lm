@@ -82,8 +82,7 @@ def fused_recurrent_simple_gla(
         g_t = g[:, :, t]
         o_t = mx.matmul(q_t, h)
         outputs.append(o_t)
-        g_decay = mx.exp(g_t)[:, :, None, None]
-        h = h * g_decay
+        h = h * mx.exp(g_t)[:, :, None, None]
         h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
 
     return mx.concatenate(outputs, axis=2)
