@@ -24,7 +24,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     mlp_bias: bool
     rope_theta: float
-    layer_types: List[str]
+    layer_types: Optional[List[str]] = None
     sliding_window: int
     rope_traditional: bool = False
     num_key_value_heads: Optional[int] = None
@@ -35,6 +35,11 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+        if self.layer_types is None:
+            self.layer_types = [
+                "full_attention" if (i + 1) % 4 == 0 else "sliding_attention"
+                for i in range(self.num_hidden_layers)
+            ]
 
 
 class Olmo3Attention(nn.Module):
