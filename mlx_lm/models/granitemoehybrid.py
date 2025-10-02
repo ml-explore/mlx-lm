@@ -417,9 +417,7 @@ class GraniteMoeHybridModel(nn.Module):
             else None
         )
         self.ssm_idx = (
-            args.layer_types.index("mamba")
-            if "mamba" in args.layer_types
-            else None
+            args.layer_types.index("mamba") if "mamba" in args.layer_types else None
         )
 
     def __call__(
@@ -492,7 +490,10 @@ class Model(nn.Module):
                 weights[k] = v.moveaxis(2, 1)
 
         # Handle MoE weight transformation to SwitchGLU format (only for MoE models)
-        if self.args.use_moe and "model.layers.0.block_sparse_moe.input_linear.weight" in weights:
+        if (
+            self.args.use_moe
+            and "model.layers.0.block_sparse_moe.input_linear.weight" in weights
+        ):
             for l in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{l}.block_sparse_moe"
 
@@ -510,7 +511,10 @@ class Model(nn.Module):
                 )
 
         # Handle dense MLP weight transformation (for dense models)
-        elif not self.args.use_moe and "model.layers.0.shared_mlp.input_linear.weight" in weights:
+        elif (
+            not self.args.use_moe
+            and "model.layers.0.shared_mlp.input_linear.weight" in weights
+        ):
             for l in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{l}.shared_mlp"
 
