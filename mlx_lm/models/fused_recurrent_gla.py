@@ -1,20 +1,10 @@
-
-
+from typing import Optional
 import mlx.core as mx
 
 def _make_fused_recurrent_gla_kernel():
     if not mx.metal.is_available():
         return None
     source = f"""
-        // This kernel computes the recurrent GLA equivalent to fused_recurrent_simple_gla.
-        // Shapes:
-        //   q, k, v: [B, H, T, Dk/Dv]
-        //   g:       [B, H, T]
-        //   y:       [B, H, T, Dv]
-        // For each (b, h, dv), we hold a column of the recurrent state h_col[Dk]
-        // and iterate over time: y_t = scale * dot(q_t, h_col);
-        // h_col = h_col * exp(g_t) + k_t * v_t[dv].
-
         auto bh = thread_position_in_grid.z; // ranges over B*H
         const int b = bh / H;
         const int h = bh % H;
@@ -22,7 +12,17 @@ def _make_fused_recurrent_gla_kernel():
 
         // Local column of the recurrent state for this (b, h, dv)
         float h_col[Dk];
-        for (int d = 0; d < Dk; ++d) {{ h_col[d] = 0.0f; }}
+
+        // state_in: [B, H, Dk, Dv], or nullptr
+        bool has_state = state_in != nullptr;
+        int state_base = ((b * H + h) * Dk * Dv) + dv;
+        if (has_state) {{
+            for (int d = 0; d < Dk; ++d) {{
+                h_col[d] = (float)state_in[state_base + d * Dv];
+            }}
+        }} else {{
+            for (int d = 0; d < Dk; ++d) {{ h_col[d] = 0.0f; }}
+        }}
 
         // Base offsets for batch b
         const int BH = B * H; // not used but kept for clarity
@@ -53,12 +53,19 @@ def _make_fused_recurrent_gla_kernel():
                 h_col[d] = h_col[d] * gamma + (float)k[k_off + d] * v_curr;
             }}
         }}
+
+        // Write back the final h_col into the state buffer if available
+        if (has_state) {{
+            for (int d = 0; d < Dk; ++d) {{
+                state_out[state_base + d * Dv] = (InT)h_col[d];
+            }}
+        }}
     """
-    inputs = ["q", "k", "v", "g", "B", "H", "T", "scale"]
+    inputs = ["q", "k", "v", "g", "B", "H_in", "T", "scale", "state_in"]
     return mx.fast.metal_kernel(
         name="fused_recurrent_gla_minimal",
         input_names=inputs,
-        output_names=["y"],
+        output_names=["y", "state_out"],
         source=source,
     )
 
@@ -70,6 +77,7 @@ def fused_recurrent_gla_ops(
     v: mx.array,
     g: mx.array,
     scale: float,
+    state: Optional[mx.array] = None
 ) -> mx.array:
     """
     Reference ops implementation equivalent to fused_recurrent_simple_gla.
@@ -79,10 +87,15 @@ def fused_recurrent_gla_ops(
         h   = h * exp(g_t) + k_t^T @ v_t
     Returns y with shape [B, H, T, Dv].
     """
-    B, H, L, K = q.shape
+    B, Hq, L, K = q.shape
     Hv = k.shape[1]
     V = v.shape[-1]
-    h = mx.zeros((B, Hv, K, V), dtype=q.dtype)
+
+    if state is None:
+        h = mx.zeros((B, Hv, K, V), dtype=q.dtype)
+    else:
+        h = state
+
     outputs = []
     for t in range(L):
         q_t = q[:, :, t:t+1] * scale
@@ -93,7 +106,8 @@ def fused_recurrent_gla_ops(
         outputs.append(o_t)
         h = h * mx.exp(g_t)[:, :, None, None]
         h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
-    return mx.concatenate(outputs, axis=2)
+
+    return mx.concatenate(outputs, axis=2), h
 
 
 def fused_recurrent_gla_update(
@@ -102,23 +116,31 @@ def fused_recurrent_gla_update(
     v: mx.array,
     g: mx.array,
     scale: float,
+    state: Optional[mx.array] = None,
     use_kernel: bool = True,
 ) -> mx.array:
     """
     Minimal fused recurrent GLA update: matches fused_recurrent_simple_gla.
     Expects q, k, v as [B, H, T, D] and g as [B, H, T]. Returns y [B, H, T, Dv].
+    If `state` is provided, it should be of shape [B, H, Dk, Dv] and will be updated in-place.
     """
     if (not use_kernel) or (mx.default_device() != mx.gpu) or (not mx.metal.is_available()):
-        return fused_recurrent_gla_ops(q, k, v, g, scale)
+        return fused_recurrent_gla_ops(q, k, v, g, scale, state)
 
     B, H, T, Dk = q.shape
     Dv = v.shape[-1]
     input_type = q.dtype
     kernel = _fused_recurrent_gla_kernel
 
+    # Prepare state buffer: if None, use zeros of shape [B, H, Dk, Dv]
+    if state is None:
+        state_buf = mx.zeros((B, H, Dk, Dv), dtype=input_type)
+    else:
+        state_buf = state
+
     # Launch one thread per (dv, b*h), iterate over time T inside the kernel.
     result = kernel(
-        inputs=[q, k, v, g, B, H, T, scale],
+        inputs=[q, k, v, g, B, H, T, scale, state_buf],
         template=[
             ("InT", input_type),
             ("Dk", Dk),
@@ -127,7 +149,9 @@ def fused_recurrent_gla_update(
         ],
         grid=(1, Dv, B * H),
         threadgroup=(1, 1, 1),
-        output_shapes=[(B, H, T, Dv)],
-        output_dtypes=[input_type],
+        output_shapes=[(B, H, T, Dv), (B, H, Dk, Dv)],
+        output_dtypes=[input_type, input_type],
     )
-    return result[0]
+    # The state buffer is updated in-place; return output and updated state
+    y, new_state = result
+    return y, new_state

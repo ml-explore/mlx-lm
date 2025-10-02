@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .fused_recurrent_gla import fused_recurrent_gla_update
 from .cache import KVCache, ArraysCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -332,7 +333,8 @@ class BailingMoeLinearLinearAttention(nn.Module):
         g = mx.broadcast_to(self.slope[None, :, None], (B, self.num_attention_heads, T_kv))
 
         # Causality is handled by the recurrence; no explicit mask needed
-        gla_out, new_state = fused_recurrent_simple_gla(
+        # gla_out, new_state = fused_recurrent_simple_gla(
+        gla_out, new_state = fused_recurrent_gla_update(
             q=queries,
             k=keys,
             v=values,
