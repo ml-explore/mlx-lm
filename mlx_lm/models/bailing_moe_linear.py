@@ -244,25 +244,20 @@ class BailingMoeLinearLinearAttention(nn.Module):
         B, L, D = x.shape
 
         qkv = self.query_key_value(x)
-        qkv = qkv.reshape(
+        qkv_mix = qkv.reshape(
             B,
             L,
             (self.num_attention_heads + 2 * self.num_key_value_heads),
             self.head_dim,
         )
-        qkv_mix = qkv[:, :, : (self.num_attention_heads + 2 * self.num_key_value_heads)]
-
-        if mask is not None and isinstance(mask, mx.array):
-            qkv_mix = mx.where(mask[..., None], qkv_mix, 0)
-
-        q = qkv_mix[:, :, : self.num_attention_heads]
-        k = qkv_mix[
-            :,
-            :,
-            self.num_attention_heads : self.num_attention_heads
-            + self.num_key_value_heads,
-        ]
-        v = qkv_mix[:, :, self.num_attention_heads + self.num_key_value_heads :]
+        q, k, v = mx.split(
+            qkv_mix,
+            [
+                self.num_attention_heads,
+                self.num_attention_heads + self.num_key_value_heads
+            ],
+            axis=2,
+        )
 
         queries = q.transpose(0, 2, 1, 3)
         keys = k.transpose(0, 2, 1, 3)
@@ -272,7 +267,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
 
-        if cache.kv is not None:
+        if cache is not None and cache.kv is not None:
             queries = self.rope(queries, offset=cache.kv.offset)
             keys = self.rope(keys, offset=cache.kv.offset)
             keys, values = cache.kv.update_and_fetch(keys, values)
@@ -289,6 +284,14 @@ class BailingMoeLinearLinearAttention(nn.Module):
             queries = mx.pad(queries, [(0, 0), (0, 0), (T_kv - T_q, 0), (0, 0)])
         elif T_q > T_kv:
             queries = queries[:, :, -T_kv:, :]
+        
+        if (
+            mask is not None
+            and isinstance(mask, mx.array)
+            and cache is not None
+        ):
+            mask_array = mask.astype(mx.float32)
+            values = values * mask_array[:, -queries.shape[2]:, None, None]
 
         g = mx.broadcast_to(
             self.slope[None, :, None], (B, self.num_attention_heads, T_kv)
@@ -305,7 +308,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
                 else None
             ),
         )
-        if cache.gla is not None:
+        if cache is not None and cache.gla is not None:
             cache.gla.cache = new_state
 
         output = gla_out[:, :, -L:, :]
