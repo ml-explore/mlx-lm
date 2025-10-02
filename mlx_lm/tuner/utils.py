@@ -3,15 +3,33 @@ import json
 import types
 from pathlib import Path
 from typing import Dict
+import math
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
-from mlx.utils import tree_flatten, tree_map_with_path, tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
+
+
+def calculate_training_steps(num_samples: int, batch_size: int, epochs: int, grad_accum_steps: int = 1) -> int:
+    """
+    Calculates the total effective training steps (TERS) from the given epoch.
+
+    Args:
+        num_samples (int): The length of the training dataset.
+        batch_size (int): The batch size used during training.
+        epochs (int): The current epoch number.
+        grad_accum_steps (int): Number of gradient accumulation steps before one optimizer update. Default is 1.
+
+    Returns:
+        int: The total effective training steps.
+    """
+    batches_per_epoch = math.ceil(num_samples / batch_size)
+    return (epochs * batches_per_epoch) // grad_accum_steps
 
 
 def build_schedule(schedule_config: Dict):
