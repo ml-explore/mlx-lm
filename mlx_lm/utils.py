@@ -42,6 +42,7 @@ from .tuner.utils import get_total_parameters, load_adapters
 # Constants
 MODEL_REMAPPING = {
     "mistral": "llama",
+    "llava": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
     "kimi_k2": "deepseek_v3",
