@@ -1,7 +1,9 @@
 # Copyright © 2025 Apple Inc.
 
 from typing import Optional
+
 import mlx.core as mx
+
 
 def _make_fused_recurrent_gla_kernel():
     if not mx.metal.is_available():
@@ -71,7 +73,9 @@ def _make_fused_recurrent_gla_kernel():
         source=source,
     )
 
+
 _fused_recurrent_gla_kernel = _make_fused_recurrent_gla_kernel()
+
 
 def fused_recurrent_gla_ops(
     q: mx.array,
@@ -79,7 +83,7 @@ def fused_recurrent_gla_ops(
     v: mx.array,
     g: mx.array,
     scale: float,
-    state: Optional[mx.array] = None
+    state: Optional[mx.array] = None,
 ) -> mx.array:
     """
     Reference ops implementation equivalent to fused_recurrent_simple_gla.
@@ -100,9 +104,9 @@ def fused_recurrent_gla_ops(
 
     outputs = []
     for t in range(L):
-        q_t = q[:, :, t:t+1] * scale
-        k_t = k[:, :, t:t+1]
-        v_t = v[:, :, t:t+1]
+        q_t = q[:, :, t : t + 1] * scale
+        k_t = k[:, :, t : t + 1]
+        v_t = v[:, :, t : t + 1]
         g_t = g[:, :, t]
         o_t = mx.matmul(q_t, h)
         outputs.append(o_t)
@@ -126,7 +130,11 @@ def fused_recurrent_gla_update(
     Expects q, k, v as [B, H, T, D] and g as [B, H, T]. Returns y [B, H, T, Dv].
     If `state` is provided, it should be of shape [B, H, Dk, Dv] and will be updated in-place.
     """
-    if (not use_kernel) or (mx.default_device() != mx.gpu) or (not mx.metal.is_available()):
+    if (
+        (not use_kernel)
+        or (mx.default_device() != mx.gpu)
+        or (not mx.metal.is_available())
+    ):
         return fused_recurrent_gla_ops(q, k, v, g, scale, state)
 
     B, H, T, Dk = q.shape

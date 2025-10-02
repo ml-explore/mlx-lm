@@ -1,15 +1,15 @@
 # Copyright © 2025 Apple Inc.
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union, Tuple
 import math
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .fused_recurrent_gla import fused_recurrent_gla_update
 from .cache import KVCache, LinearAttentionCache
+from .fused_recurrent_gla import fused_recurrent_gla_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -180,7 +180,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self.head_dim = args.hidden_size // self.num_attention_heads
         self.scale = self.head_dim**-0.5
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-        self.mode = 'chunk'
+        self.mode = "chunk"
 
         self.query_key_value = nn.Linear(
             args.hidden_size,
@@ -194,17 +194,19 @@ class BailingMoeLinearLinearAttention(nn.Module):
             bias=args.use_bias,
         )
 
-        self.g_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.g_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
         self.g_norm = BailingMoeLinearV2GroupRMSNorm(
             args.num_attention_heads * self.head_dim,
             eps=args.rms_norm_eps,
-            groups=args.group_norm_size
+            groups=args.group_norm_size,
         )
 
         if args.use_qk_norm:
             self.key_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
             self.query_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-          
+
         self.rope = initialize_rope(
             int(self.head_dim * args.partial_rotary_factor),
             args.rope_theta,
@@ -224,13 +226,13 @@ class BailingMoeLinearLinearAttention(nn.Module):
     def _get_slopes(self, n: int) -> mx.array:
         def power_of_2_slopes(n):
             return [2 ** (-(2 ** -(math.log2(n) - 3)) * (i + 1)) for i in range(n)]
-        
+
         if math.log2(n).is_integer():
             slopes = power_of_2_slopes(n)
         else:
             p = 2 ** math.floor(math.log2(n))
-            slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][:n - p]
-        
+            slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][: n - p]
+
         return mx.array(slopes, dtype=mx.float32)
 
     def __call__(
@@ -242,15 +244,25 @@ class BailingMoeLinearLinearAttention(nn.Module):
         B, L, D = x.shape
 
         qkv = self.query_key_value(x)
-        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads), self.head_dim)
-        qkv_mix = qkv[:, :, :(self.num_attention_heads + 2 * self.num_key_value_heads)]
+        qkv = qkv.reshape(
+            B,
+            L,
+            (self.num_attention_heads + 2 * self.num_key_value_heads),
+            self.head_dim,
+        )
+        qkv_mix = qkv[:, :, : (self.num_attention_heads + 2 * self.num_key_value_heads)]
 
         if mask is not None and isinstance(mask, mx.array):
             qkv_mix = mx.where(mask[..., None], qkv_mix, 0)
 
-        q = qkv_mix[:, :, :self.num_attention_heads]
-        k = qkv_mix[:, :, self.num_attention_heads:self.num_attention_heads + self.num_key_value_heads]
-        v = qkv_mix[:, :, self.num_attention_heads + self.num_key_value_heads:]
+        q = qkv_mix[:, :, : self.num_attention_heads]
+        k = qkv_mix[
+            :,
+            :,
+            self.num_attention_heads : self.num_attention_heads
+            + self.num_key_value_heads,
+        ]
+        v = qkv_mix[:, :, self.num_attention_heads + self.num_key_value_heads :]
 
         queries = q.transpose(0, 2, 1, 3)
         keys = k.transpose(0, 2, 1, 3)
@@ -274,18 +286,24 @@ class BailingMoeLinearLinearAttention(nn.Module):
 
         T_q, T_kv = queries.shape[2], keys.shape[2]
         if T_q < T_kv:
-            queries = mx.pad(queries, [(0,0),(0,0),(T_kv - T_q,0),(0,0)])
+            queries = mx.pad(queries, [(0, 0), (0, 0), (T_kv - T_q, 0), (0, 0)])
         elif T_q > T_kv:
             queries = queries[:, :, -T_kv:, :]
 
-        g = mx.broadcast_to(self.slope[None, :, None], (B, self.num_attention_heads, T_kv))
+        g = mx.broadcast_to(
+            self.slope[None, :, None], (B, self.num_attention_heads, T_kv)
+        )
         gla_out, new_state = fused_recurrent_gla_update(
             q=queries,
             k=keys,
             v=values,
             g=g,
             scale=self.scale,
-            state=cache.gla.cache if (cache and cache.gla and cache.gla.cache is not None) else None
+            state=(
+                cache.gla.cache
+                if (cache and cache.gla and cache.gla.cache is not None)
+                else None
+            ),
         )
         if cache.gla is not None:
             cache.gla.cache = new_state
@@ -403,8 +421,13 @@ class BailingMoeLinearSparseMoeBlock(nn.Module):
 class BailingMoeLinearDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.attention_layer_type = "attention" if (layer_idx + 1) % args.layer_group_size == 0 or \
-            layer_idx >= args.num_hidden_layers // args.layer_group_size * args.layer_group_size else "linear_attention"
+        self.attention_layer_type = (
+            "attention"
+            if (layer_idx + 1) % args.layer_group_size == 0
+            or layer_idx
+            >= args.num_hidden_layers // args.layer_group_size * args.layer_group_size
+            else "linear_attention"
+        )
 
         if self.attention_layer_type == "attention":
             self.attention = BailingMoeLinearAttention(args)
@@ -541,7 +564,7 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
-    
+
     def make_cache(self):
         caches = []
         for l in self.layers:
