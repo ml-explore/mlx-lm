@@ -20,6 +20,7 @@ from .tuner.utils import (
     linear_to_lora_layers,
     load_adapters,
     print_trainable_parameters,
+    calculate_training_steps,
 )
 from .utils import load, save_config
 
@@ -56,6 +57,7 @@ CONFIG_DEFAULTS = {
     "num_layers": 16,
     "batch_size": 4,
     "iters": 1000,
+    "epochs": None,
     "val_batches": 25,
     "learning_rate": 1e-5,
     "steps_per_report": 10,
@@ -126,6 +128,12 @@ def build_parser():
     )
     parser.add_argument("--batch-size", type=int, help="Minibatch size.")
     parser.add_argument("--iters", type=int, help="Iterations to train for.")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of training epochs. If set, overrides --iters."
+    )
     parser.add_argument(
         "--val-batches",
         type=int,
@@ -334,6 +342,14 @@ def run(args, training_callback: TrainingCallback = None):
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
+
+    if args.epochs is not None:
+        args.iters = calculate_training_steps(
+            num_samples=len(train_set),
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            grad_accum_steps=1
+        )
 
     if args.test and not args.train:
         # Allow testing without LoRA layers by providing empty path
