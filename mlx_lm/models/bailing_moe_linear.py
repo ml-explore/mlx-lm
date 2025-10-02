@@ -254,7 +254,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
             qkv_mix,
             [
                 self.num_attention_heads,
-                self.num_attention_heads + self.num_key_value_heads
+                self.num_attention_heads + self.num_key_value_heads,
             ],
             axis=2,
         )
@@ -284,14 +284,10 @@ class BailingMoeLinearLinearAttention(nn.Module):
             queries = mx.pad(queries, [(0, 0), (0, 0), (T_kv - T_q, 0), (0, 0)])
         elif T_q > T_kv:
             queries = queries[:, :, -T_kv:, :]
-        
-        if (
-            mask is not None
-            and isinstance(mask, mx.array)
-            and cache is not None
-        ):
+
+        if mask is not None and isinstance(mask, mx.array) and cache is not None:
             mask_array = mask.astype(mx.float32)
-            values = values * mask_array[:, -queries.shape[2]:, None, None]
+            values = values * mask_array[:, -queries.shape[2] :, None, None]
 
         g = mx.broadcast_to(
             self.slope[None, :, None], (B, self.num_attention_heads, T_kv)

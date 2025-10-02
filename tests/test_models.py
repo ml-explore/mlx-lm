@@ -346,7 +346,7 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
-    
+
     def test_bailing_moe_linear(self):
         from mlx_lm.models import bailing_moe_linear
 
