@@ -53,39 +53,49 @@ class ModelArgs(BaseModelArgs):
 
 
 def fused_recurrent_simple_gla(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    scale: float = None
+    q: mx.array,  # [B, H, T, K]
+    k: mx.array,  # [B, H, T, K]  
+    v: mx.array,  # [B, H, T, V]
+    g: Optional[mx.array] = None,  # [B, H, T]
+    scale: Optional[float] = None,
 ) -> mx.array:
-    B, Hq, L, K = q.shape
-    Hv = k.shape[1]
+    B, H, T, K = q.shape
     V = v.shape[-1]
     
     if scale is None:
         scale = K ** -0.5
     
-    if Hq != Hv:
-        assert Hq % Hv == 0
-        repeat_factor = Hq // Hv
-        k = mx.repeat(k, repeat_factor, axis=1)
-        v = mx.repeat(v, repeat_factor, axis=1)
-        Hv = Hq
+    # Initialize hidden state [B, H, K, V]
+    h = mx.zeros((B, H, K, V), dtype=mx.float32)
     
-    h = mx.zeros((B, Hv, K, V), dtype=q.dtype)
     outputs = []
-    for t in range(L):
-        q_t = q[:, :, t:t+1] * scale
-        k_t = k[:, :, t:t+1]
-        v_t = v[:, :, t:t+1]
-        g_t = g[:, :, t]
-        o_t = mx.matmul(q_t, h)
+    
+    for t in range(T):
+        # Load current timestep values
+        q_t = q[:, :, t, :] * scale  # [B, H, K] - scale applied to query!
+        k_t = k[:, :, t, :]          # [B, H, K]
+        v_t = v[:, :, t, :]          # [B, H, V]
+        
+        # Apply forget gate if provided (before computing output)
+        if g is not None:
+            g_t = g[:, :, t]  # [B, H]
+            h = h * mx.exp(g_t)[:, :, None, None]
+        
+        # Compute output: o_t = sum(h * q_t, axis=K)
+        # h: [B, H, K, V], q_t: [B, H, K]
+        # Broadcasting: q_t[:, :, :, None] -> [B, H, K, 1]
+        # Result: [B, H, K, V] * [B, H, K, 1] -> [B, H, K, V]
+        # Sum over K: [B, H, V]
+        o_t = (h * q_t[:, :, :, None]).sum(axis=2)
         outputs.append(o_t)
-        h = h * mx.exp(g_t)[:, :, None, None]
-        h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
-
-    return mx.concatenate(outputs, axis=2)
+        
+        # Update hidden state: h += outer_product(k_t, v_t)
+        # k_t: [B, H, K, 1], v_t: [B, H, 1, V] -> [B, H, K, V]
+        h = h + k_t[:, :, :, None] * v_t[:, :, None, :]
+    
+    # Stack outputs along time dimension
+    output = mx.stack(outputs, axis=2)  # [B, H, T, V]
+    return output
 
 
 class BailingMoeLinearV2GroupRMSNorm(nn.Module):
@@ -100,7 +110,6 @@ class BailingMoeLinearV2GroupRMSNorm(nn.Module):
         group_shape = shape[:-1] + (self.groups, shape[-1] // self.groups)
         x = mx.reshape(x, group_shape).astype(mx.float32)
         x = x * mx.rsqrt(mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps)
-        
         return self.weight * mx.reshape(x, shape)
 
 
@@ -210,7 +219,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self.use_qk_norm = args.use_qk_norm
         self.num_hidden_layers = args.num_hidden_layers
         self.num_attention_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
+        self.num_key_value_heads = args.num_attention_heads
         self.head_dim = args.hidden_size // self.num_attention_heads
         self.scale = self.head_dim**-0.5
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
@@ -218,7 +227,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
 
         self.query_key_value = nn.Linear(
             args.hidden_size,
-            (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim * 2,
+            (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
             bias=args.use_qkv_bias,
         )
 
@@ -274,7 +283,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
         B, L, D = x.shape
         
         qkv = self.query_key_value(x)
-        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads) * 2, self.head_dim)
+        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads), self.head_dim)
           
         if mask is not None and isinstance(mask, mx.array):
             qkv = mx.where(mask[..., None], qkv, 0)
@@ -478,14 +487,9 @@ class BailingMoeLinearModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(h, cache[0])
-        if isinstance(fa_mask, mx.array):
-            la_mask = fa_mask[-1:, :] if fa_mask.ndim > 1 else fa_mask
-        else:
-            la_mask = fa_mask
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
-            mask = fa_mask if layer.attention_layer_type == "attention" else la_mask
             h = layer(h, mask, c)
 
         return self.norm(h)
