@@ -17,10 +17,10 @@ from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
+    calculate_training_steps,
     linear_to_lora_layers,
     load_adapters,
     print_trainable_parameters,
-    calculate_training_steps,
 )
 from .utils import load, save_config
 
@@ -132,7 +132,7 @@ def build_parser():
         "--epochs",
         type=int,
         default=None,
-        help="Number of training epochs. If set, overrides --iters."
+        help="Number of training epochs. If set, overrides --iters.",
     )
     parser.add_argument(
         "--val-batches",
@@ -348,7 +348,7 @@ def run(args, training_callback: TrainingCallback = None):
             num_samples=len(train_set),
             batch_size=args.batch_size,
             epochs=args.epochs,
-            grad_accum_steps=1
+            grad_accum_steps=1,
         )
 
     if args.test and not args.train:

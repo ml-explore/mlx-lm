@@ -1,9 +1,9 @@
 # Copyright © 2024 Apple Inc.
 import json
+import math
 import types
 from pathlib import Path
 from typing import Dict
-import math
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,7 +15,9 @@ from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
 
-def calculate_training_steps(num_samples: int, batch_size: int, epochs: int, grad_accum_steps: int = 1) -> int:
+def calculate_training_steps(
+    num_samples: int, batch_size: int, epochs: int, grad_accum_steps: int = 1
+) -> int:
     """
     Calculates the total effective training steps (TERS) from the given epoch.
 
