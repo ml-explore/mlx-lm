@@ -71,7 +71,6 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
-    "wandb": None,  # will be deprecated in a future release
     "report_to": None,
     "project_name": None,
 }
@@ -184,15 +183,6 @@ def build_parser():
         action="store_true",
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
-    )
-    parser.add_argument(  # will be deprecated in a future release
-        "--wandb",
-        type=str,
-        default=None,
-        help=(
-            "The 'wandb' argument is deprecated and will be removed in a future release. "
-            "Use 'report_to: wandb' and 'project_name' in the configuration instead."
-        ),
     )
     parser.add_argument(
         "--report-to",
@@ -314,14 +304,6 @@ def evaluate_model(args, model: nn.Module, test_set):
 
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
-    if args.wandb is not None:
-        warnings.warn(
-            "The 'wandb' argument is deprecated and will be removed in a future release. "
-            "Use 'report_to: wandb' and 'project_name' in the configuration instead.",
-            DeprecationWarning,
-        )
-        args.report_to = "wandb"
-        args.project_name = args.wandb
     training_callback = get_reporting_callbacks(
         args.report_to,
         project_name=args.project_name,
