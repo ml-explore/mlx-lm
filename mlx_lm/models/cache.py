@@ -655,8 +655,8 @@ class CacheList(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
-        for c in self.caches:
-            c.extend(other)
+        for c, o in zip(self.caches, other.caches):
+            c.extend(o)
 
 
 class BatchKVCache(_BaseCache):

@@ -1824,6 +1824,21 @@ class TestModels(unittest.TestCase):
                 "time_step_limit": (0.01, 10),
                 "time_step_rank": "auto",
             },
+            {
+                "model_type": "olmo3",
+                "num_heads": 8,
+                "head_dim": 16,
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "rope_theta": 1000,
+                "num_hidden_layers": 8,
+                "rms_norm_eps": 1e-4,
+                "sliding_window": 128,
+                "tie_word_embeddings": True,
+                "max_position_embeddings": 1000,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]

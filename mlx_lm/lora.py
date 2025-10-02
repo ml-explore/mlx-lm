@@ -40,7 +40,7 @@ yaml_loader.add_implicit_resolver(
 )
 
 CONFIG_DEFAULTS = {
-    "model": "mlx_model",
+    "model": "Qwen/Qwen3-0.6b",
     "train": False,
     "fine_tune_type": "lora",
     "optimizer": "adam",
@@ -51,7 +51,7 @@ CONFIG_DEFAULTS = {
         "sgd": {},
         "adafactor": {},
     },
-    "data": "data/",
+    "data": "mlx-community/WikiSQL",
     "seed": 0,
     "num_layers": 16,
     "batch_size": 4,

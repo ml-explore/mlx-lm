@@ -28,13 +28,6 @@ def swapped_with_identity(obj, func):
 
 
 class TestLora(unittest.TestCase):
-    def setUp(self):
-        self.capturedOutput = StringIO()
-        sys.stdout = self.capturedOutput
-
-    def tearDown(self):
-        sys.stdout = sys.__stdout__
-
     def test_llama(self):
         from mlx_lm.models import llama
 
@@ -48,7 +41,6 @@ class TestLora(unittest.TestCase):
             vocab_size=10_000,
             tie_word_embeddings=False,
         )
-
         lora_layers = 4
 
         def check_config(params, expected_trainable_parameters=None):
@@ -68,10 +60,13 @@ class TestLora(unittest.TestCase):
             self.assertEqual(trainable_params, expected_trainable_parameters)
 
         params = {"rank": 8, "dropout": 0.0, "scale": 10.0}
-        check_config(params)
+        nparams = (
+            args.hidden_size * 2 * 4 + (args.intermediate_size + args.hidden_size) * 3
+        ) * lora_layers
+        check_config(params, expected_trainable_parameters=nparams * params["rank"])
 
         params["rank"] = 1
-        check_config(params)
+        check_config(params, expected_trainable_parameters=nparams * params["rank"])
 
         params["keys"] = ["self_attn.k_proj"]
         check_config(params)
@@ -191,7 +186,7 @@ class TestDora(unittest.TestCase):
 
         dora_layers = 4
 
-        def check_config(params):
+        def check_config(params, expected_params=None):
             n_keys = 2
             if "keys" in params:
                 n_keys = len(params["keys"])
@@ -201,17 +196,29 @@ class TestDora(unittest.TestCase):
             trainable_params = sum(
                 v.size for _, v in tree_flatten(model.trainable_parameters())
             )
-            self.assertEqual(
-                trainable_params,
+            expected_params = expected_params or (
                 dora_layers
-                * (params["rank"] * hidden_size * 2 * n_keys + n_keys * hidden_size),
+                * (params["rank"] * hidden_size * 2 * n_keys + n_keys * hidden_size)
             )
+            self.assertEqual(trainable_params, expected_params)
 
         params = {"rank": 8, "alpha": 16, "dropout": 0.0, "scale": 10.0}
-        check_config(params)
+        nparams = (
+            args.hidden_size * 2 * 4 + (args.intermediate_size + args.hidden_size) * 3
+        )
+        nparams = (
+            nparams * params["rank"] + 5 * args.hidden_size + 2 * args.intermediate_size
+        ) * dora_layers
+        check_config(params, expected_params=nparams)
 
         params["rank"] = 1
-        check_config(params)
+        nparams = (
+            args.hidden_size * 2 * 4 + (args.intermediate_size + args.hidden_size) * 3
+        )
+        nparams = (
+            nparams * params["rank"] + 5 * args.hidden_size + 2 * args.intermediate_size
+        ) * dora_layers
+        check_config(params, expected_params=nparams * params["rank"])
 
         params["keys"] = ["self_attn.k_proj"]
         check_config(params)
