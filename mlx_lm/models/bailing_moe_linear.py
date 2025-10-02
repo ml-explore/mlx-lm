@@ -8,8 +8,23 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, ArraysCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+class LinearAttentionCache:
+    def __init__(self):
+        self.kv = KVCache()
+        self.gla = ArraysCache(1)
+        self.gla.cache = None
+
+    @property
+    def offset(self):
+        return self.kv.offset
+
+    @property
+    def state(self):
+        return self.kv.state
 
 
 @dataclass
@@ -54,46 +69,34 @@ class ModelArgs(BaseModelArgs):
 
 
 def fused_recurrent_simple_gla(
-    q: mx.array,  # [B, H, T, K]
-    k: mx.array,  # [B, H, T, K]  
-    v: mx.array,  # [B, H, T, V]
-    g: Optional[mx.array] = None,  # [B, H, T]
-    scale: Optional[float] = None,
-) -> mx.array:
-    B, H, T, K = q.shape
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    scale: float = None,
+    state: Optional[mx.array] = None
+) -> Tuple[mx.array, mx.array]:
+    B, Hq, L, K = q.shape
+    Hv = k.shape[1]
     V = v.shape[-1]
 
-    # Initialize hidden state [B, H, K, V]
-    h = mx.zeros((B, H, K, V), dtype=mx.float32)
+    if state is None:
+        h = mx.zeros((B, Hv, K, V), dtype=q.dtype)
+    else:
+        h = state
 
     outputs = []
-
-    for t in range(T):
-        # Load current timestep values
-        q_t = q[:, :, t, :] * scale  # [B, H, K] - scale applied to query!
-        k_t = k[:, :, t, :]          # [B, H, K]
-        v_t = v[:, :, t, :]          # [B, H, V]
-
-        # Apply forget gate if provided (before computing output)
-        if g is not None:
-            g_t = g[:, :, t]  # [B, H]
-            h = h * mx.exp(g_t)[:, :, None, None]
-
-        # Compute output: o_t = sum(h * q_t, axis=K)
-        # h: [B, H, K, V], q_t: [B, H, K]
-        # Broadcasting: q_t[:, :, :, None] -> [B, H, K, 1]
-        # Result: [B, H, K, V] * [B, H, K, 1] -> [B, H, K, V]
-        # Sum over K: [B, H, V]
-        o_t = (h * q_t[:, :, :, None]).sum(axis=2)
+    for t in range(L):
+        q_t = q[:, :, t:t+1] * scale
+        k_t = k[:, :, t:t+1]
+        v_t = v[:, :, t:t+1]
+        g_t = g[:, :, t]
+        o_t = mx.matmul(q_t, h)
         outputs.append(o_t)
+        h = h * mx.exp(g_t)[:, :, None, None]
+        h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
 
-        # Update hidden state: h += outer_product(k_t, v_t)
-        # k_t: [B, H, K, 1], v_t: [B, H, 1, V] -> [B, H, K, V]
-        h = h + k_t[:, :, :, None] * v_t[:, :, None, :]
-
-    # Stack outputs along time dimension
-    output = mx.stack(outputs, axis=2)  # [B, H, T, V]
-    return output
+    return mx.concatenate(outputs, axis=2), h
 
 
 class BailingMoeLinearV2GroupRMSNorm(nn.Module):
@@ -257,7 +260,9 @@ class BailingMoeLinearLinearAttention(nn.Module):
     @property
     def slope(self):
         slopes = self._get_slopes(self.num_attention_heads)
-        layer_factor = 1 - (self.layer_idx - 1) / (self.num_hidden_layers - 1) + 1e-5
+        denom = max(1, self.num_hidden_layers - 1)
+        layer_pos = max(0, self.layer_idx - 1)
+        layer_factor = 1 - (layer_pos / denom) + 1e-5
         return -slopes * layer_factor
 
     def _get_slopes(self, n: int) -> mx.array:
@@ -276,56 +281,72 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
+        cache: Optional["LinearAttentionCache"] = None,
     ) -> mx.array:
         B, L, D = x.shape
-        
+
+        # Project to QKV and reshape
         qkv = self.query_key_value(x)
-        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads), self.head_dim)            
+        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads), self.head_dim)
         qkv_mix = qkv[:, :, :(self.num_attention_heads + 2 * self.num_key_value_heads)]
+
+        if mask is not None and isinstance(mask, mx.array):
+            qkv_mix = mx.where(mask[..., None], qkv_mix, 0)
 
         q = qkv_mix[:, :, :self.num_attention_heads]
         k = qkv_mix[:, :, self.num_attention_heads:self.num_attention_heads + self.num_key_value_heads]
         v = qkv_mix[:, :, self.num_attention_heads + self.num_key_value_heads:]
-          
+
+        # Layouts expected by fused_recurrent_simple_gla: [B, H, T, K/V]
         queries = q.transpose(0, 2, 1, 3)
         keys = k.transpose(0, 2, 1, 3)
         values = v.transpose(0, 2, 1, 3)
 
+        # Optional Q/K RMSNorm
         if self.use_qk_norm:
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
-              
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
+
+        # Apply RoPE and accumulate KV history
+        if cache.kv is not None:
+            queries = self.rope(queries, offset=cache.kv.offset)
+            keys = self.rope(keys, offset=cache.kv.offset)
+            keys, values = cache.kv.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)    
+            queries = self.rope(queries)
             keys = self.rope(keys)
 
+        # Repeat KV heads if needed
         if self.num_key_value_groups > 1:
             keys = mx.repeat(keys, self.num_key_value_groups, axis=1)
             values = mx.repeat(values, self.num_key_value_groups, axis=1)
 
-        g = mx.broadcast_to(self.slope[None, :, None], (B, self.num_attention_heads, L))
+        # Make Q length match the full KV history (required by recurrent kernel)
+        T_q, T_kv = queries.shape[2], keys.shape[2]
+        if T_q < T_kv:
+            queries = mx.pad(queries, [(0,0),(0,0),(T_kv - T_q,0),(0,0)])
+        elif T_q > T_kv:
+            queries = queries[:, :, -T_kv:, :]
 
-        if (
-            mask is not None
-            and isinstance(mask, mx.array)
-            and cache is not None
-        ):
-            mask_array = mask.astype(mx.float32)
-            values = values * mask_array[:, -queries.shape[2]:, None, None]
+        # Head-wise decay for Attention across full timeline
+        g = mx.broadcast_to(self.slope[None, :, None], (B, self.num_attention_heads, T_kv))
 
-
-        output = fused_recurrent_simple_gla(
+        # Causality is handled by the recurrence; no explicit mask needed
+        gla_out, new_state = fused_recurrent_simple_gla(
             q=queries,
             k=keys,
             v=values,
             g=g,
             scale=self.scale,
+            state=cache.gla.cache if (cache and cache.gla and cache.gla.cache is not None) else None
         )
+        if cache.gla is not None:
+            cache.gla.cache = new_state
+
+        # Keep only current step(s): last L positions
+        output = gla_out[:, :, -L:, :]  # [B, H, L, V]
+
+        # Post-projection + gating
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
         return self.dense(output)
@@ -576,3 +597,12 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+    
+    def make_cache(self):
+        caches = []
+        for l in self.layers:
+            if l.attention_layer_type == "linear_attention":
+                caches.append(LinearAttentionCache())
+            elif l.attention_layer_type == "attention":
+                caches.append(KVCache())
+        return caches
