@@ -33,6 +33,7 @@ class ModelArgs(BaseModelArgs):
     layer_group_size: int
     group_norm_size: int
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_traditional: bool = False
     use_bias: bool = False
     use_qkv_bias: bool = False
     norm_head: bool = False
@@ -61,26 +62,23 @@ def fused_recurrent_simple_gla(
 ) -> mx.array:
     B, H, T, K = q.shape
     V = v.shape[-1]
-    
-    if scale is None:
-        scale = K ** -0.5
-    
+
     # Initialize hidden state [B, H, K, V]
     h = mx.zeros((B, H, K, V), dtype=mx.float32)
-    
+
     outputs = []
-    
+
     for t in range(T):
         # Load current timestep values
         q_t = q[:, :, t, :] * scale  # [B, H, K] - scale applied to query!
         k_t = k[:, :, t, :]          # [B, H, K]
         v_t = v[:, :, t, :]          # [B, H, V]
-        
+
         # Apply forget gate if provided (before computing output)
         if g is not None:
             g_t = g[:, :, t]  # [B, H]
             h = h * mx.exp(g_t)[:, :, None, None]
-        
+
         # Compute output: o_t = sum(h * q_t, axis=K)
         # h: [B, H, K, V], q_t: [B, H, K]
         # Broadcasting: q_t[:, :, :, None] -> [B, H, K, 1]
@@ -88,11 +86,11 @@ def fused_recurrent_simple_gla(
         # Sum over K: [B, H, V]
         o_t = (h * q_t[:, :, :, None]).sum(axis=2)
         outputs.append(o_t)
-        
+
         # Update hidden state: h += outer_product(k_t, v_t)
         # k_t: [B, H, K, 1], v_t: [B, H, 1, V] -> [B, H, K, V]
         h = h + k_t[:, :, :, None] * v_t[:, :, None, :]
-    
+
     # Stack outputs along time dimension
     output = mx.stack(outputs, axis=2)  # [B, H, T, V]
     return output
@@ -163,7 +161,7 @@ class BailingMoeLinearAttention(nn.Module):
         self.rope = initialize_rope(
             int(self.head_dim * args.partial_rotary_factor),
             args.rope_theta,
-            traditional=True,
+            traditional=args.rope_traditional,
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
@@ -251,7 +249,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self.rope = initialize_rope(
             int(self.head_dim * args.partial_rotary_factor),
             args.rope_theta,
-            traditional=False,
+            traditional=args.rope_traditional,
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
@@ -283,13 +281,9 @@ class BailingMoeLinearLinearAttention(nn.Module):
         B, L, D = x.shape
         
         qkv = self.query_key_value(x)
-        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads), self.head_dim)
-          
-        if mask is not None and isinstance(mask, mx.array):
-            qkv = mx.where(mask[..., None], qkv, 0)
-          
+        qkv = qkv.reshape(B, L, (self.num_attention_heads + 2 * self.num_key_value_heads), self.head_dim)            
         qkv_mix = qkv[:, :, :(self.num_attention_heads + 2 * self.num_key_value_heads)]
-          
+
         q = qkv_mix[:, :, :self.num_attention_heads]
         k = qkv_mix[:, :, self.num_attention_heads:self.num_attention_heads + self.num_key_value_heads]
         v = qkv_mix[:, :, self.num_attention_heads + self.num_key_value_heads:]
@@ -315,6 +309,15 @@ class BailingMoeLinearLinearAttention(nn.Module):
             values = mx.repeat(values, self.num_key_value_groups, axis=1)
 
         g = mx.broadcast_to(self.slope[None, :, None], (B, self.num_attention_heads, L))
+
+        if (
+            mask is not None
+            and isinstance(mask, mx.array)
+            and cache is not None
+        ):
+            mask_array = mask.astype(mx.float32)
+            values = values * mask_array[:, -queries.shape[2]:, None, None]
+
 
         output = fused_recurrent_simple_gla(
             q=queries,
