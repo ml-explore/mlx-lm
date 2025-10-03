@@ -97,6 +97,16 @@ def fused_recurrent_gla_ops(
     Hv = k.shape[1]
     V = v.shape[-1]
 
+    if L == 1 and state is not None:
+        q_t = q * scale
+        k_t = k
+        v_t = v
+        g_t = g
+        o_t = mx.matmul(q_t, state)
+        state = state * mx.exp(g_t)[:, :, None, None]
+        state = state + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
+        return o_t, state
+
     if state is None:
         h = mx.zeros((B, Hv, K, V), dtype=q.dtype)
     else:
@@ -130,26 +140,28 @@ def fused_recurrent_gla_update(
     Expects q, k, v as [B, H, T, D] and g as [B, H, T]. Returns y [B, H, T, Dv].
     If `state` is provided, it should be of shape [B, H, Dk, Dv] and will be updated in-place.
     """
-    if (
-        (not use_kernel)
-        or (mx.default_device() != mx.gpu)
-        or (not mx.metal.is_available())
-    ):
-        return fused_recurrent_gla_ops(q, k, v, g, scale, state)
-
     B, H, T, Dk = q.shape
     Dv = v.shape[-1]
     input_type = q.dtype
-    kernel = _fused_recurrent_gla_kernel
 
-    # Prepare state buffer: if None, use zeros of shape [B, H, Dk, Dv]
     if state is None:
         state_buf = mx.zeros((B, H, Dk, Dv), dtype=input_type)
     else:
         state_buf = state
 
-    # Launch one thread per (dv, b*h), iterate over time T inside the kernel.
-    result = kernel(
+    if (
+        (not use_kernel)
+        or (mx.default_device() != mx.gpu)
+        or (not mx.metal.is_available())
+    ):
+        if T == 1 and state is not None:
+            return fused_recurrent_gla_ops(q, k, v, g, scale, state_buf)
+        else:
+            return fused_recurrent_gla_ops(q, k, v, g, scale, state_buf)
+
+    kernel = _fused_recurrent_gla_kernel
+
+    y, new_state = kernel(
         inputs=[q, k, v, g, B, H, T, scale, state_buf],
         template=[
             ("InT", input_type),
@@ -162,6 +174,4 @@ def fused_recurrent_gla_update(
         output_shapes=[(B, H, T, Dv), (B, H, Dk, Dv)],
         output_dtypes=[input_type, input_type],
     )
-    # The state buffer is updated in-place; return output and updated state
-    y, new_state = result
     return y, new_state
