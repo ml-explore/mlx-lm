@@ -47,6 +47,9 @@ steps_per_report: 10
 # Number of training steps between validations.
 steps_per_eval: 200
 
+# Number of micro-steps to accumulate before each optimizer update.
+grad_accumulation_steps: 1
+
 # Load path to resume training with the given adapter weights.
 resume_adapter_file: null
 
@@ -90,4 +93,3 @@ lora_parameters:
 #  valid_split: "train[-100:]"
 #  prompt_feature: "text"
 #  completion_feature: "summary"
-
