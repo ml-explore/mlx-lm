@@ -8,62 +8,48 @@ import mlx.core as mx
 def _make_fused_recurrent_gla_kernel():
     if not mx.metal.is_available():
         return None
-    source = f"""
-        auto bh = thread_position_in_grid.z; // ranges over B*H
+    source = """
+        auto bh = thread_position_in_grid.z;
         const int b = bh / H;
         const int h = bh % H;
-        const int dv = thread_position_in_grid.y; // [0, Dv)
-
-        // Local column of the recurrent state for this (b, h, dv)
+        const int dv = thread_position_in_grid.y;
         float h_col[Dk];
-
-        // state_in: [B, H, Dk, Dv], or nullptr
         bool has_state = state_in != nullptr;
         int state_base = ((b * H + h) * Dk * Dv) + dv;
-        if (has_state) {{
-            for (int d = 0; d < Dk; ++d) {{
+        if (has_state) {
+            for (int d = 0; d < Dk; ++d) {
                 h_col[d] = (float)state_in[state_base + d * Dv];
-            }}
-        }} else {{
-            for (int d = 0; d < Dk; ++d) {{ h_col[d] = 0.0f; }}
-        }}
-
-        // Base offsets for batch b
-        const int BH = B * H; // not used but kept for clarity
+            }
+        } else {
+            for (int d = 0; d < Dk; ++d) { h_col[d] = 0.0f; }
+        }
+        const int BH = B * H;
         const int q_base_b = b * H * T * Dk;
         const int k_base_b = b * H * T * Dk;
         const int v_base_b = b * H * T * Dv;
         const int y_base_b = b * H * T * Dv;
         const int g_base_b = b * H * T;
-
-        for (int t = 0; t < T; ++t) {{
-            // offsets for this time step and head h
+        for (int t = 0; t < T; ++t) {
             const int q_off = q_base_b + (h * T + t) * Dk;
             const int k_off = k_base_b + (h * T + t) * Dk;
             const int v_off = v_base_b + (h * T + t) * Dv;
             const int y_off = y_base_b + (h * T + t) * Dv;
-
-            // 1) output = scale * dot(q_t, h_col)
             float acc = 0.0f;
-            for (int d = 0; d < Dk; ++d) {{
+            for (int d = 0; d < Dk; ++d) {
                 acc += (float)q[q_off + d] * h_col[d];
-            }}
+            }
             y[y_off + dv] = (InT)(acc * (float)scale);
-
-            // 2) update recurrent state column
             float gamma = exp((float)g[g_base_b + h * T + t]);
             float v_curr = (float)v[v_off + dv];
-            for (int d = 0; d < Dk; ++d) {{
+            for (int d = 0; d < Dk; ++d) {
                 h_col[d] = h_col[d] * gamma + (float)k[k_off + d] * v_curr;
-            }}
-        }}
-
-        // Write back the final h_col into the state buffer if available
-        if (has_state) {{
-            for (int d = 0; d < Dk; ++d) {{
+            }
+        }
+        if (has_state) {
+            for (int d = 0; d < Dk; ++d) {
                 state_out[state_base + d * Dv] = (InT)h_col[d];
-            }}
-        }}
+            }
+        }
     """
     inputs = ["q", "k", "v", "g", "B", "H_in", "T", "scale", "state_in"]
     return mx.fast.metal_kernel(
@@ -86,7 +72,7 @@ def fused_recurrent_gla_ops(
     state: Optional[mx.array] = None,
 ) -> mx.array:
     """
-    Reference ops implementation equivalent to fused_recurrent_simple_gla.
+    Reference ops implementation equivalent to fused_recurrent_simple_gla from fla.
     q, k, v have shape [B, H, T, D], g has shape [B, H, T].
     Recurrence per (b, h):
         y_t = (q_t @ h) * scale
@@ -136,7 +122,7 @@ def fused_recurrent_gla_update(
     use_kernel: bool = True,
 ) -> mx.array:
     """
-    Minimal fused recurrent GLA update: matches fused_recurrent_simple_gla.
+    Minimal fused recurrent GLA update, reference from fla.ops.simple_gla.fused_recurrent.fused_recurrent_simple_gla.
     Expects q, k, v as [B, H, T, D] and g as [B, H, T]. Returns y [B, H, T, Dv].
     If `state` is provided, it should be of shape [B, H, Dk, Dv] and will be updated in-place.
     """
