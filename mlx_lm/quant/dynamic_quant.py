@@ -16,8 +16,6 @@ from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint
 from mlx_lm.utils import (
     compute_bits_per_weight,
-    fetch_from_hub,
-    get_model_path,
     load,
     quantize_model,
     save,
@@ -187,9 +185,9 @@ def main():
     args = parser.parse_args()
 
     group = mx.distributed.init()
+    model, tokenizer, config = load(args.model, return_config=True)
 
     if args.sensitivities is None:
-        model, tokenizer = load(args.model)
         mx.random.seed(args.seed)
         data = load_data(tokenizer, num_samples=-1, sequence_length=512)
 
@@ -211,8 +209,6 @@ def main():
             sensitivities = json.load(fid)
 
     sensitivities = dict(sensitivities)
-    model_path, hf_repo = get_model_path(args.model, revision=None)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
     mx.random.seed(args.seed)
     data = load_data(tokenizer, num_samples=-1, sequence_length=512)
 
@@ -251,11 +247,10 @@ def main():
 
     save(
         args.mlx_path,
-        model_path,
+        args.model,
         model,
         tokenizer,
         config,
-        hf_repo=hf_repo,
     )
     print(f"Peak memory used: {mx.get_peak_memory() / 1000**3:.3f}GB")
 

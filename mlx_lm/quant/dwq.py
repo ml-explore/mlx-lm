@@ -17,8 +17,7 @@ from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
-    fetch_from_hub,
-    get_model_path,
+    load,
     quantize_model,
     save,
 )
@@ -248,9 +247,10 @@ def main():
     np.random.seed(args.seed)
     mx.random.seed(args.seed)
 
-    model_path, hf_repo = get_model_path(args.model, revision=None)
-    model, config, tokenizer = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=True
+    model, tokenizer, config = load(
+        args.model,
+        lazy=True,
+        return_config=True,
     )
 
     train_data, valid_data = load_data(
@@ -258,9 +258,10 @@ def main():
     )
 
     if args.quantized_model is not None:
-        q_model_path, _ = get_model_path(args.quantized_model, revision=None)
-        q_model, config, _ = fetch_from_hub(
-            q_model_path, lazy=True, trust_remote_code=True
+        q_model, tokenizer, config = load(
+            args.quantized_model,
+            lazy=True,
+            return_config=True,
         )
         if "quantization" not in config:
             raise ValueError("Quantized model must already be quantized.")
@@ -290,9 +291,8 @@ def main():
     )
     save(
         args.mlx_path,
-        model_path,
+        args.model,
         q_model,
         tokenizer,
         config,
-        hf_repo=hf_repo,
     )
