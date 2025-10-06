@@ -390,7 +390,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         return h + r
 
 
-class DeepseekV3Model(nn.Module, PipelineMixin):
+class DeepseekV3Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.vocab_size = config.vocab_size
