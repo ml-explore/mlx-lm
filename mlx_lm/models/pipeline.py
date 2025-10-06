@@ -5,6 +5,7 @@ import mlx.core as mx
 
 class PipelineMixin:
     def __init__(self):
+        super().__init__()
         self.pipeline_rank = 0
         self.pipeline_size = 1
         self.start_idx = 0
