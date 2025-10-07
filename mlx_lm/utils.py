@@ -118,6 +118,10 @@ def _download(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     return model_path
 
 
+def hf_repo_to_path(hf_repo):
+    return Path(snapshot_download(hf_repo, local_files_only=True))
+
+
 def load_config(model_path: Path) -> dict:
     try:
         with open(model_path / "config.json", "r") as f:
@@ -554,7 +558,7 @@ def save(
     src_path = Path(src_path_or_repo)
     if not src_path.exists():
         hf_repo = src_path_or_repo
-        src_path = Path(snapshot_download(src_path_or_repo, allow_patterns=[]))
+        src_path = hf_repo_to_path(hf_repo)
     else:
         hf_repo = None
 
