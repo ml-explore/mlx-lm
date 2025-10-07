@@ -20,18 +20,20 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     vocab_size: int
     hidden_size: int
+    intermediate_size: int
+    moe_intermediate_size: int
     num_hidden_layers: int
+    num_experts: int
+    num_experts_per_tok: int
+    norm_topk_prob: bool
     num_attention_heads: int
     num_key_value_heads: int
     max_position_embeddings: int
+    use_expert_bias: bool
+    num_dense_layers: int
     norm_eps: float
     conv_bias: bool
     conv_L_cache: int
-    block_dim: int
-    block_ff_dim: int
-    block_multiple_of: int
-    block_ffn_dim_multiplier: float
-    block_auto_adjust_ff_dim: bool
     rope_theta: float
     full_attn_idxs: Optional[List[int]] = None
     layer_types: Optional[List[str]] = None
@@ -158,27 +160,16 @@ class ShortConv(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        ff_dim: int,
-        multiple_of: int,
-        auto_adjust_ff_dim: bool,
-        ffn_dim_multiplier: Optional[float],
-    ):
+    def __init__(self, config: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
-        if auto_adjust_ff_dim:
-            ff_dim = int(2 * ff_dim / 3)
-            if ffn_dim_multiplier is not None:
-                ff_dim = int(ffn_dim_multiplier * ff_dim)
-            ff_dim = multiple_of * ((ff_dim + multiple_of - 1) // multiple_of)
-
-        self.w1 = nn.Linear(dim, ff_dim, bias=False)
-        self.w3 = nn.Linear(dim, ff_dim, bias=False)
-        self.w2 = nn.Linear(ff_dim, dim, bias=False)
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
@@ -190,9 +181,12 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
+        self.use_expert_bias = args.use_expert_bias
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        if self.use_expert_bias:
+            self.expert_bias = mx.zeros((self.num_experts,))
 
     def __call__(
         self,
@@ -201,8 +195,12 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
+        if self.use_expert_bias:
+            gates += self.expert_bias
+
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -222,11 +220,8 @@ class Lfm2DecoderLayer(nn.Module):
         else:
             self.conv = ShortConv(args, layer_idx)
         self.feed_forward = MLP(
-            dim=args.block_dim,
-            ff_dim=args.block_ff_dim,
-            multiple_of=args.block_multiple_of,
-            auto_adjust_ff_dim=args.block_auto_adjust_ff_dim,
-            ffn_dim_multiplier=args.block_ffn_dim_multiplier,
+            config=args,
+            intermediate_size=args.intermediate_size,
         ) if layer_idx < args.num_dense_layers else Lfm2MoeSparseMoeBlock(args)
 
         self.operator_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
@@ -319,21 +314,19 @@ class Model(nn.Module):
             if "conv.weight" in name:
                 if param.shape[-1] > param.shape[1]:
                     param = param.transpose(0, 2, 1)
-            if "w1" in name:
-                name = name.replace("w1", "gate_proj")
-            if "w2" in name:
-                name = name.replace("w2", "down_proj")
-            if "w3" in name:
-                name = name.replace("w3", "up_proj")
+            replacements = {"w1.weight": "gate_proj.weight", "w2.weight": "down_proj.weight", "w3.weight": "up_proj.weight"}
+            for old, new in replacements.items():
+                if old in name:
+                    name = name.replace(old, new)
             sanitized_weights[name] = param
 
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}.feed_forward"
+            prefix = f"model.layers.{l}"
             # Only sanitize MoE layer weights
-            if f"{prefix}.experts.gate_proj" in weights:
-                for n in ["gate_proj", "down_proj", "up_proj"]:
-                    to_join = weights.pop(f"{prefix}.experts.{n}.weight")
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = to_join
+            for n in ["gate_proj", "down_proj", "up_proj"]:
+                if f"{prefix}.feed_forward.experts.0.{n}.weight" in sanitized_weights:
+                    to_join =[sanitized_weights.pop(f"{prefix}.feed_forward.experts.{e}.{n}.weight") for e in range(self.args.num_experts)]
+                    sanitized_weights[f"{prefix}.feed_forward.switch_mlp.{n}.weight"] = mx.stack(to_join)
         return sanitized_weights
 
     @property
