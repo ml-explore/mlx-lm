@@ -33,6 +33,7 @@ def compute_dwq_targets(
     valid_data,
     batch_size,
     max_seq_length,
+    seed,
 ):
     rank = mx.distributed.init().rank()
 
@@ -42,16 +43,19 @@ def compute_dwq_targets(
         path.mkdir(parents=True, exist_ok=True)
         for i, (batch, _) in (
             pbar := tqdm(
-                enumerate(iterate_batches(data, batch_size, max_seq_length)),
+                enumerate(iterate_batches(data, batch_size, max_seq_length, seed=seed)),
                 total=len(data) // batch_size,
                 desc=f"Computing targets for {split}",
+                disable=rank != 0,
             )
         ):
             batch = batch[:, :-1]
             logits = model(batch)
-            idx = mx.argpartition(logits, kth=-1024, axis=-1)[..., -1024:]
-            logits = mx.take_along_axis(logits, idx, axis=-1)
+            mx.eval(logits)
             if rank == 0:
+                idx = mx.argpartition(logits, kth=-1024, axis=-1)[..., -1024:]
+                logits = mx.take_along_axis(logits, idx, axis=-1)
+
                 file = path / f"{i:010d}.safetensors"
                 mx.save_safetensors(file, {"logits": logits, "indices": idx})
 
@@ -67,6 +71,7 @@ def dwq_quantize(
     valid_data,
     batch_size,
     max_seq_length,
+    seed,
     dtype: mx.Dtype = mx.bfloat16,
     gradient_checkpoint: bool = False,
     temperature: float = 2.0,
@@ -121,7 +126,9 @@ def dwq_quantize(
         v_loss = 0.0
         v_tokens = 0
         for i, (batch, lengths) in tqdm(
-            enumerate(iterate_batches(valid_data, batch_size, max_seq_length)),
+            enumerate(
+                iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
+            ),
             total=len(valid_data) // batch_size,
             desc="Computing validation loss",
             leave=False,
@@ -156,7 +163,9 @@ def dwq_quantize(
 
     for it, (batch, lengths) in (
         pbar := tqdm(
-            enumerate(iterate_batches(train_data, batch_size, max_seq_length)),
+            enumerate(
+                iterate_batches(train_data, batch_size, max_seq_length, seed=seed)
+            ),
             total=len(train_data) // batch_size,
         )
     ):
@@ -308,6 +317,7 @@ def main():
         target_dir = None
 
     tokenizer = load_tokenizer(args.model)
+
     train_data, valid_data = load_data(
         tokenizer, args.data_path, args.num_samples, args.max_seq_length
     )
@@ -330,6 +340,7 @@ def main():
             valid_data,
             batch_size=args.batch_size,
             max_seq_length=args.max_seq_length,
+            seed=args.seed,
         )
         has_targets = True
 
@@ -383,6 +394,7 @@ def main():
         valid_data,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
+        seed=args.seed,
         gradient_checkpoint=args.grad_checkpoint,
     )
     save(

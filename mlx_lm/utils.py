@@ -103,7 +103,11 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
-def _download(path_or_hf_repo: str, revision: Optional[str] = None, allow_patterns: List[str] = None) -> Path:
+def _download(
+    path_or_hf_repo: str,
+    revision: Optional[str] = None,
+    allow_patterns: List[str] = None,
+) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -254,9 +258,7 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     return _load_adapters(model, adapter_path)
 
 
-def load_tokenizer(
-    model_path, tokenizer_config_extra={}, eos_token_ids=None
-):
+def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
     """
@@ -273,7 +275,9 @@ def load_tokenizer(
             "*.jinja",
         ],
     )
-    return _load_tokenizer(model_path, tokenizer_config_extra, eos_token_ids=eos_token_ids)
+    return _load_tokenizer(
+        model_path, tokenizer_config_extra, eos_token_ids=eos_token_ids
+    )
 
 
 def load(
@@ -330,9 +334,18 @@ def load(
 
 def pipeline_load(repo, return_config=False):
     # Get model path with everything but weight safetensors
-    model_path, _ = get_model_path(
+    model_path = _download(
         repo,
-        allow_patterns=["*.json", "*.py", "tokenizer.model", "*.tiktoken", "*.txt"],
+        allow_patterns=[
+            "*.json",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ],
     )
 
     # Lazy load and shard model to figure out which weights we need
@@ -351,7 +364,7 @@ def pipeline_load(repo, return_config=False):
         local_files.add(weight_index[k])
 
     # Download weights for local shard
-    get_model_path(repo, allow_patterns=local_files)
+    _download(repo, allow_patterns=local_files)
 
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
