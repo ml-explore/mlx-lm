@@ -133,7 +133,6 @@ class ShortConv(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        seqlen = x.shape[1]
         BCx = self.in_proj(x)
         B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x

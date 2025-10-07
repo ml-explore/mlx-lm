@@ -39,8 +39,6 @@ class ModelArgs(BaseModelArgs):
     layer_types: Optional[List[str]] = None
 
     def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
         if self.full_attn_idxs is None:
             self.full_attn_idxs = [
                 i
@@ -136,7 +134,6 @@ class ShortConv(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        seqlen = x.shape[1]
         BCx = self.in_proj(x)
         B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x
@@ -163,7 +160,9 @@ class MLP(nn.Module):
     def __init__(self, config: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.intermediate_size = (
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -192,8 +191,8 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         self,
         x: mx.array,
     ):
-        gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
+        gates = self.gate(x).astype(mx.float32)
+        gates = mx.softmax(gates, axis=-1)
 
         if self.use_expert_bias:
             gates += self.expert_bias
@@ -203,12 +202,14 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
 
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
-            scores /= mx.sum(scores, axis=-1, keepdims=True)
+            scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20
+        scores = scores.astype(x.dtype)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
         return y
+
 
 class Lfm2DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
@@ -219,10 +220,14 @@ class Lfm2DecoderLayer(nn.Module):
             self.self_attn = Attention(args)
         else:
             self.conv = ShortConv(args, layer_idx)
-        self.feed_forward = MLP(
-            config=args,
-            intermediate_size=args.intermediate_size,
-        ) if layer_idx < args.num_dense_layers else Lfm2MoeSparseMoeBlock(args)
+        self.feed_forward = (
+            MLP(
+                config=args,
+                intermediate_size=args.intermediate_size,
+            )
+            if layer_idx < args.num_dense_layers
+            else Lfm2MoeSparseMoeBlock(args)
+        )
 
         self.operator_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
         self.ffn_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)
@@ -314,7 +319,11 @@ class Model(nn.Module):
             if "conv.weight" in name:
                 if param.shape[-1] > param.shape[1]:
                     param = param.transpose(0, 2, 1)
-            replacements = {"w1.weight": "gate_proj.weight", "w2.weight": "down_proj.weight", "w3.weight": "up_proj.weight"}
+            replacements = {
+                "w1.weight": "gate_proj.weight",
+                "w2.weight": "down_proj.weight",
+                "w3.weight": "up_proj.weight",
+            }
             for old, new in replacements.items():
                 if old in name:
                     name = name.replace(old, new)
@@ -325,8 +334,15 @@ class Model(nn.Module):
             # Only sanitize MoE layer weights
             for n in ["gate_proj", "down_proj", "up_proj"]:
                 if f"{prefix}.feed_forward.experts.0.{n}.weight" in sanitized_weights:
-                    to_join =[sanitized_weights.pop(f"{prefix}.feed_forward.experts.{e}.{n}.weight") for e in range(self.args.num_experts)]
-                    sanitized_weights[f"{prefix}.feed_forward.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                    to_join = [
+                        sanitized_weights.pop(
+                            f"{prefix}.feed_forward.experts.{e}.{n}.weight"
+                        )
+                        for e in range(self.args.num_experts)
+                    ]
+                    sanitized_weights[
+                        f"{prefix}.feed_forward.switch_mlp.{n}.weight"
+                    ] = mx.stack(to_join)
         return sanitized_weights
 
     @property
@@ -338,3 +354,19 @@ class Model(nn.Module):
             KVCache() if l.is_attention_layer else ArraysCache(size=1)
             for l in self.layers
         ]
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("feed_forward.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
+
+        return predicate

@@ -353,7 +353,7 @@ class TestModels(unittest.TestCase):
         args = lfm2_moe.ModelArgs(
             model_type="lfm2_moe",
             hidden_size=1024,
-            intermediate_size = 7168,
+            intermediate_size=7168,
             num_hidden_layers=4,
             num_attention_heads=4,
             num_key_value_heads=2,
@@ -364,13 +364,12 @@ class TestModels(unittest.TestCase):
             max_position_embeddings=1000,
             conv_bias=True,
             conv_L_cache=3,
-            moe_intermediate_size = 1792,
-            num_dense_layers = 2,
-            num_experts = 4,
-            num_experts_per_tok = 2,
-            norm_topk_prob = True,
-            use_expert_bias = True,
-
+            moe_intermediate_size=1792,
+            num_dense_layers=2,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            use_expert_bias=True,
         )
         model = lfm2_moe.Model(args)
         self.model_test_runner(
