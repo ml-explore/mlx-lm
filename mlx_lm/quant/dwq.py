@@ -39,8 +39,9 @@ def compute_dwq_targets(
 
     def _compute_targets(data, path, split):
 
-        path = path / split
-        path.mkdir(parents=True, exist_ok=True)
+        if rank == 0:
+            path = path / split
+            path.mkdir(parents=True, exist_ok=True)
         for i, (batch, _) in (
             pbar := tqdm(
                 enumerate(iterate_batches(data, batch_size, max_seq_length, seed=seed)),
