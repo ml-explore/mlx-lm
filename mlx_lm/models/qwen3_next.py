@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
