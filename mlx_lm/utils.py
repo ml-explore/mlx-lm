@@ -361,6 +361,10 @@ def pipeline_load(repo, return_config=False):
 
     local_files = set()
     for k, _ in tree_flatten(model.parameters()):
+        if file_name := weight_index.get(k, None) is None:
+            raise ValueError(
+                "Pipeline loading is only supported for MLX converted models."
+            )
         local_files.add(weight_index[k])
 
     # Download weights for local shard

@@ -111,8 +111,8 @@ def iterate_batches(
     # If running in distributed mode (N machines) then each one should skip N-1
     # samples
     if comm_group is not None:
-        offset = mx.distributed.init().rank()
-        step = mx.distributed.init().size()
+        offset = comm_group.rank()
+        step = comm_group.size()
     else:
         offset = 0
         step = 1
