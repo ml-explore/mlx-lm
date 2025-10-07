@@ -13,6 +13,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from queue import Empty as QueueEmpty
+from queue import Queue
+from threading import Condition, Lock, Thread
 from typing import (
     Any,
     Dict,
@@ -43,11 +46,13 @@ def get_system_fingerprint():
 class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
+    trim_text_length: int
 
 
 def stopping_criteria(
     tokens: List[int],
     stop_id_sequences: List[List[int]],
+    stop_words: List[str],
     eos_token_id: Union[int, None],
 ) -> StopCondition:
     """
@@ -59,6 +64,8 @@ def stopping_criteria(
         stop_id_sequences (List[List[[int]]): A list of integer lists, each
           representing a sequence of token IDs. If the end of the `tokens`
           list matches any of these sequences, the generation should stop.
+        stop_words (List[str]): The stop words that correspond to the
+            ``stop_id_sequences``.
         eos_token_id (Union[int, None]): The token ID that represents the
           end-of-sequence. If the last token in `tokens` matches this, the
           generation should stop.
@@ -66,17 +73,22 @@ def stopping_criteria(
     Returns:
         StopCondition: A named tuple indicating whether the stop condition has
           been met (`stop_met`) and how many tokens should be trimmed from the
-          end if it has (`trim_length`).
+          end if it has (`trim_length`) as well as the text that should be
+          trimmed.
     """
     if tokens and tokens[-1] == eos_token_id:
-        return StopCondition(stop_met=True, trim_length=0)
+        return StopCondition(stop_met=True, trim_length=0, trim_text_length=0)
 
-    for stop_ids in stop_id_sequences:
+    for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
         if len(tokens) >= len(stop_ids):
             if tokens[-len(stop_ids) :] == stop_ids:
-                return StopCondition(stop_met=True, trim_length=len(stop_ids))
+                return StopCondition(
+                    stop_met=True,
+                    trim_length=len(stop_ids),
+                    trim_text_length=len(stop_word),
+                )
 
-    return StopCondition(stop_met=False, trim_length=0)
+    return StopCondition(stop_met=False, trim_length=0, trim_text_length=0)
 
 
 def sequence_overlap(s1: Sequence, s2: Sequence) -> bool:
@@ -285,10 +297,62 @@ class LRUPromptCache:
 
 
 @dataclass
-class PromptCache:
-    cache: List[Any] = field(default_factory=list)
-    model_key: Tuple[str, Optional[str]] = ("", None, None)
-    tokens: List[int] = field(default_factory=list)
+class ModelDescription:
+    model: str
+    draft: str
+    adapter: str
+
+
+@dataclass
+class SamplingArguments:
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    xtc_probability: float
+    xtc_threshold: float
+
+
+@dataclass
+class LogitsProcessorArguments:
+    logit_bias: Optional[Dict[int, float]]
+    repetition_penalty: float
+    repetition_context_size: int
+
+
+@dataclass
+class GenerationArguments:
+    model: ModelDescription
+    sampling: SamplingArguments
+    logits: LogitsProcessorArguments
+
+    stop_words: List[str]
+
+    max_tokens: int
+    num_draft_tokens: int
+    logprobs: int
+    seed: Optional[int]
+
+
+@dataclass
+class CompletionRequest:
+    request_type: Literal["chat", "text"]
+
+    prompt: str
+
+    messages: List[Any]
+    tools: Optional[List[Any]]
+    role_mapping: Optional[Dict[str, Any]]
+
+
+@dataclass
+class GenerationContext:
+    has_tool_calling: bool
+    tool_call_start: str
+    tool_call_end: str
+    eos_token_id: int
+    stop_token_sequences: List[List[int]]
+    prompt: List[int]
 
 
 class ModelProvider:
@@ -372,12 +436,177 @@ class ModelProvider:
         return self.model, self.tokenizer
 
 
+class ResponseGenerator:
+    def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
+        self.model_provider = model_provider
+        self.prompt_cache = prompt_cache
+        self.requests = Queue()
+        self._generation_thread = Thread(target=self._generate)
+        self._generation_thread.start()
+
+    def _tokenize_chat(self, tokenizer, messages, tools=None, role_mapping=None):
+        if tokenizer.chat_template:
+            process_message_content(messages)
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tools,
+                add_generation_prompt=True,
+                **self.model_provider.cli_args.chat_template_args,
+            )
+        else:
+            prompt = convert_chat(messages, role_mapping)
+            prompt = tokenizer.encode(prompt)
+
+        return prompt
+
+    def _generate(self):
+        current_model = None
+        current_sampling = None
+        current_logits_proc = None
+
+        unprocessed_requests = []
+
+        def get_next_request():
+            nonlocal unprocessed_requests
+
+            if unprocessed_requests:
+                r, *unprocessed_requests = unprocessed_requests
+                return r
+            else:
+                try:
+                    return self.requests.get_nowait()
+                except QueueEmpty:
+                    return None
+
+        while True:
+            request = get_next_request()
+            if request is not None:
+                self._serve_single(request)
+
+    def _serve_single(self, request):
+        rqueue, request, args = request
+
+        try:
+            # Load the model and tokenizer
+            model, tokenizer = self.model_provider.load(
+                args.model.model, args.model.adapter, args.model.draft
+            )
+            draft_model = self.model_provider.draft_model
+
+            # Prepare the prompt
+            if request.request_type == "chat":
+                prompt = self._tokenize_chat(
+                    tokenizer, request.messages, request.tools, request.role_mapping
+                )
+            else:
+                prompt = tokenizer.encode(request.prompt)
+
+            # Start the generation context
+            ctx = GenerationContext(
+                has_tool_calling=tokenizer.has_tool_calling,
+                tool_call_start=tokenizer.tool_call_start,
+                tool_call_end=tokenizer.tool_call_end,
+                eos_token_id=tokenizer.eos_token_id,
+                stop_token_sequences=[
+                    tokenizer.encode(stop_word, add_special_tokens=False)
+                    for stop_word in args.stop_words
+                ],
+                prompt=prompt,
+            )
+            rqueue.put(ctx)
+
+            # Seed if requested
+            if args.seed is not None:
+                mx.random.seed(args.seed)
+
+            # Make the sampler and logit processor
+            sampler = make_sampler(
+                args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                top_k=args.sampling.top_k,
+                min_p=args.sampling.min_p,
+                xtc_probability=args.sampling.xtc_probability,
+                xtc_threshold=args.sampling.xtc_threshold,
+                xtc_special_tokens=[
+                    tokenizer.eos_token_id,
+                    tokenizer.encode("\n"),
+                ],
+            )
+            logits_processors = make_logits_processors(
+                args.logits.logit_bias,
+                args.logits.repetition_penalty,
+                args.logits.repetition_context_size,
+            )
+
+            # Load the KV cache
+            cache, rest = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key, prompt
+            )
+            cache_key = prompt[: len(prompt) - len(rest)]
+            if cache is None:
+                cache = make_prompt_cache(self.model_provider.model)
+                if self.model_provider.draft_model is not None:
+                    cache += make_prompt_cache(self.model_provider.draft_model)
+
+            # Process the prompt and generate tokens
+            cache_key += rest
+            for gen in stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=rest,
+                max_tokens=args.max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prompt_cache=cache,
+                draft_model=draft_model,
+                num_draft_tokens=args.num_draft_tokens,
+                # TODO: prompt progress callback
+            ):
+                rqueue.put(gen)
+                cache_key.append(gen.token)
+            rqueue.put(None)
+
+            # Save the KV cache again
+            self.prompt_cache.insert_cache(
+                self.model_provider.model_key, cache_key, cache
+            )
+
+        except Exception as e:
+            rqueue.put(e)
+
+    def generate(
+        self,
+        request: CompletionRequest,
+        generation_args: GenerationArguments,
+    ):
+        response_queue = Queue()
+        self.requests.put((response_queue, request, generation_args))
+
+        def _inner():
+            while True:
+                response = response_queue.get()
+                if response is None:
+                    break
+                if isinstance(response, Exception):
+                    raise response
+                yield response
+
+        ctx = response_queue.get()
+        if isinstance(ctx, Exception):
+            raise ctx
+
+        return ctx, _inner()
+
+    @property
+    def cli_args(self):
+        return self.model_provider.cli_args
+
+
 class APIHandler(BaseHTTPRequestHandler):
     def __init__(
         self,
-        model_provider: ModelProvider,
+        response_generator: ResponseGenerator,
         *args,
-        prompt_cache: Optional[PromptCache] = None,
         system_fingerprint: Optional[str] = None,
         **kwargs,
     ):
@@ -385,8 +614,7 @@ class APIHandler(BaseHTTPRequestHandler):
         Create static request specific metadata
         """
         self.created = int(time.time())
-        self.model_provider = model_provider
-        self.prompt_cache = prompt_cache or LRUPromptCache()
+        self.response_generator = response_generator
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
         super().__init__(*args, **kwargs)
 
@@ -414,13 +642,13 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
-        endpoints = {
+        request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
         }
 
-        if self.path not in endpoints:
+        if self.path not in request_factories:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -451,20 +679,20 @@ class APIHandler(BaseHTTPRequestHandler):
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
+            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
         )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
-                "max_tokens", self.model_provider.cli_args.max_tokens
+                "max_tokens", self.response_generator.cli_args.max_tokens
             )
         self.temperature = self.body.get(
-            "temperature", self.model_provider.cli_args.temp
+            "temperature", self.response_generator.cli_args.temp
         )
-        self.top_p = self.body.get("top_p", self.model_provider.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.model_provider.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.model_provider.cli_args.min_p)
+        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
+        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
+        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
         self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
@@ -473,40 +701,15 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logprobs = self.body.get("logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.validate_model_parameters()
-        if self.seed is not None:
-            mx.random.seed(self.seed)
-        # Load the model if needed
-        try:
-            self.model, self.tokenizer = self.model_provider.load(
-                self.requested_model,
-                self.adapter,
-                self.requested_draft_model,
-            )
-        except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write((f"{e}").encode())
-            return
 
-        # Get stop id sequences, if provided
+        # Get stop sequences
         stop_words = self.body.get("stop")
         stop_words = stop_words or []
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
-        stop_id_sequences = [
-            self.tokenizer.encode(stop_word, add_special_tokens=False)
-            for stop_word in stop_words
-        ]
 
-        # Send header type
-        (
-            self._set_stream_headers(200)
-            if self.stream
-            else self._set_completion_headers(200)
-        )
-
-        # Call endpoint specific method
-        prompt = endpoints[self.path]()
-        self.handle_completion(prompt, stop_id_sequences)
+        # Create the completion request
+        request = request_factories[self.path]()
+        self.handle_completion(request, stop_words)
 
     def validate_model_parameters(self):
         """
@@ -677,156 +880,118 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
-    def get_prompt_cache(self, prompt):
-        """
-        Given the prompt find the closest KV cache that can be extended to the
-        passed in prompt.
-
-        If one couldn't be found then make a new one.
-
-        Args:
-            prompt (List[int]): The tokenized new prompt.
-
-        Returns:
-            List[Any]: The prompt cache object
-            List[int]: The tokens that are in the returned object
-            List[int]: The remaining tokens to be added
-        """
-        cache, rest = self.prompt_cache.fetch_nearest_cache(
-            self.model_provider.model_key, prompt
-        )
-        cache_key = prompt[: len(prompt) - len(rest)]
-
-        # Make a new cache for the model
-        if cache is None:
-            cache = make_prompt_cache(self.model_provider.model)
-            if self.model_provider.draft_model is not None:
-                cache += make_prompt_cache(self.model_provider.draft_model)
-
-        return cache, cache_key, rest
-
-    def handle_completion(
-        self,
-        prompt: List[int],
-        stop_id_sequences: List[List[int]],
-    ):
+    def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
 
         Args:
             prompt (List[int]): The tokenized prompt.
-            stop_id_sequences (List[List[int]]): A list of stop words passed
-              to the stopping_criteria function
+            stop_words (List[str]): A list of stop words passed to the
+                stopping_criteria function
         """
-        tokens = []
-        finish_reason = "length"
-        stop_sequence_suffix = None
-        if self.stream:
+        args = GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            seed=self.seed,
+        )
+
+        # Create the token generator
+        try:
+            ctx, response = self.response_generator.generate(request, args)
+        except Exception as e:
+            self._set_completion_headers(404)
             self.end_headers()
-            logging.debug(f"Starting stream:")
+            self.wfile.write((f"{e}").encode())
+            return
+
+        # Prepare the headers
+        if self.stream:
+            self._set_stream_headers(200)
+            self.end_headers()
+            logging.debug("Starting stream:")
         else:
-            logging.debug(f"Starting completion:")
+            self._set_completion_headers(200)
+            logging.debug("Starting completion:")
+
+        # Variables to save the tool calls in as they are being generated by
+        # the model.
+        in_tool_call = False
+        tool_calls = []
+        tool_text = ""
+
+        # Variables to save the generated tokens and the corresponding probs
+        tokens = []
         token_logprobs = []
         top_tokens = []
 
-        cache, cache_key, prompt = self.get_prompt_cache(prompt)
-
+        # Variables to save the generated text
         text = ""
-        tic = time.perf_counter()
-        sampler = make_sampler(
-            self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            min_p=self.min_p,
-            xtc_probability=self.xtc_probability,
-            xtc_threshold=self.xtc_threshold,
-            xtc_special_tokens=[
-                self.tokenizer.eos_token_id,
-                self.tokenizer.encode("\n"),
-            ],
-        )
-        logits_processors = make_logits_processors(
-            self.logit_bias,
-            self.repetition_penalty,
-            self.repetition_context_size,
-        )
-
-        tool_calls = []
-        tool_text = ""
-        in_tool_call = False
         segment = ""
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
-            if self.stream:
-                try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
-                    pass
+        # Well finally save the reason for stopping
+        finish_reason = "length"
 
-        cache_key += prompt
-        prompt_token_count = len(cache_key)
-        for gen_response in stream_generate(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            prompt=prompt,
-            max_tokens=self.max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            prompt_cache=cache,
-            draft_model=self.model_provider.draft_model,
-            num_draft_tokens=self.num_draft_tokens,
-            prompt_progress_callback=keepalive_callback,
-        ):
-            logging.debug(gen_response.text)
+        # Process the generated tokens
+        for gen in response:
+            logging.debug(gen.text)
 
-            if (
-                self.tokenizer.has_tool_calling
-                and gen_response.text == self.tokenizer.tool_call_start
-            ):
+            # Gather the text in tool calling or text variables
+            if ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 in_tool_call = True
             elif in_tool_call:
-                if gen_response.text == self.tokenizer.tool_call_end:
+                if gen.text == ctx.tool_call_end:
                     tool_calls.append(tool_text)
                     tool_text = ""
                     in_tool_call = False
                 else:
-                    tool_text += gen_response.text
+                    tool_text += gen.text
             else:
-                text += gen_response.text
-                segment += gen_response.text
-            token = gen_response.token
-            logprobs = gen_response.logprobs
-            tokens.append(token)
-            cache_key.append(token)
+                text += gen.text
+                segment += gen.text
 
-            if self.logprobs > 0:
+            # Save the token and its logprob
+            tokens.append(gen.token)
+            token_logprobs.append(gen.logprobs[gen.token].item())
+
+            # If requested save the k top logprobs
+            if args.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
                 top_indices = sorted_indices[: self.logprobs]
                 top_logprobs = logprobs[top_indices]
                 top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
                 top_tokens.append(tuple(top_token_info))
 
-            token_logprobs.append(logprobs[token].item())
-
+            # Check if we should stop early
+            # TODO: This doesn't actually stop generation in the generation
+            #       thread we should probably have a way to do that via the ctx
+            #       object
             stop_condition = stopping_criteria(
-                tokens, stop_id_sequences, self.tokenizer.eos_token_id
+                tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id
             )
             if stop_condition.stop_met:
                 finish_reason = "stop"
-                if stop_condition.trim_length:
-                    stop_sequence_suffix = self.tokenizer.decode(
-                        tokens[-stop_condition.trim_length :]
-                    )
-                    text = text[: -len(stop_sequence_suffix)]
+                tokens = tokens[: -stop_condition.trim_length]
+                text = text[: -stop_condition.trim_text_length]
                 segment = ""
                 break
 
@@ -836,7 +1001,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if any(
                     (
                         sequence_overlap(tokens, sequence)
-                        for sequence in stop_id_sequences
+                        for sequence in ctx.stop_token_sequences
                     )
                 ):
                     continue
@@ -849,12 +1014,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     segment = ""
                     tool_calls = []
 
-        if gen_response.finish_reason is not None:
-            finish_reason = gen_response.finish_reason
+            if gen.finish_reason is not None:
+                finish_reason = gen.finish_reason
 
-        logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
-        logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
-        logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
+        logging.debug(f"Prompt: {gen.prompt_tps:.3f} tokens-per-sec")
+        logging.debug(f"Generation: {gen.generation_tps:.3f} tokens-per-sec")
+        logging.debug(f"Peak memory: {gen.peak_memory:.3f} GB")
 
         if self.stream:
             response = self.generate_response(
@@ -863,9 +1028,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(
-                    prompt_token_count, len(tokens)
-                )
+                response = self.completion_usage_response(len(ctx.prompt), len(tokens))
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
@@ -874,7 +1037,7 @@ class APIHandler(BaseHTTPRequestHandler):
             response = self.generate_response(
                 text,
                 finish_reason,
-                prompt_token_count,
+                len(ctx.prompt),
                 len(tokens),
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
@@ -890,8 +1053,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response_json)
             self.wfile.flush()
-
-        self.prompt_cache.insert_cache(self.model_provider.model_key, cache_key, cache)
 
     def completion_usage_response(
         self,
@@ -913,7 +1074,7 @@ class APIHandler(BaseHTTPRequestHandler):
         }
         return response
 
-    def handle_chat_completions(self) -> List[int]:
+    def handle_chat_completions(self) -> CompletionRequest:
         """
         Handle a chat completion request.
 
@@ -926,22 +1087,16 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
-        if self.tokenizer.chat_template:
-            messages = body["messages"]
-            process_message_content(messages)
-            prompt = self.tokenizer.apply_chat_template(
-                messages,
-                body.get("tools") or None,
-                add_generation_prompt=True,
-                **self.model_provider.cli_args.chat_template_args,
-            )
-        else:
-            prompt = convert_chat(body["messages"], body.get("role_mapping"))
-            prompt = self.tokenizer.encode(prompt)
 
-        return prompt
+        return CompletionRequest(
+            "chat",
+            "",
+            body["messages"],
+            body.get("tools") or None,
+            body.get("role_mapping"),
+        )
 
-    def handle_text_completions(self) -> List[int]:
+    def handle_text_completions(self) -> CompletionRequest:
         """
         Handle a text completion request.
 
@@ -952,7 +1107,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.request_id = f"cmpl-{uuid.uuid4()}"
         self.object_type = "text_completion"
         assert "prompt" in self.body, "Request did not contain a prompt"
-        return self.tokenizer.encode(self.body["prompt"])
+        return CompletionRequest(
+            "text",
+            self.body["prompt"],
+            [],
+            None,
+            None,
+        )
 
     def do_GET(self):
         """
@@ -1032,7 +1193,7 @@ def run(
     handler_class=APIHandler,
 ):
     server_address = (host, port)
-    prompt_cache = LRUPromptCache()
+    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
@@ -1040,8 +1201,7 @@ def run(
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(
-            model_provider,
-            prompt_cache=prompt_cache,
+            response_generator,
             system_fingerprint=get_system_fingerprint(),
             *args,
             **kwargs,
