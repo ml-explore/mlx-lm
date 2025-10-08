@@ -249,11 +249,9 @@ class MiniMaxDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x * self.attn_alpha_factor + r * self.attn_beta_factor
-        r = self.block_sparse_moe(self.post_attention_layernorm(h))
-        out = h * self.mlp_alpha_factor + r * self.mlp_beta_factor
-        return out
+        r = self.input_layernorm(x) * self.attn_alpha_factor + self.self_attn(x, mask, cache) * self.attn_beta_factor
+        r = self.block_sparse_moe(self.post_attention_layernorm(x)) * self.mlp_alpha_factor + r * self.mlp_beta_factor
+        return r
 
 
 class MiniMaxModel(nn.Module):
