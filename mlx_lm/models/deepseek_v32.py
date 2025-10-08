@@ -101,10 +101,12 @@ class Indexer(nn.Module):
             k = cache.update_and_fetch(k)
         if k.shape[2] <= self.index_topk:
             return None
+        scores = q @ k.swapaxes(-1, -2)
+        scores = mx.maximum(scores, 0)
         weights = self.weights_proj(x) * (self.n_heads**-0.5)
         weights = (weights * self.softmax_scale).swapaxes(-1, -2)[..., None]
-        q_scaled = q * weights
-        scores = (q * weights) @ k.swapaxes(-1, -2)
+        scores = scores * weights
+        scores = scores.sum(axis=1)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
@@ -219,24 +221,17 @@ class DeepseekV32Attention(nn.Module):
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
-            repeats = self.num_heads // self.config.index_n_heads
-            if L == 1:
-                topk_indices = mx.repeat(topk_indices, repeats, axis=1).squeeze(-2)[
-                    ..., None
-                ]
-                keys = mx.take_along_axis(keys, topk_indices, axis=-2)
-                values = mx.take_along_axis(values, topk_indices, axis=-2)
-            else:
-                topk_mask = mx.zeros(
-                    (B, self.config.index_n_heads, *mask.shape[-2:]), mx.bool_
-                )
-                topk_mask = mx.put_along_axis(
-                    topk_mask, topk_indices, mx.array(True), axis=-1
-                )
-                mask = mask & topk_mask
-                mask = mx.repeat(mask, repeats, axis=1)
+            k_seq = keys.shape[2]
+            sparse_mask = mx.zeros((B, L, k_seq), dtype=mx.bool_)
+            sparse_mask = mx.put_along_axis(
+                sparse_mask, topk_indices, mx.array(True), axis=-1
+            )
+            sparse_mask = sparse_mask[:, None, :, :]
+            if mask is not None:
+                sparse_mask = sparse_mask & mask
+            mask = sparse_mask
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, cache=cache[0], scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
