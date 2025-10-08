@@ -1,180 +1,170 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
-    attention_dropout: float
-    attn_type_list: List[int]
-    head_dim: int
     hidden_size: int
     intermediate_size: int
-    layernorm_full_attention_alpha: float
-    layernorm_full_attention_beta: float
-    max_position_embeddings: int
     num_attention_heads: int
-    num_experts_per_tok: int
-    num_hidden_layers: int
     num_key_value_heads: int
+    max_position_embeddings: int
+    num_experts_per_tok: int
     num_local_experts: int
-    rms_norm_eps: float
-    rope_theta: int
-    rotary_dim: int
-    router_aux_loss_coef: float
     shared_intermediate_size: int
-    tie_word_embeddings: bool
+    num_hidden_layers: int
+    rms_norm_eps: float
+    rope_theta: float
+    rotary_dim: int
     vocab_size: int
-    layernorm_linear_attention_alpha: float = 1
-    layernorm_linear_attention_beta: float = 1
-    layernorm_mlp_alpha: float = 1
-    layernorm_mlp_beta: float = 1
-    mlp_bias: bool = False
+    tie_word_embeddings: bool = False
     postnorm: bool = True
+    shared_moe_mode: str = "sigmoid"
+    full_attn_alpha_factor: float = 3.5565588200778455
+    full_attn_beta_factor: float = 1.0
+    linear_attn_alpha_factor: float = 3.5565588200778455
+    linear_attn_beta_factor: float = 1.0
+    mlp_alpha_factor: float = 3.5565588200778455
+    mlp_beta_factor: float = 1.0
+    layer_types: List[str] = None
+    head_dim: Optional[int] = None
 
 
-BLOCK: int = 256
 
 
-class MiniMaxText01AttentionType0(nn.Module):
+
+{
+  "layer_types": [
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention"
+  ],
+  "head_dim": 128,
+  "hidden_size": 6144,
+  "intermediate_size": 9216,
+  "full_attn_alpha_factor": 3.5565588200778455,
+  "full_attn_beta_factor": 1.0,
+  "linear_attn_alpha_factor": 3.5565588200778455,
+  "linear_attn_beta_factor": 1.0,
+  "mlp_alpha_factor": 3.5565588200778455,
+  "mlp_beta_factor": 1.0,
+  "max_position_embeddings": 10240000,
+  "num_attention_heads": 64,
+  "num_experts_per_tok": 2,
+  "num_hidden_layers": 80,
+  "num_key_value_heads": 8,
+  "num_local_experts": 32,
+  "postnorm": true,
+  "rms_norm_eps": 1e-05,
+  "rope_theta": 10000000,
+  "rotary_dim": 64,
+  "shared_intermediate_size": 0,
+  "shared_moe_mode": "sigmoid",
+  "sliding_window": null,
+  "tie_word_embeddings": false,
+  "vocab_size": 200064
+}
+
+
+
+
+class MiniMaxAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.num_heads = args.num_attention_heads
-        self.head_dim = getattr(args, "head_dim", args.hidden_size // self.num_heads)
-        self.hidden_size = args.hidden_size
-
-        self.qkv_proj = nn.Linear(
-            args.hidden_size, 3 * self.head_dim * self.num_heads, bias=args.mlp_bias
-        )
-        self.output_gate = nn.Linear(
-            args.hidden_size, self.head_dim * self.num_heads, bias=args.mlp_bias
-        )
-        self.norm = nn.RMSNorm(self.head_dim * self.num_heads)
-        self.out_proj = nn.Linear(
-            self.head_dim * self.num_heads, args.hidden_size, bias=args.mlp_bias
-        )
-
-        self.offset = 0
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        slope_rate: Optional[mx.array] = None,
-    ):
-        b, n, d = x.shape
-
-        # linear map
-        qkv = nn.silu(self.qkv_proj(x))
-        new_shape = qkv.shape[:-1] + (self.num_heads, -1)
-        qkv = qkv.reshape(*new_shape)
-        q, k, v = mx.split(qkv, 3, axis=-1)
-        q = mx.transpose(q, (0, 2, 1, 3))
-        k = mx.transpose(k, (0, 2, 1, 3))
-        v = mx.transpose(v, (0, 2, 1, 3))
-
-        if cache is not None:
-            keys, values = cache.update_and_fetch(k, v)
-
-            output_parts = []
-            for i in range(n):
-                q_i = q[:, :, i : i + 1]
-
-                pos = cache.offset - n + i
-                if pos > 0:
-                    k_past = keys[:, :, :pos]
-                    v_past = values[:, :, :pos]
-
-                    attn_weights = mx.matmul(q_i, mx.transpose(k_past, (0, 1, 3, 2)))
-                    attn_output = mx.matmul(attn_weights, v_past)
-
-                    output_parts.append(attn_output)
-                else:
-                    output_parts.append(
-                        mx.zeros((b, self.num_heads, 1, self.head_dim), dtype=q.dtype)
-                    )
-
-            output = mx.concatenate(output_parts, axis=2)
-            output = output.transpose(0, 2, 1, 3).reshape(b, n, -1)
-
-        else:
-            slope_rate = slope_rate.astype(mx.float32)
-
-            NUM_BLOCK = (n + BLOCK - 1) // BLOCK
-
-            array = mx.arange(BLOCK) + 1
-            q_decay = mx.exp(-slope_rate * array.reshape(-1, 1))
-            k_decay = mx.exp(-slope_rate * (BLOCK - array.reshape(-1, 1)))
-
-            index = array[:, None] - array[None, :]
-            s_index = slope_rate * index[None, None, :]
-            s_index = mx.where(index >= 0, -s_index, float("-inf"))
-            diag_decay = mx.exp(s_index)
-
-            kv = mx.zeros(
-                (b, self.num_heads, self.head_dim, self.head_dim), dtype=mx.float32
-            )
-            output = mx.zeros((b, self.num_heads, n, self.head_dim), dtype=q.dtype)
-
-            for i in range(NUM_BLOCK):
-                si = i * BLOCK
-                ei = min(si + BLOCK, n)
-                m = ei - si
-
-                qi = q[:, :, si:ei]
-                ki = k[:, :, si:ei]
-                vi = v[:, :, si:ei]
-
-                qkv_none_diag = mx.matmul(qi * q_decay[:, :m], kv).astype(mx.float32)
-
-                qk = (
-                    mx.matmul(qi, mx.transpose(ki, (0, 1, 3, 2))).astype(mx.float32)
-                    * diag_decay[:, :, :m, :m]
-                )
-                qkv_diag = mx.matmul(qk, vi.astype(mx.float32))
-                block_decay = mx.exp(-slope_rate * m)
-
-                output_slice = qkv_none_diag + qkv_diag
-                output = mx.concatenate(
-                    [output[:, :, :si], output_slice, output[:, :, ei:]], axis=2
-                )
-
-                kv = block_decay * kv + mx.matmul(
-                    mx.transpose(ki * k_decay[:, -m:], (0, 1, 3, 2)).astype(vi.dtype),
-                    vi,
-                )
-
-            output = output.transpose(0, 2, 1, 3).reshape(b, n, -1)
-
-        output = self.norm(output)
-        output = mx.sigmoid(self.output_gate(x)) * output
-
-        return self.out_proj(output)
-
-
-class MiniMaxText01AttentionType1(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.num_heads = args.num_attention_heads
+        self.num_attention_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads if args.head_dim is None else args.head_dim
 
-        self.head_dim = args.head_dim or args.hidden_size // args.num_attention_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
-            args.hidden_size, self.num_heads * self.head_dim, bias=False
+            args.hidden_size, self.num_attention_heads * self.head_dim, bias=False
         )
         self.k_proj = nn.Linear(
             args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
@@ -183,14 +173,13 @@ class MiniMaxText01AttentionType1(nn.Module):
             args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, args.hidden_size, bias=False
+            self.num_attention_heads * self.head_dim, args.hidden_size, bias=False
         )
 
-        self.rotary_emb = initialize_rope(
-            dims=args.rotary_dim or self.head_dim,
-            traditional=True,
+        self.rope = nn.RoPE(
+            args.rotary_dim,
+            traditional=False,
             base=args.rope_theta,
-            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -198,136 +187,96 @@ class MiniMaxText01AttentionType1(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        slope_rate: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
 
         if cache is not None:
-            queries = self.rotary_emb(queries, offset=cache.offset)
-            keys = self.rotary_emb(keys, offset=cache.offset)
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rotary_emb(queries)
-            keys = self.rotary_emb(keys)
+            queries = self.rope(queries)
+            keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
-
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
 
-class MiniMaxText01SharedMLP(nn.Module):
+class MiniMaxSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
-        )
-        self.up_proj = nn.Linear(
-            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
-        )
+        self.num_experts_per_tok = args.num_experts_per_tok
+
+        self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
+        self.switch_mlp = SwitchGLU(args.hidden_size, args.intermediate_size, args.num_local_experts)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        gates = self.gate(x)
+        inds = mx.stop_gradient(mx.argpartition(-gates, kth=self.num_experts_per_tok - 1, axis=-1)[..., :self.num_experts_per_tok])
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = mx.softmax(scores, axis=-1, precise=True)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        return y
 
 
-class MiniMaxText01SparseMoeBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+class MiniMaxDecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.num_experts = args.num_local_experts
-        self.top_k = args.num_experts_per_tok
-
-        self.gate = nn.Linear(args.hidden_size, self.num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(
-            input_dims=args.hidden_size,
-            hidden_dims=args.intermediate_size,
-            num_experts=self.num_experts,
-            bias=args.mlp_bias if hasattr(args, "mlp_bias") else False,
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        B, L, D = x.shape
-        x_flat = x.reshape(-1, D)
-        router_logits = self.gate(x_flat)
-        routing_weights = mx.softmax(router_logits, axis=1, precise=True)
-        indices = mx.stop_gradient(
-            mx.argpartition(-routing_weights, kth=self.top_k - 1, axis=-1)[
-                ..., : self.top_k
-            ]
-        )
-        scores = mx.take_along_axis(routing_weights, indices, axis=-1)
-        y = self.switch_mlp(x_flat, indices)
-        y = (y * mx.expand_dims(scores, axis=-1)).sum(axis=1)
-        return y.reshape(B, L, D)
-
-
-class MiniMaxText01DecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, attention_type: Literal[0, 1] = 0):
-        super().__init__()
-        if attention_type == 0:
-            self.self_attn = MiniMaxText01AttentionType0(args)
+        self.layer_idx = layer_idx
+        self.layer_type = args.layer_types[layer_idx]
+        self.mlp_alpha_factor = args.mlp_alpha_factor
+        self.mlp_beta_factor = args.mlp_beta_factor
+    
+        if self.layer_type == "linear_attention":
+            self.self_attn = MiniMaxLightningAttention(args)
+            self.attn_alpha_factor = args.linear_attn_alpha_factor
+            self.attn_beta_factor = args.linear_attn_beta_factor
         else:
-            self.self_attn = MiniMaxText01AttentionType1(args)
+            self.self_attn = MiniMaxAttention(args)
+            self.attn_alpha_factor = args.full_attn_alpha_factor
+            self.attn_beta_factor = args.full_attn_beta_factor
+        
+        self.block_sparse_moe = MiniMaxSparseMoeBlock(args)
 
-        self.block_sparse_moe = MiniMaxText01SparseMoeBlock(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-
-        self.postnorm = args.postnorm
-        self.layernorm_attention_alpha = args.layernorm_linear_attention_alpha
-        self.layernorm_attention_beta = args.layernorm_linear_attention_beta
-        self.layernorm_mlp_alpha = args.layernorm_mlp_alpha
-        self.layernorm_mlp_beta = args.layernorm_mlp_beta
-
-        shared_intermediate = args.shared_intermediate_size
-        self.shared_moe = False
-        if shared_intermediate > 0:
-            self.shared_moe = True
-            self.shared_mlp = MiniMaxText01SharedMLP(args)
-            self.coefficient = nn.Linear(args.hidden_size, 1, bias=False)
-
+    
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        slope_rate: Optional[mx.array] = None,
     ) -> mx.array:
-        r = x
-        h = self.input_layernorm(x)
-        if self.postnorm:
-            h = h
-        attn_output = self.self_attn(x=h, mask=mask, cache=cache, slope_rate=slope_rate)
-        h = (
-            r * self.layernorm_attention_alpha
-            + attn_output * self.layernorm_attention_beta
-        )
-        r = h
-        h = self.post_attention_layernorm(h)
-        if self.postnorm:
-            r = h
-        moe_h = self.block_sparse_moe(h)
-        if self.shared_moe:
-            output_mlp = self.shared_mlp(h)
-            coef = nn.sigmoid(h @ self.coefficient)
-            h = moe_h * (1 - coef) + output_mlp * coef
-        else:
-            h = moe_h
-        return r * self.layernorm_mlp_alpha + h * self.layernorm_mlp_beta
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x * self.attn_alpha_factor + r * self.attn_beta_factor
+        r = self.block_sparse_moe(self.post_attention_layernorm(h))
+        out = h * self.mlp_alpha_factor + r * self.mlp_beta_factor
+        return out
+
+
+
+
+
+
+
+
+
+
+
 
 
 class MiniMaxText01Model(nn.Module):
