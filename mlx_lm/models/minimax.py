@@ -46,7 +46,11 @@ class MiniMaxAttention(nn.Module):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
-        self.head_dim = args.hidden_size // args.num_attention_heads if args.head_dim is None else args.head_dim
+        self.head_dim = (
+            args.hidden_size // args.num_attention_heads
+            if args.head_dim is None
+            else args.head_dim
+        )
 
         self.scale = self.head_dim**-0.5
 
@@ -79,7 +83,9 @@ class MiniMaxAttention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(
+            0, 2, 1, 3
+        )
         keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
@@ -105,14 +111,24 @@ class MiniMaxLightningAttention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_attention_heads = args.num_attention_heads
-        self.head_dim = args.hidden_size // args.num_attention_heads if args.head_dim is None else args.head_dim
+        self.head_dim = (
+            args.hidden_size // args.num_attention_heads
+            if args.head_dim is None
+            else args.head_dim
+        )
         self.num_hidden_layers = args.num_hidden_layers
         self.block_size = args.block_size
 
         self.norm = nn.RMSNorm(self.head_dim * self.num_attention_heads, eps=1e-6)
-        self.qkv_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim * 3, bias=False)
-        self.out_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
-        self.output_gate = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.qkv_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim * 3, bias=False
+        )
+        self.out_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
+        self.output_gate = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
 
         self.rope = nn.RoPE(
             args.rotary_dim,
@@ -121,7 +137,9 @@ class MiniMaxLightningAttention(nn.Module):
         )
 
         self.slope_rate = self.get_slope_rate()
-        self.query_decay, self.key_decay, self.diagonal_decay = self.decay_factors(self.slope_rate)
+        self.query_decay, self.key_decay, self.diagonal_decay = self.decay_factors(
+            self.slope_rate
+        )
 
     @property
     def ratio(self):
@@ -131,7 +149,7 @@ class MiniMaxLightningAttention(nn.Module):
         base = 1 / (2 ** (8 / self.num_attention_heads))
         exp = mx.arange(self.num_attention_heads) + 1
         factor = 1 - self.layer_idx / (self.num_hidden_layers - 1 + 1e-5) + 1e-5
-        rate = base ** exp
+        rate = base**exp
         rate = rate * factor
         return rate[:, None, None]
 
@@ -160,9 +178,15 @@ class MiniMaxLightningAttention(nn.Module):
 
         qkv = nn.silu(self.qkv_proj(x))
         q, k, v = mx.split(qkv, 3, axis=-1)
-        q = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        k = k.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        v = v.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
 
         if mask is not None:
             if mask.ndim == 2:
@@ -180,13 +204,16 @@ class MiniMaxLightningAttention(nn.Module):
             state = None
 
         if state is None:
-            state = mx.zeros((B, self.num_attention_heads, self.head_dim, self.head_dim), dtype=k.dtype)
+            state = mx.zeros(
+                (B, self.num_attention_heads, self.head_dim, self.head_dim),
+                dtype=k.dtype,
+            )
 
         attn_output = []
         for i in range(L):
-            qi = q[:, :, i:i+1, :]
-            ki = k[:, :, i:i+1, :]
-            vi = v[:, :, i:i+1, :]
+            qi = q[:, :, i : i + 1, :]
+            ki = k[:, :, i : i + 1, :]
+            vi = v[:, :, i : i + 1, :]
 
             kv_update = mx.matmul(ki.transpose(0, 1, 3, 2), vi)
             state = self.ratio * state + kv_update
@@ -194,13 +221,15 @@ class MiniMaxLightningAttention(nn.Module):
             attn_output.append(out_i)
 
         y = mx.concatenate(attn_output, axis=2)
-        y = y.transpose(0, 2, 1, 3).reshape(B, L, self.num_attention_heads * self.head_dim)
+        y = y.transpose(0, 2, 1, 3).reshape(
+            B, L, self.num_attention_heads * self.head_dim
+        )
         y = self.norm(y)
         y = nn.sigmoid(self.output_gate(x)) * y
 
         if cache is not None and cache.kv is not None:
             cache.recurrent.cache = state
-            
+
         return self.out_proj(y)
 
 
@@ -210,24 +239,31 @@ class MiniMaxSparseMoeBlock(nn.Module):
         self.num_experts_per_tok = args.num_experts_per_tok
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
-        self.switch_mlp = SwitchGLU(args.hidden_size, args.intermediate_size, args.num_local_experts)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size, args.intermediate_size, args.num_local_experts
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=self.num_experts_per_tok - 1, axis=-1)[..., :self.num_experts_per_tok])
+        inds = mx.stop_gradient(
+            mx.argpartition(-gates, kth=self.num_experts_per_tok - 1, axis=-1)[
+                ..., : self.num_experts_per_tok
+            ]
+        )
         scores = mx.take_along_axis(gates, inds, axis=-1)
         scores = mx.softmax(scores, axis=-1, precise=True)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         return y
-    
+
+
 class MiniMaxDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.layer_type = args.layer_types[layer_idx]
         self.mlp_alpha_factor = args.mlp_alpha_factor
         self.mlp_beta_factor = args.mlp_beta_factor
-    
+
         if self.layer_type == "linear_attention":
             self.self_attn = MiniMaxLightningAttention(args, layer_idx=layer_idx)
             self.attn_alpha_factor = args.linear_attn_alpha_factor
@@ -236,20 +272,29 @@ class MiniMaxDecoderLayer(nn.Module):
             self.self_attn = MiniMaxAttention(args)
             self.attn_alpha_factor = args.full_attn_alpha_factor
             self.attn_beta_factor = args.full_attn_beta_factor
-        
+
         self.block_sparse_moe = MiniMaxSparseMoeBlock(args)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-    
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.input_layernorm(x) * self.attn_alpha_factor + self.self_attn(x, mask, cache) * self.attn_beta_factor
-        r = self.block_sparse_moe(self.post_attention_layernorm(x)) * self.mlp_alpha_factor + r * self.mlp_beta_factor
+        r = (
+            self.input_layernorm(x) * self.attn_alpha_factor
+            + self.self_attn(x, mask, cache) * self.attn_beta_factor
+        )
+        r = (
+            self.block_sparse_moe(self.post_attention_layernorm(x))
+            * self.mlp_alpha_factor
+            + r * self.mlp_beta_factor
+        )
         return r
 
 
@@ -328,7 +373,7 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
-    
+
     def make_cache(self):
         caches = []
         for l in self.layers:

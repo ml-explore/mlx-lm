@@ -1174,7 +1174,9 @@ def main():
         tokenizer.chat_template = json.loads(metadata["chat_template"])
 
     # Normalize chat_template content format: flatten list-of-dicts to strings
-    if tokenizer.chat_template is not None and isinstance(tokenizer.chat_template, list):
+    if tokenizer.chat_template is not None and isinstance(
+        tokenizer.chat_template, list
+    ):
         for msg in tokenizer.chat_template:
             # Skip entries that aren’t dicts (e.g., plain strings)
             if not isinstance(msg, dict):
@@ -1182,8 +1184,7 @@ def main():
             cont = msg.get("content")
             if isinstance(cont, list):
                 msg["content"] = "".join(
-                    part.get("text", "") for part in cont
-                    if isinstance(part, dict)
+                    part.get("text", "") for part in cont if isinstance(part, dict)
                 )
 
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
