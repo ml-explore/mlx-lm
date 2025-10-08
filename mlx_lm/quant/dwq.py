@@ -52,6 +52,8 @@ def compute_dwq_targets(
         ):
             batch = batch[:, :-1]
             logits = model(batch)
+            # Hack to make the last op pre-eval on the CPU to avoid even timeout
+            logits = mx.stop_gradient(logits, stream=mx.cpu)
             mx.eval(logits)
             if rank == 0:
                 idx = mx.argpartition(logits, kth=-1024, axis=-1)[..., -1024:]
