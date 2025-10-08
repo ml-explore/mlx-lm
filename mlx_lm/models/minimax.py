@@ -29,7 +29,6 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     block_size: int = 256
     tie_word_embeddings: bool = False
-    postnorm: bool = True
     shared_moe_mode: str = "sigmoid"
     full_attn_alpha_factor: float = 3.5565588200778455
     full_attn_beta_factor: float = 1.0
