@@ -1005,3 +1005,18 @@ class BatchRotatingKVCache(_BaseCache):
         )
         self._idx = max_idx
         self._offset = max(self._offset, other._offset)
+
+
+class LinearAttentionCache:
+    def __init__(self):
+        self.kv = KVCache()
+        self.recurrent = ArraysCache(1)
+        self.recurrent.cache = None
+
+    @property
+    def offset(self):
+        return self.kv.offset
+
+    @property
+    def state(self):
+        return self.kv.state
