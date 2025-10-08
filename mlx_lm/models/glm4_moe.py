@@ -331,7 +331,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     @property
     def cast_predicate(self):
