@@ -27,6 +27,7 @@ from .models.cache import (
     ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
+    CacheList,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -859,24 +860,25 @@ def _make_cache(model, left_padding):
     Convert a list of regular caches into their corresponding
     batch-aware caches.
     """
+
+    def to_batch_cache(c):
+        if isinstance(c, KVCache):
+            return BatchKVCache(left_padding)
+        elif isinstance(c, ArraysCache):
+            c.left_padding = mx.array(left_padding)
+            return c
+        elif isinstance(c, RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError("RotatingKVCache with keep tokens is not supported.")
+            return BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, CacheList):
+            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        else:
+            raise ValueError(f"{type(c)} does not yet support batching")
+
     if hasattr(model, "make_cache"):
         cache = model.make_cache()
-        batch_cache = []
-        for c in cache:
-            if isinstance(c, KVCache):
-                batch_cache.append(BatchKVCache(left_padding))
-            elif isinstance(c, ArraysCache):
-                c.left_padding = mx.array(left_padding)
-                batch_cache.append(c)
-            elif isinstance(c, RotatingKVCache):
-                if c.keep > 0:
-                    raise ValueError(
-                        "RotatingKVCache with keep tokens is not supported."
-                    )
-                batch_cache.append(BatchRotatingKVCache(c.max_size, left_padding))
-            else:
-                raise ValueError(f"{type(c)} does not yet support batching")
-        return batch_cache
+        return [to_batch_cache(c) for c in cache]
     else:
         return [BatchKVCache(left_padding) for _ in model.layers]
 

@@ -175,6 +175,49 @@ class TestModels(unittest.TestCase):
         sums = mask.sum(axis=1)
         self.assertTrue(mx.array_equal(sums, expected_sums))
 
+    def test_llama_model_sliding_attention(self):
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+        )
+        model = llama.Model(args)
+
+        tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        out = model(tokens)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 5, args.vocab_size))
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        caches = model.make_cache()
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        step = model(tokens[:, 2:3], cache=caches)
+        mx.eval(step)
+        self.assertEqual(caches[0].offset, 3)
+        self.assertEqual(caches[1].offset, 3)
+
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
         self.assertTrue(isinstance(rope, nn.RoPE))
@@ -300,6 +343,35 @@ class TestModels(unittest.TestCase):
             conv_L_cache=3,
         )
         model = lfm2.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_lfm2_moe(self):
+        from mlx_lm.models import lfm2_moe
+
+        args = lfm2_moe.ModelArgs(
+            model_type="lfm2_moe",
+            hidden_size=1024,
+            intermediate_size=7168,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            norm_eps=1e-5,
+            vocab_size=10_000,
+            full_attn_idxs=[0, 1, 2],
+            rope_theta=10000,
+            max_position_embeddings=1000,
+            conv_bias=True,
+            conv_L_cache=3,
+            moe_intermediate_size=1792,
+            num_dense_layers=2,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            use_expert_bias=True,
+        )
+        model = lfm2_moe.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -662,6 +734,19 @@ class TestModels(unittest.TestCase):
             time_step_rank=48,
         )
         model = mamba.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_falcon_h1(self):
+        from mlx_lm.models import falcon_h1
+
+        args = falcon_h1.ModelArgs(
+            model_type="falcon_h1",
+            num_hidden_layers=12,
+            vocab_size=10000,
+        )
+        model = falcon_h1.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -1767,6 +1852,21 @@ class TestModels(unittest.TestCase):
                 "tie_word_embeddings": True,
                 "time_step_limit": (0.01, 10),
                 "time_step_rank": "auto",
+            },
+            {
+                "model_type": "olmo3",
+                "num_heads": 8,
+                "head_dim": 16,
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "rope_theta": 1000,
+                "num_hidden_layers": 8,
+                "rms_norm_eps": 1e-4,
+                "sliding_window": 128,
+                "tie_word_embeddings": True,
+                "max_position_embeddings": 1000,
             },
         ]
         for config in test_configs:

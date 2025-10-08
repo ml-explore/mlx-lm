@@ -399,6 +399,7 @@ class RotatingKVCache(_BaseCache):
             # preserve context
             self.keys = self._temporal_order(self.keys)
             self.values = self._temporal_order(self.values)
+            self._idx = self.keys.shape[2]
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
@@ -615,7 +616,7 @@ class ChunkedKVCache(KVCache):
         self.chunk_size, self.start_position = map(int, v)
 
 
-class CacheList(KVCache):
+class CacheList(_BaseCache):
     def __init__(self, *caches):
         self.caches = caches
 
@@ -642,6 +643,20 @@ class CacheList(KVCache):
             l = len(c.state)
             c.state = v[start : start + l]
             start += l
+
+    def filter(self, batch_indices):
+        """
+        In-place filter to keep just the given indices in the cache.
+        """
+        for c in self.caches:
+            c.filter(batch_indices)
+
+    def extend(self, other):
+        """
+        In-place extend this cache with the other cache.
+        """
+        for c, o in zip(self.caches, other.caches):
+            c.extend(o)
 
 
 class BatchKVCache(_BaseCache):

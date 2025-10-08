@@ -554,6 +554,20 @@ class TestPromptCache(unittest.TestCase):
         for c, lc in zip(cache, loaded_cache):
             self.assertTrue(mx.array_equal(c.left_padding, left_padding))
 
+    def test_rotating_cache_updates(self):
+        cache = RotatingKVCache(max_size=8)
+        k = v = mx.zeros((1, 1, 10, 1))
+        cache.update_and_fetch(k, v)
+
+        for _ in range(3):
+            k = v = mx.zeros((1, 1, 1, 1))
+            cache.update_and_fetch(k, v)
+
+        k = v = mx.zeros((1, 1, 3, 1))
+        k, v = cache.update_and_fetch(k, v)
+        self.assertEqual(k.shape[2], 10)
+        self.assertEqual(v.shape[2], 10)
+
 
 if __name__ == "__main__":
     unittest.main()
