@@ -82,9 +82,7 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
-def get_model_path(
-    path_or_hf_repo: str, revision: Optional[str] = None
-) -> Tuple[Path, Optional[str]]:
+def _download(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -94,12 +92,11 @@ def get_model_path(
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
 
     Returns:
-        Tuple[Path, str]: A tuple containing the local file path and the Hugging Face repo ID.
+        Path: The local file path.
     """
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        hf_path = path_or_hf_repo
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -117,16 +114,12 @@ def get_model_path(
                 ],
             )
         )
-    else:
-        from huggingface_hub import ModelCard
 
-        card_path = model_path / "README.md"
-        if card_path.is_file():
-            card = ModelCard.load(card_path)
-            hf_path = card.data.base_model
-        else:
-            hf_path = None
-    return model_path, hf_path
+    return model_path
+
+
+def hf_repo_to_path(hf_repo):
+    return Path(snapshot_download(hf_repo, local_files_only=True))
 
 
 def load_config(model_path: Path) -> dict:
@@ -238,7 +231,12 @@ def load(
     model_config={},
     adapter_path: Optional[str] = None,
     lazy: bool = False,
-) -> Tuple[nn.Module, TokenizerWrapper]:
+    return_config: bool = False,
+    revision: str = None,
+) -> Union[
+    Tuple[nn.Module, TokenizerWrapper],
+    Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
+]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
@@ -253,14 +251,17 @@ def load(
         lazy (bool): If ``False`` eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        return_config (bool: If ``True`` return the model config as the last item..
+        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
     Returns:
-        Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
+        Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
+            A tuple containing the loaded model, tokenizer and, if requested, the model config.
 
     Raises:
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path, _ = get_model_path(path_or_hf_repo)
+    model_path = _download(path_or_hf_repo, revision=revision)
 
     model, config = load_model(model_path, lazy, model_config=model_config)
     if adapter_path is not None:
@@ -270,19 +271,10 @@ def load(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
 
-    return model, tokenizer
-
-
-def fetch_from_hub(
-    model_path: Path, lazy: bool = False, trust_remote_code: bool = False
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model, config = load_model(model_path, lazy)
-    tokenizer = load_tokenizer(
-        model_path,
-        eos_token_ids=config.get("eos_token_id", None),
-        tokenizer_config_extra={"trust_remote_code": trust_remote_code},
-    )
-    return model, config, tokenizer
+    if return_config:
+        return model, tokenizer, config
+    else:
+        return model, tokenizer
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
@@ -309,24 +301,28 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
+def create_model_card(path: Union[str, Path], hf_path: Union[str, Path, None]):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
         path (Union[str, Path]): Local path to the model.
-        hf_path (Union[str, Path]): Path to the original Hugging Face model.
+        hf_path (Union[str, Path, None]): Path to the original Hugging Face model.
     """
-    from huggingface_hub import ModelCard
+    from huggingface_hub import ModelCard, ModelCardData
 
-    card = ModelCard.load(hf_path)
+    if hf_path is None:
+        card = ModelCard.from_template(ModelCardData(language="en"))
+    else:
+        card = ModelCard.load(hf_path)
     card.data.library_name = "mlx"
     card.data.pipeline_tag = "text-generation"
     if card.data.tags is None:
         card.data.tags = ["mlx"]
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
-    card.data.base_model = str(hf_path)
+    if hf_path is not None:
+        card.data.base_model = str(hf_path)
     card.text = ""
     card.save(os.path.join(path, "README.md"))
 
@@ -346,15 +342,22 @@ def upload_to_hub(path: str, upload_repo: str):
     logging.set_verbosity_info()
     card_path = Path(path) / "README.md"
     card = ModelCard.load(card_path)
-    hf_path = card.data.base_model
-    card.text = dedent(
-        f"""
-        # {upload_repo}
 
+    hf_path = card.data.base_model
+
+    if hf_path is not None:
+        provenance = f"""
         This model [{upload_repo}](https://huggingface.co/{upload_repo}) was
         converted to MLX format from [{hf_path}](https://huggingface.co/{hf_path})
         using mlx-lm version **{__version__}**.
+        """
+    else:
+        provenance = ""
 
+    card.text = dedent(
+        f"""
+        # {upload_repo}
+        {provenance}
         ## Use with mlx
 
         ```bash
@@ -545,14 +548,20 @@ def save_config(
 
 def save(
     dst_path: Union[str, Path],
-    src_path: Union[str, Path],
+    src_path_or_repo: Union[str, Path],
     model: nn.Module,
     tokenizer: TokenizerWrapper,
     config: Dict[str, Any],
-    hf_repo: Optional[str] = None,
     donate_model: bool = True,
 ):
-    src_path = Path(src_path)
+
+    src_path = Path(src_path_or_repo)
+    if not src_path.exists():
+        hf_repo = src_path_or_repo
+        src_path = hf_repo_to_path(hf_repo)
+    else:
+        hf_repo = None
+
     dst_path = Path(dst_path)
     save_model(dst_path, model, donate_model=True)
     save_config(config, config_path=dst_path / "config.json")
@@ -562,8 +571,7 @@ def save(
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 
-    if hf_repo is not None:
-        create_model_card(dst_path, hf_repo)
+    create_model_card(dst_path, hf_repo)
 
 
 def common_prefix_len(list1, list2):
