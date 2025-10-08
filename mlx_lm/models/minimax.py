@@ -197,12 +197,11 @@ class MiniMaxLightningAttention(nn.Module):
         y = y.transpose(0, 2, 1, 3).reshape(B, L, self.num_attention_heads * self.head_dim)
         y = self.norm(y)
         y = nn.sigmoid(self.output_gate(x)) * y
-        y = self.out_proj(y)
 
         if cache is not None and cache.kv is not None:
             cache.recurrent.cache = state
-
-        return y
+            
+        return self.out_proj(y)
 
 
 class MiniMaxSparseMoeBlock(nn.Module):
