@@ -223,11 +223,11 @@ class DeepseekV32Attention(nn.Module):
         if topk_indices is not None:
             k_seq = keys.shape[2]
             sparse_mask = mx.zeros((B, L, k_seq), dtype=mx.bool_)
-            ones = mx.ones(topk_indices.shape, dtype=mx.bool_)
-            sparse_mask = mx.put_along_axis(sparse_mask, topk_indices, ones, axis=-1)
+            sparse_mask = mx.put_along_axis(sparse_mask, topk_indices, mx.array(True), axis=-1)
+            sparse_mask = sparse_mask[:, None, :, :]
             if mask is not None:
                 sparse_mask = sparse_mask & mask
-            mask = sparse_mask[:, None, :, :]
+            mask = sparse_mask
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache[0], scale=self.scale, mask=mask
         )
