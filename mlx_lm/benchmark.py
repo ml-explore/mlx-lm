@@ -4,13 +4,8 @@ import argparse
 
 import mlx.core as mx
 
-from mlx_lm import batch_generate, stream_generate
+from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.tokenizer_utils import load_tokenizer
-from mlx_lm.utils import (
-    fetch_from_hub,
-    get_model_path,
-)
 
 
 def setup_arg_parser():
@@ -24,11 +19,6 @@ def setup_arg_parser():
             f"If no model is specified, then {DEFAULT_MODEL} is used."
         ),
         default=None,
-    )
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Enable trusting remote code for tokenizer",
     )
     parser.add_argument(
         "--prompt-tokens",
@@ -68,13 +58,12 @@ def main():
 
     model_path = args.model or DEFAULT_MODEL
 
-    model_path, _ = get_model_path(model_path, revision=None)
-    model, config, _ = fetch_from_hub(model_path, trust_remote_code=True)
-    tokenizer = load_tokenizer(
-        model_path,
-        eos_token_ids=[],  # Empty to avoid early stopping
-        tokenizer_config_extra={"trust_remote_code": True},
+    model, tokenizer, config = load(
+        args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
     )
+
+    # Empty to avoid early stopping
+    tokenizer._eos_token_ids = {}
 
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
