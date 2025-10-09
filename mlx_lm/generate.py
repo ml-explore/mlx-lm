@@ -299,7 +299,7 @@ def generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
-    sampler: Optional[Callable[mx.array, mx.array]] = None,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
@@ -307,7 +307,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
-    prompt_progress_callback: Optional[Callable[int, int]] = None,
+    prompt_progress_callback: Optional[Callable[[int], int]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -333,7 +333,7 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
-        prompt_progress_callback (Callable[int, int]): A call-back which takes the
+        prompt_progress_callback (Callable[[int], int]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
@@ -466,7 +466,7 @@ def speculative_generate_step(
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
-    sampler: Optional[Callable[mx.array, mx.array]] = None,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 512,
@@ -485,7 +485,7 @@ def speculative_generate_step(
           speculative decoding. Default: ``2``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
-        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
+        sampler (Callable[[mx.array], mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
           A list of functions that take tokens and logits and return the processed
@@ -897,7 +897,7 @@ class BatchGenerator:
         model,
         max_tokens: int = 128,
         stop_tokens: Optional[set] = None,
-        sampler: Optional[Callable[mx.array, mx.array]] = None,
+        sampler: Optional[Callable[[mx.array], mx.array]] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
