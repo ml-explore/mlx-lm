@@ -1,13 +1,12 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Optional, List, Any
+from typing import Optional, Any
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask
-from .rope_utils import initialize_rope
 
 
 @dataclass
