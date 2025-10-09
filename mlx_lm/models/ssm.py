@@ -181,7 +181,7 @@ def ssm_attn(
             B[:, i : i + step],
             C[:, i : i + step],
             state,
-            mask,
+            None if mask is None else mask[..., i : i + step],
         )
         ys.append(y)
     y = mx.concatenate(ys, axis=1) + x * D.reshape(1, 1, h, 1)
