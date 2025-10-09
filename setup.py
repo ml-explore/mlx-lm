@@ -6,11 +6,11 @@ from pathlib import Path
 from setuptools import setup
 
 package_dir = Path(__file__).parent / "mlx_lm"
-with open("requirements.txt") as fid:
-    requirements = [l.strip() for l in fid.readlines()]
-
 sys.path.append(str(package_dir))
+
 from _version import __version__
+
+MIN_MLX_VERSION = "0.29.2"
 
 setup(
     name="mlx-lm",
@@ -23,13 +23,22 @@ setup(
     author="MLX Contributors",
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
-    install_requires=requirements,
+    install_requires=[
+        f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
+        "numpy",
+        "transformers>=4.39.3",
+        "protobuf",
+        "pyyaml",
+        "jinja2",
+    ],
     packages=["mlx_lm", "mlx_lm.models", "mlx_lm.quant", "mlx_lm.tuner"],
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
+        "cuda": [f"mlx[cuda]>={MIN_MLX_VERSION}"],
+        "cpu": [f"mlx[cpu]>={MIN_MLX_VERSION}"],
     },
     entry_points={
         "console_scripts": [
