@@ -537,7 +537,10 @@ class TestModels(unittest.TestCase):
         )
         model = qwen3_vl_moe.Model(args)
         self.model_test_runner(
-            model, args.model_type, args.text_config["vocab_size"], args.text_config["num_hidden_layers"]
+            model,
+            args.model_type,
+            args.text_config["vocab_size"],
+            args.text_config["num_hidden_layers"],
         )
 
     def test_qwen3(self):

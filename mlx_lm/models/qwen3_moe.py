@@ -215,10 +215,7 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-        input_embeddings: Optional[mx.array] = None
+        self, inputs: mx.array, cache=None, input_embeddings: Optional[mx.array] = None
     ):
         out = self.model(inputs, cache, input_embeddings)
         return self.lm_head(out)
