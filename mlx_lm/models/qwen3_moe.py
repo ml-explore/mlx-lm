@@ -188,8 +188,12 @@ class Qwen3MoeModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        h = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -214,8 +218,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings)
         return self.lm_head(out)
 
     def sanitize(self, weights):
