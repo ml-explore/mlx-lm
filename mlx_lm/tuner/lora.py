@@ -176,19 +176,25 @@ class LoRASwitchLinear(nn.Module):
         self.lora_a = mx.random.uniform(
             low=-scale,
             high=scale,
-            shape=(r * num_experts, input_dims),
+            shape=(num_experts, r, input_dims),
         )
         self.lora_b = mx.zeros(shape=(num_experts, output_dims, r))
         self.num_experts = num_experts
 
-    def __call__(self, x, indices):
-        shape = x.shape[:-3] + (self.num_experts, -1)
-
-        y = self.linear(x, indices)
-        z = (self.dropout(x) @ self.lora_a.T).reshape(shape)
-        z = mx.take_along_axis(z, indices[..., None], axis=-2)
-        z = z[..., None, :] @ self.lora_b[indices].swapaxes(-2, -1)
-
+    def __call__(self, x, indices, sorted_indices=False):
+        y = self.linear(x, indices, sorted_indices=sorted_indices)
+        z = mx.gather_mm(
+            self.dropout(x),
+            self.lora_a.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
+        z = mx.gather_mm(
+            z,
+            self.lora_b.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
         return y + (self.scale * z).astype(x.dtype)
 
 

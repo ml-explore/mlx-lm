@@ -18,8 +18,7 @@ from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     compute_bits_per_weight,
-    fetch_from_hub,
-    get_model_path,
+    load,
     save,
 )
 
@@ -202,8 +201,7 @@ def main():
 
     mx.random.seed(args.seed)
 
-    model_path, hf_repo = get_model_path(args.model, revision=None)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+    model, tokenizer, config = load(args.model, lazy=True, return_config=True)
     calibration_data = load_data(tokenizer, args.num_samples, args.sequence_length)
 
     model, config["quantization"] = gptq_quantize(
@@ -220,11 +218,10 @@ def main():
 
     save(
         args.mlx_path,
-        model_path,
+        args.model,
         model,
         tokenizer,
         config,
-        hf_repo=hf_repo,
     )
 
 

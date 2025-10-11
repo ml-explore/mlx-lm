@@ -27,7 +27,10 @@ class TestUtils(unittest.TestCase):
         cls.test_dir_fid.cleanup()
 
     def test_load(self):
+        from mlx_lm.models.qwen2 import Model as Qwen2Model
+
         model, _ = utils.load(HF_MODEL_PATH)
+        self.assertIsInstance(model, Qwen2Model)
 
         model_lazy, _ = utils.load(HF_MODEL_PATH, lazy=True)
 
@@ -90,6 +93,35 @@ class TestUtils(unittest.TestCase):
 
         self.assertEqual(model.layers[0].mlp.up_proj.scales.dtype, mx.bfloat16)
         self.assertEqual(model.layers[-1].mlp.up_proj.scales.dtype, mx.bfloat16)
+
+    def test_load_model_with_custom_get_classes(self):
+        class CustomQwenModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+                self.config = args
+                self.custom_attribute = "This is a custom model"
+
+            def load_weights(self, weights, **kwargs):
+                self.qwenWeights = weights
+
+        class CustomQwenConfig:
+            @classmethod
+            def from_dict(cls, config):
+                instance = cls()
+                for k, v in config.items():
+                    setattr(instance, k, v)
+                return instance
+
+        def custom_get_classes(config):
+            return CustomQwenModel, CustomQwenConfig
+
+        model_path = utils.hf_repo_to_path(HF_MODEL_PATH)
+        model, _ = utils.load_model(model_path, get_model_classes=custom_get_classes)
+
+        self.assertIsInstance(model, CustomQwenModel)
+        self.assertTrue(hasattr(model, "custom_attribute"))
+        self.assertEqual(model.custom_attribute, "This is a custom model")
+        self.assertTrue(hasattr(model, "qwenWeights"))
 
 
 if __name__ == "__main__":

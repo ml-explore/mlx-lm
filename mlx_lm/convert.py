@@ -10,8 +10,7 @@ from mlx.utils import tree_map_with_path
 
 from .utils import (
     dequantize_model,
-    fetch_from_hub,
-    get_model_path,
+    load,
     quantize_model,
     save,
     upload_to_hub,
@@ -63,7 +62,9 @@ def mixed_quant_predicate_builder(
             or index >= 7 * num_layers // 8
             or (index - num_layers // 8) % 3 == 2
         )
-        if "v_proj" in path and use_more_bits:
+        if (
+            "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
+        ) and use_more_bits:
             return {"group_size": group_size, "bits": high_bits}
         if "down_proj" in path and use_more_bits:
             return {"group_size": group_size, "bits": high_bits}
@@ -107,9 +108,12 @@ def convert(
         )
 
     print("[INFO] Loading")
-    model_path, hf_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
+    model, tokenizer, config = load(
+        hf_path,
+        revision=revision,
+        return_config=True,
+        tokenizer_config={"trust_remote_code": trust_remote_code},
+        lazy=True,
     )
 
     if isinstance(quant_predicate, str):
@@ -154,11 +158,10 @@ def convert(
 
     save(
         mlx_path,
-        model_path,
+        hf_path,
         model,
         tokenizer,
         config,
-        hf_repo=hf_path,
     )
 
     if upload_repo is not None:

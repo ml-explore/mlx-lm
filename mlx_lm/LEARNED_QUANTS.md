@@ -129,7 +129,7 @@ mlx_lm.awq --help
 Use `mlx_lm.gptq` to run GPTQ on a given model. For example:
 
 ```bash
-mlx_lm.awq --model Qwen/Qwen3-0.6B
+mlx_lm.gptq --model Qwen/Qwen3-0.6B
 ```
 
 The script can take anywhere from a few minutes to several hours depending on

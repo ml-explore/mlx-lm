@@ -37,6 +37,7 @@ class ModelArgs(BaseModelArgs):
     use_qk_norm: bool = False
     tie_word_embeddings: bool = False
     partial_rotary_factor: float = 1.0
+    rotary_dim: Optional[int] = None
     moe_router_enable_expert_bias: bool = False
     moe_router_enable_routed_scaling: bool = True
     routed_scaling_factor: float = 1.0
@@ -94,8 +95,10 @@ class BailingMoeAttention(nn.Module):
             self.key_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
             self.query_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
+        if (rope_dim := args.rotary_dim) is None:
+            rope_dim = int(self.head_dim * args.partial_rotary_factor)
         self.rope = initialize_rope(
-            int(self.head_dim * args.partial_rotary_factor),
+            rope_dim,
             args.rope_theta,
             traditional=False,
             scaling_config=args.rope_scaling,
@@ -179,7 +182,7 @@ def group_expert_select(
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
+        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
         scores = scores / denominator
     scores = scores * routed_scaling_factor
 
