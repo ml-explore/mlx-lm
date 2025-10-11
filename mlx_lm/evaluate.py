@@ -307,7 +307,7 @@ class MLXLM(LM):
         group = mx.distributed.init()
 
         # split data accross ranks
-        pad_to = (len(requests) + group.size() - 1) // group.size()
+        total_requests = len(requests)
         requests = requests[group.rank() :: group.size()]
 
         logging.info("Generating continuation for %d sequences." % len(requests))
@@ -342,8 +342,8 @@ class MLXLM(LM):
         # Gather the completions
         if group.size() > 1:
             with mx.stream(mx.cpu):
-                n = len(completions)
-                pad = pad_to - n
+                pad_to = (total_requests + group.size() - 1) // group.size()
+                pad = pad_to - len(completions)
                 completions = [list(c.encode("utf-8")) for c in completions]
                 max_len = mx.array(max(len(c) for c in completions))
                 max_len = mx.distributed.all_max(max_len).item()
@@ -365,8 +365,8 @@ class MLXLM(LM):
                     .flatten(0, 1)
                     .tolist()
                 )
-                completions = completions[:n]
-                lengths = lengths[:n]
+                completions = completions[:total_requests]
+                lengths = lengths[:total_requests]
                 completions = [
                     bytearray(c[:l]).decode() for c, l in zip(completions, lengths)
                 ]
