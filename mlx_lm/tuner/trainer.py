@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 from .callbacks import TrainingCallback
@@ -63,6 +63,12 @@ class TrainingArgs:
     grad_checkpoint: bool = field(
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
+    )
+    grad_accumulation_steps: int = field(
+        default=1,
+        metadata={
+            "help": "Number of steps to accumulate gradients before applying an optimizer update."
+        },
     )
 
 
@@ -209,22 +215,29 @@ def train(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
+    loss_value_and_grad = nn.value_and_grad(model, loss)
+
+    grad_accum_steps = args.grad_accumulation_steps
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accumulation_steps must be at least 1")
+
     state = [model.state, optimizer.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch):
-        # Forward and backward pass
+    def step(batch, prev_grad, do_update):
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
 
-        # All reduce the gradients if running in distributed mode
-        grad = average_gradients(grad)
+        if prev_grad is not None:
+            grad = tree_map(lambda x, y: x + y, grad, prev_grad)
 
-        # Model update
-        optimizer.update(model, grad)
+        if do_update:
+            grad = average_gradients(grad)
+            if grad_accum_steps > 1:
+                grad = tree_map(lambda x: x / grad_accum_steps, grad)
+            optimizer.update(model, grad)
+            grad = None
 
-        return lvalue, toks
-
-    loss_value_and_grad = nn.value_and_grad(model, loss)
+        return lvalue, toks, grad
 
     model.train()
     losses = 0
@@ -232,6 +245,8 @@ def train(
     steps = 0
     trained_tokens = 0
     train_time = 0
+    grad_accum = None
+
     # Main training loop
     for it, batch in zip(
         range(1, args.iters + 1),
@@ -276,11 +291,16 @@ def train(
 
             tic = time.perf_counter()
 
-        lvalue, toks = step(batch)
+        lvalue, toks, grad_accum = step(
+            batch,
+            grad_accum,
+            it % grad_accum_steps == 0,
+        )
+
         losses += lvalue
         n_tokens += toks
         steps += 1
-        mx.eval(state, losses, n_tokens)
+        mx.eval(state, losses, n_tokens, grad_accum)
         train_time += time.perf_counter() - tic
 
         # Report training loss if needed
