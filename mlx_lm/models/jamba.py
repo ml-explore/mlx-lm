@@ -285,6 +285,7 @@ class JambaMambaDecoderLayer(nn.Module):
 
 class JambaModel(nn.Module):
     def __init__(self, args: ModelArgs):
+        super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
         self.layers = [
