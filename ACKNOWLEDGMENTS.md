@@ -11,9 +11,9 @@ MLX LM was developed with contributions from the following individuals:
 - Gökdeniz Gülmez: Added support for the following architectures: OpenBMB's
   `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's `Mamba v1`, `Mamba v2`, Z.ai &
    THUKEG's `GLM`, `GLM4`, Rednote `dots.llm1`, Baisu's `Ernie4.5 MoE`, inclusionAI's
-   `Bailing MoE e.g. Ling-family`, Klear team - Kuaishou Technology's `Klear`,
-   IBM's `Granite MoE`, Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's
-   `Apertus`, Nikity's `Lille130m`, Alibaba Qwen's `Qwen3Next`, and Allenai's `OLMoE` and `Olmo 3`;
+   `Bailing MoE e.g. Ling-family`, Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba`
+   IBM's `Granite MoE`, Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's `Apertus`, 
+   Nikity's `Lille130m`, Alibaba Qwen's `Qwen3Next`, and Allenai's `OLMoE` and `Olmo 3`;
    Helped add support for the following model architectures: Alibaba Qwen's `Qwen3 & Qwen3MoE)`;
    Added support for the following training algorithms: `Full Weight Fine-Tuning`, and the `Muon`
    optimizer; Added support for the following other features: `Multiple Optimizers
