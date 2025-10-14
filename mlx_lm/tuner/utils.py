@@ -80,7 +80,6 @@ def linear_to_lora_layers(
             scale=config["scale"],
             dropout=config["dropout"],
         )
-
     if (keys := config.get("keys", None)) is None:
         keys = set()
 
