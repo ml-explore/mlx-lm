@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,7 +37,7 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     max_position_embeddings: int
     vocab_size: int
-    mamba_dt_rank: str | int = "auto"
+    mamba_dt_rank: Union[str, int] = "auto"
     mamba_proj_bias: bool = False
     mamba_conv_bias: bool = True
     layers_block_type: Optional[List[str]] = None
