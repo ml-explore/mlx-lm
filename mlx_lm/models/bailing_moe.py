@@ -56,7 +56,9 @@ def swiglu(gate, up):
 
 @partial(mx.compile, shapeless=True)
 def aggregate_expert_outputs(expert_outputs, scores):
-    return (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
+    return (
+        (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
+    )
 
 
 class BailingMoeMLP(nn.Module):
