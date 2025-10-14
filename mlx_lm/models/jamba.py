@@ -1,14 +1,19 @@
 # Copyright © 2025 Apple Inc.
 
-from dataclasses import dataclass
-from typing import Optional, Any, List
 import math
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, scaled_dot_product_attention, create_attention_mask, create_ssm_mask
-from .cache import KVCache, MambaCache, CacheList
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
+from .cache import CacheList, KVCache, MambaCache
 from .switch_layers import SwitchGLU
 
 
@@ -32,7 +37,7 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     max_position_embeddings: int
     vocab_size: int
-    mamba_dt_rank: Optional[str|int] = None
+    mamba_dt_rank: Optional[str | int] = None
     mamba_proj_bias: bool = False
     mamba_conv_bias: bool = True
     layers_block_type: Optional[List[str]] = None
@@ -43,7 +48,11 @@ class ModelArgs(BaseModelArgs):
             self.mamba_dt_rank = math.ceil(self.hidden_size / 16)
         if self.layers_block_type is None:
             self.layers_block_type = [
-                "attention" if i % self.attn_layer_period == self.attn_layer_offset else "mamba"
+                (
+                    "attention"
+                    if i % self.attn_layer_period == self.attn_layer_offset
+                    else "mamba"
+                )
                 for i in range(self.num_hidden_layers)
             ]
 
@@ -67,10 +76,18 @@ class JambaAttention(nn.Module):
         self.head_dim = args.hidden_size // args.num_attention_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
 
     def __call__(
         self,
@@ -82,9 +99,13 @@ class JambaAttention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(
+            0, 2, 1, 3
+        )
         keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -123,11 +144,9 @@ class JambaMambaMixer(nn.Module):
         self.x_proj = nn.Linear(
             self.intermediate_size,
             self.time_step_rank + self.ssm_state_size * 2,
-            bias=False
+            bias=False,
         )
-        self.dt_proj = nn.Linear(
-            self.time_step_rank, self.intermediate_size, bias=True
-        )
+        self.dt_proj = nn.Linear(self.time_step_rank, self.intermediate_size, bias=True)
 
         A = mx.repeat(
             mx.arange(1.0, self.ssm_state_size + 1.0).reshape([1, self.ssm_state_size]),
@@ -144,7 +163,6 @@ class JambaMambaMixer(nn.Module):
         self.dt_layernorm = nn.RMSNorm(self.time_step_rank, eps=args.rms_norm_eps)
         self.b_layernorm = nn.RMSNorm(self.ssm_state_size, eps=args.rms_norm_eps)
         self.c_layernorm = nn.RMSNorm(self.ssm_state_size, eps=args.rms_norm_eps)
-
 
     def ssm_step(self, x, A, state=None):
         D = self.D
@@ -208,7 +226,9 @@ class JambaSparseMoeBlock(nn.Module):
         self.num_experts_per_tok = args.num_experts_per_tok
 
         self.router = nn.Linear(args.hidden_size, args.num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(args.hidden_size, args.intermediate_size, args.num_experts)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size, args.intermediate_size, args.num_experts
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.router(x)
@@ -219,7 +239,7 @@ class JambaSparseMoeBlock(nn.Module):
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         return y
-    
+
 
 class JambaAttentionDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -251,7 +271,7 @@ class JambaMambaDecoderLayer(nn.Module):
         self.feed_forward = ffn_layer_class(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_ff_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-    
+
     def __call__(
         self,
         x: mx.array,
@@ -268,11 +288,15 @@ class JambaModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
         self.layers = [
-            JambaMambaDecoderLayer(args) if args.layers_block_type[i] == "mamba" else JambaAttentionDecoderLayer(args)
+            (
+                JambaMambaDecoderLayer(args)
+                if args.layers_block_type[i] == "mamba"
+                else JambaAttentionDecoderLayer(args)
+            )
             for i in range(args.num_hidden_layers)
         ]
         self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-    
+
     def __call__(
         self,
         inputs: mx.array,
@@ -282,9 +306,13 @@ class JambaModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
-        
+
         for layer, c in zip(self.layers, cache):
-            mask = create_ssm_mask(h, c) if layer.type == "mamba" else create_attention_mask(h, c)
+            mask = (
+                create_ssm_mask(h, c)
+                if layer.type == "mamba"
+                else create_attention_mask(h, c)
+            )
             h = layer(h, mask=mask, cache=c)
 
         return self.final_layernorm(h)
@@ -310,7 +338,7 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
-    
+
     def make_cache(self):
         caches = []
         for layer in self.model.layers:
@@ -319,7 +347,7 @@ class Model(nn.Module):
             else:
                 caches.append(KVCache())
         return caches
-    
+
     def sanitize(self, weights):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -346,7 +374,7 @@ class Model(nn.Module):
                             mx.stack(to_join)
                         )
         return weights
-    
+
     @property
     def layers(self):
         return self.model.layers
