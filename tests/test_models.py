@@ -1893,6 +1893,26 @@ class TestModels(unittest.TestCase):
                 "tie_word_embeddings": True,
                 "max_position_embeddings": 1000,
             },
+            {
+                "model_type": "jamba",
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "attn_layer_offset": 1,
+                "attn_layer_period": 2,
+                "expert_layer_offset": 1,
+                "expert_layer_period": 2,
+                "mamba_d_conv": 4,
+                "mamba_d_state": 128,
+                "mamba_expand": 128,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "rms_norm_eps": 1e-5,
+                "max_position_embeddings": 1000,
+                "vocab_size": 1000,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]

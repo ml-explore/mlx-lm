@@ -13,7 +13,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import CacheList, KVCache, MambaCache
+from .cache import KVCache, MambaCache
 from .switch_layers import SwitchGLU
 
 
@@ -21,7 +21,7 @@ from .switch_layers import SwitchGLU
 class ModelArgs(BaseModelArgs):
     model_type: str
     hidden_size: int
-    intermediate_size: float
+    intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -37,7 +37,7 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     max_position_embeddings: int
     vocab_size: int
-    mamba_dt_rank: Optional[str | int] = None
+    mamba_dt_rank: str | int = "auto"
     mamba_proj_bias: bool = False
     mamba_conv_bias: bool = True
     layers_block_type: Optional[List[str]] = None
@@ -118,6 +118,11 @@ class JambaAttention(nn.Module):
         return self.o_proj(output)
 
 
+@mx.compile
+def fma(a, b, c):
+    return a * b + c
+
+
 class JambaMambaMixer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -165,6 +170,7 @@ class JambaMambaMixer(nn.Module):
         self.c_layernorm = nn.RMSNorm(self.ssm_state_size, eps=args.rms_norm_eps)
 
     def ssm_step(self, x, A, state=None):
+        T = x.shape[1]
         D = self.D
         deltaBC = self.x_proj(x)
         delta, B, C = mx.split(
@@ -174,48 +180,47 @@ class JambaMambaMixer(nn.Module):
         )
         delta, B, C = self.dt_layernorm(delta), self.b_layernorm(B), self.c_layernorm(C)
         delta = nn.softplus(self.dt_proj(delta))
-        new_state = mx.expand_dims(delta * x, -1) * mx.expand_dims(B, 1)
-        if state is not None:
-            new_state += state * mx.exp(mx.expand_dims(delta, -1) * A)
-        y = (new_state @ mx.expand_dims(C, -1)).squeeze(2)
-        y = y + D * x
-        return y, new_state
+        new_state = mx.expand_dims(delta * x, -1) * mx.expand_dims(B, -2)
+        dtA = mx.exp(mx.expand_dims(delta, -1) * A)
 
-    def _process_sequence(self, x, conv_cache, state_cache):
-        B, T, D = x.shape
+        # TODO, speed up prefill with chunked scan
+        for t in range(T):
+            if state is not None:
+                new_state[:, t] = fma(state, dtA[:, t], new_state[:, t])
+            state = new_state[:, t]
+        y = (new_state @ mx.expand_dims(C, -1)).squeeze(-1)
+        y = y + D * x
+        return y, new_state[:, -1]
+
+    def _process_sequence(self, x, conv_state, ssm_state):
         xz = self.in_proj(x)
         x, z = xz.split(indices_or_sections=2, axis=-1)
         K = self.conv_kernel_size
-        if conv_cache is not None:
-            x_full = mx.concatenate([conv_cache, x], axis=1)
+        if conv_state is not None:
+            x_full = mx.concatenate([conv_state, x], axis=1)
         else:
             x_full = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
         conv_out = self.conv1d(x_full)
-        new_conv_cache = x_full[:, -(K - 1) :, :]
+        conv_state = x_full[:, -(K - 1) :, :]
         x = nn.silu(conv_out)
         A = -mx.exp(self.A_log)
-        current_state = state_cache
-        y = []
-        for t in range(T):
-            y_t, current_state = self.ssm_step(x[:, t], A, current_state)
-            y.append(y_t)
-        y = mx.stack(y, axis=1)
+        y, ssm_state = self.ssm_step(x, A, ssm_state)
         z = self.out_proj(nn.silu(z) * y)
-        return z, (new_conv_cache, current_state)
+        return z, (conv_state, ssm_state)
 
     def __call__(self, x, cache):
         if cache is None:
-            conv_cache, state_cache = None, None
+            conv_state, ssm_state = None, None
         else:
-            conv_cache, state_cache = cache[0], cache[1]
+            conv_state, ssm_state = cache[0], cache[1]
 
-        output, (new_conv_cache, new_state_cache) = self._process_sequence(
-            x, conv_cache, state_cache
+        output, (conv_state, ssm_state) = self._process_sequence(
+            x, conv_state, ssm_state
         )
 
-        if isinstance(cache, MambaCache):
-            cache[0] = new_conv_cache
-            cache[1] = new_state_cache
+        if cache is not None:
+            cache[0] = conv_state
+            cache[1] = ssm_state
 
         return output
 
@@ -241,11 +246,14 @@ class JambaSparseMoeBlock(nn.Module):
         return y
 
 
-class JambaAttentionDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
+class JambaDecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs, layer_type: str):
         super().__init__()
-        self.type = "attention"
-        self.self_attn = JambaAttention(args)
+        self.is_attn = layer_type == "attention"
+        if self.is_attn:
+            self.self_attn = JambaAttention(args)
+        else:
+            self.mamba = JambaMambaMixer(args)
         ffn_layer_class = JambaSparseMoeBlock if args.num_experts > 1 else JambaMLP
         self.feed_forward = ffn_layer_class(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -257,28 +265,11 @@ class JambaAttentionDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        out = r + self.feed_forward(self.pre_ff_layernorm(r))
-        return out
-
-
-class JambaMambaDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.type = "mamba"
-        self.mamba = JambaMambaMixer(args)
-        ffn_layer_class = JambaSparseMoeBlock if args.num_experts > 1 else JambaMLP
-        self.feed_forward = ffn_layer_class(args)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.pre_ff_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = x + self.mamba(self.input_layernorm(x), cache=cache)
+        if self.is_attn:
+            h = self.self_attn(self.input_layernorm(x), mask, cache)
+        else:
+            h = self.mamba(self.input_layernorm(x), cache)
+        r = x + h
         out = r + self.feed_forward(self.pre_ff_layernorm(r))
         return out
 
@@ -288,15 +279,10 @@ class JambaModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
-        self.layers = [
-            (
-                JambaMambaDecoderLayer(args)
-                if args.layers_block_type[i] == "mamba"
-                else JambaAttentionDecoderLayer(args)
-            )
-            for i in range(args.num_hidden_layers)
-        ]
+        self.layers = [JambaDecoderLayer(args, t) for t in args.layers_block_type]
         self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.attn_idx = args.layers_block_type.index("attention")
+        self.ssm_idx = args.layers_block_type.index("mamba")
 
     def __call__(
         self,
@@ -308,12 +294,11 @@ class JambaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        attn_mask = create_attention_mask(h, cache[self.attn_idx])
+        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+
         for layer, c in zip(self.layers, cache):
-            mask = (
-                create_ssm_mask(h, c)
-                if layer.type == "mamba"
-                else create_attention_mask(h, c)
-            )
+            mask = attn_mask if layer.is_attn else ssm_mask
             h = layer(h, mask=mask, cache=c)
 
         return self.final_layernorm(h)
@@ -343,10 +328,10 @@ class Model(nn.Module):
     def make_cache(self):
         caches = []
         for layer in self.model.layers:
-            if layer.type == "mamba":
-                caches.append(MambaCache())
-            else:
+            if layer.is_attn:
                 caches.append(KVCache())
+            else:
+                caches.append(MambaCache())
         return caches
 
     def sanitize(self, weights):
@@ -379,3 +364,12 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("router"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
