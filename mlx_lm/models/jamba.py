@@ -237,7 +237,7 @@ class JambaAttentionDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = x + self.self_attn(self.input_layernorm(x), mask, cache[1])
+        r = x + self.self_attn(self.input_layernorm(x), mask, cache)
         out = r + self.feed_forward(self.pre_ff_layernorm(r))
         return out
 
@@ -258,7 +258,7 @@ class JambaMambaDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = x + self.mamba(self.input_layernorm(x), cache=cache[0])
+        r = x + self.mamba(self.input_layernorm(x), cache=cache)
         out = r + self.feed_forward(self.pre_ff_layernorm(r))
         return out
 
@@ -283,11 +283,8 @@ class JambaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         
-        mamba_mask = create_ssm_mask(h, cache[0][0])
-        attn_mask = create_attention_mask(h, cache[0][1])
-
         for layer, c in zip(self.layers, cache):
-            mask = mamba_mask if layer.type == "mamba" else attn_mask
+            mask = create_ssm_mask(h, c) if layer.type == "mamba" else create_attention_mask(h, c)
             h = layer(h, mask=mask, cache=c)
 
         return self.final_layernorm(h)
@@ -315,7 +312,13 @@ class Model(nn.Module):
         return out
     
     def make_cache(self):
-        return [CacheList(MambaCache(), KVCache()) for _ in self.model.layers]
+        caches = []
+        for layer in self.model.layers:
+            if layer.type == "mamba":
+                caches.append(MambaCache())
+            else:
+                caches.append(KVCache())
+        return caches
     
     def sanitize(self, weights):
         for k, v in weights.items():
