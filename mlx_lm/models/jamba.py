@@ -335,30 +335,36 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
-        for k, v in weights.items():
+        for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:
-            return weights
+        w_to_proj = {
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        }
+
+        def stack_expert_tensors(layer_idx, tensor_name):
+            for w_key, proj in w_to_proj.items():
+                base = f"model.layers.{layer_idx}.feed_forward.experts"
+                expert_tensors = []
+                e = 0
+                while f"{base}.{e}.{w_key}.{tensor_name}" in weights:
+                    expert_tensors.append(weights.pop(f"{base}.{e}.{w_key}.{tensor_name}"))
+                    e += 1
+                if expert_tensors:
+                    stacked = mx.stack(expert_tensors)
+                    weights[f"model.layers.{layer_idx}.feed_forward.switch_mlp.{proj}.{tensor_name}"] = stacked
 
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.block_sparse_moe.experts.0.{n}.{k}" in weights:
-                        to_join = [
-                            weights.pop(
-                                f"{prefix}.block_sparse_moe.experts.{e}.{n}.{k}"
-                            )
-                            for e in range(self.args.num_local_experts)
-                        ]
-                        weights[f"{prefix}.block_sparse_moe.switch_mlp.{m}.{k}"] = (
-                            mx.stack(to_join)
-                        )
+            if any(key.startswith(f"model.layers.{l}.feed_forward.experts.") for key in weights.keys()):
+                for name in ["weight", "bias", "scales", "biases"]:
+                    stack_expert_tensors(l, name)
+
         return weights
 
     @property
