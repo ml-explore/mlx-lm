@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -201,6 +202,11 @@ class NanoChatModel(nn.Module):
         return h
 
 
+@partial(mx.compile, shapeless=True)
+def softcap(logits, cap=15.0):
+    return cap * mx.tanh(logits / cap)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -218,8 +224,7 @@ class Model(nn.Module):
         logits = self.lm_head(out)
 
         # Critical: logits softcap (nanochat uses softcap=15)
-        softcap = 15.0
-        logits = softcap * mx.tanh(logits / softcap)
+        logits = softcap(logits)
 
         return logits
 
