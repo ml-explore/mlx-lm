@@ -335,7 +335,7 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
-        for k, v in list(weights.items()):
+        for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
@@ -354,14 +354,21 @@ class Model(nn.Module):
                 expert_tensors = []
                 e = 0
                 while f"{base}.{e}.{w_key}.{tensor_name}" in weights:
-                    expert_tensors.append(weights.pop(f"{base}.{e}.{w_key}.{tensor_name}"))
+                    expert_tensors.append(
+                        weights.pop(f"{base}.{e}.{w_key}.{tensor_name}")
+                    )
                     e += 1
                 if expert_tensors:
                     stacked = mx.stack(expert_tensors)
-                    weights[f"model.layers.{layer_idx}.feed_forward.switch_mlp.{proj}.{tensor_name}"] = stacked
+                    weights[
+                        f"model.layers.{layer_idx}.feed_forward.switch_mlp.{proj}.{tensor_name}"
+                    ] = stacked
 
         for l in range(self.args.num_hidden_layers):
-            if any(key.startswith(f"model.layers.{l}.feed_forward.experts.") for key in weights.keys()):
+            if any(
+                key.startswith(f"model.layers.{l}.feed_forward.experts.")
+                for key in weights.keys()
+            ):
                 for name in ["weight", "bias", "scales", "biases"]:
                     stack_expert_tensors(l, name)
 
