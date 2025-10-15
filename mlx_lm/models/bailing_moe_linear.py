@@ -267,27 +267,39 @@ class BailingMoeLinearLinearAttention(nn.Module):
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
 
-        if cache is not None and cache.kv is not None:
-            queries = self.rope(queries, offset=cache.kv.offset)
-            keys = self.rope(keys, offset=cache.kv.offset)
-            keys, values = cache.kv.update_and_fetch(keys, values)
+        if L == 1 and cache is not None and cache.kv is not None:
+            # Fast path: Only update cache, don't fetch old values
+            offset = cache.kv.offset
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
+
+            # Update cache without fetching (just increment offset)
+            cache.kv.update_and_fetch(keys, values)
+
+            T_kv = L  # Only processing current token
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            # Slow path: For prompt processing, we need the full cache
+            if cache is not None and cache.kv is not None:
+                queries = self.rope(queries, offset=cache.kv.offset)
+                keys = self.rope(keys, offset=cache.kv.offset)
+                keys, values = cache.kv.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
 
-        if self.num_key_value_groups > 1:
-            keys = mx.repeat(keys, self.num_key_value_groups, axis=1)
-            values = mx.repeat(values, self.num_key_value_groups, axis=1)
+            if self.num_key_value_groups > 1:
+                keys = mx.repeat(keys, self.num_key_value_groups, axis=1)
+                values = mx.repeat(values, self.num_key_value_groups, axis=1)
 
-        T_q, T_kv = queries.shape[2], keys.shape[2]
-        if T_q < T_kv:
-            queries = mx.pad(queries, [(0, 0), (0, 0), (T_kv - T_q, 0), (0, 0)])
-        elif T_q > T_kv:
-            queries = queries[:, :, -T_kv:, :]
+            T_q, T_kv = queries.shape[2], keys.shape[2]
+            if T_q < T_kv:
+                queries = mx.pad(queries, [(0, 0), (0, 0), (T_kv - T_q, 0), (0, 0)])
+            elif T_q > T_kv:
+                queries = queries[:, :, -T_kv:, :]
 
-        if mask is not None and isinstance(mask, mx.array) and cache is not None:
-            mask_array = mask.astype(mx.float32)
-            values = values * mask_array[:, -queries.shape[2] :, None, None]
+            if mask is not None and isinstance(mask, mx.array) and cache is not None:
+                mask_array = mask.astype(mx.float32)
+                values = values * mask_array[:, -queries.shape[2] :, None, None]
 
         g = mx.broadcast_to(
             self.slope[None, :, None], (B, self.num_attention_heads, T_kv)
