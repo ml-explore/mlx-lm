@@ -370,6 +370,7 @@ class TestModels(unittest.TestCase):
             group_norm_size=1,
         )
         model = bailing_moe_linear.Model(args)
+
     def test_lfm2_moe(self):
         from mlx_lm.models import lfm2_moe
 

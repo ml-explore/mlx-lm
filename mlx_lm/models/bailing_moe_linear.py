@@ -268,17 +268,12 @@ class BailingMoeLinearLinearAttention(nn.Module):
             keys = self.key_layernorm(keys)
 
         if L == 1 and cache is not None and cache.kv is not None:
-            # Fast path: Only update cache, don't fetch old values
             offset = cache.kv.offset
             queries = self.rope(queries, offset=offset)
             keys = self.rope(keys, offset=offset)
-
-            # Update cache without fetching (just increment offset)
             cache.kv.update_and_fetch(keys, values)
-
-            T_kv = L  # Only processing current token
+            T_kv = L
         else:
-            # Slow path: For prompt processing, we need the full cache
             if cache is not None and cache.kv is not None:
                 queries = self.rope(queries, offset=cache.kv.offset)
                 keys = self.rope(keys, offset=cache.kv.offset)
