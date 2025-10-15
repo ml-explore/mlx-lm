@@ -46,10 +46,20 @@ def apply_rotary_emb(x, offset, base=10000.0, freqs=None):
     if freqs is None:
         # Compute negated frequencies
         half_D = head_dim // 2
-        freqs = -mx.exp(mx.arange(0.0, half_D, dtype=mx.float32) * (math.log(base) / half_D))
+        freqs = -mx.exp(
+            mx.arange(0.0, half_D, dtype=mx.float32) * (math.log(base) / half_D)
+        )
 
     # Use traditional=False + negated freqs
-    return mx.fast.rope(x, dims=head_dim, traditional=False, base=None, freqs=freqs, scale=1.0, offset=offset)
+    return mx.fast.rope(
+        x,
+        dims=head_dim,
+        traditional=False,
+        base=None,
+        freqs=freqs,
+        scale=1.0,
+        offset=offset,
+    )
 
 
 class Attention(nn.Module):
@@ -63,15 +73,22 @@ class Attention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.rope_theta = args.rope_theta
 
-        self.c_q = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.c_q = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.c_k = nn.Linear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.c_v = nn.Linear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
         self.c_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
         # Precompute negated RoPE frequencies for awni's approach
         half_D = self.head_dim // 2
         self._rope_freqs = -mx.exp(
-            mx.arange(0.0, half_D, dtype=mx.float32) * (math.log(self.rope_theta) / half_D)
+            mx.arange(0.0, half_D, dtype=mx.float32)
+            * (math.log(self.rope_theta) / half_D)
         )
 
     def __call__(
@@ -87,14 +104,24 @@ class Attention(nn.Module):
         values = self.c_v(x)
 
         # Reshape to (B, L, H, D) then transpose to (B, H, L, D)
-        queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        keys = keys.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        values = values.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
 
         # Apply RoPE using precomputed frequencies (expects B, H, T, D format)
         offset = cache.offset if cache is not None else 0
-        queries = apply_rotary_emb(queries, offset=offset, base=self.rope_theta, freqs=self._rope_freqs)
-        keys = apply_rotary_emb(keys, offset=offset, base=self.rope_theta, freqs=self._rope_freqs)
+        queries = apply_rotary_emb(
+            queries, offset=offset, base=self.rope_theta, freqs=self._rope_freqs
+        )
+        keys = apply_rotary_emb(
+            keys, offset=offset, base=self.rope_theta, freqs=self._rope_freqs
+        )
 
         # QK norm (critical feature of nanochat!)
         queries = rms_norm(queries)
