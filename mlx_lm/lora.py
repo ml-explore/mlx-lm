@@ -61,6 +61,7 @@ CONFIG_DEFAULTS = {
     "steps_per_report": 10,
     "steps_per_eval": 200,
     "resume_adapter_file": None,
+    "iteration_offset": 0,
     "adapter_path": "adapters",
     "save_every": 100,
     "test": False,
@@ -153,6 +154,13 @@ def build_parser():
         help="Load path to resume training from the given fine-tuned weights.",
     )
     parser.add_argument(
+        "--iteration-offset",
+        type=int,
+        help=(
+            "Offset applied to iteration-dependent reporting and adapter checkpoint names."
+        ),
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         help="Save/load path for the fine-tuned weights.",
@@ -241,6 +249,8 @@ def train_model(
     if args.resume_adapter_file is not None:
         print(f"Loading fine-tuned weights from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
+    if args.iteration_offset < 0:
+        raise ValueError("iteration_offset must be non-negative")
 
     print_trainable_parameters(model)
 
@@ -258,6 +268,7 @@ def train_model(
         steps_per_report=args.steps_per_report,
         steps_per_eval=args.steps_per_eval,
         steps_per_save=args.save_every,
+        iteration_offset=args.iteration_offset,
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,

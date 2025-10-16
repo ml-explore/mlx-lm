@@ -56,6 +56,10 @@ class TrainingArgs:
     max_seq_length: int = field(
         default=2048, metadata={"help": "Maximum sequence length."}
     )
+    iteration_offset: int = field(
+        default=0,
+        metadata={"help": "Offset applied to iteration-dependent reporting and saves."},
+    )
     adapter_file: str = field(
         default="adapters.safetensors",
         metadata={"help": "Save/load path for the trained adapter weights."},
@@ -220,6 +224,8 @@ def train(
     grad_accum_steps = args.grad_accumulation_steps
     if grad_accum_steps < 1:
         raise ValueError("grad_accumulation_steps must be at least 1")
+    if args.iteration_offset < 0:
+        raise ValueError("iteration_offset must be non-negative")
 
     state = [model.state, optimizer.state, mx.random.state]
 
@@ -257,6 +263,7 @@ def train(
             train=True,
         ),
     ):
+        global_iter = args.iteration_offset + it
         tic = time.perf_counter()
         # Report validation loss if needed, the first validation loss
         # is always measured before any training.
@@ -275,7 +282,7 @@ def train(
             val_time = time.perf_counter() - tic
             if rank == 0:
                 print(
-                    f"Iter {it}: "
+                    f"Iter {global_iter}: "
                     f"Val loss {val_loss:.3f}, "
                     f"Val took {val_time:.3f}s",
                     flush=True,
@@ -283,7 +290,7 @@ def train(
 
             if training_callback is not None:
                 val_info = {
-                    "iteration": it - 1,
+                    "iteration": global_iter - 1,
                     "val_loss": val_loss,
                     "val_time": val_time,
                 }
@@ -315,7 +322,7 @@ def train(
             peak_mem = mx.get_peak_memory() / 1e9
             if rank == 0:
                 print(
-                    f"Iter {it}: Train loss {train_loss:.3f}, "
+                    f"Iter {global_iter}: Train loss {train_loss:.3f}, "
                     f"Learning Rate {learning_rate:.3e}, "
                     f"It/sec {it_sec:.3f}, "
                     f"Tokens/sec {tokens_sec:.3f}, "
@@ -326,7 +333,7 @@ def train(
 
             if training_callback is not None:
                 train_info = {
-                    "iteration": it,
+                    "iteration": global_iter,
                     "train_loss": train_loss,
                     "learning_rate": learning_rate,
                     "iterations_per_second": it_sec,
@@ -346,11 +353,12 @@ def train(
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
             mx.save_safetensors(str(args.adapter_file), adapter_weights)
             checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+                Path(args.adapter_file).parent
+                / f"{global_iter:07d}_adapters.safetensors"
             )
             mx.save_safetensors(str(checkpoint), adapter_weights)
             print(
-                f"Iter {it}: Saved adapter weights to "
+                f"Iter {global_iter}: Saved adapter weights to "
                 f"{args.adapter_file} and {checkpoint}."
             )
 

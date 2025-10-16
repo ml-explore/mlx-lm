@@ -81,6 +81,12 @@ You can specify the output location with `--adapter-path`.
 
 You can resume fine-tuning with an existing adapter with
 `--resume-adapter-file <path_to_adapters.safetensors>`.
+When resuming, you can keep the numbered checkpoint files in sequence by
+supplying `--iteration-offset <last_completed_iteration>`. For example, if your
+previous run stopped after iteration 1,000 and produced
+`0001000_adapters.safetensors`, then resume with
+`--iteration-offset 1000` so the next checkpoints start at
+`0001001_adapters.safetensors`.
 
 #### Logging
 
