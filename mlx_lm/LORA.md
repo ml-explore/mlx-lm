@@ -81,9 +81,8 @@ You can specify the output location with `--adapter-path`.
 
 You can resume fine-tuning with an existing adapter with
 `--resume-adapter-file <path_to_adapters.safetensors>`. When you resume, the
-trainer checks the numbered checkpoint files (and, if needed, the saved
-training settings in `adapter_config.json`) so that new checkpoints pick up
-exactly where the previous run left off.
+trainer looks at the existing numbered checkpoint files so that new
+checkpoints pick up exactly where the previous run left off.
 
 #### Logging
 

@@ -1,5 +1,4 @@
 import argparse
-import json
 import math
 import os
 import re
@@ -91,16 +90,6 @@ def _extract_iteration_from_filename(path: Path) -> Optional[int]:
         return None
 
 
-def _load_adapter_config(config_path: Path) -> Optional[dict]:
-    if not config_path.exists():
-        return None
-    try:
-        with config_path.open("r") as fid:
-            return json.load(fid)
-    except (OSError, ValueError):
-        return None
-
-
 def _infer_iteration_offset(
     adapter_path: Path, resume_adapter_file: Optional[str]
 ) -> int:
@@ -123,20 +112,7 @@ def _infer_iteration_offset(
                 continue
             if max_iteration is None or iteration > max_iteration:
                 max_iteration = iteration
-
-    if max_iteration is not None:
-        return max_iteration
-
-    for directory in search_dirs:
-        config = _load_adapter_config(directory / "adapter_config.json")
-        if not config:
-            continue
-        for key in ("iters", "save_every"):
-            value = config.get(key)
-            if isinstance(value, int) and value > 0:
-                return value
-
-    return 0
+    return max_iteration or 0
 
 
 def build_parser():
