@@ -1,10 +1,12 @@
 import argparse
+import json
 import math
 import os
 import re
 import types
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -61,7 +63,6 @@ CONFIG_DEFAULTS = {
     "steps_per_report": 10,
     "steps_per_eval": 200,
     "resume_adapter_file": None,
-    "iteration_offset": 0,
     "adapter_path": "adapters",
     "save_every": 100,
     "test": False,
@@ -76,6 +77,66 @@ CONFIG_DEFAULTS = {
     "report_to": None,
     "project_name": None,
 }
+
+_ITERATION_PATTERN = re.compile(r"(\d+)_adapters\.safetensors$")
+
+
+def _extract_iteration_from_filename(path: Path) -> Optional[int]:
+    match = _ITERATION_PATTERN.match(path.name)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _load_adapter_config(config_path: Path) -> Optional[dict]:
+    if not config_path.exists():
+        return None
+    try:
+        with config_path.open("r") as fid:
+            return json.load(fid)
+    except (OSError, ValueError):
+        return None
+
+
+def _infer_iteration_offset(
+    adapter_path: Path, resume_adapter_file: Optional[str]
+) -> int:
+    search_dirs = []
+    if resume_adapter_file:
+        resume_path = Path(resume_adapter_file)
+        iteration = _extract_iteration_from_filename(resume_path)
+        if iteration is not None:
+            return iteration
+        search_dirs.append(resume_path.parent)
+    search_dirs.append(adapter_path)
+
+    max_iteration: Optional[int] = None
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for candidate in directory.glob("*_adapters.safetensors"):
+            iteration = _extract_iteration_from_filename(candidate)
+            if iteration is None:
+                continue
+            if max_iteration is None or iteration > max_iteration:
+                max_iteration = iteration
+
+    if max_iteration is not None:
+        return max_iteration
+
+    for directory in search_dirs:
+        config = _load_adapter_config(directory / "adapter_config.json")
+        if not config:
+            continue
+        for key in ("iters", "save_every"):
+            value = config.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+
+    return 0
 
 
 def build_parser():
@@ -152,13 +213,6 @@ def build_parser():
         "--resume-adapter-file",
         type=str,
         help="Load path to resume training from the given fine-tuned weights.",
-    )
-    parser.add_argument(
-        "--iteration-offset",
-        type=int,
-        help=(
-            "Offset applied to iteration-dependent reporting and adapter checkpoint names."
-        ),
     )
     parser.add_argument(
         "--adapter-path",
@@ -249,16 +303,20 @@ def train_model(
     if args.resume_adapter_file is not None:
         print(f"Loading fine-tuned weights from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
-    if args.iteration_offset < 0:
-        raise ValueError("iteration_offset must be non-negative")
-
-    print_trainable_parameters(model)
-
     adapter_path = Path(args.adapter_path)
     adapter_path.mkdir(parents=True, exist_ok=True)
 
+    iteration_offset = _infer_iteration_offset(adapter_path, args.resume_adapter_file)
+    if iteration_offset < 0:
+        raise ValueError("Computed iteration offset must be non-negative")
+    if args.resume_adapter_file is not None and iteration_offset > 0:
+        print(f"Continuing from iteration {iteration_offset}.")
+
+    print_trainable_parameters(model)
+
     adapter_file = adapter_path / "adapters.safetensors"
-    save_config(vars(args), adapter_path / "adapter_config.json")
+    config_data = vars(args).copy()
+    save_config(config_data, adapter_path / "adapter_config.json")
 
     # init training args
     training_args = TrainingArgs(
@@ -268,7 +326,7 @@ def train_model(
         steps_per_report=args.steps_per_report,
         steps_per_eval=args.steps_per_eval,
         steps_per_save=args.save_every,
-        iteration_offset=args.iteration_offset,
+        iteration_offset=iteration_offset,
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
