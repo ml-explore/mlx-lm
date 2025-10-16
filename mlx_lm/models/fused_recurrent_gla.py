@@ -23,7 +23,6 @@ def _make_fused_recurrent_gla_kernel():
         } else {
             for (int d = 0; d < Dk; ++d) { h_col[d] = 0.0f; }
         }
-        const int BH = B * H;
         const int q_base_b = b * H * T * Dk;
         const int k_base_b = b * H * T * Dk;
         const int v_base_b = b * H * T * Dv;
@@ -36,19 +35,23 @@ def _make_fused_recurrent_gla_kernel():
             const int y_off = y_base_b + (h * T + t) * Dv;
             float acc = 0.0f;
             for (int d = 0; d < Dk; ++d) {
-                acc += (float)q[q_off + d] * h_col[d];
+                float q_scaled_f32 = (float)q[q_off + d] * (float)scale;
+                float q_scaled_bf16 = (float)(InT)q_scaled_f32;
+                acc += q_scaled_bf16 * h_col[d];
             }
-            y[y_off + dv] = (InT)(acc * (float)scale);
+            y[y_off + dv] = acc;
             float gamma = exp((float)g[g_base_b + h * T + t]);
             float v_curr = (float)v[v_off + dv];
             for (int d = 0; d < Dk; ++d) {
-                h_col[d] = h_col[d] * gamma + (float)k[k_off + d] * v_curr;
+                float h_decay = h_col[d] * gamma;
+                float kv_f32 = (float)k[k_off + d] * v_curr;
+                float kv_bf16 = (float)(InT)kv_f32;
+                h_col[d] = h_decay + kv_bf16;
             }
         }
-        if (has_state) {
-            for (int d = 0; d < Dk; ++d) {
-                state_out[state_base + d * Dv] = (InT)h_col[d];
-            }
+
+        for (int d = 0; d < Dk; ++d) {
+            state_out[state_base + d * Dv] = h_col[d];
         }
     """
     inputs = ["q", "k", "v", "g", "B", "H_in", "T", "scale", "state_in"]
@@ -89,7 +92,7 @@ def fused_recurrent_gla_ops(
         v_t = v
         g_t = g
         o_t = mx.matmul(q_t, state)
-        state = state * mx.exp(g_t)[:, :, None, None]
+        state = state * mx.exp(g_t)[:, :, 0, None, None]
         state = state + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
         return o_t, state
 
@@ -158,6 +161,6 @@ def fused_recurrent_gla_update(
         grid=(1, Dv, B * H),
         threadgroup=(1, 1, 1),
         output_shapes=[(B, H, T, Dv), (B, H, Dk, Dv)],
-        output_dtypes=[input_type, input_type],
+        output_dtypes=[mx.float32, mx.float32],
     )
     return y, new_state
