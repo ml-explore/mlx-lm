@@ -30,6 +30,7 @@ batch_size: 4
 
 # Iterations to train for.
 iters: 1000
+# epochs: 2 # Alternatively, specify number of epochs to train for.
 
 # Number of validation batches, -1 uses the entire validation set.
 val_batches: 25
