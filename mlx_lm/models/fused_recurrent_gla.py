@@ -33,6 +33,17 @@ def _make_fused_recurrent_gla_kernel():
             const int k_off = k_base_b + (h * T + t) * Dk;
             const int v_off = v_base_b + (h * T + t) * Dv;
             const int y_off = y_base_b + (h * T + t) * Dv;
+            float gamma = exp((float)g[g_base_b + h * T + t]);
+            for (int d = 0; d < Dk; ++d) {
+                h_col[d] = h_col[d] * gamma;
+            }
+            float v_curr = (float)v[v_off + dv];
+            for (int d = 0; d < Dk; ++d) {
+                float k_val = (float)k[k_off + d];
+                float kv_f32 = k_val * v_curr;
+                float kv_bf16 = (float)(InT)kv_f32;
+                h_col[d] = h_col[d] + kv_bf16;
+            }
             float acc = 0.0f;
             for (int d = 0; d < Dk; ++d) {
                 float q_scaled_f32 = (float)q[q_off + d] * (float)scale;
@@ -40,14 +51,6 @@ def _make_fused_recurrent_gla_kernel():
                 acc += q_scaled_bf16 * h_col[d];
             }
             y[y_off + dv] = acc;
-            float gamma = exp((float)g[g_base_b + h * T + t]);
-            float v_curr = (float)v[v_off + dv];
-            for (int d = 0; d < Dk; ++d) {
-                float h_decay = h_col[d] * gamma;
-                float kv_f32 = (float)k[k_off + d] * v_curr;
-                float kv_bf16 = (float)(InT)kv_f32;
-                h_col[d] = h_decay + kv_bf16;
-            }
         }
 
         for (int d = 0; d < Dk; ++d) {
@@ -78,8 +81,9 @@ def fused_recurrent_gla_ops(
     Reference ops implementation equivalent to fused_recurrent_simple_gla from fla.
     q, k, v have shape [B, H, T, D], g has shape [B, H, T].
     Recurrence per (b, h):
-        y_t = (q_t @ h) * scale
-        h   = h * exp(g_t) + k_t^T @ v_t
+        h_t = h_{t-1} * exp(g_t)
+        h_t = h_t + k_t^T @ v_t
+        y_t = (q_t @ h_t) * scale
     Returns y with shape [B, H, T, Dv].
     """
     B, Hq, L, K = q.shape
@@ -91,9 +95,9 @@ def fused_recurrent_gla_ops(
         k_t = k
         v_t = v
         g_t = g
-        o_t = mx.matmul(q_t, state)
         state = state * mx.exp(g_t)[:, :, 0, None, None]
         state = state + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
+        o_t = mx.matmul(q_t, state)
         return o_t, state
 
     if state is None:
@@ -107,10 +111,10 @@ def fused_recurrent_gla_ops(
         k_t = k[:, :, t : t + 1]
         v_t = v[:, :, t : t + 1]
         g_t = g[:, :, t]
-        o_t = mx.matmul(q_t, h)
-        outputs.append(o_t)
         h = h * mx.exp(g_t)[:, :, None, None]
         h = h + mx.matmul(k_t.transpose(0, 1, 3, 2), v_t)
+        o_t = mx.matmul(q_t, h)
+        outputs.append(o_t)
 
     return mx.concatenate(outputs, axis=2), h
 
