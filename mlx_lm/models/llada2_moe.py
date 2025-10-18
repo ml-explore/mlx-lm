@@ -462,6 +462,226 @@ class Model(nn.Module):
     def n_kv_heads(self):
         return self.args.num_key_value_heads
 
+    def stream_generate(
+        self,
+        inputs: mx.array,
+        temperature: float = 0.0,
+        block_length: int = 32,
+        steps: int = 32,
+        gen_length: int = 2048,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        eos_early_stop: bool = False,
+        minimal_topk: int = 1,
+        threshold: float = 0.95,
+        eos_id: Optional[int] = None,
+        mask_id: Optional[int] = None,
+    ):
+        """
+        Stream diffusion generation block-by-block.
+
+        This method yields completed blocks as they finish denoising, allowing
+        for progressive output display.
+
+        Args:
+            inputs: Input token IDs (prompt)
+            temperature: Sampling temperature (0 = greedy)
+            block_length: Size of each generation block
+            steps: Number of denoising iterations per block
+            gen_length: Maximum tokens to generate
+            top_p: Nucleus sampling threshold
+            top_k: Top-k sampling parameter
+            eos_early_stop: Stop on first valid EOS token
+            minimal_topk: Minimum tokens to keep (caps effective steps)
+            threshold: Confidence threshold for token acceptance
+            eos_id: End-of-sequence token ID
+            mask_id: Mask token ID for ungenerated positions
+
+        Yields:
+            Tuple[mx.array, int, int]: (new_tokens, block_start, block_end)
+                - new_tokens: The newly completed tokens for this block
+                - block_start: Starting position (relative to generation start)
+                - block_end: Ending position (relative to generation start)
+        """
+        # Use config defaults if not provided
+        if eos_id is None:
+            eos_id = self.args.eos_token_id
+        if mask_id is None:
+            mask_id = self.args.mask_token_id
+
+        # Cap steps based on minimal_topk
+        steps = min(steps, gen_length // minimal_topk)
+
+        # Setup
+        prompt_length = inputs.shape[1] if len(inputs.shape) > 1 else inputs.shape[0]
+        if len(inputs.shape) == 1:
+            inputs = mx.expand_dims(inputs, 0)
+
+        num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
+        total_length = num_blocks * block_length
+
+        # Create block-diagonal attention mask
+        block_mask = mx.tril(mx.ones((num_blocks, num_blocks)))
+        block_diffusion_attention_mask = mx.repeat(
+            mx.repeat(block_mask, block_length, axis=0), block_length, axis=1
+        )
+        block_diffusion_attention_mask = mx.expand_dims(
+            mx.expand_dims(block_diffusion_attention_mask, 0), 0
+        )
+        block_diffusion_attention_mask = mx.where(
+            block_diffusion_attention_mask.astype(mx.bool_),
+            mx.array(0.0, dtype=mx.bfloat16),
+            mx.array(float("-inf"), dtype=mx.bfloat16),
+        )
+
+        # Initialize sequence with mask tokens
+        x = mx.full((1, total_length), mask_id, dtype=mx.int32)
+        x[:, :prompt_length] = inputs
+
+        # Determine how many blocks are already filled (prompt)
+        prefill_blocks = prompt_length // block_length
+
+        # Calculate token transfer schedule
+        num_transfer_tokens_schedule = self._get_num_transfer_tokens(
+            block_length, steps
+        )
+
+        # Track what we've yielded
+        last_yielded_pos = prompt_length
+
+        # Process each block
+        for num_block in range(prefill_blocks, num_blocks):
+            current_window_end = (num_block + 1) * block_length
+            cur_x = x[:, :current_window_end]
+            cur_attn_mask = block_diffusion_attention_mask[
+                :, :, :current_window_end, :current_window_end
+            ]
+
+            # Iterative denoising for this block
+            for step in range(steps):
+                # Check if any tokens left to denoise
+                active_block_mask = cur_x[:, -block_length:] == mask_id
+                if active_block_mask.sum() == 0:
+                    break
+
+                # Forward pass with block-diagonal mask
+                logits = self(cur_x, cache=None, mask=cur_attn_mask)
+
+                # Focus on current block
+                active_logits = logits[:, -block_length:, :]
+
+                # Sample tokens with confidence
+                x0, x0_p = self._sample_with_temperature_topk_topp(
+                    active_logits, temperature=temperature, top_k=top_k, top_p=top_p
+                )
+
+                # Determine which tokens to transfer
+                num_to_transfer = int(num_transfer_tokens_schedule[step])
+                confidence = mx.where(active_block_mask, x0_p, float("-inf"))
+
+                # Select high-confidence tokens
+                high_conf_mask = confidence[0] > threshold
+                num_high_confidence = high_conf_mask.sum().item()
+
+                # Determine which positions to update
+                if num_high_confidence >= num_to_transfer:
+                    # Use high confidence mask
+                    update_mask = high_conf_mask
+                else:
+                    # Take top-k by confidence
+                    k = min(num_to_transfer, active_block_mask.sum().item())
+                    idx = mx.argpartition(-confidence[0], kth=k - 1)[:k]
+                    # Create update mask using broadcasting
+                    positions = mx.arange(block_length)
+                    update_mask = mx.any(
+                        mx.expand_dims(positions, 0) == mx.expand_dims(idx, 1), axis=0
+                    )
+
+                # Update tokens in the current block
+                if update_mask.any():
+                    # Update only the last block_length positions
+                    new_block = mx.where(update_mask, x0[0], cur_x[0, -block_length:])
+                    cur_x = mx.concatenate(
+                        [cur_x[:, :-block_length], mx.expand_dims(new_block, 0)], axis=1
+                    )
+
+                # Early stop on EOS
+                if eos_early_stop:
+                    # Check if any newly updated tokens are EOS
+                    newly_updated = mx.where(
+                        update_mask, x0[0], mx.array(-1, dtype=x0.dtype)
+                    )
+                    if (newly_updated == eos_id).any():
+                        eos_mask = cur_x[0, prompt_length:] == eos_id
+                        if eos_mask.any():
+                            # Find first EOS position by converting to list
+                            eos_list = eos_mask.tolist()
+                            try:
+                                eos_idx = eos_list.index(True)
+                                eos_pos = eos_idx + prompt_length
+                                if (cur_x[0, prompt_length:eos_pos] != mask_id).all():
+                                    # Yield final tokens and return
+                                    final_end = eos_pos + 1
+                                    if final_end > last_yielded_pos:
+                                        new_tokens = cur_x[
+                                            0, last_yielded_pos:final_end
+                                        ]
+                                        block_start = last_yielded_pos - prompt_length
+                                        block_end = final_end - prompt_length
+                                        yield (new_tokens, block_start, block_end)
+                                    return
+                            except ValueError:
+                                pass  # No True found
+
+            # Update global sequence
+            x[:, :current_window_end] = cur_x
+
+            # Yield completed block (excluding mask tokens and stopping at EOS)
+            gen_end = min(current_window_end, prompt_length + gen_length)
+            if gen_end > last_yielded_pos:
+                new_tokens = x[0, last_yielded_pos:gen_end]
+
+                # Don't yield if block is all mask tokens
+                if not (new_tokens == mask_id).all():
+                    # Check for EOS tokens first
+                    eos_positions = (new_tokens == eos_id).tolist()
+                    if any(eos_positions):
+                        # Truncate at first EOS (inclusive)
+                        first_eos_idx = eos_positions.index(True)
+                        new_tokens = new_tokens[: first_eos_idx + 1]
+                        actual_end = last_yielded_pos + first_eos_idx + 1
+                        block_start = last_yielded_pos - prompt_length
+                        block_end = actual_end - prompt_length
+                        yield (new_tokens, block_start, block_end)
+                        # Stop after yielding block with EOS
+                        return
+
+                    # Check for mask tokens
+                    mask_positions = (new_tokens == mask_id).tolist()
+                    if any(mask_positions):
+                        # Find first mask position
+                        first_mask_idx = mask_positions.index(True)
+                        if first_mask_idx > 0:
+                            # Yield only up to first mask
+                            new_tokens = new_tokens[:first_mask_idx]
+                            actual_end = last_yielded_pos + first_mask_idx
+                            block_start = last_yielded_pos - prompt_length
+                            block_end = actual_end - prompt_length
+                            yield (new_tokens, block_start, block_end)
+                            last_yielded_pos = actual_end
+                            # Stop yielding - rest is incomplete
+                            break
+                    else:
+                        # No masks or EOS, yield entire block
+                        block_start = last_yielded_pos - prompt_length
+                        block_end = gen_end - prompt_length
+                        yield (new_tokens, block_start, block_end)
+                        last_yielded_pos = gen_end
+
+            # Stop if EOS found
+            if (x[0, prompt_length:current_window_end] == eos_id).any():
+                break
+
     def generate(
         self,
         inputs: mx.array,
@@ -632,6 +852,15 @@ class Model(nn.Module):
 
         # Extract final generation
         generated_answer = x[:, : prompt_length + gen_length]
+
+        # Find first mask token and truncate (incomplete generation)
+        generation_part = generated_answer[0, prompt_length:]
+        mask_positions = (generation_part == mask_id).tolist()
+        if any(mask_positions):
+            first_mask_idx = mask_positions.index(True)
+            if first_mask_idx > 0:
+                # Truncate at first mask
+                generated_answer = generated_answer[:, : prompt_length + first_mask_idx]
 
         # Find first EOS and truncate
         eos_mask = generated_answer[0, prompt_length:] == eos_id

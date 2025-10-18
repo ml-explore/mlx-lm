@@ -209,6 +209,30 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--show-blocks",
+        action="store_true",
+        help="[Diffusion models only] Show detailed block boundaries and progress. "
+        "Shows [Block X-Y] prefixes when streaming diffusion model output.",
+    )
+    parser.add_argument(
+        "--block-length",
+        type=int,
+        default=16,
+        help="[Diffusion models only] Number of tokens per block (default: 16)",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=8,
+        help="[Diffusion models only] Number of denoising iterations per block (default: 8)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.85,
+        help="[Diffusion models only] Confidence threshold for token acceptance (default: 0.85)",
+    )
     return parser
 
 
@@ -750,17 +774,22 @@ def generate(
        verbose (bool): If ``True``, print tokens and timing information.
            Default: ``False``.
        kwargs: The remaining options get passed to :func:`stream_generate`.
-          See :func:`stream_generate` for more details.
-
-    Note:
-       For diffusion models (like LLaDA2), generation works differently:
-       - No streaming (returns final result at once)
-       - Different parameters (block_length, steps, threshold)
-       - Use max_tokens → gen_length, temp → temperature mapping
+          See :func:`stream_generate` for more details. For diffusion models
+          (e.g., LLaDA2), additional options include ``block_length``, ``steps``,
+          and ``threshold``.
     """
     # Check if this is a diffusion model (e.g., LLaDA2)
     if getattr(model, "is_diffusion_model", False):
-        return _generate_diffusion(model, tokenizer, prompt, verbose, **kwargs)
+        show_blocks = kwargs.pop("show_blocks", False)
+        return _generate_diffusion(
+            model, tokenizer, prompt, verbose, show_blocks, **kwargs
+        )
+
+    # Remove diffusion-specific kwargs not used by autoregressive models
+    kwargs.pop("show_blocks", None)
+    kwargs.pop("block_length", None)
+    kwargs.pop("steps", None)
+    kwargs.pop("threshold", None)
 
     if verbose:
         print("=" * 10)
@@ -789,19 +818,78 @@ def generate(
     return text
 
 
+def _generate_diffusion_stream(
+    model: nn.Module,
+    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    prompt_tokens: List[int],
+    inputs: mx.array,
+    gen_kwargs: dict,
+    verbose: bool,
+    show_blocks: bool = False,
+):
+    """Streaming generation for diffusion models (generator function)."""
+    import time
+
+    if verbose:
+        print("=" * 10, flush=True)
+        if show_blocks:
+            print(
+                f"[Diffusion Streaming: block_length={gen_kwargs['block_length']}, steps={gen_kwargs['steps']}]",
+                flush=True,
+            )
+
+    start_time = time.time()
+    total_tokens = 0
+
+    # Use the streaming generator
+    for new_tokens, block_start, block_end in model.stream_generate(
+        inputs=inputs, **gen_kwargs
+    ):
+        # Decode just the new block
+        block_text = tokenizer.decode(new_tokens.tolist())
+        total_tokens += len(new_tokens)
+
+        if verbose:
+            if show_blocks:
+                # Show detailed block info
+                print(f"[Block {block_start:3d}-{block_end:3d}] ", end="", flush=True)
+                print(block_text, flush=True)
+            else:
+                # Just print the text (no block markers)
+                print(block_text, end="", flush=True)
+
+        yield block_text
+
+    if verbose:
+        if not show_blocks:
+            print()  # Final newline (only if not already printed by show_blocks)
+        elapsed = time.time() - start_time
+        print("=" * 10, flush=True)
+        print(
+            f"Prompt: {len(prompt_tokens)} tokens, {len(prompt_tokens)/elapsed:.3f} tokens-per-sec",
+            flush=True,
+        )
+        print(
+            f"Generation: {total_tokens} tokens, {total_tokens/elapsed:.3f} tokens-per-sec",
+            flush=True,
+        )
+        peak_mem = mx.get_peak_memory() / 1e9
+        print(f"Peak memory: {peak_mem:.3f} GB", flush=True)
+
+
 def _generate_diffusion(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, List[int]],
     verbose: bool = False,
+    show_blocks: bool = False,
     **kwargs,
 ) -> str:
     """
     Generate text using a diffusion model.
 
     Diffusion models (like LLaDA2) use iterative block-wise denoising
-    instead of autoregressive generation, so they have different parameters
-    and cannot stream tokens.
+    instead of autoregressive generation, so they have different parameters.
 
     Standard parameters are mapped as follows:
     - max_tokens → gen_length
@@ -813,12 +901,6 @@ def _generate_diffusion(
     - steps: Denoising iterations (default: 8)
     - threshold: Confidence threshold (default: 0.85)
     """
-    import time
-
-    if verbose:
-        print("=" * 10)
-        print("[Diffusion Model - No Streaming]")
-
     # Convert prompt to tokens if needed
     if isinstance(prompt, str):
         prompt_tokens = tokenizer.encode(prompt)
@@ -859,43 +941,17 @@ def _generate_diffusion(
         if key in kwargs:
             gen_kwargs[key] = kwargs.pop(key)
 
-    if verbose:
-        print(f"Prompt tokens: {len(prompt_tokens)}")
-        print(
-            f"Parameters: gen_length={gen_kwargs['gen_length']}, "
-            f"temp={gen_kwargs['temperature']:.1f}, "
-            f"block_length={gen_kwargs['block_length']}, "
-            f"steps={gen_kwargs['steps']}"
-        )
-        print("Generating...")
-
-    # Measure prompt + generation time together (diffusion doesn't separate them)
-    start_time = time.time()
-
-    # Generate using model's diffusion method
-    output = model.generate(inputs=inputs, **gen_kwargs)
-
-    end_time = time.time()
-    elapsed = end_time - start_time
-
-    # Decode output
-    result_tokens = output[0].tolist()
-    text = tokenizer.decode(result_tokens)
-
-    if verbose:
-        print(text)
-        print("=" * 10)
-        generation_tokens = len(result_tokens)
-        prompt_tokens_count = len(prompt_tokens)
-        total_tokens = prompt_tokens_count + generation_tokens
-
-        print(f"Prompt: {prompt_tokens_count} tokens")
-        print(f"Generation: {generation_tokens} tokens")
-        print(f"Total time: {elapsed:.2f}s ({total_tokens/elapsed:.1f} tokens/sec)")
-
-        # Get peak memory
-        peak_mem = mx.metal.get_peak_memory() / 1e9
-        print(f"Peak memory: {peak_mem:.3f} GB")
+    # Consume the streaming generator and collect output
+    text = ""
+    for chunk in _generate_diffusion_stream(
+        model, tokenizer, prompt_tokens, inputs, gen_kwargs, verbose, show_blocks
+    ):
+        if verbose:
+            # Already printed in the stream, just consume
+            pass
+        else:
+            # Collect chunks for return
+            text += chunk
 
     return text
 
@@ -1345,21 +1401,32 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
-    response = generate(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens=args.max_tokens,
-        verbose=args.verbose,
-        sampler=sampler,
-        max_kv_size=args.max_kv_size,
-        prompt_cache=prompt_cache if using_cache else None,
-        kv_bits=args.kv_bits,
-        kv_group_size=args.kv_group_size,
-        quantized_kv_start=args.quantized_kv_start,
-        draft_model=draft_model,
-        num_draft_tokens=args.num_draft_tokens,
-    )
+
+    # Prepare generation kwargs
+    gen_kwargs = {
+        "max_tokens": args.max_tokens,
+        "verbose": args.verbose,
+        "show_blocks": args.show_blocks,
+        "sampler": sampler,
+        "max_kv_size": args.max_kv_size,
+        "prompt_cache": prompt_cache if using_cache else None,
+        "kv_bits": args.kv_bits,
+        "kv_group_size": args.kv_group_size,
+        "quantized_kv_start": args.quantized_kv_start,
+        "draft_model": draft_model,
+        "num_draft_tokens": args.num_draft_tokens,
+    }
+
+    # Add diffusion-specific parameters if this is a diffusion model
+    if getattr(model, "is_diffusion_model", False):
+        gen_kwargs["block_length"] = args.block_length
+        gen_kwargs["steps"] = args.steps
+        gen_kwargs["threshold"] = args.threshold
+
+    # Generate
+    response = generate(model, tokenizer, prompt, **gen_kwargs)
+
+    # Print response if not verbose (verbose mode prints during generation)
     if not args.verbose:
         print(response)
 
