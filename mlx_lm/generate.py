@@ -751,7 +751,17 @@ def generate(
            Default: ``False``.
        kwargs: The remaining options get passed to :func:`stream_generate`.
           See :func:`stream_generate` for more details.
+
+    Note:
+       For diffusion models (like LLaDA2), generation works differently:
+       - No streaming (returns final result at once)
+       - Different parameters (block_length, steps, threshold)
+       - Use max_tokens → gen_length, temp → temperature mapping
     """
+    # Check if this is a diffusion model (e.g., LLaDA2)
+    if getattr(model, "is_diffusion_model", False):
+        return _generate_diffusion(model, tokenizer, prompt, verbose, **kwargs)
+
     if verbose:
         print("=" * 10)
 
@@ -776,6 +786,117 @@ def generate(
             f"{response.generation_tps:.3f} tokens-per-sec"
         )
         print(f"Peak memory: {response.peak_memory:.3f} GB")
+    return text
+
+
+def _generate_diffusion(
+    model: nn.Module,
+    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    prompt: Union[str, List[int]],
+    verbose: bool = False,
+    **kwargs,
+) -> str:
+    """
+    Generate text using a diffusion model.
+
+    Diffusion models (like LLaDA2) use iterative block-wise denoising
+    instead of autoregressive generation, so they have different parameters
+    and cannot stream tokens.
+
+    Standard parameters are mapped as follows:
+    - max_tokens → gen_length
+    - temp → temperature
+    - top_k, top_p → passed through
+
+    Diffusion-specific parameters can also be provided:
+    - block_length: Tokens per block (default: 16)
+    - steps: Denoising iterations (default: 8)
+    - threshold: Confidence threshold (default: 0.85)
+    """
+    import time
+
+    if verbose:
+        print("=" * 10)
+        print("[Diffusion Model - No Streaming]")
+
+    # Convert prompt to tokens if needed
+    if isinstance(prompt, str):
+        prompt_tokens = tokenizer.encode(prompt)
+    else:
+        prompt_tokens = prompt
+
+    inputs = mx.array([prompt_tokens])
+
+    # Map standard parameters to diffusion parameters
+    gen_kwargs = {}
+
+    # Map max_tokens to gen_length
+    if "max_tokens" in kwargs:
+        gen_kwargs["gen_length"] = kwargs.pop("max_tokens")
+    elif "gen_length" not in kwargs:
+        gen_kwargs["gen_length"] = DEFAULT_MAX_TOKENS
+
+    # Map temp to temperature
+    if "temp" in kwargs:
+        gen_kwargs["temperature"] = kwargs.pop("temp")
+    elif "temperature" not in kwargs:
+        gen_kwargs["temperature"] = DEFAULT_TEMP
+
+    # Pass through top_k and top_p
+    if "top_k" in kwargs:
+        gen_kwargs["top_k"] = kwargs.pop("top_k") if kwargs["top_k"] > 0 else None
+    if "top_p" in kwargs and kwargs["top_p"] < 1.0:
+        gen_kwargs["top_p"] = kwargs.pop("top_p")
+
+    # Diffusion-specific parameters with sensible defaults
+    gen_kwargs.setdefault("block_length", 16)
+    gen_kwargs.setdefault("steps", 8)
+    gen_kwargs.setdefault("threshold", 0.85)
+    gen_kwargs.setdefault("eos_early_stop", True)
+
+    # Override with any explicitly provided diffusion parameters
+    for key in ["block_length", "steps", "threshold", "eos_early_stop", "minimal_topk"]:
+        if key in kwargs:
+            gen_kwargs[key] = kwargs.pop(key)
+
+    if verbose:
+        print(f"Prompt tokens: {len(prompt_tokens)}")
+        print(
+            f"Parameters: gen_length={gen_kwargs['gen_length']}, "
+            f"temp={gen_kwargs['temperature']:.1f}, "
+            f"block_length={gen_kwargs['block_length']}, "
+            f"steps={gen_kwargs['steps']}"
+        )
+        print("Generating...")
+
+    # Measure prompt + generation time together (diffusion doesn't separate them)
+    start_time = time.time()
+
+    # Generate using model's diffusion method
+    output = model.generate(inputs=inputs, **gen_kwargs)
+
+    end_time = time.time()
+    elapsed = end_time - start_time
+
+    # Decode output
+    result_tokens = output[0].tolist()
+    text = tokenizer.decode(result_tokens)
+
+    if verbose:
+        print(text)
+        print("=" * 10)
+        generation_tokens = len(result_tokens)
+        prompt_tokens_count = len(prompt_tokens)
+        total_tokens = prompt_tokens_count + generation_tokens
+
+        print(f"Prompt: {prompt_tokens_count} tokens")
+        print(f"Generation: {generation_tokens} tokens")
+        print(f"Total time: {elapsed:.2f}s ({total_tokens/elapsed:.1f} tokens/sec)")
+
+        # Get peak memory
+        peak_mem = mx.metal.get_peak_memory() / 1e9
+        print(f"Peak memory: {peak_mem:.3f} GB")
+
     return text
 
 
