@@ -1296,6 +1296,36 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_llada2_moe(self):
+        from mlx_lm.models import llada2_moe
+
+        args = llada2_moe.ModelArgs(
+            model_type="llada2_moe",
+            hidden_size=128,
+            intermediate_size=256,
+            max_position_embeddings=1000,
+            moe_intermediate_size=256,
+            num_experts=4,
+            num_shared_experts=1,
+            norm_topk_prob=True,
+            num_attention_heads=4,
+            num_experts_per_tok=2,
+            num_hidden_layers=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=1000,
+            vocab_size=1000,
+            first_k_dense_replace=2,
+            routed_scaling_factor=1.0,
+            score_function="sigmoid",
+            n_group=2,
+            topk_group=1,
+        )
+        model = llada2_moe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_all_models(self):
         test_configs = [
             {
@@ -1938,6 +1968,28 @@ class TestModels(unittest.TestCase):
                 "num_hidden_layers": 20,
                 "vocab_size": 32,
                 "intermediate_size": 128,
+            },
+            {
+                "model_type": "llada2_moe",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "max_position_embeddings": 1000,
+                "moe_intermediate_size": 256,
+                "num_experts": 4,
+                "num_shared_experts": 1,
+                "norm_topk_prob": True,
+                "num_attention_heads": 4,
+                "num_experts_per_tok": 2,
+                "num_hidden_layers": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "vocab_size": 1000,
+                "first_k_dense_replace": 2,
+                "routed_scaling_factor": 1.0,
+                "score_function": "sigmoid",
+                "n_group": 2,
+                "topk_group": 1,
             },
         ]
         for config in test_configs:
