@@ -253,7 +253,7 @@ class LLaDA2MoeGate(nn.Module):
         self.score_function = args.score_function
 
         # Gate projection (raw weight, not nn.Linear wrapper)
-        self.weight = mx.random.normal((args.num_experts, args.hidden_size)) * 0.02
+        self.weight = mx.zeros((args.num_experts, args.hidden_size))
 
         # Expert bias for load balancing
         self.expert_bias = (
