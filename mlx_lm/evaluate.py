@@ -304,11 +304,16 @@ class MLXLM(LM):
             continuation: str
                 The generated continuation.
         """
+        group = mx.distributed.init()
+
+        # split data accross ranks
+        total_requests = len(requests)
+        requests = requests[group.rank() :: group.size()]
+
         logging.info("Generating continuation for %d sequences." % len(requests))
         contexts, options = zip(*[req.args for req in requests])
         # The second element of the tuple contains:
         # {'do_sample': False, 'until': ['\n\n'], 'temperature': 0}
-        completions = []
 
         # Tokenize all contexts
         contexts = [
@@ -333,6 +338,39 @@ class MLXLM(LM):
             until = opt["until"]
             if any(u in text for u in until):
                 completions[e] = _rstrip_until(text, until)
+
+        # Gather the completions
+        if group.size() > 1:
+            with mx.stream(mx.cpu):
+                pad_to = (total_requests + group.size() - 1) // group.size()
+                pad = pad_to - len(completions)
+                completions = [list(c.encode("utf-8")) for c in completions]
+                max_len = mx.array(max(len(c) for c in completions))
+                max_len = mx.distributed.all_max(max_len).item()
+                lengths = mx.array([len(c) for c in completions] + [0] * pad)
+                completions = mx.array(
+                    [c + [0] * (max_len - len(c)) for c in completions]
+                    + [[0] * max_len] * pad,
+                    mx.uint8,
+                )
+                completions = (
+                    mx.distributed.all_gather(completions[None])
+                    .swapaxes(0, 1)
+                    .flatten(0, 1)
+                    .tolist()
+                )
+                lengths = (
+                    mx.distributed.all_gather(lengths[None])
+                    .swapaxes(0, 1)
+                    .flatten(0, 1)
+                    .tolist()
+                )
+                completions = completions[:total_requests]
+                lengths = lengths[:total_requests]
+                completions = [
+                    bytearray(c[:l]).decode() for c, l in zip(completions, lengths)
+                ]
+
         return completions
 
 

@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -48,6 +49,18 @@ class ModelArgs(BaseModelArgs):
     moe_router_enable_shared_expert: bool = True
 
 
+@partial(mx.compile, shapeless=True)
+def swiglu(gate, up):
+    return nn.silu(gate) * up
+
+
+@partial(mx.compile, shapeless=True)
+def aggregate_expert_outputs(expert_outputs, scores):
+    return (
+        (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
+    )
+
+
 class BailingMoeMLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -68,7 +81,7 @@ class BailingMoeMLP(nn.Module):
         )
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class BailingMoeAttention(nn.Module):
@@ -149,6 +162,7 @@ class BailingMoeAttention(nn.Module):
         return self.dense(output)
 
 
+@mx.compile
 def group_expert_select(
     gates,
     e_score_correction_bias,
@@ -174,12 +188,12 @@ def group_expert_select(
         k = n_group - topk_group
         group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
         scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+            scores, mx.stop_gradient(group_idx), mx.array(0.0, scores.dtype), axis=-2
         )
         scores = mx.flatten(scores, -2, -1)
 
     k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
@@ -248,7 +262,7 @@ class BailingMoeSparseMoeBlock(nn.Module):
     def __call__(self, x):
         topk_idx, topk_weight = self.gate(x)
         out = self.switch_mlp(x, topk_idx)
-        out = (out * topk_weight[..., None]).sum(axis=-2)
+        out = aggregate_expert_outputs(out, topk_weight)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
         return out
