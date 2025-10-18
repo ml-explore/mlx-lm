@@ -1391,23 +1391,12 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    sampler = make_sampler(
-        args.temp,
-        args.top_p,
-        args.min_p,
-        args.min_tokens_to_keep,
-        top_k=args.top_k,
-        xtc_probability=args.xtc_probability,
-        xtc_threshold=args.xtc_threshold,
-        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
-    )
 
     # Prepare generation kwargs
     gen_kwargs = {
         "max_tokens": args.max_tokens,
         "verbose": args.verbose,
         "show_blocks": args.show_blocks,
-        "sampler": sampler,
         "max_kv_size": args.max_kv_size,
         "prompt_cache": prompt_cache if using_cache else None,
         "kv_bits": args.kv_bits,
@@ -1417,11 +1406,27 @@ def main():
         "num_draft_tokens": args.num_draft_tokens,
     }
 
-    # Add diffusion-specific parameters if this is a diffusion model
     if getattr(model, "is_diffusion_model", False):
+        # Diffusion models need raw sampling parameters
+        gen_kwargs["temp"] = args.temp
+        gen_kwargs["top_k"] = args.top_k
+        gen_kwargs["top_p"] = args.top_p
         gen_kwargs["block_length"] = args.block_length
         gen_kwargs["steps"] = args.steps
         gen_kwargs["threshold"] = args.threshold
+    else:
+        # Autoregressive models use a sampler
+        sampler = make_sampler(
+            args.temp,
+            args.top_p,
+            args.min_p,
+            args.min_tokens_to_keep,
+            top_k=args.top_k,
+            xtc_probability=args.xtc_probability,
+            xtc_threshold=args.xtc_threshold,
+            xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+        )
+        gen_kwargs["sampler"] = sampler
 
     # Generate
     response = generate(model, tokenizer, prompt, **gen_kwargs)
