@@ -335,42 +335,29 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
-        for k, v in weights.items():
+        for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        w_to_proj = {
-            "w1": "gate_proj",
-            "w2": "down_proj",
-            "w3": "up_proj",
-        }
-
-        def stack_expert_tensors(layer_idx, tensor_name):
-            for w_key, proj in w_to_proj.items():
-                base = f"model.layers.{layer_idx}.feed_forward.experts"
-                expert_tensors = []
-                e = 0
-                while f"{base}.{e}.{w_key}.{tensor_name}" in weights:
-                    expert_tensors.append(
-                        weights.pop(f"{base}.{e}.{w_key}.{tensor_name}")
-                    )
-                    e += 1
-                if expert_tensors:
-                    stacked = mx.stack(expert_tensors)
-                    weights[
-                        f"model.layers.{layer_idx}.feed_forward.switch_mlp.{proj}.{tensor_name}"
-                    ] = stacked
-
         for l in range(self.args.num_hidden_layers):
-            if any(
-                key.startswith(f"model.layers.{l}.feed_forward.experts.")
-                for key in weights.keys()
-            ):
+            base = f"model.layers.{l}.feed_forward"
+            if not any(key.startswith(f"{base}.experts.") for key in weights.keys()):
+                continue
+
+            for proj in ["gate_proj", "down_proj", "up_proj"]:
                 for name in ["weight", "bias", "scales", "biases"]:
-                    stack_expert_tensors(l, name)
+                    expert_tensors = [
+                        weights.pop(f"{base}.experts.{e}.{proj}.{name}")
+                        for e in range(len(weights))
+                        if f"{base}.experts.{e}.{proj}.{name}" in weights
+                    ]
+                    if expert_tensors:
+                        weights[f"{base}.switch_mlp.{proj}.{name}"] = mx.stack(
+                            expert_tensors
+                        )
 
         return weights
 
