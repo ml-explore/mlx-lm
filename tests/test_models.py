@@ -1932,6 +1932,13 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
                 "vocab_size": 1000,
             },
+            {
+                "model_type": "nanochat",
+                "hidden_size": 1280,
+                "num_hidden_layers": 20,
+                "vocab_size": 32,
+                "intermediate_size": 128,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
