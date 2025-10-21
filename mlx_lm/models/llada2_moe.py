@@ -135,7 +135,7 @@ class LLaDA2MoeAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        B, L, D = x.shape
+        B, L, _ = x.shape
 
         # Fused QKV projection
         qkv = self.query_key_value(x)
@@ -856,27 +856,26 @@ class Model(nn.Module):
         if p is None or p >= 1.0:
             return logits
 
-        # Convert to probabilities and sort ascending
-        probs = mx.softmax(logits, axis=-1)
-        sorted_indices = mx.argsort(logits, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+        # Sort descending by negating
+        sorted_indices = mx.argsort(-logits, axis=-1)
+        sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
 
-        # Compute cumulative probabilities
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+        # Get cumulative probabilities in sorted (descending) order
+        sorted_probs = mx.softmax(sorted_logits, axis=-1)
+        cumsum_probs = mx.cumsum(sorted_probs, axis=-1)
 
-        # Create inverse mapping to rearrange back to original order
-        inverse_indices = mx.put_along_axis(
-            mx.zeros_like(sorted_indices),
+        # Mask tokens where cumsum (before current token) > p
+        # Subtract sorted_probs to get cumulative sum before adding current token
+        remove_mask = (cumsum_probs - sorted_probs) > p
+        sorted_logits_masked = mx.where(remove_mask, -float("inf"), sorted_logits)
+
+        # Scatter back to original order
+        return mx.put_along_axis(
+            mx.full(logits.shape, -float("inf"), logits.dtype),
             sorted_indices,
-            mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
+            sorted_logits_masked,
             axis=-1,
         )
-        cumulative_probs = mx.take_along_axis(
-            cumulative_probs, inverse_indices, axis=-1
-        )
-
-        # Mask tokens with cumulative probability > 1 - top_p
-        return mx.where(cumulative_probs > 1 - p, -float("inf"), logits)
 
     def _sample_with_temperature_topk_topp(
         self,
