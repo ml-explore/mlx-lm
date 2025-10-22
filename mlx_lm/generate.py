@@ -936,8 +936,37 @@ def _generate_diffusion(
     gen_kwargs.setdefault("threshold", 0.85)
     gen_kwargs.setdefault("eos_early_stop", True)
 
+    # Pass all EOS token IDs from the tokenizer
+    eos_tokens = list(tokenizer.eos_token_ids)
+
+    # Add model's default EOS token if not already present
+    if (
+        hasattr(model.args, "eos_token_id")
+        and model.args.eos_token_id not in eos_tokens
+    ):
+        eos_tokens.append(model.args.eos_token_id)
+
+    # Check for special tokens that might be missing from the config
+    for special_token in ["<|role_end|>", "<|im_end|>", "<|end|>"]:
+        try:
+            # Only add if it encodes to a single token (not subword split)
+            token_ids = tokenizer.encode(special_token, add_special_tokens=False)
+            if len(token_ids) == 1 and token_ids[0] not in eos_tokens:
+                eos_tokens.append(token_ids[0])
+        except:
+            pass  # Token doesn't exist in vocabulary
+
+    gen_kwargs.setdefault("eos_token_ids", eos_tokens)
+
     # Override with any explicitly provided diffusion parameters
-    for key in ["block_length", "steps", "threshold", "eos_early_stop", "minimal_topk"]:
+    for key in [
+        "block_length",
+        "steps",
+        "threshold",
+        "eos_early_stop",
+        "minimal_topk",
+        "eos_token_ids",
+    ]:
         if key in kwargs:
             gen_kwargs[key] = kwargs.pop(key)
 

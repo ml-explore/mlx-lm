@@ -65,6 +65,21 @@ def aggregate_expert_outputs(expert_outputs, scores):
     )
 
 
+def is_eos_token(tokens: mx.array, eos_token_ids) -> mx.array:
+    """
+    Check if tokens match any EOS token ID using broadcasting.
+
+    Args:
+        tokens: 1D array of token IDs to check
+        eos_token_ids: Set, list, or array of EOS token IDs
+
+    Returns:
+        Boolean mask with same shape as tokens
+    """
+    eos_array = mx.array(list(eos_token_ids))
+    return (tokens[:, None] == eos_array).any(axis=-1)
+
+
 class LLaDA2MoeMLP(nn.Module):
     """Standard MLP for dense layers."""
 
@@ -508,7 +523,7 @@ class Model(nn.Module):
         x0: mx.array,
         cur_x: mx.array,
         prompt_length: int,
-        eos_id: int,
+        eos_token_ids: set,
         mask_id: int,
         last_yielded_pos: int,
     ) -> tuple[bool, Optional[tuple[mx.array, int, int]]]:
@@ -521,22 +536,24 @@ class Model(nn.Module):
         """
         # Check if any newly updated tokens are EOS
         newly_updated = mx.where(update_mask, x0[0], mx.array(-1, dtype=x0.dtype))
-        if not (newly_updated == eos_id).any():
+        has_eos_in_update = is_eos_token(newly_updated, eos_token_ids).any()
+        if not has_eos_in_update:
             return False, None
 
-        eos_mask = cur_x[0, prompt_length:] == eos_id
-        if not eos_mask.any():
+        # Check for any EOS token in the generated sequence
+        combined_eos_mask = is_eos_token(cur_x[0, prompt_length:], eos_token_ids)
+        if not combined_eos_mask.any():
             return False, None
 
         # Find first EOS position
         # Note: .tolist() is faster than mx.argmax for short sequences (< 2048 tokens)
         # which is typical for block-by-block generation
-        eos_idx = eos_mask.tolist().index(True)
+        eos_idx = combined_eos_mask.tolist().index(True)
         eos_pos = eos_idx + prompt_length
 
         if (cur_x[0, prompt_length:eos_pos] != mask_id).all():
-            # Valid EOS found - prepare yield data
-            final_end = eos_pos + 1
+            # Valid EOS found - prepare yield data (exclude EOS token)
+            final_end = eos_pos
             if final_end > last_yielded_pos:
                 new_tokens = cur_x[0, last_yielded_pos:final_end]
                 block_start = last_yielded_pos - prompt_length
@@ -553,7 +570,7 @@ class Model(nn.Module):
         gen_end: int,
         prompt_length: int,
         mask_id: int,
-        eos_id: int,
+        eos_token_ids: set,
     ) -> tuple[Optional[tuple[mx.array, int, int]], int, bool]:
         """
         Process completed block and determine what to yield.
@@ -576,12 +593,12 @@ class Model(nn.Module):
         # Check for EOS tokens first
         # Note: .tolist().index() is faster than mx.argmax for short sequences
         # (typical block_length is 32-128 tokens)
-        eos_mask = new_tokens == eos_id
+        eos_mask = is_eos_token(new_tokens, eos_token_ids)
         if eos_mask.any():
-            # Truncate at first EOS (inclusive)
+            # Truncate at first EOS (exclusive - don't include EOS in output)
             first_eos_idx = eos_mask.tolist().index(True)
-            new_tokens = new_tokens[: first_eos_idx + 1]
-            actual_end = last_yielded_pos + first_eos_idx + 1
+            new_tokens = new_tokens[:first_eos_idx]
+            actual_end = last_yielded_pos + first_eos_idx
             block_start = last_yielded_pos - prompt_length
             block_end = actual_end - prompt_length
             return (new_tokens, block_start, block_end), actual_end, True
@@ -617,7 +634,7 @@ class Model(nn.Module):
         eos_early_stop: bool = False,
         minimal_topk: int = 1,
         threshold: float = 0.95,
-        eos_id: Optional[int] = None,
+        eos_token_ids: Optional[Union[int, list, set]] = None,
         mask_id: Optional[int] = None,
     ):
         """
@@ -637,7 +654,7 @@ class Model(nn.Module):
             eos_early_stop: Stop on first valid EOS token
             minimal_topk: Minimum tokens to keep (caps effective steps)
             threshold: Confidence threshold for token acceptance
-            eos_id: End-of-sequence token ID
+            eos_token_ids: End-of-sequence token ID(s). Can be a single int, list, or set.
             mask_id: Mask token ID for ungenerated positions
 
         Yields:
@@ -646,9 +663,16 @@ class Model(nn.Module):
                 - block_start: Starting position (relative to generation start)
                 - block_end: Ending position (relative to generation start)
         """
-        # Use config defaults if not provided
-        if eos_id is None:
-            eos_id = self.args.eos_token_id
+        # Convert to set for consistent handling
+        if eos_token_ids is None:
+            eos_token_ids = {self.args.eos_token_id}
+        elif isinstance(eos_token_ids, int):
+            eos_token_ids = {eos_token_ids}
+        elif isinstance(eos_token_ids, list):
+            eos_token_ids = set(eos_token_ids)
+        else:
+            eos_token_ids = set(eos_token_ids)
+
         if mask_id is None:
             mask_id = self.args.mask_token_id
 
@@ -734,7 +758,7 @@ class Model(nn.Module):
                         x0,
                         cur_x,
                         prompt_length,
-                        eos_id,
+                        eos_token_ids,
                         mask_id,
                         last_yielded_pos,
                     )
@@ -749,7 +773,7 @@ class Model(nn.Module):
             # Yield completed block (excluding mask tokens and stopping at EOS)
             gen_end = min(current_window_end, prompt_length + gen_length)
             yield_data, last_yielded_pos, should_break = self._process_completed_block(
-                x, last_yielded_pos, gen_end, prompt_length, mask_id, eos_id
+                x, last_yielded_pos, gen_end, prompt_length, mask_id, eos_token_ids
             )
 
             if yield_data is not None:
@@ -759,7 +783,10 @@ class Model(nn.Module):
                 break
 
             # Stop if EOS found
-            if (x[0, prompt_length:current_window_end] == eos_id).any():
+            eos_found = is_eos_token(
+                x[0, prompt_length:current_window_end], eos_token_ids
+            ).any()
+            if eos_found:
                 break
 
     def generate(
@@ -774,7 +801,7 @@ class Model(nn.Module):
         eos_early_stop: bool = False,
         minimal_topk: int = 1,
         threshold: float = 0.95,
-        eos_id: Optional[int] = None,
+        eos_token_ids: Optional[Union[int, list, set]] = None,
         mask_id: Optional[int] = None,
     ) -> mx.array:
         """
@@ -794,7 +821,7 @@ class Model(nn.Module):
             eos_early_stop: Stop on first valid EOS token
             minimal_topk: Minimum tokens to keep (caps effective steps)
             threshold: Confidence threshold for token acceptance
-            eos_id: End-of-sequence token ID
+            eos_token_ids: End-of-sequence token ID(s). Can be a single int, list, or set.
             mask_id: Mask token ID for ungenerated positions
 
         Returns:
@@ -813,7 +840,7 @@ class Model(nn.Module):
             eos_early_stop=eos_early_stop,
             minimal_topk=minimal_topk,
             threshold=threshold,
-            eos_id=eos_id,
+            eos_token_ids=eos_token_ids,
             mask_id=mask_id,
         ):
             all_tokens.append(new_tokens)
