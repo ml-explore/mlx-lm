@@ -526,13 +526,13 @@ class Model(nn.Module):
         eos_token_ids: set,
         mask_id: int,
         last_yielded_pos: int,
-    ) -> tuple[bool, Optional[tuple[mx.array, int, int]]]:
+    ) -> tuple[bool, Optional[tuple[mx.array, int, int, str]]]:
         """
         Check if we should early stop due to EOS token.
 
         Returns:
             (should_stop, yield_data): If should_stop is True, yield_data contains
-                                       (new_tokens, block_start, block_end) or None
+                                       (new_tokens, block_start, block_end, finish_reason) or None
         """
         # Check if any newly updated tokens are EOS
         newly_updated = mx.where(update_mask, x0[0], mx.array(-1, dtype=x0.dtype))
@@ -558,7 +558,7 @@ class Model(nn.Module):
                 new_tokens = cur_x[0, last_yielded_pos:final_end]
                 block_start = last_yielded_pos - prompt_length
                 block_end = final_end - prompt_length
-                return True, (new_tokens, block_start, block_end)
+                return True, (new_tokens, block_start, block_end, "stop")
             return True, None
 
         return False, None
@@ -571,24 +571,25 @@ class Model(nn.Module):
         prompt_length: int,
         mask_id: int,
         eos_token_ids: set,
-    ) -> tuple[Optional[tuple[mx.array, int, int]], int, bool]:
+    ) -> tuple[Optional[tuple[mx.array, int, int]], int, bool, Optional[str]]:
         """
         Process completed block and determine what to yield.
 
         Returns:
-            (yield_data, new_last_yielded_pos, should_break):
+            (yield_data, new_last_yielded_pos, should_break, finish_reason):
                 - yield_data: (new_tokens, block_start, block_end) or None
                 - new_last_yielded_pos: Updated yielded position
                 - should_break: Whether to break from block loop
+                - finish_reason: "stop" if EOS found, None otherwise
         """
         if gen_end <= last_yielded_pos:
-            return None, last_yielded_pos, False
+            return None, last_yielded_pos, False, None
 
         new_tokens = x[0, last_yielded_pos:gen_end]
 
         # Don't yield if block is all mask tokens
         if (new_tokens == mask_id).all():
-            return None, last_yielded_pos, False
+            return None, last_yielded_pos, False, None
 
         # Check for EOS tokens first
         # Note: .tolist().index() is faster than mx.argmax for short sequences
@@ -601,7 +602,7 @@ class Model(nn.Module):
             actual_end = last_yielded_pos + first_eos_idx
             block_start = last_yielded_pos - prompt_length
             block_end = actual_end - prompt_length
-            return (new_tokens, block_start, block_end), actual_end, True
+            return (new_tokens, block_start, block_end), actual_end, True, "stop"
 
         # Check for mask tokens
         mask_mask = new_tokens == mask_id
@@ -614,13 +615,13 @@ class Model(nn.Module):
                 actual_end = last_yielded_pos + first_mask_idx
                 block_start = last_yielded_pos - prompt_length
                 block_end = actual_end - prompt_length
-                return (new_tokens, block_start, block_end), actual_end, True
-            return None, last_yielded_pos, True
+                return (new_tokens, block_start, block_end), actual_end, True, "stop"
+            return None, last_yielded_pos, True, "stop"
 
         # No masks or EOS, yield entire block
         block_start = last_yielded_pos - prompt_length
         block_end = gen_end - prompt_length
-        return (new_tokens, block_start, block_end), gen_end, False
+        return (new_tokens, block_start, block_end), gen_end, False, None
 
     def stream_generate(
         self,
@@ -772,12 +773,14 @@ class Model(nn.Module):
 
             # Yield completed block (excluding mask tokens and stopping at EOS)
             gen_end = min(current_window_end, prompt_length + gen_length)
-            yield_data, last_yielded_pos, should_break = self._process_completed_block(
-                x, last_yielded_pos, gen_end, prompt_length, mask_id, eos_token_ids
+            yield_data, last_yielded_pos, should_break, finish_reason = (
+                self._process_completed_block(
+                    x, last_yielded_pos, gen_end, prompt_length, mask_id, eos_token_ids
+                )
             )
 
             if yield_data is not None:
-                yield yield_data
+                yield (*yield_data, finish_reason)
 
             if should_break:
                 break

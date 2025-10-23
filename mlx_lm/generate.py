@@ -210,12 +210,6 @@ def setup_arg_parser():
         default=3,
     )
     parser.add_argument(
-        "--show-blocks",
-        action="store_true",
-        help="[Diffusion models only] Show detailed block boundaries and progress. "
-        "Shows [Block X-Y] prefixes when streaming diffusion model output.",
-    )
-    parser.add_argument(
         "--block-length",
         type=int,
         default=16,
@@ -780,13 +774,9 @@ def generate(
     """
     # Check if this is a diffusion model (e.g., LLaDA2)
     if getattr(model, "is_diffusion_model", False):
-        show_blocks = kwargs.pop("show_blocks", False)
-        return _generate_diffusion(
-            model, tokenizer, prompt, verbose, show_blocks, **kwargs
-        )
+        return _generate_diffusion(model, tokenizer, prompt, verbose, **kwargs)
 
     # Remove diffusion-specific kwargs not used by autoregressive models
-    kwargs.pop("show_blocks", None)
     kwargs.pop("block_length", None)
     kwargs.pop("steps", None)
     kwargs.pop("threshold", None)
@@ -824,57 +814,64 @@ def _generate_diffusion_stream(
     prompt_tokens: List[int],
     inputs: mx.array,
     gen_kwargs: dict,
-    verbose: bool,
-    show_blocks: bool = False,
-):
+) -> Generator[GenerationResponse, None, None]:
     """Streaming generation for diffusion models (generator function)."""
-    import time
-
-    if verbose:
-        print("=" * 10, flush=True)
-        if show_blocks:
-            print(
-                f"[Diffusion Streaming: block_length={gen_kwargs['block_length']}, steps={gen_kwargs['steps']}]",
-                flush=True,
-            )
-
-    start_time = time.time()
+    tic = time.perf_counter()
+    prompt_tps = 0.0
     total_tokens = 0
+    finish_reason = None
 
     # Use the streaming generator
-    for new_tokens, block_start, block_end in model.stream_generate(
-        inputs=inputs, **gen_kwargs
+    for n, (new_tokens, _, _, block_finish_reason) in enumerate(
+        model.stream_generate(inputs=inputs, **gen_kwargs)
     ):
         # Decode just the new block
         block_text = tokenizer.decode(new_tokens.tolist())
         total_tokens += len(new_tokens)
 
-        if verbose:
-            if show_blocks:
-                # Show detailed block info
-                print(f"[Block {block_start:3d}-{block_end:3d}] ", end="", flush=True)
-                print(block_text, flush=True)
-            else:
-                # Just print the text (no block markers)
-                print(block_text, end="", flush=True)
+        if n == 0:
+            # Calculate prompt processing speed after first block
+            prompt_time = time.perf_counter() - tic
+            prompt_tps = len(prompt_tokens) / prompt_time if prompt_time > 0 else 0.0
+            tic = time.perf_counter()
 
-        yield block_text
+        # Yield block response
+        elapsed = time.perf_counter() - tic
+        yield GenerationResponse(
+            text=block_text,
+            token=-1,  # Diffusion doesn't generate token-by-token
+            logprobs=mx.array([]),  # No logprobs for diffusion blocks
+            from_draft=False,
+            prompt_tokens=len(prompt_tokens),
+            prompt_tps=prompt_tps,
+            generation_tokens=total_tokens,
+            generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=None,
+        )
 
-    if verbose:
-        if not show_blocks:
-            print()  # Final newline (only if not already printed by show_blocks)
-        elapsed = time.time() - start_time
-        print("=" * 10, flush=True)
-        print(
-            f"Prompt: {len(prompt_tokens)} tokens, {len(prompt_tokens)/elapsed:.3f} tokens-per-sec",
-            flush=True,
-        )
-        print(
-            f"Generation: {total_tokens} tokens, {total_tokens/elapsed:.3f} tokens-per-sec",
-            flush=True,
-        )
-        peak_mem = mx.get_peak_memory() / 1e9
-        print(f"Peak memory: {peak_mem:.3f} GB", flush=True)
+        # Check if this is the final block
+        if block_finish_reason is not None:
+            finish_reason = block_finish_reason
+            break
+    else:
+        # Loop completed without break - hit max length
+        finish_reason = "length"
+
+    # Yield final response
+    elapsed = time.perf_counter() - tic
+    yield GenerationResponse(
+        text="",
+        token=-1,
+        logprobs=mx.array([]),
+        from_draft=False,
+        prompt_tokens=len(prompt_tokens),
+        prompt_tps=prompt_tps,
+        generation_tokens=total_tokens,
+        generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
+        peak_memory=mx.get_peak_memory() / 1e9,
+        finish_reason=finish_reason,
+    )
 
 
 def _generate_diffusion(
@@ -882,7 +879,6 @@ def _generate_diffusion(
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, List[int]],
     verbose: bool = False,
-    show_blocks: bool = False,
     **kwargs,
 ) -> str:
     """
@@ -953,7 +949,7 @@ def _generate_diffusion(
             token_ids = tokenizer.encode(special_token, add_special_tokens=False)
             if len(token_ids) == 1 and token_ids[0] not in eos_tokens:
                 eos_tokens.append(token_ids[0])
-        except:
+        except Exception:
             pass  # Token doesn't exist in vocabulary
 
     gen_kwargs.setdefault("eos_token_ids", eos_tokens)
@@ -970,17 +966,33 @@ def _generate_diffusion(
         if key in kwargs:
             gen_kwargs[key] = kwargs.pop(key)
 
-    # Consume the streaming generator and collect output
+    if verbose:
+        print("=" * 10)
+
     text = ""
-    for chunk in _generate_diffusion_stream(
-        model, tokenizer, prompt_tokens, inputs, gen_kwargs, verbose, show_blocks
+    for response in _generate_diffusion_stream(
+        model, tokenizer, prompt_tokens, inputs, gen_kwargs
     ):
-        if verbose:
-            # Already printed in the stream, just consume
-            pass
-        else:
-            # Collect chunks for return
-            text += chunk
+        if response.text:
+            if verbose:
+                print(response.text, end="", flush=True)
+            text += response.text
+
+    if verbose:
+        print()
+        print("=" * 10)
+        if len(text) == 0:
+            print("No text generated for this prompt")
+            return text
+        print(
+            f"Prompt: {response.prompt_tokens} tokens, "
+            f"{response.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"Generation: {response.generation_tokens} tokens, "
+            f"{response.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"Peak memory: {response.peak_memory:.3f} GB")
 
     return text
 
@@ -1425,7 +1437,6 @@ def main():
     gen_kwargs = {
         "max_tokens": args.max_tokens,
         "verbose": args.verbose,
-        "show_blocks": args.show_blocks,
         "max_kv_size": args.max_kv_size,
         "prompt_cache": prompt_cache if using_cache else None,
         "kv_bits": args.kv_bits,
