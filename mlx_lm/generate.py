@@ -825,7 +825,7 @@ def _generate_diffusion_stream(
     for n, (new_tokens, _, _, block_finish_reason) in enumerate(
         model.stream_generate(inputs=inputs, **gen_kwargs)
     ):
-        # Decode just the new block
+        # Decode tokens
         block_text = tokenizer.decode(new_tokens.tolist())
         total_tokens += len(new_tokens)
 
@@ -850,7 +850,7 @@ def _generate_diffusion_stream(
             finish_reason=None,
         )
 
-        # Check if this is the final block
+        # Check if we should stop after this yield
         if block_finish_reason is not None:
             finish_reason = block_finish_reason
             break

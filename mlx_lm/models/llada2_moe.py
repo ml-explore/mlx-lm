@@ -639,10 +639,10 @@ class Model(nn.Module):
         mask_id: Optional[int] = None,
     ):
         """
-        Stream diffusion generation block-by-block.
+        Stream diffusion generation with token-by-token yielding.
 
-        This method yields completed blocks as they finish denoising, allowing
-        for progressive output display.
+        This method yields tokens as they become confident during the denoising
+        process, providing responsive incremental output.
 
         Args:
             inputs: Input token IDs (prompt)
@@ -659,10 +659,11 @@ class Model(nn.Module):
             mask_id: Mask token ID for ungenerated positions
 
         Yields:
-            Tuple[mx.array, int, int]: (new_tokens, block_start, block_end)
-                - new_tokens: The newly completed tokens for this block
+            Tuple[mx.array, int, int, Optional[str]]: (new_tokens, block_start, block_end, finish_reason)
+                - new_tokens: The newly completed tokens
                 - block_start: Starting position (relative to generation start)
                 - block_end: Ending position (relative to generation start)
+                - finish_reason: "stop" if EOS found, None otherwise
         """
         # Convert to set for consistent handling
         if eos_token_ids is None:
@@ -719,6 +720,14 @@ class Model(nn.Module):
                 :, :, :current_window_end, :current_window_end
             ]
 
+            # Track which positions in current block have been yielded
+            block_start_abs = num_block * block_length
+            last_yielded_in_block = (
+                last_yielded_pos - block_start_abs
+                if last_yielded_pos > block_start_abs
+                else 0
+            )
+
             # Iterative denoising for this block
             for step in range(steps):
                 # Check if any tokens left to denoise
@@ -752,6 +761,57 @@ class Model(nn.Module):
                         axis=1,
                     )
 
+                    # Yield newly confident tokens within this block
+                    # Update global sequence
+                    x[:, :current_window_end] = cur_x
+
+                    # Extract tokens from current block
+                    block_tokens = cur_x[0, -block_length:]
+
+                    # Determine valid yield range using array operations
+                    start_idx = max(
+                        last_yielded_in_block, prompt_length - block_start_abs
+                    )
+                    if start_idx >= block_length:
+                        continue  # Nothing to yield yet
+
+                    # Create boolean masks for stop conditions
+                    remaining_tokens = block_tokens[start_idx:]
+                    is_mask = remaining_tokens == mask_id
+                    is_eos = is_eos_token(remaining_tokens, eos_token_ids)
+
+                    # Find first stop position (mask or EOS)
+                    stop_mask = is_mask | is_eos
+                    if stop_mask.any():
+                        # Find first True using argmax (works because True=1, False=0)
+                        stop_offset = mx.argmax(stop_mask.astype(mx.int32)).item()
+                        end_idx = start_idx + stop_offset
+
+                        # Check if we hit EOS
+                        hit_eos = (
+                            is_eos[stop_offset].item()
+                            if stop_offset < len(is_eos)
+                            else False
+                        )
+                    else:
+                        # No stop conditions found
+                        end_idx = block_length
+                        hit_eos = False
+
+                    # Yield tokens if we have any
+                    if end_idx > start_idx:
+                        tokens_slice = block_tokens[start_idx:end_idx]
+                        gen_start = (block_start_abs + start_idx) - prompt_length
+                        gen_end = gen_start + (end_idx - start_idx)
+                        yield (tokens_slice, gen_start, gen_end, None)
+
+                        last_yielded_pos = block_start_abs + end_idx
+                        last_yielded_in_block = end_idx
+
+                    # If we hit EOS, stop iterating (block completion will handle final yield)
+                    if hit_eos:
+                        break
+
                 # Early stop on EOS
                 if eos_early_stop:
                     should_stop, yield_data = self._check_early_stop_eos(
@@ -767,9 +827,6 @@ class Model(nn.Module):
                         if yield_data is not None:
                             yield yield_data
                         return
-
-            # Update global sequence
-            x[:, :current_window_end] = cur_x
 
             # Yield completed block (excluding mask tokens and stopping at EOS)
             gen_end = min(current_window_end, prompt_length + gen_length)
@@ -832,7 +889,7 @@ class Model(nn.Module):
         """
         # Collect all blocks from streaming generator
         all_tokens = []
-        for new_tokens, _, _ in self.stream_generate(
+        for new_tokens, _, _, _ in self.stream_generate(
             inputs=inputs,
             temperature=temperature,
             block_length=block_length,
