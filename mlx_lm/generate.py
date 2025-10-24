@@ -212,20 +212,20 @@ def setup_arg_parser():
     parser.add_argument(
         "--block-length",
         type=int,
-        default=16,
-        help="[Diffusion models only] Number of tokens per block (default: 16)",
+        default=32,
+        help="[Diffusion models only] Number of tokens per block (default: 32)",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=8,
-        help="[Diffusion models only] Number of denoising iterations per block (default: 8)",
+        default=32,
+        help="[Diffusion models only] Number of denoising iterations per block (default: 32)",
     )
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.85,
-        help="[Diffusion models only] Confidence threshold for token acceptance (default: 0.85)",
+        default=0.95,
+        help="[Diffusion models only] Confidence threshold for token acceptance (default: 0.95)",
     )
     return parser
 
@@ -694,60 +694,149 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
+    complete_eos_token_ids = set(tokenizer.eos_token_ids)
+
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
+    if (
+        hasattr(model, "generate_step")
+        and callable(getattr(model, "generate_step"))
+        and not draft_model
+    ):
+        for key in [
+            "max_kv_size",
+            "prompt_cache",
+            "kv_bits",
+            "kv_group_size",
+            "quantized_kv_start",
+            "draft_model",
+            "num_draft_tokens",
+            "logits_processors",
+            "prompt_progress_callback",
+        ]:
+            kwargs.pop(key, None)
+
+        if "eos_token_ids" not in kwargs:
+            # Only augment EOS tokens if tokenizer has some defined
+            if len(complete_eos_token_ids) > 0:
+                if hasattr(model, "args") and hasattr(model.args, "eos_token_id"):
+                    complete_eos_token_ids.add(model.args.eos_token_id)
+                if hasattr(model, "EXTRA_EOS_TOKENS"):
+                    for special_token in model.EXTRA_EOS_TOKENS:
+                        try:
+                            token_ids = tokenizer.encode(
+                                special_token, add_special_tokens=False
+                            )
+                            if len(token_ids) == 1:
+                                complete_eos_token_ids.add(token_ids[0])
+                        except Exception:
+                            pass
+
+            kwargs["eos_token_ids"] = list(complete_eos_token_ids)
+
+        batched_prompt = prompt[None] if len(prompt.shape) == 1 else prompt
+
+        def wrap_custom_generator():
+            with mx.stream(generation_stream):
+                yield_count = 0
+                for tokens, logprobs in model.generate_step(
+                    inputs=batched_prompt, **kwargs
+                ):
+                    tokens_list = (
+                        tokens.flatten().tolist()
+                        if isinstance(tokens, mx.array)
+                        else list(tokens)
+                    )
+                    yield (tokens_list, logprobs, False)
+
+                    yield_count += 1
+                    if yield_count % 256 == 0:
+                        mx.clear_cache()
+
+        token_generator = wrap_custom_generator()
     else:
-        kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
+        for key in ["block_length", "steps", "threshold"]:
+            kwargs.pop(key, None)
+
+        if draft_model is None:
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = (
+                ([token], logprobs, False)
+                for token, logprobs in generate_step(prompt, model, **kwargs)
+            )
+        else:
+            kwargs.pop("max_kv_size", None)
+            kwargs.pop("prompt_progress_callback", None)
+            token_generator = (
+                ([token], logprobs, from_draft)
+                for token, logprobs, from_draft in speculative_generate_step(
+                    prompt, model, draft_model, **kwargs
+                )
+            )
+
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
+        total_tokens = 0
+        prompt_tps = 0.0
+        last_token = -1
+        last_logprobs = mx.array([])
+        last_from_draft = False
+        finish_reason = None
+
+        for n, (tokens_list, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+            for token in tokens_list:
+                if token in complete_eos_token_ids:
+                    finish_reason = "stop"
+                    break
 
+                detokenizer.add_token(token)
+                total_tokens += 1
+                last_token = token
+                last_logprobs = logprobs
+                last_from_draft = from_draft
+
+                if total_tokens >= max_tokens:
+                    finish_reason = "length"
+                    break
+
+            elapsed = time.perf_counter() - tic
             yield GenerationResponse(
                 text=detokenizer.last_segment,
-                token=token,
-                logprobs=logprobs,
+                token=last_token,
+                logprobs=last_logprobs,
                 from_draft=from_draft,
                 prompt_tokens=prompt.size,
                 prompt_tps=prompt_tps,
-                generation_tokens=n + 1,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                generation_tokens=total_tokens,
+                generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
                 peak_memory=mx.get_peak_memory() / 1e9,
                 finish_reason=None,
             )
 
+            if finish_reason:
+                break
+
+        if not finish_reason:
+            finish_reason = "length"
+
         detokenizer.finalize()
+        elapsed = time.perf_counter() - tic
         yield GenerationResponse(
             text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
+            token=last_token,
+            logprobs=last_logprobs,
+            from_draft=last_from_draft,
             prompt_tokens=prompt.size,
             prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
+            generation_tokens=total_tokens,
+            generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
             peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
+            finish_reason=finish_reason,
         )
 
 
@@ -772,15 +861,6 @@ def generate(
           (e.g., LLaDA2), additional options include ``block_length``, ``steps``,
           and ``threshold``.
     """
-    # Check if this is a diffusion model (e.g., LLaDA2)
-    if getattr(model, "is_diffusion_model", False):
-        return _generate_diffusion(model, tokenizer, prompt, verbose, **kwargs)
-
-    # Remove diffusion-specific kwargs not used by autoregressive models
-    kwargs.pop("block_length", None)
-    kwargs.pop("steps", None)
-    kwargs.pop("threshold", None)
-
     if verbose:
         print("=" * 10)
 
@@ -789,194 +869,6 @@ def generate(
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
-
-    if verbose:
-        print()
-        print("=" * 10)
-        if len(text) == 0:
-            print("No text generated for this prompt")
-            return
-        print(
-            f"Prompt: {response.prompt_tokens} tokens, "
-            f"{response.prompt_tps:.3f} tokens-per-sec"
-        )
-        print(
-            f"Generation: {response.generation_tokens} tokens, "
-            f"{response.generation_tps:.3f} tokens-per-sec"
-        )
-        print(f"Peak memory: {response.peak_memory:.3f} GB")
-    return text
-
-
-def _generate_diffusion_stream(
-    model: nn.Module,
-    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
-    prompt_tokens: List[int],
-    inputs: mx.array,
-    gen_kwargs: dict,
-) -> Generator[GenerationResponse, None, None]:
-    """Streaming generation for diffusion models (generator function)."""
-    tic = time.perf_counter()
-    prompt_tps = 0.0
-    total_tokens = 0
-    finish_reason = None
-
-    # Use the streaming generator
-    for n, (new_tokens, _, _, block_finish_reason) in enumerate(
-        model.stream_generate(inputs=inputs, **gen_kwargs)
-    ):
-        # Decode tokens
-        block_text = tokenizer.decode(new_tokens.tolist())
-        total_tokens += len(new_tokens)
-
-        if n == 0:
-            # Calculate prompt processing speed after first block
-            prompt_time = time.perf_counter() - tic
-            prompt_tps = len(prompt_tokens) / prompt_time if prompt_time > 0 else 0.0
-            tic = time.perf_counter()
-
-        # Yield block response
-        elapsed = time.perf_counter() - tic
-        yield GenerationResponse(
-            text=block_text,
-            token=-1,  # Diffusion doesn't generate token-by-token
-            logprobs=mx.array([]),  # No logprobs for diffusion blocks
-            from_draft=False,
-            prompt_tokens=len(prompt_tokens),
-            prompt_tps=prompt_tps,
-            generation_tokens=total_tokens,
-            generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=None,
-        )
-
-        # Check if we should stop after this yield
-        if block_finish_reason is not None:
-            finish_reason = block_finish_reason
-            break
-    else:
-        # Loop completed without break - hit max length
-        finish_reason = "length"
-
-    # Yield final response
-    elapsed = time.perf_counter() - tic
-    yield GenerationResponse(
-        text="",
-        token=-1,
-        logprobs=mx.array([]),
-        from_draft=False,
-        prompt_tokens=len(prompt_tokens),
-        prompt_tps=prompt_tps,
-        generation_tokens=total_tokens,
-        generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
-        peak_memory=mx.get_peak_memory() / 1e9,
-        finish_reason=finish_reason,
-    )
-
-
-def _generate_diffusion(
-    model: nn.Module,
-    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
-    prompt: Union[str, List[int]],
-    verbose: bool = False,
-    **kwargs,
-) -> str:
-    """
-    Generate text using a diffusion model.
-
-    Diffusion models (like LLaDA2) use iterative block-wise denoising
-    instead of autoregressive generation, so they have different parameters.
-
-    Standard parameters are mapped as follows:
-    - max_tokens → gen_length
-    - temp → temperature
-    - top_k, top_p → passed through
-
-    Diffusion-specific parameters can also be provided:
-    - block_length: Tokens per block (default: 16)
-    - steps: Denoising iterations (default: 8)
-    - threshold: Confidence threshold (default: 0.85)
-    """
-    # Convert prompt to tokens if needed
-    if isinstance(prompt, str):
-        prompt_tokens = tokenizer.encode(prompt)
-    else:
-        prompt_tokens = prompt
-
-    inputs = mx.array([prompt_tokens])
-
-    # Map standard parameters to diffusion parameters
-    gen_kwargs = {}
-
-    # Map max_tokens to gen_length
-    if "max_tokens" in kwargs:
-        gen_kwargs["gen_length"] = kwargs.pop("max_tokens")
-    elif "gen_length" not in kwargs:
-        gen_kwargs["gen_length"] = DEFAULT_MAX_TOKENS
-
-    # Map temp to temperature
-    if "temp" in kwargs:
-        gen_kwargs["temperature"] = kwargs.pop("temp")
-    elif "temperature" not in kwargs:
-        gen_kwargs["temperature"] = DEFAULT_TEMP
-
-    # Pass through top_k and top_p
-    if "top_k" in kwargs:
-        gen_kwargs["top_k"] = kwargs.pop("top_k") if kwargs["top_k"] > 0 else None
-    if "top_p" in kwargs and kwargs["top_p"] < 1.0:
-        gen_kwargs["top_p"] = kwargs.pop("top_p")
-
-    # Diffusion-specific parameters with sensible defaults
-    gen_kwargs.setdefault("block_length", 16)
-    gen_kwargs.setdefault("steps", 8)
-    gen_kwargs.setdefault("threshold", 0.85)
-    gen_kwargs.setdefault("eos_early_stop", True)
-
-    # Pass all EOS token IDs from the tokenizer
-    eos_tokens = list(tokenizer.eos_token_ids)
-
-    # Add model's default EOS token if not already present
-    if (
-        hasattr(model.args, "eos_token_id")
-        and model.args.eos_token_id not in eos_tokens
-    ):
-        eos_tokens.append(model.args.eos_token_id)
-
-    # Check for special tokens that might be missing from the config
-    for special_token in ["<|role_end|>", "<|im_end|>", "<|end|>"]:
-        try:
-            # Only add if it encodes to a single token (not subword split)
-            token_ids = tokenizer.encode(special_token, add_special_tokens=False)
-            if len(token_ids) == 1 and token_ids[0] not in eos_tokens:
-                eos_tokens.append(token_ids[0])
-        except Exception:
-            pass  # Token doesn't exist in vocabulary
-
-    gen_kwargs.setdefault("eos_token_ids", eos_tokens)
-
-    # Override with any explicitly provided diffusion parameters
-    for key in [
-        "block_length",
-        "steps",
-        "threshold",
-        "eos_early_stop",
-        "minimal_topk",
-        "eos_token_ids",
-    ]:
-        if key in kwargs:
-            gen_kwargs[key] = kwargs.pop(key)
-
-    if verbose:
-        print("=" * 10)
-
-    text = ""
-    for response in _generate_diffusion_stream(
-        model, tokenizer, prompt_tokens, inputs, gen_kwargs
-    ):
-        if response.text:
-            if verbose:
-                print(response.text, end="", flush=True)
-            text += response.text
 
     if verbose:
         print()
@@ -993,7 +885,6 @@ def _generate_diffusion(
             f"{response.generation_tps:.3f} tokens-per-sec"
         )
         print(f"Peak memory: {response.peak_memory:.3f} GB")
-
     return text
 
 
@@ -1294,6 +1185,13 @@ def batch_generate(
           See :obj:`BatchGenerator` for more details.
     """
 
+    # Check if model uses custom generation (e.g., diffusion models)
+    if hasattr(model, "generate_step") and callable(getattr(model, "generate_step")):
+        raise NotImplementedError(
+            f"{model.__class__.__name__} uses custom generation and does not support "
+            "batch_generate(). Use generate() or stream_generate() instead."
+        )
+
     gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
     num_samples = len(prompts)
     fin = 0
@@ -1444,29 +1342,25 @@ def main():
         "quantized_kv_start": args.quantized_kv_start,
         "draft_model": draft_model,
         "num_draft_tokens": args.num_draft_tokens,
+        # Diffusion-specific parameters
+        "block_length": args.block_length,
+        "steps": args.steps,
+        "threshold": args.threshold,
     }
 
-    if getattr(model, "is_diffusion_model", False):
-        # Diffusion models need raw sampling parameters
-        gen_kwargs["temp"] = args.temp
-        gen_kwargs["top_k"] = args.top_k
-        gen_kwargs["top_p"] = args.top_p
-        gen_kwargs["block_length"] = args.block_length
-        gen_kwargs["steps"] = args.steps
-        gen_kwargs["threshold"] = args.threshold
-    else:
-        # Autoregressive models use a sampler
-        sampler = make_sampler(
-            args.temp,
-            args.top_p,
-            args.min_p,
-            args.min_tokens_to_keep,
-            top_k=args.top_k,
-            xtc_probability=args.xtc_probability,
-            xtc_threshold=args.xtc_threshold,
-            xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
-        )
-        gen_kwargs["sampler"] = sampler
+    # Create sampler for all models
+    sampler = make_sampler(
+        args.temp,
+        args.top_p,
+        args.min_p,
+        args.min_tokens_to_keep,
+        top_k=args.top_k,
+        xtc_probability=args.xtc_probability,
+        xtc_threshold=args.xtc_threshold,
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+    )
+
+    gen_kwargs["sampler"] = sampler
 
     # Generate
     response = generate(model, tokenizer, prompt, **gen_kwargs)

@@ -434,6 +434,9 @@ class Model(nn.Module):
     denoising instead of standard autoregressive generation.
     """
 
+    # Chat-specific EOS tokens used by LLaDA2 but not in default config
+    EXTRA_EOS_TOKENS = ["<|role_end|>"]
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -526,13 +529,13 @@ class Model(nn.Module):
         eos_token_ids: set,
         mask_id: int,
         last_yielded_pos: int,
-    ) -> tuple[bool, Optional[tuple[mx.array, int, int, str]]]:
+    ) -> tuple[bool, Optional[mx.array]]:
         """
         Check if we should early stop due to EOS token.
 
         Returns:
-            (should_stop, yield_data): If should_stop is True, yield_data contains
-                                       (new_tokens, block_start, block_end, finish_reason) or None
+            (should_stop, new_tokens): If should_stop is True, new_tokens contains
+                                       tokens to yield (including EOS) or None
         """
         # Check if any newly updated tokens are EOS
         newly_updated = mx.where(update_mask, x0[0], mx.array(-1, dtype=x0.dtype))
@@ -546,19 +549,15 @@ class Model(nn.Module):
             return False, None
 
         # Find first EOS position
-        # Note: .tolist() is faster than mx.argmax for short sequences (< 2048 tokens)
-        # which is typical for block-by-block generation
         eos_idx = combined_eos_mask.tolist().index(True)
         eos_pos = eos_idx + prompt_length
 
         if (cur_x[0, prompt_length:eos_pos] != mask_id).all():
-            # Valid EOS found - prepare yield data (exclude EOS token)
-            final_end = eos_pos
+            # Valid EOS found - prepare yield data (include EOS token)
+            final_end = eos_pos + 1  # Include EOS position
             if final_end > last_yielded_pos:
                 new_tokens = cur_x[0, last_yielded_pos:final_end]
-                block_start = last_yielded_pos - prompt_length
-                block_end = final_end - prompt_length
-                return True, (new_tokens, block_start, block_end, "stop")
+                return True, new_tokens
             return True, None
 
         return False, None
@@ -571,38 +570,35 @@ class Model(nn.Module):
         prompt_length: int,
         mask_id: int,
         eos_token_ids: set,
-    ) -> tuple[Optional[tuple[mx.array, int, int]], int, bool, Optional[str]]:
+    ) -> tuple[Optional[mx.array], int, bool]:
         """
         Process completed block and determine what to yield.
 
         Returns:
-            (yield_data, new_last_yielded_pos, should_break, finish_reason):
-                - yield_data: (new_tokens, block_start, block_end) or None
+            (new_tokens, new_last_yielded_pos, should_break):
+                - new_tokens: Tokens to yield (includes EOS if present) or None
                 - new_last_yielded_pos: Updated yielded position
                 - should_break: Whether to break from block loop
-                - finish_reason: "stop" if EOS found, None otherwise
         """
         if gen_end <= last_yielded_pos:
-            return None, last_yielded_pos, False, None
+            return None, last_yielded_pos, False
 
         new_tokens = x[0, last_yielded_pos:gen_end]
 
         # Don't yield if block is all mask tokens
         if (new_tokens == mask_id).all():
-            return None, last_yielded_pos, False, None
+            return None, last_yielded_pos, False
 
         # Check for EOS tokens first
         # Note: .tolist().index() is faster than mx.argmax for short sequences
         # (typical block_length is 32-128 tokens)
         eos_mask = is_eos_token(new_tokens, eos_token_ids)
         if eos_mask.any():
-            # Truncate at first EOS (exclusive - don't include EOS in output)
+            # Truncate at first EOS (inclusive - let loop handle EOS detection)
             first_eos_idx = eos_mask.tolist().index(True)
-            new_tokens = new_tokens[:first_eos_idx]
-            actual_end = last_yielded_pos + first_eos_idx
-            block_start = last_yielded_pos - prompt_length
-            block_end = actual_end - prompt_length
-            return (new_tokens, block_start, block_end), actual_end, True, "stop"
+            new_tokens = new_tokens[: first_eos_idx + 1]  # Include EOS
+            actual_end = last_yielded_pos + first_eos_idx + 1
+            return new_tokens, actual_end, True
 
         # Check for mask tokens
         mask_mask = new_tokens == mask_id
@@ -613,45 +609,37 @@ class Model(nn.Module):
                 # Yield only up to first mask
                 new_tokens = new_tokens[:first_mask_idx]
                 actual_end = last_yielded_pos + first_mask_idx
-                block_start = last_yielded_pos - prompt_length
-                block_end = actual_end - prompt_length
-                return (new_tokens, block_start, block_end), actual_end, True, "stop"
-            return None, last_yielded_pos, True, "stop"
+                return new_tokens, actual_end, True
+            return None, last_yielded_pos, True
 
         # No masks or EOS, yield entire block
-        block_start = last_yielded_pos - prompt_length
-        block_end = gen_end - prompt_length
-        return (new_tokens, block_start, block_end), gen_end, False, None
+        return new_tokens, gen_end, False
 
-    def stream_generate(
+    def generate_step(
         self,
         inputs: mx.array,
-        temperature: float = 0.0,
+        max_tokens: int = 2048,
+        sampler: Optional[callable] = None,
         block_length: int = 32,
         steps: int = 32,
-        gen_length: int = 2048,
-        top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
-        eos_early_stop: bool = False,
+        eos_early_stop: bool = True,
         minimal_topk: int = 1,
         threshold: float = 0.95,
         eos_token_ids: Optional[Union[int, list, set]] = None,
         mask_id: Optional[int] = None,
     ):
         """
-        Stream diffusion generation with token-by-token yielding.
+        Custom generate_step implementation for diffusion models.
 
-        This method yields tokens as they become confident during the denoising
-        process, providing responsive incremental output.
+        This implements the diffusion-specific token generation strategy using
+        block-wise iterative denoising.
 
         Args:
             inputs: Input token IDs (prompt)
-            temperature: Sampling temperature (0 = greedy)
+            max_tokens: Maximum tokens to generate
+            sampler: Sampling function from make_sampler() (provides temp, top-k, top-p, min-p, XTC)
             block_length: Size of each generation block
             steps: Number of denoising iterations per block
-            gen_length: Maximum tokens to generate
-            top_p: Nucleus sampling threshold
-            top_k: Top-k sampling parameter
             eos_early_stop: Stop on first valid EOS token
             minimal_topk: Minimum tokens to keep (caps effective steps)
             threshold: Confidence threshold for token acceptance
@@ -659,18 +647,22 @@ class Model(nn.Module):
             mask_id: Mask token ID for ungenerated positions
 
         Yields:
-            Tuple[mx.array, int, int, Optional[str]]: (new_tokens, block_start, block_end, finish_reason)
-                - new_tokens: The newly completed tokens
-                - block_start: Starting position (relative to generation start)
-                - block_end: Ending position (relative to generation start)
-                - finish_reason: "stop" if EOS found, None otherwise
+            Tuple[mx.array, mx.array]: (tokens, logprobs)
+                - tokens: Array of generated tokens (can be multiple per yield, includes EOS if present)
+                - logprobs: Empty array (diffusion doesn't have per-token logprobs)
         """
-        # Convert to set for consistent handling
+        # Default to greedy sampling if no sampler provided
+        if sampler is None:
+            sampler = lambda x: mx.argmax(x, axis=-1)
+
+        gen_length = max_tokens
+
+        # Setup EOS tokens: use provided list or default from config
         if eos_token_ids is None:
             eos_token_ids = {self.args.eos_token_id}
         elif isinstance(eos_token_ids, int):
             eos_token_ids = {eos_token_ids}
-        elif isinstance(eos_token_ids, list):
+        elif isinstance(eos_token_ids, (list, set)):
             eos_token_ids = set(eos_token_ids)
         else:
             eos_token_ids = set(eos_token_ids)
@@ -682,9 +674,11 @@ class Model(nn.Module):
         steps = min(steps, gen_length // minimal_topk)
 
         # Setup
-        prompt_length = inputs.shape[1] if len(inputs.shape) > 1 else inputs.shape[0]
-        if len(inputs.shape) == 1:
-            inputs = mx.expand_dims(inputs, 0)
+        batch_size, prompt_length = inputs.shape
+        if batch_size != 1:
+            raise ValueError(
+                f"Diffusion generation only supports batch_size=1, got {batch_size}"
+            )
 
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
         total_length = num_blocks * block_length
@@ -741,10 +735,8 @@ class Model(nn.Module):
                 # Focus on current block
                 active_logits = logits[:, -block_length:, :]
 
-                # Sample tokens with confidence
-                x0, x0_p = self._sample_with_temperature_topk_topp(
-                    active_logits, temperature=temperature, top_k=top_k, top_p=top_p
-                )
+                # Sample tokens with confidence using unified sampler
+                x0, x0_p = self._sample_with_sampler(active_logits, sampler)
 
                 # Determine which tokens to transfer
                 num_to_transfer = int(num_transfer_tokens_schedule[step])
@@ -801,20 +793,18 @@ class Model(nn.Module):
                     # Yield tokens if we have any
                     if end_idx > start_idx:
                         tokens_slice = block_tokens[start_idx:end_idx]
-                        gen_start = (block_start_abs + start_idx) - prompt_length
-                        gen_end = gen_start + (end_idx - start_idx)
-                        yield (tokens_slice, gen_start, gen_end, None)
+                        yield (tokens_slice, mx.array([]))
 
                         last_yielded_pos = block_start_abs + end_idx
                         last_yielded_in_block = end_idx
 
-                    # If we hit EOS, stop iterating (block completion will handle final yield)
+                    # If we hit EOS, it's included in the yield above, so stop
                     if hit_eos:
                         break
 
                 # Early stop on EOS
                 if eos_early_stop:
-                    should_stop, yield_data = self._check_early_stop_eos(
+                    should_stop, new_tokens = self._check_early_stop_eos(
                         update_mask,
                         x0,
                         cur_x,
@@ -824,93 +814,21 @@ class Model(nn.Module):
                         last_yielded_pos,
                     )
                     if should_stop:
-                        if yield_data is not None:
-                            yield yield_data
+                        if new_tokens is not None:
+                            yield (new_tokens, mx.array([]))
                         return
 
             # Yield completed block (excluding mask tokens and stopping at EOS)
             gen_end = min(current_window_end, prompt_length + gen_length)
-            yield_data, last_yielded_pos, should_break, finish_reason = (
-                self._process_completed_block(
-                    x, last_yielded_pos, gen_end, prompt_length, mask_id, eos_token_ids
-                )
+            new_tokens, last_yielded_pos, should_break = self._process_completed_block(
+                x, last_yielded_pos, gen_end, prompt_length, mask_id, eos_token_ids
             )
 
-            if yield_data is not None:
-                yield (*yield_data, finish_reason)
+            if new_tokens is not None:
+                yield (new_tokens, mx.array([]))
 
             if should_break:
                 break
-
-            # Stop if EOS found
-            eos_found = is_eos_token(
-                x[0, prompt_length:current_window_end], eos_token_ids
-            ).any()
-            if eos_found:
-                break
-
-    def generate(
-        self,
-        inputs: mx.array,
-        temperature: float = 0.0,
-        block_length: int = 32,
-        steps: int = 32,
-        gen_length: int = 2048,
-        top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
-        eos_early_stop: bool = False,
-        minimal_topk: int = 1,
-        threshold: float = 0.95,
-        eos_token_ids: Optional[Union[int, list, set]] = None,
-        mask_id: Optional[int] = None,
-    ) -> mx.array:
-        """
-        Diffusion-based generation using block-wise iterative denoising.
-
-        This is a convenience wrapper around stream_generate() that collects
-        all generated tokens and returns them at once.
-
-        Args:
-            inputs: Input token IDs (prompt)
-            temperature: Sampling temperature (0 = greedy)
-            block_length: Size of each generation block
-            steps: Number of denoising iterations per block
-            gen_length: Maximum tokens to generate
-            top_p: Nucleus sampling threshold
-            top_k: Top-k sampling parameter
-            eos_early_stop: Stop on first valid EOS token
-            minimal_topk: Minimum tokens to keep (caps effective steps)
-            threshold: Confidence threshold for token acceptance
-            eos_token_ids: End-of-sequence token ID(s). Can be a single int, list, or set.
-            mask_id: Mask token ID for ungenerated positions
-
-        Returns:
-            Generated token IDs (excluding prompt)
-        """
-        # Collect all blocks from streaming generator
-        all_tokens = []
-        for new_tokens, _, _, _ in self.stream_generate(
-            inputs=inputs,
-            temperature=temperature,
-            block_length=block_length,
-            steps=steps,
-            gen_length=gen_length,
-            top_p=top_p,
-            top_k=top_k,
-            eos_early_stop=eos_early_stop,
-            minimal_topk=minimal_topk,
-            threshold=threshold,
-            eos_token_ids=eos_token_ids,
-            mask_id=mask_id,
-        ):
-            all_tokens.append(new_tokens)
-
-        # Concatenate all generated tokens
-        if all_tokens:
-            return mx.concatenate(all_tokens, axis=0)
-        else:
-            # No tokens generated
-            return mx.array([], dtype=mx.int32)
 
     @staticmethod
     def _get_num_transfer_tokens(block_length: int, steps: int) -> mx.array:
@@ -925,77 +843,29 @@ class Model(nn.Module):
 
         return num_transfer_tokens
 
-    @staticmethod
-    def _top_k_logits(logits: mx.array, k: Optional[int]) -> mx.array:
-        """Apply top-k filtering to logits."""
-        if k is None or k <= 0:
-            return logits
-
-        # Use argpartition with negative kth to avoid creating -logits copy
-        mask_idx = mx.argpartition(logits, kth=-k, axis=-1)[..., :-k]
-        return mx.put_along_axis(
-            logits, mask_idx, mx.array(-float("inf"), logits.dtype), axis=-1
-        )
-
-    @staticmethod
-    def _top_p_logits(logits: mx.array, p: Optional[float]) -> mx.array:
-        """Apply nucleus (top-p) filtering to logits."""
-        if p is None or p >= 1.0:
-            return logits
-
-        # Sort descending by negating
-        sorted_indices = mx.argsort(-logits, axis=-1)
-        sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
-
-        # Get cumulative probabilities in sorted (descending) order
-        sorted_probs = mx.softmax(sorted_logits, axis=-1)
-        cumsum_probs = mx.cumsum(sorted_probs, axis=-1)
-
-        # Mask tokens where cumsum (before current token) > p
-        # Subtract sorted_probs to get cumulative sum before adding current token
-        remove_mask = (cumsum_probs - sorted_probs) > p
-        sorted_logits_masked = mx.where(remove_mask, -float("inf"), sorted_logits)
-
-        # Scatter back to original order
-        return mx.put_along_axis(
-            mx.full(logits.shape, -float("inf"), logits.dtype),
-            sorted_indices,
-            sorted_logits_masked,
-            axis=-1,
-        )
-
-    def _sample_with_temperature_topk_topp(
+    def _sample_with_sampler(
         self,
         logits: mx.array,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
+        sampler: callable,
     ) -> tuple[mx.array, mx.array]:
-        """Sample tokens with temperature, top-k, and top-p filtering."""
-        # Handle greedy decoding (temperature=0) early
-        if temperature == 0.0:
-            token = mx.argmax(logits, axis=-1)
-            probs = mx.softmax(logits, axis=-1)
-            token_prob = mx.take_along_axis(probs, mx.expand_dims(token, -1), axis=-1)
-            return token, token_prob.squeeze(-1)
+        """
+        Sample tokens using the provided sampler function.
 
-        # Apply temperature
-        if temperature != 1.0:
-            logits = logits / temperature
+        Args:
+            logits: Logits to sample from (shape: [batch, seq_len, vocab_size])
+            sampler: Sampling function from make_sampler()
 
-        # Apply top-k filtering
-        if top_k is not None and top_k > 0:
-            logits = self._top_k_logits(logits, top_k)
+        Returns:
+            (tokens, token_probs): Sampled tokens and their probabilities
+        """
+        # Convert logits to log probabilities
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-        # Apply top-p filtering
-        if top_p is not None and top_p < 1.0:
-            logits = self._top_p_logits(logits, top_p)
-
-        # Sample from logits (categorical expects unnormalized log-probs)
-        token = mx.random.categorical(logits, axis=-1)
+        # Apply sampler (handles temperature, top-k, top-p, min-p, XTC)
+        token = sampler(logprobs)
 
         # Get token probabilities for confidence scoring
-        probs = mx.softmax(logits, axis=-1)
+        probs = mx.exp(logprobs)
         token_prob = mx.take_along_axis(probs, mx.expand_dims(token, -1), axis=-1)
 
         return token, token_prob.squeeze(-1)
