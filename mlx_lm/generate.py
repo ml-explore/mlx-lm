@@ -703,44 +703,38 @@ def stream_generate(
         and callable(getattr(model, "generate_step"))
         and not draft_model
     ):
-        for key in [
-            "max_kv_size",
-            "prompt_cache",
-            "kv_bits",
-            "kv_group_size",
-            "quantized_kv_start",
-            "draft_model",
-            "num_draft_tokens",
-            "logits_processors",
-            "prompt_progress_callback",
-        ]:
-            kwargs.pop(key, None)
+        # Build EOS token set
+        if complete_eos_token_ids:
+            if hasattr(model, "args") and hasattr(model.args, "eos_token_id"):
+                complete_eos_token_ids.add(model.args.eos_token_id)
+            if hasattr(model, "EXTRA_EOS_TOKENS"):
+                for token in model.EXTRA_EOS_TOKENS:
+                    try:
+                        token_ids = tokenizer.encode(token, add_special_tokens=False)
+                        if len(token_ids) == 1:
+                            complete_eos_token_ids.add(token_ids[0])
+                    except Exception:
+                        pass
 
-        if "eos_token_ids" not in kwargs:
-            # Only augment EOS tokens if tokenizer has some defined
-            if len(complete_eos_token_ids) > 0:
-                if hasattr(model, "args") and hasattr(model.args, "eos_token_id"):
-                    complete_eos_token_ids.add(model.args.eos_token_id)
-                if hasattr(model, "EXTRA_EOS_TOKENS"):
-                    for special_token in model.EXTRA_EOS_TOKENS:
-                        try:
-                            token_ids = tokenizer.encode(
-                                special_token, add_special_tokens=False
-                            )
-                            if len(token_ids) == 1:
-                                complete_eos_token_ids.add(token_ids[0])
-                        except Exception:
-                            pass
-
-            kwargs["eos_token_ids"] = list(complete_eos_token_ids)
+        # Build kwargs for custom generate_step
+        custom_kwargs = {
+            "max_tokens": kwargs.get("max_tokens", max_tokens),
+            "sampler": kwargs.get("sampler"),
+            "eos_token_ids": (
+                list(complete_eos_token_ids) if complete_eos_token_ids else None
+            ),
+        }
+        # Add diffusion-specific CLI parameters if present
+        for key in ["block_length", "steps", "threshold"]:
+            if key in kwargs:
+                custom_kwargs[key] = kwargs[key]
 
         batched_prompt = prompt[None] if len(prompt.shape) == 1 else prompt
 
         def wrap_custom_generator():
             with mx.stream(generation_stream):
-                yield_count = 0
-                for tokens, logprobs in model.generate_step(
-                    inputs=batched_prompt, **kwargs
+                for i, (tokens, logprobs) in enumerate(
+                    model.generate_step(inputs=batched_prompt, **custom_kwargs)
                 ):
                     tokens_list = (
                         tokens.flatten().tolist()
@@ -748,9 +742,7 @@ def stream_generate(
                         else list(tokens)
                     )
                     yield (tokens_list, logprobs, False)
-
-                    yield_count += 1
-                    if yield_count % 256 == 0:
+                    if i % 256 == 0:
                         mx.clear_cache()
 
         token_generator = wrap_custom_generator()
