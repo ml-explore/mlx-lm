@@ -32,11 +32,6 @@ class ModelArgs(BaseModelArgs):
 
 
 @partial(mx.compile, shapeless=True)
-def relu_squared(x):
-    return nn.relu(x).square()
-
-
-@partial(mx.compile, shapeless=True)
 def addcmul(x, y, z):
     return x + y * z
 
@@ -48,8 +43,9 @@ def l2_norm(x):
 
 @mx.compile
 def _wkv7_step_ops(r, w, k, v, a, b, state):
-    state = state * w + v @ k + (state @ a) @ b
-    y = state @ r
+    sab = (state @ a[..., None]) @ b[..., None, :]
+    state = state * w[:, :, None, :] + v[..., None] @ k[..., None, :] + sab
+    y = state @ r[..., None]
     return y, state
 
 
@@ -117,11 +113,10 @@ class Rwkv7ChannelMixing(nn.Module):
     def __call__(self, x, cache) -> mx.array:
         token_shift_cache = cache[2] if cache is not None else None
         x_prev = self.token_shift(x, token_shift_cache)
-        xx = x_prev - x
-        xx = addcmul(x, xx, self.x_k)
+        xx = addcmul(x, x_prev - x, self.x_k)
         if isinstance(cache, RwkvCache):
             cache[2] = x[:, -1, :]
-        return self.value(relu_squared(self.key(xx)))
+        return self.value(nn.relu2(self.key(xx)))
 
 
 class Rwkv7TimeMixing(nn.Module):
@@ -146,8 +141,8 @@ class Rwkv7TimeMixing(nn.Module):
         self.x_a = mx.zeros((1, 1, self.hidden_size))
         self.x_g = mx.zeros((1, 1, self.hidden_size))
 
-        self.k_k = mx.zeros((self.hidden_size))
-        self.k_a = mx.zeros((self.hidden_size))
+        self.k_k = mx.zeros((self.num_heads, self.head_dim))
+        self.k_a = mx.zeros((self.num_heads, self.head_dim))
         self.r_k = mx.zeros((self.num_heads, self.head_dim))
 
         self.r_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -180,16 +175,9 @@ class Rwkv7TimeMixing(nn.Module):
         )
     
     def _wkv7(self, r, w, k, v, a, b, state):
-        B, L, _ = r.shape
+        B, L, _, _ = r.shape
         if state is None:
             state = mx.zeros((B, self.num_heads, self.head_dim, self.head_dim), dtype=mx.float32)
-
-        r = r.reshape([B, L, self.num_heads, self.head_dim, 1])
-        w = w.reshape([B, L, self.num_heads, 1, self.head_dim])
-        k = k.reshape([B, L, self.num_heads, 1, self.head_dim])
-        v = v.reshape([B, L, self.num_heads, self.head_dim, 1])
-        a = a.reshape([B, L, self.num_heads, self.head_dim, 1])
-        b = b.reshape([B, L, self.num_heads, 1, self.head_dim])
 
         ys = []
         for t in range(L):
@@ -224,28 +212,26 @@ class Rwkv7TimeMixing(nn.Module):
         xa = addcmul(x, xx, self.x_a)
         xg = addcmul(x, xx, self.x_g)
 
-        key = self.k_proj(xk)
-        value = self.v_proj(xv)
-        receptance = self.r_proj(xr)
-        a = mx.sigmoid(self.a_lora(xa))
+        key = self.k_proj(xk).reshape(B, L, self.num_heads, self.head_dim)
+        value = self.v_proj(xv).reshape(B, L, self.num_heads, self.head_dim)
+        receptance = self.r_proj(xr).reshape(B, L, self.num_heads, self.head_dim)
+        a = mx.sigmoid(self.a_lora(xa)).reshape(B, L, self.num_heads, self.head_dim)
         g = self.g_lora(xg)
 
         if self.layer_idx == 0:
             v_first = value
         else:
-            value = value + (v_first - value) * mx.sigmoid(self.v_lora(xv))
+            value = value + (v_first - value) * mx.sigmoid(self.v_lora(xv)).reshape(B, L, self.num_heads, self.head_dim)
 
-        decay = mx.exp(-0.606531 * mx.sigmoid(self.w_lora(xw)).astype(mx.float32))
-        kk = l2_norm((key * self.k_k).reshape([B, L, self.num_heads, self.head_dim])).reshape([B, L, D])
+        decay = mx.exp(-0.606531 * mx.sigmoid(self.w_lora(xw).reshape(B, L, self.num_heads, self.head_dim)).astype(mx.float32))
+        kk = l2_norm((key * self.k_k))
         key = key * (1 + (a - 1) * self.k_a)
         b = kk * a
         a = -kk
 
         out, new_state_cache = self._wkv7(receptance, decay, key, value, a, b, state_cache)
         out = self.g_norm(out.reshape([B, L, D]))
-        residual = (receptance * key * self.r_k.reshape([D])).reshape([B, L, self.num_heads, self.head_dim])
-        residual = (residual.sum(axis=-1, keepdims=True) * value.reshape(B, L, self.num_heads, self.head_dim)).reshape([B, L, D])
-        out = out + residual
+        out = out + ((receptance * key * self.r_k).sum(axis=-1, keepdims=True) * value).reshape([B, L, D])
 
         if isinstance(cache, RwkvCache):
             cache[0] = x[:, -1, :]
@@ -326,4 +312,6 @@ class Model(nn.Module):
         for k, v in weights.items():
             if v.dtype == mx.bfloat16:
                 weights[k] = v.astype(mx.float16)
+            if "k_k" in k or "k_a" in k:
+                weights[k] = weights[k].reshape(self.args.hidden_size // self.args.head_dim, self.args.head_dim)
         return weights
