@@ -1,13 +1,13 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+
 from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache
 from .switch_layers import SwitchGLU
 
 
@@ -27,16 +27,9 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     rotary_dim: int
     vocab_size: int
-    block_size: int = 256
     tie_word_embeddings: bool = False
     shared_moe_mode: str = "sigmoid"
-    full_attn_alpha_factor: float = 3.5565588200778455
-    full_attn_beta_factor: float = 1.0
-    linear_attn_alpha_factor: float = 3.5565588200778455
-    linear_attn_beta_factor: float = 1.0
-    mlp_alpha_factor: float = 3.5565588200778455
-    mlp_beta_factor: float = 1.0
-    layer_types: List[str] = None
+    scoring_func: str = "sigmoid"
     head_dim: Optional[int] = None
     use_qk_norm: bool = True
 
@@ -70,7 +63,7 @@ class MiniMaxAttention(nn.Module):
             self.num_attention_heads * self.head_dim, args.hidden_size, bias=False
         )
 
-        self.use_qk_norm = args.use_qk_norm
+        self.use_qk_norm = args.use_qk_norm if hasattr(args, 'use_qk_norm') else False
         if self.use_qk_norm:
             self.q_norm = nn.RMSNorm(head_dim * self.num_attention_heads, eps=args.rms_norm_eps)
             self.k_norm = nn.RMSNorm(head_dim * self.num_key_value_heads, eps=args.rms_norm_eps)
@@ -118,7 +111,6 @@ class MiniMaxAttention(nn.Module):
         return self.o_proj(output)
 
 
-
 class MiniMaxSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -146,12 +138,12 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
 
 class MiniMaxDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, layer_idx: int):
+    def __init__(self, args: ModelArgs):
         super().__init__()
+
         self.mlp_alpha_factor = args.mlp_alpha_factor
         self.mlp_beta_factor = args.mlp_beta_factor
 
-        
         self.self_attn = MiniMaxAttention(args)
         self.attn_alpha_factor = args.full_attn_alpha_factor
         self.attn_beta_factor = args.full_attn_beta_factor
@@ -169,15 +161,8 @@ class MiniMaxDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = (
-            self.input_layernorm(x) * self.attn_alpha_factor
-            + self.self_attn(x, mask, cache) * self.attn_beta_factor
-        )
-        r = (
-            self.block_sparse_moe(self.post_attention_layernorm(x))
-            * self.mlp_alpha_factor
-            + r * self.mlp_beta_factor
-        )
+        r = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        r = r + self.block_sparse_moe(self.post_attention_layernorm(r))
         return r
 
 
@@ -187,8 +172,8 @@ class MiniMaxModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
         self.layers = [
-            MiniMaxDecoderLayer(args=args, layer_idx=i)
-            for i in range(args.num_hidden_layers)
+            MiniMaxDecoderLayer(args=args)
+            for _ in range(args.num_hidden_layers)
         ]
 
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -233,57 +218,70 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
-
     def sanitize(self, weights):
-        # Dequantize FP8 weights first before any other processing
+        """Dequantize FP8 weights and restructure MoE experts."""
+    
+        
         keys_to_remove = []
+        dequantized_count = 0
+        
         for key in list(weights.keys()):
             if key.endswith('.weight_scale_inv'):
-                # Get the corresponding weight key
                 weight_key = key.replace('.weight_scale_inv', '.weight')
-                if weight_key in weights:
-                    scale_inv = weights[key]
-                    weight = weights[weight_key]
+                
+                # Debug: Check if weight key exists
+                if weight_key not in weights:
+                    print(f"⚠️  Scale found but no matching weight: {key}")
+                    continue
+                
+                scale_inv = weights[key]
+                weight = weights[weight_key]
+             
+                # Handle block-wise quantization (weight_block_size: [128, 128])
+                if scale_inv.ndim == 2 and weight.ndim == 2:
+                    scale_h, scale_w = scale_inv.shape
+                    weight_h, weight_w = weight.shape
                     
-                    # Handle block-wise quantization
-                    if scale_inv.ndim == 2 and weight.ndim == 2:
-                        scale_h, scale_w = scale_inv.shape
-                        weight_h, weight_w = weight.shape
-                        
-                        # Calculate block size
-                        block_h = weight_h // scale_h
-                        block_w = weight_w // scale_w
-                        
-                        # Expand scale_inv to match weight dimensions using reshape + tile
-                        # Method 1: Using reshape and tile (most efficient)
-                        expanded_scale = scale_inv[:, None, :, None]  # [scale_h, 1, scale_w, 1]
-                        expanded_scale = mx.tile(expanded_scale, (1, block_h, 1, block_w))  # [scale_h, block_h, scale_w, block_w]
-                        expanded_scale = expanded_scale.reshape(weight_h, weight_w)
-                        
-                        weights[weight_key] = weight * expanded_scale
-                        
-                    elif scale_inv.shape == weight.shape:
-                        # Element-wise multiplication
-                        weights[weight_key] = weight * scale_inv
-                        
-                    elif scale_inv.ndim == 1 and weight.ndim == 2:
-                        # Per-channel scaling
-                        if scale_inv.shape[0] == weight.shape[0]:
-                            weights[weight_key] = weight * scale_inv[:, None]
-                        elif scale_inv.shape[0] == weight.shape[1]:
-                            weights[weight_key] = weight * scale_inv[None, :]
-                        else:
-                            raise ValueError(f"Incompatible shapes: weight {weight.shape}, scale {scale_inv.shape}")
-                    else:
-                        raise ValueError(f"Unsupported quantization format: weight {weight.shape}, scale {scale_inv.shape}")
+                    # Calculate block dimensions
+                    block_h = weight_h // scale_h
+                    block_w = weight_w // scale_w
                     
-                    keys_to_remove.append(key)
+                 
+                    # Expand each scale value to its corresponding 128x128 block
+                    expanded_scale = scale_inv[:, None, :, None]
+                    expanded_scale = mx.tile(expanded_scale, (1, block_h, 1, block_w))
+                    expanded_scale = expanded_scale.reshape(weight_h, weight_w)
+                    
+                    # Dequantize: fp32_weight = fp8_weight * scale_inv
+                    dequantized_weight = weight.astype(mx.float32) * expanded_scale.astype(mx.float32)
+                    weights[weight_key] = dequantized_weight
+                    
+                    
+                elif scale_inv.shape == weight.shape:
+                    # Per-element scaling
+                    dequantized_weight = weight.astype(mx.float32) * scale_inv.astype(mx.float32)
+                    weights[weight_key] = dequantized_weight
+                    
+                elif scale_inv.ndim == 1 and weight.ndim == 2:
+                    # Per-channel scaling
+                    if scale_inv.shape[0] == weight.shape[0]:
+                        dequantized_weight = weight.astype(mx.float32) * scale_inv[:, None].astype(mx.float32)
+                    elif scale_inv.shape[0] == weight.shape[1]:
+                        dequantized_weight = weight.astype(mx.float32) * scale_inv[None, :].astype(mx.float32)
+                    weights[weight_key] = dequantized_weight
+                else:
+                    print(f"    ⚠️  Unsupported scale shape: weight {weight.shape}, scale {scale_inv.shape}")
+                    continue
+                
+                dequantized_count += 1
+                keys_to_remove.append(key)
         
-        # Remove the scale_inv keys after dequantization
+        # Clean up scale_inv keys
         for key in keys_to_remove:
             weights.pop(key)
-
-        # Handle MoE expert weights restructuring
+   
+        
+        # Step 2: Handle MoE expert weights restructuring
         if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:
             return weights
         
