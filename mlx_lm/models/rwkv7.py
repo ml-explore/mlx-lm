@@ -86,7 +86,7 @@ class LoRA(nn.Module):
 
 
 class TokenShift(nn.Module):
-    def __call__(self, x, state) -> mx.array:
+    def __call__(self, x, state):
         B, L, D = x.shape
         if state is None:
             state = mx.zeros((B, 1, D), x.dtype)
@@ -115,7 +115,7 @@ class Rwkv7ChannelMixing(nn.Module):
         x_prev = self.token_shift(x, token_shift_cache)
         xx = addcmul(x, x_prev - x, self.x_k)
         if isinstance(cache, RwkvCache):
-            cache[2] = x[:, -1, :]
+            cache[2] = x[:, -1:, :]
         return self.value(nn.relu2(self.key(xx)))
 
 
@@ -234,7 +234,7 @@ class Rwkv7TimeMixing(nn.Module):
         out = out + ((receptance * key * self.r_k).sum(axis=-1, keepdims=True) * value).reshape([B, L, D])
 
         if isinstance(cache, RwkvCache):
-            cache[0] = x[:, -1, :]
+            cache[0] = x[:, -1:, :]
             cache[1] = new_state_cache
 
         output = self.o_proj(out * g)
