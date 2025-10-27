@@ -37,7 +37,6 @@ class MiniMaxAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
-
         self.hidden_dim = hidden_size = args.hidden_size
 
         self.num_attention_heads = args.num_attention_heads
@@ -47,7 +46,7 @@ class MiniMaxAttention(nn.Module):
             if args.head_dim is None
             else args.head_dim
         )
-        self.scale = head_dim**-0.5
+        self.scale = head_dim ** -0.5
 
         self.q_proj = nn.Linear(
             args.hidden_size, self.num_attention_heads * self.head_dim, bias=False
@@ -79,7 +78,6 @@ class MiniMaxAttention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-
         if self.use_qk_norm:
             queries = self.q_norm(queries)
             keys = self.k_norm(keys)
@@ -91,7 +89,6 @@ class MiniMaxAttention(nn.Module):
         values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
-
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -131,6 +128,9 @@ class MiniMaxSparseMoeBlock(nn.Module):
         k = self.num_experts_per_tok
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+
+        scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         return y
@@ -140,9 +140,7 @@ class MiniMaxDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
-
         self.self_attn = MiniMaxAttention(args)
-    
 
         self.block_sparse_moe = MiniMaxSparseMoeBlock(args)
 
@@ -214,10 +212,10 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
+
     def sanitize(self, weights):
         """Dequantize FP8 weights and restructure MoE experts."""
     
-        
         keys_to_remove = []
         dequantized_count = 0
         
@@ -242,7 +240,6 @@ class Model(nn.Module):
                     block_h = weight_h // scale_h
                     block_w = weight_w // scale_w
                     
-                 
                     # Expand each scale value to its corresponding 128x128 block
                     expanded_scale = scale_inv[:, None, :, None]
                     expanded_scale = mx.tile(expanded_scale, (1, block_h, 1, block_w))
