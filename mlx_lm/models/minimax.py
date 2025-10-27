@@ -130,12 +130,8 @@ class MiniMaxSparseMoeBlock(nn.Module):
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
-<<<<<<< HEAD
-        scores = scores / mx.sum(scores, axis=-1, keepdims=True) + 1e-20
-=======
         scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
         scores = scores.astype(x.dtype)
->>>>>>> 3bfb6ed (fix minimax)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
@@ -218,9 +214,9 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
-
     def sanitize(self, weights):
         """Dequantize FP8 weights and restructure MoE experts."""
+
         def dequant(weight, scale_inv):
             dtype = weight.dtype
             bs = 128  # block size
