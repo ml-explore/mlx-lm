@@ -129,7 +129,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
-        scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+        scores = scores / mx.sum(scores, axis=-1, keepdims=True) + 1e-20
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
@@ -213,88 +213,65 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
+
     def sanitize(self, weights):
-        """Dequantize FP8 weights and restructure MoE experts."""
-    
         keys_to_remove = []
         dequantized_count = 0
-        
-        for key in list(weights.keys()):
-            if key.endswith('.weight_scale_inv'):
-                weight_key = key.replace('.weight_scale_inv', '.weight')
-                
-                # Debug: Check if weight key exists
-                if weight_key not in weights:
-                    print(f"⚠️  Scale found but no matching weight: {key}")
-                    continue
-                
-                scale_inv = weights[key]
-                weight = weights[weight_key]
-             
-                # Handle block-wise quantization (weight_block_size: [128, 128])
-                if scale_inv.ndim == 2 and weight.ndim == 2:
-                    scale_h, scale_w = scale_inv.shape
-                    weight_h, weight_w = weight.shape
-                    
-                    # Calculate block dimensions
-                    block_h = weight_h // scale_h
-                    block_w = weight_w // scale_w
-                    
-                    # Expand each scale value to its corresponding 128x128 block
-                    expanded_scale = scale_inv[:, None, :, None]
-                    expanded_scale = mx.tile(expanded_scale, (1, block_h, 1, block_w))
-                    expanded_scale = expanded_scale.reshape(weight_h, weight_w)
-                    
-                    # Dequantize: fp32_weight = fp8_weight * scale_inv
-                    dequantized_weight = weight.astype(mx.float32) * expanded_scale.astype(mx.float32)
-                    weights[weight_key] = dequantized_weight
-                    
-                    
-                elif scale_inv.shape == weight.shape:
-                    # Per-element scaling
-                    dequantized_weight = weight.astype(mx.float32) * scale_inv.astype(mx.float32)
-                    weights[weight_key] = dequantized_weight
-                    
-                elif scale_inv.ndim == 1 and weight.ndim == 2:
-                    # Per-channel scaling
-                    if scale_inv.shape[0] == weight.shape[0]:
-                        dequantized_weight = weight.astype(mx.float32) * scale_inv[:, None].astype(mx.float32)
-                    elif scale_inv.shape[0] == weight.shape[1]:
-                        dequantized_weight = weight.astype(mx.float32) * scale_inv[None, :].astype(mx.float32)
-                    weights[weight_key] = dequantized_weight
-                else:
-                    print(f"    ⚠️  Unsupported scale shape: weight {weight.shape}, scale {scale_inv.shape}")
-                    continue
-                
-                dequantized_count += 1
-                keys_to_remove.append(key)
-        
-        # Clean up scale_inv keys
-        for key in keys_to_remove:
-            weights.pop(key)
-   
-        
-        # Step 2: Handle MoE expert weights restructuring
-        if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:
-            return weights
-        
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-            for orig_name, new_name in mapping.items():
-                if f"{prefix}.block_sparse_moe.experts.0.{orig_name}.weight" in weights:
-                    to_join = [
-                        weights.pop(
-                            f"{prefix}.block_sparse_moe.experts.{e}.{orig_name}.weight"
-                        )
-                        for e in range(self.args.num_local_experts)
-                    ]
-                    weights[
-                        f"{prefix}.block_sparse_moe.switch_mlp.{new_name}.weight"
-                    ] = mx.stack(to_join)
-         
-        return weights
 
+        for key in list(weights.keys()):
+            if not key.endswith(".weight_scale_inv"):
+                continue
+
+            weight_key = key.replace(".weight_scale_inv", ".weight")
+            if weight_key not in weights:
+                continue
+
+            scale_inv = mx.array(weights[key])           # float32, [H_s, W_s]
+            bf16_weight = mx.array(weights[weight_key])  # bfloat16, [H, W]
+
+            H, W = bf16_weight.shape
+            Hs, Ws = scale_inv.shape
+
+            # Handle block-wise quantization (weight_block_size: [128, 128])
+
+            if scale_inv.ndim == 2:
+                if H % 128 != 0 or W % 128 != 0:
+                    raise ValueError(f"Weight {weight_key} not divisible by 128")
+                if (Hs, Ws) != (H // 128, W // 128):
+                    raise ValueError(f"Scale shape mismatch: {scale_inv.shape} vs {(H//128, W//128)}")
+
+                s = scale_inv.reshape(Hs, 1, Ws, 1)
+                s = mx.tile(s, (1, 128, 1, 128))
+                s = s.reshape(H, W)
+            else:
+                s = scale_inv  # fallback
+
+            # Dequantize
+            fp32_weight = (bf16_weight.astype(mx.float32) * s.astype(mx.float32))
+            weights[weight_key] = fp32_weight
+            dequantized_count += 1
+            keys_to_remove.append(key)
+
+        # Clean up scale_inv keys
+        for k in keys_to_remove:
+            weights.pop(k, None)
+
+       
+        # Step 2: Handle MoE expert weights restructuring
+        if not any("block_sparse_moe.experts.0.w1.weight" in k for k in weights):
+            return weights
+
+        mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.block_sparse_moe"
+            for src, dst in mapping.items():
+                expert_weights = [
+                    weights.pop(f"{prefix}.experts.{e}.{src}.weight")
+                    for e in range(self.args.num_local_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.{dst}.weight"] = mx.stack(expert_weights, axis=0)
+
+        return weights
     @property
     def layers(self):
         return self.model.layers
