@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     MambaCache,
     QuantizedKVCache,
     RotatingKVCache,
+    can_resume_from_cache,
     load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
@@ -567,6 +568,72 @@ class TestPromptCache(unittest.TestCase):
         k, v = cache.update_and_fetch(k, v)
         self.assertEqual(k.shape[2], 10)
         self.assertEqual(v.shape[2], 10)
+
+    def test_can_resume_from_cache(self):
+        # Test with empty cache
+        self.assertFalse(can_resume_from_cache([], 10))
+        self.assertFalse(can_resume_from_cache(None, 10))
+
+        # Test with cache that has sufficient tokens
+        cache = [KVCache() for _ in range(2)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 10, 4))
+            c.update_and_fetch(x, x)
+
+        self.assertTrue(can_resume_from_cache(cache, 10))  # exact match
+        self.assertTrue(can_resume_from_cache(cache, 5))   # cache has more
+        self.assertFalse(can_resume_from_cache(cache, 15)) # cache has less
+
+        # Test with RotatingKVCache
+        cache = [RotatingKVCache(max_size=8) for _ in range(2)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 12, 4))
+            c.update_and_fetch(x, x)
+
+        self.assertTrue(can_resume_from_cache(cache, 10))
+        self.assertFalse(can_resume_from_cache(cache, 15))
+
+    def test_resume_from_cache_with_generate(self):
+        """Test that cache resume optimization produces identical token outputs."""
+        model, tokenizer = load(HF_MODEL_PATH)
+        prompt = tokenizer.encode("this is a test prompt", return_tensors="mlx")[0]
+
+        # First generation with cache but no resume
+        prompt_cache = make_prompt_cache(model)
+        results1 = list(
+            generate_step(prompt, model, prompt_cache=prompt_cache, max_tokens=5)
+        )
+        toks1, _ = zip(*results1)
+
+        # Verify cache has sufficient tokens
+        self.assertTrue(can_resume_from_cache(prompt_cache, len(prompt)))
+
+        # Trim the generated tokens to simulate identical request (swipe behavior)
+        trim_prompt_cache(prompt_cache, 5)
+
+        # Second generation with cache resume enabled
+        # This should skip prefill and start generating immediately
+        results2 = list(
+            generate_step(
+                prompt,
+                model,
+                prompt_cache=prompt_cache,
+                max_tokens=5,
+                resume_from_cache=True,
+            )
+        )
+        toks2, _ = zip(*results2)
+
+        # Verify generated tokens are identical
+        # This is the key test: cache resume should produce same outputs
+        self.assertEqual(toks1, toks2)
+
+        # Verify cache offset increased (resume processes last prompt token + new tokens)
+        # After first generation: offset = len(prompt) + 5
+        # After trim: offset = len(prompt)
+        # After resume: offset = len(prompt) + 1 (last token) + 5 (new tokens)
+        # The implementation keeps the last token for generation start
+        self.assertGreater(prompt_cache[0].offset, len(prompt))
 
 
 if __name__ == "__main__":
