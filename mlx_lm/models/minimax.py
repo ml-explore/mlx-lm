@@ -140,12 +140,9 @@ class MiniMaxDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
-        self.mlp_alpha_factor = args.mlp_alpha_factor
-        self.mlp_beta_factor = args.mlp_beta_factor
 
         self.self_attn = MiniMaxAttention(args)
-        self.attn_alpha_factor = args.full_attn_alpha_factor
-        self.attn_beta_factor = args.full_attn_beta_factor
+    
 
         self.block_sparse_moe = MiniMaxSparseMoeBlock(args)
 
