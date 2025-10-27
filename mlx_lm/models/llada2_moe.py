@@ -468,8 +468,9 @@ class Model(nn.Module):
                 )
 
                 if stop_idx > 0:
-                    yield (remaining[:stop_idx], mx.array([]))
-                    last_yield_pos = block_start + start + stop_idx
+                    end_idx = stop_idx + 1 if hit_eos else stop_idx
+                    yield (remaining[:end_idx], mx.array([]))
+                    last_yield_pos = block_start + start + end_idx
 
                 if hit_eos:
                     return
@@ -482,8 +483,9 @@ class Model(nn.Module):
                 )
 
                 if stop_idx > 0:
-                    yield (remaining[:stop_idx], mx.array([]))
-                    last_yield_pos += stop_idx
+                    end_idx = stop_idx + 1 if hit_eos else stop_idx
+                    yield (remaining[:end_idx], mx.array([]))
+                    last_yield_pos += end_idx
 
                 if hit_eos:
                     return
