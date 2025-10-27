@@ -28,7 +28,6 @@ class ModelArgs(BaseModelArgs):
     rotary_dim: int
     vocab_size: int
     tie_word_embeddings: bool = False
-    shared_moe_mode: str = "sigmoid"
     scoring_func: str = "sigmoid"
     head_dim: Optional[int] = None
     use_qk_norm: bool = True
