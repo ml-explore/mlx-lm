@@ -1,7 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -42,31 +41,33 @@ class MiniMaxAttention(nn.Module):
         self.num_attention_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
         self.head_dim = head_dim = (
-            hidden_size // args.num_attention_heads
-            if args.head_dim is None
-            else args.head_dim
+            args.head_dim or hidden_size // args.num_attention_heads
         )
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(
-            args.hidden_size, self.num_attention_heads * self.head_dim, bias=False
+            args.hidden_size, self.num_attention_heads * head_dim, bias=False
         )
         self.k_proj = nn.Linear(
-            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            args.hidden_size, self.num_key_value_heads * head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            args.hidden_size, self.num_key_value_heads * head_dim, bias=False
         )
         self.o_proj = nn.Linear(
-            self.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+            self.num_attention_heads * head_dim, args.hidden_size, bias=False
         )
 
-        self.use_qk_norm = args.use_qk_norm if hasattr(args, 'use_qk_norm') else False
+        self.use_qk_norm = args.use_qk_norm if hasattr(args, "use_qk_norm") else False
         if self.use_qk_norm:
-            self.q_norm = nn.RMSNorm(head_dim * self.num_attention_heads, eps=args.rms_norm_eps)
-            self.k_norm = nn.RMSNorm(head_dim * self.num_key_value_heads, eps=args.rms_norm_eps)
+            self.q_norm = nn.RMSNorm(
+                head_dim * self.num_attention_heads, eps=args.rms_norm_eps
+            )
+            self.k_norm = nn.RMSNorm(
+                head_dim * self.num_key_value_heads, eps=args.rms_norm_eps
+            )
 
-        self.rope = nn.RoPE(head_dim, traditional=False, base=args.rope_theta)
+        self.rope = nn.RoPE(args.rotary_dim, traditional=False, base=args.rope_theta)
 
     def __call__(
         self,
@@ -129,7 +130,12 @@ class MiniMaxSparseMoeBlock(nn.Module):
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
+<<<<<<< HEAD
         scores = scores / mx.sum(scores, axis=-1, keepdims=True) + 1e-20
+=======
+        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores = scores.astype(x.dtype)
+>>>>>>> 3bfb6ed (fix minimax)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
@@ -166,8 +172,7 @@ class MiniMaxModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
         self.layers = [
-            MiniMaxDecoderLayer(args=args)
-            for _ in range(args.num_hidden_layers)
+            MiniMaxDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
         ]
 
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -215,63 +220,72 @@ class Model(nn.Module):
 
 
     def sanitize(self, weights):
-        keys_to_remove = []
-        dequantized_count = 0
+        """Dequantize FP8 weights and restructure MoE experts."""
+        def dequant(weight, scale_inv):
+            dtype = weight.dtype
+            bs = 128  # block size
+            m, n = weight.shape
+            pad_bottom = (-m) % bs
+            pad_side = (-n) % bs
+            weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+            weight = weight.reshape(
+                ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
+            )
+            weight = (weight * scale_inv[:, None, :, None]).reshape(
+                m + pad_bottom, n + pad_side
+            )
+            return weight[:m, :n].astype(dtype)
 
-        for key in list(weights.keys()):
-            if not key.endswith(".weight_scale_inv"):
-                continue
+        # Dequantize
+        new_weights = {}
+        for k, v in weights.items():
+            if "weight_scale_inv" in k:
+                scale_inv = v
+                wk = k.replace("_scale_inv", "")
+                weight = weights[wk]
+                weight = dequant(weight, scale_inv)
+                new_weights[wk] = weight
+            elif k not in new_weights:
+                new_weights[k] = v
+        weights = new_weights
 
-            weight_key = key.replace(".weight_scale_inv", ".weight")
-            if weight_key not in weights:
-                continue
-
-            scale_inv = mx.array(weights[key])           # float32, [H_s, W_s]
-            bf16_weight = mx.array(weights[weight_key])  # bfloat16, [H, W]
-
-            H, W = bf16_weight.shape
-            Hs, Ws = scale_inv.shape
-
-            # Handle block-wise quantization (weight_block_size: [128, 128])
-
-            if scale_inv.ndim == 2:
-                if H % 128 != 0 or W % 128 != 0:
-                    raise ValueError(f"Weight {weight_key} not divisible by 128")
-                if (Hs, Ws) != (H // 128, W // 128):
-                    raise ValueError(f"Scale shape mismatch: {scale_inv.shape} vs {(H//128, W//128)}")
-
-                s = scale_inv.reshape(Hs, 1, Ws, 1)
-                s = mx.tile(s, (1, 128, 1, 128))
-                s = s.reshape(H, W)
-            else:
-                s = scale_inv  # fallback
-
-            # Dequantize
-            fp32_weight = (bf16_weight.astype(mx.float32) * s.astype(mx.float32))
-            weights[weight_key] = fp32_weight
-            dequantized_count += 1
-            keys_to_remove.append(key)
-
-        # Clean up scale_inv keys
-        for k in keys_to_remove:
-            weights.pop(k, None)
-
-       
         # Step 2: Handle MoE expert weights restructuring
-        if not any("block_sparse_moe.experts.0.w1.weight" in k for k in weights):
+        if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:
             return weights
 
-        mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}.block_sparse_moe"
-            for src, dst in mapping.items():
-                expert_weights = [
-                    weights.pop(f"{prefix}.experts.{e}.{src}.weight")
-                    for e in range(self.args.num_local_experts)
-                ]
-                weights[f"{prefix}.switch_mlp.{dst}.weight"] = mx.stack(expert_weights, axis=0)
+            prefix = f"model.layers.{l}"
+            mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+            for orig_name, new_name in mapping.items():
+                if f"{prefix}.block_sparse_moe.experts.0.{orig_name}.weight" in weights:
+                    to_join = [
+                        weights.pop(
+                            f"{prefix}.block_sparse_moe.experts.{e}.{orig_name}.weight"
+                        )
+                        for e in range(self.args.num_local_experts)
+                    ]
+                    weights[
+                        f"{prefix}.block_sparse_moe.switch_mlp.{new_name}.weight"
+                    ] = mx.stack(to_join)
 
         return weights
+
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("block_sparse_moe.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
