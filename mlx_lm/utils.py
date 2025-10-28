@@ -31,13 +31,11 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
 else:
     from huggingface_hub import snapshot_download
 
-from mlx.utils import tree_flatten, tree_map, tree_reduce
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 from transformers import PreTrainedTokenizer
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
-from .tuner.utils import dequantize as dequantize_model
-from .tuner.utils import get_total_parameters, load_adapters
 
 # Constants
 MODEL_REMAPPING = {
@@ -72,6 +70,20 @@ def _get_classes(config: dict):
         raise ValueError(msg)
 
     return arch.Model, arch.ModelArgs
+
+
+def get_total_parameters(model):
+    leaf_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+    )
+
+    def nparams(m):
+        if hasattr(m, "bits"):
+            n = 0 if not hasattr(m, "bias") else m.bias.size
+            return n + m.weight.size * 32 // m.bits
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
+
+    return sum(nparams(m) for _, m in leaf_modules)
 
 
 def compute_bits_per_weight(model):
@@ -223,6 +235,12 @@ def load_model(
 
     model.eval()
     return model, config
+
+
+def load_adapeters(model: nn.Module, adapter_path: str) -> nn.Module:
+    from .tuner.utils import load_adapters as _load_adapters
+
+    return _load_adapters(model, adapter_path)
 
 
 def load(
@@ -518,6 +536,52 @@ def quantize_model(
     print(f"[INFO] Quantized model with {bpw:.3f} bits per weight.")
 
     return model, quantized_config
+
+
+def dequantize_model(model: nn.Module) -> nn.Module:
+    """
+    Dequantize the quantized layers in the model.
+
+    Args:
+        model (nn.Module): The model with quantized layers.
+
+    Returns:
+        nn.Module: The model with dequantized layers.
+    """
+    from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+
+    dequantize_layers = []
+    for name, module in model.named_modules():
+        bias = "bias" in module
+        if isinstance(module, nn.QuantizedLinear):
+            cls = nn.Linear
+            kwargs = {"bias": bias}
+        elif isinstance(module, nn.QuantizedEmbedding):
+            kwargs = {}
+            cls = nn.Embedding
+        elif isinstance(module, QuantizedSwitchLinear):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        else:
+            continue
+        weight = mx.dequantize(
+            module.weight,
+            module.scales,
+            module.biases,
+            module.group_size,
+            module.bits,
+            module.mode,
+        )
+        args = weight.shape[::-1]
+        m = cls(*args, **kwargs)
+        if bias:
+            m.bias = module.bias
+        m.weight = weight
+        dequantize_layers.append((name, m))
+
+    if len(dequantize_layers) > 0:
+        model.update_modules(tree_unflatten(dequantize_layers))
+    return model
 
 
 def save_config(

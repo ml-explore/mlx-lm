@@ -4,8 +4,8 @@ from pathlib import Path
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .gguf import convert_to_gguf
-from .tuner.utils import dequantize, load_adapters
 from .utils import (
+    dequantize_model,
     load,
     save,
     upload_to_hub,
@@ -39,8 +39,8 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
-        "--de-quantize",
-        help="Generate a de-quantized model.",
+        "--dequantize",
+        help="Generate a dequantized model.",
         action="store_true",
     )
     parser.add_argument(
@@ -66,7 +66,7 @@ def main() -> None:
     )
 
     fused_linears = [
-        (n, m.fuse(de_quantize=args.de_quantize))
+        (n, m.fuse(dequantize=args.dequantize))
         for n, m in model.named_modules()
         if hasattr(m, "fuse")
     ]
@@ -74,8 +74,8 @@ def main() -> None:
     if fused_linears:
         model.update_modules(tree_unflatten(fused_linears))
 
-    if args.de_quantize:
-        print("De-quantizing model")
+    if args.dequantize:
+        print("Dequantizing model")
         model = dequantize(model)
         config.pop("quantization", None)
 

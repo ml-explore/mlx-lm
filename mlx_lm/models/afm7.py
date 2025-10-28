@@ -50,7 +50,7 @@ class FusedLoRALinear(nn.Module):
         ]
         self.lora_b = [mx.zeros((r, od)) for od in output_dims]
 
-    def fuse(self, de_quantize: bool = False):
+    def fuse(self, dequantize: bool = False):
         linear = self.linear
         weight = linear.weight
         is_quantized = isinstance(linear, FusedQuantizedLinear)
@@ -79,7 +79,7 @@ class FusedLoRALinear(nn.Module):
         delta = mx.concatenate(deltas, axis=0)
         fused_linear.weight = weight + delta
 
-        if is_quantized and not de_quantize:
+        if is_quantized and not dequantize:
             fused_linear = fused_linear.to_quantized(linear.group_size, linear.bits)
 
         return fused_linear

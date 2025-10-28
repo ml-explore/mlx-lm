@@ -68,9 +68,8 @@ def main():
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
-    prompts = mx.random.randint(
-        0, config["vocab_size"], (batch_size, prompt_tokens)
-    ).tolist()
+    vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+    prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
     prompt = prompts[0]
 
     def single_bench():
