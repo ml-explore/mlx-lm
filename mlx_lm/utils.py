@@ -232,7 +232,7 @@ def load(
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     return_config: bool = False,
-    revision: str = None,
+    revision: Optional[str] = None,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
