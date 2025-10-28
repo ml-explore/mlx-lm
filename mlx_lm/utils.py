@@ -227,8 +227,8 @@ def load_model(
 
 def load(
     path_or_hf_repo: str,
-    tokenizer_config={},
-    model_config={},
+    tokenizer_config: Dict[str, Any]={},
+    model_config: Dict[str, Any] = {},
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     return_config: bool = False,
