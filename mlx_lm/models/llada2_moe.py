@@ -305,6 +305,9 @@ class Model(nn.Module):
 
     EXTRA_EOS_TOKENS = ["<|role_end|>"]
 
+    # As per original paper, LLaDA does not support kv caching
+    supports_prompt_cache = False
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

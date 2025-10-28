@@ -49,6 +49,9 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_BLOCK_LENGTH = 32
+DEFAULT_STEPS = 32
+DEFAULT_THRESHOLD = 0.95
 
 
 def str2bool(string):
@@ -212,20 +215,20 @@ def setup_arg_parser():
     parser.add_argument(
         "--block-length",
         type=int,
-        default=32,
-        help="[Diffusion models only] Number of tokens per block (default: 32)",
+        default=DEFAULT_BLOCK_LENGTH,
+        help="[Diffusion models only] Number of tokens per block",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=32,
-        help="[Diffusion models only] Number of denoising iterations per block (default: 32)",
+        default=DEFAULT_STEPS,
+        help="[Diffusion models only] Number of denoising iterations per block",
     )
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.95,
-        help="[Diffusion models only] Confidence threshold for token acceptance (default: 0.95)",
+        default=DEFAULT_THRESHOLD,
+        help="[Diffusion models only] Confidence threshold for token acceptance",
     )
     return parser
 
@@ -698,11 +701,7 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if (
-        hasattr(model, "generate_step")
-        and callable(getattr(model, "generate_step"))
-        and not draft_model
-    ):
+    if callable(getattr(model, "generate_step", None)) and not draft_model:
         # Build EOS token set
         if complete_eos_token_ids:
             if hasattr(model, "args") and hasattr(model.args, "eos_token_id"):
@@ -1178,7 +1177,7 @@ def batch_generate(
     """
 
     # Check if model uses custom generation (e.g., diffusion models)
-    if hasattr(model, "generate_step") and callable(getattr(model, "generate_step")):
+    if callable(getattr(model, "generate_step", None)):
         raise NotImplementedError(
             f"{model.__class__.__name__} uses custom generation and does not support "
             "batch_generate(). Use generate() or stream_generate() instead."
