@@ -428,7 +428,7 @@ def load_tokenizer(
     tokenizer_config_extra: Optional[Dict[str, Any]]=None,
     return_tokenizer=True,
     eos_token_ids=None
-):
+) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
