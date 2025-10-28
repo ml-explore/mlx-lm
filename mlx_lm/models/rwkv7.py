@@ -428,3 +428,12 @@ class Model(nn.Module):
             if "k_k" in k or "k_a" in k or "g_norm" in k:
                 weights[k] = weights[k].reshape(self.args.hidden_size // self.args.head_dim, self.args.head_dim)
         return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if "lora.2" in path or "embeddings" in path:
+                return {"bits": 8}
+            return True
+
+        return predicate
