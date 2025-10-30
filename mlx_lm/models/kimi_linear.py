@@ -364,10 +364,8 @@ class KimiDeltaAttention(nn.Module):
 
         if attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
-            hidden_states = index_first_axis(
-                hidden_states.reshape(-1, hidden_states.shape[-1]),
-                indices
-            )[None, ...]
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])[indices][None, ...]
+
 
         conv_state_q, conv_state_k, conv_state_v = None, None, None
         recurrent_state = None
