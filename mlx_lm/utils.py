@@ -389,6 +389,28 @@ def pipeline_load(repo, return_config=False):
         return model, tokenizer
 
 
+def sharded_load(repo, return_config=False):
+    # Download the model and load the metadata
+    model_path = _download(repo)
+    model, config = load_model(model_path, lazy=True, strict=True)
+    tokenizer = load_tokenizer(
+        model_path,
+        {"trust_remote_code": True},
+        eos_token_ids=config.get("eos_token_id", None),
+    )
+
+    # Shard the model and load it into memory
+    model.shard()
+    mx.eval(model.parameters())
+
+    # Synchronize processes to avoid timeout
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+    if return_config:
+        return model, tokenizer, config
+    else:
+        return model, tokenizer
+
+
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
     """
     Splits the weights into smaller shards.
