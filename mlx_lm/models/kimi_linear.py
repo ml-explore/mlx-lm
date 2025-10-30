@@ -360,9 +360,6 @@ class KimiDeltaAttention(nn.Module):
     ):
 
         batch_size, q_len, _ = hidden_states.shape
-        mode = 'fused_recurrent' if q_len <= 64 else self.mode
-
-        cu_seqlens = kwargs.get('cu_seqlens', None)
         indices = None
 
         if attention_mask is not None:
@@ -533,7 +530,7 @@ class KimiLinearMoE(nn.Module):
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV3MLP(
+            self.shared_experts = KimiLinearMLP(
                 config=config, intermediate_size=intermediate_size
             )
 
@@ -553,7 +550,7 @@ class KimiLinearDecoderLayer(nn.Module):
 
         if config.is_kda_layer(layer_idx):
             self.is_linear_attn = True
-            self.self_attn = KimiDeltaAttention(args=config, layer_idx=layer_idx)
+            self.self_attn = KimiDeltaAttention(config=config, layer_idx=layer_idx)
         elif config.is_mla:
             self.is_linear_attn = False
             self.self_attn = KimiLinearAttention(config)
@@ -561,13 +558,13 @@ class KimiLinearDecoderLayer(nn.Module):
             raise NotImplementedError
 
         self.mlp = (
-            DeepseekV3MoE(config)
+            KimiLinearMoE(config)
             if (
                 config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0
             )
-            else DeepseekV3MLP(config)
+            else KimiLinearMLP(config)
         )
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
