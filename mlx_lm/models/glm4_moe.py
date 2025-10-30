@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -243,7 +244,7 @@ class DecoderLayer(nn.Module):
         return h + r
 
 
-class LanguageModel(nn.Module):
+class LanguageModel(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -264,13 +265,28 @@ class LanguageModel(nn.Module):
     ) -> mx.array:
         h = self.embed_tokens(x)
 
-        if cache is None:
-            cache = [None] * self.num_layers
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
 
+        if cache is None:
+            cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(h, cache[0])
 
-        for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for l, c in zip(self.pipeline_layers, cache):
+            h = l(h, mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -315,7 +331,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     @property
     def cast_predicate(self):

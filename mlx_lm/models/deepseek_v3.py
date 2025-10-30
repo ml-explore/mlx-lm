@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -389,7 +390,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         return h + r
 
 
-class DeepseekV3Model(nn.Module):
+class DeepseekV3Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -398,28 +399,7 @@ class DeepseekV3Model(nn.Module):
             DeepseekV3DecoderLayer(config, idx)
             for idx in range(config.num_hidden_layers)
         ]
-        self.start_idx = 0
-        self.end_idx = len(self.layers)
-        self.num_layers = self.end_idx
-
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pipeline_rank = 0
-        self.pipeline_size = 1
-
-    def pipeline(self, group):
-        # Split layers in reverse so rank=0 gets the last layers and
-        # rank=pipeline_size-1 gets the first
-        self.pipeline_rank = group.rank()
-        self.pipeline_size = group.size()
-        layers_per_rank = len(self.layers) // self.pipeline_size
-        extra = len(self.layers) - layers_per_rank * self.pipeline_size
-        if self.pipeline_rank < extra:
-            layers_per_rank += 1
-        self.start_idx = (self.pipeline_size - self.pipeline_rank - 1) * layers_per_rank
-        self.end_idx = self.start_idx + layers_per_rank
-        self.layers = self.layers[: self.end_idx]
-        self.layers[: self.start_idx] = [None] * self.start_idx
-        self.num_layers = len(self.layers) - self.start_idx
 
     def __call__(
         self,
@@ -432,16 +412,15 @@ class DeepseekV3Model(nn.Module):
         pipeline_size = self.pipeline_size
 
         if cache is None:
-            cache = [None] * self.num_layers
+            cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(h, cache[0])
 
         # Receive from the previous process in the pipeline
-
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
-        for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+        for l, c in zip(self.pipeline_layers, cache):
+            h = l(h, mask, cache=c)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -521,7 +500,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers[self.model.start_idx : self.model.end_idx]
+        return self.model.pipeline_layers
 
     @property
     def cast_predicate(self):

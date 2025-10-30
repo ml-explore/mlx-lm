@@ -5,7 +5,7 @@ import sys
 import unittest
 from contextlib import contextmanager
 from io import StringIO
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -405,6 +405,7 @@ class TestScheduleConfig(unittest.TestCase):
             dataset=mock_dataset,
             batch_size=2,
             max_seq_length=2048,
+            comm_group=ANY,
         )
         self.assertEqual(mock_default_loss.call_count, 2)
 
@@ -441,6 +442,7 @@ class TestScheduleConfig(unittest.TestCase):
             dataset=mock_dataset,
             batch_size=2,
             max_seq_length=2048,
+            comm_group=ANY,
         )
         self.assertEqual(mock_default_loss.call_count, 3)
 
