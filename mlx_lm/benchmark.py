@@ -6,7 +6,7 @@ import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.utils import pipeline_load
+from mlx_lm.utils import pipeline_load, sharded_load
 
 
 def setup_arg_parser():
@@ -49,6 +49,12 @@ def setup_arg_parser():
         help="Number of timing trials",
         type=int,
     )
+    parser.add_argument(
+        "--shard", action="store_true", help="Shard the model to nodes across width"
+    )
+    parser.add_argument(
+        "--pipeline", action="store_true", help="Shard the model to nodes across depth"
+    )
     return parser
 
 
@@ -67,7 +73,12 @@ def main():
     model_path = args.model or DEFAULT_MODEL
 
     if group.size() > 1:
-        model, tokenizer, config = pipeline_load(args.model, return_config=True)
+        if args.pipeline:
+            model, tokenizer, config = pipeline_load(args.model, return_config=True)
+        elif args.shard:
+            model, tokenizer, config = sharded_load(args.model, return_config=True)
+        else:
+            parser.error("At least one of --pipeline or --shard is required for distributed generation")
     else:
         model, tokenizer, config = load(
             args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
