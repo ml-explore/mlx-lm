@@ -247,14 +247,17 @@ class JambaSparseMoeBlock(nn.Module):
 
 
 class JambaDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, layer_type: str):
+    def __init__(self, args: ModelArgs, layer_type: str, layer_idx: int):
         super().__init__()
         self.is_attn = layer_type == "attention"
         if self.is_attn:
             self.self_attn = JambaAttention(args)
         else:
             self.mamba = JambaMambaMixer(args)
-        ffn_layer_class = JambaSparseMoeBlock if args.num_experts > 1 else JambaMLP
+        if (layer_idx + args.expert_layer_offset) % args.expert_layer_period == 0:
+            ffn_layer_class = JambaSparseMoeBlock
+        else:
+            ffn_layer_class = JambaMLP
         self.feed_forward = ffn_layer_class(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_ff_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -279,7 +282,10 @@ class JambaModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
-        self.layers = [JambaDecoderLayer(args, t) for t in args.layers_block_type]
+        self.layers = [
+            JambaDecoderLayer(args, t, idx)
+            for idx, t in enumerate(args.layers_block_type)
+        ]
         self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.attn_idx = args.layers_block_type.index("attention")
         self.ssm_idx = args.layers_block_type.index("mamba")
