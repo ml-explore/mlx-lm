@@ -254,7 +254,10 @@ class JambaDecoderLayer(nn.Module):
             self.self_attn = JambaAttention(args)
         else:
             self.mamba = JambaMambaMixer(args)
-        if (layer_idx + args.expert_layer_offset) % args.expert_layer_period == 0:
+        if (
+            args.num_experts > 1
+            and (layer_idx + args.expert_layer_offset) % args.expert_layer_period == 0
+        ):
             ffn_layer_class = JambaSparseMoeBlock
         else:
             ffn_layer_class = JambaMLP
