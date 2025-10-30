@@ -625,7 +625,7 @@ class KimiLinearModel(nn.Module):
 
         if cache is None:
             cache = [None] * self.num_layers
-        mask = create_attention_mask(h, cache[-1][0], return_array=True)
+        mask = create_attention_mask(h, cache[0][-1], return_array=True)
 
         # Receive from the previous process in the pipeline
 
