@@ -71,6 +71,12 @@ CONFIG_DEFAULTS = {
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
     "lr_schedule": None,
+    "lr_steps": None,
+    "lr_end": None,
+    "lr_decay_rate": None,
+    "lr_step_size": None,
+    "warmup_steps": None,
+    "warmup_init": 0.0,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
     "report_to": None,
@@ -253,7 +259,7 @@ def build_parser():
         "--lr-schedule-warmup-init",
         dest="warmup_init",
         type=float,
-        default=0.0,
+        default=None,
         help="Initial learning rate during warmup.",
     )
     return parser
