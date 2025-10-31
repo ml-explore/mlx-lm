@@ -243,6 +243,7 @@ submit a pull request.
 
 Here are a few examples of Hugging Face models that work with this example:
 
+- [MiniMax/MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2)
 - [mistralai/Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)
 - [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
 - [deepseek-ai/deepseek-coder-6.7b-instruct](https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-instruct)
