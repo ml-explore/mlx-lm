@@ -164,7 +164,7 @@ class LoRA(nn.Module):
         output_dim: int,
         low_rank_dim: int,
         bias: Optional[bool] = True,
-        activation: Optional[str] = 'tanh'
+        activation: Optional[str] = "tanh",
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -174,11 +174,11 @@ class LoRA(nn.Module):
 
         if activation is None:
             self.activation = nn.Identity()
-        elif activation == 'sigmoid':
+        elif activation == "sigmoid":
             self.activation = nn.Sigmoid()
-        elif activation == 'tanh':
+        elif activation == "tanh":
             self.activation = nn.Tanh()
-        elif activation == 'relu':
+        elif activation == "relu":
             self.activation = nn.ReLU()
         else:
             raise ValueError(f"Unsupported activation type: {activation}.")
@@ -186,7 +186,7 @@ class LoRA(nn.Module):
         self.lora = [
             nn.Linear(self.input_dim, self.low_rank_dim, bias=False),
             self.activation,
-            nn.Linear(self.low_rank_dim, self.output_dim, bias=self.bias)
+            nn.Linear(self.low_rank_dim, self.output_dim, bias=self.bias),
         ]
 
     def __call__(self, x) -> mx.array:
@@ -261,38 +261,51 @@ class Rwkv7TimeMixing(nn.Module):
         self.g_norm = LayerNormPerHead(self.head_dim, self.num_heads, eps=64e-5)
 
         self.w_lora = LoRA(
-            self.hidden_size, self.hidden_size, low_rank_dim=self.decay_low_rank_dim, activation='tanh'
+            self.hidden_size,
+            self.hidden_size,
+            low_rank_dim=self.decay_low_rank_dim,
+            activation="tanh",
         )
 
         if self.layer_idx > 0:
             self.v_lora = LoRA(
-                self.hidden_size, self.hidden_size, low_rank_dim=self.v_low_rank_dim, activation=None
+                self.hidden_size,
+                self.hidden_size,
+                low_rank_dim=self.v_low_rank_dim,
+                activation=None,
             )
 
         self.a_lora = LoRA(
-            self.hidden_size, self.hidden_size, low_rank_dim=self.a_low_rank_dim, activation=None
+            self.hidden_size,
+            self.hidden_size,
+            low_rank_dim=self.a_low_rank_dim,
+            activation=None,
         )
 
         self.g_lora = LoRA(
-            self.hidden_size, self.hidden_size, low_rank_dim=self.gate_low_rank_dim, activation='sigmoid', bias=False
+            self.hidden_size,
+            self.hidden_size,
+            low_rank_dim=self.gate_low_rank_dim,
+            activation="sigmoid",
+            bias=False,
         )
 
     def _wkv7(self, r, w, k, v, a, b, state, use_kernel: bool = True):
         B, L, _, _ = r.shape
         if state is None:
-            state = mx.zeros((B, self.num_heads, self.head_dim, self.head_dim), dtype=r.dtype)
+            state = mx.zeros(
+                (B, self.num_heads, self.head_dim, self.head_dim), dtype=r.dtype
+            )
 
-        if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        if (
+            not use_kernel
+            or mx.default_device() != mx.gpu
+            or not mx.metal.is_available()
+        ):
             ys = []
             for t in range(L):
                 y, state = _wkv7_step_ops(
-                    r[:, t],
-                    w[:, t],
-                    k[:, t],
-                    v[:, t],
-                    a[:, t],
-                    b[:, t],
-                    state
+                    r[:, t], w[:, t], k[:, t], v[:, t], a[:, t], b[:, t], state
                 )
                 ys.append(y)
 
@@ -300,7 +313,6 @@ class Rwkv7TimeMixing(nn.Module):
             return y, state
         else:
             return wkv7_kernel(r, w, k, v, a, b, state)
-
 
     def __call__(self, x, v_first, cache):
         if cache is None:
@@ -328,19 +340,27 @@ class Rwkv7TimeMixing(nn.Module):
         if self.layer_idx == 0:
             v_first = value
         else:
-            vv = mx.sigmoid(self.v_lora(xv)).reshape(B, L, self.num_heads, self.head_dim)
+            vv = mx.sigmoid(self.v_lora(xv)).reshape(
+                B, L, self.num_heads, self.head_dim
+            )
             value = addcmul(value, v_first - value, vv)
 
-        decay = mx.sigmoid(self.w_lora(xw).reshape(B, L, self.num_heads, self.head_dim)).astype(mx.float32)
+        decay = mx.sigmoid(
+            self.w_lora(xw).reshape(B, L, self.num_heads, self.head_dim)
+        ).astype(mx.float32)
         decay = mx.exp(-0.606531 * decay).astype(receptance.dtype)
         kk = l2_norm((key * self.k_k))
         key = key * (1 + (iclr - 1) * self.k_a)
         a = -kk
         b = kk * iclr
 
-        out, new_state_cache = self._wkv7(receptance, decay, key, value, a, b, state_cache)
+        out, new_state_cache = self._wkv7(
+            receptance, decay, key, value, a, b, state_cache
+        )
         out = self.g_norm(out.reshape(B, L, self.num_heads, self.head_dim))
-        out = (out + (receptance * key * self.r_k).sum(axis=-1, keepdims=True) * value).reshape([B, L, D])
+        out = (
+            out + (receptance * key * self.r_k).sum(axis=-1, keepdims=True) * value
+        ).reshape([B, L, D])
 
         if isinstance(cache, RwkvCache):
             cache[0] = x[:, -1:, :]
@@ -375,7 +395,9 @@ class Rwkv7Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [Rwkv7Layer(args, layer_idx=i) for i in range(args.num_hidden_layers)]
+        self.layers = [
+            Rwkv7Layer(args, layer_idx=i) for i in range(args.num_hidden_layers)
+        ]
         self.norm = nn.LayerNorm(args.hidden_size, eps=args.norm_eps)
 
     def __call__(self, x: mx.array, cache):
@@ -422,7 +444,9 @@ class Model(nn.Module):
             if v.dtype == mx.bfloat16 and "embeddings" not in k:
                 weights[k] = v.astype(mx.float16)
             if "k_k" in k or "k_a" in k or "g_norm" in k:
-                weights[k] = weights[k].reshape(self.args.hidden_size // self.args.head_dim, self.args.head_dim)
+                weights[k] = weights[k].reshape(
+                    self.args.hidden_size // self.args.head_dim, self.args.head_dim
+                )
         return weights
 
     @property
