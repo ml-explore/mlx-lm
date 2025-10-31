@@ -796,3 +796,98 @@ def js_div_loss(logits_q, logits_p):
         kl_p = nn.losses.kl_div_loss(logprobs_m, logprobs_p, axis=-1, reduction="none")
         kl_q = nn.losses.kl_div_loss(logprobs_m, logprobs_q, axis=-1, reduction="none")
         return 0.5 * (kl_p + kl_q)
+
+
+def dpo_loss(
+    policy_chosen_logits: mx.array,
+    policy_rejected_logits: mx.array,
+    reference_chosen_logits: mx.array,
+    reference_rejected_logits: mx.array,
+    chosen_labels: mx.array,
+    rejected_labels: mx.array,
+    beta: float = 0.1,
+) -> mx.array:
+    """
+    Compute Direct Preference Optimization loss.
+
+    Args:
+        policy_chosen_logits: Policy model logits for chosen responses [batch, seq, vocab]
+        policy_rejected_logits: Policy model logits for rejected responses [batch, seq, vocab]
+        reference_chosen_logits: Reference model logits for chosen responses [batch, seq, vocab]
+        reference_rejected_logits: Reference model logits for rejected responses [batch, seq, vocab]
+        chosen_labels: Token labels for chosen responses [batch, seq]
+        rejected_labels: Token labels for rejected responses [batch, seq]
+        beta: Temperature parameter controlling strength of KL penalty
+
+    Returns:
+        DPO loss scalar value
+
+    Examples:
+        >>> batch_size, seq_len, vocab_size = 2, 10, 1000
+        >>> policy_chosen = mx.random.normal((batch_size, seq_len, vocab_size))
+        >>> policy_rejected = mx.random.normal((batch_size, seq_len, vocab_size))
+        >>> ref_chosen = mx.random.normal((batch_size, seq_len, vocab_size))
+        >>> ref_rejected = mx.random.normal((batch_size, seq_len, vocab_size))
+        >>> chosen_labels = mx.random.randint(0, vocab_size, (batch_size, seq_len))
+        >>> rejected_labels = mx.random.randint(0, vocab_size, (batch_size, seq_len))
+        >>> loss = dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected,
+        ...                 chosen_labels, rejected_labels, beta=0.1)
+    """
+    # Compute log probabilities for chosen responses
+    policy_chosen_logprobs = _log_prob_from_logits_and_labels(
+        policy_chosen_logits, chosen_labels
+    )
+    policy_rejected_logprobs = _log_prob_from_logits_and_labels(
+        policy_rejected_logits, rejected_labels
+    )
+    reference_chosen_logprobs = _log_prob_from_logits_and_labels(
+        reference_chosen_logits, chosen_labels
+    )
+    reference_rejected_logprobs = _log_prob_from_logits_and_labels(
+        reference_rejected_logits, rejected_labels
+    )
+
+    # Compute KL-regularized reward differences
+    # π_θ(y|x) / π_ref(y|x) in log space: log π_θ(y|x) - log π_ref(y|x)
+    policy_chosen_rewards = beta * (policy_chosen_logprobs - reference_chosen_logprobs)
+    policy_rejected_rewards = beta * (
+        policy_rejected_logprobs - reference_rejected_logprobs
+    )
+
+    # Bradley-Terry preference model: log σ(β[r_chosen - r_rejected])
+    # Using log-sigmoid for numerical stability: log σ(x) = -softplus(-x)
+    reward_diff = policy_chosen_rewards - policy_rejected_rewards
+    loss = -nn.log_sigmoid(reward_diff)
+
+    return mx.mean(loss)
+
+
+def _log_prob_from_logits_and_labels(logits: mx.array, labels: mx.array) -> mx.array:
+    """
+    Compute log probabilities of labels given logits.
+
+    Args:
+        logits: Model logits [batch, seq, vocab]
+        labels: Token labels [batch, seq]
+
+    Returns:
+        Log probabilities [batch] - sum over sequence dimension
+    """
+    # Convert logits to log probabilities
+    log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    # Use gather operation to get log probabilities for specific tokens
+    # Reshape to facilitate gathering: [batch*seq, vocab]
+    batch_size, seq_len, vocab_size = logits.shape
+    log_probs_flat = mx.reshape(log_probs, (batch_size * seq_len, vocab_size))
+    labels_flat = mx.reshape(labels, (batch_size * seq_len,))
+
+    # Create indices for gathering
+    flat_indices = mx.arange(batch_size * seq_len)
+    selected_log_probs_flat = log_probs_flat[flat_indices, labels_flat]
+
+    # Reshape back to [batch, seq] and sum over sequence
+    selected_log_probs = mx.reshape(selected_log_probs_flat, (batch_size, seq_len))
+
+    # Sum over sequence dimension to get total log probability
+    return mx.sum(selected_log_probs, axis=1)
