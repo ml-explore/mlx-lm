@@ -309,6 +309,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int], int]] = None,
     input_embeddings: Optional[mx.array] = None,
+    resume_from_cache: bool = False,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -337,6 +338,10 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        resume_from_cache (bool): If True and prompt_cache contains cache.offset >=
+          len(prompt), skip the prompt prefill phase and resume generation directly.
+          This optimization is safe when the cache already contains the full prompt
+          from a previous identical request. Default: ``False``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -416,6 +421,17 @@ def generate_step(
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
+
+        # Check if we can skip prefill by resuming from cache
+        if resume_from_cache and cache.can_resume_from_cache(prompt_cache, total_prompt_tokens):
+            cache_offset = prompt_cache[0].offset if prompt_cache else 0
+            # Cache already contains the full prompt, skip prefill entirely
+            prompt_processed_tokens = total_prompt_tokens
+            # Keep only the last token for the initial generation step
+            prompt = prompt[-1:]
+            if input_embeddings is not None:
+                input_embeddings = input_embeddings[-1:]
+
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             n_to_process = min(prefill_step_size, prompt.size - 1)
