@@ -1,14 +1,4 @@
-"""Kimi Linear model implementation for MLX-LM.
-
-This module ports the Moonshot AI Kimi Linear architecture (48B A3B Instruct)
-from its reference PyTorch implementation to MLX.  The model mixes
-multi-latent attention (MLA) layers with Kimi Delta linear attention layers and
-employs a large sparsely-gated MoE in later blocks.
-
-The implementation follows the conventions described in the MLX-LM model
-guide, reusing base utilities (`BaseModelArgs`, `scaled_dot_product_attention`,
-`create_attention_mask`) and the shared SwitchGLU MoE experts.
-"""
+# Copyright © 2025 Apple Inc.
 
 from __future__ import annotations
 
@@ -50,7 +40,6 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     use_cache: bool = True
 
-    # MLA specific configuration
     q_lora_rank: Optional[int] = None
     kv_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
@@ -58,10 +47,8 @@ class ModelArgs(BaseModelArgs):
     v_head_dim: Optional[int] = None
     mla_use_nope: bool = False
 
-    # Linear attention configuration
     linear_attn_config: Optional[Dict[str, Any]] = None
 
-    # MoE configuration
     num_experts: Optional[int] = None
     num_experts_per_token: int = 1
     num_shared_experts: int = 0
@@ -75,7 +62,6 @@ class ModelArgs(BaseModelArgs):
     num_expert_group: int = 1
     topk_group: int = 1
 
-    # Misc
     model_max_length: Optional[int] = None
 
     def __post_init__(self):
@@ -119,12 +105,7 @@ class ModelArgs(BaseModelArgs):
         kda_layers = self.linear_attn_config.get("kda_layers")
         if not kda_layers:
             return False
-        # The HuggingFace config uses 1-indexed layer numbering
         return (layer_idx + 1) in kda_layers
-
-
-# ---------------------------------------------------------------------------
-# Utility functions
 
 
 @partial(mx.compile, shapeless=True)
@@ -156,10 +137,6 @@ class RMSNormGated(nn.Module):
         else:
             gate = nn.silu(gate)
         return y * gate
-
-
-# ---------------------------------------------------------------------------
-# Feed-forward blocks
 
 
 class KimiMLP(nn.Module):
@@ -262,10 +239,6 @@ class KimiSparseMoE(nn.Module):
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
         return out
-
-
-# ---------------------------------------------------------------------------
-# Attention blocks
 
 
 class KimiMLAAttention(nn.Module):
@@ -530,10 +503,6 @@ class KimiDeltaAttention(nn.Module):
         return self.o_proj(out)
 
 
-# ---------------------------------------------------------------------------
-# Decoder layers and full model
-
-
 class KimiDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -690,12 +659,10 @@ class Model(nn.Module):
                         weights[f"{attn_prefix}.{dst_name}.conv.weight"] = w
                 A_key = f"{attn_prefix}.A_log"
                 if A_key in weights:
-                    # Handle both HF format [1, 1, H, 1] and already converted [H]
                     if weights[A_key].ndim == 4:
                         weights[A_key] = mx.squeeze(weights[A_key], axis=(0, 1, 3))
                 dt_key = f"{attn_prefix}.dt_bias"
                 if dt_key in weights:
-                    # Handle both original shape and already flattened
                     if weights[dt_key].ndim > 1:
                         weights[dt_key] = mx.reshape(weights[dt_key], (-1,))
             elif isinstance(attn, KimiMLAAttention):
@@ -723,7 +690,6 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            # Quantize MoE gate to 8-bit for better routing precision
             if path.endswith("mlp.gate"):
                 return {"group_size": 64, "bits": 8}
             return True
