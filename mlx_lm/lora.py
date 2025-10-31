@@ -17,6 +17,7 @@ from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
+    build_schedule_config,
     linear_to_lora_layers,
     load_adapters,
     print_trainable_parameters,
@@ -203,6 +204,58 @@ def build_parser():
         help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+
+    # Learning rate scheduler arguments
+    lr_group = parser.add_argument_group("Learning rate schedule")
+    lr_group.add_argument(
+        "--lr-schedule",
+        type=str,
+        choices=["linear", "cosine", "exponential", "step"],
+        default=None,
+        help="Learning rate schedule to use for training.",
+    )
+    lr_group.add_argument(
+        "--lr-schedule-steps",
+        dest="lr_steps",
+        type=int,
+        default=None,
+        help="Steps for linear/cosine (defaults to --iters).",
+    )
+    lr_group.add_argument(
+        "--lr-schedule-end",
+        dest="lr_end",
+        type=float,
+        default=None,
+        help="End LR for linear/cosine (linear defaults to 0.0).",
+    )
+    lr_group.add_argument(
+        "--lr-schedule-decay-rate",
+        dest="lr_decay_rate",
+        type=float,
+        default=None,
+        help="Decay rate for exponential/step (defaults to 0.999 and 0.5 respectively).",
+    )
+    lr_group.add_argument(
+        "--lr-schedule-step-size",
+        dest="lr_step_size",
+        type=int,
+        default=None,
+        help="Step size for step decay (defaults to iters//10).",
+    )
+    lr_group.add_argument(
+        "--lr-schedule-warmup-steps",
+        dest="warmup_steps",
+        type=int,
+        default=None,
+        help="Warmup steps before schedule starts.",
+    )
+    lr_group.add_argument(
+        "--lr-schedule-warmup-init",
+        dest="warmup_init",
+        type=float,
+        default=0.0,
+        help="Initial learning rate during warmup.",
+    )
     return parser
 
 
@@ -265,7 +318,24 @@ def train_model(
     )
 
     # Initialize the selected optimizer
-    lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
+    lr = args.learning_rate
+    use_schedule = (args.lr_schedule is not None) or (
+        args.warmup_steps is not None and args.warmup_steps > 0
+    )
+    if use_schedule:
+        schedule_config = build_schedule_config(
+            learning_rate=args.learning_rate,
+            iters=args.iters,
+            lr_schedule=args.lr_schedule,
+            lr_steps=args.lr_steps,
+            lr_end=args.lr_end,
+            lr_decay_rate=args.lr_decay_rate,
+            lr_step_size=args.lr_step_size,
+            warmup_steps=args.warmup_steps,
+            warmup_init=args.warmup_init,
+            grad_accumulation_steps=args.grad_accumulation_steps,
+        )
+        lr = build_schedule(schedule_config)
 
     optimizer_name = args.optimizer.lower()
     optimizer_config = args.optimizer_config.get(optimizer_name, {})

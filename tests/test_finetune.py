@@ -109,6 +109,44 @@ class TestLora(unittest.TestCase):
         model.freeze()
         tuner.utils.linear_to_lora_layers(model, num_lora_layers, params)
 
+    def test_constant_with_warmup_schedule(self):
+        initial_lr = 2e-4
+        warmup = 40
+        warmup_init = 2e-7
+        cfg = {
+            "name": "constant",
+            "arguments": [initial_lr],
+            "warmup": warmup,
+            "warmup_init": warmup_init,
+        }
+        lr = build_schedule(cfg)
+
+        self.assertEqual(lr(0), warmup_init)
+        self.assertEqual(lr(warmup), initial_lr)
+        self.assertEqual(lr(warmup + 1), initial_lr)
+        self.assertEqual(lr(warmup + 100), initial_lr)
+
+    def test_cosine_with_warmup_boundary(self):
+        initial_lr = 2e-4
+        end = 0.0
+        warmup = 3
+        decay_steps = 7
+        cfg = {
+            "name": "cosine_decay",
+            "arguments": [initial_lr, decay_steps, end],
+            "warmup": warmup,
+            "warmup_init": 2e-7,
+        }
+        lr = build_schedule(cfg)
+
+        self.assertLess(lr(0), lr(1))
+        self.assertLess(lr(1), lr(2))
+        self.assertEqual(lr(warmup), initial_lr)
+        # After warmup, cosine should start at or below init
+        self.assertLessEqual(lr(warmup + 1), initial_lr)
+        # By the end of cosine, reaches end
+        self.assertEqual(lr(warmup + decay_steps), end)
+
     def test_lora_embedding(self):
         num_embeddings = 256
         dims = 512

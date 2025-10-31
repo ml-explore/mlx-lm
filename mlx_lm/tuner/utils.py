@@ -1,8 +1,10 @@
 # Copyright © 2024 Apple Inc.
 import json
 import types
+import warnings
+from math import ceil
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,13 +16,162 @@ from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
 
+def build_schedule_config(
+    learning_rate: float,
+    iters: int,
+    lr_schedule: Optional[str] = None,
+    lr_steps: Optional[int] = None,
+    lr_end: Optional[float] = None,
+    lr_decay_rate: Optional[float] = None,
+    lr_step_size: Optional[int] = None,
+    warmup_steps: Optional[int] = None,
+    warmup_init: float = 0.0,
+    grad_accumulation_steps: int = 1,
+) -> Dict:
+    """
+    Build the scheduler configuration dict for ``build_schedule`` from explicit parameters.
+
+    Args:
+        learning_rate: Initial learning rate (init parameter for the scheduler).
+        iters: Total training iterations, used as a default for `lr_steps` when applicable.
+        lr_schedule: One of {`linear`, `cosine`, `exponential`, `step`}, or None for constant.
+        lr_steps: Number of steps for linear/cosine schedulers (defaults to `iters` when None).
+        lr_end: End learning rate for linear/cosine (linear defaults to 0.0 when None; cosine end optional).
+        lr_decay_rate: Decay rate for exponential/step (defaults to 0.999 for exponential, 0.5 for step when None).
+        lr_step_size: Number of steps for step decay (defaults to `max(1, schedule_updates // 10)` when None).
+        warmup_steps: Optional warmup steps (>= 0) to prepend.
+        warmup_init: Initial learning rate during warmup (defaults to 0.0).
+        grad_accumulation_steps: Number of steps to accumulate before each optimizer update.
+    Returns:
+        Dict with keys: `name`, `arguments`, `warmup`, `warmup_init` suitable for `build_schedule`.
+    """
+    initial_lr = learning_rate
+
+    # Convert to update units to account for gradient accumulation
+    convert_to_update_units = lambda x: max(
+        1, ceil(x / max(1, grad_accumulation_steps))
+    )
+
+    # number of times the optimizer's update function will be called during warmup
+    warmup_updates = (
+        None if warmup_steps in (None, 0) else convert_to_update_units(warmup_steps)
+    )
+
+    if lr_schedule is None:
+        return {
+            "name": "constant",
+            "arguments": [initial_lr],
+            "warmup": warmup_updates,
+            "warmup_init": warmup_init,
+        }
+
+    # map of simplified lr_schedule names to MLX scheduler names
+    schedule_name_map = {
+        "linear": "linear_schedule",
+        "cosine": "cosine_decay",
+        "exponential": "exponential_decay",
+        "step": "step_decay",
+    }
+    # list of allowed MLX scheduler names. Important for YAML config files.
+    allowed_mlx_names = {
+        "linear_schedule",
+        "cosine_decay",
+        "exponential_decay",
+        "step_decay",
+    }
+    if lr_schedule in schedule_name_map:
+        name = schedule_name_map[lr_schedule]
+    elif lr_schedule in allowed_mlx_names:
+        # lr_schedule is already an MLX scheduler name
+        name = lr_schedule
+    else:
+        warnings.warn(
+            f"Unknown value for --lr_schedule: '{lr_schedule}', defaulting to constant learning rate.",
+            RuntimeWarning,
+        )
+        return {
+            "name": "constant",
+            "arguments": [initial_lr],
+            "warmup": warmup_updates,
+            "warmup_init": warmup_init,
+        }
+
+    if lr_steps is not None:
+        # use lr_steps to calculate the number of main schedule updates
+        schedule_updates = convert_to_update_units(lr_steps)
+    else:
+        # use iters to calculate the number of main schedule updates
+        schedule_updates = convert_to_update_units(iters)
+
+    if warmup_updates:
+        # number main schedule updates = number of main schedule updates - number of warmup updates
+        schedule_updates = max(1, schedule_updates - warmup_updates)
+
+    if name == "linear_schedule":
+        # linear_schedule(init: float, end: float, steps: int)
+        end = lr_end if lr_end is not None else 0.0
+        arguments = [initial_lr, end, schedule_updates]
+    elif name == "cosine_decay":
+        # cosine_decay(init: float, decay_steps: int[, end: float])
+        end = lr_end if lr_end is not None else 0.0
+        arguments = [initial_lr, schedule_updates, end]
+    elif name == "exponential_decay":
+        # exponential_decay(init: float, decay_rate: float)
+        decay_rate = lr_decay_rate if lr_decay_rate is not None else 0.999
+        arguments = [initial_lr, decay_rate]
+    elif name == "step_decay":
+        # step_decay(init: float, decay_rate: float, decay_every_n_steps: int)
+        decay_rate = lr_decay_rate if lr_decay_rate is not None else 0.5
+        decay_every_n_steps = (
+            convert_to_update_units(lr_step_size)
+            if lr_step_size is not None
+            else max(1, schedule_updates // 10)
+        )
+        arguments = [initial_lr, decay_rate, decay_every_n_steps]
+    else:
+        arguments = [initial_lr]
+
+    return {
+        "name": name,
+        "arguments": arguments,
+        "warmup": warmup_updates,
+        "warmup_init": warmup_init,
+    }
+
+
 def build_schedule(schedule_config: Dict):
     """
-    Build a learning rate schedule from the given config.
+    Build and return a step-indexed learning-rate function from a config dict.
+
+    See: https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html for more details.
+
+    schedule_config keys:
+    - `name` (str): MLX scheduler under `mlx.optimizers.schedulers`
+      (e.g., `linear_schedule`, `cosine_decay`, `exponential_decay`, `step_decay`)
+      or `constant` for a fixed LR.
+    - `arguments` (list): Positional args for the chosen scheduler. For `constant`, use `[init_lr]`.
+    - `warmup` (int, optional): Warmup steps (>= 0). If > 0, a linear warmup from `warmup_init` to
+      the initial LR is prepended.
+    - `warmup_init` (float, optional): Initial LR during warmup. Defaults to 0.0.
+
+    Returns:
+        Callable[[int], float]: A function mapping `step` (int) -> learning rate (float).
+
+    Raises:
+        AttributeError: If `name` is not a valid MLX scheduler (except `constant`).
     """
-    schedule_fn = getattr(opt.schedulers, schedule_config["name"])
+    name = schedule_config["name"]
     arguments = schedule_config["arguments"]
     initial_lr = arguments[0]
+
+    if name == "constant":
+        warmup_steps = schedule_config.get("warmup", 0) or 0
+        warmup_init = schedule_config.get("warmup_init", 0.0)
+        if warmup_steps > 0:
+            return opt.schedulers.linear_schedule(warmup_init, initial_lr, warmup_steps)
+        return opt.schedulers.linear_schedule(initial_lr, initial_lr, 1)
+
+    schedule_fn = getattr(opt.schedulers, name)
     bound_schedule_fn = schedule_fn(*arguments)
     if warmup_steps := schedule_config.get("warmup", 0):
         warmup_init = schedule_config.get("warmup_init", 0.0)
@@ -28,10 +179,9 @@ def build_schedule(schedule_config: Dict):
             warmup_init, initial_lr, warmup_steps
         )
         return opt.schedulers.join_schedules(
-            [warmup_fn, bound_schedule_fn], [warmup_steps + 1]
+            [warmup_fn, bound_schedule_fn], [warmup_steps]
         )
-    else:
-        return bound_schedule_fn
+    return bound_schedule_fn
 
 
 def linear_to_lora_layers(
