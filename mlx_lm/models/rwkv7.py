@@ -22,7 +22,7 @@ class ModelArgs(BaseModelArgs):
     v_low_rank_dim: int
     gate_low_rank_dim: int
     decay_low_rank_dim: int
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
 
 
 @partial(mx.compile, shapeless=True)
@@ -110,7 +110,7 @@ def _make_wkv7_kernel():
     """
     inputs = ["r", "w", "k", "v", "a", "b", "state_in", "T"]
     return mx.fast.metal_kernel(
-        name="wkv7_step",
+        name="wkv7_kernel",
         input_names=inputs,
         output_names=["y", "state_out"],
         source=source,
@@ -149,9 +149,6 @@ def wkv7_kernel(
 class LayerNormPerHead(nn.Module):
     def __init__(self, head_dim, num_heads, eps):
         super().__init__()
-        # self.norms = [
-        #     nn.LayerNorm(head_dim, eps=eps, bias=False) for _ in range(num_heads)
-        # ]
         self.weight = mx.zeros((num_heads, head_dim))
         self.bias = mx.zeros((num_heads, head_dim))
         self.eps = eps
@@ -211,13 +208,13 @@ class Rwkv7ChannelMixing(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
-        dim = args.hidden_size
-        hidden_dim = args.intermediate_size
+        hidden_dim = args.hidden_size
+        intermediate_size = args.intermediate_size
 
-        self.key = nn.Linear(dim, hidden_dim, bias=False)
-        self.value = nn.Linear(hidden_dim, dim, bias=False)
+        self.key = nn.Linear(hidden_dim, intermediate_size, bias=False)
+        self.value = nn.Linear(intermediate_size, hidden_dim, bias=False)
 
-        self.x_k = mx.zeros((dim))
+        self.x_k = mx.zeros((hidden_dim))
 
         self.token_shift = TokenShift()
 
@@ -259,10 +256,7 @@ class Rwkv7TimeMixing(nn.Module):
         self.r_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-
-        self.o_proj = nn.Linear(
-            self.hidden_size, self.hidden_size, bias=False
-        )
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
         self.g_norm = LayerNormPerHead(self.head_dim, self.num_heads, eps=64e-5)
 
@@ -328,30 +322,32 @@ class Rwkv7TimeMixing(nn.Module):
         key = self.k_proj(xk).reshape(B, L, self.num_heads, self.head_dim)
         value = self.v_proj(xv).reshape(B, L, self.num_heads, self.head_dim)
         receptance = self.r_proj(xr).reshape(B, L, self.num_heads, self.head_dim)
-        a = mx.sigmoid(self.a_lora(xa)).reshape(B, L, self.num_heads, self.head_dim)
-        g = self.g_lora(xg)
+        iclr = mx.sigmoid(self.a_lora(xa)).reshape(B, L, self.num_heads, self.head_dim)
+        gate = self.g_lora(xg)
 
         if self.layer_idx == 0:
             v_first = value
         else:
-            value = value + (v_first - value) * mx.sigmoid(self.v_lora(xv)).reshape(B, L, self.num_heads, self.head_dim)
+            vv = mx.sigmoid(self.v_lora(xv)).reshape(B, L, self.num_heads, self.head_dim)
+            value = addcmul(value, v_first - value, vv)
 
-        decay = mx.exp(-0.606531 * mx.sigmoid(self.w_lora(xw).reshape(B, L, self.num_heads, self.head_dim)).astype(mx.float32)).astype(receptance.dtype)
+        decay = mx.sigmoid(self.w_lora(xw).reshape(B, L, self.num_heads, self.head_dim)).astype(mx.float32)
+        decay = mx.exp(-0.606531 * decay).astype(receptance.dtype)
         kk = l2_norm((key * self.k_k))
-        key = key * (1 + (a - 1) * self.k_a)
-        b = kk * a
+        key = key * (1 + (iclr - 1) * self.k_a)
         a = -kk
+        b = kk * iclr
 
         out, new_state_cache = self._wkv7(receptance, decay, key, value, a, b, state_cache)
         out = self.g_norm(out.reshape(B, L, self.num_heads, self.head_dim))
-        out = (out + ((receptance * key * self.r_k).sum(axis=-1, keepdims=True) * value)).reshape([B, L, D])
+        out = (out + (receptance * key * self.r_k).sum(axis=-1, keepdims=True) * value).reshape([B, L, D])
 
         if isinstance(cache, RwkvCache):
             cache[0] = x[:, -1:, :]
             cache[1] = new_state_cache
 
-        output = self.o_proj(out * g)
-        return output, v_first
+        out = self.o_proj(out * gate)
+        return out, v_first
 
 
 class Rwkv7Layer(nn.Module):
