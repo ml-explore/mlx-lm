@@ -1,572 +1,560 @@
-# Copyright © 2024 Apple Inc.
+"""Kimi Linear model implementation for MLX-LM.
 
-import math
+This module ports the Moonshot AI Kimi Linear architecture (48B A3B Instruct)
+from its reference PyTorch implementation to MLX.  The model mixes
+multi-latent attention (MLA) layers with Kimi Delta linear attention layers and
+employs a large sparsely-gated MoE in later blocks.
+
+The implementation follows the conventions described in the MLX-LM model
+guide, reusing base utilities (`BaseModelArgs`, `scaled_dot_product_attention`,
+`create_attention_mask`) and the shared SwitchGLU MoE experts.
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, ArraysCache, CacheList, MambaCache
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
+from .cache import KVCache, MambaCache
+from .gated_delta import gated_delta_update
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "kimi_linear"
-    vocab_size: int = 163840
-    hidden_size: int = 2304
-    intermediate_size: int = 9216
-    moe_intermediate_size: int = 1024
-    num_hidden_layers: int = 27
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 32
-    n_shared_experts: Optional[int] = 1
-    n_routed_experts: Optional[int] = 256
-    routed_scaling_factor: float = 2.446
-    kv_lora_rank: int = 512
+    model_type: str
+    vocab_size: int
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    intermediate_size: int
+    head_dim: int
+    rope_theta: float
+    rms_norm_eps: float
+    hidden_act: str = "silu"
+    initializer_range: float = 0.02
+    rope_scaling: Optional[Dict[str, Any]] = None
+    partial_rotary_factor: float = 1.0
+    tie_word_embeddings: bool = False
+    use_cache: bool = True
+
+    # MLA specific configuration
     q_lora_rank: Optional[int] = None
-    qk_rope_head_dim: int = 64
-    v_head_dim: int = 128
-    qk_nope_head_dim: int = 128
-    head_dim: int = 72
-    topk_method: str = "noaux_tc"
-    scoring_func: str = "sigmoid"
-    norm_topk_prob: bool = True
-    n_group: int = 1
-    topk_group: int = 1
-    num_experts_per_tok: int = 8
+    kv_lora_rank: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
+    mla_use_nope: bool = False
+
+    # Linear attention configuration
+    linear_attn_config: Optional[Dict[str, Any]] = None
+
+    # MoE configuration
+    num_experts: Optional[int] = None
+    num_experts_per_token: int = 1
+    num_shared_experts: int = 0
+    moe_intermediate_size: Optional[int] = None
+    moe_router_activation_func: str = "sigmoid"
+    moe_renormalize: bool = True
+    routed_scaling_factor: float = 1.0
+    first_k_dense_replace: int = 0
     moe_layer_freq: int = 1
-    first_k_dense_replace: int = 1
-    max_position_embeddings: int = 1048576
-    rms_norm_eps: float = 1e-5
-    rope_theta: float = 10000.0
-    rope_scaling: Dict = None
-    attention_bias: bool = False
-    linear_attn_config: Dict = None
+    use_grouped_topk: bool = True
+    num_expert_group: int = 1
+    topk_group: int = 1
+
+    # Misc
+    model_max_length: Optional[int] = None
+
+    def __post_init__(self):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+
+        if self.linear_attn_config is not None:
+            for key in ("head_dim", "num_heads", "short_conv_kernel_size"):
+                if key not in self.linear_attn_config:
+                    raise ValueError(
+                        f"linear_attn_config missing required field '{key}'"
+                    )
+
+    @property
+    def is_moe(self) -> bool:
+        return self.num_experts is not None and self.num_experts > 0
+
+    @property
+    def is_mla(self) -> bool:
+        return (
+            any(
+                getattr(self, name) is not None
+                for name in (
+                    "q_lora_rank",
+                    "kv_lora_rank",
+                    "qk_nope_head_dim",
+                    "qk_rope_head_dim",
+                    "v_head_dim",
+                )
+            )
+            or self.mla_use_nope
+        )
+
+    @property
+    def is_linear_attn(self) -> bool:
+        return self.linear_attn_config is not None
+
+    def is_kda_layer(self, layer_idx: int) -> bool:
+        if not self.is_linear_attn:
+            return False
+        kda_layers = self.linear_attn_config.get("kda_layers")
+        if not kda_layers:
+            return False
+        # The HuggingFace config uses 1-indexed layer numbering
+        return (layer_idx + 1) in kda_layers
 
 
+# ---------------------------------------------------------------------------
+# Utility functions
 
-class KimiLinearAttention(nn.Module):
-    def __init__(self, config: ModelArgs):
+
+@partial(mx.compile, shapeless=True)
+def _swish(x: mx.array) -> mx.array:
+    return nn.silu(x)
+
+
+def _activation_fn(name: str):
+    if name == "silu" or name == "swish":
+        return _swish
+    raise ValueError(f"Unsupported activation function '{name}' for KimiLinear")
+
+
+class RMSNormGated(nn.Module):
+    def __init__(
+        self, hidden_size: int, eps: float = 1e-5, activation: str = "sigmoid"
+    ):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.q_lora_rank = config.q_lora_rank
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.kv_lora_rank = config.kv_lora_rank
-        self.v_head_dim = config.v_head_dim
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.weight = mx.ones((hidden_size,))
+        self.eps = eps
+        if activation not in ("sigmoid", "silu", "swish"):
+            raise ValueError(f"Unsupported gate activation '{activation}'")
+        self.activation = activation
 
-        self.scale = self.q_head_dim**-0.5
-
-        if self.q_lora_rank is None:
-            self.q_proj = nn.Linear(
-                self.hidden_size, self.num_heads * self.q_head_dim, bias=False
-            )
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        y = mx.fast.rms_norm(x, self.weight, self.eps)
+        if self.activation == "sigmoid":
+            gate = mx.sigmoid(gate)
         else:
-            self.q_a_proj = nn.Linear(
-                self.hidden_size, self.q_lora_rank, bias=config.attention_bias
-            )
-            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
-            self.q_b_proj = nn.Linear(
-                self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
-            )
-
-        self.kv_a_proj_with_mqa = nn.Linear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=config.attention_bias,
-        )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
-        )
-
-        self.o_proj = nn.Linear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=config.attention_bias,
-        )
-
-        self.rope = nn.RoPE(
-            dims=self.qk_rope_head_dim,
-            base=self.rope_theta,
-            traditional=True,
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, D = x.shape
-
-        if self.q_lora_rank is None:
-            q = self.q_proj(x)
-        else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
-
-        q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-        q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
-        compressed_kv = self.kv_a_proj_with_mqa(x)
-        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
-        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
-
-        if cache is not None:
-            q_pe = self.rope(q_pe, cache[-1].offset)
-            k_pe = self.rope(k_pe, cache[-1].offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache[-1].update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), values
-            )
-        else:
-            q_pe = self.rope(q_pe)
-            k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
-
-        queries = mx.concatenate([q_nope, q_pe], axis=-1)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+            gate = nn.silu(gate)
+        return y * gate
 
 
-class ShortConv(nn.Module):
+# ---------------------------------------------------------------------------
+# Feed-forward blocks
 
+
+class KimiMLP(nn.Module):
     def __init__(
         self,
-        hidden_size: int,
-        kernel_size: int,
-        bias: bool = False
+        args: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
-
-        self.hidden_size = hidden_size
-        self.kernel_size = kernel_size
-        self.padding = kernel_size - 1
-
-        self.conv = nn.Conv1d(
-            in_channels=hidden_size,
-            out_channels=hidden_size,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=0,
-            groups=hidden_size,
-            bias=bias
-        )
-
-
-    def __call__(
-        self,
-        x: mx.array,
-        residual: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
-        cache: Optional[mx.array] = None,
-        cu_seqlens: Optional[mx.array] = None,
-        **kwargs,
-    ):
-
-        B, T, D = x.shape
-        N = B if cu_seqlens is None else len(cu_seqlens) - 1
-
-        if mask is not None:
-            if cu_seqlens is not None:
-                raise ValueError("`mask` and `cu_seqlens` cannot be provided at the same time")
-            x = x * mask[..., None]
-
-
-        if B * T == N:
-            y, cache = self.step(
-                x=x,
-                residual=residual,
-                cache=cache,
-                cu_seqlens=cu_seqlens
-            )
-            return y, cache
-
-
-        x_transposed = mx.transpose(x, (0, 2, 1))
-
-        if cache is not None:
-            x_padded = mx.concatenate([cache, x_transposed], axis=-1)
-        else:
-            padding = mx.zeros((B, D, self.padding))
-            x_padded = mx.concatenate([padding, x_transposed], axis=-1)
-
-        y = self.conv(x_padded)
-
-        y = nn.silu(y)
-
-        final_state = None
-
-        final_state = x_padded[:, :, -self.kernel_size:]
-
-
-        y = mx.transpose(y, (0, 2, 1))
-
-        if residual is not None:
-            y = y + residual
-
-        return y, final_state
-
-    def step(
-        self,
-        x: mx.array,
-        residual: Optional[mx.array],
-        cache: Optional[mx.array],
-        output_final_state: bool = False,
-        cu_seqlens: Optional[mx.array] = None
-    ):
-        """
-        Single step inference (used during decoding).
-
-        Args:
-            x: Input of shape [B, 1, D] or [1, B, D] (depending on cu_seqlens)
-            residual: Residual tensor
-            cache: Cached states of shape [N, D, W]
-            output_final_state: Whether to output final state
-            cu_seqlens: Cumulative sequence lengths
-
-        Returns:
-            Tuple of (output, updated_cache)
-        """
-        B = x.shape[0]
-        D = self.hidden_size
-        W = self.kernel_size
-        N = B if cu_seqlens is None else len(cu_seqlens) - 1
-
-        if cache is None:
-            cache = mx.zeros((N, D, W))
-
-        shape = x.shape
-        # Squeeze to get [B, D] or [N, D]
-        x_squeezed = x.squeeze(1) if cu_seqlens is None else x.squeeze(0)
-
-        if cache is not None:
-            # Roll cache and add new input
-            # cache[:, :, :-1] = cache[:, :, 1:]; cache[:, :, -1] = x_squeezed
-            new_cache = mx.concatenate([cache[:, :, 1:], x_squeezed[:, :, None]], axis=-1)
-
-            # Compute output using the conv weights
-            # Shape of conv.weight: [out_channels, in_channels/groups, kernel_size]
-            # For depthwise conv: [D, 1, W]
-            weight = self.conv.weight.squeeze(1)  # [D, W]
-
-            # Compute: sum(cache * weight, dim=-1)
-            y = mx.sum(new_cache * weight[None, :, :], axis=-1)  # [N, D]
-
-            if self.conv.bias is not None:
-                y = y + self.conv.bias[None, :]
-
-            y = self._apply_activation(y)
-            cache[0] = new_cache
-        else:
-            # No cache - this shouldn't normally happen in step mode
-            # Fallback: just return the input
-            y = x_squeezed
-            if output_final_state:
-                cache = mx.zeros((N, D, W))
-
-        # Restore original shape
-        y = y.reshape(shape)
-
-        if residual is not None:
-            y = y + residual
-
-        return y, cache
-
-
-
-class KimiDeltaAttention(nn.Module):
-    def __init__(self, config: ModelArgs, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.mode = "chunk"
-
-        self.hidden_size = config.hidden_size
-        self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
-        self.head_dim = config.linear_attn_config["head_dim"]
-        self.num_heads = config.linear_attn_config["num_heads"]
-        self.head_k_dim = self.head_dim
-        self.num_k_heads = self.num_heads
-
-        self.layer_idx = layer_idx
-
-        assert self.mode in [
-            'chunk', 'fused_recurrent'], f"Not supported mode `{self.mode}`."
-
-        projection_k_size = self.head_k_dim * self.num_k_heads
-        projection_size = self.head_dim * self.num_heads
-
-        self.q_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-
-        self.q_conv1d = ShortConv(
-            hidden_size=projection_k_size,
-            kernel_size=self.conv_size,
-        )
-        self.k_conv1d = ShortConv(
-            hidden_size=projection_k_size,
-            kernel_size=self.conv_size,
-        )
-        self.v_conv1d = ShortConv(
-            hidden_size=projection_size,
-            kernel_size=self.conv_size,
-        )
-
-        # Initialize A_log parameter
-        self.A_log = mx.log(mx.random.uniform(1, 16, (1, 1, self.num_heads, 1)))
-
-        self.f_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.f_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
-
-        self.dt_bias = mx.zeros((projection_size,))
-
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-
-        self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
-
-        self.o_norm = nn.RMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )
-        self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
-
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        attention_mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        cu_seqlens: Optional[mx.array] = None,
-    ):
-
-        batch_size, q_len, _ = hidden_states.shape
-        indices = None
-
-        if attention_mask is not None:
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
-            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])[indices][None, ...]
-
-
-        conv_state_q, conv_state_k, conv_state_v = None, None, None
-        recurrent_state = None
-
-        if cache is not None:
-            if cache[0][self.layer_idx] is not None:
-                conv_state_q, conv_state_k, conv_state_v = cache[0][self.layer_idx]
-            recurrent_state = cache[1][self.layer_idx]
-
-        q, conv_state_q = self.q_conv1d(
-            x=self.q_proj(hidden_states),
-            cache=conv_state_q,
-            cu_seqlens=cu_seqlens
-        )
-        k, conv_state_k = self.k_conv1d(
-            x=self.k_proj(hidden_states),
-            cache=conv_state_k,
-            cu_seqlens=cu_seqlens
-        )
-        v, conv_state_v = self.v_conv1d(
-            x=self.v_proj(hidden_states),
-            cache=conv_state_v,
-            cu_seqlens=cu_seqlens
-        )
-
-        g = self.f_b_proj(self.f_a_proj(hidden_states))
-        g = fused_kda_gate(g, self.A_log, self.head_dim, g_bias=self.dt_bias)
-        beta = mx.sigmoid(self.b_proj(hidden_states))
-
-        # Reshape operations (equivalent to rearrange)
-        q = q.reshape(*q.shape[:-1], self.num_heads, self.head_k_dim)
-        k = k.reshape(*k.shape[:-1], self.num_k_heads, self.head_k_dim)
-        v = v.reshape(*v.shape[:-1], self.num_heads, self.head_dim)
-
-
-        o, recurrent_state = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=recurrent_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-        )
-
-        if cache is not None:
-            cache[1][self.layer_idx] = recurrent_state
-            cache[0][self.layer_idx] = (
-                conv_state_q, conv_state_k, conv_state_v)
-
-        g = self.g_b_proj(self.g_a_proj(hidden_states))
-        g = g.reshape(*g.shape[:-1], self.num_heads, self.head_dim)
-
-        o = self.o_norm(o)
-        o = o * nn.silu(g)
-
-        o = o.reshape(o.shape[0], o.shape[1], -1)
-        o = self.o_proj(o)
-
-        if attention_mask is not None:
-            o = mx.pad(o[0], [(0, 0), (0, 0), (0, 0)])
-
-        return o
-
-
-class KimiLinearMLP(nn.Module):
-    def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            config.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x):
-        down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        dim = hidden_size or args.hidden_size
+        hidden = intermediate_size or args.intermediate_size
+        self.gate_proj = nn.Linear(dim, hidden, bias=False)
+        self.up_proj = nn.Linear(dim, hidden, bias=False)
+        self.down_proj = nn.Linear(hidden, dim, bias=False)
+        self.act = _activation_fn(args.hidden_act)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
 
 
 @mx.compile
-def group_expert_select(
-    gates,
-    e_score_correction_bias,
-    top_k,
-    n_group,
-    topk_group,
-    routed_scaling_factor,
-    norm_topk_prob,
-):
+def _group_expert_select(
+    gates: mx.array,
+    bias: Optional[mx.array],
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    renormalize: bool,
+    score_function: str,
+) -> Tuple[mx.array, mx.array]:
+    if score_function == "sigmoid":
+        scores = mx.sigmoid(gates.astype(mx.float32))
+    elif score_function == "softmax":
+        scores = mx.softmax(gates.astype(mx.float32), axis=-1, precise=True)
+    else:
+        raise ValueError(f"Unsupported MoE router activation '{score_function}'")
 
-    scores = mx.sigmoid(gates.astype(mx.float32))
     orig_scores = scores
-    scores = scores + e_score_correction_bias
+    if bias is not None:
+        scores = scores + bias.astype(scores.dtype)
+
     if n_group > 1:
         scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
         group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
         k = n_group - topk_group
         group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
         scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+            scores,
+            mx.stop_gradient(group_idx),
+            mx.array(0.0, dtype=scores.dtype),
+            axis=-2,
         )
         scores = mx.flatten(scores, -2, -1)
 
-    k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
+
+    if top_k > 1 and renormalize:
+        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
         scores = scores / denominator
-    scores = scores * routed_scaling_factor
 
-    return inds, scores
+    return inds, scores * routed_scaling_factor
 
 
-class MoEGate(nn.Module):
-    def __init__(self, config: ModelArgs):
+class KimiSparseMoE(nn.Module):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.norm_topk_prob = config.norm_topk_prob
-        self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
-        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
-        assert config.topk_method == "noaux_tc", "Unsupported topk method."
+        self.args = args
+        hidden = args.hidden_size
+        experts = args.num_experts
+        if experts is None:
+            raise ValueError("num_experts must be specified for MoE layers")
 
-    def __call__(self, x):
-        return group_expert_select(
-            x @ self.weight.T,
-            self.e_score_correction_bias,
-            self.top_k,
-            self.n_group,
-            self.topk_group,
-            self.routed_scaling_factor,
-            self.norm_topk_prob,
-        )
+        self.gate = nn.Linear(hidden, experts, bias=False)
+        self.switch_mlp = SwitchGLU(hidden, args.moe_intermediate_size, experts)
+        self.e_score_correction_bias = mx.zeros((experts,), dtype=mx.float32)
 
-
-class KimiLinearMoE(nn.Module):
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-        self.config = config
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.switch_mlp = SwitchGLU(
-            config.hidden_size,
-            config.moe_intermediate_size,
-            config.n_routed_experts,
-        )
-
-        self.gate = MoEGate(config)
-        if config.n_shared_experts is not None:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = KimiLinearMLP(
-                config=config, intermediate_size=intermediate_size
-            )
-
-    def __call__(self, x):
-        inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(x)
-
-        return y
-
-
-class KimiLinearDecoderLayer(nn.Module):
-    def __init__(self, config: ModelArgs, layer_idx: int):
-        super().__init__()
-
-        if config.is_kda_layer(layer_idx):
-            self.is_linear_attn = True
-            self.self_attn = KimiDeltaAttention(config=config, layer_idx=layer_idx)
-        elif config.is_mla:
-            self.is_linear_attn = False
-            self.self_attn = KimiLinearAttention(config)
+        if args.num_shared_experts:
+            shared_hidden = args.moe_intermediate_size * args.num_shared_experts
+            self.shared_experts = KimiMLP(args, intermediate_size=shared_hidden)
         else:
-            raise NotImplementedError
+            self.shared_experts = None
 
-        self.mlp = (
-            KimiLinearMoE(config)
-            if (
-                config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0
-            )
-            else KimiLinearMLP(config)
+    def __call__(self, x: mx.array) -> mx.array:
+        scores = self.gate(x)
+        inds, weights = _group_expert_select(
+            scores,
+            self.e_score_correction_bias,
+            self.args.num_experts_per_token,
+            self.args.num_expert_group,
+            self.args.topk_group,
+            self.args.routed_scaling_factor,
+            self.args.moe_renormalize,
+            self.args.moe_router_activation_func,
         )
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        out = self.switch_mlp(x, inds)
+        out = (out * weights[..., None]).sum(axis=-2)
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(x)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Attention blocks
+
+
+class KimiMLAAttention(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.num_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
+        self.qk_nope_head_dim = args.qk_nope_head_dim or args.head_dim
+        self.qk_rope_head_dim = args.qk_rope_head_dim or 0
+        self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.v_head_dim = args.v_head_dim or args.head_dim
+        self.scale = self.q_head_dim**-0.5
+
+        hidden = args.hidden_size
+        self.q_proj = nn.Linear(hidden, self.num_heads * self.q_head_dim, bias=False)
+        self.kv_a_proj = nn.Linear(
+            hidden,
+            (args.kv_lora_rank or 0) + self.qk_rope_head_dim,
+            bias=False,
+        )
+        self.kv_a_norm = nn.RMSNorm(
+            args.kv_lora_rank or self.qk_nope_head_dim, eps=args.rms_norm_eps
+        )
+        self.kv_b_proj = nn.Linear(
+            args.kv_lora_rank or self.qk_nope_head_dim,
+            self.num_heads
+            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
+            bias=False,
+        )
+        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
+
+        rope_dim = self.qk_rope_head_dim or self.q_head_dim
+        self.rope = initialize_rope(
+            rope_dim,
+            base=args.rope_theta,
+            traditional=False,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.model_max_length or 1_000_000,
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[KVCache] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+        q_states = self.q_proj(x).reshape(B, L, self.num_heads, self.q_head_dim)
+        q_pass, q_rot = mx.split(q_states, [self.qk_nope_head_dim], axis=-1)
+
+        compressed = self.kv_a_proj(x)
+        k_pass, k_rot = mx.split(
+            compressed, [compressed.shape[-1] - self.qk_rope_head_dim], axis=-1
+        )
+        k_pass = self.kv_a_norm(k_pass)
+        kv = self.kv_b_proj(k_pass)
+        kv = kv.reshape(
+            B,
+            L,
+            self.num_heads,
+            self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim,
+        )
+        k_pass, v_states = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+
+        if self.qk_rope_head_dim:
+            k_rot = mx.reshape(k_rot, (B, L, 1, self.qk_rope_head_dim))
+            k_rot = mx.broadcast_to(k_rot, (*k_pass.shape[:-1], self.qk_rope_head_dim))
+        else:
+            k_rot = mx.zeros((*k_pass.shape[:-1], 0), dtype=k_pass.dtype)
+
+        queries = mx.concatenate([q_pass, q_rot], axis=-1).transpose(0, 2, 1, 3)
+        keys = mx.concatenate([k_pass, k_rot], axis=-1).transpose(0, 2, 1, 3)
+        values = v_states.transpose(0, 2, 1, 3)
+
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+
+        out = scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            cache,
+            scale=self.scale,
+            mask=mask,
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(out)
+
+
+class ShortConv1d(nn.Module):
+    def __init__(self, channels: int, kernel_size: int):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            bias=False,
+            groups=channels,
+            padding=0,
+        )
+
+    def __call__(
+        self, x: mx.array, cache: Optional[mx.array]
+    ) -> Tuple[mx.array, mx.array]:
+        if cache is None:
+            pad = mx.zeros(
+                (x.shape[0], self.kernel_size - 1, x.shape[-1]), dtype=x.dtype
+            )
+        else:
+            pad = cache
+        conv_input = mx.concatenate([pad, x], axis=1)
+        out = nn.silu(self.conv(conv_input))
+        new_cache = conv_input[:, -self.kernel_size + 1 :, :]
+        return out, new_cache
+
+
+class KimiDeltaAttention(nn.Module):
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        if args.linear_attn_config is None:
+            raise ValueError("linear_attn_config must be provided for KDA layers")
+        cfg = args.linear_attn_config
+
+        self.layer_idx = layer_idx
+        self.num_heads = cfg["num_heads"]
+        self.head_dim = cfg["head_dim"]
+        self.conv_kernel = cfg.get("short_conv_kernel_size", 4)
+
+        self.projection_dim = self.num_heads * self.head_dim
+        hidden = args.hidden_size
+
+        self.scale = float(self.head_dim) ** -0.5
+
+        self.q_proj = nn.Linear(hidden, self.projection_dim, bias=False)
+        self.k_proj = nn.Linear(hidden, self.projection_dim, bias=False)
+        self.v_proj = nn.Linear(hidden, self.projection_dim, bias=False)
+
+        self.q_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
+        self.k_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
+        self.v_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
+
+        self.f_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
+        self.f_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
+        self.b_proj = nn.Linear(hidden, self.num_heads, bias=False)
+
+        self.g_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
+        self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
+
+        self.A_log = mx.log(
+            mx.random.uniform(
+                low=1.0,
+                high=16.0,
+                shape=(self.num_heads,),
+                dtype=mx.float32,
+            )
+        )
+        self.dt_bias = mx.zeros((self.projection_dim,), dtype=mx.float32)
+
+        self.o_norm = RMSNormGated(
+            self.head_dim, eps=args.rms_norm_eps, activation="sigmoid"
+        )
+        self.o_proj = nn.Linear(self.projection_dim, hidden, bias=False)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, T, _ = x.shape
+        dtype = x.dtype
+
+        conv_state = None
+        recurrent_state = None
+        if cache is not None:
+            conv_state = cache[0]
+            recurrent_state = cache[1]
+
+        if conv_state is None:
+            zeros_q = mx.zeros(
+                (B, self.conv_kernel - 1, self.projection_dim), dtype=dtype
+            )
+            zeros_k = mx.zeros(
+                (B, self.conv_kernel - 1, self.projection_dim), dtype=dtype
+            )
+            zeros_v = mx.zeros(
+                (B, self.conv_kernel - 1, self.projection_dim), dtype=dtype
+            )
+        else:
+            zeros_q, zeros_k, zeros_v = conv_state
+
+        q_conv, conv_q = self.q_conv(self.q_proj(x), zeros_q)
+        k_conv, conv_k = self.k_conv(self.k_proj(x), zeros_k)
+        v_conv, conv_v = self.v_conv(self.v_proj(x), zeros_v)
+
+        if cache is not None:
+            cache[0] = (conv_q, conv_k, conv_v)
+
+        q = q_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
+        k = k_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
+        v = v_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
+
+        def _l2norm(x, eps=1e-6):
+            norm = mx.linalg.norm(x, axis=-1, keepdims=True)
+            return x / (norm + eps)
+
+        q = _l2norm(q)
+        k = _l2norm(k)
+        q = q * self.scale
+
+        a_logits = (
+            self.f_b_proj(self.f_a_proj(x))
+            .reshape(B, T, self.num_heads, self.head_dim)
+            .astype(mx.float32)
+        )
+        b_logits = self.b_proj(x).reshape(B, T, self.num_heads).astype(mx.float32)
+
+        state_in = None
+        if recurrent_state is not None:
+            state_in = recurrent_state.astype(mx.float32)
+
+        mask_bool: Optional[mx.array] = None
+        if mask is not None:
+            mask_bool = mask.astype(mx.bool_) if mask.dtype != mx.bool_ else mask
+            if mask_bool.ndim == 2:
+                mask_bool = mx.expand_dims(mask_bool, axis=-1)
+            if mask_bool is not None and mask_bool.shape[-1] == 1:
+                mask_bool = mx.broadcast_to(mask_bool, (B, T, self.num_heads))
+
+        out, new_state = gated_delta_update(
+            q,
+            k,
+            v,
+            a_logits,
+            b_logits,
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=state_in,
+            mask=mask_bool,
+            use_kernel=True,
+        )
+
+        if cache is not None:
+            cache[1] = new_state
+
+        out = out.astype(dtype)
+        gate = (
+            self.g_b_proj(self.g_a_proj(x))
+            .reshape(B, T, self.num_heads, self.head_dim)
+            .astype(dtype)
+        )
+        out = self.o_norm(
+            out.reshape(B, T, self.num_heads, self.head_dim), gate
+        ).reshape(B, T, -1)
+        return self.o_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# Decoder layers and full model
+
+
+class KimiDecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.is_linear = args.is_kda_layer(layer_idx)
+        if self.is_linear:
+            self.self_attn = KimiDeltaAttention(args, layer_idx)
+        else:
+            self.self_attn = KimiMLAAttention(args)
+
+        if (
+            args.is_moe
+            and layer_idx >= args.first_k_dense_replace
+            and layer_idx % args.moe_layer_freq == 0
+        ):
+            self.mlp = KimiSparseMoE(args)
+        else:
+            self.mlp = KimiMLP(args)
+
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            args.hidden_size, eps=args.rms_norm_eps
         )
 
     def __call__(
@@ -575,154 +563,169 @@ class KimiLinearDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        attn_cache = None if cache is None else cache
+        y = self.self_attn(self.input_layernorm(x), mask, attn_cache)
+        h = x + y
+        z = self.mlp(self.post_attention_layernorm(h))
+        return h + z
 
 
 class KimiLinearModel(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.vocab_size = config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = [
-            KimiLinearDecoderLayer(config, idx)
-            for idx in range(config.num_hidden_layers)
-        ]
-        self.start_idx = 0
-        self.end_idx = len(self.layers)
-        self.num_layers = self.end_idx
-
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pipeline_rank = 0
-        self.pipeline_size = 1
-
-    def pipeline(self, group):
-        # Split layers in reverse so rank=0 gets the last layers and
-        # rank=pipeline_size-1 gets the first
-        self.pipeline_rank = group.rank()
-        self.pipeline_size = group.size()
-        layers_per_rank = len(self.layers) // self.pipeline_size
-        extra = len(self.layers) - layers_per_rank * self.pipeline_size
-        if self.pipeline_rank < extra:
-            layers_per_rank += 1
-        self.start_idx = (self.pipeline_size - self.pipeline_rank - 1) * layers_per_rank
-        self.end_idx = self.start_idx + layers_per_rank
-        self.layers = self.layers[: self.end_idx]
-        self.layers[: self.start_idx] = [None] * self.start_idx
-        self.num_layers = len(self.layers) - self.start_idx
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [KimiDecoderLayer(args, i) for i in range(args.num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
-        x: mx.array,
-        cache: Optional[Any] = None,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
     ) -> mx.array:
-        h = self.embed_tokens(x)
-
-        pipeline_rank = self.pipeline_rank
-        pipeline_size = self.pipeline_size
-
+        h = self.embed_tokens(inputs)
         if cache is None:
-            cache = [None] * self.num_layers
-        mask = create_attention_mask(h, cache[0][-1], return_array=True)
+            cache = [None] * len(self.layers)
 
-        # Receive from the previous process in the pipeline
-
-        if pipeline_rank < pipeline_size - 1:
-            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
-
-        for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
-
-        # Send to the next process in the pipeline
-        if pipeline_rank != 0:
-            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
-            if cache[-1] is not None:
-                cache[-1].keys = mx.depends(cache[-1].keys, h)
-
-        # Broadcast h while keeping it in the graph
-        h = mx.distributed.all_gather(h)[: h.shape[0]]
+        for layer, layer_cache in zip(self.layers, cache):
+            if layer.is_linear:
+                mask = create_ssm_mask(h, layer_cache)
+            else:
+                mask = create_attention_mask(h, layer_cache)
+            h = layer(h, mask=mask, cache=layer_cache)
 
         return self.norm(h)
 
 
 class Model(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = config
-        self.model_type = config.model_type
-        self.model = KimiLinearModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.args = args
+        self.model_type = args.model_type
+        self.model = KimiLinearModel(args)
+        if args.tie_word_embeddings:
+            self.lm_head = None
+        else:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
-        cache: Optional[Any] = None,
-    ):
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
         out = self.model(inputs, cache)
+        if self.lm_head is None:
+            return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
-
-    def sanitize(self, weights):
-        def dequant(weight, scale_inv):
-            dtype = weight.dtype
-            bs = 128  # block size
-            m, n = weight.shape
-            pad_bottom = (-m) % bs
-            pad_side = (-n) % bs
-            weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
-            weight = weight.reshape(
-                ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
-            )
-            weight = (weight * scale_inv[:, None, :, None]).reshape(
-                m + pad_bottom, n + pad_side
-            )
-            return weight[:m, :n].astype(dtype)
-
-        # Dequantize
-        new_weights = {}
-        for k, v in weights.items():
-            if "weight_scale_inv" in k:
-                scale_inv = v
-                wk = k.replace("_scale_inv", "")
-                weight = weights[wk]
-                weight = dequant(weight, scale_inv)
-                new_weights[wk] = weight
-            elif k not in new_weights:
-                new_weights[k] = v
-        weights = new_weights
-
-        # Stack experts
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-
-        # Remove multi-token prediction layer and any unused precomputed rotary freqs
-        return {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith("model.layers.61") and "rotary_emb.inv_freq" not in k
-        }
 
     @property
     def layers(self):
-        return self.model.layers[self.model.start_idx : self.model.end_idx]
+        return self.model.layers
 
-
-    def make_cache(self) -> List[Any]:
-        caches = []
-        for i, layer in enumerate(self.model.layers):
-            conv_cache = MambaCache()
-            recurrent_cache = ArraysCache(size=1)
-            kv_cache = KVCache()
-            caches.append(CacheList(conv_cache, recurrent_cache, kv_cache))
+    def make_cache(self):
+        caches: List[Any] = []
+        for layer in self.layers:
+            if layer.is_linear:
+                caches.append(MambaCache())
+            else:
+                caches.append(KVCache())
         return caches
 
+    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        weights = {k: v for k, v in weights.items() if not k.startswith("model.mtp")}
 
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+
+        for layer_idx, layer in enumerate(self.layers):
+            prefix = f"model.layers.{layer_idx}"
+
+            if isinstance(layer.mlp, KimiSparseMoE):
+                src_prefix = f"{prefix}.block_sparse_moe"
+                dst_prefix = f"{prefix}.mlp"
+                for src, dst in [
+                    ("w1", "gate_proj"),
+                    ("w2", "down_proj"),
+                    ("w3", "up_proj"),
+                ]:
+                    key = f"{src_prefix}.experts.0.{src}.weight"
+                    if key in weights:
+                        stacked = [
+                            weights.pop(f"{src_prefix}.experts.{i}.{src}.weight")
+                            for i in range(self.args.num_experts)
+                        ]
+                        weights[f"{dst_prefix}.switch_mlp.{dst}.weight"] = mx.stack(
+                            stacked
+                        )
+
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    src_key = f"{src_prefix}.shared_experts.{name}.weight"
+                    if src_key in weights:
+                        weights[f"{dst_prefix}.shared_experts.{name}.weight"] = (
+                            weights.pop(src_key)
+                        )
+
+                gate_key = f"{src_prefix}.gate.weight"
+                if gate_key in weights:
+                    weights[f"{dst_prefix}.gate.weight"] = weights.pop(gate_key)
+
+                bias_key = f"{src_prefix}.gate.e_score_correction_bias"
+                if bias_key in weights:
+                    weights[f"{dst_prefix}.e_score_correction_bias"] = weights.pop(
+                        bias_key
+                    )
+
+            attn = getattr(layer, "self_attn", None)
+            if isinstance(attn, KimiDeltaAttention):
+                attn_prefix = f"{prefix}.self_attn"
+                for src_name, dst_name in (
+                    ("q_conv1d", "q_conv"),
+                    ("k_conv1d", "k_conv"),
+                    ("v_conv1d", "v_conv"),
+                ):
+                    src_key = f"{attn_prefix}.{src_name}.weight"
+                    if src_key in weights:
+                        w = weights.pop(src_key)
+                        if w.ndim == 3:
+                            w = w.moveaxis(2, 1)
+                        weights[f"{attn_prefix}.{dst_name}.conv.weight"] = w
+                A_key = f"{attn_prefix}.A_log"
+                if A_key in weights:
+                    # Handle both HF format [1, 1, H, 1] and already converted [H]
+                    if weights[A_key].ndim == 4:
+                        weights[A_key] = mx.squeeze(weights[A_key], axis=(0, 1, 3))
+                dt_key = f"{attn_prefix}.dt_bias"
+                if dt_key in weights:
+                    # Handle both original shape and already flattened
+                    if weights[dt_key].ndim > 1:
+                        weights[dt_key] = mx.reshape(weights[dt_key], (-1,))
+            elif isinstance(attn, KimiMLAAttention):
+                attn_prefix = f"{prefix}.self_attn"
+                proj_key = f"{attn_prefix}.kv_a_proj_with_mqa.weight"
+                if proj_key in weights:
+                    weights[f"{attn_prefix}.kv_a_proj.weight"] = weights.pop(proj_key)
+                norm_key = f"{attn_prefix}.kv_a_layernorm.weight"
+                if norm_key in weights:
+                    weights[f"{attn_prefix}.kv_a_norm.weight"] = weights.pop(norm_key)
+
+        return weights
+
+    @property
+    def cast_predicate(self):
+        def predicate(path: str):
+            if "e_score_correction_bias" in path:
+                return False
+            if path.endswith("A_log") or path.endswith("dt_bias"):
+                return False
+            return True
+
+        return predicate
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            # Quantize MoE gate to 8-bit for better routing precision
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
