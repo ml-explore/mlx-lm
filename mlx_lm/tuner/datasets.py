@@ -8,6 +8,34 @@ from typing import Any, Dict, List
 from transformers import PreTrainedTokenizer
 
 
+def _apply_chat_template_safe(
+    tokenizer, messages, tools=None, add_generation_prompt=None
+):
+    try:
+        if add_generation_prompt is None:
+            # try with tools
+            return tokenizer.apply_chat_template(messages, tools=tools)
+        # try with tools and add_generation_prompt
+        return tokenizer.apply_chat_template(
+            messages, tools=tools, add_generation_prompt=add_generation_prompt
+        )
+    except (TypeError, AttributeError):
+        try:
+            if add_generation_prompt is None:
+                # try without tools
+                return tokenizer.apply_chat_template(messages)
+            # try without tools but with add_generation_prompt
+            return tokenizer.apply_chat_template(
+                messages, add_generation_prompt=add_generation_prompt
+            )
+        except (TypeError, AttributeError):
+            # if we still get an error, try without add_generation_prompt
+            if add_generation_prompt is not None:
+                return tokenizer.apply_chat_template(messages)
+            # propagate the original failure
+            raise
+
+
 class TextDataset:
     """
     Light-weight wrapper to hold a dataset.
@@ -57,10 +85,13 @@ class ChatDataset:
     def process(self, d):
         messages = d[self.chat_key]
         tools = d.get("tools", None)
-        tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
+        tokens = _apply_chat_template_safe(self.tokenizer, messages, tools=tools)
         if self.mask_prompt:
             messages = messages[:-1]
-            offset = len(self.tokenizer.apply_chat_template(messages, tools=tools))
+            offset_tokens = _apply_chat_template_safe(
+                self.tokenizer, messages, tools=tools, add_generation_prompt=True
+            )
+            offset = len(offset_tokens)
             return (tokens, offset)
         else:
             return (tokens, 0)
@@ -94,18 +125,21 @@ class CompletionsDataset:
         self.tokenizer = tokenizer
 
     def process(self, d):
-        tokens = self.tokenizer.apply_chat_template(
-            [
-                {"role": "user", "content": d[self.prompt_key]},
-                {"role": "assistant", "content": d[self.completion_key]},
-            ],
-        )
+        tools = d.get("tools", None)
+        messages = [
+            {"role": "user", "content": d[self.prompt_key]},
+            {"role": "assistant", "content": d[self.completion_key]},
+        ]
+        tokens = _apply_chat_template_safe(self.tokenizer, messages, tools=tools)
         if self.mask_prompt:
-            offset = len(
-                self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": d[self.prompt_key]}]
-                )
+            user_only = [{"role": "user", "content": d[self.prompt_key]}]
+            offset_tokens = _apply_chat_template_safe(
+                self.tokenizer,
+                user_only,
+                tools=tools,
+                add_generation_prompt=True,
             )
+            offset = len(offset_tokens)
             return (tokens, offset)
 
         return (tokens, 0)
