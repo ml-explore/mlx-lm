@@ -237,7 +237,7 @@ def load_model(
     return model, config
 
 
-def load_adapeters(model: nn.Module, adapter_path: str) -> nn.Module:
+def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     from .tuner.utils import load_adapters as _load_adapters
 
     return _load_adapters(model, adapter_path)
