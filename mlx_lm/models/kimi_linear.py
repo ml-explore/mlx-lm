@@ -445,9 +445,9 @@ class KimiDeltaAttention(nn.Module):
         if cache is not None:
             cache[0] = (conv_q, conv_k, conv_v)
 
-        q = q_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
-        k = k_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
-        v = v_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
+        q = q_conv.reshape(B, T, self.num_heads, self.head_dim)
+        k = k_conv.reshape(B, T, self.num_heads, self.head_dim)
+        v = v_conv.reshape(B, T, self.num_heads, self.head_dim)
 
         def _l2norm(x, eps=1e-6):
             norm = mx.linalg.norm(x, axis=-1, keepdims=True)
@@ -460,13 +460,13 @@ class KimiDeltaAttention(nn.Module):
         a_logits = (
             self.f_b_proj(self.f_a_proj(x))
             .reshape(B, T, self.num_heads, self.head_dim)
-            .astype(mx.float32)
+            
         )
-        b_logits = self.b_proj(x).reshape(B, T, self.num_heads).astype(mx.float32)
+        b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
 
         state_in = None
         if recurrent_state is not None:
-            state_in = recurrent_state.astype(dtype)
+            state_in = recurrent_state
 
         mask_bool: Optional[mx.array] = None
         if mask is not None:
@@ -490,14 +490,13 @@ class KimiDeltaAttention(nn.Module):
         )
 
         if cache is not None:
-            cache[1] = new_state.astype(dtype)
+            cache[1] = new_state
 
-        out = out.astype(dtype)
+
 
         gate = (
             self.g_b_proj(self.g_a_proj(x))
             .reshape(B, T, self.num_heads, self.head_dim)
-            .astype(dtype)
         )
         out = self.o_norm(
             out.reshape(B, T, self.num_heads, self.head_dim), gate
