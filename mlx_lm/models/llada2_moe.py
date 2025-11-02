@@ -156,12 +156,10 @@ def group_expert_select(
     norm_topk_prob,
     score_function,
 ):
-    in_type = gates.dtype
-
     scores = (
-        mx.sigmoid(gates.astype(mx.float32))
+        mx.sigmoid(gates)
         if score_function == "sigmoid"
-        else mx.softmax(gates.astype(mx.float32), axis=-1)
+        else mx.softmax(gates, axis=-1, precise=True)
     )
     orig_scores = scores
 
@@ -185,7 +183,7 @@ def group_expert_select(
         scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
 
     scores = scores * routed_scaling_factor
-    return inds, scores.astype(in_type)
+    return inds, scores
 
 
 class LLaDA2MoeGate(nn.Module):
@@ -207,7 +205,7 @@ class LLaDA2MoeGate(nn.Module):
     def __call__(self, x):
         orig_shape = x.shape
         x = x.reshape(-1, x.shape[-1])
-        gates = mx.matmul(x.astype(mx.float32), self.weight.T)
+        gates = mx.matmul(x, self.weight.T)
 
         indices, scores = group_expert_select(
             gates,
@@ -248,7 +246,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
     def __call__(self, x):
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = (y * scores[..., None]).sum(axis=-2)
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
         return y
@@ -336,12 +334,14 @@ class Model(nn.Module):
     def n_kv_heads(self):
         return self.args.num_key_value_heads
 
-    def _create_block_diagonal_mask(self, num_blocks: int, block_length: int):
+    def _create_block_diagonal_mask(
+        self, num_blocks: int, block_length: int, dtype=mx.float32
+    ):
         """Create block-diagonal attention mask for diffusion generation."""
         mask = mx.tril(mx.ones((num_blocks, num_blocks)))
         mask = mx.repeat(mx.repeat(mask, block_length, axis=0), block_length, axis=1)
         mask = mask[None, None, :, :]
-        return mx.where(mask, 0.0, float("-inf")).astype(mx.bfloat16)
+        return mx.where(mask, 0.0, float("-inf")).astype(dtype)
 
     def _select_tokens_to_update(
         self, confidence: mx.array, mask: mx.array, num_tokens: int, threshold: float
@@ -422,7 +422,9 @@ class Model(nn.Module):
         num_blocks = (prompt_length + max_tokens + block_length - 1) // block_length
         total_length = num_blocks * block_length
 
-        mask = self._create_block_diagonal_mask(num_blocks, block_length)
+        mask = self._create_block_diagonal_mask(
+            num_blocks, block_length, dtype=self.model.word_embeddings.weight.dtype
+        )
         transfer_schedule = self._get_num_transfer_tokens(block_length, steps)
 
         x = mx.full((1, total_length), mask_id, dtype=mx.int32)
