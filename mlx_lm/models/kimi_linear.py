@@ -223,6 +223,7 @@ class KimiSparseMoE(nn.Module):
             self.shared_experts = None
 
     def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
         scores = self.gate(x)
         inds, weights = _group_expert_select(
             scores,
@@ -234,6 +235,7 @@ class KimiSparseMoE(nn.Module):
             self.args.moe_renormalize,
             self.args.moe_router_activation_func,
         )
+        weights = weights.astype(dtype)
         out = self.switch_mlp(x, inds)
         out = (out * weights[..., None]).sum(axis=-2)
         if self.shared_experts is not None:
@@ -398,11 +400,10 @@ class KimiDeltaAttention(nn.Module):
             mx.random.uniform(
                 low=1.0,
                 high=16.0,
-                shape=(self.num_heads,),
-                dtype=mx.float32,
+                shape=(self.num_heads,)
             )
         )
-        self.dt_bias = mx.zeros((self.projection_dim,), dtype=mx.float32)
+        self.dt_bias = mx.zeros((self.projection_dim,))
 
         self.o_norm = RMSNormGated(
             self.head_dim, eps=args.rms_norm_eps, activation="sigmoid"
@@ -465,7 +466,7 @@ class KimiDeltaAttention(nn.Module):
 
         state_in = None
         if recurrent_state is not None:
-            state_in = recurrent_state.astype(mx.float32)
+            state_in = recurrent_state.astype(dtype)
 
         mask_bool: Optional[mx.array] = None
         if mask is not None:
@@ -489,9 +490,10 @@ class KimiDeltaAttention(nn.Module):
         )
 
         if cache is not None:
-            cache[1] = new_state
+            cache[1] = new_state.astype(dtype)
 
         out = out.astype(dtype)
+
         gate = (
             self.g_b_proj(self.g_a_proj(x))
             .reshape(B, T, self.num_heads, self.head_dim)
