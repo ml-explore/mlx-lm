@@ -123,7 +123,7 @@ class TestLora(unittest.TestCase):
             embedding.bits,
         )
         lora_emb = LoRAEmbedding.from_base(embedding, r=8, dropout=0, scale=10)
-        new_embedding = lora_emb.fuse(de_quantize=True)
+        new_embedding = lora_emb.fuse(dequantize=True)
         self.assertTrue(mx.array_equal(dequantized_weight, new_embedding.weight))
         self.assertTrue(mx.array_equal(embedding(tokens), lora_emb(tokens)))
 
@@ -137,7 +137,7 @@ class TestLora(unittest.TestCase):
 
         # change the value of lora_b and the embeddings will no longer be equal
         lora_emb.lora_b = mx.random.uniform(shape=lora_emb.lora_b.shape)
-        new_embedding = lora_emb.fuse(de_quantize=True)
+        new_embedding = lora_emb.fuse(dequantize=True)
         self.assertFalse(mx.array_equal(dequantized_weight, new_embedding.weight))
         self.assertFalse(mx.array_equal(embedding(tokens), lora_emb(tokens)))
 
@@ -300,7 +300,7 @@ class TestDora(unittest.TestCase):
         quantized_linear = nn.QuantizedLinear(in_dims, out_dims, bias=True)
         dora_quantized_linear = DoRALinear.from_base(quantized_linear, r)
         # Dequantize
-        to_linear_from_quantized = dora_quantized_linear.fuse(de_quantize=True)
+        to_linear_from_quantized = dora_quantized_linear.fuse(dequantize=True)
         self.assertTrue(
             mx.allclose(quantized_linear.bias, to_linear_from_quantized.bias)
         )
