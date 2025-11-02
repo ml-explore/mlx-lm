@@ -99,7 +99,7 @@ class BailingMoeLinearAttention(nn.Module):
         self.use_qk_norm = args.use_qk_norm
         self.num_attention_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
-        self.head_dim = args.hidden_size // self.num_attention_heads
+        self.head_dim = args.head_dim or args.hidden_size // self.num_attention_heads
         self.scale = self.head_dim**-0.5
 
         self.query_key_value = nn.Linear(
