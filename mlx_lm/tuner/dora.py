@@ -29,7 +29,7 @@ class DoRALinear(nn.Module):
         dora_lin.set_linear(linear)
         return dora_lin
 
-    def fuse(self, de_quantize: bool = False):
+    def fuse(self, dequantize: bool = False):
         linear = self.linear
         bias = "bias" in linear
         weight = self._dequantized_weight()
@@ -49,7 +49,7 @@ class DoRALinear(nn.Module):
         if bias:
             fused_linear.bias = linear.bias
 
-        if self._is_quantized() and not de_quantize:
+        if self._is_quantized() and not dequantize:
             fused_linear = nn.QuantizedLinear.from_linear(
                 fused_linear,
                 linear.group_size,
@@ -151,7 +151,7 @@ class DoRAEmbedding(nn.Module):
         dora_embedding.set_embedding(embedding)
         return dora_embedding
 
-    def fuse(self, de_quantize: bool = False):
+    def fuse(self, dequantize: bool = False):
         embedding = self.embedding
         weight = embedding.weight
 

@@ -27,6 +27,8 @@ from .generate import batch_generate
 from .models.cache import make_prompt_cache
 from .utils import common_prefix_len, load
 
+DEFAULT_MAX_TOKENS = 8192
+
 
 def _rstrip_until(s, untils):
     """Limit a string <s> to the first occurrence of any substring in untils."""
@@ -68,7 +70,7 @@ class MLXLM(LM):
     def __init__(
         self,
         path_or_hf_repo: str,
-        max_tokens: int,
+        max_tokens: Optional[int] = None,
         use_chat_template: Optional[bool] = None,
         trust_remote_code: bool = False,
     ) -> None:
@@ -182,7 +184,8 @@ class MLXLM(LM):
             max_completed_l = max(len(s) for s in full_sequences)
 
             # compute truncation length
-            truncation = max(0, max_completed_l - self._max_tokens - 1)
+            max_tokens = self._max_tokens or DEFAULT_MAX_TOKENS
+            truncation = max(0, max_completed_l - max_tokens - 1)
             orig_prefix_l = len(prefix)
             prefix_l = max(len(prefix) - truncation, 0)
             prefix = prefix[len(prefix) - prefix_l :]
@@ -324,7 +327,10 @@ class MLXLM(LM):
         ]
 
         # TODO consider multi-token, per-prompt stop conditions
-        max_tokens = [opt.get("max_gen_toks", self._max_tokens) for opt in options]
+        max_tokens = [
+            self._max_tokens or opt.get("max_gen_tokens", DEFAULT_MAX_TOKENS)
+            for opt in options
+        ]
 
         completions = batch_generate(
             model=self._model,
@@ -388,8 +394,9 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        help="Maximum number of tokens to generate.",
-        default=8912,
+        help="Maximum number of tokens to generate. When set, this value takes"
+        " precedence over task specific defaults.",
+        default=None,
     )
     parser.add_argument(
         "--limit",

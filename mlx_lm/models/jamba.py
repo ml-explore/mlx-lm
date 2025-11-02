@@ -247,14 +247,20 @@ class JambaSparseMoeBlock(nn.Module):
 
 
 class JambaDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, layer_type: str):
+    def __init__(self, args: ModelArgs, layer_type: str, layer_idx: int):
         super().__init__()
         self.is_attn = layer_type == "attention"
         if self.is_attn:
             self.self_attn = JambaAttention(args)
         else:
             self.mamba = JambaMambaMixer(args)
-        ffn_layer_class = JambaSparseMoeBlock if args.num_experts > 1 else JambaMLP
+        if (
+            args.num_experts > 1
+            and (layer_idx + args.expert_layer_offset) % args.expert_layer_period == 0
+        ):
+            ffn_layer_class = JambaSparseMoeBlock
+        else:
+            ffn_layer_class = JambaMLP
         self.feed_forward = ffn_layer_class(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_ff_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -279,7 +285,10 @@ class JambaModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
-        self.layers = [JambaDecoderLayer(args, t) for t in args.layers_block_type]
+        self.layers = [
+            JambaDecoderLayer(args, t, idx)
+            for idx, t in enumerate(args.layers_block_type)
+        ]
         self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.attn_idx = args.layers_block_type.index("attention")
         self.ssm_idx = args.layers_block_type.index("mamba")
@@ -335,30 +344,30 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
-        for k, v in weights.items():
+        for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:
-            return weights
-
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.block_sparse_moe.experts.0.{n}.{k}" in weights:
-                        to_join = [
-                            weights.pop(
-                                f"{prefix}.block_sparse_moe.experts.{e}.{n}.{k}"
-                            )
-                            for e in range(self.args.num_local_experts)
-                        ]
-                        weights[f"{prefix}.block_sparse_moe.switch_mlp.{m}.{k}"] = (
-                            mx.stack(to_join)
+            base = f"model.layers.{l}.feed_forward"
+            if not any(key.startswith(f"{base}.experts.") for key in weights.keys()):
+                continue
+
+            for proj in ["gate_proj", "down_proj", "up_proj"]:
+                for name in ["weight", "bias", "scales", "biases"]:
+                    expert_tensors = [
+                        weights.pop(f"{base}.experts.{e}.{proj}.{name}")
+                        for e in range(len(weights))
+                        if f"{base}.experts.{e}.{proj}.{name}" in weights
+                    ]
+                    if expert_tensors:
+                        weights[f"{base}.switch_mlp.{proj}.{name}"] = mx.stack(
+                            expert_tensors
                         )
+
         return weights
 
     @property
