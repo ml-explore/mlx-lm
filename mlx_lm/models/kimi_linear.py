@@ -170,9 +170,9 @@ def _group_expert_select(
     score_function: str,
 ) -> Tuple[mx.array, mx.array]:
     if score_function == "sigmoid":
-        scores = mx.sigmoid(gates.astype(mx.float32))
+        scores = mx.sigmoid(gates)
     elif score_function == "softmax":
-        scores = mx.softmax(gates.astype(mx.float32), axis=-1, precise=True)
+        scores = mx.softmax(gates, axis=-1, precise=True)
     else:
         raise ValueError(f"Unsupported MoE router activation '{score_function}'")
 
@@ -223,7 +223,6 @@ class KimiSparseMoE(nn.Module):
             self.shared_experts = None
 
     def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
         scores = self.gate(x)
         inds, weights = _group_expert_select(
             scores,
@@ -235,7 +234,6 @@ class KimiSparseMoE(nn.Module):
             self.args.moe_renormalize,
             self.args.moe_router_activation_func,
         )
-        weights = weights.astype(dtype)
         out = self.switch_mlp(x, inds)
         out = (out * weights[..., None]).sum(axis=-2)
         if self.shared_experts is not None:
