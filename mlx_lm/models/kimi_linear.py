@@ -108,37 +108,6 @@ class ModelArgs(BaseModelArgs):
         return (layer_idx + 1) in kda_layers
 
 
-@partial(mx.compile, shapeless=True)
-def _swish(x: mx.array) -> mx.array:
-    return nn.silu(x)
-
-
-def _activation_fn(name: str):
-    if name == "silu" or name == "swish":
-        return _swish
-    raise ValueError(f"Unsupported activation function '{name}' for KimiLinear")
-
-
-class RMSNormGated(nn.Module):
-    def __init__(
-        self, hidden_size: int, eps: float = 1e-5, activation: str = "sigmoid"
-    ):
-        super().__init__()
-        self.weight = mx.ones((hidden_size,))
-        self.eps = eps
-        if activation not in ("sigmoid", "silu", "swish"):
-            raise ValueError(f"Unsupported gate activation '{activation}'")
-        self.activation = activation
-
-    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
-        y = mx.fast.rms_norm(x, self.weight, self.eps)
-        if self.activation == "sigmoid":
-            gate = mx.sigmoid(gate)
-        else:
-            gate = nn.silu(gate)
-        return y * gate
-
-
 class KimiMLP(nn.Module):
     def __init__(
         self,
@@ -152,10 +121,9 @@ class KimiMLP(nn.Module):
         self.gate_proj = nn.Linear(dim, hidden, bias=False)
         self.up_proj = nn.Linear(dim, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, dim, bias=False)
-        self.act = _activation_fn(args.hidden_act)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 @mx.compile
@@ -403,8 +371,8 @@ class KimiDeltaAttention(nn.Module):
         )
         self.dt_bias = mx.zeros((self.projection_dim,))
 
-        self.o_norm = RMSNormGated(
-            self.head_dim, eps=args.rms_norm_eps, activation="sigmoid"
+        self.o_norm = nn.RMSNorm(
+            self.head_dim, eps=args.rms_norm_eps
         )
         self.o_proj = nn.Linear(self.projection_dim, hidden, bias=False)
 
@@ -490,14 +458,13 @@ class KimiDeltaAttention(nn.Module):
         if cache is not None:
             cache[1] = new_state
 
-
-
+        
         gate = (
             self.g_b_proj(self.g_a_proj(x))
             .reshape(B, T, self.num_heads, self.head_dim)
         )
-        out = self.o_norm(
-            out.reshape(B, T, self.num_heads, self.head_dim), gate
+        out = (
+            self.o_norm(out.reshape(B, T, self.num_heads, self.head_dim)) * mx.sigmoid(gate)
         ).reshape(B, T, -1)
         return self.o_proj(out)
 
