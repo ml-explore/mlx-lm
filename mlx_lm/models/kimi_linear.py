@@ -363,17 +363,11 @@ class KimiDeltaAttention(nn.Module):
         self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
 
         self.A_log = mx.log(
-            mx.random.uniform(
-                low=1.0,
-                high=16.0,
-                shape=(self.num_heads,)
-            )
+            mx.random.uniform(low=1.0, high=16.0, shape=(self.num_heads,))
         )
         self.dt_bias = mx.zeros((self.projection_dim,))
 
-        self.o_norm = nn.RMSNorm(
-            self.head_dim, eps=args.rms_norm_eps
-        )
+        self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, hidden, bias=False)
 
     def __call__(
@@ -423,10 +417,8 @@ class KimiDeltaAttention(nn.Module):
         k = _l2norm(k)
         q = q * self.scale
 
-        a_logits = (
-            self.f_b_proj(self.f_a_proj(x))
-            .reshape(B, T, self.num_heads, self.head_dim)
-            
+        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
+            B, T, self.num_heads, self.head_dim
         )
         b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
 
@@ -458,13 +450,12 @@ class KimiDeltaAttention(nn.Module):
         if cache is not None:
             cache[1] = new_state
 
-        
-        gate = (
-            self.g_b_proj(self.g_a_proj(x))
-            .reshape(B, T, self.num_heads, self.head_dim)
+        gate = self.g_b_proj(self.g_a_proj(x)).reshape(
+            B, T, self.num_heads, self.head_dim
         )
         out = (
-            self.o_norm(out.reshape(B, T, self.num_heads, self.head_dim)) * mx.sigmoid(gate)
+            self.o_norm(out.reshape(B, T, self.num_heads, self.head_dim))
+            * mx.sigmoid(gate)
         ).reshape(B, T, -1)
         return self.o_proj(out)
 
