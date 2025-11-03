@@ -32,6 +32,7 @@ from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import common_prefix_len, load
 
+import os
 
 def get_system_fingerprint():
     gpu_arch = mx.metal.device_info()["architecture"] if mx.metal.is_available() else ""
@@ -267,6 +268,78 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _read_chunked_body(self, max_bytes: int | None = None) -> bytes:
+        """
+        Read an HTTP/1.1 chunked transfer-encoded body from self.rfile and return
+        the concatenated payload bytes.
+
+        Raises ValueError on decoding errors.
+        """
+        out = bytearray()
+        rfile = self.rfile
+
+        def _readline_strict():
+            # read up to CRLF (returns bytes without CRLF)
+            line = rfile.readline()
+            if not line:
+                raise ValueError("unexpected EOF while reading chunk size")
+            if not line.endswith(b"\r\n"):
+                # allow robustness: if line ends with \n only, normalize
+                if line.endswith(b"\n"):
+                    line = line.rstrip(b"\n")
+                else:
+                    raise ValueError("malformed chunk size line (missing CRLF)")
+            return line.rstrip(b"\r\n")
+
+        while True:
+            # Read chunk-size line
+            size_line = _readline_strict()
+            # strip optional chunk extensions
+            if b";" in size_line:
+                size_str = size_line.split(b";", 1)[0].strip()
+            else:
+                size_str = size_line.strip()
+            try:
+                size = int(size_str.decode("ascii"), 16)
+            except Exception:
+                raise ValueError(f"invalid chunk size: {size_str!r}")
+            if size == 0:
+                # Consume the trailing CRLF after last-chunk (it may already be consumed)
+                # Then read optional trailers until blank line (not handled here in detail)
+                # Read the CRLF after the 0 chunk if present
+                trailer_line = rfile.readline()
+                # If there are trailers, consume until blank line
+                if trailer_line and trailer_line.strip() != b"":
+                    # there are trailers; read until blank line
+                    while True:
+                        line = rfile.readline()
+                        if not line:
+                            break
+                        if line in (b"\r\n", b"\n", b""):
+                            break
+                return bytes(out)
+            # Read exactly `size` bytes of data
+            remaining = size
+            while remaining > 0:
+                chunk = rfile.read(remaining)
+                if not chunk:
+                    raise ValueError("incomplete chunk data!")
+                out.extend(chunk)
+                if max_bytes is not None and len(out) > max_bytes:
+                    raise ValueError(f"payload too large: {len(out)} bytes > {max_bytes} bytes") 
+                remaining -= len(chunk)
+            # after chunk-data there must be CRLF
+            crlf = rfile.read(2)
+            if crlf != b"\r\n":
+                # some clients may send only '\n' or split; be permissive but strict enough
+                if crlf == b"\n":
+                    # accept single LF
+                    pass
+                else:
+                    raise ValueError("missing CRLF after chunk data")
+        # unreachable
+        return bytes(out)
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
@@ -287,9 +360,48 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not Found")
             return
 
-        # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
-        raw_body = self.rfile.read(content_length)
+        # Maximum body size in bytes. Prevent DOS attacks. Set sane limits. 
+        MAX_BODY_BYTES = 1024 * 1024 * 10 # 10MB
+
+        transfer_encoding = self.headers.get('Transfer-Encoding', "") # transfer encoding
+
+        if "chunked" in transfer_encoding.lower():
+            try:
+                raw_body = self._read_chunked_body(max_bytes=MAX_BODY_BYTES)
+            except ValueError as e:
+                self._set_completion_headers(413 if "payload too large" in str(e).lower() else 400)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Invalid chunked body: {e}"}).encode())
+                return
+            except Exception:
+                self._set_completion_headers(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "internal server error"}).encode())
+                return
+        else:
+            cl_header = self.headers.get("Content-Length")
+            if cl_header is None:
+                self._set_completion_headers(411)  # Length Required
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Content-Length required"}).encode())
+                return
+            
+            try:
+                content_length = int(cl_header)
+            except ValueError:
+                self._set_completion_headers(400)  # Bad Request
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Invalid Content-Length"}).encode())
+                return 
+
+            if content_length < 0 or content_length > MAX_BODY_BYTES:
+                self._set_completion_headers(413)  # Payload Too Large
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Payload too large"}).encode())
+                return
+
+            raw_body = self.rfile.read(content_length)
+
         try:
             self.body = json.loads(raw_body.decode())
         except json.JSONDecodeError as e:
@@ -309,8 +421,21 @@ class APIHandler(BaseHTTPRequestHandler):
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
+        
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
+
+        if os.environ.get("MLX_MODEL_PATH", None) is not None:
+            model_path = os.environ['MLX_MODEL_PATH']
+            if not os.path.exists(model_path):
+                raise Exception(f"MLX_MODEL_PATH={model_path} is not a path")
+
+            if self.requested_model != "default_model":
+                self.requested_model = os.path.join(model_path, self.requested_model)
+
+            if self.requested_draft_model != "default_model":
+                self.requested_draft_model = os.path.join(model_path, self.requested_draft_model)
+
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
         )
