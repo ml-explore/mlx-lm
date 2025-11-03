@@ -44,6 +44,7 @@ class ModelArgs(BaseModelArgs):
     score_function: str = "sigmoid"
     n_group: int = 1
     topk_group: int = 4
+    router_dtype: Optional[str] = None
     mask_token_id: int = 156895
     eos_token_id: int = 156892
 
@@ -195,9 +196,15 @@ class LLaDA2MoeGate(nn.Module):
         self.topk_group = args.topk_group
         self.routed_scaling_factor = args.routed_scaling_factor
         self.score_function = args.score_function
-        self.weight = mx.zeros((args.num_experts, args.hidden_size))
+
+        if args.router_dtype == "fp32":
+            router_dtype = mx.float32
+        else:
+            router_dtype = None
+
+        self.weight = mx.zeros((args.num_experts, args.hidden_size), dtype=router_dtype)
         self.expert_bias = (
-            mx.zeros((args.num_experts,))
+            mx.zeros((args.num_experts,), dtype=router_dtype)
             if args.moe_router_enable_expert_bias
             else None
         )
