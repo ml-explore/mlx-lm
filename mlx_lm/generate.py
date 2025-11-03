@@ -831,19 +831,25 @@ class Batch:
     max_tokens: List[int]
     num_tokens: List[int]
     cache: List[Any]
+    histories: List[mx.array]
 
     def __len__(self):
         return len(self.uids)
 
     def filter(self, keep_idx: List[int]):
+        keep_idx_list = keep_idx
+        mx_idx = mx.array(keep_idx_list, mx.int32)
+        
         self.uids = [self.uids[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
-        keep_idx = mx.array(keep_idx, mx.int32)
-        self.y = self.y[keep_idx]
-        self.logprobs = self.logprobs[keep_idx]
+        self.histories = [self.histories[k] for k in keep_idx]
+
+        self.y = self.y[mx_idx]
+        self.logprobs = self.logprobs[mx_idx]
         for c in self.cache:
-            c.filter(keep_idx)
+            c.filter(mx_idx)
+
 
     def extend(self, other):
         self.uids.extend(other.uids)
@@ -853,6 +859,7 @@ class Batch:
         self.max_tokens.extend(other.max_tokens)
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
+        self.histories.extend(other.histories)
 
 
 def _make_cache(model, left_padding):
@@ -901,6 +908,7 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -914,6 +922,7 @@ class BatchGenerator:
         self._stats = BatchStats()
 
         self.active_batch = None
+        self.logits_processors = logits_processors
 
     def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
         uids = []
@@ -932,16 +941,17 @@ class BatchGenerator:
         return uids
 
     def _process_prompts(self, prompts):
-        uids, inputs, max_tokens = zip(*prompts)
-        lengths = [len(p) for p in inputs]
+        uids, raw_inputs, max_tokens = zip(*prompts)
+        lengths = [len(p) for p in raw_inputs]
         max_length = max(lengths)
         batch_size = self.prefill_batch_size
         self._stats.prompt_tokens += sum(lengths)
         left_padding = [max_length - l for l in lengths]
-        inputs = _left_pad_prompts(inputs, max_length=max_length)
+        inputs = _left_pad_prompts(raw_inputs, max_length=max_length)
 
         prompt_cache = _make_cache(self.model, left_padding)
-
+        histories = [mx.array(p, mx.uint32) for p in raw_inputs]
+        
         while inputs.shape[1] > 1:
             n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
             self.model(inputs[:, :n_to_process], cache=prompt_cache)
@@ -949,15 +959,32 @@ class BatchGenerator:
             inputs = inputs[:, n_to_process:]
             mx.clear_cache()
 
-        y, logprobs = self._step(inputs, prompt_cache)
+        y, logprobs = self._step(inputs, prompt_cache, tokens_stack=histories)
         mx.async_eval(y, logprobs)
         return Batch(
-            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache, histories
         )
 
-    def _step(self, input_tokens: mx.array, prompt_cache: List[Any]):
+    def _step(self, input_tokens: mx.array, prompt_cache: List[Any], tokens_stack: List[mx.array]):
         logits = self.model(input_tokens, cache=prompt_cache)
         logits = logits[:, -1, :]
+
+        # apply per-row processors if provided
+        if self.logits_processors:
+            # build a stacked tokens tensor per row from histories + current input
+            # histories live in self.active_batch.histories when called from _next()
+            if tokens_stack is None:
+                tokens_stack = self.active_batch.histories  # List[mx.array]
+            # apply processors sequentially, row-wise
+            out = []
+            for i in range(len(tokens_stack)):
+                li = logits[i:i+1, :]
+                toks = tokens_stack[i]
+                for proc in self.logits_processors:
+                    li = proc(toks, li)
+                out.append(li)
+            logits = mx.concatenate(out, axis=0)
+
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
         return sampled, logprobs
@@ -1009,7 +1036,14 @@ class BatchGenerator:
 
         batch = self.active_batch
         y, logprobs = batch.y, batch.logprobs
-        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
+        # processors must see history INCLUDING the current input token y
+        tokens_stack_with_curr = [
+            mx.concatenate([h, mx.array([int(t)], dtype=mx.uint32)])
+            for h, t in zip(batch.histories, y)
+        ]
+        batch.y, batch.logprobs = self._step(
+            y[:, None], batch.cache, tokens_stack=tokens_stack_with_curr
+        )
         mx.async_eval(batch.y, batch.logprobs)
 
         y = y.tolist()
@@ -1025,6 +1059,9 @@ class BatchGenerator:
         for e, (t, uid, num_tok, max_tok) in enumerate(
             zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
         ):
+            batch.histories[e] = mx.concatenate(
+                [batch.histories[e], mx.array([t], mx.uint32)]
+            )
             num_tok += 1
             batch.num_tokens[e] = num_tok
             if t in self.stop_tokens:
