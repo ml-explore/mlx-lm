@@ -13,8 +13,7 @@ import mlx.nn as nn
 import numpy as np
 
 from mlx_lm.tuner.datasets import load_dataset
-from mlx_lm.tuner.utils import get_total_parameters
-from mlx_lm.utils import load
+from mlx_lm.utils import get_total_parameters, load
 
 
 def load_data(

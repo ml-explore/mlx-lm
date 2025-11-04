@@ -31,7 +31,7 @@ class LoRALinear(nn.Module):
         lora_lin.linear = linear
         return lora_lin
 
-    def fuse(self, de_quantize: bool = False):
+    def fuse(self, dequantize: bool = False):
         linear = self.linear
         bias = "bias" in linear
         weight = linear.weight
@@ -57,7 +57,7 @@ class LoRALinear(nn.Module):
         if bias:
             fused_linear.bias = linear.bias
 
-        if is_quantized and not de_quantize:
+        if is_quantized and not dequantize:
             fused_linear = nn.QuantizedLinear.from_linear(
                 fused_linear,
                 linear.group_size,
@@ -119,7 +119,7 @@ class LoRASwitchLinear(nn.Module):
         lora_lin.linear = linear
         return lora_lin
 
-    def fuse(self, de_quantize: bool = False):
+    def fuse(self, dequantize: bool = False):
         linear = self.linear
         bias = "bias" in linear
         weight = linear.weight
@@ -146,7 +146,7 @@ class LoRASwitchLinear(nn.Module):
         if bias:
             fused_linear.bias = linear.bias
 
-        if is_quantized and not de_quantize:
+        if is_quantized and not dequantize:
             fused_linear = fused_linear.to_quantized(linear.group_size, linear.bits)
 
         return fused_linear
@@ -219,7 +219,7 @@ class LoRAEmbedding(nn.Module):
         lora_embedding.embedding = embedding
         return lora_embedding
 
-    def fuse(self, de_quantize: bool = False):
+    def fuse(self, dequantize: bool = False):
         embedding = self.embedding
         weight = embedding.weight
         is_quantized = isinstance(embedding, nn.QuantizedEmbedding)
@@ -243,7 +243,7 @@ class LoRAEmbedding(nn.Module):
         lora_b = self.lora_b.astype(dtype)
         fused_embedding.weight = weight + lora_a @ lora_b
 
-        if is_quantized and not de_quantize:
+        if is_quantized and not dequantize:
             fused_embedding = nn.QuantizedEmbedding.from_embedding(
                 fused_embedding,
                 embedding.group_size,

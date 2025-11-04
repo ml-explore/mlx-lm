@@ -1939,6 +1939,22 @@ class TestModels(unittest.TestCase):
                 "vocab_size": 32,
                 "intermediate_size": 128,
             },
+            {
+                "model_type": "minimax",
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "max_position_embeddings": 1000,
+                "num_experts_per_tok": 2,
+                "num_local_experts": 8,
+                "shared_intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "rms_norm_eps": 1e-4,
+                "rope_theta": 1000,
+                "rotary_dim": 16,
+                "vocab_size": 1000,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
