@@ -228,7 +228,6 @@ class ModelProvider:
             validate_draft_tokenizer(draft_tokenizer)
 
         elif draft_model_path is not None and draft_model_path != "default_model":
-            self._validate_model_path(draft_model_path)
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
         return self.model, self.tokenizer
