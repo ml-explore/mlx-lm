@@ -105,7 +105,7 @@ class CompletionsDataset:
             {"role": "user", "content": d[self.prompt_key]},
             {"role": "assistant", "content": d[self.completion_key]},
         ]
-        tokens = _apply_chat_template_safe(self.tokenizer, messages, tools=tools)
+        tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
         if self.mask_prompt:
             offset = len(
                 self.tokenizer.apply_chat_template(
