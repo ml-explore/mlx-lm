@@ -76,6 +76,30 @@ class TrainingArgs:
     )
 
 
+def _unpack_loss_output(out, need_accuracy: bool):
+    """
+    Normalize various loss outputs to a common form (loss, ntoks, correct).
+    Supported outputs:
+    - (loss, ntoks, logits, targets, mask): preferred; computes accuracy only if requested.
+    - (loss, ntoks): no accuracy available; returns correct=0.
+    Any other shape falls back to (loss, 0, 0).
+    """
+    if isinstance(out, tuple):
+        if len(out) >= 5:
+            losses, toks, logits, targets, mask = out[:5]
+            if need_accuracy:
+                preds = mx.argmax(logits, axis=-1)
+                correct = ((preds == targets) * mask).sum()
+            else:
+                correct = mx.array(0)
+            return losses, toks, correct
+        elif len(out) == 2:
+            losses, toks = out
+            return losses, toks, mx.array(0)
+    # Fallback
+    return out, mx.array(0), mx.array(0)
+
+
 def default_loss(model, batch, lengths):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
@@ -89,11 +113,8 @@ def default_loss(model, batch, lengths):
     ntoks = mask.sum()
     ce = ce.astype(mx.float32).sum() / ntoks
 
-    preds = mx.argmax(logits, axis=-1)
-    correct = (preds == targets) * mask
-    correct = correct.sum()
-
-    return ce, ntoks, correct
+    # Return intermediates so accuracy can be computed conditionally outside
+    return ce, ntoks, logits, targets, mask
 
 
 def iterate_batches(
@@ -193,14 +214,14 @@ def evaluate(
         total=min(len(dataset) // batch_size, num_batches),
     ):
         out = loss(model, *batch)
-        if isinstance(out, tuple) and len(out) == 3:
-            losses, toks, correct = out
-            all_correct += correct
-        else:
-            losses, toks = out
+        losses, toks, correct = _unpack_loss_output(out, return_accuracy)
         all_losses += losses * toks
         ntokens += toks
-        mx.eval(all_losses, ntokens, all_correct)
+        if return_accuracy:
+            all_correct += correct
+            mx.eval(all_losses, ntokens, all_correct)
+        else:
+            mx.eval(all_losses, ntokens)
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
@@ -245,7 +266,8 @@ def train(
 
     @partial(mx.compile, inputs=state, outputs=state)
     def step(batch, prev_grad, do_update):
-        (lvalue, toks, correct), grad = loss_value_and_grad(model, *batch)
+        out, grad = loss_value_and_grad(model, *batch)
+        lvalue, toks, correct = _unpack_loss_output(out, args.report_accuracy)
 
         if prev_grad is not None:
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
