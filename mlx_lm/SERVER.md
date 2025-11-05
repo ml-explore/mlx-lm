@@ -98,6 +98,16 @@ curl localhost:8080/v1/chat/completions \
 - `num_draft_tokens`: (Optional) The number of draft tokens the draft model
   should predict at once. Defaults to `3`.
 
+### Continuous batching flags (experimental)
+
+The HTTP server now supports iteration-level continuous batching when you start it with `--enable-continuous-batching`. Additional flags:
+
+- `--max-num-seqs`: maximum active sequences decoded per scheduler iteration (default `16`).
+- `--max-tokens-per-step`: token budget per scheduler tick for prefill work (default `4096`).
+- `--prefill-chunk`: maximum prompt tokens ingested per prefill step (default `1024`).
+
+When the flag is enabled, requests requiring tool-calling or per-token logprobs currently fall back to the legacy streaming path. Persistent KV cache and prefix caching arrive in subsequent releases.
+
 ### Response Fields
 
 - `id`: A unique identifier for the chat.

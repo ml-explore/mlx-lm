@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
+import logging
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -85,8 +87,24 @@ class Attention(nn.Module):
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            offsets = getattr(cache, "offset", 0)
+            if not isinstance(offsets, mx.array):
+                offsets = mx.array(offsets)
+            if offsets.ndim == 0:
+                rope_offset = offsets
+            else:
+                leading = int(queries.shape[0])
+                if int(offsets.shape[0]) != leading:
+                    logging.debug(
+                        "rope offset length %s does not match batch %s; trimming",
+                        offsets.shape,
+                        leading,
+                    )
+                    offsets = offsets[:leading]
+                rope_offset = mx.reshape(offsets, (leading,))
+
+            queries = self.rope(queries, offset=rope_offset)
+            keys = self.rope(keys, offset=rope_offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)

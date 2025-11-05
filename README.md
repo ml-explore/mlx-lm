@@ -113,6 +113,20 @@ To see a description of all the arguments you can do:
 >>> help(convert)
 ```
 
+### Continuous batching (experimental)
+
+`mlx_lm.server` supports iteration-level continuous batching when launched with `--enable-continuous-batching`. The scheduler admits new requests between decode steps so concurrent arrivals see lower TTFT and higher throughput.
+
+Flags:
+- `--enable-continuous-batching`
+- `--max-num-seqs` (default `16`)
+- `--max-tokens-per-step` (default `4096`)
+- `--prefill-chunk` (default `1024`)
+
+Requests that require tool-calling or per-token logprobs currently fall back to the legacy streaming path. Persistent KV cache, prefix caching, and Metal PagedAttention arrive in future PRs.
+
+A Poisson-arrival benchmark comparing the new runtime against `batch_generate` is available in `bench/bench_continuous_vs_static.py`.
+
 #### Streaming
 
 For streaming generation, use the `stream_generate` function. This yields

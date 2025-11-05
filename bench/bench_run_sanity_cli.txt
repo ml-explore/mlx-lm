@@ -1,0 +1,53 @@
+*** Terminating app due to uncaught exception 'NSRangeException', reason: '*** -[__NSArray0 objectAtIndex:]: index 0 beyond bounds for empty array'
+*** First throw call stack:
+(
+	0   CoreFoundation                      0x000000019ec67ae0 __exceptionPreprocess + 176
+	1   libobjc.A.dylib                     0x000000019e72ab90 objc_exception_throw + 88
+	2   CoreFoundation                      0x000000019ec9017c CFArrayApply + 0
+	3   libmlx.dylib                        0x0000000103097ef8 _ZN3mlx4core5metal6DeviceC2Ev + 204
+	4   libmlx.dylib                        0x000000010309b584 _ZN3mlx4core5metal6deviceENS0_6DeviceE + 80
+	5   libmlx.dylib                        0x0000000103072dd0 _ZN3mlx4core5metal14MetalAllocatorC2Ev + 64
+	6   libmlx.dylib                        0x0000000103072c6c _ZN3mlx4core9allocator9allocatorEv + 80
+	7   libmlx.dylib                        0x00000001025369c4 _ZN3mlx4core9allocator6mallocEm + 28
+	8   libmlx.dylib                        0x0000000102642734 _ZN3mlx4core5array4initIPKjEEvT_ + 64
+	9   libmlx.dylib                        0x000000010264266c _ZN3mlx4core5arrayC2IjEESt16initializer_listIT_ENS0_5DtypeE + 156
+	10  libmlx.dylib                        0x000000010263bfbc _ZN3mlx4core6random3keyEy + 72
+	11  core.cpython-39-darwin.so           0x000000010129cc2c PyInit_core + 688004
+	12  core.cpython-39-darwin.so           0x000000010129e56c PyInit_core + 694468
+	13  core.cpython-39-darwin.so           0x00000001011f4e58 PyInit_core + 432
+	14  Python3                             0x0000000100eea724 PyImport_AppendInittab + 5440
+	15  Python3                             0x0000000100ee9e8c PyImport_AppendInittab + 3240
+	16  Python3                             0x0000000100e35d18 PyCMethod_New + 800
+	17  Python3                             0x0000000100ec0d88 _PyEval_EvalFrameDefault + 9364
+	18  Python3                             0x0000000100ec5be4 _PyEval_EvalFrameDefault + 29424
+	19  Python3                             0x0000000100df3afc _PyFunction_Vectorcall + 228
+	20  Python3                             0x0000000100ec4e74 _PyEval_EvalFrameDefault + 25984
+	21  Python3                             0x0000000100ec08c8 _PyEval_EvalFrameDefault + 8148
+	22  Python3                             0x0000000100df3bac _PyFunction_Vectorcall + 404
+	23  Python3                             0x0000000100ec4e74 _PyEval_EvalFrameDefault + 25984
+	24  Python3                             0x0000000100ec08a4 _PyEval_EvalFrameDefault + 8112
+	25  Python3                             0x0000000100df3bac _PyFunction_Vectorcall + 404
+	26  Python3                             0x0000000100ec4e74 _PyEval_EvalFrameDefault + 25984
+	27  Python3                             0x0000000100ec116c _PyEval_EvalFrameDefault + 10360
+	28  Python3                             0x0000000100df3bac _PyFunction_Vectorcall + 404
+	29  Python3                             0x0000000100ec4e74 _PyEval_EvalFrameDefault + 25984
+	30  Python3                             0x0000000100ec116c _PyEval_EvalFrameDefault + 10360
+	31  Python3                             0x0000000100df3bac _PyFunction_Vectorcall + 404
+	32  Python3                             0x0000000100ec4e74 _PyEval_EvalFrameDefault + 25984
+	33  Python3                             0x0000000100ec116c _PyEval_EvalFrameDefault + 10360
+	34  Python3                             0x0000000100df3bac _PyFunction_Vectorcall + 404
+	35  Python3                             0x0000000100df4d30 PyObject_CallMethodObjArgs + 508
+	36  Python3                             0x0000000100df4eb0 _PyObject_CallMethodIdObjArgs + 112
+	37  Python3                             0x0000000100ee8a80 PyImport_ImportModuleLevelObject + 1360
+	38  Python3                             0x0000000100ec1f0c _PyEval_EvalFrameDefault + 13848
+	39  Python3                             0x0000000100ec5be4 _PyEval_EvalFrameDefault + 29424
+	40  Python3                             0x0000000100ebe82c PyEval_EvalCode + 80
+	41  Python3                             0x0000000100f00a40 PyParser_ASTFromStringObject + 500
+	42  Python3                             0x0000000100f00c30 PyRun_FileExFlags + 356
+	43  Python3                             0x0000000100eff3f8 PyRun_SimpleFileExFlags + 812
+	44  Python3                             0x0000000100f1c534 Py_RunMain + 1448
+	45  Python3                             0x0000000100f1c8e8 Py_Main + 372
+	46  Python3                             0x0000000100f1c988 Py_BytesMain + 40
+	47  dyld                                0x000000019e76ab98 start + 6076
+)
+libc++abi: terminating due to uncaught exception of type NSException

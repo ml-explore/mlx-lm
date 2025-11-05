@@ -1,13 +1,17 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import atexit
 import json
 import logging
 import platform
+import signal
 import socket
+import sys
 import time
 import uuid
 import warnings
+import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -21,6 +25,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    TYPE_CHECKING,
 )
 
 import mlx.core as mx
@@ -31,6 +36,9 @@ from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import common_prefix_len, load
+from .server_batched.handler import maybe_handle_continuous_batching
+from .server_batched.config import create_arg_parser
+from .server_batched.runtime import create_runtime
 
 
 def get_system_fingerprint():
@@ -240,6 +248,7 @@ class APIHandler(BaseHTTPRequestHandler):
         *args,
         prompt_cache: Optional[PromptCache] = None,
         system_fingerprint: Optional[str] = None,
+        runtime_state: Optional[dict] = None,
         **kwargs,
     ):
         """
@@ -249,7 +258,51 @@ class APIHandler(BaseHTTPRequestHandler):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache or PromptCache()
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
+        self.runtime_state = runtime_state or {
+            "config": {"enabled": False},
+            "runtime": None,
+            "model_key": None,
+            "lock": threading.Lock(),
+        }
+        self.batch_runtime = self.runtime_state.get("runtime")
         super().__init__(*args, **kwargs)
+
+    def _ensure_batch_runtime(self):
+        config = self.runtime_state.get("config", {})
+        if not config.get("enabled"):
+            self.batch_runtime = None
+            return None
+        if self.model is None or self.tokenizer is None:
+            return None
+        model_key = self.model_provider.model_key
+        if model_key is None:
+            return None
+        lock = self.runtime_state.setdefault("lock", threading.Lock())
+        with lock:
+            current_key = self.runtime_state.get("model_key")
+            if current_key != model_key:
+                existing = self.runtime_state.get("runtime")
+                if existing is not None:
+                    existing.shutdown()
+                runtime = create_runtime(
+                    config,
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    draft_model=self.model_provider.draft_model,
+                )
+                self.runtime_state["runtime"] = runtime
+                self.runtime_state["model_key"] = model_key
+            self.batch_runtime = self.runtime_state.get("runtime")
+        return self.batch_runtime
+
+    def _ensure_prompt_tokens(self, prompt) -> List[int]:
+        if isinstance(prompt, list) and (not prompt or isinstance(prompt[0], int)):
+            return list(prompt)
+        if isinstance(prompt, mx.array):
+            return prompt.tolist()
+        if isinstance(prompt, str):
+            return self.tokenizer.encode(prompt)
+        return list(prompt)
 
     def _set_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -434,6 +487,28 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("adapter must be a string")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("seed must be an integer")
+
+    def _maybe_handle_continuous_batching(
+        self,
+        *,
+        prompt_tokens,
+        stop_id_sequences,
+        sampler_settings,
+        stopping_settings,
+        logit_bias,
+        repetition_penalty,
+        repetition_context_size,
+    ):
+        return maybe_handle_continuous_batching(
+            self,
+            prompt_tokens=prompt_tokens,
+            stop_id_sequences=stop_id_sequences,
+            sampler_settings=sampler_settings,
+            stopping_settings=stopping_settings,
+            logit_bias=logit_bias,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+        )
 
     def generate_response(
         self,
@@ -634,72 +709,106 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_id_sequences (List[List[int]]): A list of stop words passed
               to the stopping_criteria function
         """
-        tokens = []
-        finish_reason = "length"
-        stop_sequence_suffix = None
-        if self.stream:
-            self.end_headers()
-            logging.debug(f"Starting stream:")
-        else:
-            logging.debug(f"Starting completion:")
-        token_logprobs = []
-        top_tokens = []
+        prompt_tokens = self._ensure_prompt_tokens(prompt)
 
-        prompt = self.get_prompt_cache(prompt)
-
-        text = ""
-        tic = time.perf_counter()
-        sampler = make_sampler(
-            self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            min_p=self.min_p,
-            xtc_probability=self.xtc_probability,
-            xtc_threshold=self.xtc_threshold,
-            xtc_special_tokens=[
+        sampler_settings = {
+            "temp": self.temperature,
+            "top_p": self.top_p,
+            "min_p": self.min_p,
+            "top_k": self.top_k,
+            "xtc_probability": self.xtc_probability,
+            "xtc_threshold": self.xtc_threshold,
+            "xtc_special_tokens": [
                 self.tokenizer.eos_token_id,
                 self.tokenizer.encode("\n"),
             ],
-        )
-        logits_processors = make_logits_processors(
-            self.logit_bias,
-            self.repetition_penalty,
-            self.repetition_context_size,
+        }
+        stopping_settings = {"eos_token_id": self.tokenizer.eos_token_id}
+        stopping_settings["stop_id_sequences"] = stop_id_sequences
+
+        runtime = self._ensure_batch_runtime()
+        can_batch = (
+            runtime is not None
+            and self.stream
+            and not stop_id_sequences
+            and self.logprobs == -1
+            and not self.body.get("tools")
+            and not getattr(self.tokenizer, "has_tool_calling", False)
         )
 
-        tool_calls = []
+        if can_batch:
+            batching_result = self._maybe_handle_continuous_batching(
+                prompt_tokens=prompt_tokens,
+                stop_id_sequences=stop_id_sequences,
+                sampler_settings=sampler_settings,
+                stopping_settings=stopping_settings,
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+            )
+        else:
+            batching_result = None
+
+        tokens: List[int] = []
+        finish_reason = "length"
+        stop_sequence_suffix = None
+        token_logprobs: List[float] = []
+        top_tokens: List[tuple] = []
+        tool_calls: List[str] = []
         tool_text = ""
         in_tool_call = False
         segment = ""
+        text = ""
+        tic = time.perf_counter()
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+        if batching_result is not None:
+            continuous_mode = True
+            _, token_generator = batching_result
+            prompt_for_usage = prompt_tokens
+            logits_processors = None
+        else:
+            continuous_mode = False
+            prompt_for_usage = self.get_prompt_cache(prompt_tokens)
+            sampler = make_sampler(**sampler_settings)
+            logits_processors = make_logits_processors(
+                self.logit_bias,
+                self.repetition_penalty,
+                self.repetition_context_size,
             )
-            if self.stream:
-                try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
-                    pass
 
-        for gen_response in stream_generate(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            prompt=prompt,
-            max_tokens=self.max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            prompt_cache=self.prompt_cache.cache,
-            draft_model=self.model_provider.draft_model,
-            num_draft_tokens=self.num_draft_tokens,
-            prompt_progress_callback=keepalive_callback,
-        ):
+            def keepalive_callback(processed_tokens, total_tokens):
+                logging.info(
+                    f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+                )
+                if self.stream:
+                    try:
+                        self.wfile.write(
+                            f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                        )
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+
+            token_generator = stream_generate(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                prompt=prompt_for_usage,
+                max_tokens=self.max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prompt_cache=self.prompt_cache.cache,
+                draft_model=self.model_provider.draft_model,
+                num_draft_tokens=self.num_draft_tokens,
+                prompt_progress_callback=keepalive_callback,
+            )
+
+        if self.stream:
+            self.end_headers()
+            logging.debug("Starting stream:")
+        else:
+            logging.debug("Starting completion:")
+
+        for gen_response in token_generator:
             logging.debug(gen_response.text)
 
             if (
@@ -720,7 +829,8 @@ class APIHandler(BaseHTTPRequestHandler):
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
-            self.prompt_cache.tokens.append(token)
+            if not continuous_mode:
+                self.prompt_cache.tokens.append(token)
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
@@ -777,9 +887,12 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                original_prompt_length = (
-                    len(self.prompt_cache.tokens) - len(tokens) + len(prompt)
-                )
+                if continuous_mode:
+                    original_prompt_length = len(prompt_for_usage)
+                else:
+                    original_prompt_length = (
+                        len(self.prompt_cache.tokens) - len(tokens) + len(prompt_for_usage)
+                    )
                 response = self.completion_usage_response(
                     original_prompt_length, len(tokens)
                 )
@@ -945,9 +1058,37 @@ def run(
     model_provider: ModelProvider,
     server_class=HTTPServer,
     handler_class=APIHandler,
+    args: Optional[argparse.Namespace] = None,
 ):
     server_address = (host, port)
     prompt_cache = PromptCache()
+    runtime_config = {
+        "enabled": bool(args and getattr(args, "enable_continuous_batching", False)),
+        "max_num_seqs": getattr(args, "max_num_seqs", 16),
+        "max_tokens_per_step": getattr(args, "max_tokens_per_step", 4096),
+        "prefill_chunk": getattr(args, "prefill_chunk", 1024),
+    }
+    runtime_state = {
+        "config": runtime_config,
+        "runtime": None,
+        "model_key": None,
+        "lock": threading.Lock(),
+    }
+
+    def _cleanup_runtime():
+        runtime = runtime_state.get("runtime")
+        if runtime is not None:
+            runtime.shutdown()
+            runtime_state["runtime"] = None
+
+    atexit.register(_cleanup_runtime)
+
+    def _signal_handler(signum, frame):
+        _cleanup_runtime()
+        raise SystemExit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _signal_handler)
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
@@ -958,6 +1099,7 @@ def run(
             model_provider,
             prompt_cache=prompt_cache,
             system_fingerprint=get_system_fingerprint(),
+            runtime_state=runtime_state,
             *args,
             **kwargs,
         ),
@@ -1066,13 +1208,14 @@ def main():
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
+    create_arg_parser(parser)
     args = parser.parse_args()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    run(args.host, args.port, ModelProvider(args))
+    run(args.host, args.port, ModelProvider(args), args=args)
 
 
 if __name__ == "__main__":
