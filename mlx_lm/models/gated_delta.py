@@ -213,44 +213,6 @@ def gated_delta_kernel(
     )
 
 
-def chunked_gated_delta_kernel(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: mx.array,
-    mask: Optional[mx.array] = None,
-    chunk_size: int = 64,
-) -> Tuple[mx.array, mx.array]:
-    B, T, _, _ = q.shape
-    outputs = []
-    start = 0
-    state_buf = state
-
-    while start < T:
-        end = min(start + chunk_size, T)
-        mask_slice = None
-        if mask is not None:
-            mask_slice = mask[:, start:end]
-        out_chunk, state_buf = gated_delta_kernel(
-            q[:, start:end],
-            k[:, start:end],
-            v[:, start:end],
-            g[:, start:end],
-            beta[:, start:end],
-            state_buf,
-            mask_slice,
-        )
-        outputs.append(out_chunk)
-        start = end
-
-    if len(outputs) == 1:
-        return outputs[0], state_buf
-
-    return mx.concatenate(outputs, axis=1), state_buf
-
-
 def gated_delta_ops(
     q: mx.array,
     k: mx.array,
@@ -299,45 +261,6 @@ def gated_delta_ops(
     return y, state
 
 
-def chunked_gated_delta_ops(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: mx.array,
-    mask: Optional[mx.array] = None,
-    chunk_size: int = 64,
-) -> Tuple[mx.array, mx.array]:
-    """
-    Ops-based implementation with chunking for long sequences.
-    Processes sequence in chunks to avoid OOM on long contexts.
-    """
-    B, T, _, _ = q.shape
-    outputs = []
-    start = 0
-
-    while start < T:
-        end = min(start + chunk_size, T)
-        mask_slice = None if mask is None else mask[:, start:end]
-
-        out_chunk, state = gated_delta_ops(
-            q[:, start:end],
-            k[:, start:end],
-            v[:, start:end],
-            g[:, start:end],
-            beta[:, start:end],
-            state,
-            mask_slice,
-        )
-        outputs.append(out_chunk)
-        start = end
-
-    if len(outputs) == 1:
-        return outputs[0], state
-    return mx.concatenate(outputs, axis=1), state
-
-
 def gated_delta_update(
     q: mx.array,
     k: mx.array,
@@ -349,7 +272,6 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
-    chunk_size: int = 64,
 ) -> Tuple[mx.array, mx.array]:
 
     beta = mx.sigmoid(b)
@@ -360,20 +282,5 @@ def gated_delta_update(
         state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-        if q.shape[1] > chunk_size:
-            return chunked_gated_delta_ops(q, k, v, g, beta, state, mask, chunk_size)
         return gated_delta_ops(q, k, v, g, beta, state, mask)
-
-    if q.shape[1] > chunk_size:
-        return chunked_gated_delta_kernel(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            state,
-            mask,
-            chunk_size,
-        )
-
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
