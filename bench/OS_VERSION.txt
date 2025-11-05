@@ -1,0 +1,3 @@
+ProductName:		macOS
+ProductVersion:		15.6.1
+BuildVersion:		24G90

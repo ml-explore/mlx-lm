@@ -1,0 +1,16 @@
+usage: - [-h] [--enable-continuous-batching] [--max-num-seqs MAX_NUM_SEQS]
+         [--max-tokens-per-step MAX_TOKENS_PER_STEP]
+         [--prefill-chunk PREFILL_CHUNK]
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --enable-continuous-batching
+                        Enable continuous batching scheduler for streaming
+                        requests.
+  --max-num-seqs MAX_NUM_SEQS
+                        Maximum concurrent sequences handled by the scheduler.
+  --max-tokens-per-step MAX_TOKENS_PER_STEP
+                        Token budget per scheduler iteration for prefill work.
+  --prefill-chunk PREFILL_CHUNK
+                        Maximum prompt tokens admitted per sequence during
+                        prefill.

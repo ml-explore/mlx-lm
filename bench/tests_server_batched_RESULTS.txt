@@ -1,0 +1,7 @@
+............../Volumes/1TB SSD/mlx-proj/mlx-lm/mlx_lm/server.py:1115: UserWarning: mlx_lm.server is not recommended for production as it only implements basic security checks.
+  warnings.warn(
+....
+----------------------------------------------------------------------
+Ran 18 tests in 0.057s
+
+OK

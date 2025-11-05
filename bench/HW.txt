@@ -1,0 +1,15 @@
+Hardware:
+
+    Hardware Overview:
+
+      Model Name: Unknown
+      Model Identifier: Unknown
+      Model Number: Z1FT000K4LL/A
+      Chip: Apple M4 Max
+      Total Number of Cores: 16 (12 performance and 4 efficiency)
+      Memory: 128 GB
+      System Firmware Version: 11881.140.96
+      OS Loader Version: 11881.140.96
+      Hardware UUID: 68A8C5F6-4EBA-55A0-92F8-84AFA3053186
+      Provisioning UDID: 00006041-0002105E26A1801C
+

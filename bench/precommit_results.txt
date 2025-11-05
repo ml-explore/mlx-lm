@@ -1,0 +1,1 @@
+pre-commit unavailable: command not found in sandbox. pip install pre-commit failed due to restricted network; see console logs.
