@@ -335,15 +335,17 @@ def gated_delta_ops(
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
+    Supports both scalar and vectorized gating.
 
     Shapes:
       - q, k: [B, T, Hk, Dk]
       - v: [B, T, Hv, Dv]
-      - g, beta: [B, T, Hv]
-      - state: [B, Hv, Dk, Dv]
+      - g: [B, T, Hv] (scalar) or [B, T, Hv, Dk] (vectorized)
+      - beta: [B, T, Hv]
+      - state: [B, Hv, Dv, Dk]
     Returns:
       - y: [B, T, Hv, Dv]
-      - state: [B, Hv, Dk, Dv]
+      - state: [B, Hv, Dv, Dk]
     """
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
@@ -356,28 +358,57 @@ def gated_delta_ops(
 
     ys = []
     for t in range(T):
-        if mask is not None:
-            y, state = _gated_delta_step_ops(
-                q[:, t],
-                k[:, t],
-                v[:, t],
-                g[:, t],
-                beta[:, t],
-                state,
-                mask[:, t],
-            )
-        else:
-            y, state = _gated_delta_step_ops(
-                q[:, t],
-                k[:, t],
-                v[:, t],
-                g[:, t],
-                beta[:, t],
-                state,
-            )
+        y, state = _gated_delta_step_ops(
+            q[:, t],
+            k[:, t],
+            v[:, t],
+            g[:, t],
+            beta[:, t],
+            state,
+            None if mask is None else mask[:, t],
+        )
         ys.append(y)
     y = mx.stack(ys, axis=1)
     return y, state
+
+
+def chunked_gated_delta_ops(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
+    chunk_size: int = 64,
+) -> Tuple[mx.array, mx.array]:
+    """
+    Ops-based implementation with chunking for long sequences.
+    Processes sequence in chunks to avoid OOM on long contexts.
+    """
+    B, T, _, _ = q.shape
+    outputs = []
+    start = 0
+
+    while start < T:
+        end = min(start + chunk_size, T)
+        mask_slice = None if mask is None else mask[:, start:end]
+
+        out_chunk, state = gated_delta_ops(
+            q[:, start:end],
+            k[:, start:end],
+            v[:, start:end],
+            g[:, start:end],
+            beta[:, start:end],
+            state,
+            mask_slice,
+        )
+        outputs.append(out_chunk)
+        start = end
+
+    if len(outputs) == 1:
+        return outputs[0], state
+    return mx.concatenate(outputs, axis=1), state
 
 
 def gated_delta_update(
@@ -399,15 +430,12 @@ def gated_delta_update(
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
-        if state is None:
-            state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-        from . import fused_recurrent_kda as frkda
-
         if q.shape[1] > chunk_size:
-            return frkda.chunked_kda_ops(q, k, v, g, beta, state, mask, chunk_size)
-        return frkda.fused_recurrent_kda_ops(q, k, v, g, beta, state, mask)
+            return chunked_gated_delta_ops(q, k, v, g, beta, state, mask, chunk_size)
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
 
     if q.shape[1] > chunk_size:
         return chunked_gated_delta_kernel(
