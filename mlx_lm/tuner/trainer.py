@@ -70,6 +70,10 @@ class TrainingArgs:
             "help": "Number of steps to accumulate gradients before applying an optimizer update."
         },
     )
+    report_accuracy: bool = field(
+        default=False,
+        metadata={"help": "Display token-level accuracy during reporting steps."},
+    )
 
 
 def default_loss(model, batch, lengths):
@@ -85,7 +89,11 @@ def default_loss(model, batch, lengths):
     ntoks = mask.sum()
     ce = ce.astype(mx.float32).sum() / ntoks
 
-    return ce, ntoks
+    preds = mx.argmax(logits, axis=-1)
+    correct = (preds == targets) * mask
+    correct = correct.sum()
+
+    return ce, ntoks, correct
 
 
 def iterate_batches(
@@ -163,10 +171,12 @@ def evaluate(
     max_seq_length=2048,
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
+    return_accuracy: bool = False,
 ):
     model.eval()
     all_losses = mx.array(0.0)
     ntokens = mx.array(0)
+    all_correct = mx.array(0)
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
@@ -182,15 +192,25 @@ def evaluate(
         desc="Calculating loss...",
         total=min(len(dataset) // batch_size, num_batches),
     ):
-        losses, toks = loss(model, *batch)
+        out = loss(model, *batch)
+        if isinstance(out, tuple) and len(out) == 3:
+            losses, toks, correct = out
+            all_correct += correct
+        else:
+            losses, toks = out
         all_losses += losses * toks
         ntokens += toks
-        mx.eval(all_losses, ntokens)
+        mx.eval(all_losses, ntokens, all_correct)
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
-
-    return (all_losses / ntokens).item()
+    if return_accuracy:
+        all_correct = mx.distributed.all_sum(all_correct, stream=mx.cpu)
+        avg_loss = (all_losses / ntokens).item()
+        acc = (all_correct / ntokens).item()
+        return avg_loss, acc
+    else:
+        return (all_losses / ntokens).item()
 
 
 def train(
@@ -225,7 +245,7 @@ def train(
 
     @partial(mx.compile, inputs=state, outputs=state)
     def step(batch, prev_grad, do_update):
-        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
+        (lvalue, toks, correct), grad = loss_value_and_grad(model, *batch)
 
         if prev_grad is not None:
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
@@ -237,7 +257,7 @@ def train(
             optimizer.update(model, grad)
             grad = None
 
-        return lvalue, toks, grad
+        return lvalue, toks, correct, grad
 
     model.train()
     losses = 0
@@ -246,6 +266,7 @@ def train(
     trained_tokens = 0
     train_time = 0
     grad_accum = None
+    correct_tokens = mx.array(0)
 
     # Main training loop
     for it, batch in zip(
@@ -262,7 +283,7 @@ def train(
         # is always measured before any training.
         if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             tic = time.perf_counter()
-            val_loss = evaluate(
+            val_result = evaluate(
                 model=model,
                 dataset=val_dataset,
                 loss=loss,
@@ -270,16 +291,30 @@ def train(
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,
                 iterate_batches=iterate_batches,
+                return_accuracy=args.report_accuracy,
             )
+            if args.report_accuracy:
+                val_loss, val_acc = val_result
+            else:
+                val_loss = val_result
             model.train()
             val_time = time.perf_counter() - tic
             if rank == 0:
-                print(
-                    f"Iter {it}: "
-                    f"Val loss {val_loss:.3f}, "
-                    f"Val took {val_time:.3f}s",
-                    flush=True,
-                )
+                if args.report_accuracy:
+                    print(
+                        f"Iter {it}: "
+                        f"Val loss {val_loss:.3f}, "
+                        f"Val acc {(val_acc * 100):.3f}%, "
+                        f"Val took {val_time:.3f}s",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"Iter {it}: "
+                        f"Val loss {val_loss:.3f}, "
+                        f"Val took {val_time:.3f}s",
+                        flush=True,
+                    )
 
             if training_callback is not None:
                 val_info = {
@@ -287,11 +322,13 @@ def train(
                     "val_loss": val_loss,
                     "val_time": val_time,
                 }
+                if args.report_accuracy:
+                    val_info["val_acc"] = val_acc
                 training_callback.on_val_loss_report(val_info)
 
             tic = time.perf_counter()
 
-        lvalue, toks, grad_accum = step(
+        lvalue, toks, correct, grad_accum = step(
             batch,
             grad_accum,
             it % grad_accum_steps == 0,
@@ -299,8 +336,12 @@ def train(
 
         losses += lvalue
         n_tokens += toks
+        correct_tokens += correct
         steps += 1
-        mx.eval(state, losses, n_tokens, grad_accum)
+        if args.report_accuracy:
+            mx.eval(state, losses, n_tokens, correct_tokens, grad_accum)
+        else:
+            mx.eval(state, losses, n_tokens, grad_accum)
         train_time += time.perf_counter() - tic
 
         # Report training loss if needed
@@ -308,26 +349,44 @@ def train(
             train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
             train_loss /= steps * world_size
             n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+            if args.report_accuracy:
+                correct_sum = mx.distributed.all_sum(
+                    correct_tokens, stream=mx.cpu
+                ).item()
+                train_acc = (correct_sum / n_tokens) if n_tokens > 0 else 0.0
             learning_rate = optimizer.learning_rate.item()
             it_sec = args.steps_per_report / train_time
             tokens_sec = float(n_tokens) / train_time
             trained_tokens += n_tokens
             peak_mem = mx.get_peak_memory() / 1e9
             if rank == 0:
-                print(
-                    f"Iter {it}: Train loss {train_loss:.3f}, "
-                    f"Learning Rate {learning_rate:.3e}, "
-                    f"It/sec {it_sec:.3f}, "
-                    f"Tokens/sec {tokens_sec:.3f}, "
-                    f"Trained Tokens {trained_tokens}, "
-                    f"Peak mem {peak_mem:.3f} GB",
-                    flush=True,
-                )
+                if args.report_accuracy:
+                    print(
+                        f"Iter {it}: Train loss {train_loss:.3f}, "
+                        f"Train acc {(train_acc * 100):.3f}%, "
+                        f"Learning Rate {learning_rate:.3e}, "
+                        f"It/sec {it_sec:.3f}, "
+                        f"Tokens/sec {tokens_sec:.3f}, "
+                        f"Trained Tokens {trained_tokens}, "
+                        f"Peak mem {peak_mem:.3f} GB",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"Iter {it}: Train loss {train_loss:.3f}, "
+                        f"Learning Rate {learning_rate:.3e}, "
+                        f"It/sec {it_sec:.3f}, "
+                        f"Tokens/sec {tokens_sec:.3f}, "
+                        f"Trained Tokens {trained_tokens}, "
+                        f"Peak mem {peak_mem:.3f} GB",
+                        flush=True,
+                    )
 
             if training_callback is not None:
                 train_info = {
                     "iteration": it,
                     "train_loss": train_loss,
+                    **({"train_acc": train_acc} if args.report_accuracy else {}),
                     "learning_rate": learning_rate,
                     "iterations_per_second": it_sec,
                     "tokens_per_second": tokens_sec,
@@ -340,6 +399,7 @@ def train(
             n_tokens = 0
             steps = 0
             train_time = 0
+            correct_tokens = mx.array(0)
 
         # Save adapter weights
         if it % args.steps_per_save == 0 and rank == 0:
