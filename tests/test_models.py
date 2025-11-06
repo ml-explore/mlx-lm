@@ -347,30 +347,6 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
-    def test_bailing_moe_linear(self):
-        from mlx_lm.models import bailing_moe_linear
-
-        args = bailing_moe_linear.ModelArgs(
-            model_type="bailing_moe_linear",
-            hidden_size=1024,
-            num_hidden_layers=4,
-            intermediate_size=2048,
-            moe_intermediate_size=1024,
-            num_experts_per_tok=2,
-            num_experts=4,
-            norm_topk_prob=True,
-            num_shared_experts=2,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            rms_norm_eps=1e-5,
-            vocab_size=10_000,
-            rope_theta=1000,
-            first_k_dense_replaced=0,
-            layer_group_size=1,
-            group_norm_size=1,
-        )
-        model = bailing_moe_linear.Model(args)
-
     def test_lfm2_moe(self):
         from mlx_lm.models import lfm2_moe
 
@@ -1978,6 +1954,26 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 1000,
                 "rotary_dim": 16,
                 "vocab_size": 1000,
+            },
+            {
+                "model_type": "bailing_moe_linear",
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "intermediate_size": 2048,
+                "moe_intermediate_size": 1024,
+                "num_experts_per_tok": 2,
+                "num_experts": 4,
+                "norm_topk_prob": True,
+                "num_shared_experts": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 10_000,
+                "rope_theta": 1000,
+                "first_k_dense_replace": 0,
+                "layer_group_size": 2,
+                "group_norm_size": 1,
+                "max_position_embeddings": 1000,
             },
         ]
         for config in test_configs:

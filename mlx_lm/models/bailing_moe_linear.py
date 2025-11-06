@@ -7,9 +7,13 @@ from typing import Any, Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, LinearAttentionCache
-from .fused_recurrent_gla import fused_recurrent_gla_update
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
+from .cache import ArraysCache, KVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -55,7 +59,44 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
 
 
-class BailingMoeLinearV2GroupRMSNorm(nn.Module):
+def recurrent_gla(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    scale: float,
+    h: Optional[mx.array] = None,
+) -> mx.array:
+    """
+    Recurrence per (b, h):
+        h_t = h_{t-1} * exp(g_t)
+        h_t = h_t + k_t^T @ v_t
+        y_t = (q_t @ h_t) * scale
+    Returns y with shape [B, H, T, Dv].
+    """
+    B, Hq, L, K = q.shape
+    Hv = k.shape[1]
+    V = v.shape[-1]
+
+    outputs = []
+    exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
+    q = q * scale
+    for t in range(L):
+        q_t = q[:, :, t : t + 1]
+        k_t = k[:, :, t : t + 1]
+        v_t = v[:, :, t : t + 1]
+        h_up = k_t.transpose(0, 1, 3, 2) @ v_t
+        if h is not None:
+            h = h * exp_g + h_up
+        else:
+            h = h_up
+        o_t = q_t @ h
+        outputs.append(o_t)
+
+    return mx.concatenate(outputs, axis=2), h
+
+
+class GroupRMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1e-5, groups: int = 1):
         super().__init__()
         self.weight = mx.ones((dims,))
@@ -64,13 +105,12 @@ class BailingMoeLinearV2GroupRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape
-        group_shape = shape[:-1] + (self.groups, shape[-1] // self.groups)
-        x = mx.reshape(x, group_shape).astype(mx.float32)
-        x = x * mx.rsqrt(mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps)
-        return self.weight * mx.reshape(x, shape)
+        x = mx.unflatten(x, axis=-1, shape=(self.groups, -1))
+        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
+        return self.weight * mx.flatten(x, -2)
 
 
-class BailingMoeLinearMLP(nn.Module):
+class MLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
         self.intermediate_size = (
@@ -93,7 +133,7 @@ class BailingMoeLinearMLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class BailingMoeLinearAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.use_qk_norm = args.use_qk_norm
@@ -169,7 +209,7 @@ class BailingMoeLinearAttention(nn.Module):
         return self.dense(output)
 
 
-class BailingMoeLinearLinearAttention(nn.Module):
+class LinearAttention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -180,7 +220,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self.head_dim = args.hidden_size // self.num_attention_heads
         self.scale = self.head_dim**-0.5
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-        self.mode = "chunk"
+        assert self.num_key_value_groups == 1, "Grouped linear not yet supported."
 
         self.query_key_value = nn.Linear(
             args.hidden_size,
@@ -197,7 +237,7 @@ class BailingMoeLinearLinearAttention(nn.Module):
         self.g_proj = nn.Linear(
             args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
         )
-        self.g_norm = BailingMoeLinearV2GroupRMSNorm(
+        self.g_norm = GroupRMSNorm(
             args.num_attention_heads * self.head_dim,
             eps=args.rms_norm_eps,
             groups=args.group_norm_size,
@@ -214,16 +254,11 @@ class BailingMoeLinearLinearAttention(nn.Module):
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
+        self._slope = self._get_slopes()
 
-    @property
-    def slope(self):
-        slopes = self._get_slopes(self.num_attention_heads)
-        denom = max(1, self.num_hidden_layers - 1)
-        layer_pos = max(0, self.layer_idx - 1)
-        layer_factor = 1 - (layer_pos / denom) + 1e-5
-        return -slopes * layer_factor
+    def _get_slopes(self) -> mx.array:
+        n = self.num_attention_heads
 
-    def _get_slopes(self, n: int) -> mx.array:
         def power_of_2_slopes(n):
             return [2 ** (-(2 ** -(math.log2(n) - 3)) * (i + 1)) for i in range(n)]
 
@@ -233,13 +268,18 @@ class BailingMoeLinearLinearAttention(nn.Module):
             p = 2 ** math.floor(math.log2(n))
             slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][: n - p]
 
-        return mx.array(slopes, dtype=mx.float32)
+        slopes = mx.array(slopes, dtype=mx.float32)
+        denom = max(1, self.num_hidden_layers - 1)
+        layer_pos = max(0, self.layer_idx - 1)
+        layer_factor = 1 - (layer_pos / denom) + 1e-5
+        return -slopes * layer_factor
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional["LinearAttentionCache"] = None,
+        cache: Optional[Any] = None,
+        offset: int = 0,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -267,40 +307,19 @@ class BailingMoeLinearLinearAttention(nn.Module):
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
 
-        if cache is not None and cache.kv is not None:
-            offset = cache.kv.offset
-            queries = self.rope(queries, offset=offset)
-            keys = self.rope(keys, offset=offset)
-            cache.kv.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+        queries = self.rope(queries, offset=offset)
+        keys = self.rope(keys, offset=offset)
 
-        if self.num_key_value_groups > 1:
-            keys = mx.repeat(keys, self.num_key_value_groups, axis=1)
-            values = mx.repeat(values, self.num_key_value_groups, axis=1)
-
-        T_kv = L
-
-        g = mx.broadcast_to(
-            self.slope[None, :, None], (B, self.num_attention_heads, T_kv)
-        )
-        gla_out, new_state = fused_recurrent_gla_update(
+        if cache is None:
+            cache = [None]
+        output, cache[0] = recurrent_gla(
             q=queries,
             k=keys,
             v=values,
-            g=g,
+            g=self._slope,
             scale=self.scale,
-            state=(
-                cache.gla.cache
-                if (cache and cache.gla and cache.gla.cache is not None)
-                else None
-            ),
+            h=cache[0],
         )
-        if cache is not None and cache.gla is not None:
-            cache.gla.cache = new_state
-
-        output = gla_out[:, :, -L:, :]
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
         return self.dense(output)
@@ -345,7 +364,7 @@ def group_expert_select(
     return inds, scores.astype(in_type)
 
 
-class BailingMoeLinearGate(nn.Module):
+class Gate(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.norm_topk_prob = args.norm_topk_prob
@@ -377,7 +396,7 @@ class BailingMoeLinearGate(nn.Module):
         )
 
 
-class BailingMoeLinearSparseMoeBlock(nn.Module):
+class SparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -388,12 +407,12 @@ class BailingMoeLinearSparseMoeBlock(nn.Module):
             args.num_experts,
             bias=args.use_bias,
         )
-        self.gate = BailingMoeLinearGate(args)
+        self.gate = Gate(args)
         shared_dim = (
             args.moe_shared_expert_intermediate_size or args.moe_intermediate_size
         )
         self.shared_experts = (
-            BailingMoeLinearMLP(
+            MLP(
                 args=args,
                 intermediate_size=shared_dim * args.num_shared_experts,
             )
@@ -410,28 +429,26 @@ class BailingMoeLinearSparseMoeBlock(nn.Module):
         return out
 
 
-class BailingMoeLinearDecoderLayer(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.attention_layer_type = (
-            "attention"
-            if (layer_idx + 1) % args.layer_group_size == 0
+        self.is_global = (
+            (layer_idx + 1) % args.layer_group_size == 0
             or layer_idx
             >= args.num_hidden_layers // args.layer_group_size * args.layer_group_size
-            else "linear_attention"
         )
 
-        if self.attention_layer_type == "attention":
-            self.attention = BailingMoeLinearAttention(args)
+        if self.is_global:
+            self.attention = Attention(args)
         else:
-            self.attention = BailingMoeLinearLinearAttention(args, layer_idx=layer_idx)
+            self.attention = LinearAttention(args, layer_idx=layer_idx)
 
         self.mlp = (
-            BailingMoeLinearSparseMoeBlock(args)
+            SparseMoeBlock(args)
             if (
                 args.num_experts is not None and layer_idx >= args.first_k_dense_replace
             )
-            else BailingMoeLinearMLP(args)
+            else MLP(args)
         )
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -443,22 +460,27 @@ class BailingMoeLinearDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        offset: int = 0,
     ) -> mx.array:
-        r = self.attention(self.input_layernorm(x), mask, cache)
+        if self.is_global:
+            r = self.attention(self.input_layernorm(x), mask, cache)
+        else:
+            r = self.attention(self.input_layernorm(x), mask, cache, offset=offset)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
 
 
-class BailingMoeLinearModel(nn.Module):
+class LanguageModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.word_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            BailingMoeLinearDecoderLayer(args, layer_idx=i)
-            for i in range(args.num_hidden_layers)
+            DecoderLayer(args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.gla_idx = 0
+        self.attn_idx = args.layer_group_size - 1
 
     def __call__(
         self,
@@ -470,10 +492,15 @@ class BailingMoeLinearModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        offset = 0
+        attn_mask = create_attention_mask(h, cache[self.attn_idx])
+        gla_mask = create_ssm_mask(h, cache[self.gla_idx])
+        if cache[self.attn_idx] is not None:
+            offset = cache[self.attn_idx].offset
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+            mask = attn_mask if layer.is_global else gla_mask
+            h = layer(h, mask, c, offset=offset)
 
         return self.norm(h)
 
@@ -484,7 +511,7 @@ class Model(nn.Module):
         self.args = args
         self.norm_head = args.norm_head
         self.model_type = args.model_type
-        self.model = BailingMoeLinearModel(args)
+        self.model = LanguageModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -560,8 +587,8 @@ class Model(nn.Module):
     def make_cache(self):
         caches = []
         for l in self.layers:
-            if l.attention_layer_type == "linear_attention":
-                caches.append(LinearAttentionCache())
-            elif l.attention_layer_type == "attention":
+            if l.is_global:
                 caches.append(KVCache())
+            else:
+                caches.append(ArraysCache(size=1))
         return caches

@@ -564,36 +564,6 @@ class MambaCache(ArraysCache):
         super().__init__(size=2, left_padding=left_padding)
 
 
-class LinearAttentionCache(_BaseCache):
-    def __init__(self):
-        self.kv = KVCache()
-        self.gla = ArraysCache(1)
-        self.gla.cache = None
-
-    @property
-    def offset(self):
-        return self.kv.offset
-
-    @property
-    def state(self):
-        return [*self.kv.state, self.gla.cache]
-
-    @state.setter
-    def state(self, v):
-        if v and len(v) >= 2:
-            self.kv.state = (v[0], v[1])
-            self.gla.cache = v[2] if len(v) > 2 else None
-        else:
-            self.kv.state = (None, None)
-            self.gla.cache = None
-
-    def is_trimmable(self):
-        return False
-
-    def trim(self, n):
-        return 0
-
-
 class ChunkedKVCache(KVCache):
     def __init__(self, chunk_size):
         super().__init__()
