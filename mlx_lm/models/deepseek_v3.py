@@ -466,7 +466,26 @@ class Model(nn.Module):
             )
             return weight[:m, :n].astype(dtype)
 
-        # Dequantize
+        def dequant_int4(w, s):
+            w = ((w[..., None] >> mx.arange(32, step=4)) & 15) - 8
+            w = mx.flatten(w, -2)
+            w = mx.unflatten(w, axis=-1, shape=(-1, 32))
+            w = s[..., None] * w.astype(s.dtype)
+            return mx.flatten(w, -2)
+
+        # Dequantize int4
+        new_weights = {}
+        for k, v in weights.items():
+            if k.endswith("weight_shape"):
+                base = k.replace("weight_shape", "")
+                w = weights[base + "weight_packed"]
+                s = weights[base + "weight_scale"]
+                new_weights[base + "weight"] = dequant_int4(w, s)
+            elif not (k.endswith("weight_scale") or k.endswith("weight_packed")):
+                new_weights[k] = v
+        weights = new_weights
+
+        # Dequantize fp8
         new_weights = {}
         for k, v in weights.items():
             if "weight_scale_inv" in k:
