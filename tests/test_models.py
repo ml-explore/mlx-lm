@@ -1975,6 +1975,27 @@ class TestModels(unittest.TestCase):
                 "group_norm_size": 1,
                 "max_position_embeddings": 1000,
             },
+            {
+                "model_type": "kimi_linear",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "intermediate_size": 128,
+                "head_dim": 32,
+                "rope_theta": 100.0,
+                "rms_norm_eps": 1e-6,
+                "linear_attn_config": {
+                    "num_heads": 8,
+                    "head_dim": 32,
+                    "kda_layers": [1],
+                },
+                "model_max_length": 1000,
+                "num_experts": 2,
+                "moe_intermediate_size": 128,
+                "kv_lora_rank": 8,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]

@@ -1,9 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -33,26 +30,19 @@ class ModelArgs(BaseModelArgs):
     head_dim: int
     rope_theta: float
     rms_norm_eps: float
-    hidden_act: str = "silu"
-    initializer_range: float = 0.02
+    linear_attn_config: Dict[str, Any]
+    model_max_length: int
+    num_experts: int
+    moe_intermediate_size: int
+    kv_lora_rank: int
     rope_scaling: Optional[Dict[str, Any]] = None
-    partial_rotary_factor: float = 1.0
     tie_word_embeddings: bool = False
-    use_cache: bool = True
-
-    q_lora_rank: Optional[int] = None
-    kv_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
     mla_use_nope: bool = False
-
-    linear_attn_config: Optional[Dict[str, Any]] = None
-
-    num_experts: Optional[int] = None
     num_experts_per_token: int = 1
     num_shared_experts: int = 0
-    moe_intermediate_size: Optional[int] = None
     moe_router_activation_func: str = "sigmoid"
     moe_renormalize: bool = True
     routed_scaling_factor: float = 1.0
@@ -61,51 +51,6 @@ class ModelArgs(BaseModelArgs):
     use_grouped_topk: bool = True
     num_expert_group: int = 1
     topk_group: int = 1
-
-    model_max_length: Optional[int] = None
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-        if self.linear_attn_config is not None:
-            for key in ("head_dim", "num_heads", "short_conv_kernel_size"):
-                if key not in self.linear_attn_config:
-                    raise ValueError(
-                        f"linear_attn_config missing required field '{key}'"
-                    )
-
-    @property
-    def is_moe(self) -> bool:
-        return self.num_experts is not None and self.num_experts > 0
-
-    @property
-    def is_mla(self) -> bool:
-        return (
-            any(
-                getattr(self, name) is not None
-                for name in (
-                    "q_lora_rank",
-                    "kv_lora_rank",
-                    "qk_nope_head_dim",
-                    "qk_rope_head_dim",
-                    "v_head_dim",
-                )
-            )
-            or self.mla_use_nope
-        )
-
-    @property
-    def is_linear_attn(self) -> bool:
-        return self.linear_attn_config is not None
-
-    def is_kda_layer(self, layer_idx: int) -> bool:
-        if not self.is_linear_attn:
-            return False
-        kda_layers = self.linear_attn_config.get("kda_layers")
-        if not kda_layers:
-            return False
-        return (layer_idx + 1) in kda_layers
 
 
 class KimiMLP(nn.Module):
@@ -223,16 +168,14 @@ class KimiMLAAttention(nn.Module):
 
         hidden = args.hidden_size
         self.q_proj = nn.Linear(hidden, self.num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj = nn.Linear(
+        self.kv_a_proj_with_mqa = nn.Linear(
             hidden,
-            (args.kv_lora_rank or 0) + self.qk_rope_head_dim,
+            args.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_norm = nn.RMSNorm(
-            args.kv_lora_rank or self.qk_nope_head_dim, eps=args.rms_norm_eps
-        )
+        self.kv_a_layernorm = nn.RMSNorm(args.kv_lora_rank, eps=args.rms_norm_eps)
         self.kv_b_proj = nn.Linear(
-            args.kv_lora_rank or self.qk_nope_head_dim,
+            args.kv_lora_rank,
             self.num_heads
             * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
             bias=False,
@@ -245,7 +188,7 @@ class KimiMLAAttention(nn.Module):
             base=args.rope_theta,
             traditional=False,
             scaling_config=args.rope_scaling,
-            max_position_embeddings=args.model_max_length or 1_000_000,
+            max_position_embeddings=args.model_max_length,
         )
 
     def __call__(
@@ -258,11 +201,11 @@ class KimiMLAAttention(nn.Module):
         q_states = self.q_proj(x).reshape(B, L, self.num_heads, self.q_head_dim)
         q_pass, q_rot = mx.split(q_states, [self.qk_nope_head_dim], axis=-1)
 
-        compressed = self.kv_a_proj(x)
+        compressed = self.kv_a_proj_with_mqa(x)
         k_pass, k_rot = mx.split(
             compressed, [compressed.shape[-1] - self.qk_rope_head_dim], axis=-1
         )
-        k_pass = self.kv_a_norm(k_pass)
+        k_pass = self.kv_a_layernorm(k_pass)
         kv = self.kv_b_proj(k_pass)
         kv = kv.reshape(
             B,
@@ -333,8 +276,6 @@ class ShortConv1d(nn.Module):
 class KimiDeltaAttention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        if args.linear_attn_config is None:
-            raise ValueError("linear_attn_config must be provided for KDA layers")
         cfg = args.linear_attn_config
 
         self.layer_idx = layer_idx
@@ -362,8 +303,9 @@ class KimiDeltaAttention(nn.Module):
         self.g_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
         self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
 
-        self.A_log = mx.log(
-            mx.random.uniform(low=1.0, high=16.0, shape=(self.num_heads,))
+        self.A_log = mx.expand_dims(
+            mx.log(mx.random.uniform(low=1.0, high=16.0, shape=(self.num_heads,))),
+            (0, 1, 3),
         )
         self.dt_bias = mx.zeros((self.projection_dim,))
 
@@ -379,31 +321,26 @@ class KimiDeltaAttention(nn.Module):
         B, T, _ = x.shape
         dtype = x.dtype
 
-        conv_state = None
-        recurrent_state = None
         if cache is not None:
-            conv_state = cache[0]
-            recurrent_state = cache[1]
+            conv_state, ssm_state = cache
+        else:
+            conv_state = None
+            ssm_state = None
 
         if conv_state is None:
-            zeros_q = mx.zeros(
-                (B, self.conv_kernel - 1, self.projection_dim), dtype=dtype
-            )
-            zeros_k = mx.zeros(
-                (B, self.conv_kernel - 1, self.projection_dim), dtype=dtype
-            )
-            zeros_v = mx.zeros(
-                (B, self.conv_kernel - 1, self.projection_dim), dtype=dtype
-            )
+            s = mx.zeros((B, self.conv_kernel - 1, self.projection_dim), dtype=dtype)
+            q_state = s
+            k_state = s
+            v_state = s
         else:
-            zeros_q, zeros_k, zeros_v = conv_state
+            q_state, k_state, v_state = conv_state
 
-        q_conv, conv_q = self.q_conv(self.q_proj(x), zeros_q)
-        k_conv, conv_k = self.k_conv(self.k_proj(x), zeros_k)
-        v_conv, conv_v = self.v_conv(self.v_proj(x), zeros_v)
+        q_conv, q_state = self.q_conv(self.q_proj(x), q_state)
+        k_conv, k_state = self.k_conv(self.k_proj(x), k_state)
+        v_conv, v_state = self.v_conv(self.v_proj(x), v_state)
 
         if cache is not None:
-            cache[0] = (conv_q, conv_k, conv_v)
+            cache[0] = (q_state, k_state, v_state)
 
         q = q_conv.reshape(B, T, self.num_heads, self.head_dim)
         k = k_conv.reshape(B, T, self.num_heads, self.head_dim)
@@ -422,19 +359,7 @@ class KimiDeltaAttention(nn.Module):
         )
         b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
 
-        state_in = None
-        if recurrent_state is not None:
-            state_in = recurrent_state
-
-        mask_bool: Optional[mx.array] = None
-        if mask is not None:
-            mask_bool = mask.astype(mx.bool_) if mask.dtype != mx.bool_ else mask
-            if mask_bool.ndim == 2:
-                mask_bool = mx.expand_dims(mask_bool, axis=-1)
-            if mask_bool is not None and mask_bool.shape[-1] == 1:
-                mask_bool = mx.broadcast_to(mask_bool, (B, T, self.num_heads))
-
-        out, new_state = gated_delta_update(
+        out, ssm_state = gated_delta_update(
             q,
             k,
             v,
@@ -442,13 +367,13 @@ class KimiDeltaAttention(nn.Module):
             b_logits,
             self.A_log.reshape(self.num_heads, 1),
             self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=state_in,
-            mask=mask_bool,
-            use_kernel=True,
+            state=ssm_state,
+            mask=mask,
+            use_kernel=not self.training,
         )
 
         if cache is not None:
-            cache[1] = new_state
+            cache[1] = ssm_state
 
         gate = self.g_b_proj(self.g_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim
@@ -463,14 +388,16 @@ class KimiDeltaAttention(nn.Module):
 class KimiDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.is_linear = args.is_kda_layer(layer_idx)
+        kda_layers = args.linear_attn_config["kda_layers"]
+        self.is_linear = (layer_idx + 1) in kda_layers
+
         if self.is_linear:
             self.self_attn = KimiDeltaAttention(args, layer_idx)
         else:
             self.self_attn = KimiMLAAttention(args)
 
         if (
-            args.is_moe
+            args.num_experts > 0
             and layer_idx >= args.first_k_dense_replace
             and layer_idx % args.moe_layer_freq == 0
         ):
@@ -502,6 +429,12 @@ class KimiLinearModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [KimiDecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        kda_layers = args.linear_attn_config["kda_layers"]
+        self.ssm_idx = kda_layers[0] - 1
+        for i in range(len(self.layers)):
+            if (i + 1) not in kda_layers:
+                self.attn_idx = i
+                break
 
     def __call__(
         self,
@@ -512,11 +445,11 @@ class KimiLinearModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        attn_mask = create_attention_mask(h, cache[self.attn_idx])
+
         for layer, layer_cache in zip(self.layers, cache):
-            if layer.is_linear:
-                mask = create_ssm_mask(h, layer_cache)
-            else:
-                mask = create_attention_mask(h, layer_cache)
+            mask = ssm_mask if layer.is_linear else attn_mask
             h = layer(h, mask=mask, cache=layer_cache)
 
         return self.norm(h)
@@ -614,22 +547,10 @@ class Model(nn.Module):
                         if w.ndim == 3:
                             w = w.moveaxis(2, 1)
                         weights[f"{attn_prefix}.{dst_name}.conv.weight"] = w
-                A_key = f"{attn_prefix}.A_log"
-                if A_key in weights:
-                    if weights[A_key].ndim == 4:
-                        weights[A_key] = mx.squeeze(weights[A_key], axis=(0, 1, 3))
                 dt_key = f"{attn_prefix}.dt_bias"
                 if dt_key in weights:
                     if weights[dt_key].ndim > 1:
                         weights[dt_key] = mx.reshape(weights[dt_key], (-1,))
-            elif isinstance(attn, KimiMLAAttention):
-                attn_prefix = f"{prefix}.self_attn"
-                proj_key = f"{attn_prefix}.kv_a_proj_with_mqa.weight"
-                if proj_key in weights:
-                    weights[f"{attn_prefix}.kv_a_proj.weight"] = weights.pop(proj_key)
-                norm_key = f"{attn_prefix}.kv_a_layernorm.weight"
-                if norm_key in weights:
-                    weights[f"{attn_prefix}.kv_a_norm.weight"] = weights.pop(norm_key)
 
         return weights
 

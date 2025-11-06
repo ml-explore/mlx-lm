@@ -7,8 +7,8 @@ import mlx.nn as nn
 
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
-    return mx.exp(
-        -mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias).astype(A_log.dtype)
+    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias)).astype(
+        A_log.dtype
     )
 
 
@@ -152,7 +152,7 @@ def _gated_delta_step_ops(
     if g.ndim == 2:
         decay = g[..., None, None]
     elif g.ndim == 3:
-        decay = g[..., :, None]
+        decay = g[..., None, :]
     else:
         raise ValueError(f"Unsupported gating shape {g.shape}")
     state = state * decay
@@ -183,8 +183,6 @@ def gated_delta_kernel(
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     if g.ndim == 4:
-        if Dk % 32 != 0:
-            return gated_delta_ops(q, k, v, g, beta, state, mask)
         kernel = _gated_delta_kernel_vec
         inputs = [q, k, v, g, beta, state, T]
         if mask is not None:
