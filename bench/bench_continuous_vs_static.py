@@ -7,6 +7,9 @@ Run: python bench/bench_continuous_vs_static.py --repo mlx-community/Llama-3.2-3
 """
 
 import argparse
+import itertools
+import os
+from contextlib import contextmanager
 import json
 import logging
 import math
@@ -15,16 +18,20 @@ import threading
 import time
 from dataclasses import dataclass
 from statistics import mean, median
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 from mlx_lm import batch_generate, load
+from mlx_lm.sample_utils import make_sampler
 from mlx_lm.server_batched.engine import ModelRunner
 from mlx_lm.server_batched.runtime import ContinuousBatchingRuntime
 
 random.seed(0)
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+# TODO: Drop this fallback once paged attention lands and dense slabs disappear.
+KV_SLAB_LIMIT_BYTES = int(os.environ.get("MLX_KV_SLAB_LIMIT_MB", "320")) * 1024 * 1024
 
 
 @dataclass
@@ -128,6 +135,164 @@ def compute_steady_state_tps(
     return (samples[mid - 1] + samples[mid]) / 2.0
 
 
+
+
+def phase_summaries(
+    history: List[Dict[str, float]],
+    *,
+    steady_fraction: float,
+    max_num_seqs: int,
+    spike_threshold_s: float = 0.2,
+) -> Dict[str, Dict[str, float]]:
+    if not history or steady_fraction <= 0 or max_num_seqs <= 0:
+        return {}
+
+    threshold = steady_fraction * max_num_seqs
+    first_steady = None
+    last_steady = None
+    for idx, tick in enumerate(history):
+        if tick.get("active_sequences", 0) >= threshold:
+            if first_steady is None:
+                first_steady = idx
+            last_steady = idx
+
+    if first_steady is None:
+        ramp_indices = list(range(len(history)))
+        steady_indices: List[int] = []
+        tail_indices: List[int] = []
+    else:
+        ramp_indices = list(range(0, first_steady))
+        steady_indices = list(range(first_steady, last_steady + 1))
+        tail_indices = list(range(last_steady + 1, len(history)))
+
+    def aggregate(indices: List[int]) -> Dict[str, float]:
+        ticks = len(indices)
+        if ticks == 0:
+            return {
+                "ticks": 0,
+                "time_s": 0.0,
+                "tokens": 0,
+                "tokens_per_sec": 0.0,
+                "mean_decode_ms": 0.0,
+                "mean_batch": 0.0,
+                "prefill_tokens": 0,
+            }
+        total_time = sum(history[i].get("decode_duration_s", 0.0) for i in indices)
+        total_tokens = sum(history[i].get("decode_tokens", 0) for i in indices)
+        mean_batch = (
+            sum(history[i].get("decode_batch_size", history[i].get("active_sequences", 0)) for i in indices)
+            / ticks
+        )
+        total_prefill = sum(history[i].get("prefill_tokens", 0) for i in indices)
+        tokens_per_sec = total_tokens / total_time if total_time > 0 else 0.0
+        mean_decode_ms = (total_time / ticks) * 1000.0 if ticks else 0.0
+        return {
+            "ticks": ticks,
+            "time_s": total_time,
+            "tokens": total_tokens,
+            "tokens_per_sec": tokens_per_sec,
+            "mean_decode_ms": mean_decode_ms,
+            "mean_batch": mean_batch,
+            "prefill_tokens": total_prefill,
+        }
+
+    summaries = {
+        "ramp": aggregate(ramp_indices),
+        "steady": aggregate(steady_indices),
+        "tail": aggregate(tail_indices),
+    }
+
+    spike_ticks = [tick for tick in history if tick.get("decode_duration_s", 0.0) > spike_threshold_s]
+    spike_time = sum(tick.get("decode_duration_s", 0.0) for tick in spike_ticks)
+    summaries["spikes"] = {
+        "count": len(spike_ticks),
+        "time_s": spike_time,
+        "threshold_s": spike_threshold_s,
+    }
+
+    return summaries
+
+
+def should_schedule_open_loop(
+    backlog: int,
+    free_slots: int,
+    active_slots: int,
+    max_num_seqs: int,
+    *,
+    target_tokens: Optional[int],
+    total_tokens_emitted: int,
+) -> bool:
+    if active_slots >= max_num_seqs:
+        return False
+    if free_slots <= 0:
+        return False
+    if backlog >= max_num_seqs:
+        return False
+    if target_tokens is not None and total_tokens_emitted >= target_tokens:
+        return False
+    return True
+
+
+def _extract_layers(model) -> Optional[List]:
+    if hasattr(model, "layers") and model.layers:
+        return list(model.layers)
+    core = getattr(model, "model", None)
+    if core is not None and hasattr(core, "layers") and core.layers:
+        return list(core.layers)
+    return None
+
+
+def estimate_safe_max_num_seqs(
+    model,
+    requested: int,
+    max_tokens: int,
+    *,
+    limit_bytes: int = KV_SLAB_LIMIT_BYTES,
+) -> Tuple[int, Optional[Dict[str, int]]]:
+    if requested <= 0 or max_tokens <= 0 or limit_bytes <= 0:
+        return max(1, requested), None
+
+    layers = _extract_layers(model)
+    if not layers:
+        return requested, None
+
+    attn = getattr(layers[0], "self_attn", None)
+    if attn is None:
+        return requested, None
+
+    n_kv_heads = getattr(attn, "n_kv_heads", None)
+    head_dim = getattr(attn, "head_dim", None)
+    if not n_kv_heads or not head_dim:
+        return requested, None
+
+    dtype = None
+    if hasattr(attn, "k_proj") and hasattr(attn.k_proj, "weight"):
+        dtype = attn.k_proj.weight.dtype
+    elif hasattr(attn, "v_proj") and hasattr(attn.v_proj, "weight"):
+        dtype = attn.v_proj.weight.dtype
+    dtype_size = getattr(dtype, "size", 2) if dtype is not None else 2
+
+    per_token_bytes = n_kv_heads * head_dim * dtype_size * 2
+    per_slot_bytes = per_token_bytes * max_tokens * len(layers)
+    if per_slot_bytes <= 0:
+        return requested, None
+
+    safe_slots = int(limit_bytes // per_slot_bytes)
+    safe_slots = max(1, safe_slots)
+    if safe_slots >= requested:
+        return requested, None
+
+    meta = {
+        "limit_bytes": int(limit_bytes),
+        "per_slot_bytes": int(per_slot_bytes),
+        "dtype_size": int(dtype_size),
+        "n_kv_heads": int(n_kv_heads),
+        "head_dim": int(head_dim),
+        "num_layers": int(len(layers)),
+    }
+    return safe_slots, meta
+
+
 def poisson_arrivals(lmbda: float, n: int):
     t = 0.0
     out = []
@@ -172,36 +337,81 @@ def summarize(name: str, results: List[Result]):
     return tokens_per_sec, wall_seconds, total_tokens
 
 
-def run_static(model, tokenizer, prompts, max_tokens, *, stop_tokens, sampler_settings):
+def run_static(
+    model,
+    tokenizer,
+    prompts,
+    max_tokens,
+    *,
+    stop_tokens,
+    sampler_settings,
+    open_loop: bool,
+    tokens_target: Optional[int],
+):
     prompt_token_batches = [tokenizer.encode(p) for p in prompts]
-    start_ns = time.perf_counter_ns()
-    response = batch_generate(
-        model,
-        tokenizer,
-        prompt_token_batches,
-        max_tokens=max_tokens,
-        verbose=False,
-        stop_tokens=stop_tokens,
-        temp=sampler_settings["temp"],
-        top_p=sampler_settings["top_p"],
-        min_p=sampler_settings["min_p"],
-        top_k=sampler_settings["top_k"],
-        xtc_probability=sampler_settings["xtc_probability"],
-        xtc_threshold=sampler_settings["xtc_threshold"],
-    )
-    end_ns = time.perf_counter_ns()
-    results = []
-    for text in response.texts:
-        tokens = len(tokenizer.encode(text, add_special_tokens=False))
-        results.append(
-            Result(
-                submit_ns=start_ns,
-                first_token_ns=end_ns,
-                finish_ns=end_ns,
-                gen_tokens=tokens,
+    results: List[Result] = []
+    total_tokens = 0
+    target_tokens = tokens_target if (open_loop and tokens_target and tokens_target > 0) else None
+    sampler = make_sampler(**sampler_settings)
+    with _override_tokenizer_stops(tokenizer, stop_tokens):
+        while True:
+            start_ns = time.perf_counter_ns()
+            response = batch_generate(
+                model,
+                tokenizer,
+                prompt_token_batches,
+                max_tokens=max_tokens,
+                verbose=False,
+                sampler=sampler,
             )
-        )
+            end_ns = time.perf_counter_ns()
+            batch_tokens = 0
+            for text in response.texts:
+                tokens = len(tokenizer.encode(text, add_special_tokens=False))
+                batch_tokens += tokens
+                results.append(
+                    Result(
+                        submit_ns=start_ns,
+                        first_token_ns=end_ns,
+                        finish_ns=end_ns,
+                        gen_tokens=tokens,
+                    )
+                )
+            total_tokens += batch_tokens
+            if not open_loop:
+                break
+            if target_tokens is not None and total_tokens >= target_tokens:
+                break
     return results
+
+
+@contextmanager
+def _override_tokenizer_stops(tokenizer, stop_tokens: List[int]):
+    original_ids = getattr(tokenizer, "eos_token_ids", None)
+    had_ids = hasattr(tokenizer, "eos_token_ids")
+    original_id = getattr(tokenizer, "eos_token_id", None)
+    had_id = hasattr(tokenizer, "eos_token_id")
+    try:
+        override_ids = list(stop_tokens)
+        override_id = override_ids[0] if override_ids else None
+        setattr(tokenizer, "eos_token_ids", override_ids)
+        setattr(tokenizer, "eos_token_id", override_id)
+        yield
+    finally:
+        if had_ids:
+            setattr(tokenizer, "eos_token_ids", original_ids)
+        else:
+            try:
+                delattr(tokenizer, "eos_token_ids")
+            except AttributeError:
+                pass
+        if had_id:
+            setattr(tokenizer, "eos_token_id", original_id)
+        else:
+            try:
+                delattr(tokenizer, "eos_token_id")
+            except AttributeError:
+                pass
 
 
 def run_continuous(
@@ -217,6 +427,8 @@ def run_continuous(
     stop_tokens_override: Optional[set],
     use_eos_stop: bool,
     sampler_settings: Dict[str, float],
+    open_loop: bool,
+    tokens_target: Optional[int],
 ):
     runner = ModelRunner(
         model,
@@ -226,6 +438,8 @@ def run_continuous(
         prefill_chunk=prefill_chunk,
         stop_tokens=stop_tokens_override,
     )
+    runner.open_loop_mode = open_loop
+    runner.open_loop_draining = False
     logging.info("runtime stop_tokens=%s", sorted(runner.stop_tokens))
     runtime = ContinuousBatchingRuntime(
         runner,
@@ -243,17 +457,25 @@ def run_continuous(
     )
     stop_list = sorted(stop_tokens_override) if stop_tokens_override else []
     stopping_template["stop_token_ids"] = stop_list
-    arrivals = poisson_arrivals(lmbda, len(prompts))
+    closed_arrivals = poisson_arrivals(lmbda, len(prompts)) if not open_loop else None
     start = time.perf_counter()
+    request_seq = itertools.count()
+    scheduled_count = 0
+    completed_count = 0
+    inflight = 0
+    total_tokens_emitted = 0
+    target_tokens = tokens_target if (open_loop and tokens_target and tokens_target > 0) else None
+    if open_loop and target_tokens is None:
+        target_tokens = max_tokens * max_num_seqs * 10
 
-    def submit(idx, arrival_s):
+    def submit(prompt_idx, arrival_s):
         while True:
             elapsed = time.perf_counter() - start
             if elapsed >= arrival_s:
                 break
             time.sleep(min(0.001, arrival_s - elapsed))
 
-        prompt = prompts[idx]
+        prompt = prompts[prompt_idx % len(prompts)]
         prompt_tokens = tokenizer.encode(prompt)
         stopping_settings = dict(stopping_template)
 
@@ -285,6 +507,7 @@ def run_continuous(
             if finish_ns is None:
                 finish_ns = time.perf_counter_ns()
             with lock:
+                nonlocal completed_count, inflight, total_tokens_emitted
                 results.append(
                     Result(
                         submit_ns=submit_ns,
@@ -293,12 +516,81 @@ def run_continuous(
                         gen_tokens=max(final_tokens, 0),
                     )
                 )
+                completed_count += 1
+                inflight = max(inflight - 1, 0)
+                total_tokens_emitted += max(final_tokens, 0)
+                should_schedule = False
+                if open_loop:
+                    allocator = getattr(runner, "slot_allocator", None)
+                if allocator is not None:
+                    free_slots = allocator.available()
+                    active_slots = allocator.active_count
+                else:
+                    free_slots = max(0, max_num_seqs - inflight)
+                    active_slots = max_num_seqs - free_slots
+                backlog = scheduled_count - completed_count
+                should_schedule = should_schedule_open_loop(
+                    backlog,
+                    free_slots,
+                    active_slots,
+                    max_num_seqs,
+                    target_tokens=target_tokens,
+                    total_tokens_emitted=total_tokens_emitted,
+                )
+                if not should_schedule:
+                        runner.open_loop_draining = True
+            if should_schedule:
+                schedule_next()
 
     threads = []
-    for idx, arrival in enumerate(arrivals):
-        th = threading.Thread(target=submit, args=(idx, arrival), daemon=True)
+    arrival_lock = threading.Lock()
+
+    def schedule_next() -> bool:
+        nonlocal scheduled_count, inflight
+        with arrival_lock:
+            if not open_loop and scheduled_count >= len(prompts):
+                return False
+            if open_loop:
+                allocator = getattr(runner, "slot_allocator", None)
+                if allocator is not None:
+                    free_slots = allocator.available()
+                    active_slots = allocator.active_count
+                else:
+                    free_slots = max(0, max_num_seqs - inflight)
+                    active_slots = max_num_seqs - free_slots
+                backlog = scheduled_count - completed_count
+                if not should_schedule_open_loop(
+                    backlog,
+                    free_slots,
+                    active_slots,
+                    max_num_seqs,
+                    target_tokens=target_tokens,
+                    total_tokens_emitted=total_tokens_emitted,
+                ):
+                    return False
+                arrival_s = time.perf_counter() - start
+            else:
+                arrival_s = closed_arrivals[scheduled_count]
+            prompt_idx = next(request_seq)
+            scheduled_count += 1
+            inflight += 1
+        th = threading.Thread(target=submit, args=(prompt_idx, arrival_s), daemon=True)
         th.start()
         threads.append(th)
+        return True
+
+    initial_requests = max_num_seqs if open_loop else len(prompts)
+
+    for _ in range(max(1, initial_requests)):
+        if not schedule_next():
+            break
+
+    while True:
+        with lock:
+            done = completed_count >= scheduled_count and inflight == 0
+        if done:
+            break
+        time.sleep(0.01)
 
     for th in threads:
         th.join()
@@ -352,12 +644,41 @@ def main():
         default=4096,
         help="Token budget per scheduler step for the continuous runtime.",
     )
+    parser.add_argument(
+        "--open-loop",
+        action="store_true",
+        help="Keep scheduling new requests to maintain occupancy until the token target is reached.",
+    )
+    parser.add_argument(
+        "--tokens-target",
+        type=int,
+        default=0,
+        help="Total generation tokens to emit in open-loop mode (default: 10x max_num_seqs*max_tokens).",
+    )
     args = parser.parse_args()
 
     model, tokenizer = load(path_or_hf_repo=args.repo)
     n_reqs = normalise_request_count(args.n, args.concurrency)
     base_prompt = "Tell me a haiku about mac GPUs." * 4
     prompts = [base_prompt[: args.prompt_len] for _ in range(n_reqs)]
+    max_num_seqs, kv_meta = estimate_safe_max_num_seqs(
+        model,
+        args.max_num_seqs,
+        args.max_tokens,
+        limit_bytes=KV_SLAB_LIMIT_BYTES,
+    )
+    if kv_meta is not None:
+        logging.warning(
+            "max_num_seqs reduced from %s to %s based on estimated KV slab size %.2f MB per slot (limit %.2f MB)",
+            args.max_num_seqs,
+            max_num_seqs,
+            kv_meta["per_slot_bytes"] / (1024 * 1024),
+            kv_meta["limit_bytes"] / (1024 * 1024),
+        )
+    target_tokens = None
+    if args.open_loop:
+        default_budget = max_num_seqs * args.max_tokens * 10
+        target_tokens = args.tokens_target if args.tokens_target > 0 else default_budget
 
     explicit_stops = set(args.stop_token) if args.stop_token else None
     controls = select_token_controls(
@@ -373,6 +694,8 @@ def main():
         args.max_tokens,
         stop_tokens=controls.static_stop_tokens,
         sampler_settings=controls.sampler_settings,
+        open_loop=args.open_loop,
+        tokens_target=target_tokens,
     )
     static_tps, static_wall, static_tokens = summarize("static_batch_generate", static_results)
 
@@ -384,24 +707,48 @@ def main():
         prompts,
         args.max_tokens,
         lmbda,
-        max_num_seqs=args.max_num_seqs,
+        max_num_seqs=max_num_seqs,
         prefill_chunk=args.prefill_chunk,
         max_tokens_per_step=args.max_tokens_per_step,
         stop_tokens_override=controls.runtime_stop_tokens,
         use_eos_stop=controls.use_eos_stop,
         sampler_settings=controls.sampler_settings,
+        open_loop=args.open_loop,
+        tokens_target=target_tokens,
     )
     cont_tps, cont_wall, cont_tokens = summarize("continuous_runtime", continuous_results)
     steady_tps = compute_steady_state_tps(
         history,
         steady_fraction=args.steady_fraction,
-        max_num_seqs=args.max_num_seqs,
+        max_num_seqs=max_num_seqs,
+    )
+    phases = phase_summaries(
+        history,
+        steady_fraction=args.steady_fraction,
+        max_num_seqs=max_num_seqs,
     )
     if steady_tps:
         print(
-            f"[continuous_runtime steady] active>={args.steady_fraction * args.max_num_seqs:.1f} "
+            f"[continuous_runtime steady] active>={args.steady_fraction * max_num_seqs:.1f} "
             f"tokens/s={steady_tps:.2f}"
         )
+    if phases:
+        for phase_name in ("ramp", "steady", "tail"):
+            stats = phases.get(phase_name)
+            if not stats:
+                continue
+            print(
+                f"[phase {phase_name}] ticks={stats['ticks']} time={stats['time_s']:.2f}s "
+                f"tokens={stats['tokens']} tokens/s={stats['tokens_per_sec']:.2f} "
+                f"mean_decode_ms={stats['mean_decode_ms']:.1f} mean_batch={stats['mean_batch']:.1f} "
+                f"prefill_tokens={stats['prefill_tokens']}"
+            )
+        spikes = phases.get("spikes")
+        if spikes:
+            print(
+                f"[phase spikes] count={spikes['count']} time={spikes['time_s']:.2f}s "
+                f"threshold={spikes['threshold_s']:.2f}s"
+            )
 
     print(
         json.dumps(
@@ -413,6 +760,9 @@ def main():
                 "continuous_total_tokens": cont_tokens,
                 "continuous_wall_seconds": cont_wall,
                 "continuous_steady_tokens_per_sec": steady_tps,
+                "continuous_phase_details": phases,
+                "effective_max_num_seqs": max_num_seqs,
+                "kv_capacity_meta": kv_meta,
             },
             indent=2,
         )

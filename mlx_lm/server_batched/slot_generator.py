@@ -51,6 +51,15 @@ class SlotLayerSlab:
             return
         grow = max(required_tokens - self.capacity, self.capacity)
         pad_shape = (self.max_slots, grow, self.n_kv_heads, self.head_dim)
+        if required_tokens >= 256:
+            logging.warning(
+                "slot_layer_slab.ensure_capacity layer=%s required=%s current=%s grow=%s dtype=%s",
+                id(self),
+                required_tokens,
+                self.capacity,
+                grow,
+                self.dtype,
+            )
         pad_k = mx.zeros(pad_shape, dtype=self.dtype)
         pad_v = mx.zeros(pad_shape, dtype=self.dtype)
         self.keys = mx.concatenate([self.keys, pad_k], axis=1)
@@ -68,6 +77,15 @@ class SlotLayerSlab:
         for idx, slot in enumerate(slot_ids):
             start = self.lengths[slot]
             end = start + tokens
+            if end > self.capacity:
+                logging.warning(
+                    "slot_layer_slab.append_batch slot=%s start=%s tokens=%s end=%s capacity=%s",
+                    slot,
+                    start,
+                    tokens,
+                    end,
+                    self.capacity,
+                )
             self.ensure_capacity(end)
             self.keys[slot, start:end] = keys_t[idx]
             self.values[slot, start:end] = values_t[idx]
@@ -119,6 +137,13 @@ class SlotKVSlab:
         n_kv_heads = int(keys.shape[1])
         head_dim = int(keys.shape[3])
         dtype = keys.dtype
+        logging.info(
+            "slot_layer_slab.ensure_layer layer=%s dtype=%s heads=%s head_dim=%s",
+            layer_idx,
+            dtype,
+            n_kv_heads,
+            head_dim,
+        )
         initial_capacity = int(keys.shape[2])
         self.layers[layer_idx] = SlotLayerSlab(
             self.max_slots,
@@ -151,6 +176,7 @@ class SlotKVSlab:
         layer = self.layers[layer_idx]
         if layer is None:
             return
+        # TODO: Replace append with paged KV updates when paged attention is wired in.
         layer.append_batch(slot_ids, keys, values)
 
     def reset_slot(self, slot: int) -> None:

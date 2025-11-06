@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import time
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -91,6 +92,8 @@ class ModelRunner:
         )
         self.slot_batcher = SlotBatcher(self.slot_allocator, self.slot_kv_cache)
         self.uid_to_context: Dict[int, SequenceContext] = {}
+        self.decode_buckets = self._compute_decode_buckets(max_num_seqs)
+        self._decode_warm = False
 
         if self.use_legacy_generator:
             self.legacy_generator = BatchGenerator(
@@ -110,6 +113,7 @@ class ModelRunner:
                 slot_alloc=self.slot_allocator,
                 prefill_chunk=prefill_chunk,
             )
+            self._prewarm_decode_buckets()
 
     # ------------------------------------------------------------------#
     # Context preparation
@@ -158,6 +162,62 @@ class ModelRunner:
         ctx.history_tokens = list(prompt_tokens)
         ctx.stop_sequences = list(stopping_cfg.get("stop_id_sequences", []))
         ctx.stop_tokens = set(self.stop_tokens)
+        return ctx
+
+    def _compute_decode_buckets(self, max_num_seqs: int) -> List[int]:
+        if max_num_seqs <= 0:
+            return [1]
+        fractions = (1.0, 0.75, 0.5, 0.25, 0.125)
+        buckets = {max(1, int(round(max_num_seqs * frac))) for frac in fractions}
+        buckets.add(1)
+        return sorted(buckets, reverse=True)
+
+    def _prewarm_decode_buckets(self) -> None:
+        if self.use_legacy_generator or self._decode_warm:
+            return
+        try:
+            call_sig = inspect.signature(self.model.__call__)
+            if "cache" not in call_sig.parameters:
+                self._decode_warm = True
+                return
+        except (TypeError, ValueError, AttributeError):
+            self._decode_warm = True
+            return
+        try:
+            for bucket in self.decode_buckets:
+                if bucket <= 0:
+                    continue
+                contexts = [self._make_padding_context(bucket, idx) for idx in range(bucket)]
+                try:
+                    self.slot_generator.decode_step(contexts)
+                finally:
+                    for ctx in contexts:
+                        ctx.state.finished = True
+                        self.slot_generator.on_release(ctx)
+        finally:
+            self._decode_warm = True
+
+    def _make_padding_context(self, bucket: int, index: int) -> SequenceContext:
+        state = SequenceState(
+            request_id=f"_warmup_{bucket}_{index}",
+            prompt_len=1,
+            max_new_tokens=1,
+        )
+        ctx = SequenceContext(
+            state=state,
+            prompt_tokens=[0],
+            sampler_settings={},
+            stopping_settings={},
+            tokenizer=self.tokenizer,
+        )
+        ctx.history_tokens = [0]
+        ctx.last_token_id = getattr(self.tokenizer, "bos_token_id", 0)
+        admitted = self.slot_generator.on_admit(ctx)
+        if not admitted:
+            raise RuntimeError("Unable to admit warmup context; insufficient slots.")
+        remaining = ctx.state.remaining_prompt_tokens
+        if remaining > 0:
+            self.slot_generator.prefill_tokens(ctx, remaining)
         return ctx
 
     # ------------------------------------------------------------------#

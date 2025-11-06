@@ -22,6 +22,11 @@ class SlotAllocator:
     def capacity(self) -> int:
         return self._max_slots
 
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return self._max_slots - len(self._free)
+
     def available(self) -> int:
         with self._lock:
             return len(self._free)

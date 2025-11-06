@@ -101,11 +101,18 @@ class SchedulerTests(unittest.TestCase):
         scheduler.enqueue(self.make_context("b"))
 
         scheduler.step()
-
         self.assertEqual(runner.prefill_calls[0], ("a", 3))
-        self.assertEqual(runner.decode_calls[0], ["a"])
+        self.assertEqual(runner.decode_calls, [])
         self.assertEqual(len(scheduler._wait_queue), 1)
-        self.assertEqual(scheduler._wait_queue[0].state.request_id, "b")
+
+        scheduler.step()
+        self.assertEqual(runner.decode_calls, [])
+        self.assertEqual(len(scheduler._wait_queue), 0)
+
+        scheduler.step()
+        self.assertEqual(runner.decode_calls[0], ["a", "b"])
+        self.assertFalse(scheduler._wait_queue)
+        self.assertFalse(scheduler._active)
 
     def test_finished_sequences_are_retired_and_new_work_admitted(self):
         runner = FakeRunner({"a": 1, "b": 1})
@@ -121,10 +128,11 @@ class SchedulerTests(unittest.TestCase):
 
         scheduler.step()
         scheduler.step()
+        scheduler.step()
 
         self.assertEqual(runner.prefill_calls[0][0], "a")
         self.assertIn("b", [name for name, _ in runner.prefill_calls[1:]])
-        self.assertEqual(runner.decode_calls, [["a"], ["b"]])
+        self.assertEqual(runner.decode_calls, [["a", "b"]])
         self.assertFalse(scheduler._wait_queue)
         self.assertFalse(scheduler._active)
 

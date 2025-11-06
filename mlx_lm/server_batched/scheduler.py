@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import deque
 import threading
 import time
+from itertools import islice
 from typing import Deque, List
 
 from .state import SequenceContext
@@ -32,12 +33,18 @@ class Scheduler:
         self.prefill_chunk = prefill_chunk
 
         self._wait_queue: Deque[SequenceContext] = deque()
-        self._active: List[SequenceContext] = []
+        self._active: Deque[SequenceContext] = deque()
         self._lock = threading.Lock()
         self._stop = False
         self._last_prefill_tokens = 0
         self._last_decode_batch = 0
         self._last_step_metrics = self._make_empty_metrics()
+        runner_buckets = getattr(runner, "decode_buckets", None)
+        if runner_buckets:
+            self._decode_buckets = list(runner_buckets)
+        else:
+            self._decode_buckets = self._default_decode_buckets(max_num_seqs)
+        self._decode_target = self._decode_buckets[0]
 
     def _make_empty_metrics(self) -> dict:
         return {
@@ -60,20 +67,26 @@ class Scheduler:
 
     def step(self) -> None:
         self.runner.begin_step()
-        prefill_duration = 0.0
-        ready_count = 0
         with self._lock:
             if self._stop:
                 self._last_step_metrics = self._make_empty_metrics()
                 return
-            prefill_start = time.perf_counter()
-            ready = self._prefill_until_budget(self.max_tokens_per_step)
-            prefill_duration = time.perf_counter() - prefill_start
-            ready_count = len(ready)
-            if ready:
-                self._active.extend(ready)
+            active_count = len(self._active)
+            wait_queue_empty = not self._wait_queue
+            open_loop_mode = getattr(self.runner, "open_loop_mode", False)
+            draining = getattr(self.runner, "open_loop_draining", False)
+            need_decode = active_count > 0 and (
+                active_count >= self._decode_target
+                or (wait_queue_empty and (not open_loop_mode or draining))
+            )
 
-            if self._stop or not self._active:
+            if not need_decode:
+                prefill_start = time.perf_counter()
+                ready = self._prefill_until_budget(self.max_tokens_per_step)
+                prefill_duration = time.perf_counter() - prefill_start
+                ready_count = len(ready)
+                if ready:
+                    self._active.extend(ready)
                 stats = self.runner.collect_step_stats()
                 self._last_prefill_tokens = stats.get("prefill_tokens", self._last_prefill_tokens)
                 self._last_decode_batch = 0
@@ -85,20 +98,31 @@ class Scheduler:
                 )
                 return
 
-            active_snapshot = list(self._active)
+            bucket = self._decode_buckets[-1]
+            for candidate in self._decode_buckets:
+                if candidate <= active_count:
+                    bucket = candidate
+                    break
+            bucket = max(1, min(bucket, active_count))
+            active_snapshot = list(islice(self._active, 0, bucket))
 
         decode_stats = self.runner.decode(active_snapshot)
-        self._last_decode_batch = len(active_snapshot)
+        decode_batch = len(active_snapshot)
 
         with self._lock:
-            self._active = [ctx for ctx in self._active if not ctx.state.finished]
+            original_active = list(self._active)
+            processed_ids = {id(ctx) for ctx in active_snapshot}
+            others = [ctx for ctx in original_active if id(ctx) not in processed_ids and not ctx.state.finished]
+            processed_survivors = [ctx for ctx in active_snapshot if not ctx.state.finished]
+            self._active = deque(others + processed_survivors)
             stats = decode_stats or self.runner.collect_step_stats()
-            self._last_prefill_tokens = stats.get("prefill_tokens", self._last_prefill_tokens)
+            self._last_prefill_tokens = stats.get("prefill_tokens", 0)
+            self._last_decode_batch = decode_batch
             self._last_step_metrics = self._compose_metrics(
                 stats=stats,
-                prefill_sequences=ready_count,
+                prefill_sequences=0,
                 decode_batch_size=self._last_decode_batch,
-                prefill_wall=prefill_duration,
+                prefill_wall=0.0,
             )
 
     def _prefill_until_budget(self, token_budget: int) -> List[SequenceContext]:
@@ -198,3 +222,8 @@ class Scheduler:
             metrics["prefill_tokens_step"] = metrics.get("prefill_tokens", 0)
             metrics.setdefault("decode_batch_size", self._last_decode_batch)
             return metrics
+    def _default_decode_buckets(self, max_num_seqs: int) -> List[int]:
+        fractions = (1.0, 0.75, 0.5, 0.25, 0.125)
+        buckets = {max(1, int(round(max_num_seqs * frac))) for frac in fractions}
+        buckets.add(1)
+        return sorted(buckets, reverse=True)
