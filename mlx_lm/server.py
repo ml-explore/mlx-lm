@@ -769,6 +769,11 @@ class APIHandler(BaseHTTPRequestHandler):
             _, token_generator = batching_result
             prompt_for_usage = prompt_tokens
             logits_processors = None
+            detok_attr = getattr(self.tokenizer, "detokenizer", None)
+            if callable(detok_attr):
+                detokenizer = detok_attr()
+            else:
+                detokenizer = detok_attr
         else:
             continuous_mode = False
             prompt_for_usage = self.get_prompt_cache(prompt_tokens)
@@ -778,6 +783,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.repetition_penalty,
                 self.repetition_context_size,
             )
+            detokenizer = None
 
             def keepalive_callback(processed_tokens, total_tokens):
                 logging.info(
@@ -813,23 +819,32 @@ class APIHandler(BaseHTTPRequestHandler):
 
         last_token_id = None
         for gen_response in token_generator:
-            logging.debug(gen_response.text)
+            if continuous_mode:
+                if detokenizer is not None and gen_response.token is not None:
+                    detokenizer.add_token(gen_response.token)
+                    current_segment = detokenizer.last_segment
+                else:
+                    current_segment = ""
+            else:
+                current_segment = gen_response.text
+
+            logging.debug(current_segment)
 
             if (
                 self.tokenizer.has_tool_calling
-                and gen_response.text == self.tokenizer.tool_call_start
+                and current_segment == self.tokenizer.tool_call_start
             ):
                 in_tool_call = True
             elif in_tool_call:
-                if gen_response.text == self.tokenizer.tool_call_end:
+                if current_segment == self.tokenizer.tool_call_end:
                     tool_calls.append(tool_text)
                     tool_text = ""
                     in_tool_call = False
                 else:
-                    tool_text += gen_response.text
+                    tool_text += current_segment
             else:
-                text += gen_response.text
-                segment += gen_response.text
+                text += current_segment
+                segment += current_segment
             token = gen_response.token
             last_token_id = token
             logprobs = gen_response.logprobs

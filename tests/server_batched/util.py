@@ -4,6 +4,8 @@
 import sys
 import types
 
+import numpy as np
+
 class _FakeArray(list):
     def tolist(self):
         return list(self)
@@ -21,14 +23,21 @@ def ensure_mlx_stub():
     metal_module = types.ModuleType("mlx.metal")
 
     core_module.fast = types.SimpleNamespace()
-    core_module.array = lambda data, *_, **__: data
+    core_module.array = lambda data, *_, **__: np.array(data)
     core_module.eval = lambda *_, **__: None
     core_module.random = types.SimpleNamespace(seed=lambda *_: None, state=None)
     core_module.compile = lambda func, *_, **__: func
     core_module.default_device = lambda: None
     core_module.new_stream = lambda *_: object()
     core_module.logsumexp = lambda logits, axis=-1, keepdims=True: 0
-    core_module.zeros = lambda shape, dtype=None: [[0] * (shape[-1] if isinstance(shape, tuple) else 1)]
+    core_module.zeros = lambda shape, dtype=None: np.zeros(
+        shape if isinstance(shape, tuple) else (shape,), dtype=dtype or float
+    )
+    core_module.stack = lambda arrays, axis=0: np.stack(arrays, axis=axis)
+    core_module.concatenate = lambda arrays, axis=0: np.concatenate(arrays, axis=axis)
+    core_module.transpose = lambda array, axes: np.transpose(array, axes)
+    core_module.expand_dims = lambda array, axis=0: np.expand_dims(array, axis)
+    core_module.int32 = np.int32
     core_module.argmax = lambda array, axis=-1: types.SimpleNamespace(item=lambda: 0)
     core_module.argpartition = lambda arr, kth, axis=-1: _FakeArray([0])
     core_module.argsort = lambda arr, axis=-1: _FakeArray([0])
@@ -126,9 +135,67 @@ def ensure_mlx_stub():
 
     if "mlx_lm.models.cache" not in sys.modules:
         cache_module = types.ModuleType("mlx_lm.models.cache")
-        cache_module.make_prompt_cache = lambda *_: []
+
+        class _StubKVCache:
+            def __init__(self):
+                self.keys = None
+                self.values = None
+                self.offset = 0
+
+            @property
+            def state(self):
+                if self.keys is None or self.values is None:
+                    zeros = np.zeros((1, 1, 0, 1), dtype=np.float32)
+                    return zeros, zeros
+                return self.keys, self.values
+
+            @state.setter
+            def state(self, value):
+                self.keys, self.values = value
+                if hasattr(self.keys, "shape"):
+                    self.offset = self.keys.shape[2]
+                else:
+                    self.offset = 0
+
+        class _StubBatchKVCache:
+            def __init__(self, left_padding):
+                self.left_padding = np.array(left_padding)
+                self.keys = None
+                self.values = None
+                self.offsets = np.array([0] * len(left_padding))
+
+            @property
+            def state(self):
+                keys = self.keys
+                values = self.values
+                if keys is None or values is None:
+                    zeros = np.zeros((len(self.left_padding), 1, 0, 1), dtype=np.float32)
+                    keys = zeros
+                    values = zeros
+                return keys, values, self.offsets, self.left_padding
+
+            @state.setter
+            def state(self, value):
+                keys, values, offsets, left_padding = value
+                self.keys = keys
+                self.values = values
+                self.offsets = np.array(
+                    offsets.tolist() if hasattr(offsets, "tolist") else offsets
+                )
+                self.left_padding = np.array(
+                    left_padding.tolist() if hasattr(left_padding, "tolist") else left_padding
+                )
+
+        class _StubCacheList:
+            def __init__(self, *caches):
+                self.caches = list(caches)
+
+        cache_module.make_prompt_cache = lambda *_: [_StubKVCache()]
         cache_module.trim_prompt_cache = lambda *_: None
         cache_module.can_trim_prompt_cache = lambda *_: False
+        cache_module.KVCache = _StubKVCache
+        cache_module.BatchKVCache = _StubBatchKVCache
+        cache_module.CacheList = _StubCacheList
         sys.modules["mlx_lm.models.cache"] = cache_module
 
     if "mlx_lm.sample_utils" not in sys.modules:

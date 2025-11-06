@@ -30,6 +30,7 @@ class ModelRunner:
         max_num_seqs: int = 16,
         prefill_chunk: int = 1024,
         force_legacy_generator: bool = False,
+        stop_tokens: Optional[Iterable[int]] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -50,18 +51,24 @@ class ModelRunner:
         }
         self._last_active_count = 0
 
-        stop_tokens = set()
         eos_id = getattr(tokenizer, "eos_token_id", None)
-        if eos_id is not None:
-            if isinstance(eos_id, (list, tuple, set)):
-                stop_tokens.update(int(tok) for tok in eos_id)
-            else:
-                stop_tokens.add(int(eos_id))
-        eos_ids = getattr(tokenizer, "eos_token_ids", None)
-        if eos_ids:
-            stop_tokens.update(int(tok) for tok in eos_ids)
+        if stop_tokens is not None:
+            stop_tokens_set = {int(tok) for tok in stop_tokens}
+        else:
+            stop_tokens_set = set()
+            if eos_id is not None:
+                if isinstance(eos_id, (list, tuple, set)):
+                    stop_tokens_set.update(int(tok) for tok in eos_id)
+                else:
+                    stop_tokens_set.add(int(eos_id))
+            eos_ids = getattr(tokenizer, "eos_token_ids", None)
+            if eos_ids:
+                stop_tokens_set.update(int(tok) for tok in eos_ids)
 
-        self.stop_tokens = set(stop_tokens)
+        self.stop_tokens = set(stop_tokens_set)
+
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        xtc_special = list(self.stop_tokens) if self.stop_tokens else ([eos_id] if eos_id is not None else [])
 
         self.default_sampler = make_sampler(
             temp=0.0,
@@ -70,7 +77,7 @@ class ModelRunner:
             top_k=0,
             xtc_probability=0.0,
             xtc_threshold=0.0,
-            xtc_special_tokens=[eos_id] if eos_id is not None else [],
+            xtc_special_tokens=xtc_special,
         )
 
         # Slot scaffolding for upcoming vectorized decode.
@@ -88,7 +95,7 @@ class ModelRunner:
         if self.use_legacy_generator:
             self.legacy_generator = BatchGenerator(
                 model,
-                stop_tokens=stop_tokens,
+                stop_tokens=self.stop_tokens,
                 completion_batch_size=max_num_seqs,
                 prefill_batch_size=max_num_seqs,
                 prefill_step_size=prefill_chunk,
@@ -142,7 +149,8 @@ class ModelRunner:
             sampler=sampler,
             logits_processors=logits_processors or None,
         )
-        ctx.detokenizer = self.tokenizer.detokenizer
+        if self.use_legacy_generator:
+            ctx.detokenizer = self.tokenizer.detokenizer
         if prompt_tokens:
             ctx.last_token_id = prompt_tokens[-1]
         else:
@@ -250,8 +258,18 @@ class ModelRunner:
             ctx.last_token_id = token_id
             if ctx.decode_started_ns is None:
                 ctx.decode_started_ns = now
+            if token_id in getattr(ctx, "stop_tokens", ()):
+                logging.info(
+                    "stop_token seen request=%s token=%s step=%s",
+                    ctx.state.request_id,
+                    token_id,
+                    ctx.state.generated_tokens,
+                )
 
-            text_segment = self._update_detokenizer(ctx, token_id)
+            if self.use_legacy_generator:
+                text_segment = self._update_detokenizer(ctx, token_id)
+            else:
+                text_segment = ""
 
             ctx.enqueue_event(
                 self._build_response(
@@ -266,8 +284,18 @@ class ModelRunner:
             finish_reason = self._evaluate_stop_conditions(ctx, token_id)
             if finish_reason:
                 ctx.state.finished = True
-                ctx.detokenizer.finalize()
-                final_segment = ctx.detokenizer.last_segment or ""
+                if self.use_legacy_generator and hasattr(ctx, "detokenizer"):
+                    ctx.detokenizer.finalize()
+                    final_segment = ctx.detokenizer.last_segment or ""
+                else:
+                    final_segment = ""
+                logging.info(
+                    "finish_reason=%s req=%s tokens=%s last_ids=%s",
+                    finish_reason,
+                    ctx.state.request_id,
+                    ctx.state.generated_tokens,
+                    ctx.history_tokens[-5:],
+                )
                 ctx.enqueue_event(
                     self._build_response(
                         ctx,

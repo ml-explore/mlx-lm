@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from statistics import mean, median
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import mlx.core as mx
 from mlx_lm import batch_generate, load
@@ -79,7 +79,7 @@ def summarize(name: str, results: List[Result]):
     return tokens_per_sec, wall_seconds, total_tokens
 
 
-def run_static(model, tokenizer, prompts, max_tokens):
+def run_static(model, tokenizer, prompts, max_tokens, *, stop_tokens, sampler_settings):
     prompt_token_batches = [tokenizer.encode(p) for p in prompts]
     start_ns = time.perf_counter_ns()
     response = batch_generate(
@@ -88,6 +88,13 @@ def run_static(model, tokenizer, prompts, max_tokens):
         prompt_token_batches,
         max_tokens=max_tokens,
         verbose=False,
+        stop_tokens=stop_tokens,
+        temp=sampler_settings["temp"],
+        top_p=sampler_settings["top_p"],
+        min_p=sampler_settings["min_p"],
+        top_k=sampler_settings["top_k"],
+        xtc_probability=sampler_settings["xtc_probability"],
+        xtc_threshold=sampler_settings["xtc_threshold"],
     )
     end_ns = time.perf_counter_ns()
     results = []
@@ -114,6 +121,9 @@ def run_continuous(
     max_num_seqs: int,
     prefill_chunk: int,
     max_tokens_per_step: int,
+    stop_tokens_override: Optional[set],
+    use_eos_stop: bool,
+    sampler_settings: Dict[str, float],
 ):
     runner = ModelRunner(
         model,
@@ -121,7 +131,9 @@ def run_continuous(
         draft_model=None,
         max_num_seqs=max_num_seqs,
         prefill_chunk=prefill_chunk,
+        stop_tokens=stop_tokens_override,
     )
+    logging.info("runtime stop_tokens=%s", sorted(runner.stop_tokens))
     runtime = ContinuousBatchingRuntime(
         runner,
         max_num_seqs=max_num_seqs,
@@ -131,20 +143,15 @@ def run_continuous(
     )
     results: List[Result] = []
     lock = threading.Lock()
+    stopping_template = (
+        {"eos_token_id": tokenizer.eos_token_id}
+        if use_eos_stop
+        else {"eos_token_id": None}
+    )
     arrivals = poisson_arrivals(lmbda, len(prompts))
     start = time.perf_counter()
 
     def submit(idx, arrival_s):
-        stats = runtime.runner.collect_step_stats()
-        metrics = runtime.scheduler.metrics
-        logging.info("[BENCH] tick stats decode_ms=%.3f decode_tokens=%s prefill_tokens=%s active=%s wait=%s" % (
-            stats.get('decode_duration_s', 0.0) * 1000.0,
-            stats.get('decode_tokens'),
-            stats.get('prefill_tokens'),
-            metrics.get('active_sequences'),
-            metrics.get('wait_queue_depth'),
-        ))
-        # Wait until scheduled arrival time
         while True:
             elapsed = time.perf_counter() - start
             if elapsed >= arrival_s:
@@ -153,16 +160,7 @@ def run_continuous(
 
         prompt = prompts[idx]
         prompt_tokens = tokenizer.encode(prompt)
-        sampler_settings = {
-            "temp": 0.0,
-            "top_p": 1.0,
-            "min_p": 0.0,
-            "top_k": 0,
-            "xtc_probability": 0.0,
-            "xtc_threshold": 0.0,
-            "xtc_special_tokens": [tokenizer.eos_token_id, tokenizer.encode("\n")],
-        }
-        stopping_settings = {"eos_token_id": tokenizer.eos_token_id}
+        stopping_settings = dict(stopping_template)
 
         submit_ns = time.perf_counter_ns()
         _, generator = runtime.submit_request(
@@ -211,7 +209,8 @@ def run_continuous(
         th.join()
 
     runtime.shutdown()
-    return results
+    history = runtime.metrics_history()
+    return results, history
 
 
 def main():
@@ -228,13 +227,13 @@ def main():
         help="Maximum concurrent sequences for the continuous runtime.",
     )
     parser.add_argument(
-        "--prefill_chunk",
+        "--prefill-chunk",
         type=int,
         default=1024,
         help="Prefill chunk size for the continuous runtime.",
     )
     parser.add_argument(
-        "--max_tokens_per_step",
+        "--max-tokens-per-step",
         type=int,
         default=4096,
         help="Token budget per scheduler step for the continuous runtime.",
