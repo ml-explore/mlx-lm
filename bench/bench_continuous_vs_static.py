@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from statistics import mean, median
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import mlx.core as mx
 from mlx_lm import batch_generate, load
@@ -33,6 +33,99 @@ class Result:
     first_token_ns: Optional[int]
     finish_ns: int
     gen_tokens: int
+
+
+@dataclass(frozen=True)
+class TokenControls:
+    sampler_settings: Dict[str, float]
+    static_stop_tokens: List[int]
+    runtime_stop_tokens: Set[int]
+    use_eos_stop: bool
+
+
+def _base_sampler_settings(stop_tokens: List[int]) -> Dict[str, float]:
+    return {
+        "temp": 0.0,
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "top_k": 0,
+        "xtc_probability": 0.0,
+        "xtc_threshold": 0.0,
+        "xtc_special_tokens": list(stop_tokens),
+    }
+
+
+def select_token_controls(
+    *,
+    mode: str,
+    tokenizer,
+    explicit_stops: Optional[Set[int]],
+) -> TokenControls:
+    if mode not in {"fixed", "eos"}:
+        raise ValueError(f"Unsupported mode {mode}")
+
+    if mode == "fixed":
+        sampler_settings = _base_sampler_settings([])
+        return TokenControls(
+            sampler_settings=sampler_settings,
+            static_stop_tokens=[],
+            runtime_stop_tokens=set(),
+            use_eos_stop=False,
+        )
+
+    if explicit_stops:
+        stop_tokens = sorted(explicit_stops)
+    else:
+        eos_ids = getattr(tokenizer, "eos_token_ids", None)
+        if eos_ids:
+            stop_tokens = sorted(int(tok) for tok in eos_ids)
+        else:
+            eos_id = getattr(tokenizer, "eos_token_id", None)
+            if eos_id is None:
+                raise ValueError("Tokenizer must expose eos_token_id for EOS mode")
+            stop_tokens = [int(eos_id)]
+
+    sampler_settings = _base_sampler_settings(stop_tokens)
+    return TokenControls(
+        sampler_settings=sampler_settings,
+        static_stop_tokens=list(stop_tokens),
+        runtime_stop_tokens=set(stop_tokens),
+        use_eos_stop=True,
+    )
+
+
+def normalise_request_count(n_value: Optional[int], concurrency: int) -> int:
+    if n_value is None:
+        return concurrency
+    return n_value
+
+
+def compute_steady_state_tps(
+    history: List[Dict[str, float]],
+    *,
+    steady_fraction: float,
+    max_num_seqs: int,
+) -> float:
+    if not history or steady_fraction <= 0 or max_num_seqs <= 0:
+        return 0.0
+    threshold = steady_fraction * max_num_seqs
+    samples: List[float] = []
+    for entry in history:
+        active = entry.get("active_sequences", 0)
+        duration = entry.get("decode_duration_s", 0.0)
+        tokens = entry.get("decode_tokens", 0)
+        if active < threshold:
+            continue
+        if duration <= 0 or tokens <= 0:
+            continue
+        samples.append(tokens / duration)
+    if not samples:
+        return 0.0
+    samples.sort()
+    mid = len(samples) // 2
+    if len(samples) % 2:
+        return samples[mid]
+    return (samples[mid - 1] + samples[mid]) / 2.0
 
 
 def poisson_arrivals(lmbda: float, n: int):
@@ -148,6 +241,8 @@ def run_continuous(
         if use_eos_stop
         else {"eos_token_id": None}
     )
+    stop_list = sorted(stop_tokens_override) if stop_tokens_override else []
+    stopping_template["stop_token_ids"] = stop_list
     arrivals = poisson_arrivals(lmbda, len(prompts))
     start = time.perf_counter()
 
@@ -216,10 +311,29 @@ def run_continuous(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default="mlx-community/Llama-3.2-3B-Instruct-4bit")
-    parser.add_argument("--n", type=int, default=32)
+    parser.add_argument(
+        "--mode",
+        choices=("fixed", "eos"),
+        default="fixed",
+        help="fixed: force max_tokens, eos: stop when EOS tokens reached.",
+    )
+    parser.add_argument("--n", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--prompt_len", type=int, default=64)
+    parser.add_argument(
+        "--steady-fraction",
+        type=float,
+        default=0.8,
+        help="Fraction of max_num_seqs considered steady-state for TPS reporting.",
+    )
+    parser.add_argument(
+        "--stop-token",
+        type=int,
+        action="append",
+        default=None,
+        help="Explicit stop token id (repeat for multiple). Defaults to tokenizer eos ids.",
+    )
     parser.add_argument(
         "--max_num_seqs",
         type=int,
@@ -241,15 +355,30 @@ def main():
     args = parser.parse_args()
 
     model, tokenizer = load(path_or_hf_repo=args.repo)
+    n_reqs = normalise_request_count(args.n, args.concurrency)
     base_prompt = "Tell me a haiku about mac GPUs." * 4
-    prompts = [base_prompt[: args.prompt_len] for _ in range(args.n)]
+    prompts = [base_prompt[: args.prompt_len] for _ in range(n_reqs)]
 
-    static_results = run_static(model, tokenizer, prompts, args.max_tokens)
+    explicit_stops = set(args.stop_token) if args.stop_token else None
+    controls = select_token_controls(
+        mode=args.mode,
+        tokenizer=tokenizer,
+        explicit_stops=explicit_stops,
+    )
+
+    static_results = run_static(
+        model,
+        tokenizer,
+        prompts,
+        args.max_tokens,
+        stop_tokens=controls.static_stop_tokens,
+        sampler_settings=controls.sampler_settings,
+    )
     static_tps, static_wall, static_tokens = summarize("static_batch_generate", static_results)
 
     est_service = max(args.max_tokens / 200.0, 0.01)
     lmbda = max(0.1, args.concurrency / est_service)
-    continuous_results = run_continuous(
+    continuous_results, history = run_continuous(
         model,
         tokenizer,
         prompts,
@@ -258,8 +387,21 @@ def main():
         max_num_seqs=args.max_num_seqs,
         prefill_chunk=args.prefill_chunk,
         max_tokens_per_step=args.max_tokens_per_step,
+        stop_tokens_override=controls.runtime_stop_tokens,
+        use_eos_stop=controls.use_eos_stop,
+        sampler_settings=controls.sampler_settings,
     )
     cont_tps, cont_wall, cont_tokens = summarize("continuous_runtime", continuous_results)
+    steady_tps = compute_steady_state_tps(
+        history,
+        steady_fraction=args.steady_fraction,
+        max_num_seqs=args.max_num_seqs,
+    )
+    if steady_tps:
+        print(
+            f"[continuous_runtime steady] active>={args.steady_fraction * args.max_num_seqs:.1f} "
+            f"tokens/s={steady_tps:.2f}"
+        )
 
     print(
         json.dumps(
@@ -270,6 +412,7 @@ def main():
                 "continuous_tokens_per_sec": cont_tps,
                 "continuous_total_tokens": cont_tokens,
                 "continuous_wall_seconds": cont_wall,
+                "continuous_steady_tokens_per_sec": steady_tps,
             },
             indent=2,
         )

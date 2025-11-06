@@ -37,6 +37,8 @@ class ContinuousBatchingRuntime:
             prefill_chunk=prefill_chunk,
         )
         self._debug_metrics = debug_metrics
+        self._metrics_history: list[dict] = []
+        self._metrics_lock = threading.Lock()
         self._wake = threading.Event()
         self._shutdown = threading.Event()
         self._worker = threading.Thread(
@@ -53,6 +55,7 @@ class ContinuousBatchingRuntime:
             if self.scheduler.has_pending_work:
                 self.scheduler.step()
                 metrics = self.scheduler.metrics
+                self._record_metrics(metrics)
                 if self._debug_metrics:
                     runner_state = self.runner.debug_state()
                     logging.info(
@@ -118,6 +121,18 @@ class ContinuousBatchingRuntime:
         self.scheduler.enqueue(ctx)
         self._wake.set()
         return request_id, self._stream(ctx)
+
+    def _record_metrics(self, metrics: dict) -> None:
+        if not metrics:
+            return
+        snapshot = dict(metrics)
+        snapshot.setdefault("timestamp", time.perf_counter())
+        with self._metrics_lock:
+            self._metrics_history.append(snapshot)
+
+    def metrics_history(self) -> list[dict]:
+        with self._metrics_lock:
+            return [dict(entry) for entry in self._metrics_history]
 
     def _stream(self, ctx: SequenceContext):
         while True:
