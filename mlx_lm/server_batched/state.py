@@ -55,6 +55,7 @@ class SequenceContext:
     stop_sequences: List[List[int]] = field(default_factory=list)
     generator_uid: Optional[int] = None
     prompt_inserted: bool = False
+    slot_initialized: bool = False
 
     def enqueue_event(self, event: Any) -> None:
         try:

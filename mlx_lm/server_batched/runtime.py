@@ -155,7 +155,7 @@ class ContinuousBatchingRuntime:
 
 
 def create_runtime(
-    config: Dict[str, int],
+    config: Dict[str, object],
     *,
     model,
     tokenizer,
@@ -172,6 +172,7 @@ def create_runtime(
         draft_model=draft_model,
         max_num_seqs=config["max_num_seqs"],
         prefill_chunk=config["prefill_chunk"],
+        force_legacy_generator=bool(config.get("force_legacy_generator", False)),
     )
     return ContinuousBatchingRuntime(
         runner=runner,

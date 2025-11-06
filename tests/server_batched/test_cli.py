@@ -40,11 +40,17 @@ class ContinuousBatchingCLIArgsTests(unittest.TestCase):
         self.assertEqual(args.max_num_seqs, 16)
         self.assertEqual(args.max_tokens_per_step, 4096)
         self.assertEqual(args.prefill_chunk, 1024)
+        self.assertFalse(args.force_legacy_generator)
 
     def test_enable_flag_turns_on_continuous_batching(self):
         parser = create_arg_parser()
         args = parser.parse_args(["--enable-continuous-batching"])
         self.assertTrue(args.enable_continuous_batching)
+
+    def test_force_legacy_generator_flag(self):
+        parser = create_arg_parser()
+        args = parser.parse_args(["--force-legacy-generator"])
+        self.assertTrue(args.force_legacy_generator)
 
 
 if __name__ == "__main__":

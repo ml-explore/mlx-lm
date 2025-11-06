@@ -6,12 +6,13 @@ from .util import ensure_mlx_stub
 ensure_mlx_stub()
 
 import time
+import numpy as np
 import types
 import unittest
 
 
 from mlx_lm.generate import GenerationResponse
-from mlx_lm.server_batched.runtime import ContinuousBatchingRuntime
+from mlx_lm.server_batched.runtime import ContinuousBatchingRuntime, create_runtime
 from mlx_lm.server_batched.state import SequenceContext, SequenceState
 
 
@@ -25,6 +26,15 @@ class DummyTokenizer:
         detok.finalize = lambda: None
         detok.last_segment = ""
         return detok
+
+
+class DummyModel:
+    def __call__(self, tokens):
+        arr = np.array(tokens)
+        if arr.ndim == 2:
+            batch = arr.shape[0]
+            return np.zeros((batch, 1, 1), dtype=np.float32)
+        return np.zeros((1, 1, 1), dtype=np.float32)
 
 
 class FakeRunner:
@@ -66,6 +76,7 @@ class FakeRunner:
         ctx.state.prompt_pos += tokens
         self._prefill_count += 1
         self._prefill_tokens += tokens
+        return tokens
 
     def decode(self, contexts):
         self.decode_calls += 1
@@ -158,6 +169,38 @@ class ContinuousBatchingRuntimeTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertGreaterEqual(self.runner.decode_calls, 1)
         list(generator)
+
+
+class RuntimeFactoryTests(unittest.TestCase):
+    def test_force_legacy_generator_creates_legacy_runner(self):
+        config = {
+            "enabled": True,
+            "max_num_seqs": 1,
+            "max_tokens_per_step": 4,
+            "prefill_chunk": 2,
+            "force_legacy_generator": True,
+        }
+        runtime = create_runtime(
+            config, model=DummyModel(), tokenizer=DummyTokenizer()
+        )
+        self.assertIsNotNone(runtime)
+        self.assertTrue(runtime.runner.use_legacy_generator)
+        runtime.shutdown()
+
+    def test_slot_generator_is_default(self):
+        config = {
+            "enabled": True,
+            "max_num_seqs": 1,
+            "max_tokens_per_step": 4,
+            "prefill_chunk": 2,
+        }
+        runtime = create_runtime(
+            config, model=DummyModel(), tokenizer=DummyTokenizer()
+        )
+        self.assertIsNotNone(runtime)
+        self.assertFalse(runtime.runner.use_legacy_generator)
+        runtime.shutdown()
+
 
 
 if __name__ == "__main__":

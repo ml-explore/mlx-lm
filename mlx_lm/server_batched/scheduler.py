@@ -106,28 +106,41 @@ class Scheduler:
         consumed = 0
         requeue: List[SequenceContext] = []
 
-        while (
-            not self._stop
-            and self._wait_queue
-            and len(self._active) + len(ready) < self.max_num_seqs
-        ):
+        while not self._stop and self._wait_queue and consumed < token_budget:
             ctx = self._wait_queue.popleft()
             if ctx.state.finished:
                 continue
             remaining = ctx.state.remaining_prompt_tokens
             if remaining <= 0:
-                ready.append(ctx)
+                if len(self._active) + len(ready) < self.max_num_seqs:
+                    ready.append(ctx)
+                else:
+                    requeue.append(ctx)
                 continue
+
+            if (
+                ctx.state.slot_id is None
+                and not getattr(ctx, "slot_initialized", False)
+                and len(self._active) + len(ready) >= self.max_num_seqs
+            ):
+                requeue.append(ctx)
+                break
 
             take = min(self.prefill_chunk, remaining, token_budget - consumed)
             if take <= 0:
                 requeue.append(ctx)
                 break
 
-            self.runner.prefill_context(ctx, take)
-            consumed += take
+            actual = self.runner.prefill_context(ctx, take)
+            if actual <= 0:
+                requeue.append(ctx)
+                break
+            consumed += actual
             if ctx.state.remaining_prompt_tokens == 0:
-                ready.append(ctx)
+                if len(self._active) + len(ready) < self.max_num_seqs:
+                    ready.append(ctx)
+                else:
+                    requeue.append(ctx)
             else:
                 requeue.append(ctx)
 

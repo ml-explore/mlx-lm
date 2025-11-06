@@ -69,10 +69,12 @@ def summarize(name: str, results: List[Result]):
     idx = max(int(math.ceil(0.95 * len(ttfts))) - 1, 0) if ttfts else 0
     ttft_p95 = ttfts[idx] if ttfts else 0.0
 
+    mean_tokens = total_tokens / len(results) if results else 0.0
     print(
         f"[{name}] n={len(results)} tokens={total_tokens} wall={wall_seconds:.2f}s "
         f"tokens/s={tokens_per_sec:.2f} "
-        f"ttft mean={ttft_mean:.1f}ms median={ttft_median:.1f}ms p95={ttft_p95:.1f}ms"
+        f"ttft mean={ttft_mean:.1f}ms median={ttft_median:.1f}ms p95={ttft_p95:.1f}ms "
+        f"gen/req mean={mean_tokens:.1f}"
     )
     return tokens_per_sec, wall_seconds, total_tokens
 
@@ -102,13 +104,29 @@ def run_static(model, tokenizer, prompts, max_tokens):
     return results
 
 
-def run_continuous(model, tokenizer, prompts, max_tokens, lmbda):
-    runner = ModelRunner(model, tokenizer, draft_model=None)
+def run_continuous(
+    model,
+    tokenizer,
+    prompts,
+    max_tokens,
+    lmbda,
+    *,
+    max_num_seqs: int,
+    prefill_chunk: int,
+    max_tokens_per_step: int,
+):
+    runner = ModelRunner(
+        model,
+        tokenizer,
+        draft_model=None,
+        max_num_seqs=max_num_seqs,
+        prefill_chunk=prefill_chunk,
+    )
     runtime = ContinuousBatchingRuntime(
         runner,
-        max_num_seqs=16,
-        max_tokens_per_step=4096,
-        prefill_chunk=1024,
+        max_num_seqs=max_num_seqs,
+        max_tokens_per_step=max_tokens_per_step,
+        prefill_chunk=prefill_chunk,
         debug_metrics=True,
     )
     results: List[Result] = []
@@ -117,6 +135,15 @@ def run_continuous(model, tokenizer, prompts, max_tokens, lmbda):
     start = time.perf_counter()
 
     def submit(idx, arrival_s):
+        stats = runtime.runner.collect_step_stats()
+        metrics = runtime.scheduler.metrics
+        logging.info("[BENCH] tick stats decode_ms=%.3f decode_tokens=%s prefill_tokens=%s active=%s wait=%s" % (
+            stats.get('decode_duration_s', 0.0) * 1000.0,
+            stats.get('decode_tokens'),
+            stats.get('prefill_tokens'),
+            metrics.get('active_sequences'),
+            metrics.get('wait_queue_depth'),
+        ))
         # Wait until scheduled arrival time
         while True:
             elapsed = time.perf_counter() - start
@@ -194,6 +221,24 @@ def main():
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--prompt_len", type=int, default=64)
+    parser.add_argument(
+        "--max_num_seqs",
+        type=int,
+        default=16,
+        help="Maximum concurrent sequences for the continuous runtime.",
+    )
+    parser.add_argument(
+        "--prefill_chunk",
+        type=int,
+        default=1024,
+        help="Prefill chunk size for the continuous runtime.",
+    )
+    parser.add_argument(
+        "--max_tokens_per_step",
+        type=int,
+        default=4096,
+        help="Token budget per scheduler step for the continuous runtime.",
+    )
     args = parser.parse_args()
 
     model, tokenizer = load(path_or_hf_repo=args.repo)
@@ -206,7 +251,14 @@ def main():
     est_service = max(args.max_tokens / 200.0, 0.01)
     lmbda = max(0.1, args.concurrency / est_service)
     continuous_results = run_continuous(
-        model, tokenizer, prompts, args.max_tokens, lmbda
+        model,
+        tokenizer,
+        prompts,
+        args.max_tokens,
+        lmbda,
+        max_num_seqs=args.max_num_seqs,
+        prefill_chunk=args.prefill_chunk,
+        max_tokens_per_step=args.max_tokens_per_step,
     )
     cont_tps, cont_wall, cont_tokens = summarize("continuous_runtime", continuous_results)
 

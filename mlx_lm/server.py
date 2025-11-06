@@ -520,6 +520,7 @@ class APIHandler(BaseHTTPRequestHandler):
         top_tokens: Optional[List[Dict[int, float]]] = None,
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
+        token_id: Optional[int] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -606,6 +607,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "content": text,
                 "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
             }
+            if self.stream and token_id is not None:
+                choice[key_name]["token_id"] = token_id
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
@@ -808,6 +811,7 @@ class APIHandler(BaseHTTPRequestHandler):
         else:
             logging.debug("Starting completion:")
 
+        last_token_id = None
         for gen_response in token_generator:
             logging.debug(gen_response.text)
 
@@ -827,19 +831,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 text += gen_response.text
                 segment += gen_response.text
             token = gen_response.token
+            last_token_id = token
             logprobs = gen_response.logprobs
             tokens.append(token)
             if not continuous_mode:
                 self.prompt_cache.tokens.append(token)
 
-            if self.logprobs > 0:
+            if logprobs is not None and self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
                 top_indices = sorted_indices[: self.logprobs]
                 top_logprobs = logprobs[top_indices]
                 top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
                 top_tokens.append(tuple(top_token_info))
 
-            token_logprobs.append(logprobs[token].item())
+            if logprobs is not None:
+                token_logprobs.append(logprobs[token].item())
+            else:
+                token_logprobs.append(None)
 
             stop_condition = stopping_criteria(
                 tokens, stop_id_sequences, self.tokenizer.eos_token_id
@@ -866,7 +874,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     continue
                 elif segment or tool_calls:
                     response = self.generate_response(
-                        segment, None, tool_calls=tool_calls
+                        segment,
+                        None,
+                        tool_calls=tool_calls,
+                        token_id=token if not in_tool_call else None,
                     )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
@@ -882,7 +893,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if self.stream:
             response = self.generate_response(
-                segment, finish_reason, tool_calls=tool_calls
+                        segment,
+                        finish_reason,
+                        tool_calls=tool_calls,
+                        token_id=last_token_id if segment else None,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
@@ -1067,6 +1081,7 @@ def run(
         "max_num_seqs": getattr(args, "max_num_seqs", 16),
         "max_tokens_per_step": getattr(args, "max_tokens_per_step", 4096),
         "prefill_chunk": getattr(args, "prefill_chunk", 1024),
+        "force_legacy_generator": bool(args and getattr(args, "force_legacy_generator", False)),
     }
     runtime_state = {
         "config": runtime_config,

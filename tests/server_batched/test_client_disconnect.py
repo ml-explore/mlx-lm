@@ -72,6 +72,7 @@ class DisconnectRunner:
         ctx.state.prompt_pos += tokens
         self._prefill_count += 1
         self._prefill_tokens += tokens
+        return tokens
 
     def decode(self, contexts):
         for ctx in contexts:

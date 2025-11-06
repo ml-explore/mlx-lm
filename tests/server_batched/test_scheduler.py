@@ -41,6 +41,7 @@ class FakeRunner:
         ctx.state.prompt_pos += tokens
         self._prefill_count += 1
         self._prefill_tokens += tokens
+        return tokens
 
     def decode(self, contexts):
         self.decode_calls.append([ctx.state.request_id for ctx in contexts])

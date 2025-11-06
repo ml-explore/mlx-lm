@@ -38,6 +38,7 @@ class BurstRunner:
         self.prefill_calls += 1
         ctx.state.prompt_pos += tokens
         self._prefill_tokens += tokens
+        return tokens
 
     def decode(self, contexts):
         batch_size = len(contexts)

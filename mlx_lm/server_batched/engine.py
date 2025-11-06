@@ -1,5 +1,5 @@
-# ABOUTME: Implements continuous batching engine on top of BatchGenerator.
-# ABOUTME: Provides ModelRunner wrapper that maps generator output to contexts.
+# ABOUTME: Implements continuous batching engine bridging slot generator modes.
+# ABOUTME: Provides ModelRunner wrapper that maps model outputs to contexts.
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from ..generate import BatchGenerator, GenerationResponse
 from ..sample_utils import make_logits_processors, make_sampler
 from .state import SequenceContext, SequenceState
 from .slot_allocator import SlotAllocator
 from .slot_batcher import SlotBatcher
+from .slot_generator import SlotGenerator
 from .slot_kv_cache import SlotKVCache
 
 
@@ -29,12 +29,14 @@ class ModelRunner:
         draft_model: Optional[nn.Module] = None,
         max_num_seqs: int = 16,
         prefill_chunk: int = 1024,
+        force_legacy_generator: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.max_num_seqs = max_num_seqs
         self.prefill_chunk = prefill_chunk
+        self.use_legacy_generator = force_legacy_generator
         self._prefill_calls = 0
         self._prefill_tokens = 0
         self._prefill_duration_s = 0.0
@@ -46,24 +48,18 @@ class ModelRunner:
             "prefill_tokens": 0,
             "prefill_duration_s": 0.0,
         }
+        self._last_active_count = 0
 
         stop_tokens = set()
         eos_id = getattr(tokenizer, "eos_token_id", None)
         if eos_id is not None:
-            stop_tokens.add(eos_id)
+            if isinstance(eos_id, (list, tuple, set)):
+                stop_tokens.update(int(tok) for tok in eos_id)
+            else:
+                stop_tokens.add(int(eos_id))
         eos_ids = getattr(tokenizer, "eos_token_ids", None)
         if eos_ids:
-            stop_tokens.update(eos_ids)
-
-        self.generator = BatchGenerator(
-            model,
-            stop_tokens=stop_tokens,
-            completion_batch_size=max_num_seqs,
-            prefill_batch_size=max_num_seqs,
-            prefill_step_size=prefill_chunk,
-            sampler=self._batched_sampler,
-        )
-        self.uid_to_context: Dict[int, SequenceContext] = {}
+            stop_tokens.update(int(tok) for tok in eos_ids)
 
         self.default_sampler = make_sampler(
             temp=0.0,
@@ -85,6 +81,26 @@ class ModelRunner:
             head_dim=1,
         )
         self.slot_batcher = SlotBatcher(self.slot_allocator, self.slot_kv_cache)
+        self.uid_to_context: Dict[int, SequenceContext] = {}
+
+        if self.use_legacy_generator:
+            self.legacy_generator = BatchGenerator(
+                model,
+                stop_tokens=stop_tokens,
+                completion_batch_size=max_num_seqs,
+                prefill_batch_size=max_num_seqs,
+                prefill_step_size=prefill_chunk,
+                sampler=self._batched_sampler,
+            )
+            self.slot_generator = None
+        else:
+            self.legacy_generator = None
+            self.slot_generator = SlotGenerator(
+                model=model,
+                tokenizer=tokenizer,
+                slot_alloc=self.slot_allocator,
+                prefill_chunk=prefill_chunk,
+            )
 
     # ------------------------------------------------------------------#
     # Context preparation
@@ -124,10 +140,11 @@ class ModelRunner:
             sampler=sampler,
             logits_processors=logits_processors or None,
         )
-        slot = self.slot_batcher.register(request_id)
-        ctx.state.slot_id = slot
         ctx.detokenizer = self.tokenizer.detokenizer
-        ctx.last_token_id = prompt_tokens[-1] if prompt_tokens else self.tokenizer.eos_token_id
+        if prompt_tokens:
+            ctx.last_token_id = prompt_tokens[-1]
+        else:
+            ctx.last_token_id = getattr(self.tokenizer, "bos_token_id", self.tokenizer.eos_token_id)
         ctx.history_tokens = list(prompt_tokens)
         ctx.stop_sequences = list(stopping_cfg.get("stop_id_sequences", []))
         return ctx
@@ -147,42 +164,146 @@ class ModelRunner:
             "prefill_tokens": 0,
             "prefill_duration_s": 0.0,
         }
+        self._last_active_count = 0
 
-    def prefill_context(self, ctx: SequenceContext, num_tokens: int) -> None:
+    def prefill_context(self, ctx: SequenceContext, num_tokens: int) -> int:
         if ctx.state.finished or num_tokens <= 0:
-            return
+            return 0
         tick_start = time.perf_counter()
         if ctx.prefill_started_ns is None:
             ctx.prefill_started_ns = time.time_ns()
-        ctx.state.prompt_pos = min(
-            ctx.state.prompt_pos + num_tokens, ctx.state.prompt_len
-        )
-        if (
-            ctx.state.remaining_prompt_tokens == 0
-            and not ctx.prompt_inserted
-            and ctx.prompt_tokens
-        ):
-            uid = self.generator.insert(
-                [ctx.prompt_tokens], ctx.state.max_new_tokens
-            )[0]
-            ctx.generator_uid = uid
-            ctx.prompt_inserted = True
-            ctx.prefill_completed_ns = time.time_ns()
-            self.uid_to_context[uid] = ctx
+
+        processed = 0
+        if self.use_legacy_generator:
+            ctx.state.prompt_pos = min(
+                ctx.state.prompt_pos + num_tokens, ctx.state.prompt_len
+            )
+            if (
+                ctx.state.remaining_prompt_tokens == 0
+                and not ctx.prompt_inserted
+                and ctx.prompt_tokens
+            ):
+                uid = self.legacy_generator.insert(
+                    [ctx.prompt_tokens], ctx.state.max_new_tokens
+                )[0]
+                ctx.generator_uid = uid
+                ctx.prompt_inserted = True
+                ctx.prefill_completed_ns = time.time_ns()
+                self.uid_to_context[uid] = ctx
+            processed = num_tokens
+        else:
+            if not ctx.slot_initialized:
+                admitted = self.slot_generator.on_admit(ctx)
+                if not admitted:
+                    return 0
+            processed = self.slot_generator.prefill_tokens(ctx, num_tokens)
+            if (
+                processed > 0
+                and ctx.state.remaining_prompt_tokens == 0
+                and ctx.prefill_completed_ns is None
+            ):
+                ctx.prefill_completed_ns = time.time_ns()
+
         tick_duration = time.perf_counter() - tick_start
         self._prefill_calls += 1
-        self._prefill_tokens += max(num_tokens, 0)
+        self._prefill_tokens += max(processed, 0)
         self._prefill_duration_s += max(tick_duration, 0.0)
+        return processed
 
     def decode(self, contexts: Iterable[SequenceContext]) -> Dict[str, float]:
+        if self.use_legacy_generator:
+            return self._legacy_decode(contexts)
+
+        active = [ctx for ctx in contexts if not ctx.state.finished]
         start = time.perf_counter()
-        responses = self.generator.next()
+        logits = self.slot_generator.decode_step(active) if active else mx.zeros((0, 0), dtype=mx.float32)
+        duration = time.perf_counter() - start
+
+        logits_mx = mx.array(logits)
+        if logits_mx.ndim == 1:
+            logits_mx = logits_mx[None, :]
+
+        emitted_tokens = 0
+        now = time.time_ns()
+        self._last_active_count = len(active)
+
+        for index, ctx in enumerate(active):
+            if ctx.state.finished:
+                continue
+            row_mx = logits_mx[index : index + 1]
+
+            if ctx.logits_processors:
+                history_mx = mx.array(ctx.history_tokens, dtype=mx.int32)[None, :]
+                for processor in ctx.logits_processors:
+                    row_mx = processor(history_mx, row_mx)
+
+            sampler = getattr(ctx, "sampler", None) or self.default_sampler
+            selection = sampler(row_mx)
+            token_id = self._extract_token(selection)
+
+            ctx.state.generated_tokens += 1
+            emitted_tokens += 1
+            ctx.history_tokens.append(token_id)
+            ctx.last_token_id = token_id
+            if ctx.decode_started_ns is None:
+                ctx.decode_started_ns = now
+
+            text_segment = self._update_detokenizer(ctx, token_id)
+
+            ctx.enqueue_event(
+                self._build_response(
+                    ctx,
+                    token_id,
+                    logprobs=None,
+                    text=text_segment,
+                    finish_reason=None,
+                )
+            )
+
+            finish_reason = self._evaluate_stop_conditions(ctx, token_id)
+            if finish_reason:
+                ctx.state.finished = True
+                ctx.detokenizer.finalize()
+                final_segment = ctx.detokenizer.last_segment or ""
+                ctx.enqueue_event(
+                    self._build_response(
+                        ctx,
+                        token_id,
+                        logprobs=None,
+                        text=final_segment,
+                        finish_reason=finish_reason,
+                    )
+                )
+                self.slot_generator.on_release(ctx)
+                if ctx.state.slot_id is not None:
+                    self.slot_batcher.release(ctx.state.request_id)
+
+        stats = {
+            "decode_iterations": 1 if emitted_tokens else 0,
+            "decode_tokens": emitted_tokens,
+            "decode_duration_s": max(duration, 0.0),
+            "prefill_calls": self._prefill_calls,
+            "prefill_tokens": self._prefill_tokens,
+            "prefill_duration_s": self._prefill_duration_s,
+        }
+        self._last_decode_stats = stats
+        return stats
+
+    def _legacy_decode(self, contexts: Iterable[SequenceContext]) -> Dict[str, float]:
+        start = time.perf_counter()
+        responses = self.legacy_generator.next()
         duration = time.perf_counter() - start
         decode_iters = 1 if responses else 0
         emitted_tokens = 0
 
         now = time.time_ns()
         missing_uids = []
+        active_batch = getattr(self.legacy_generator, "active_batch", None)
+        if active_batch is not None and hasattr(active_batch, "uids"):
+            self._last_active_count = len(active_batch.uids)
+        else:
+            self._last_active_count = 0
+
         for response in responses or ():
             ctx = self.uid_to_context.get(response.uid)
             if ctx is None or ctx.state.finished:
@@ -226,13 +347,13 @@ class ModelRunner:
                     ctx.detokenizer.finalize()
                     final_segment = ctx.detokenizer.last_segment or ""
                     ctx.enqueue_event(
-                    self._build_response(
-                        ctx,
-                        token_id,
-                        logprobs,
-                        final_segment,
-                        finish_reason=finish_reason,
-                    )
+                        self._build_response(
+                            ctx,
+                            token_id,
+                            logprobs,
+                            final_segment,
+                            finish_reason=finish_reason,
+                        )
                     )
                     self.uid_to_context.pop(response.uid, None)
                     if ctx.state.slot_id is not None:
@@ -253,8 +374,11 @@ class ModelRunner:
         return stats
 
     def debug_state(self) -> Dict[str, int]:
-        active = getattr(self.generator, "active_batch", None)
-        batch_size = len(active.uids) if active is not None and hasattr(active, "uids") else 0
+        if self.use_legacy_generator:
+            active = getattr(self.legacy_generator, "active_batch", None)
+            batch_size = len(active.uids) if active is not None and hasattr(active, "uids") else 0
+        else:
+            batch_size = self._last_active_count
         return {
             "generator_active": batch_size,
             "uid_count": len(self.uid_to_context),
@@ -274,8 +398,34 @@ class ModelRunner:
     # ------------------------------------------------------------------#
     # Helpers
     # ------------------------------------------------------------------#
+    def _extract_token(self, value) -> int:
+        if hasattr(value, "item"):
+            try:
+                mx.eval(value)
+                return int(value.item())
+            except (TypeError, ValueError):
+                pass
+        if hasattr(value, "tolist"):
+            try:
+                mx.eval(value)
+            except Exception:
+                pass
+            data = value.tolist()
+            if isinstance(data, list):
+                while data and isinstance(data[0], list):
+                    data = data[0]
+                if data:
+                    return int(data[0])
+        if isinstance(value, (list, tuple)):
+            data = value
+            while data and isinstance(data[0], (list, tuple)):
+                data = data[0]
+            if data:
+                return int(data[0])
+        return int(value)
+
     def _batched_sampler(self, logprobs: mx.array) -> mx.array:
-        batch = getattr(self.generator, "active_batch", None)
+        batch = getattr(self.legacy_generator, "active_batch", None)
         if batch is None or not batch.uids:
             return mx.argmax(logprobs, axis=-1)
 
@@ -303,8 +453,28 @@ class ModelRunner:
         return ctx.detokenizer.last_segment
 
     def _evaluate_stop_conditions(self, ctx: SequenceContext, token_id: int) -> Optional[str]:
-        eos = ctx.stopping_settings.get("eos_token_id", self.tokenizer.eos_token_id)
-        if token_id == eos:
+        eos_setting = ctx.stopping_settings.get("eos_token_id", None)
+        eos_ids_setting = ctx.stopping_settings.get("eos_token_ids", None)
+        eos_candidates = []
+        if eos_setting is not None:
+            eos_candidates.extend(
+                eos_setting if isinstance(eos_setting, (list, tuple, set)) else [eos_setting]
+            )
+        tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
+        if tokenizer_eos is not None:
+            eos_candidates.extend(
+                tokenizer_eos if isinstance(tokenizer_eos, (list, tuple, set)) else [tokenizer_eos]
+            )
+        tokenizer_eos_ids = getattr(self.tokenizer, "eos_token_ids", None)
+        if tokenizer_eos_ids:
+            eos_candidates.extend(tokenizer_eos_ids)
+        if eos_ids_setting:
+            eos_candidates.extend(
+                eos_ids_setting
+                if isinstance(eos_ids_setting, (list, tuple, set))
+                else [eos_ids_setting]
+            )
+        if eos_candidates and token_id in set(int(e) for e in eos_candidates if e is not None):
             return "stop"
         for stop_seq in ctx.stop_sequences:
             if stop_seq and ctx.history_tokens[-len(stop_seq) :] == stop_seq:
@@ -317,7 +487,7 @@ class ModelRunner:
         self,
         ctx: SequenceContext,
         token_id: int,
-        logprobs: mx.array,
+        logprobs: Optional[mx.array],
         text: str,
         finish_reason: Optional[str],
     ) -> GenerationResponse:

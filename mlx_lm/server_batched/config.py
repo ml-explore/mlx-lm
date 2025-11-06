@@ -30,6 +30,11 @@ def create_arg_parser(parser: Optional[argparse.ArgumentParser] = None) -> argpa
         default=1024,
         help="Maximum prompt tokens admitted per sequence during prefill.",
     )
+    parser.add_argument(
+        "--force-legacy-generator",
+        action="store_true",
+        help="Use legacy BatchGenerator instead of slot-indexed decode.",
+    )
     return parser
 
 
