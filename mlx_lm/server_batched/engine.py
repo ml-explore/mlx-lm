@@ -61,6 +61,8 @@ class ModelRunner:
         if eos_ids:
             stop_tokens.update(int(tok) for tok in eos_ids)
 
+        self.stop_tokens = set(stop_tokens)
+
         self.default_sampler = make_sampler(
             temp=0.0,
             top_p=1.0,
@@ -147,6 +149,7 @@ class ModelRunner:
             ctx.last_token_id = getattr(self.tokenizer, "bos_token_id", self.tokenizer.eos_token_id)
         ctx.history_tokens = list(prompt_tokens)
         ctx.stop_sequences = list(stopping_cfg.get("stop_id_sequences", []))
+        ctx.stop_tokens = set(self.stop_tokens)
         return ctx
 
     # ------------------------------------------------------------------#
@@ -453,28 +456,7 @@ class ModelRunner:
         return ctx.detokenizer.last_segment
 
     def _evaluate_stop_conditions(self, ctx: SequenceContext, token_id: int) -> Optional[str]:
-        eos_setting = ctx.stopping_settings.get("eos_token_id", None)
-        eos_ids_setting = ctx.stopping_settings.get("eos_token_ids", None)
-        eos_candidates = []
-        if eos_setting is not None:
-            eos_candidates.extend(
-                eos_setting if isinstance(eos_setting, (list, tuple, set)) else [eos_setting]
-            )
-        tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
-        if tokenizer_eos is not None:
-            eos_candidates.extend(
-                tokenizer_eos if isinstance(tokenizer_eos, (list, tuple, set)) else [tokenizer_eos]
-            )
-        tokenizer_eos_ids = getattr(self.tokenizer, "eos_token_ids", None)
-        if tokenizer_eos_ids:
-            eos_candidates.extend(tokenizer_eos_ids)
-        if eos_ids_setting:
-            eos_candidates.extend(
-                eos_ids_setting
-                if isinstance(eos_ids_setting, (list, tuple, set))
-                else [eos_ids_setting]
-            )
-        if eos_candidates and token_id in set(int(e) for e in eos_candidates if e is not None):
+        if getattr(ctx, "stop_tokens", None) and token_id in ctx.stop_tokens:
             return "stop"
         for stop_seq in ctx.stop_sequences:
             if stop_seq and ctx.history_tokens[-len(stop_seq) :] == stop_seq:
