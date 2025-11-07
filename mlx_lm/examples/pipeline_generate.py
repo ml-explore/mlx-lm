@@ -19,6 +19,7 @@ https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
 import argparse
 
 import mlx.core as mx
+
 from mlx_lm import stream_generate
 from mlx_lm.utils import pipeline_load
 

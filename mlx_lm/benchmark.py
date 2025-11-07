@@ -4,8 +4,9 @@ import argparse
 
 import mlx.core as mx
 
-from mlx_lm import batch_generate, load, pipeline_load, stream_generate
+from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
+from mlx_lm.utils import pipeline_load
 
 
 def setup_arg_parser():
@@ -66,7 +67,7 @@ def main():
     model_path = args.model or DEFAULT_MODEL
 
     if group.size() > 1:
-        model, tokenizer = pipeline_load(args.model, return_config=True)
+        model, tokenizer, config = pipeline_load(args.model, return_config=True)
     else:
         model, tokenizer, config = load(
             args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
