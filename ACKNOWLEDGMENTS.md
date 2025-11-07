@@ -22,5 +22,6 @@ Added support for the following other features:
 `Multiple Optimizers to choose for training`, and `reporting training metrics to WandB (Weights & Biases)`.
 - Prince Canuma: Helped add support for the following model architectures:
   HuggingFace's `Starcoder2`, Cohere's `Cohere (1 and 2)`, Alibaba Qwen's `Qwen (2, 3 and MoE)`, 
-  Microsoft's `Phi (3 and 3.5 MoE)`, `BitNet1.58`, Meta's `Llama (3 and 4)`, 
-  Google DeepMind's `Gemma 3`, TII's `Falcon H1` and InterLM's `InternLM 2.5`.
+  Microsoft's `Phi (3 and 3.5 MoE)`, `BitNet1.58`, Meta's `Llama (3 and 4)`, MinimaxAI's `MiniMax`, 
+  MoonshotAI's `Kimi-Linear`, LiquidAI's `LFM2`, Google DeepMind's `Gemma 3`, 
+  TII's `Falcon H1` and InterLM's `InternLM 2.5`.
