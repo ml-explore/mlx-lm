@@ -359,9 +359,7 @@ def main():
     else:
 
         def target_fn(batch, idx, split):
-            targets = model(batch)
-            idx = mx.argpartition(targets, kth=-1024, axis=-1)[..., -1024:]
-            return mx.take_along_axis(targets, idx, axis=-1), idx
+            return model(batch)
 
     if args.quantized_model is not None:
         q_model, tokenizer, config = load(

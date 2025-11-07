@@ -37,14 +37,10 @@ else:
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
-from transformers import PreTrainedTokenizer
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper
 from .tokenizer_utils import load as _load_tokenizer
-
-from mlx.utils import tree_flatten, tree_map, tree_reduce
-from transformers import PreTrainedTokenizer
 
 # Constants
 MODEL_REMAPPING = {
