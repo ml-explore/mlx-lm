@@ -26,4 +26,4 @@ Added support for the following other features:
   MoonshotAI's `Kimi-Linear`, LiquidAI's `LFM2` and `LFM2 MoE`, 
   Google DeepMind's `Gemma 3`, TII's `Falcon H1` and InterLM's `InternLM 2.5`.
 - Ivan Fioravanti: Added support for the following architectures:
- ServiceNow-AI's `Apriel 1.5`, Tencent's `Hunyuan Dense V1` and `Hunyuan MoE V1`, 
+ ServiceNow-AI's `Apriel 1.5`, Tencent's `Hunyuan Dense V1` and `Hunyuan MoE V1`.
