@@ -148,7 +148,7 @@ def load_model(
     model_path: Path,
     lazy: bool = False,
     strict: bool = True,
-    model_config: dict = {},
+    model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -175,7 +175,8 @@ def load_model(
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     config = load_config(model_path)
-    config.update(model_config)
+    if model_config is not None:
+        config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -245,12 +246,12 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
 
 def load(
     path_or_hf_repo: str,
-    tokenizer_config={},
-    model_config={},
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[Dict[str, Any]] = None,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     return_config: bool = False,
-    revision: str = None,
+    revision: Optional[str] = None,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
