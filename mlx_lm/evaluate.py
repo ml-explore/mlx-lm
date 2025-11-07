@@ -12,7 +12,7 @@ import logging
 import os
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import lm_eval
 import mlx.core as mx
@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from .generate import batch_generate
 from .models.cache import make_prompt_cache
+from .sample_utils import make_sampler
 from .utils import common_prefix_len, load
 
 DEFAULT_MAX_TOKENS = 8192
@@ -36,6 +37,13 @@ def _rstrip_until(s, untils):
     f = [s.find(u) for u in untils]
     f = [l if x < 0 else x for x in f]
     return s[: min(f)]
+
+
+def _lstrip(s, pattern):
+    """Truncate the prefix of the string after the first occurrence of pattern."""
+    if (idx := s.find(pattern)) != -1:
+        return s[idx + len(pattern) :]
+    return s
 
 
 def _pad_inputs(inputs):
@@ -73,6 +81,7 @@ class MLXLM(LM):
         max_tokens: Optional[int] = None,
         use_chat_template: Optional[bool] = None,
         trust_remote_code: bool = False,
+        sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ) -> None:
         super().__init__()
         tokenizer_config = {"trust_remote_code": True if trust_remote_code else None}
@@ -84,6 +93,7 @@ class MLXLM(LM):
         self.use_chat_template = use_chat_template
         if use_chat_template is None:
             self.use_chat_template = self.tokenizer.chat_template is not None
+        self._sampler = sampler
 
     def _process_prompt(self, prompt, step_size: int = 2048):
         prompt = mx.array(prompt)[None]
@@ -338,12 +348,13 @@ class MLXLM(LM):
             prompts=contexts,
             max_tokens=max_tokens,
             verbose=True,
+            sampler=self._sampler,
         ).texts
 
         for e, (text, opt) in enumerate(zip(completions, options)):
-            until = opt["until"]
-            if any(u in text for u in until):
-                completions[e] = _rstrip_until(text, until)
+            completions[e] = _rstrip_until(text, opt["until"])
+            if self.tokenizer.has_thinking:
+                completions[e] = _lstrip(text, self.tokenizer.think_end)
 
         # Gather the completions
         if group.size() > 1:
@@ -438,7 +449,9 @@ def main():
         action="store_true",
         help="Enable trusting remote code for tokenizer",
     )
-
+    parser.add_argument("--temp", type=float, default=0.0, help="Sampling temperature")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
+    parser.add_argument("--top-k", type=int, default=0, help="Sampling top-k")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -455,11 +468,17 @@ def main():
     if world.size() > 1 and world.rank() == 0:
         print(f"Evaluating with {world.size()} nodes")
 
+    sampler = make_sampler(
+        temp=args.temp,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
     lm = MLXLM(
         args.model,
         max_tokens=args.max_tokens,
         use_chat_template=args.apply_chat_template,
         trust_remote_code=args.trust_remote_code,
+        sampler=sampler,
     )
     MLXLM.apply_chat_template = chat_template_fn(**args.chat_template_args)
 

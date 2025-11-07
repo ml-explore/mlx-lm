@@ -1,7 +1,7 @@
 import json
 from functools import partial
 from json import JSONDecodeError
-from typing import List
+from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -423,9 +423,12 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def load_tokenizer(
-    model_path, tokenizer_config_extra={}, return_tokenizer=True, eos_token_ids=None
-):
+def load(
+    model_path,
+    tokenizer_config_extra: Optional[Dict[str, Any]] = None,
+    return_tokenizer=True,
+    eos_token_ids=None,
+) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
@@ -435,6 +438,7 @@ def load_tokenizer(
     detokenizer_class = NaiveStreamingDetokenizer
 
     tokenizer_file = model_path / "tokenizer.json"
+
     if tokenizer_file.exists():
         with open(tokenizer_file, "r", encoding="utf-8") as fid:
             try:
@@ -454,8 +458,9 @@ def load_tokenizer(
         eos_token_ids = [eos_token_ids]
 
     if return_tokenizer:
+        kwargs = tokenizer_config_extra or {}
         return TokenizerWrapper(
-            AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
+            AutoTokenizer.from_pretrained(model_path, **kwargs),
             detokenizer_class,
             eos_token_ids=eos_token_ids,
         )

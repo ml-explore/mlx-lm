@@ -23,6 +23,7 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     rotary_emb_base: int
     rotary_pct: float
+    use_parallel_residual: bool = True
     num_key_value_heads: int = None
 
     def __post_init__(self):
@@ -107,6 +108,7 @@ class TransformerBlock(nn.Module):
         self.layer_norm_eps = args.layer_norm_eps
         self.attention = Attention(args)
         self.mlp = MLP(args)
+        self.use_parallel_residual = args.use_parallel_residual
         self.input_layernorm = nn.LayerNorm(
             self.hidden_size,
             eps=self.layer_norm_eps,
@@ -121,12 +123,20 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        residual = x
-        # NeoX runs attention and feedforward network in parallel.
-        attn = self.attention(self.input_layernorm(x), mask, cache)
-        ffn = self.mlp(self.post_attention_layernorm(x))
-        out = attn + ffn + residual
-        return out
+        if self.use_parallel_residual:
+            residual = x
+            # Run attention and feedforward network in parallel.
+            attn = self.attention(self.input_layernorm(x), mask, cache)
+            ffn = self.mlp(self.post_attention_layernorm(x))
+            out = attn + ffn + residual
+            return out
+        else:
+            # Run attention and feedforward network sequentially.
+            attn_output = self.attention(self.input_layernorm(x), mask, cache)
+            x = x + attn_output
+            ffn_output = self.mlp(self.post_attention_layernorm(x))
+            x = x + ffn_output
+            return x
 
 
 class GPTNeoXModel(nn.Module):
