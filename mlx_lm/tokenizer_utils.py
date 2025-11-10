@@ -210,7 +210,9 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         # For multi-byte utf-8 wait until they are complete
         # For single spaces wait until the next token to clean it if needed
         if not text.endswith("\ufffd") and not (
-            len(v) == 1 and self._byte_decoder[v[0]] == 32
+            len(v) == 1
+            and (v[0] in self._byte_decoder)
+            and self._byte_decoder[v[0]] == 32
         ):
             self.text += self._maybe_trim_space(text)
             self._unflushed = ""
