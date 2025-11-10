@@ -1,9 +1,4 @@
-"""
-Ouro model implementation for MLX.
-
-Ouro is a Universal Transformer that processes inputs through
-layers multiple times (UT steps) with an early exit mechanism.
-"""
+# Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
 from functools import partial
@@ -30,17 +25,11 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 65536
     rope_theta: float = 1000000.0
     rope_scaling: Optional[dict] = None
-    attention_dropout: float = 0.0
     rms_norm_eps: float = 1e-6
-    hidden_act: str = "silu"
     total_ut_steps: int = 4
-    early_exit_threshold: Optional[float] = 1.0
-    layer_types: Optional[List[str]] = None
-    sliding_window: Optional[int] = None
-    max_window_layers: Optional[int] = None
-    use_sliding_window: bool = False
+    early_exit_step: Optional[int] = None
+    early_exit_threshold: Optional[float] = None
     tie_word_embeddings: bool = False
-    initializer_range: float = 0.02
 
 
 @partial(mx.compile, shapeless=True)
@@ -77,13 +66,6 @@ class OuroAttention(nn.Module):
             traditional=False,
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
-        )
-
-        layer_types = args.layer_types or ["full_attention"] * args.num_hidden_layers
-        self.sliding_window = (
-            args.sliding_window
-            if layer_types[layer_idx] == "sliding_attention"
-            else None
         )
 
     def __call__(
@@ -126,7 +108,6 @@ class OuroAttention(nn.Module):
 class OuroMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-
         self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
@@ -138,10 +119,8 @@ class OuroMLP(nn.Module):
 class OuroDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-
         self.self_attn = OuroAttention(args, layer_idx)
         self.mlp = OuroMLP(args)
-
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.input_layernorm_2 = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -167,26 +146,20 @@ class OuroDecoderLayer(nn.Module):
         h = self.post_attention_layernorm(h)
         h = self.mlp(h)
         h = self.post_attention_layernorm_2(h)
-        h = residual + h
-
-        return h
+        return residual + h
 
 
 class OuroModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-
         self.args = args
         self.vocab_size = args.vocab_size
         self.total_ut_steps = args.total_ut_steps
-
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-
         self.layers = [
             OuroDecoderLayer(args, layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
-
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.early_exit_gate = nn.Linear(args.hidden_size, 1, bias=True)
 
@@ -197,25 +170,21 @@ class OuroModel(nn.Module):
     ) -> Tuple[mx.array, Optional[List[mx.array]], Optional[List[mx.array]]]:
         h = self.embed_tokens(x)
 
-        # For UT, we need total_ut_steps * num_layers cache slots
         if cache is None:
             cache = [None] * (self.total_ut_steps * len(self.layers))
 
         mask = create_attention_mask(h, cache[0])
-
         hidden_states_list = []
         gate_list = []
 
         for current_ut in range(self.total_ut_steps):
             for layer_idx, layer in enumerate(self.layers):
-                # Cache index: current_ut * num_layers + layer_idx
                 cache_idx = current_ut * len(self.layers) + layer_idx
                 layer_cache = cache[cache_idx] if cache else None
                 h = layer(h, mask, layer_cache)
 
             h = self.norm(h)
             hidden_states_list.append(h)
-
             gate = self.early_exit_gate(h)
             gate_list.append(gate)
 
@@ -225,11 +194,9 @@ class OuroModel(nn.Module):
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-
         self.args = args
         self.model_type = args.model_type
         self.model = OuroModel(args)
-
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -237,18 +204,161 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[List[KVCache]] = None,
+        use_weighted_exit: bool = False,
+        exit_at_step: Optional[int] = None,
+        exit_threshold: Optional[float] = None,
+        logits_to_keep: int = 0,
     ):
-        hidden_states, _, _ = self.model(inputs, cache)
+        exit_at_step = (
+            exit_at_step if exit_at_step is not None else self.args.early_exit_step
+        )
+        exit_threshold = (
+            exit_threshold
+            if exit_threshold is not None
+            else self.args.early_exit_threshold
+        )
 
+        hidden_states, hidden_states_list, gate_list = self.model(inputs, cache)
+
+        stacked_exit_pdf = None
+        if gate_list:
+            stacked_exit_pdf = self._compute_exit_distribution(gate_list)
+
+        logits = self._compute_logits(
+            hidden_states,
+            hidden_states_list,
+            stacked_exit_pdf,
+            use_weighted_exit,
+            exit_at_step,
+            exit_threshold,
+            logits_to_keep,
+        )
+
+        return logits
+
+    def _compute_exit_distribution(self, gate_list: List[mx.array]) -> mx.array:
+        pdf_list = []
+        remaining_prob = mx.ones_like(gate_list[0].squeeze(-1))
+
+        for idx, gate_tensor in enumerate(gate_list):
+            lambda_i = mx.sigmoid(gate_tensor.squeeze(-1))
+
+            if idx < len(gate_list) - 1:
+                p_i = lambda_i * remaining_prob
+                remaining_prob = remaining_prob * (1.0 - lambda_i)
+            else:
+                p_i = remaining_prob
+
+            pdf_list.append(p_i)
+
+        return mx.stack(pdf_list, axis=-1)
+
+    def _select_token_positions(
+        self, tensor: mx.array, logits_to_keep: int
+    ) -> mx.array:
+        if logits_to_keep == 0:
+            return tensor
+        return tensor[:, -logits_to_keep:]
+
+    def _compute_logits(
+        self,
+        final_hidden_states: mx.array,
+        hidden_states_list: Optional[List[mx.array]],
+        stacked_exit_pdf: Optional[mx.array],
+        use_weighted_exit: bool,
+        exit_at_step: Optional[int],
+        exit_threshold: Optional[float],
+        logits_to_keep: int,
+    ) -> mx.array:
+        if not hidden_states_list or stacked_exit_pdf is None:
+            hidden = self._select_token_positions(final_hidden_states, logits_to_keep)
+            return self._apply_lm_head(hidden)
+
+        if exit_at_step is not None and 0 <= exit_at_step < len(hidden_states_list):
+            selected_hidden = hidden_states_list[exit_at_step]
+            hidden = self._select_token_positions(selected_hidden, logits_to_keep)
+            return self._apply_lm_head(hidden)
+
+        if exit_threshold is not None:
+            return self._compute_threshold_exit_logits(
+                hidden_states_list, stacked_exit_pdf, exit_threshold, logits_to_keep
+            )
+
+        if use_weighted_exit:
+            return self._compute_weighted_exit_logits(
+                hidden_states_list, stacked_exit_pdf, logits_to_keep
+            )
+
+        hidden = self._select_token_positions(final_hidden_states, logits_to_keep)
+        return self._apply_lm_head(hidden)
+
+    def _apply_lm_head(self, hidden_states: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden_states)
-        else:
-            return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states)
+
+    def _compute_weighted_exit_logits(
+        self,
+        hidden_states_list: List[mx.array],
+        stacked_exit_pdf: mx.array,
+        logits_to_keep: int,
+    ) -> mx.array:
+        token_exit_pdf = self._select_token_positions(stacked_exit_pdf, logits_to_keep)
+        expected_logits = None
+
+        for step_idx, hidden in enumerate(hidden_states_list):
+            step_hidden = self._select_token_positions(hidden, logits_to_keep)
+            step_logits = self._apply_lm_head(step_hidden)
+            weight = mx.expand_dims(token_exit_pdf[..., step_idx], axis=-1)
+
+            if expected_logits is None:
+                expected_logits = step_logits * weight
+            else:
+                expected_logits = expected_logits + step_logits * weight
+
+        return expected_logits
+
+    def _compute_threshold_exit_logits(
+        self,
+        hidden_states_list: List[mx.array],
+        stacked_exit_pdf: mx.array,
+        exit_threshold: float,
+        logits_to_keep: int,
+    ) -> mx.array:
+        cumulative_probs = mx.cumsum(stacked_exit_pdf, axis=-1)
+        threshold_mask = cumulative_probs >= exit_threshold
+        exit_steps = mx.argmax(threshold_mask, axis=-1)
+
+        never_exceeded = mx.logical_not(mx.any(threshold_mask, axis=-1))
+        last_step_idx = len(hidden_states_list) - 1
+        exit_steps = mx.where(never_exceeded, last_step_idx, exit_steps)
+
+        stacked_hidden = mx.stack(hidden_states_list, axis=2)
+        batch_size, seq_len = exit_steps.shape
+        batch_indices = mx.arange(batch_size)[:, None]
+        seq_indices = mx.arange(seq_len)[None, :]
+
+        final_hidden_states = stacked_hidden[batch_indices, seq_indices, exit_steps, :]
+
+        final_hidden = self._select_token_positions(final_hidden_states, logits_to_keep)
+        return self._apply_lm_head(final_hidden)
 
     @property
     def layers(self):
         return self.model.layers
 
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if "early_exit_gate" in path:
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
     def make_cache(self):
         total_caches = self.args.total_ut_steps * len(self.layers)
         return [KVCache() for _ in range(total_caches)]
+
+    def sanitize(self, weights):
+        return weights
