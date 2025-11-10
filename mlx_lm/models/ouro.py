@@ -167,11 +167,12 @@ class OuroModel(nn.Module):
         self,
         x: mx.array,
         cache: Optional[List[KVCache]] = None,
-    ) -> Tuple[mx.array, Optional[List[mx.array]], Optional[List[mx.array]]]:
+    ) -> Tuple[mx.array, List[mx.array], List[mx.array]]:
         h = self.embed_tokens(x)
 
+        num_layers = len(self.layers)
         if cache is None:
-            cache = [None] * (self.total_ut_steps * len(self.layers))
+            cache = [None] * (self.total_ut_steps * num_layers)
 
         mask = create_attention_mask(h, cache[0])
         hidden_states_list = []
@@ -179,14 +180,12 @@ class OuroModel(nn.Module):
 
         for current_ut in range(self.total_ut_steps):
             for layer_idx, layer in enumerate(self.layers):
-                cache_idx = current_ut * len(self.layers) + layer_idx
-                layer_cache = cache[cache_idx]
-                h = layer(h, mask, layer_cache)
+                cache_idx = current_ut * num_layers + layer_idx
+                h = layer(h, mask, cache[cache_idx])
 
             h = self.norm(h)
             hidden_states_list.append(h)
-            gate = self.early_exit_gate(h)
-            gate_list.append(gate)
+            gate_list.append(self.early_exit_gate(h))
 
         return h, hidden_states_list, gate_list
 
@@ -207,7 +206,6 @@ class Model(nn.Module):
         use_weighted_exit: bool = False,
         exit_at_step: Optional[int] = None,
         exit_threshold: Optional[float] = None,
-        logits_to_keep: int = 0,
     ) -> mx.array:
         hidden_states, hidden_states_list, gate_list = self.model(inputs, cache)
         exit_pdf = self._compute_exit_distribution(gate_list)
@@ -228,7 +226,6 @@ class Model(nn.Module):
             use_weighted_exit,
             exit_at_step,
             exit_threshold,
-            logits_to_keep,
         )
 
     def _compute_exit_distribution(self, gate_list: List[mx.array]) -> mx.array:
@@ -244,18 +241,6 @@ class Model(nn.Module):
         pdf_list.append(remaining_prob)
         return mx.stack(pdf_list, axis=-1)
 
-    def _select_token_positions(
-        self, tensor: mx.array, logits_to_keep: int
-    ) -> mx.array:
-        return tensor if logits_to_keep == 0 else tensor[:, -logits_to_keep:]
-
-    def _hidden_to_logits(
-        self, hidden_states: mx.array, logits_to_keep: int
-    ) -> mx.array:
-        return self._apply_lm_head(
-            self._select_token_positions(hidden_states, logits_to_keep)
-        )
-
     def _compute_logits(
         self,
         final_hidden_states: mx.array,
@@ -264,27 +249,22 @@ class Model(nn.Module):
         use_weighted_exit: bool,
         exit_at_step: Optional[int],
         exit_threshold: Optional[float],
-        logits_to_keep: int,
     ) -> mx.array:
         if not hidden_states_list or exit_pdf is None:
-            return self._hidden_to_logits(final_hidden_states, logits_to_keep)
+            return self._apply_lm_head(final_hidden_states)
 
         if exit_at_step is not None and 0 <= exit_at_step < len(hidden_states_list):
-            return self._hidden_to_logits(
-                hidden_states_list[exit_at_step], logits_to_keep
-            )
+            return self._apply_lm_head(hidden_states_list[exit_at_step])
 
         if exit_threshold is not None:
             return self._compute_threshold_exit_logits(
-                hidden_states_list, exit_pdf, exit_threshold, logits_to_keep
+                hidden_states_list, exit_pdf, exit_threshold
             )
 
         if use_weighted_exit:
-            return self._compute_weighted_exit_logits(
-                hidden_states_list, exit_pdf, logits_to_keep
-            )
+            return self._compute_weighted_exit_logits(hidden_states_list, exit_pdf)
 
-        return self._hidden_to_logits(final_hidden_states, logits_to_keep)
+        return self._apply_lm_head(final_hidden_states)
 
     def _apply_lm_head(self, hidden_states: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
@@ -295,29 +275,17 @@ class Model(nn.Module):
         self,
         hidden_states_list: List[mx.array],
         exit_pdf: mx.array,
-        logits_to_keep: int,
     ) -> mx.array:
-        token_exit_pdf = self._select_token_positions(exit_pdf, logits_to_keep)
-        expected_logits = None
-
-        for step_idx, hidden in enumerate(hidden_states_list):
-            step_logits = self._hidden_to_logits(hidden, logits_to_keep)
-            weight = mx.expand_dims(token_exit_pdf[..., step_idx], axis=-1)
-            weighted = step_logits * weight
-
-            if expected_logits is None:
-                expected_logits = weighted
-            else:
-                expected_logits = expected_logits + weighted
-
-        return expected_logits
+        stacked_hidden = mx.stack(hidden_states_list, axis=2)
+        all_logits = self._apply_lm_head(stacked_hidden)
+        weights = mx.expand_dims(exit_pdf, axis=-1)
+        return mx.sum(all_logits * weights, axis=2)
 
     def _compute_threshold_exit_logits(
         self,
         hidden_states_list: List[mx.array],
         exit_pdf: mx.array,
         exit_threshold: float,
-        logits_to_keep: int,
     ) -> mx.array:
         cumulative_probs = mx.cumsum(exit_pdf, axis=-1)
         threshold_mask = cumulative_probs >= exit_threshold
@@ -332,7 +300,7 @@ class Model(nn.Module):
         seq_indices = mx.arange(exit_steps.shape[1])[None, :]
         final_hidden_states = stacked_hidden[batch_indices, seq_indices, exit_steps, :]
 
-        return self._hidden_to_logits(final_hidden_states, logits_to_keep)
+        return self._apply_lm_head(final_hidden_states)
 
     @property
     def layers(self):
