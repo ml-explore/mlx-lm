@@ -211,8 +211,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         # For single spaces wait until the next token to clean it if needed
         if not text.endswith("\ufffd") and not (
             len(v) == 1
-            and (v[0] in self._byte_decoder)
-            and self._byte_decoder[v[0]] == 32
+            and self._byte_decoder.get(v[0]) == 32
         ):
             self.text += self._maybe_trim_space(text)
             self._unflushed = ""
