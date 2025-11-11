@@ -936,7 +936,7 @@ class BatchGenerator:
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
-        self.completion_batch_size = completion_batch_size
+        self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self._stats = BatchStats()
 
         self.active_batch = None
