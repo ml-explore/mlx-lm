@@ -39,7 +39,7 @@ class TextDataset:
 class ChatDataset:
     """
     A dataset for chat data in the format of {"messages": [...]}
-    https://platform.openai.com/docs/guides/fine-tuning/example-format
+    https://platform.openai.com/docs/guides/supervised-fine-tuning#formatting-your-data
     """
 
     def __init__(
@@ -59,8 +59,14 @@ class ChatDataset:
         tools = d.get("tools", None)
         tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
         if self.mask_prompt:
-            messages = messages[:-1]
-            offset = len(self.tokenizer.apply_chat_template(messages, tools=tools))
+            add_generation_prompt = messages[-1].get("role") == "assistant"
+            offset = len(
+                self.tokenizer.apply_chat_template(
+                    messages[:-1],
+                    tools=tools,
+                    add_generation_prompt=add_generation_prompt,
+                )
+            )
             return (tokens, offset)
         else:
             return (tokens, 0)
@@ -94,16 +100,16 @@ class CompletionsDataset:
         self.tokenizer = tokenizer
 
     def process(self, d):
-        tokens = self.tokenizer.apply_chat_template(
-            [
-                {"role": "user", "content": d[self.prompt_key]},
-                {"role": "assistant", "content": d[self.completion_key]},
-            ],
-        )
+        tools = d.get("tools", None)
+        messages = [
+            {"role": "user", "content": d[self.prompt_key]},
+            {"role": "assistant", "content": d[self.completion_key]},
+        ]
+        tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
         if self.mask_prompt:
             offset = len(
                 self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": d[self.prompt_key]}]
+                    messages[0], tools=tools, add_generation_prompt=True
                 )
             )
             return (tokens, offset)

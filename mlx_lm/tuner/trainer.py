@@ -92,7 +92,9 @@ def iterate_batches(
     dataset,
     batch_size,
     max_seq_length,
-    train=False,
+    loop=False,
+    seed=None,
+    comm_group=None,
 ):
     # Sort by length:
     if isinstance(dataset, CacheDataset):
@@ -108,8 +110,12 @@ def iterate_batches(
 
     # If running in distributed mode (N machines) then each one should skip N-1
     # samples
-    offset = mx.distributed.init().rank()
-    step = mx.distributed.init().size()
+    if comm_group is not None:
+        offset = comm_group.rank()
+        step = comm_group.size()
+    else:
+        offset = 0
+        step = 1
     if batch_size % step != 0:
         raise ValueError("The batch size must be divisible by the number of workers")
 
@@ -118,7 +124,8 @@ def iterate_batches(
         idx[i + offset : i + offset + batch_size : step]
         for i in range(0, len(idx) - batch_size + 1, batch_size)
     ]
-
+    if seed:
+        np.random.seed(seed)
     while True:
         indices = np.random.permutation(len(batch_idx))
         for i in indices:
@@ -151,7 +158,7 @@ def iterate_batches(
             batch = mx.array(batch_arr)
             yield batch, mx.array(list(zip(offsets, lengths)))
 
-        if not train:
+        if not loop:
             break
 
 
@@ -177,6 +184,7 @@ def evaluate(
                 dataset=dataset,
                 batch_size=batch_size,
                 max_seq_length=max_seq_length,
+                comm_group=mx.distributed.init(),
             ),
         ),
         desc="Calculating loss...",
@@ -254,7 +262,8 @@ def train(
             dataset=train_dataset,
             batch_size=args.batch_size,
             max_seq_length=args.max_seq_length,
-            train=True,
+            loop=True,
+            comm_group=world,
         ),
     ):
         tic = time.perf_counter()

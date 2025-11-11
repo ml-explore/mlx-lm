@@ -7,15 +7,28 @@ import mlx.nn as nn
 
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
-    return mx.exp(
-        -mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias).astype(A_log.dtype)
+    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias)).astype(
+        A_log.dtype
     )
 
 
-def _make_gated_delta_kernel(has_mask=False):
+def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     if not mx.metal.is_available():
         return None
     mask_source = "mask[b_idx * T + t]" if has_mask else "true"
+
+    # Configure g indexing based on whether gating is vectorized
+    if vectorized:
+        g_comment = "// g: [B, T, Hv, Dk]"
+        g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
+        g_access = "g_[s_idx]"
+        g_advance = "g_ += Hv * Dk;"
+    else:
+        g_comment = "// g: [B, T, Hv]"
+        g_setup = "auto g_ = g + b_idx * T * Hv;"
+        g_access = "g_[hv_idx]"
+        g_advance = "g_ += Hv;"
+
     source = f"""
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
@@ -44,8 +57,8 @@ def _make_gated_delta_kernel(has_mask=False):
           state[i] = static_cast<float>(i_state[s_idx]);
         }}
 
-        // beta, g: [B, T, Hv]
-        auto g_ = g + b_idx * T * Hv;
+        {g_comment}
+        {g_setup}
         auto beta_ = beta + b_idx * T * Hv;
 
         for (int t = 0; t < T; ++t) {{
@@ -53,7 +66,7 @@ def _make_gated_delta_kernel(has_mask=False):
             float kv_mem = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] * g_[hv_idx];
+              state[i] = state[i] * {g_access};
               kv_mem += state[i] * k_[s_idx];
             }}
             kv_mem = simd_sum(kv_mem);
@@ -76,7 +89,7 @@ def _make_gated_delta_kernel(has_mask=False):
           k_ += Hk * Dk;
           v_ += Hv * Dv;
           y += Hv * Dv;
-          g_ += Hv;
+          {g_advance}
           beta_ += Hv;
         }}
         for (int i = 0; i < n_per_t; ++i) {{
@@ -87,16 +100,27 @@ def _make_gated_delta_kernel(has_mask=False):
     inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
     if has_mask:
         inputs.append("mask")
+
+    suffix = ""
+    if vectorized:
+        suffix += "_vec"
+    if has_mask:
+        suffix += "_mask"
+
     return mx.fast.metal_kernel(
-        name="gated_delta_step" + "_mask" if has_mask else "",
+        name=f"gated_delta_step{suffix}",
         input_names=inputs,
         output_names=["y", "state_out"],
         source=source,
     )
 
 
-_gated_delta_kernel = _make_gated_delta_kernel()
-_gated_delta_kernel_masked = _make_gated_delta_kernel(True)
+_gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
+_gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
+_gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
+_gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
+    has_mask=True, vectorized=True
+)
 
 
 @mx.compile
@@ -115,7 +139,8 @@ def _gated_delta_step_ops(
     Shapes:
       - q, k: [B, H, Dk]
       - v: [B, H, Dv]
-      - g, beta: [B, H]
+      - g: [B, H] or [B, H, Dk]
+      - beta: [B, H]
       - state: [B, H, Dv, Dk]
     Returns:
       - y: [B, H, Dv]
@@ -124,13 +149,23 @@ def _gated_delta_step_ops(
 
     # Decay
     old_state = state
-    state = state * g[..., None, None]
+    if g.ndim == 2:
+        decay = g[..., None, None]
+    elif g.ndim == 3:
+        decay = g[..., None, :]
+    else:
+        raise ValueError(f"Unsupported gating shape {g.shape}")
+    state = state * decay
     kv_mem = (state * k[..., None, :]).sum(axis=-1)  # [B, H, Dv]
     delta = (v - kv_mem) * beta[..., None]  # [B, H, Dv]
     state = state + k[..., None, :] * delta[..., None]
     # Output projection along key dim with q
     y = (state * q[..., None, :]).sum(axis=-1)  # [B, H, Dv]
     if mask is not None:
+        if mask.ndim == 2:
+            mask = mx.expand_dims(mask, axes=(2, 3))
+        elif mask.ndim == 3:
+            mask = mx.expand_dims(mask, axis=-1)
         state = mx.where(mask, state, old_state)
     return y, state
 
@@ -147,11 +182,19 @@ def gated_delta_kernel(
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
-    kernel = _gated_delta_kernel
-    inputs = [q, k, v, g, beta, state, T]
-    if mask is not None:
-        kernel = _gated_delta_kernel_masked
-        inputs.append(mask)
+    if g.ndim == 4:
+        kernel = _gated_delta_kernel_vec
+        inputs = [q, k, v, g, beta, state, T]
+        if mask is not None:
+            kernel = _gated_delta_kernel_vec_masked
+            inputs.append(mask)
+    else:
+        kernel = _gated_delta_kernel
+        inputs = [q, k, v, g, beta, state, T]
+        if mask is not None:
+            kernel = _gated_delta_kernel_masked
+            inputs.append(mask)
+
     return kernel(
         inputs=inputs,
         template=[
@@ -179,15 +222,17 @@ def gated_delta_ops(
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
+    Supports both scalar and vectorized gating.
 
     Shapes:
       - q, k: [B, T, Hk, Dk]
       - v: [B, T, Hv, Dv]
-      - g, beta: [B, T, Hv]
-      - state: [B, Hv, Dk, Dv]
+      - g: [B, T, Hv] (scalar) or [B, T, Hv, Dk] (vectorized)
+      - beta: [B, T, Hv]
+      - state: [B, Hv, Dv, Dk]
     Returns:
       - y: [B, T, Hv, Dv]
-      - state: [B, Hv, Dk, Dv]
+      - state: [B, Hv, Dv, Dk]
     """
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
@@ -200,25 +245,15 @@ def gated_delta_ops(
 
     ys = []
     for t in range(T):
-        if mask is not None:
-            y, state = _gated_delta_step_ops(
-                q[:, t],
-                k[:, t],
-                v[:, t],
-                g[:, t],
-                beta[:, t],
-                state,
-                mask[:, t],
-            )
-        else:
-            y, state = _gated_delta_step_ops(
-                q[:, t],
-                k[:, t],
-                v[:, t],
-                g[:, t],
-                beta[:, t],
-                state,
-            )
+        y, state = _gated_delta_step_ops(
+            q[:, t],
+            k[:, t],
+            v[:, t],
+            g[:, t],
+            beta[:, t],
+            state,
+            None if mask is None else mask[:, t],
+        )
         ys.append(y)
     y = mx.stack(ys, axis=1)
     return y, state
@@ -242,10 +277,8 @@ def gated_delta_update(
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
-        if state is None:
-            state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state, mask)
-    else:
-        return gated_delta_kernel(q, k, v, g, beta, state, mask)
+    return gated_delta_kernel(q, k, v, g, beta, state, mask)

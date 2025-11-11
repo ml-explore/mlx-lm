@@ -228,7 +228,6 @@ class ModelProvider:
             validate_draft_tokenizer(draft_tokenizer)
 
         elif draft_model_path is not None and draft_model_path != "default_model":
-            self._validate_model_path(draft_model_path)
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
         return self.model, self.tokenizer
@@ -295,17 +294,10 @@ class APIHandler(BaseHTTPRequestHandler):
             self.body = json.loads(raw_body.decode())
         except json.JSONDecodeError as e:
             logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            # Set appropriate headers based on streaming requirement
-            if self.stream:
-                self._set_stream_headers(400)
-                self.wfile.write(
-                    f"data: {json.dumps({'error': f'Invalid JSON in request body: {e}'})}\n\n".encode()
-                )
-            else:
-                self._set_completion_headers(400)
-                self.wfile.write(
-                    json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
-                )
+            self._set_completion_headers(400)
+            self.wfile.write(
+                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+            )
             return
 
         indent = "\t"  # Backslashes can't be inside of f-strings

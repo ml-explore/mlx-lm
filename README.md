@@ -236,45 +236,19 @@ for more usage details.
 
 ### Supported Models
 
-`mlx-lm` supports thousands of Hugging Face format LLMs. If the model you want to
-run is not supported, file an
-[issue](https://github.com/ml-explore/mlx-lm/issues/new) or better yet,
-submit a pull request.
+`mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
+model you want to run is not supported, file an
+[issue](https://github.com/ml-explore/mlx-lm/issues/new) or better yet, submit
+a pull request. Many supported models are available in various quantization
+formats in the [MLX Community](https://huggingface.co/mlx-community) Hugging
+Face organization.
 
-Here are a few examples of Hugging Face models that work with this example:
+For some models the tokenizer may require you to enable the `trust_remote_code`
+option. You can do this by passing `--trust-remote-code` in the command line.
+If you don't specify the flag explicitly, you will be prompted to trust remote
+code in the terminal when running the model. 
 
-- [mistralai/Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)
-- [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
-- [deepseek-ai/deepseek-coder-6.7b-instruct](https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-instruct)
-- [01-ai/Yi-6B-Chat](https://huggingface.co/01-ai/Yi-6B-Chat)
-- [microsoft/phi-2](https://huggingface.co/microsoft/phi-2)
-- [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1)
-- [Qwen/Qwen-7B](https://huggingface.co/Qwen/Qwen-7B)
-- [pfnet/plamo-13b](https://huggingface.co/pfnet/plamo-13b)
-- [pfnet/plamo-13b-instruct](https://huggingface.co/pfnet/plamo-13b-instruct)
-- [stabilityai/stablelm-2-zephyr-1_6b](https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b)
-- [internlm/internlm2-7b](https://huggingface.co/internlm/internlm2-7b)
-- [tiiuae/falcon-mamba-7b-instruct](https://huggingface.co/tiiuae/falcon-mamba-7b-instruct)
-
-Most
-[Mistral](https://huggingface.co/models?library=transformers,safetensors&other=mistral&sort=trending),
-[Llama](https://huggingface.co/models?library=transformers,safetensors&other=llama&sort=trending),
-[Phi-2](https://huggingface.co/models?library=transformers,safetensors&other=phi&sort=trending),
-and
-[Mixtral](https://huggingface.co/models?library=transformers,safetensors&other=mixtral&sort=trending)
-style models should work out of the box.
-
-For some models (such as `Qwen` and `plamo`) the tokenizer requires you to
-enable the `trust_remote_code` option. You can do this by passing
-`--trust-remote-code` in the command line. If you don't specify the flag
-explicitly, you will be prompted to trust remote code in the terminal when
-running the model. 
-
-For `Qwen` models you must also specify the `eos_token`. You can do this by
-passing `--eos-token "<|endoftext|>"` in the command
-line. 
-
-These options can also be set in the Python API. For example:
+Tokenizer options can also be set in the Python API. For example:
 
 ```python
 model, tokenizer = load(

@@ -9,26 +9,11 @@ from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
-    load_tokenizer,
 )
+from mlx_lm.utils import load_tokenizer
 
 
 class TestTokenizers(unittest.TestCase):
-
-    def download_tokenizer(self, repo):
-        path = Path(
-            snapshot_download(
-                repo_id=repo,
-                allow_patterns=[
-                    "tokenizer.json",
-                    "tokenizer_config.json",
-                    "special_tokens_map.json",
-                    "tokenizer.model",
-                    "chat_template.jinja",
-                ],
-            )
-        )
-        return load_tokenizer(path)
 
     def check_tokenizer(self, tokenizer):
         def check(tokens):
@@ -77,19 +62,19 @@ class TestTokenizers(unittest.TestCase):
         ]
         for tokenizer_repo, expected_detokenizer in tokenizer_repos:
             with self.subTest(tokenizer=tokenizer_repo):
-                tokenizer = self.download_tokenizer(tokenizer_repo)
+                tokenizer = load_tokenizer(tokenizer_repo)
                 tokenizer.decode([0, 1, 2])
                 self.assertTrue(isinstance(tokenizer.detokenizer, expected_detokenizer))
                 self.check_tokenizer(tokenizer)
 
         # Try one with a naive detokenizer
-        tokenizer = self.download_tokenizer("mlx-community/Llama-3.2-1B-Instruct-4bit")
+        tokenizer = load_tokenizer("mlx-community/Llama-3.2-1B-Instruct-4bit")
         tokenizer._detokenizer = NaiveStreamingDetokenizer(tokenizer)
         self.check_tokenizer(tokenizer)
 
     def test_special_tokens(self):
         tokenizer_repo = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"
-        tokenizer = self.download_tokenizer(tokenizer_repo)
+        tokenizer = load_tokenizer(tokenizer_repo)
 
         detokenizer = tokenizer.detokenizer
         detokenizer.reset()
@@ -100,18 +85,18 @@ class TestTokenizers(unittest.TestCase):
 
     def test_tool_calling(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
-        tokenizer = self.download_tokenizer(tokenizer_repo)
+        tokenizer = load_tokenizer(tokenizer_repo)
         self.assertTrue(tokenizer.has_tool_calling)
         self.assertEqual(tokenizer.tool_call_start, "<tool_call>")
         self.assertEqual(tokenizer.tool_call_end, "</tool_call>")
 
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
-        tokenizer = self.download_tokenizer(tokenizer_repo)
+        tokenizer = load_tokenizer(tokenizer_repo)
         self.assertFalse(tokenizer.has_tool_calling)
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
-        tokenizer = self.download_tokenizer(tokenizer_repo)
+        tokenizer = load_tokenizer(tokenizer_repo)
         self.assertTrue(tokenizer.has_thinking)
         self.assertEqual(tokenizer.think_start, "<think>")
         self.assertEqual(tokenizer.think_end, "</think>")
