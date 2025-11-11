@@ -17,6 +17,8 @@ from typing import (
     Union,
 )
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
@@ -640,6 +642,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    max_captured_steps: int = 5,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -691,6 +694,14 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
+
+    # catpure prfoile
+    if os.environ.get("MTL_CAPTURE_ENABLED", "0") == "1":
+        max_captured_steps = os.environ.get("MLX_MAX_CAPTURED_STEPS", max_captured_steps)
+        mlx_trace_file = os.environ.get("MLX_TRACE_FILE", "mlx_trace.gputrace")
+
+        mx.metal.start_capture(mlx_trace_file)
+
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
@@ -698,6 +709,11 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
+
+            if n >= max_captured_steps:
+                mx.metal.stop_capture()
+                max_captured_steps = float("inf")  # only stop once
+
             if token in tokenizer.eos_token_ids:
                 break
 
