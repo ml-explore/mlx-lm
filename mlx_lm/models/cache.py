@@ -109,6 +109,10 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def cache_length(cache: List[Any]):
+    return max(len(c) for c in cache)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -141,6 +145,12 @@ class _BaseCache:
 
     def is_trimmable(self):
         return False
+
+    def __len__(self):
+        return 0
+
+    def __bool__(self):
+        return True
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -313,6 +323,9 @@ class KVCache(_BaseCache):
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    def __len__(self):
+        return self.offset
 
     @property
     def state(self):
@@ -659,6 +672,15 @@ class CacheList(_BaseCache):
             c.extend(o)
 
 
+def dynamic_roll(x, shifts, axis):
+    n = x.shape[axis]
+    expand_shifts = (...,) + (None,) * (x.ndim - axis)
+    expand_indices = expand_shifts[:-1]
+    idx = (mx.arange(n)[expand_indices] - shifts[expand_shifts]) % n
+    rolled = mx.take_along_axis(x, idx, axis=axis)
+    return rolled
+
+
 class BatchKVCache(_BaseCache):
     step = 256
 
@@ -711,6 +733,18 @@ class BatchKVCache(_BaseCache):
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
         return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+
+    def __len__(self):
+        return self._idx
+
+    def roll(self, padding):
+        if not isinstance(padding, mx.array):
+            padding = mx.array(padding)
+
+        self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
+        self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+        self.offset -= padding
+        self.left_padding += padding
 
     @property
     def state(self):
@@ -784,6 +818,39 @@ class BatchKVCache(_BaseCache):
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx
+
+    def extract(self, idx):
+        cache = KVCache()
+        padding = self.left_padding[idx].item()
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.keys.shape[2]
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        lengths = [len(c) for c in caches]
+        max_length = max(lengths)
+        padding = [max_length - l for l in lengths]
+        B = len(caches)
+        H = max(c.keys.shape[1] for c in caches if c.keys is not None)
+        Dk = max(c.keys.shape[3] for c in caches if c.keys is not None)
+        Dv = max(c.values.shape[3] for c in caches if c.values is not None)
+        dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+
+        keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
+        values = mx.zeros((B, H, max_length, Dv), dtype=dt)
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            keys[i : i + 1, :, p : p + c.offset] = c.keys[..., : c.offset, :]
+            values[i : i + 1, :, p : p + c.offset] = c.values[..., : c.offset, :]
+
+        cache = cls(padding)
+        cache.keys = keys
+        cache.values = values
+        cache.offset += keys.shape[2]
+        cache._idx = keys.shape[2]
+
+        return cache
 
 
 class BatchRotatingKVCache(_BaseCache):
