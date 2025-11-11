@@ -900,6 +900,10 @@ def _merge_caches(caches):
         cache = None
         if isinstance(caches[0][i], KVCache):
             cache = BatchKVCache.merge([c[i] for c in caches])
+        else:
+            raise ValueError(
+                f"{type(caches[0][i])} does not yet support batching with history"
+            )
         batch_cache.append(cache)
     return batch_cache
 
