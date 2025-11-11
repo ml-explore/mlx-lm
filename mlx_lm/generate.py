@@ -696,11 +696,15 @@ def stream_generate(
         )
 
     # catpure prfoile
-    if os.environ.get("MTL_CAPTURE_ENABLED", "0") == "1":
-        max_captured_steps = os.environ.get("MLX_MAX_CAPTURED_STEPS", max_captured_steps)
+    doProfile = os.environ.get("MTL_CAPTURE_ENABLED", "0") == "1"
+    includePrefillStage = os.environ.get("MLX_PROFILE_PREFILL", "0") == "1"
+    if doProfile:
+        max_captured_steps = int(os.environ.get("MLX_MAX_CAPTURED_STEPS", max_captured_steps))
         mlx_trace_file = os.environ.get("MLX_TRACE_FILE", "mlx_trace.gputrace")
 
-        mx.metal.start_capture(mlx_trace_file)
+        # NOTE (yiakwy) : profile prefill stage is very expensive for MLX
+        if includePrefillStage:
+            mx.metal.start_capture(mlx_trace_file)
 
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
@@ -709,6 +713,9 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
+            
+                if not includePrefillStage:
+                    mx.metal.start_capture(mlx_trace_file)
 
             if n >= max_captured_steps:
                 mx.metal.stop_capture()
