@@ -1167,6 +1167,7 @@ def batch_generate(
                         )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+                else:
                     cache.trim_prompt_cache(r.prompt_cache, 1)
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
