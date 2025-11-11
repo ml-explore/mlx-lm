@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-benchmark_ollama.py
+online_benchmark.py
 
-Benchmark an Ollama backend (OpenAI-compatible /v1/chat/completions) by sending
+Benchmark an MLX backend (OpenAI-compatible /v1/chat/completions) by sending
 concurrent requests and measuring per-request and overall metrics:
  - input tokens
  - output tokens
@@ -12,7 +12,7 @@ concurrent requests and measuring per-request and overall metrics:
  - total throughput (tokens/sec)
 
 Example:
-    python benchmark_ollama.py --base-url localhost:11435 --batch-size 256 --input-size 4096 --output-len 128
+    python online_benchmark.py --base-url localhost:11435 --batch-size 256 --input-size 4096 --output-len 128
 """
 
 import argparse
@@ -113,8 +113,6 @@ async def post_completion_stream(
             if resp.status_code >= 400:
                 # read body
                 body = await resp.aread()
-                import pdb
-                pdb.set_trace()
                 raise RuntimeError(f"HTTP {resp.status_code}: {body.decode(errors='ignore')}")
             # read chunked response iteratively
             async for raw_chunk in resp.aiter_bytes():
@@ -129,8 +127,6 @@ async def post_completion_stream(
                     s = raw_chunk.decode(errors="ignore")
                 except Exception as e:
                     print(f"Exception-1 (client ) : {e}")
-                    import pdb
-                    pdb.set_trace()
                     s = str(raw_chunk)
                 # If server uses SSE style "data: ..." lines, extract them
                 for line in s.splitlines():
@@ -163,8 +159,6 @@ async def post_completion_stream(
                         except Exception as e:
                             # If not JSON, append raw payload
                             print(f"I don't know")
-                            import pdb
-                            pdb.set_trace()
                             text_parts.append(payload)
                     else:
                         # Not SSE-like, append raw line
@@ -173,8 +167,6 @@ async def post_completion_stream(
     except httpx.ReadError as e:
         # network read error; fallback to a normal non-streaming request
         print(f"httpx.ReadError : {e}")
-        import pdb
-        pdb.set_trace()
         raise
     end = time.perf_counter()
     ttft = (first_chunk_time - start) if first_chunk_time is not None else (end - start)
@@ -201,8 +193,6 @@ async def post_completion_nonstream(
         if resp.status_code >= 400:
             body = await resp.aread()
 
-            import pdb
-            pdb.set_trace()
             print(f"httpx.ReadError : {e}")
 
             raise RuntimeError(f"HTTP {resp.status_code}: {body.decode(errors='ignore')}")
@@ -238,9 +228,6 @@ async def post_completion_nonstream(
                 text_out = body_bytes.decode(errors="ignore")
         except Exception as e:
             print(f"Exception : {e}")
-            
-            import pdb
-            pdb.set_trace()
 
             text_out = body_bytes.decode(errors="ignore")
         ttft = first_arrival - start
@@ -344,14 +331,8 @@ async def run_benchmark(
     else:
         base = "http://" + base_url
     endpoint = f"{base.rstrip('/')}/v1/chat/completions"
-    # endpoint = f"{base.rstrip('/')}/v1/responses"
-
-    # http://localhost:5001/v1/chat/completions 
-    # print(f"endpoint : {endpoint}")
 
     prompt = build_prompt_for_token_target(input_size, model_for_token_count)
-
-    # print(f"prompt : {prompt}")
 
     # prepare client
     limits = httpx.Limits(max_keepalive_connections=concurrency, max_connections=concurrency * 2)
@@ -435,7 +416,7 @@ async def run_benchmark(
     # TPOT definition: time per output token (average across requests) computed above.
 
     # Print summary
-    print("\n===== Ollama Benchmark Summary =====")
+    print("\n===== MLX Benchmark Summary =====")
     print(f"Target model: {model}")
     print(f"Endpoint: {endpoint}")
     print(f"Batch size (total requests): {batch_size}")
@@ -476,7 +457,7 @@ async def run_benchmark(
 
 # ---------- CLI ----------
 def parse_args():
-    p = argparse.ArgumentParser(description="Benchmark Ollama (OpenAI-like) server.")
+    p = argparse.ArgumentParser(description="Benchmark MLX (OpenAI-like) server.")
     p.add_argument("--base-url", required=True, help="Base URL (host[:port]) e.g. localhost:11435 or http://localhost:11435")
     p.add_argument("--model", default="gpt-oss:120b", help="Model name (server-specific). Default: gpt-oss:120b")
     p.add_argument("--batch-size", type=int, default=16, help="Number of requests to send (total).")
