@@ -171,22 +171,30 @@ class OuroModel(nn.Module):
         exit_at_step: Optional[int] = None,
         exit_threshold: Optional[float] = None,
     ) -> mx.array:
-        h, hs, gates = self._forward_ut_steps(x, cache)
-
-        exit_pdf = self._compute_exit_distribution(gates)
+        hs, gates = self._forward_ut_steps(x, cache)
 
         exit_at_step = (
             exit_at_step if exit_at_step is not None else self.args.early_exit_step
         )
+        if exit_at_step is not None and 0 <= exit_at_step < len(hs):
+            return hs[exit_at_step]
+
         exit_threshold = (
             exit_threshold
             if exit_threshold is not None
             else self.args.early_exit_threshold
         )
 
-        return self._select_exit(
-            h, hs, exit_pdf, use_weighted_exit, exit_at_step, exit_threshold
-        )
+        if exit_threshold is not None or use_weighted_exit:
+            exit_pdf = self._compute_exit_distribution(gates)
+
+            if exit_threshold is not None:
+                return self._threshold_exit(hs, exit_pdf, exit_threshold)
+
+            if use_weighted_exit:
+                return self._weighted_exit(hs, exit_pdf)
+
+        return hs[-1]
 
     def _forward_ut_steps(self, x: mx.array, cache: Optional[List[KVCache]] = None):
         h = self.embed_tokens(x)
@@ -208,7 +216,7 @@ class OuroModel(nn.Module):
             hs.append(h)
             gates.append(self.early_exit_gate(h))
 
-        return h, hs, gates
+        return hs, gates
 
     def _compute_exit_distribution(self, gates: List[mx.array]) -> mx.array:
         pdf = []
@@ -222,26 +230,6 @@ class OuroModel(nn.Module):
 
         pdf.append(remaining)
         return mx.stack(pdf, axis=-1)
-
-    def _select_exit(
-        self,
-        h: mx.array,
-        hs: List[mx.array],
-        exit_pdf: mx.array,
-        use_weighted_exit: bool,
-        exit_at_step: Optional[int],
-        exit_threshold: Optional[float],
-    ) -> mx.array:
-        if exit_at_step is not None and 0 <= exit_at_step < len(hs):
-            return hs[exit_at_step]
-
-        if exit_threshold is not None:
-            return self._threshold_exit(hs, exit_pdf, exit_threshold)
-
-        if use_weighted_exit:
-            return self._weighted_exit(hs, exit_pdf)
-
-        return h
 
     def _weighted_exit(
         self,
