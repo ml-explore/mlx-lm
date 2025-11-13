@@ -1,6 +1,7 @@
 # ABOUTME: Validates handler helper delegating to continuous batching runtime.
 # ABOUTME: Ensures runtime hook executes only when configured for streaming.
 
+import importlib
 import io
 import types
 import unittest
@@ -11,7 +12,6 @@ from .util import ensure_mlx_stub
 ensure_mlx_stub()
 
 from mlx_lm.generate import GenerationResponse
-from mlx_lm.server import APIHandler, PromptCache
 from mlx_lm.server_batched.handler import maybe_handle_continuous_batching
 
 
@@ -203,6 +203,9 @@ class HandlerFallbackTests(unittest.TestCase):
             self._patchers.pop().stop()
 
     def make_handler(self, *, streaming=True, logprobs=-1, tools=None):
+        server_module = importlib.import_module("mlx_lm.server")
+        APIHandler = server_module.APIHandler
+        PromptCache = server_module.PromptCache
         handler = APIHandler.__new__(APIHandler)
         handler.stream = streaming
         handler.body = {"messages": [{"role": "user", "content": "Hi"}]}
@@ -262,7 +265,9 @@ class HandlerFallbackTests(unittest.TestCase):
                 finish_reason="stop",
             )
         ]
-        with mock.patch("mlx_lm.server.stream_generate", return_value=iter([])) as mock_stream:
+        with mock.patch(
+            "mlx_lm.server.stream_generate", return_value=iter([])
+        ) as mock_stream:
             with mock.patch(
                 "mlx_lm.server.maybe_handle_continuous_batching",
                 return_value=("req-batch", iter(responses)),

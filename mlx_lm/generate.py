@@ -964,10 +964,16 @@ class BatchGenerator:
         return sampled, logprobs
 
     def stats(self):
-        self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
-        self._stats.generation_tps = (
-            self._stats.generation_tokens / self._stats.generation_time
-        )
+        if self._stats.prompt_time > 0:
+            self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
+        else:
+            self._stats.prompt_tps = 0.0
+        if self._stats.generation_time > 0:
+            self._stats.generation_tps = (
+                self._stats.generation_tokens / self._stats.generation_time
+            )
+        else:
+            self._stats.generation_tps = 0.0
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
 
@@ -979,7 +985,9 @@ class BatchGenerator:
         num_active = len(batch) if batch else 0
         num_to_add = self.completion_batch_size - num_active
         while num_to_add > 0 and self.unprocessed_prompts:
-            take = min(self.prefill_batch_size, num_to_add, len(self.unprocessed_prompts))
+            take = min(
+                self.prefill_batch_size, num_to_add, len(self.unprocessed_prompts)
+            )
             prompts = self.unprocessed_prompts[:take]
             if not prompts:
                 break

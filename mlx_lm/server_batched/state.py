@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -22,6 +22,14 @@ class SequenceState:
     finished: bool = False
     cancel_requested: bool = False
     slot_id: Optional[int] = None
+    paged_seq_id: Optional[int] = None
+    apc_key: Optional[bytes] = None
+    apc_prefixes: Optional[List[Tuple[int, bytes]]] = None
+    apc_reused: bool = False
+    apc_recorded: bool = False
+    hybrid_dense_remaining: int = 0
+    prefill_ramp_remaining: int = 0
+    prefill_decode_ready: bool = False
 
     @property
     def remaining_prompt_tokens(self) -> int:
@@ -56,6 +64,7 @@ class SequenceContext:
     generator_uid: Optional[int] = None
     prompt_inserted: bool = False
     slot_initialized: bool = False
+    uses_default_sampler: bool = False
 
     def enqueue_event(self, event: Any) -> None:
         try:

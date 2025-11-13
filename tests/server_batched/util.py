@@ -1,28 +1,114 @@
 # ABOUTME: Provides helper utilities for scheduler integration tests.
 # ABOUTME: Includes stubs for MLX modules when unavailable in test envs.
 
+import os
 import sys
 import types
 
 import numpy as np
+
 
 class _FakeArray(list):
     def tolist(self):
         return list(self)
 
 
+import importlib
+import importlib.util
 from pathlib import Path
 
 
 def ensure_mlx_stub():
-    if "mlx" in sys.modules:
-        return
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_str = str(repo_root)
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+
+    force_stub = os.environ.get("MLX_FORCE_STUB", "").lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+    }
+    if force_stub:
+        for name in list(sys.modules.keys()):
+            if name == "mlx" or name.startswith("mlx."):
+                sys.modules.pop(name, None)
+        _install_mlx_stub()
+    elif "mlx" not in sys.modules:
+        try:
+            import mlx  # noqa: F401
+        except ImportError:
+            _install_mlx_stub()
+    _install_support_stubs()
+
+    for name in list(sys.modules.keys()):
+        if name == "mlx_lm" or name.startswith("mlx_lm."):
+            sys.modules.pop(name, None)
+
+    pkg_path = repo_root / "mlx_lm" / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "mlx_lm",
+        pkg_path,
+        submodule_search_locations=[str(repo_root / "mlx_lm")],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["mlx_lm"] = module
+    spec.loader.exec_module(module)
+
+    try:
+        importlib.import_module("mlx_lm")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Unable to import local mlx_lm package") from exc
+
+
+def _install_support_stubs():
+    if "huggingface_hub" not in sys.modules:
+        hf_module = types.ModuleType("huggingface_hub")
+        hf_module.snapshot_download = lambda *_, **__: ""
+        hf_module.HfFileSystem = object
+        hf_module.scan_cache_dir = lambda **__: types.SimpleNamespace(repos=[])
+        sys.modules["huggingface_hub"] = hf_module
+    if "transformers" not in sys.modules:
+        transformers_module = types.ModuleType("transformers")
+
+        class _PreTrainedTokenizer:
+            def __init__(self, *_, **__):
+                pass
+
+        transformers_module.PreTrainedTokenizer = _PreTrainedTokenizer
+        transformers_module.PreTrainedTokenizerFast = _PreTrainedTokenizer
+
+        class _AutoTokenizer:
+            _registry = {}
+
+            @classmethod
+            def from_pretrained(cls, *_, **__):
+                return _PreTrainedTokenizer()
+
+            @classmethod
+            def register(cls, name, fast_tokenizer_class=None, **kwargs):
+                cls._registry[name] = (fast_tokenizer_class, kwargs)
+
+        transformers_module.AutoTokenizer = _AutoTokenizer
+        sys.modules["transformers"] = transformers_module
+
+
+def _install_mlx_stub():
 
     mlx_module = types.ModuleType("mlx")
     core_module = types.ModuleType("mlx.core")
     metal_module = types.ModuleType("mlx.metal")
 
     core_module.fast = types.SimpleNamespace()
+    core_module.fast.paged_attention = lambda *_, **__: None
+    core_module.fast._paged_attention_with_overlay_impl = lambda *_, **__: None
+    core_module.fast._paged_attention_last_time_ms = lambda: 0.0
+    core_module.fast._paged_kv_write_impl = lambda *_, **__: None
+    core_module.fast.paged_kv_write_layers_tokens = lambda *_, **__: None
+    core_module.fast.paged_kv_write_layers_batch = lambda *_, **__: None
+    core_module.fast._paged_attention_prewarm = lambda *_, **__: None
+    core_module.fast.paged_prefill = lambda *_, **__: None
     core_module.array = lambda data, *_, **__: np.array(data)
     core_module.eval = lambda *_, **__: None
     core_module.random = types.SimpleNamespace(seed=lambda *_: None, state=None)
@@ -33,11 +119,34 @@ def ensure_mlx_stub():
     core_module.zeros = lambda shape, dtype=None: np.zeros(
         shape if isinstance(shape, tuple) else (shape,), dtype=dtype or float
     )
+    core_module.zeros_like = lambda array: np.zeros_like(array)
+    core_module.ones = lambda shape, dtype=None: np.ones(
+        shape if isinstance(shape, tuple) else (shape,), dtype=dtype or float
+    )
+    core_module.array_equal = lambda a, b: np.array_equal(a, b)
     core_module.stack = lambda arrays, axis=0: np.stack(arrays, axis=axis)
     core_module.concatenate = lambda arrays, axis=0: np.concatenate(arrays, axis=axis)
     core_module.transpose = lambda array, axes: np.transpose(array, axes)
     core_module.expand_dims = lambda array, axis=0: np.expand_dims(array, axis)
+    core_module.contiguous = lambda array: array
+    core_module.arange = lambda *args, **kwargs: np.arange(*args, **kwargs)
+    core_module.synchronize = lambda *_, **__: None
+    core_module.full = lambda shape, fill_value, dtype=None: np.full(
+        shape if isinstance(shape, tuple) else (shape,),
+        fill_value,
+        dtype=dtype or float,
+    )
+    core_module.int8 = np.int8
+    core_module.uint8 = np.uint8
+    core_module.int16 = np.int16
+    core_module.uint16 = np.uint16
     core_module.int32 = np.int32
+    core_module.uint32 = np.uint32
+    core_module.float16 = np.float16
+    core_module.bfloat16 = np.float16
+    core_module.float32 = np.float32
+    _StubStream = type("Stream", (), {})
+    core_module.Stream = _StubStream
     core_module.argmax = lambda array, axis=-1: types.SimpleNamespace(item=lambda: 0)
     core_module.argpartition = lambda arr, kth, axis=-1: _FakeArray([0])
     core_module.argsort = lambda arr, axis=-1: _FakeArray([0])
@@ -49,8 +158,22 @@ def ensure_mlx_stub():
 
     metal_module.device_info = lambda: {"architecture": "stub"}
     metal_module.is_available = lambda: False
+    metal_module.command_buffer_profiling_supported = lambda: False
+    metal_module.command_buffer_profiling_enabled = lambda: False
+    metal_module.set_command_buffer_profiling = lambda *_: None
 
     nn_module = types.ModuleType("mlx.nn")
+    paged_kv_module = types.ModuleType("mlx.nn.paged_kv")
+
+    class _StubKVBlockManager:
+        IS_STUB = True
+
+        def __init__(self, *_, **__):
+            raise RuntimeError("KVBlockManager stub is not available in test stubs")
+
+    paged_kv_module.KVBlockManager = _StubKVBlockManager
+    paged_kv_module.prefill_into_kv = lambda *_, **__: None
+    nn_module.paged_kv = paged_kv_module
     nn_module.Module = object
     utils_module = types.ModuleType("mlx.utils")
     utils_module.tree_map_with_path = lambda func, tree: tree
@@ -66,6 +189,8 @@ def ensure_mlx_stub():
     mlx_module.utils = utils_module
     mlx_module.uint32 = int
     mlx_module.float32 = float
+    mlx_module.float16 = float
+    mlx_module.Stream = _StubStream
     mlx_module.__version__ = "0.0.0"
     mlx_module.__path__ = []
 
@@ -73,6 +198,7 @@ def ensure_mlx_stub():
     sys.modules["mlx.core"] = core_module
     sys.modules["mlx.metal"] = metal_module
     sys.modules["mlx.nn"] = nn_module
+    sys.modules["mlx.nn.paged_kv"] = paged_kv_module
     sys.modules["mlx.utils"] = utils_module
     if "huggingface_hub" not in sys.modules:
         hf_module = types.ModuleType("huggingface_hub")
@@ -169,7 +295,9 @@ def ensure_mlx_stub():
                 keys = self.keys
                 values = self.values
                 if keys is None or values is None:
-                    zeros = np.zeros((len(self.left_padding), 1, 0, 1), dtype=np.float32)
+                    zeros = np.zeros(
+                        (len(self.left_padding), 1, 0, 1), dtype=np.float32
+                    )
                     keys = zeros
                     values = zeros
                 return keys, values, self.offsets, self.left_padding
@@ -183,7 +311,9 @@ def ensure_mlx_stub():
                     offsets.tolist() if hasattr(offsets, "tolist") else offsets
                 )
                 self.left_padding = np.array(
-                    left_padding.tolist() if hasattr(left_padding, "tolist") else left_padding
+                    left_padding.tolist()
+                    if hasattr(left_padding, "tolist")
+                    else left_padding
                 )
 
         class _StubCacheList:
@@ -216,8 +346,6 @@ def ensure_mlx_stub():
 
     if "mlx_lm" not in sys.modules:
         try:
-            import importlib
-
             importlib.import_module("mlx_lm")
         except Exception:
             pkg = types.ModuleType("mlx_lm")
@@ -231,7 +359,9 @@ def ensure_mlx_stub():
 
     if "mlx_lm.server_batched" not in sys.modules:
         subpkg = types.ModuleType("mlx_lm.server_batched")
-        subpkg.__path__ = [str(Path(__file__).resolve().parents[2] / "mlx_lm" / "server_batched")]
+        subpkg.__path__ = [
+            str(Path(__file__).resolve().parents[2] / "mlx_lm" / "server_batched")
+        ]
         from importlib.machinery import ModuleSpec
 
         spec = ModuleSpec(name="mlx_lm.server_batched", loader=None, is_package=True)

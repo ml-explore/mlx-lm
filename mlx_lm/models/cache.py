@@ -1,13 +1,18 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from .base import create_causal_mask
+
+try:  # pragma: no cover - optional dependency
+    from mlx.nn.paged_kv import KVBlockManager
+except Exception:  # pragma: no cover
+    KVBlockManager = None
 
 
 def make_prompt_cache(
@@ -1005,3 +1010,102 @@ class BatchRotatingKVCache(_BaseCache):
         )
         self._idx = max_idx
         self._offset = max(self._offset, other._offset)
+
+
+# ---------------------------------------------------------------------------#
+# Paged KV cache (KVBlockManager-backed)
+# ---------------------------------------------------------------------------#
+
+
+class PagedKVCacheAdapter(_BaseCache):
+    """Layer-scoped cache that streams writes into a shared KVBlockManager."""
+
+    def __init__(self, manager: "KVBlockManager", seq_id: int, layer_idx: int):
+        if KVBlockManager is None:
+            raise RuntimeError("Paged KV cache requires mlx.nn.paged_kv")
+        self.manager = manager
+        self.seq_id = seq_id
+        self.layer_idx = layer_idx
+        self.offset = 0
+
+    def update_and_fetch(self, keys, values):
+        if keys is None or values is None:
+            return None, None
+        k_chunk = _collapse_batch_chunk(keys)
+        v_chunk = _collapse_batch_chunk(values)
+        start = self.offset
+        self.manager.write_prefill(
+            self.seq_id,
+            self.layer_idx,
+            k_chunk,
+            v_chunk,
+            start,
+            commit=not self.manager.is_prefill_active(self.seq_id),
+        )
+        self.offset += k_chunk.shape[1]
+        return keys, values
+
+    def append_token(self, k_token: mx.array, v_token: mx.array) -> None:
+        """Append a single decode token into the paged cache."""
+        self.manager.append_decode_token(
+            self.seq_id,
+            self.layer_idx,
+            k_token,
+            v_token,
+        )
+        self.offset += 1
+
+    def table(self) -> Tuple[mx.array, int]:
+        return self.manager.table(self.seq_id)
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    @property
+    def is_trimmable(self) -> bool:
+        return False
+
+    def trim(self, _unused: int) -> int:
+        return 0
+
+    @property
+    def state(self):
+        return (self.seq_id, self.layer_idx, self.offset)
+
+    @state.setter
+    def state(self, value):
+        seq_id, layer_idx, offset = value
+        self.seq_id = int(seq_id)
+        self.layer_idx = int(layer_idx)
+        self.offset = int(offset)
+
+    @property
+    def meta_state(self):
+        return ("paged",)
+
+    @meta_state.setter
+    def meta_state(self, _value):
+        # No-op; meta state is informational only.
+        return
+
+
+def make_paged_prompt_cache(
+    manager: "KVBlockManager", seq_id: int, num_layers: int
+) -> List[PagedKVCacheAdapter]:
+    if KVBlockManager is None:
+        raise RuntimeError("Paged KV cache requires mlx.nn.paged_kv")
+    return [
+        PagedKVCacheAdapter(manager, seq_id, layer_idx)
+        for layer_idx in range(num_layers)
+    ]
+
+
+def _collapse_batch_chunk(chunk: mx.array) -> mx.array:
+    """Collapse `[B, H, T, D] -> [H, T, D]` for paged writes."""
+    arr = mx.array(chunk)
+    if arr.ndim != 4:
+        raise ValueError("expected chunk with shape [B, kv_heads, tokens, dim]")
+    if arr.shape[0] != 1:
+        raise ValueError("paged cache expects batch dimension == 1")
+    collapsed = arr[0]
+    return collapsed

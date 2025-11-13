@@ -8,14 +8,15 @@ import platform
 import signal
 import socket
 import sys
+import threading
 import time
 import uuid
 import warnings
-import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Dict,
     List,
@@ -25,7 +26,6 @@ from typing import (
     Sequence,
     Tuple,
     Union,
-    TYPE_CHECKING,
 )
 
 import mlx.core as mx
@@ -35,10 +35,10 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import common_prefix_len, load
-from .server_batched.handler import maybe_handle_continuous_batching
 from .server_batched.config import create_arg_parser
+from .server_batched.handler import maybe_handle_continuous_batching
 from .server_batched.runtime import create_runtime
+from .utils import common_prefix_len, load
 
 
 def get_system_fingerprint():
@@ -908,10 +908,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if self.stream:
             response = self.generate_response(
-                        segment,
-                        finish_reason,
-                        tool_calls=tool_calls,
-                        token_id=last_token_id if segment else None,
+                segment,
+                finish_reason,
+                tool_calls=tool_calls,
+                token_id=last_token_id if segment else None,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
@@ -920,7 +920,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     original_prompt_length = len(prompt_for_usage)
                 else:
                     original_prompt_length = (
-                        len(self.prompt_cache.tokens) - len(tokens) + len(prompt_for_usage)
+                        len(self.prompt_cache.tokens)
+                        - len(tokens)
+                        + len(prompt_for_usage)
                     )
                 response = self.completion_usage_response(
                     original_prompt_length, len(tokens)
@@ -1096,7 +1098,21 @@ def run(
         "max_num_seqs": getattr(args, "max_num_seqs", 16),
         "max_tokens_per_step": getattr(args, "max_tokens_per_step", 4096),
         "prefill_chunk": getattr(args, "prefill_chunk", 1024),
-        "force_legacy_generator": bool(args and getattr(args, "force_legacy_generator", False)),
+        "prefill_ramp_chunk": getattr(args, "prefill_ramp_chunk", 64),
+        "prefill_ramp_budget_ms": getattr(args, "prefill_ramp_budget_ms", None),
+        "prefill_hybrid_threshold": getattr(args, "prefill_hybrid_threshold", 0),
+        "force_legacy_generator": bool(
+            args and getattr(args, "force_legacy_generator", False)
+        ),
+        "attn_backend": getattr(args, "attn_backend", "auto"),
+        "decode_engine": getattr(args, "decode_engine", "paged-arrays"),
+        "kv_block_size": getattr(args, "kv_block_size", 16),
+        "kv_pool_blocks": getattr(args, "kv_pool_blocks", "auto"),
+        "kv_quant_mode": getattr(args, "kv_quant", "none"),
+        "kv_quant_group_size": getattr(args, "kv_quant_group_size", 64),
+        "paged_vec_width": getattr(args, "paged_vec_width", "auto"),
+        "paged_threads_per_head": getattr(args, "paged_threads_per_head", "auto"),
+        "metal_profiling": bool(args and getattr(args, "metal_profiling", False)),
     }
     runtime_state = {
         "config": runtime_config,

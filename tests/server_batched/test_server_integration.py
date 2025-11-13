@@ -49,6 +49,15 @@ class RunIntegrationTests(unittest.TestCase):
                 max_num_seqs=8,
                 max_tokens_per_step=2048,
                 prefill_chunk=512,
+                prefill_ramp_chunk=32,
+                prefill_hybrid_threshold=16,
+                attn_backend="auto",
+                kv_block_size=32,
+                kv_pool_blocks=512,
+                kv_quant="none",
+                kv_quant_group_size=64,
+                paged_vec_width="auto",
+                paged_threads_per_head="auto",
             ),
         )
 
@@ -57,6 +66,11 @@ class RunIntegrationTests(unittest.TestCase):
         self.assertTrue(state["config"]["enabled"])
         self.assertEqual(state["config"]["max_num_seqs"], 8)
         self.assertEqual(state["config"]["prefill_chunk"], 512)
+        self.assertEqual(state["config"]["prefill_ramp_chunk"], 32)
+        self.assertEqual(state["config"]["prefill_hybrid_threshold"], 16)
+        self.assertEqual(state["config"]["attn_backend"], "auto")
+        self.assertEqual(state["config"]["kv_block_size"], 32)
+        self.assertIn("metal_profiling", state["config"])
 
     @patch("mlx_lm.server.socket.getaddrinfo")
     def test_run_disables_runtime_when_flag_off(self, mock_getaddrinfo):

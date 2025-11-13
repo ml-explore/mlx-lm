@@ -353,5 +353,19 @@ class TestGenerate(unittest.TestCase):
         del self.model.make_cache
 
 
+class _DummyModel:
+    def __init__(self):
+        self.layers = []
+
+
+class TestBatchStatsSafety(unittest.TestCase):
+    def test_batch_generator_stats_handles_zero_time(self):
+        model = _DummyModel()
+        gen = BatchGenerator(model, stop_tokens=set(), max_tokens=1)
+        stats = gen.stats()
+        self.assertEqual(stats.prompt_tps, 0.0)
+        self.assertEqual(stats.generation_tps, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

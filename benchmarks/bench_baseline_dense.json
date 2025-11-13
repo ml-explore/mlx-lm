@@ -1,0 +1,543 @@
+{
+  "decode_engine": "dense",
+  "prefill_hybrid_threshold": 0,
+  "static_summary": {
+    "count": 4,
+    "tokens": 188,
+    "wall_seconds": 0.127585167,
+    "tokens_per_sec": 1473.5255235430307,
+    "ttft_mean_ms": 127.585167,
+    "ttft_median_ms": 127.585167,
+    "ttft_p95_ms": 127.585167,
+    "mean_tokens_per_request": 47.0,
+    "ttft_samples_ms": [
+      127.585167,
+      127.585167,
+      127.585167,
+      127.585167
+    ],
+    "emit_event_counts": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "emit_trace_samples": [
+      [
+        {
+          "tokens": 47,
+          "token_id": null,
+          "finish_reason": "length"
+        }
+      ],
+      [
+        {
+          "tokens": 47,
+          "token_id": null,
+          "finish_reason": "length"
+        }
+      ],
+      [
+        {
+          "tokens": 47,
+          "token_id": null,
+          "finish_reason": "length"
+        }
+      ],
+      [
+        {
+          "tokens": 47,
+          "token_id": null,
+          "finish_reason": "length"
+        }
+      ]
+    ]
+  },
+  "continuous_summary": {
+    "count": 4,
+    "tokens": 64,
+    "wall_seconds": 0.106748542,
+    "tokens_per_sec": 599.5398044874468,
+    "ttft_mean_ms": 3.0696565000000002,
+    "ttft_median_ms": 3.1427085000000003,
+    "ttft_p95_ms": 3.558584,
+    "mean_tokens_per_request": 16.0,
+    "ttft_samples_ms": [
+      2.434625,
+      3.06875,
+      3.216667,
+      3.558584
+    ],
+    "emit_event_counts": [
+      17,
+      17,
+      17,
+      17
+    ],
+    "emit_trace_samples": [
+      [
+        {
+          "tokens": 1,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 2,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 3,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 4,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 5,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 6,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 7,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 8,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 9,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 10,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 11,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 12,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 13,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 14,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 15,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": "length"
+        }
+      ],
+      [
+        {
+          "tokens": 1,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 2,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 3,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 4,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 5,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 6,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 7,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 8,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 9,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 10,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 11,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 12,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 13,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 14,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 15,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": "length"
+        }
+      ],
+      [
+        {
+          "tokens": 1,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 2,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 3,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 4,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 5,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 6,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 7,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 8,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 9,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 10,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 11,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 12,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 13,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 14,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 15,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": "length"
+        }
+      ],
+      [
+        {
+          "tokens": 1,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 2,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 3,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 4,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 5,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 6,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 7,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 8,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 9,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 10,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 11,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 12,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 13,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 14,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 15,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": null
+        },
+        {
+          "tokens": 16,
+          "token_id": 27,
+          "finish_reason": "length"
+        }
+      ]
+    ]
+  },
+  "continuous_steady_tokens_per_sec": 12359.483416514084,
+  "continuous_phase_details": {
+    "ramp": {
+      "ticks": 52,
+      "time_s": 0.006152377085527405,
+      "tokens": 45,
+      "tokens_per_sec": 7314.246083169402,
+      "mean_decode_ms": 0.1183149439524501,
+      "mean_batch": 0.8653846153846154,
+      "prefill_tokens": 11,
+      "prefill_wall_s": 0.0017187910270877182,
+      "decode_model_ms": 0.0883396714925766,
+      "decode_driver_ms": 0.1183149439524501,
+      "array_prefill_graph_s": 0.0,
+      "array_prefill_writer_s": 0.0,
+      "array_prefill_chunk_ms_total": 0.0,
+      "array_prefill_chunk_count": 0.0,
+      "array_prefill_chunk_ms_mean": 0.0,
+      "array_prefill_first_chunk_ms": 0.0,
+      "array_prefill_pending_tokens_max": 0.0,
+      "array_prefill_pending_tokens_last": 0.0,
+      "array_prefill_attn_s": 0.0,
+      "array_prefill_mlp_s": 0.0,
+      "array_prefill_overlay_s": 0.0,
+      "array_prefill_overlay_wait_s": 0.0,
+      "array_prefill_overlay_wait_count": 0.0,
+      "array_prefill_waiting_sequences_max": 0.0,
+      "array_prefill_waiting_sequences_last": 0.0,
+      "paged_prefill_slice_s": 0.0,
+      "paged_prefill_model_s": 0.0,
+      "paged_prefill_commit_s": 0.0,
+      "paged_prefill_slice_count": 0.0,
+      "paged_prefill_first_slice_ms": 0.0
+    },
+    "steady": {
+      "ticks": 2,
+      "time_s": 0.0003307499864604324,
+      "tokens": 4,
+      "tokens_per_sec": 12093.726874508942,
+      "mean_decode_ms": 0.1653749932302162,
+      "mean_batch": 2.0,
+      "prefill_tokens": 1,
+      "prefill_wall_s": 0.00011175000690855086,
+      "decode_model_ms": 0.1152500044554472,
+      "decode_driver_ms": 0.1653749932302162,
+      "array_prefill_graph_s": 0.0,
+      "array_prefill_writer_s": 0.0,
+      "array_prefill_chunk_ms_total": 0.0,
+      "array_prefill_chunk_count": 0.0,
+      "array_prefill_chunk_ms_mean": 0.0,
+      "array_prefill_first_chunk_ms": 0.0,
+      "array_prefill_pending_tokens_max": 0.0,
+      "array_prefill_pending_tokens_last": 0.0,
+      "array_prefill_attn_s": 0.0,
+      "array_prefill_mlp_s": 0.0,
+      "array_prefill_overlay_s": 0.0,
+      "array_prefill_overlay_wait_s": 0.0,
+      "array_prefill_overlay_wait_count": 0.0,
+      "array_prefill_waiting_sequences_max": 0.0,
+      "array_prefill_waiting_sequences_last": 0.0,
+      "paged_prefill_slice_s": 0.0,
+      "paged_prefill_model_s": 0.0,
+      "paged_prefill_commit_s": 0.0,
+      "paged_prefill_slice_count": 0.0,
+      "paged_prefill_first_slice_ms": 0.0
+    },
+    "tail": {
+      "ticks": 14,
+      "time_s": 0.001776124961907044,
+      "tokens": 15,
+      "tokens_per_sec": 8445.351718887134,
+      "mean_decode_ms": 0.126866068707646,
+      "mean_batch": 1.0714285714285714,
+      "prefill_tokens": 0,
+      "prefill_wall_s": 0.0,
+      "decode_model_ms": 0.09479457263036498,
+      "decode_driver_ms": 0.126866068707646,
+      "array_prefill_graph_s": 0.0,
+      "array_prefill_writer_s": 0.0,
+      "array_prefill_chunk_ms_total": 0.0,
+      "array_prefill_chunk_count": 0.0,
+      "array_prefill_chunk_ms_mean": 0.0,
+      "array_prefill_first_chunk_ms": 0.0,
+      "array_prefill_pending_tokens_max": 0.0,
+      "array_prefill_pending_tokens_last": 0.0,
+      "array_prefill_attn_s": 0.0,
+      "array_prefill_mlp_s": 0.0,
+      "array_prefill_overlay_s": 0.0,
+      "array_prefill_overlay_wait_s": 0.0,
+      "array_prefill_overlay_wait_count": 0.0,
+      "array_prefill_waiting_sequences_max": 0.0,
+      "array_prefill_waiting_sequences_last": 0.0,
+      "paged_prefill_slice_s": 0.0,
+      "paged_prefill_model_s": 0.0,
+      "paged_prefill_commit_s": 0.0,
+      "paged_prefill_slice_count": 0.0,
+      "paged_prefill_first_slice_ms": 0.0
+    },
+    "spikes": {
+      "count": 0,
+      "time_s": 0,
+      "threshold_s": 0.2
+    }
+  },
+  "effective_max_num_seqs": 2,
+  "kv_capacity_meta": null,
+  "continuous_apc_stats": {},
+  "runtime_compile_stats": {
+    "compile_cache_hits": 0.0,
+    "compile_cache_misses": 0.0
+  },
+  "kill_switch": {
+    "tripped": false,
+    "reasons": []
+  }
+}

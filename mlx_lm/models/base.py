@@ -1,8 +1,9 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional, Protocol, Tuple
 
 import mlx.core as mx
 from mlx.utils import tree_map
@@ -126,7 +127,44 @@ def scaled_dot_product_attention(
             group_size=cache.group_size,
             bits=cache.bits,
         )
-    else:
+    backend = _current_attention_backend()
+    return backend.run(
+        queries,
+        keys=keys,
+        values=values,
+        cache=cache,
+        scale=scale,
+        mask=mask,
+        sinks=sinks,
+    )
+
+
+class AttentionBackend(Protocol):
+    def run(
+        self,
+        queries: mx.array,
+        *,
+        keys: mx.array,
+        values: mx.array,
+        cache,
+        scale: float,
+        mask: Optional[mx.array],
+        sinks: Optional[mx.array],
+    ) -> mx.array: ...
+
+
+class _DenseAttentionBackend(AttentionBackend):
+    def run(
+        self,
+        queries: mx.array,
+        *,
+        keys: mx.array,
+        values: mx.array,
+        cache,
+        scale: float,
+        mask: Optional[mx.array],
+        sinks: Optional[mx.array],
+    ) -> mx.array:
         return mx.fast.scaled_dot_product_attention(
             queries,
             keys,
@@ -135,3 +173,22 @@ def scaled_dot_product_attention(
             mask=mask,
             sinks=sinks,
         )
+
+
+_DEFAULT_ATTENTION_BACKEND: AttentionBackend = _DenseAttentionBackend()
+_BACKEND_STACK: List[AttentionBackend] = []
+
+
+@contextmanager
+def use_attention_backend(backend: AttentionBackend):
+    _BACKEND_STACK.append(backend)
+    try:
+        yield
+    finally:
+        _BACKEND_STACK.pop()
+
+
+def _current_attention_backend() -> AttentionBackend:
+    if _BACKEND_STACK:
+        return _BACKEND_STACK[-1]
+    return _DEFAULT_ATTENTION_BACKEND
