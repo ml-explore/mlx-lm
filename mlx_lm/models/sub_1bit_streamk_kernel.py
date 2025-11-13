@@ -3,6 +3,24 @@ import mlx.core as mx
 import numpy as np
 import torch
 
+import subprocess
+
+def get_mlx_gpu_cores():
+    result = subprocess.run(
+        ["/usr/sbin/system_profiler SPDisplaysDataType | grep 'Total Number\ of\ Cores:\ ' | awk '{print $NF}'"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        shell=True,
+    )
+
+    if result.returncode != 0:
+        return False, None
+
+    gpu_cores = int(result.stdout.strip())
+    return True, [gpu_cores]
+
+
 # Refer to this https://www.shashankshekhar.com/blog/apple-metal-vs-nvidia-cuda for Metal kernel terminology
 def make_sub_1bit_streamk_kernel():
     """
@@ -181,6 +199,11 @@ def pack_1_bit_weights(weights, dtype=torch.int16):
 def ceil_div(a, b):
     return (a + b - 1) // b
 
+
+NUM_METAL_CORES = get_mlx_gpu_cores()[1][0]
+
+print(f"NUM_METAL_CORES : {NUM_METAL_CORES}")
+
 # NOTE (yiakwy): implement fp8 group scaled gemm using sub-1bit kernel
 def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tuning_config):
     """
@@ -208,8 +231,6 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
 
     BLOCK_SIZE_K = tuning_config.get("BLOCK_SIZE_K", 16)
     assert K % BLOCK_SIZE_K == 0, "K must be divisible by BLOCK_SIZE_K"
-
-    NUM_METAL_CORES = 20
 
     # NOTE (yiakwy) : apple fast kernel does not support inplace of output
     if o is None:
