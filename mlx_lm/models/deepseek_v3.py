@@ -466,7 +466,22 @@ class Model(nn.Module):
             )
             return weight[:m, :n].astype(dtype)
 
-        # Dequantize
+        # Remap for int4
+        new_weights = {}
+        for k, v in weights.items():
+            if k.endswith("weight_shape"):
+                base = k.replace("weight_shape", "")
+                new_weights[base + "weight"] = weights[base + "weight_packed"].view(
+                    mx.uint32
+                )
+                s = weights[base + "weight_scale"]
+                new_weights[base + "scales"] = s
+                new_weights[base + "biases"] = -8 * s
+            elif not (k.endswith("weight_scale") or k.endswith("weight_packed")):
+                new_weights[k] = v
+        weights = new_weights
+
+        # Dequantize fp8
         new_weights = {}
         for k, v in weights.items():
             if "weight_scale_inv" in k:

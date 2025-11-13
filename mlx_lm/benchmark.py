@@ -6,6 +6,7 @@ import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
+from mlx_lm.utils import pipeline_load
 
 
 def setup_arg_parser():
@@ -56,11 +57,21 @@ def main():
     args = parser.parse_args()
     mx.random.seed(0)
 
+    group = mx.distributed.init()
+    rank = group.rank()
+
+    def rprint(*args, **kwargs):
+        if rank == 0:
+            print(*args, **kwargs)
+
     model_path = args.model or DEFAULT_MODEL
 
-    model, tokenizer, config = load(
-        args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
-    )
+    if group.size() > 1:
+        model, tokenizer, config = pipeline_load(args.model, return_config=True)
+    else:
+        model, tokenizer, config = load(
+            args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
+        )
 
     # Empty to avoid early stopping
     tokenizer._eos_token_ids = {}
@@ -89,18 +100,18 @@ def main():
     else:
         _bench = batch_bench
 
-    print("Running warmup..")
+    rprint("Running warmup..")
     _bench()
 
     report_keys = ["prompt_tps", "generation_tps", "peak_memory"]
-    print(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
+    rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
         response = _bench()
         responses.append(response)
         results = [(k, getattr(response, k)) for k in report_keys]
         results = [f"{k}={v:.3f}" for k, v in results]
-        print(f"Trial {i+1}:  " + ", ".join(results))
+        rprint(f"Trial {i+1}:  " + ", ".join(results))
 
     def avg(k):
         vals = (getattr(response, k) for response in responses)
@@ -108,7 +119,7 @@ def main():
 
     results = [(k, avg(k)) for k in report_keys]
     results = [f"{k}={v:.3f}" for k, v in results]
-    print(f"Averages: " + ", ".join(results))
+    rprint(f"Averages: " + ", ".join(results))
 
 
 if __name__ == "__main__":
