@@ -900,6 +900,8 @@ def _merge_caches(caches):
         cache = None
         if isinstance(caches[0][i], KVCache):
             cache = BatchKVCache.merge([c[i] for c in caches])
+        elif isinstance(caches[0][i], RotatingKVCache):
+            cache = BatchRotatingKVCache.merge([c[i] for c in caches])
         else:
             raise ValueError(
                 f"{type(caches[0][i])} does not yet support batching with history"
@@ -991,14 +993,17 @@ class BatchGenerator:
                 mx.clear_cache()
 
         # Further prompt processing so we need to
-        #   1. Merge the KV caches
+        #   1. Merge the KV caches and prepare for right padded prompts
         #   2. Right pad the inputs
         #   2. Process
-        #   3. Left pad the batched cache
+        #   3. Finalize the KV caches so they are left padded again
         else:
             last_inputs = mx.array([p[-1:] for p in inputs])
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
+
+            for c in prompt_cache:
+                c.prepare(lengths=lengths, right_padding=padding)
 
             while inputs.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
@@ -1008,7 +1013,7 @@ class BatchGenerator:
                 mx.clear_cache()
 
             for c in prompt_cache:
-                c.roll(padding)
+                c.finalize()
             mx.eval([c.state for c in prompt_cache])
             mx.clear_cache()
             inputs = last_inputs

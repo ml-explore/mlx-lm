@@ -471,6 +471,9 @@ class RotatingKVCache(_BaseCache):
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
 
+    def __len__(self):
+        return min(self.offset, self.max_size)
+
     @property
     def state(self):
         if self.offset < self.keys.shape[2]:
@@ -709,6 +712,8 @@ class BatchKVCache(_BaseCache):
         self.offset = mx.array([-l for l in left_padding])
         self._idx = 0
 
+        self._right_padding = None
+
     def update_and_fetch(self, keys, values):
         prev = self._idx
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
@@ -737,14 +742,27 @@ class BatchKVCache(_BaseCache):
     def __len__(self):
         return self._idx
 
-    def roll(self, padding):
-        if not isinstance(padding, mx.array):
-            padding = mx.array(padding)
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
 
-        self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
-        self.values = dynamic_roll(self.values, padding[:, None], axis=2)
-        self.offset -= padding
-        self.left_padding += padding
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            padding = self._right_padding
+            self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
+            self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
 
     @property
     def state(self):
@@ -868,6 +886,10 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset = 0
         self.rotated = False
 
+        # Lengths for right_padded inputs to make sure that padding tokens do
+        # not evict valid tokens.
+        self._lengths = None
+
     def _trim(self, trim_size, v, append=None):
         if trim_size > 0:
             v = v[..., trim_size:, :]
@@ -899,6 +921,15 @@ class BatchRotatingKVCache(_BaseCache):
                 self.keys = self.keys[..., : self._idx, :]
                 self.values = self.values[..., : self._idx, :]
 
+            # Roll right sequences that are padded to make sure that we don't
+            # trim valid cache entries
+            if self._lengths is not None:
+                roll = mx.maximum(0, self.offset - self._lengths)
+                self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
+                self.values = dynamic_roll(self.values, roll[:, None], axis=2)
+                self.left_padding += roll
+                self.offset -= roll
+
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
             trim_size = self._idx - self.max_size + 1
@@ -912,6 +943,11 @@ class BatchRotatingKVCache(_BaseCache):
         return self.keys, self.values
 
     def _update_in_place(self, keys, values):
+        if self._lengths is not None:
+            raise RuntimeError(
+                "finalize() should be called before deocoding with BatchRotatingKVCache"
+            )
+
         # May not have hit the max size yet, so potentially
         # keep growing the cache
         B, n_kv_heads, S, k_head_dim = keys.shape
@@ -966,6 +1002,31 @@ class BatchRotatingKVCache(_BaseCache):
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
+
+    def __len__(self):
+        return min(self._offset, self.max_size)
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchRotatingKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._lengths = mx.array(lengths) + self.offset
+
+    def finalize(self):
+        if self._lengths is not None:
+            roll = mx.maximum(0, self.offset - self._lengths)
+            self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
+            self.values = dynamic_roll(self.values, roll[:, None], axis=2)
+            self.left_padding += roll
+            self.offset -= roll
+            self._lengths = None
 
     @property
     def state(self):
@@ -1076,6 +1137,7 @@ class BatchRotatingKVCache(_BaseCache):
     def extract(self, idx):
         cache = RotatingKVCache(self.max_size)
         padding = self.left_padding[idx].item()
+        offset = self.offset[idx].item()
         cache.keys = self.keys[idx : idx + 1]
         cache.values = self.values[idx : idx + 1]
         cache._idx = self._idx
@@ -1086,7 +1148,39 @@ class BatchRotatingKVCache(_BaseCache):
         if padding > 0:
             cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
             cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
-        cache.offset = cache.keys.shape[2]
-        cache._idx = cache.offset
+        cache.offset = offset
+        cache._idx = cache.keys.shape[2]
+
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        if not all(c.max_size == caches[0].max_size for c in caches):
+            raise ValueError(
+                "BatchRotatingKVCache can only merge caches with the same maximum size"
+            )
+
+        offsets = [c.offset for c in caches]
+        lengths = [len(c) for c in caches]
+        max_length = max(lengths)
+        padding = [max_length - l for l in lengths]
+        B = len(caches)
+        H = max(c.keys.shape[1] for c in caches if c.keys is not None)
+        Dk = max(c.keys.shape[3] for c in caches if c.keys is not None)
+        Dv = max(c.values.shape[3] for c in caches if c.values is not None)
+        dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+
+        keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
+        values = mx.zeros((B, H, max_length, Dv), dtype=dt)
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            keys[i : i + 1, :, p : p + c.offset] = c._temporal_order(c.keys)
+            values[i : i + 1, :, p : p + c.offset] = c._temporal_order(c.values)
+
+        cache = cls(caches[0].max_size, padding)
+        cache.keys = keys
+        cache.values = values
+        cache.offset = mx.array(offsets)
+        cache._idx = keys.shape[2]
+        cache._offset = keys.shape[2]
 
         return cache
