@@ -4,6 +4,8 @@ import argparse
 
 import mlx.core as mx
 
+from mlx_lm import generate
+
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
@@ -106,21 +108,28 @@ def main():
     print(f"[INFO] Starting chat session with {args.model}.")
     print_help()
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
+
+    messages = []
+    if args.system_prompt is not None:
+        messages.append({"role": "system", "content": args.system_prompt})
+
     while True:
         query = input(">> ")
         if query == "q":
             break
         if query == "r":
             prompt_cache = make_prompt_cache(model, args.max_kv_size)
+            messages = []
+            if args.system_prompt is not None:
+                messages.append({"role": "system", "content": args.system_prompt})
             continue
         if query == "h":
             print_help()
             continue
-        messages = []
-        if args.system_prompt is not None:
-            messages.append({"role": "system", "content": args.system_prompt})
         messages.append({"role": "user", "content": query})
         prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+
+        full_response = ""
         for response in stream_generate(
             model,
             tokenizer,
@@ -137,7 +146,10 @@ def main():
             ),
             prompt_cache=prompt_cache,
         ):
+            full_response += response.text
             print(response.text, flush=True, end="")
+
+        messages.append({"role": "assistant", "content": full_response})
         print()
 
 
