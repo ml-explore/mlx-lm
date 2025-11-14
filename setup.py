@@ -27,6 +27,7 @@ setup(
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
         "numpy",
         "transformers>=4.39.3",
+        "sentencepiece",
         "protobuf",
         "pyyaml",
         "jinja2",
