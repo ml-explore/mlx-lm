@@ -1,8 +1,0 @@
-[static_batch_generate] n=64 tokens=4096 wall=77.28s tokens/s=53.00 ttft mean=77281.7ms median=77281.7ms p95=77281.7ms
-[continuous_runtime] n=64 tokens=4096 wall=139.99s tokens/s=29.26 ttft mean=57556.8ms median=43395.2ms p95=107267.7ms
-{
-  "static_tokens_per_sec": 53.000922943282085,
-  "static_wall_seconds": 77.281673083,
-  "continuous_tokens_per_sec": 29.259838289120964,
-  "continuous_wall_seconds": 139.987103125
-}
