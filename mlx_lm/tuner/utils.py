@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import json
 import types
+from math import ceil
 from pathlib import Path
 from typing import Dict
 
@@ -15,21 +16,120 @@ from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
 
-def build_schedule(schedule_config: Dict):
+def build_schedule(
+    schedule_config: Dict,
+    learning_rate: float = None,
+    iters: int = None,
+    grad_accumulation_steps: int = 1,
+):
     """
     Build a learning rate schedule from the given config.
+
+    Args:
+        schedule_config (dict): The configuration for the learning rate schedule.
+        learning_rate (float): The initial learning rate.
+        iters (int): The total number of iterations.
+        grad_accumulation_steps (int): The number of steps to accumulate gradients before applying an optimizer update.
     """
-    schedule_fn = getattr(opt.schedulers, schedule_config["name"])
-    arguments = schedule_config["arguments"]
-    initial_lr = arguments[0]
+    # Determine scheduler name. If missing and warmup present, treat as warmup-only constant.
+    name = schedule_config.get("name")
+    arguments = schedule_config.get("arguments", [])
+    initial_lr = arguments[0] if len(arguments) > 0 else learning_rate
+
+    # Convert to update units to account for gradient accumulation
+    convert_to_update_units = lambda x: max(
+        1, ceil(x / max(1, grad_accumulation_steps))
+    )
+    warmup_config = schedule_config.get("warmup")  # raw number of steps
+    if warmup_config is not None and warmup_config > 0:
+        warmup_steps = convert_to_update_units(warmup_config)
+    else:
+        warmup_steps = 0
+
+    # If no lr was supplied anywhere and no explicit initial lr was provided, error early
+    if initial_lr is None and len(arguments) == 0:
+        raise KeyError("learning_rate")
+
+    # Handle missing name:
+    if not name:
+        if warmup_steps > 0:
+            name = "constant"
+        else:
+            raise KeyError("name")
+
+    if name == "constant":
+        warmup_init = schedule_config.get("warmup_init", 0.0)
+        if warmup_steps > 0:
+            return opt.schedulers.linear_schedule(warmup_init, initial_lr, warmup_steps)
+        return opt.schedulers.linear_schedule(initial_lr, initial_lr, 1)
+
+    # Set sane defaults for arguments of known schedulers
+    if name == "linear_schedule":
+        # params: start, end, steps
+        start, end, steps = initial_lr, 0.0, convert_to_update_units(iters or 1)
+        if len(arguments) >= 1:
+            start = arguments[0]
+        if len(arguments) >= 2:
+            end = arguments[1]
+        if len(arguments) >= 3:
+            steps = convert_to_update_units(arguments[2])
+        if len(arguments) > 3:
+            raise ValueError(f"Unsupported number of arguments for scheduler: {name}")
+        arguments = [start, end, steps]
+    elif name == "cosine_decay":
+        # params: initial_lr, decay_steps, end_lr
+        init, decay_steps, end_lr = (
+            initial_lr,
+            convert_to_update_units(iters or 1),
+            0.0,
+        )
+        if len(arguments) >= 1:
+            init = arguments[0]
+        if len(arguments) >= 2:
+            decay_steps = convert_to_update_units(arguments[1])
+        if len(arguments) >= 3:
+            end_lr = arguments[2]
+        if len(arguments) > 3:
+            raise ValueError(f"Unsupported number of arguments for scheduler: {name}")
+        arguments = [init, decay_steps, end_lr]
+    elif name == "exponential_decay":
+        # params: initial_lr, decay_rate
+        init, decay_rate = initial_lr, 0.999
+        if len(arguments) >= 1:
+            init = arguments[0]
+        if len(arguments) >= 2:
+            decay_rate = arguments[1]
+        if len(arguments) > 2:
+            raise ValueError(f"Unsupported number of arguments for scheduler: {name}")
+        arguments = [init, decay_rate]
+    elif name == "step_decay":
+        # params: initial_lr, decay_rate, step_size
+        init, factor, step_size = (
+            initial_lr,
+            0.5,
+            max(1, convert_to_update_units((iters or 1) // 10)),
+        )
+        if len(arguments) >= 1:
+            init = arguments[0]
+        if len(arguments) >= 2:
+            factor = arguments[1]
+        if len(arguments) >= 3:
+            step_size = convert_to_update_units(arguments[2])
+        if len(arguments) > 3:
+            raise ValueError(f"Unsupported number of arguments for scheduler: {name}")
+        arguments = [init, factor, step_size]
+    else:
+        raise ValueError(f"Unsupported scheduler: {name}")
+
+    schedule_fn = getattr(opt.schedulers, name)
     bound_schedule_fn = schedule_fn(*arguments)
-    if warmup_steps := schedule_config.get("warmup", 0):
+    if warmup_steps > 0:
         warmup_init = schedule_config.get("warmup_init", 0.0)
         warmup_fn = opt.schedulers.linear_schedule(
             warmup_init, initial_lr, warmup_steps
         )
         return opt.schedulers.join_schedules(
-            [warmup_fn, bound_schedule_fn], [warmup_steps + 1]
+            [warmup_fn, bound_schedule_fn], [warmup_steps]
         )
     else:
         return bound_schedule_fn

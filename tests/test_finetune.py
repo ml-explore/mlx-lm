@@ -363,11 +363,24 @@ class TestScheduleConfig(unittest.TestCase):
         self.assertAlmostEqual(lr, 1e-6, delta=1e-7)
 
     def test_malformed_config(self):
-        config = {"warmup": 100}
-        self.assertRaises(KeyError, build_schedule, config)
-
         config = {"cosine_decay": None}
         self.assertRaises(KeyError, build_schedule, config)
+        # unknown scheduler name
+        self.assertRaises(KeyError, build_schedule, {"name": None, "arguments": [1e-5]})
+        self.assertRaises(
+            ValueError,
+            build_schedule,
+            {"name": "unknown_scheduler"},
+            learning_rate=1e-5,
+        )
+        # no initial lr provided
+        self.assertRaises(KeyError, build_schedule, {"name": "linear_schedule"})
+        # too many arguments provided
+        self.assertRaises(
+            ValueError,
+            build_schedule,
+            {"name": "linear_schedule", "arguments": [0.1, 0.0, 10, 0.5]},
+        )
 
     def test_evaluate_calls(self):
         mock_model = MagicMock()
