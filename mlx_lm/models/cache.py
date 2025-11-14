@@ -109,6 +109,30 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def can_resume_from_cache(cache: List[Any], prompt_length: int) -> bool:
+    """
+    Check if the cache already contains at least prompt_length tokens.
+
+    This function determines if prompt processing can be skipped because
+    the cache already contains a valid prefilled state for the prompt.
+
+    Args:
+        cache (List[Any]): The model's cache.
+        prompt_length (int): The number of prompt tokens.
+
+    Returns:
+        bool: True if cache.offset >= prompt_length, meaning the cache
+            already contains the full prompt and prefill can be skipped.
+    """
+    if not cache or len(cache) == 0:
+        return False
+
+    # Check the offset of the first cache layer (all layers should have same offset)
+    cache_offset = getattr(cache[0], 'offset', 0)
+
+    return cache_offset >= prompt_length
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
