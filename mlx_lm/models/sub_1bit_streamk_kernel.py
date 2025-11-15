@@ -32,6 +32,8 @@ def make_sub_1bit_streamk_kernel(**config):
     header = """
     #include <metal_atomic>
     #include <metal_simdgroup>
+
+#define NOT_USE_XOR 1
     """
 
     source = """
@@ -120,8 +122,12 @@ def make_sub_1bit_streamk_kernel(**config):
                     for (uint k = 0; k < BLOCK_SIZE_K && k_start + k < K; k++) {
 
                         uint16_t wq_nk = tile_wq[n + j * warp_frag_size_n][k / packed_size];
+
+#ifdef NOT_USE_XOR
                         thread half wq_depacked_nk = half((wq_nk >> (k % packed_size)) & 1) * 2 - 1;
-                        //uint16_t wq_depacked_nk = ((wq_nk << (15 - k % packed_size)) ^ 0x8000);
+#else
+                        thread int16_t wq_depacked_nk = ((wq_nk << (15 - k % packed_size)) & 0x8000) ^ 0x8000;
+#endif // NOT_USE_XOR
                         
                         // for (uint m = m_thr_coord; m < BLOCK_SIZE_M; m += reg_tile_m * warps) {
                         for (uint i=0, m = m_thr_coord; i < reg_tile_m; i++) {
@@ -129,20 +135,20 @@ def make_sub_1bit_streamk_kernel(**config):
 
                             thread half xq_mk = tile_xq[m + i * warps * warp_frag_size_m][k];
 
-                            /*
                             // "reinterpret_cast" is not supported in Metal Shading Language
+ #ifdef NOT_USE_XOR
+                            acc[i][j] += xq_mk * wq_depacked_nk;
+ #else                           
                             union {
-                                uint16_t u;
-                                half f;
+                                uint16_t u_val;
+                                int16_t i_val;
+                                half f_val;
                             } datum;
 
-                            datum.f = xq_mk;
-                            datum.u ^= wq_depacked_nk;
-                            acc[i][j] += datum.f;
-                             */
-
-                            acc[i][j] += xq_mk * wq_depacked_nk;
-
+                            datum.f_val = xq_mk;
+                            datum.u_val ^= wq_depacked_nk;
+                            acc[i][j] += datum.f_val;
+#endif // NOT_USE_XOR
                         } // end of reg_tile_n
 
                     } // end of k loop
@@ -250,7 +256,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
 
     Inputs:
         xq: (M, K) float16 for mps backend
-        packed_weights: (N, K / packed_size) uint8
+        packed_weights: (N, K / packed_size) uint8/uint16/uint32
     Outputs:
         out: (M, N) float16/float32
     """
@@ -264,15 +270,18 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
     SPLIT_K = tuning_config.get("split_k", 1)
     DEBUG = tuning_config.get("DEBUG", False)
 
+    # TODO (add) : add break k-even coverage
     assert K % SPLIT_K == 0, "K must be divisible by SPLIT_K"
 
     BLOCK_SIZE_M = tuning_config.get("BLOCK_SIZE_M", 32)
-    BLOCK_SIZE_N = tuning_config.get("BLOCK_SIZE_N", 256)
+    BLOCK_SIZE_N = tuning_config.get("BLOCK_SIZE_N", 128)
 
     WARP_SIZE_M = tuning_config.get("WARP_SIZE_M", 1)
     WARP_SIZE_N = tuning_config.get("WARP_SIZE_N", 32) # 1 el / thread
 
     BLOCK_SIZE_K = tuning_config.get("BLOCK_SIZE_K", 64)
+    if BLOCK_SIZE_K > K:
+        BLOCK_SIZE_K = K
     assert K % BLOCK_SIZE_K == 0, "K must be divisible by BLOCK_SIZE_K"
 
     # NOTE (yiakwy) : apple metal fast kernel does not support inplace of output
