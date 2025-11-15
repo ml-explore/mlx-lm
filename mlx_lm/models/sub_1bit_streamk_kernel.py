@@ -22,7 +22,7 @@ def get_mlx_gpu_cores():
 
 
 # Refer to this https://www.shashankshekhar.com/blog/apple-metal-vs-nvidia-cuda for Metal kernel terminology
-def make_sub_1bit_streamk_kernel():
+def make_sub_1bit_streamk_kernel(**config):
     """
     Custom Metal kernel that performs matrix multiplication directly on
     packed weights and scales the output. This eliminates the need to
@@ -57,12 +57,12 @@ def make_sub_1bit_streamk_kernel():
 
         const uint offs_k = pid_k * BLOCK_SIZE_K;
 
-        // Reg Accumulator located by (m_coord, n_coord), where acc[m][n] per thread sotres a partial sum
+        // Reg Accumulator located by (m_coord, n_coord), where acc[m][m]=acc_mn[i][j] per thread sotres a partial sum
         thread AccT acc[reg_tile_m][reg_tile_n] = {0.0};
 
         constexpr uint BLOCK_SIZE_K_PACKED = BLOCK_SIZE_K / packed_size;
 
-        for (uint k_start = offs_k; k_start < K; k_start += BLOCK_SIZE_K * split_k) {
+        for (uint k_start = offs_k; k_start < K; k_start += BLOCK_SIZE_K * SPLIT_K) {
             // load tile_xq and tile_w from global memory to threadgroup memory
             threadgroup half tile_xq[BLOCK_SIZE_M][BLOCK_SIZE_K];
             
@@ -165,7 +165,11 @@ def make_sub_1bit_streamk_kernel():
             uint n_thr_coord = lane_id % warp_frag_size_n;
 
             // out[(offs_xq_m) * stride_o_m + offs_wq_n * stride_o_n] += tile_id;
-            // atomic_fetch_add_explicit((device atomic<float> *)(out + (offs_xq_m) * stride_o_m + offs_wq_n * stride_o_n), pid, memory_order_relaxed);
+            /*
+            if (lane_id == 0 && warp_id == 0) {
+                atomic_fetch_add_explicit((device atomic<float> *)(out + (offs_xq_m) * stride_o_m + offs_wq_n * stride_o_n), pid, memory_order_relaxed);
+            }
+             */
 
             // NOTE (yiakwy) : find a min func
             uint estimated_boundary_m = offs_xq_m + BLOCK_SIZE_M;
@@ -173,7 +177,7 @@ def make_sub_1bit_streamk_kernel():
 
             uint boundary_m = M < estimated_boundary_m ? M : estimated_boundary_m ;
             uint boundary_n = N < estimated_boundary_n ? N : estimated_boundary_n;
-
+            
             for (uint i=0, m = m_thr_coord; i < reg_tile_m; i++) {
 
                 // apply group/channel wise scale
@@ -181,10 +185,16 @@ def make_sub_1bit_streamk_kernel():
 
                 for (uint j=0, n = n_thr_coord; j < reg_tile_n; j++) {
                     if ( offs_xq_m + m + i * warps * warp_frag_size_m < boundary_m && offs_wq_n + n + j * warp_frag_size_n < boundary_n ) {
-                        out[(offs_xq_m + m + i * warps * warp_frag_size_m) * stride_o_m + (offs_wq_n + n + j * warp_frag_size_n) * stride_o_n] = acc[i][j] * scale;
+                        if constexpr (SPLIT_K > 1) {
+                            // NOTE (yiakwy) : static cast to avoid compilation errors in non split-k streaming mode
+                            atomic_fetch_add_explicit((device atomic<float> *)(out + (offs_xq_m + m + i * warps * warp_frag_size_m) * stride_o_m + (offs_wq_n + n + j * warp_frag_size_n) * stride_o_n), acc[i][j] * scale, memory_order_relaxed);
+                        } else {
+                            out[(offs_xq_m + m + i * warps * warp_frag_size_m) * stride_o_m + (offs_wq_n + n + j * warp_frag_size_n) * stride_o_n] = acc[i][j] * scale;
+                        }
                     }
                 }
             }
+            
         } // end of store acc back to global memory
 
     }
@@ -197,12 +207,12 @@ def make_sub_1bit_streamk_kernel():
         source=source,
         header=header,
         ensure_row_contiguous=True,
-        atomic_outputs=False
+        atomic_outputs=config.get("split_k", False)
     )
 
 
-_sub_1bit_streamk_kernel = make_sub_1bit_streamk_kernel()
-
+_sub_1bit_streamk_kernel = make_sub_1bit_streamk_kernel(split_k=False)
+_sub_1bit_split_k_stream_kernel = make_sub_1bit_streamk_kernel(split_k=True)
 
 # NOTE (yiakwy) : pack sub-1bit model weights in 1-bit format
 def pack_1_bit_weights(weights, dtype=torch.int16):
@@ -248,7 +258,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
     N = packed_weights.shape[0]
 
     # split K dimension into chunks for streaming to ensure minimum work done per metal threadgroup
-    SPLIT_K = 1
+    SPLIT_K = tuning_config.get("split_k", 1)
 
     assert K % SPLIT_K == 0, "K must be divisible by SPLIT_K"
 
@@ -261,9 +271,14 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
     BLOCK_SIZE_K = tuning_config.get("BLOCK_SIZE_K", 16)
     assert K % BLOCK_SIZE_K == 0, "K must be divisible by BLOCK_SIZE_K"
 
-    # NOTE (yiakwy) : apple fast kernel does not support inplace of output
+    # NOTE (yiakwy) : apple metal fast kernel does not support inplace of output
     if o is None:
         outDtype = mx.float16
+
+    if SPLIT_K > 1:
+        if outDtype == mx.float16:
+            # TODO (yiakwy) : MacStudio does not support atomic<half>
+            outDtype = mx.float32
 
     NUM_PID_M = ceil_div(M, BLOCK_SIZE_M)
     NUM_PID_N = ceil_div(N, BLOCK_SIZE_N)
@@ -277,11 +292,11 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
         1
     )
 
-    # SIMD 
+    # SIMD , Apple M3 Ultra
     simd_group_size = 32
 
     # concurrent warps
-    warps = 4
+    warps = tuning_config.get("WARPS", 4)
 
     threadgroup = (simd_group_size, warps, 1)
     grid = (cugrid[0]* threadgroup[0], threadgroup[1], threadgroup[2])
@@ -301,11 +316,11 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
 
     print(f"packed_weights : {packed_weights.shape}")
 
-    x = xq
+    sub_1bit_streamk_kernel = _sub_1bit_split_k_stream_kernel if SPLIT_K > 1 else _sub_1bit_streamk_kernel
 
-    o = _sub_1bit_streamk_kernel(
+    o = sub_1bit_streamk_kernel(
         inputs=[
-            x,
+            xq,
             packed_weights,
             weight_scale,
         ],
@@ -328,7 +343,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
             ("BLOCK_SIZE_K", BLOCK_SIZE_K),
             ("WARP_SIZE_M", WARP_SIZE_M),
             ("WARP_SIZE_N", WARP_SIZE_N),
-            ("split_k", SPLIT_K),
+            ("SPLIT_K", SPLIT_K),
             ("reg_tile_m", reg_tile_m),
             ("reg_tile_n", reg_tile_n),
             ("NUM_PID_M", NUM_PID_M),
@@ -384,7 +399,9 @@ def test_fp8_group_scaled_gemm():
 
         input_fp16_mxl = mx.array(input_fp16.cpu().numpy())
         packed_weights_mxl = mx.array(packed_weights.cpu().numpy())
-        output_mlx = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None)
+
+        split_k = 2
+        output_mlx = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k)
         mx.eval(output_mlx)
 
         max_error = np.max(np.abs(output_torch.cpu().numpy() - output_mlx))
@@ -392,10 +409,11 @@ def test_fp8_group_scaled_gemm():
 
         # print(f"output_torch : {output_torch}")
 
-        # np.set_printoptions(128)
-        # print(f"output_mlx : {np.array(output_mlx)}")
-        # print(f"output_mlx : {output_mlx}")
-
+        if split_k > 1:
+            np.set_printoptions(128)
+            print(f"output_mlx : {np.array(output_mlx)}")
+        else:
+            print(f"output_mlx : {output_mlx}")
         print(f"diff : {output_torch.cpu().numpy() - output_mlx}")
 
         # # Performance benchmark for MLX
