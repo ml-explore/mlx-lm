@@ -29,6 +29,11 @@ def make_sub_1bit_streamk_kernel():
     store unpacked weights in memory.
     """
 
+    header = """
+    #include <metal_atomic>
+    #include <metal_simdgroup>
+    """
+
     source = """
     // total blocks threads_per_grid.x / threads_per_threadgroup.x
     const uint pid = threadgroup_position_in_grid.x;
@@ -64,14 +69,16 @@ def make_sub_1bit_streamk_kernel():
             // load tile_wq in packed format from global memory to private memory
             threadgroup uint16_t tile_wq[BLOCK_SIZE_N][BLOCK_SIZE_K_PACKED];
 
-            // TODO (yiakw) : using BlockMMA load with vectorized loads
+            // TODO (yiakwy) : using BlockMMA load with vectorized loads
             // load xq cooperatively
             {
                 for (uint i=lane_id + warp_id * threads_per_threadgroup.x; i < BLOCK_SIZE_M * BLOCK_SIZE_K; i+=total_threads) {
                     const uint m = i / BLOCK_SIZE_K;
                     const uint k = i % BLOCK_SIZE_K;
 
-                    tile_xq[m][k] = x[(offs_xq_m + m) * stride_x_m + (k_start + k) * stride_x_k];
+                    if (offs_xq_m + m < M && k_start + k < K) {
+                        tile_xq[m][k] = x[(offs_xq_m + m) * stride_x_m + (k_start + k) * stride_x_k];
+                    }
                 }
             } // end of load xq
 
@@ -83,23 +90,25 @@ def make_sub_1bit_streamk_kernel():
                     const uint n = i / BLOCK_SIZE_K_PACKED;
                     const uint k = i % BLOCK_SIZE_K_PACKED;
 
-                    tile_wq[n][k] = packed_weights[(offs_wq_n + n) * stride_w_n + ((k_start / packed_size) + k) * stride_w_k];
+                    if (offs_wq_n + n < N && (k_start / packed_size) + k < K) {
+                        tile_wq[n][k] = packed_weights[(offs_wq_n + n) * stride_w_n + ((k_start / packed_size) + k) * stride_w_k];
+                    }
                 }
             } // end of load wq
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // TODO (yiakw) : using BlockMMA mma and simdgroup_multiply_accumulate, see https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
+            // TODO (yiakwy) : using BlockMMA mma and simdgroup_multiply_accumulate, see https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
             // compute acc
             {
 
                 // TODO (yiakwy) : warp size will be optimized later, this is for 1x32 frag
-                uint warp_frag_size_n = WARP_SIZE_N;
-                uint warp_frag_size_m = WARP_SIZE_M;
+                constexpr uint warp_frag_size_n = WARP_SIZE_N;
+                constexpr uint warp_frag_size_m = WARP_SIZE_M;
 
-                uint warps = threads_per_threadgroup.y;
+                thread const uint& warps = threads_per_threadgroup.y;
 
-                uint m_thr_coord = lane_id / warp_frag_size_n + warp_id * reg_tile_m;
+                uint m_thr_coord = lane_id / warp_frag_size_n + warp_id * warp_frag_size_m;
                 uint n_thr_coord = lane_id % warp_frag_size_n;
 
                 for (uint j=0, n = n_thr_coord; j < reg_tile_n; j++) {
@@ -107,7 +116,7 @@ def make_sub_1bit_streamk_kernel():
                     // generate partial sum
                     for (uint k = 0; k < BLOCK_SIZE_K && k_start + k < K; k++) {
 
-                        uint16_t wq_nk = tile_wq[n+j*warp_frag_size_n][k / packed_size];
+                        uint16_t wq_nk = tile_wq[n + j * warp_frag_size_n][k / packed_size];
                         thread half wq_depacked_nk = half((wq_nk >> (k % packed_size)) & 1) * 2 - 1;
                         //uint16_t wq_depacked_nk = ((wq_nk << (15 - k % packed_size)) ^ 0x8000);
                         
@@ -115,7 +124,7 @@ def make_sub_1bit_streamk_kernel():
                         for (uint i=0, m = m_thr_coord; i < reg_tile_m; i++) {
                             // generate partial sum
 
-                            thread half xq_mk = tile_xq[m+i * warp_frag_size_m][k];
+                            thread half xq_mk = tile_xq[m + i * warps * warp_frag_size_m][k];
 
                             /*
                             // "reinterpret_cast" is not supported in Metal Shading Language
@@ -147,25 +156,35 @@ def make_sub_1bit_streamk_kernel():
 
         // store acc to back to global memory
         {
+            constexpr uint warp_frag_size_n = WARP_SIZE_N;
+            constexpr uint warp_frag_size_m = WARP_SIZE_M;
 
-                uint warp_frag_size_n = threads_per_threadgroup.x;
-                uint warps = threads_per_threadgroup.y;
+            thread const uint& warps = threads_per_threadgroup.y;
 
-                uint m_thr_coord = lane_id / warp_frag_size_n + warp_id * reg_tile_m;
-                uint n_thr_coord = lane_id % warp_frag_size_n;
+            uint m_thr_coord = lane_id / warp_frag_size_n + warp_id * warp_frag_size_m;
+            uint n_thr_coord = lane_id % warp_frag_size_n;
 
-                for (uint i=0, m = m_thr_coord; i < reg_tile_m; i++) {
+            // out[(offs_xq_m) * stride_o_m + offs_wq_n * stride_o_n] += tile_id;
+            // atomic_fetch_add_explicit((device atomic<float> *)(out + (offs_xq_m) * stride_o_m + offs_wq_n * stride_o_n), pid, memory_order_relaxed);
 
-                    // apply group/channel wise scale
-                    float scale = 1; // invert_weight_scales ? 1.0 / weight_scale[(offs_xq_m + m)] : weight_scale[(offs_xq_m + m)];
+            // NOTE (yiakwy) : find a min func
+            uint estimated_boundary_m = offs_xq_m + BLOCK_SIZE_M;
+            uint estimated_boundary_n = offs_wq_n + BLOCK_SIZE_N;
 
-                    for (uint j=0, n = n_thr_coord; j < reg_tile_n; j++) {
-                        if ( offs_xq_m + m + i * reg_tile_m < M && offs_wq_n + n + j * reg_tile_n < N ) {
-                            out[(offs_xq_m + m + i * reg_tile_m) * stride_o_m + (offs_wq_n + n + j * reg_tile_n) * stride_o_n] += acc[i][j] * scale;
-                        }
+            uint boundary_m = M < estimated_boundary_m ? M : estimated_boundary_m ;
+            uint boundary_n = N < estimated_boundary_n ? N : estimated_boundary_n;
+
+            for (uint i=0, m = m_thr_coord; i < reg_tile_m; i++) {
+
+                // apply group/channel wise scale
+                float scale = invert_weight_scales ? 1.0 / weight_scale[(offs_xq_m + m)] : weight_scale[(offs_xq_m + m)];
+
+                for (uint j=0, n = n_thr_coord; j < reg_tile_n; j++) {
+                    if ( offs_xq_m + m + i * warps * warp_frag_size_m < boundary_m && offs_wq_n + n + j * warp_frag_size_n < boundary_n ) {
+                        out[(offs_xq_m + m + i * warps * warp_frag_size_m) * stride_o_m + (offs_wq_n + n + j * warp_frag_size_n) * stride_o_n] = acc[i][j] * scale;
                     }
                 }
-
+            }
         } // end of store acc back to global memory
 
     }
@@ -176,8 +195,9 @@ def make_sub_1bit_streamk_kernel():
         input_names=["x", "packed_weights", "weight_scale"],
         output_names=["out"],
         source=source,
+        header=header,
         ensure_row_contiguous=True,
-        # atomic_outputs=True
+        atomic_outputs=False
     )
 
 
@@ -207,6 +227,7 @@ def ceil_div(a, b):
 
 NUM_METAL_CORES = get_mlx_gpu_cores()[1][0]
 
+
 print(f"NUM_METAL_CORES : {NUM_METAL_CORES}")
 
 # NOTE (yiakwy): implement fp8 group scaled gemm using sub-1bit kernel
@@ -231,8 +252,8 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
 
     assert K % SPLIT_K == 0, "K must be divisible by SPLIT_K"
 
-    BLOCK_SIZE_M = tuning_config.get("BLOCK_SIZE_M", 2)
-    BLOCK_SIZE_N = tuning_config.get("BLOCK_SIZE_N", 1)
+    BLOCK_SIZE_M = tuning_config.get("BLOCK_SIZE_M", 4)
+    BLOCK_SIZE_N = tuning_config.get("BLOCK_SIZE_N", 4)
 
     WARP_SIZE_M = tuning_config.get("WARP_SIZE_M", 1)
     WARP_SIZE_N = tuning_config.get("WARP_SIZE_N", 32) # 1 el / thread
@@ -265,8 +286,13 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
     threadgroup = (simd_group_size, warps, 1)
     grid = (cugrid[0]* threadgroup[0], threadgroup[1], threadgroup[2])
 
+    # determin threads level repetition
+    reg_tile_m = ceil_div(BLOCK_SIZE_M, WARP_SIZE_M * warps)
+    reg_tile_n = ceil_div(BLOCK_SIZE_N, WARP_SIZE_N)
+
     print(f"grids : {grid}")
     print(f"threadgroup : {threadgroup}")
+    print(f"(reg_tile_m, reg_tile_n) = (WARP_SIZE_M, WAPR_SIZE_N) / (BLOCK_SIZE_M, BLOCK_SIZE_N): ({reg_tile_m}, {reg_tile_n}) = ({WARP_SIZE_M}, {WARP_SIZE_N}) / ({BLOCK_SIZE_M}, {BLOCK_SIZE_N})")
 
     # NOTE (yiakwy) : sub 1-bit kernel only supports 1-bit weights
     bits_per_weight = 1
@@ -303,8 +329,8 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
             ("WARP_SIZE_M", WARP_SIZE_M),
             ("WARP_SIZE_N", WARP_SIZE_N),
             ("split_k", SPLIT_K),
-            ("reg_tile_m", ceil_div(BLOCK_SIZE_M, WARP_SIZE_M * warps)),
-            ("reg_tile_n", ceil_div(BLOCK_SIZE_N, WARP_SIZE_N)),
+            ("reg_tile_m", reg_tile_m),
+            ("reg_tile_n", reg_tile_n),
             ("NUM_PID_M", NUM_PID_M),
             ("NUM_PID_N", NUM_PID_N),
             ("kGRID_MNK", kGRID_MNK),
@@ -315,7 +341,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
         threadgroup=threadgroup, 
         output_shapes=[(M, N)],
         output_dtypes=[outDtype],
-        verbose=False,
+        verbose=True,
     )[0]
 
     return o
@@ -325,7 +351,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
 def test_fp8_group_scaled_gemm():
     test_configs = [
         # (4096, 16384, 4096),
-        (2, 16, 1)
+        (8, 32, 8)
     ]
 
     for M, K, N in test_configs:
@@ -339,8 +365,8 @@ def test_fp8_group_scaled_gemm():
 
         weights_fp16 = weights.half()
 
-        print(f"input_fp16 : {input_fp16}")
-        print(f"weights_fp16 : {weights_fp16}")
+        # print(f"input_fp16 : {input_fp16}")
+        # print(f"weights_fp16 : {weights_fp16}")
 
         assert(weights_fp16.is_contiguous())
 
@@ -364,10 +390,15 @@ def test_fp8_group_scaled_gemm():
         max_error = np.max(np.abs(output_torch.cpu().numpy() - output_mlx))
         print(f"Max error between torch and mlx: {max_error:.6f}")
 
-        print(f"output_torch : {output_torch}")
-        print(f"output_mlx : {output_mlx}")
+        # print(f"output_torch : {output_torch}")
 
-        # Performance benchmark for MLX
+        # np.set_printoptions(128)
+        # print(f"output_mlx : {np.array(output_mlx)}")
+        # print(f"output_mlx : {output_mlx}")
+
+        print(f"diff : {output_torch.cpu().numpy() - output_mlx}")
+
+        # # Performance benchmark for MLX
 
         # import time
 
