@@ -123,6 +123,103 @@ class CompletionsDataset:
         return len(self._data)
 
 
+class PreferenceDataset:
+    """
+    A dataset for DPO training with chosen/rejected pairs.
+
+    Expected format:
+    {
+        "prompt": "...",
+        "chosen": "...",
+        "rejected": "..."
+    }
+
+    or
+
+    {
+        "messages": [...],  # list of conversation messages
+        "chosen": "...",    # preferred assistant response
+        "rejected": "..."   # dispreferred assistant response
+    }
+    """
+
+    def __init__(
+        self,
+        data: List[Dict[str, str]],
+        tokenizer: PreTrainedTokenizer,
+        max_length: int = 2048,
+        prompt_key: str = "prompt",
+        chosen_key: str = "chosen",
+        rejected_key: str = "rejected",
+        messages_key: str = "messages",
+    ):
+        self._data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.prompt_key = prompt_key
+        self.chosen_key = chosen_key
+        self.rejected_key = rejected_key
+        self.messages_key = messages_key
+
+    def process(self, d):
+        # Handle both prompt+chosen/rejected and messages+chosen/rejected formats
+        if self.messages_key in d:
+            # Chat format: messages + chosen/rejected responses
+            messages = d[self.messages_key].copy()
+            chosen_messages = messages + [
+                {"role": "assistant", "content": d[self.chosen_key]}
+            ]
+            rejected_messages = messages + [
+                {"role": "assistant", "content": d[self.rejected_key]}
+            ]
+
+            chosen_tokens = self.tokenizer.apply_chat_template(chosen_messages)
+            rejected_tokens = self.tokenizer.apply_chat_template(rejected_messages)
+
+            # Get prompt tokens for masking
+            prompt_tokens = self.tokenizer.apply_chat_template(messages)
+            prompt_length = len(prompt_tokens)
+
+        else:
+            # Simple prompt + chosen/rejected format
+            prompt = d[self.prompt_key]
+            chosen_text = prompt + d[self.chosen_key]
+            rejected_text = prompt + d[self.rejected_key]
+
+            chosen_tokens = self.tokenizer.encode(chosen_text)
+            rejected_tokens = self.tokenizer.encode(rejected_text)
+            prompt_tokens = self.tokenizer.encode(prompt)
+            prompt_length = len(prompt_tokens)
+
+        # Add EOS tokens if not present
+        if chosen_tokens[-1] != self.tokenizer.eos_token_id:
+            chosen_tokens.append(self.tokenizer.eos_token_id)
+        if rejected_tokens[-1] != self.tokenizer.eos_token_id:
+            rejected_tokens.append(self.tokenizer.eos_token_id)
+
+        # Truncate if necessary
+        if len(chosen_tokens) > self.max_length:
+            chosen_tokens = chosen_tokens[: self.max_length]
+            chosen_tokens[-1] = self.tokenizer.eos_token_id
+        if len(rejected_tokens) > self.max_length:
+            rejected_tokens = rejected_tokens[: self.max_length]
+            rejected_tokens[-1] = self.tokenizer.eos_token_id
+
+        return {
+            "chosen_tokens": chosen_tokens,
+            "rejected_tokens": rejected_tokens,
+            "chosen_length": len(chosen_tokens),
+            "rejected_length": len(rejected_tokens),
+            "prompt_length": prompt_length,
+        }
+
+    def __getitem__(self, idx: int):
+        return self._data[idx]
+
+    def __len__(self):
+        return len(self._data)
+
+
 class ConcatenatedDataset:
     def __init__(self, data: List[Any]):
         self._data = data

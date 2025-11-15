@@ -13,6 +13,7 @@ if __name__ == "__main__":
         "cache_prompt",
         "chat",
         "convert",
+        "dpo",
         "evaluate",
         "fuse",
         "generate",
