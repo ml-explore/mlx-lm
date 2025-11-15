@@ -3,6 +3,8 @@ import mlx.core as mx
 import numpy as np
 import torch
 
+import os
+
 import subprocess
 
 def get_mlx_gpu_cores():
@@ -33,7 +35,7 @@ def make_sub_1bit_streamk_kernel(**config):
     #include <metal_atomic>
     #include <metal_simdgroup>
 
-#define NOT_USE_XOR 1
+#define NOT_USE_XOR 0
     """
 
     source = """
@@ -123,7 +125,7 @@ def make_sub_1bit_streamk_kernel(**config):
 
                         uint16_t wq_nk = tile_wq[n + j * warp_frag_size_n][k / packed_size];
 
-#ifdef NOT_USE_XOR
+#ifdef NOT_USE_XOR || NOT_USE_XOR
                         thread half wq_depacked_nk = half((wq_nk >> (k % packed_size)) & 1) * 2 - 1;
 #else
                         thread int16_t wq_depacked_nk = ((wq_nk << (15 - k % packed_size)) & 0x8000) ^ 0x8000;
@@ -136,7 +138,7 @@ def make_sub_1bit_streamk_kernel(**config):
                             thread half xq_mk = tile_xq[m + i * warps * warp_frag_size_m][k];
 
                             // "reinterpret_cast" is not supported in Metal Shading Language
- #ifdef NOT_USE_XOR
+ #ifdef NOT_USE_XOR || NOT_USE_XOR
                             acc[i][j] += xq_mk * wq_depacked_nk;
  #else                           
                             union {
@@ -149,11 +151,11 @@ def make_sub_1bit_streamk_kernel(**config):
                             datum.u_val ^= wq_depacked_nk;
                             acc[i][j] += datum.f_val;
 #endif // NOT_USE_XOR
-                        } // end of reg_tile_n
+                        } // end of reg_tile_m
 
                     } // end of k loop
 
-                } // end of reg_tile_m
+                } // end of reg_tile_n
  
             } // end of compute acc
 
@@ -269,7 +271,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
     # split K dimension into chunks for streaming to ensure minimum work done per metal threadgroup
     SPLIT_K = tuning_config.get("split_k", 1)
     DEBUG = tuning_config.get("DEBUG", False)
-
+    
     # TODO (add) : add break k-even coverage
     assert K % SPLIT_K == 0, "K must be divisible by SPLIT_K"
 
@@ -283,6 +285,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
     if BLOCK_SIZE_K > K:
         BLOCK_SIZE_K = K
     assert K % BLOCK_SIZE_K == 0, "K must be divisible by BLOCK_SIZE_K"
+    assert BLOCK_SIZE_N % WARP_SIZE_N == 0, "WARP_SIZE_N should be divied by BLOCK_SIZE_N for efficiency"
 
     # NOTE (yiakwy) : apple metal fast kernel does not support inplace of output
     if o is None:
@@ -417,9 +420,20 @@ def test_fp8_group_scaled_gemm():
         input_fp16_mxl = mx.array(input_fp16.cpu().numpy())
         packed_weights_mxl = mx.array(packed_weights.cpu().numpy())
 
+        doProfile = os.environ.get("MTL_CAPTURE_ENABLED", "0") == "1"
+
         split_k = 1
+
+        if doProfile:
+            mlx_trace_file = "mlx_sub_1bit_streamk_gemm.gputrace"
+            mx.metal.start_capture(mlx_trace_file)
+
         output_mlx = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k, debug=True)
         mx.eval(output_mlx)
+
+        if doProfile:
+            # capture once
+            mx.metal.stop_capture()
 
         max_error = np.max(np.abs(output_torch.cpu().numpy() - output_mlx))
         print(f"Max error between torch and mlx: {max_error:.6f}")
@@ -441,11 +455,14 @@ def test_fp8_group_scaled_gemm():
         import time
 
         # Warm up
+        outs = []
         for _ in range(10):
             _ = torch.matmul(input_fp16, weights_fp16)
-            _ = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k)
+            out = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k)
+            outs.append(out)
 
         torch.mps.synchronize()
+        mx.eval(outs)
 
         # Benchmark Pytorch MPS backend
         start_time = time.time()
