@@ -57,6 +57,9 @@ def make_sub_1bit_streamk_kernel(**config):
 
         const uint offs_k = pid_k * BLOCK_SIZE_K;
 
+        // uint estimated_boundary_k = offs_k + BLOCK_SIZE_K;
+        // uint estimated_boundary_k_packed = offs_k / packed + BLOCK_SIZE_K;
+
         // Reg Accumulator located by (m_coord, n_coord), where acc[m][m]=acc_mn[i][j] per thread sotres a partial sum
         thread AccT acc[reg_tile_m][reg_tile_n] = {0.0};
 
@@ -90,7 +93,7 @@ def make_sub_1bit_streamk_kernel(**config):
                     const uint n = i / BLOCK_SIZE_K_PACKED;
                     const uint k = i % BLOCK_SIZE_K_PACKED;
 
-                    if (offs_wq_n + n < N && (k_start / packed_size) + k < K) {
+                    if (offs_wq_n + n < N && (k_start / packed_size) + k < K / packed_size) {
                         tile_wq[n][k] = packed_weights[(offs_wq_n + n) * stride_w_n + ((k_start / packed_size) + k) * stride_w_k];
                     }
                 }
@@ -259,16 +262,17 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
 
     # split K dimension into chunks for streaming to ensure minimum work done per metal threadgroup
     SPLIT_K = tuning_config.get("split_k", 1)
+    DEBUG = tuning_config.get("DEBUG", False)
 
     assert K % SPLIT_K == 0, "K must be divisible by SPLIT_K"
 
-    BLOCK_SIZE_M = tuning_config.get("BLOCK_SIZE_M", 4)
-    BLOCK_SIZE_N = tuning_config.get("BLOCK_SIZE_N", 4)
+    BLOCK_SIZE_M = tuning_config.get("BLOCK_SIZE_M", 32)
+    BLOCK_SIZE_N = tuning_config.get("BLOCK_SIZE_N", 256)
 
     WARP_SIZE_M = tuning_config.get("WARP_SIZE_M", 1)
     WARP_SIZE_N = tuning_config.get("WARP_SIZE_N", 32) # 1 el / thread
 
-    BLOCK_SIZE_K = tuning_config.get("BLOCK_SIZE_K", 16)
+    BLOCK_SIZE_K = tuning_config.get("BLOCK_SIZE_K", 64)
     assert K % BLOCK_SIZE_K == 0, "K must be divisible by BLOCK_SIZE_K"
 
     # NOTE (yiakwy) : apple metal fast kernel does not support inplace of output
@@ -305,16 +309,18 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
     reg_tile_m = ceil_div(BLOCK_SIZE_M, WARP_SIZE_M * warps)
     reg_tile_n = ceil_div(BLOCK_SIZE_N, WARP_SIZE_N)
 
-    print(f"grids : {grid}")
-    print(f"threadgroup : {threadgroup}")
-    print(f"(reg_tile_m, reg_tile_n) = (WARP_SIZE_M, WAPR_SIZE_N) / (BLOCK_SIZE_M, BLOCK_SIZE_N): ({reg_tile_m}, {reg_tile_n}) = ({WARP_SIZE_M}, {WARP_SIZE_N}) / ({BLOCK_SIZE_M}, {BLOCK_SIZE_N})")
+    if DEBUG:
+        print(f"grids : {grid}")
+        print(f"threadgroup : {threadgroup}")
+        print(f"(reg_tile_m, reg_tile_n) = (WARP_SIZE_M, WAPR_SIZE_N) / (BLOCK_SIZE_M, BLOCK_SIZE_N): ({reg_tile_m}, {reg_tile_n}) = ({WARP_SIZE_M}, {WARP_SIZE_N}) / ({BLOCK_SIZE_M}, {BLOCK_SIZE_N})")
 
     # NOTE (yiakwy) : sub 1-bit kernel only supports 1-bit weights
     bits_per_weight = 1
     packed_size = packed_weights.dtype.size * 8 // bits_per_weight
     assert BLOCK_SIZE_K % packed_size == 0, "BLOCK_SIZE_K must be divisible by packed_size"
 
-    print(f"packed_weights : {packed_weights.shape}")
+    if DEBUG:
+        print(f"packed_weights : {packed_weights.shape}")
 
     sub_1bit_streamk_kernel = _sub_1bit_split_k_stream_kernel if SPLIT_K > 1 else _sub_1bit_streamk_kernel
 
@@ -356,7 +362,7 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
         threadgroup=threadgroup, 
         output_shapes=[(M, N)],
         output_dtypes=[outDtype],
-        verbose=True,
+        verbose=False,
     )[0]
 
     return o
@@ -365,8 +371,10 @@ def fp8_group_scaled_gemm(xq, packed_weights, o=None, weight_scale=None, **tunin
 # support torch mps backend, mlx backend, and ANE backend
 def test_fp8_group_scaled_gemm():
     test_configs = [
-        # (4096, 16384, 4096),
-        (8, 32, 8)
+        # (8, 32, 8)
+        # (128, 256, 128)
+        # (1024, 4096, 1024)
+        (4096, 16384, 4096),
     ]
 
     for M, K, N in test_configs:
@@ -400,8 +408,8 @@ def test_fp8_group_scaled_gemm():
         input_fp16_mxl = mx.array(input_fp16.cpu().numpy())
         packed_weights_mxl = mx.array(packed_weights.cpu().numpy())
 
-        split_k = 2
-        output_mlx = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k)
+        split_k = 1
+        output_mlx = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k, debug=True)
         mx.eval(output_mlx)
 
         max_error = np.max(np.abs(output_torch.cpu().numpy() - output_mlx))
@@ -409,43 +417,45 @@ def test_fp8_group_scaled_gemm():
 
         # print(f"output_torch : {output_torch}")
 
+        # by default torch does not employ split-k strategy, when split-k used, since acc order may change time to time, one should expect 1e-3 error
         if split_k > 1:
-            np.set_printoptions(128)
-            print(f"output_mlx : {np.array(output_mlx)}")
+            pass
+            # np.set_printoptions(128)
+            # print(f"output_mlx : {np.array(output_mlx)}")
         else:
-            print(f"output_mlx : {output_mlx}")
+            pass
+            # print(f"output_mlx : {output_mlx}")
         print(f"diff : {output_torch.cpu().numpy() - output_mlx}")
 
-        # # Performance benchmark for MLX
+        # Performance benchmark for MLX
 
-        # import time
+        import time
 
-        # # Warm up
-        # for _ in range(10):
-        #     _ = torch.matmul(input_fp16, weights_fp16)
-        #     _ = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None)
-        #     pass
+        # Warm up
+        for _ in range(10):
+            _ = torch.matmul(input_fp16, weights_fp16)
+            _ = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k)
 
-        # torch.mps.synchronize()
+        torch.mps.synchronize()
 
-        # # Benchmark Pytorch MPS backend
-        # start_time = time.time()
-        # for _ in range(10):
-        #     _ = torch.matmul(input_fp16, weights_fp16)
-        # torch.mps.synchronize()
-        # torch_elpase = (time.time() - start_time)/ 10 * 1000
+        # Benchmark Pytorch MPS backend
+        start_time = time.time()
+        for _ in range(10):
+            _ = torch.matmul(input_fp16, weights_fp16)
+        torch.mps.synchronize()
+        torch_elpase = (time.time() - start_time)/ 10 * 1000
         
-        # # Benchmark MLX backend
-        # start_time = time.time()
-        # outs = []
-        # for _ in range(10):
-        #     out = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None)
-        #     outs.append(out)
-        # mx.eval(outs)
-        # mlx_elpase = (time.time() - start_time)/ 10 * 1000
+        # Benchmark MLX backend
+        start_time = time.time()
+        outs = []
+        for _ in range(10):
+            out = fp8_group_scaled_gemm(input_fp16_mxl, packed_weights_mxl, weight_scale=None, split_k=split_k)
+            outs.append(out)
+        mx.eval(outs)
+        mlx_elpase = (time.time() - start_time)/ 10 * 1000
 
-        # print(f"Pytorch MPS backend average time over 10 runs: {torch_elpase:.2f} ms")
-        # print(f"MLX backend average time over 10 runs: {mlx_elpase:.2f} ms")
+        print(f"fp16x{M}x{N}x{K} Pytorch MPS backend average time over 10 runs: {torch_elpase:.2f} ms")
+        print(f"w16a1x{M}x{N}x{K} MLX backend average time over 10 runs: {mlx_elpase:.2f} ms")
 
 
 if __name__ == "__main__":
