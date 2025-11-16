@@ -79,12 +79,19 @@ def make_sub_1bit_streamk_kernel(**config):
             // TODO (yiakwy) : using BlockMMA load with vectorized loads
             // load xq cooperatively
             {
-                for (uint i=lane_id + warp_id * threads_per_threadgroup.x; i < BLOCK_SIZE_M * BLOCK_SIZE_K; i+=total_threads) {
-                    const uint m = i / BLOCK_SIZE_K;
-                    const uint k = i % BLOCK_SIZE_K;
+                constexpr uint vec_size = 4;
+                thread half4 regs = {0.0};
+
+                for (uint i=lane_id + warp_id * threads_per_threadgroup.x; i < BLOCK_SIZE_M * BLOCK_SIZE_K / vec_size; i+=total_threads) {
+                    const uint m = (i * vec_size) / BLOCK_SIZE_K;
+                    const uint k = (i * vec_size) % BLOCK_SIZE_K;
 
                     if (offs_xq_m + m < M && k_start + k < K) {
-                        tile_xq[m][k] = x[(offs_xq_m + m) * stride_x_m + (k_start + k) * stride_x_k];
+                        regs = *((const device half4*)(x + (offs_xq_m + m) * stride_x_m + (k_start + k) * stride_x_k));
+                        
+                        for (uint r=0; r < vec_size && k_start + k + r < K; r++) {
+                            tile_xq[m][k + r] = regs[r];
+                        }
                     }
                 }
             } // end of load xq
@@ -93,14 +100,22 @@ def make_sub_1bit_streamk_kernel(**config):
 
             // load wq cooperatively
             {
-                for (uint i=lane_id + warp_id * threads_per_threadgroup.x; i < BLOCK_SIZE_N * BLOCK_SIZE_K_PACKED; i+=total_threads) {
-                    const uint n = i / BLOCK_SIZE_K_PACKED;
-                    const uint k = i % BLOCK_SIZE_K_PACKED;
+                constexpr uint vec_size = 4;
+                thread half4 regs = {0.0};
+
+                for (uint i=lane_id + warp_id * threads_per_threadgroup.x; i < BLOCK_SIZE_N * BLOCK_SIZE_K_PACKED / vec_size; i+=total_threads) {
+                    const uint n = (i * vec_size) / BLOCK_SIZE_K_PACKED;
+                    const uint k = (i * vec_size) % BLOCK_SIZE_K_PACKED;
 
                     if (offs_wq_n + n < N && (k_start / packed_size) + k < K / packed_size) {
-                        tile_wq[n][k] = packed_weights[(offs_wq_n + n) * stride_w_n + ((k_start / packed_size) + k) * stride_w_k];
+                        regs = *((const device half4*)(packed_weights + (offs_wq_n + n) * stride_w_n + ((k_start / packed_size) + k) * stride_w_k));
+
+                        for (uint r=0; r < vec_size && (k_start / packed_size) + k + r < K / packed_size; r++) {
+                            tile_wq[n][k + r] = as_type<uint16_t>(regs[r]);
+                        }
                     }
                 }
+                
             } // end of load wq
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -481,7 +496,7 @@ def test_fp8_group_scaled_gemm():
         mlx_elpase = (time.time() - start_time)/ 10 * 1000
 
         print(f"fp16x{M}x{N}x{K} Pytorch MPS backend average time over 10 runs: {torch_elpase:.2f} ms")
-        print(f"w16a1x{M}x{N}x{K} MLX backend average time over 10 runs: {mlx_elpase:.2f} ms")
+        print(f"w1a16x{M}x{N}x{K} MLX backend average time over 10 runs: {mlx_elpase:.2f} ms")
 
 
 if __name__ == "__main__":
