@@ -1132,7 +1132,7 @@ def batch_generate(
     prompt_caches: Optional[List[List[Any]]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
-    return_prompt_cache: bool = False,
+    return_prompt_caches: bool = False,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1142,10 +1142,15 @@ def batch_generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (List[List[int]]): The input prompts.
+       prompt_caches (List[List[Any]], optional): Pre-computed prompt-caches
+          for each input prompt. Note, unlike ``generate_step``, the caches
+          won't be updated in-place.
        verbose (bool): If ``True``, print tokens and timing information.
           Default: ``False``.
        max_tokens (Union[int, List[int]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
+       return_prompt_caches (bool): Return the prompt caches in the batch
+          responses. Default: ``False``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
@@ -1159,11 +1164,12 @@ def batch_generate(
     with wired_limit(model, [generation_stream]):
         uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
         results = {uid: [] for uid in uids}
-        prompt_caches = {uid: None for uid in uids}
+        prompt_caches = {}
         while responses := gen.next():
             for r in responses:
                 if r.finish_reason is not None:
-                    prompt_caches[r.uid] = r.prompt_cache
+                    if return_prompt_caches:
+                        prompt_caches[r.uid] = r.prompt_cache
                     if verbose:
                         fin += 1
                         print(
@@ -1172,15 +1178,13 @@ def batch_generate(
                         )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
-                else:
-                    cache.trim_prompt_cache(r.prompt_cache, 1)
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
 
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     stats = gen.stats()
-    caches = [prompt_caches[uid] for uid in uids] if return_prompt_cache else None
+    caches = [prompt_caches[uid] for uid in uids] if return_prompt_caches else None
     if verbose:
         print(
             f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"

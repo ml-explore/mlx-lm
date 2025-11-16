@@ -27,7 +27,7 @@ prompts = [
 
 # Set `verbose=True` to see generation statistics
 result = batch_generate(
-    model, tokenizer, prompts, verbose=False, return_prompt_cache=True
+    model, tokenizer, prompts, verbose=False, return_prompt_caches=True
 )
 print(result.texts[-1])
 

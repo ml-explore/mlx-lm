@@ -147,9 +147,21 @@ class _BaseCache:
         return False
 
     def __len__(self):
+        """The length of a cache is meant to represent the number of elements
+        that we need to process in the attention. For instance for KVCache it
+        is the size of the state, for RotatingKVCache it would be up to
+        max_size etc."""
         return 0
 
     def __bool__(self):
+        """When an object defines __len__ then python defines the bool operator
+        as len(obj) != 0. This, for instance, doesn't allow us to write
+
+            cache = cache or make_cache()
+
+        which is why we are overriding that behaviour with a constant bool
+        operator return True.
+        """
         return True
 
     @classmethod
