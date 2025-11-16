@@ -88,7 +88,8 @@ def make_sub_1bit_streamk_kernel(**config):
 
                     if (offs_xq_m + m < M && k_start + k < K) {
                         regs = *((const device half4*)(x + (offs_xq_m + m) * stride_x_m + (k_start + k) * stride_x_k));
-                        
+
+                        #pragma unroll    
                         for (uint r=0; r < vec_size && k_start + k + r < K; r++) {
                             tile_xq[m][k + r] = regs[r];
                         }
@@ -110,6 +111,7 @@ def make_sub_1bit_streamk_kernel(**config):
                     if (offs_wq_n + n < N && (k_start / packed_size) + k < K / packed_size) {
                         regs = *((const device half4*)(packed_weights + (offs_wq_n + n) * stride_w_n + ((k_start / packed_size) + k) * stride_w_k));
 
+                        #pragma unroll
                         for (uint r=0; r < vec_size && (k_start / packed_size) + k + r < K / packed_size; r++) {
                             tile_wq[n][k + r] = as_type<uint16_t>(regs[r]);
                         }
