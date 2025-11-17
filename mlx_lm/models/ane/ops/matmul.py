@@ -6,36 +6,44 @@ import tempfile
 import torch
 
 import numpy as np
+import coremltools.models.datatypes as datatypes
 
 try:
     import coremltools as ct
 
+    from Cocoa import NSURL
     from CoreML import MLModel, MLModelConfiguration
-    import objc
+    from CoreML import MLDictionaryFeatureProvider, MLFeatureValue
+    # import objc
 except Exception as e:
     print(e)
     print("Please install CoreML, pyobjc and coremltools, see requirements.txt.")
     exit(1)
 
 
-def ane_subgraph_builder(w : np.ndarray, b : np.ndarray = None, input_name="x", prefix : str = "") -> ct.models.MLModel:
+def ane_subgraph_builder(x_desc : tuple, w : np.ndarray, b : np.ndarray = None, input_name="x", output_name="out", prefix : str = "") -> ct.models.MLModel:
     if w.ndim != 2:
         # reshape
         pass
 
-    M, K = x.shape
-    N = w.shape[0]
+    M, K = x_desc
+    N, K = w.shape
 
-    output_name = f'{prefix}/out'
+    output_name = f'{prefix}/{output_name}'
 
     input_features = [(input_name, ct.models.datatypes.Array(M, K))]
     output_features = [(output_name, ct.models.datatypes.Array(M, N))]
 
     # see https://apple.github.io/coremltools/v3.4/generated/coremltools.models.neural_network.builder.html
-    builder = ct.models.neural_network.NeuralNetworkBuilder(input_features, output_features)
-    builder.add_inner_product(name='matmul', input_name=input_name, output_name=output_name, W=weights, b=b, input_channels=K, output_channels=N, has_bias=b != None)
+    builder = ct.models.neural_network.NeuralNetworkBuilder(input_features, output_features, disable_rank5_shape_mapping=True)
+    builder.add_inner_product(name='matmul', input_name=input_name, output_name=output_name, 
+        W=w, b=b, input_channels=K, output_channels=N, has_bias=b != None)
 
-    spec = build.spec
+    spec = builder.spec
+    spec.description.predictedFeatureName = output_name
+
+    # ct.utils.convert_double_to_float_multiarray_type(spec)
+
     model = ct.models.MLModel(spec)
     return model, output_name
 
@@ -49,57 +57,54 @@ def _hash_matmul(W, b=None):
     if b is not None:
         algo.update(b.tobytes())
 
-    return aglo.hexdigest()
+    return algo.hexdigest()
 
 
-def matmul(x : np.ndarray, w : np.ndarray, b : np.ndarray = None, prefix : str = "", input_name="x", model=None):
+def save_model_proto(model : ct.models.MLModel, saved_path : str, model_name : str):
+    if not os.path.exists(saved_path):
+        os.makedirs(saved_path, exist_ok=True)
 
-    key = _hash_matmul(W, b=b)
+    model.save(saved_path)
+
+
+def matmul(x : np.ndarray, w : np.ndarray, b : np.ndarray = None, prefix : str = "", input_name="x", output_name="out", model=None, **configs):
+
+    key = _hash_matmul(w, b=b)
 
     if model is None:
-        # TODO (yiakwy) : load from path
-
         cached = _cache.get(key, None)
-        if cached is None or cached[2] is None:
-            model, output_name = ane_subgraph_builder(w, b)
+        if cached is None:
+
+            model, output_name = ane_subgraph_builder(x.shape, w, b, input_name=input_name)
+            print( f"model : {model}")
+
+            dump = configs.get("dump", True)
+            saved_path = configs.get("saved_path", os.path.join(tempfile.gettempdir(), "mlx_ane_ops_cache"))
+            model_name = configs.get("model_name", f"op_matmul_{key}.mlmodel")
 
             # TODO (yiakwy) : save to path asynchronously
-            modelproto_saved_path_dir = os.path.join(tempfile.gettempdir(), "mlx_ane_ops_cache")
-            os.makedirs(modelproto_saved_path_dir, exist_ok=True)
+            if dump:
+                save_model_proto(model, saved_path, model_name)
 
-            modelproto_saved_path = os.path.join(modelproto_saved_path_dir, f"matmul_{key}.mlmodel")
-
-            compiled_mlmodel_path = MLModel.compileModelAtURL_error_(modelproto_saved_path, None)
-
-            config = MLModelConfiguration.alloc().init()
-            config.computeUnits = "all"
-            mlmodel_obj = MLModel.modelWithContentsOfURL_configuration_error_(compiled_mlmodel_path, config, None)
-
-            _cache[key] = (modelproto_saved_path, compiled_mlmodel_path, mlmodel_obj)
-
-            model = mlmodel_obj
+            _cache[key] = (model)
         else:
-            model = cached[2]
+            model = cached[0]
+            output_name = f'{prefix}/{output_name}'
 
+    inputs = {input_name : x.astype(np.float32)}
     
-    # get the moel
+    outputs = model.predict(inputs)
 
-
-    inputs = {
-        input_name : x
-    }
-
-    outputs = model.predictionFromFeatures_error_(inputs, None)
-
-    out = np.array(outputs["out"], dtype=np.float32)
+    out = np.array(outputs[output_name], dtype=np.float32)
     return out
 
 
 def test_fp8_group_scaled_gemm():
     test_configs = [
-        (8, 32, 8)
+        # (8, 32, 8)
+        # (1, 1, 1)
         # (128, 256, 128)
-        # (1024, 4096, 1024)
+        (1024, 4096, 1024)
         # (4096, 16384, 4096),
     ]
 
@@ -123,14 +128,18 @@ def test_fp8_group_scaled_gemm():
         output_torch = torch.matmul(input_fp16, weights_fp16)
 
         input_fp16_np = input_fp16.cpu().numpy()
-        weights_fp16_np = weights_fp16.cpu().numpy()
 
-        out = matmul(input_fp16_np, weights_fp16_np)
 
-        max_error = np.max(np.abs(output_torch.cpu().numpy() - output_mlx))
+        weights_fp16_t = torch.zeros((N, K), dtype=torch.float16, device="mps")
+        weights_fp16_t[:] = weights_fp16.T[:]
+
+        weights_fp16_np = weights_fp16_t.cpu().numpy()
+
+        output_ane = matmul(input_fp16_np, weights_fp16_np)
+
+        max_error = np.max(np.abs(output_torch.cpu().numpy() - output_ane))
         print(f"Max error between torch and mlx: {max_error:.6f}")
-    pass
 
 
-    if __name__ == "__main__":
-        test_fp8_group_scaled_gemm()
+if __name__ == "__main__":
+    test_fp8_group_scaled_gemm()
