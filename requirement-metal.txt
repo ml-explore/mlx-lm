@@ -1,0 +1,7 @@
+# use to build objc codes
+pyobjc
+
+# use to build ane graph
+coremltools
+
+-r requirements-dev.txt

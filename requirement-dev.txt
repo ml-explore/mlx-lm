@@ -1,0 +1,9 @@
+setuptools>=40.8.0
+wheel
+cmake>=3.20,<4.0
+ninja>=1.11.1
+pybind11>=2.13.1
+lit
+
+triton @ git+https://github.com/triton-lang/triton.git
+
