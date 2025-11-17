@@ -11,6 +11,9 @@ import coremltools.models.datatypes as datatypes
 try:
     import coremltools as ct
 
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.input_types import TensorType
+
     from coremltools.models.neural_network import quantization_utils
     from coremltools.proto.FeatureTypes_pb2 import ArrayFeatureType
 
@@ -49,7 +52,7 @@ def ane_subgraph_builder(x_desc : tuple, w : np.ndarray, b : np.ndarray = None, 
 
     model_fp32 = ct.models.MLModel(spec)
 
-    # https://apple.github.io/coremltools/docs-guides/source/quantization-neural-network.html
+    # weights to fp16 https://apple.github.io/coremltools/docs-guides/source/quantization-neural-network.html
     model_fp16 = quantization_utils.quantize_weights(model_fp32, nbits=16, quantization_mode='linear',)
 
     return model_fp16, output_name
@@ -107,6 +110,26 @@ def matmul(x : np.ndarray, w : np.ndarray, b : np.ndarray = None, prefix : str =
     return out
 
 
+# NOTE(yiakwy) : x.data_ptr() != x.cpu().data_ptr() in pytorch metal backend
+def dispatch_matmul(x, w, w_cpu, out=None, div=5):
+    M, K = x.shape
+    K, N = w.shape
+
+    if out is None:
+        out = torch.zeros((M, N), dtype=torch.float16, device="mps")
+    
+    x_partial_0_view = x[M // div:M]
+    out_partial_0_view = out[M // div:M]
+
+    torch.matmul(x_partial_0_view, w, out=out_partial_0_view)
+
+    x_partial_1_view = x[:M // div]
+    output_partial_ane = matmul(x_partial_1_view.cpu().numpy(), w_cpu)
+    out[:M // div] = torch.from_numpy(output_partial_ane[:]).to("mps")
+
+    return out
+
+
 def test_fp8_group_scaled_gemm():
     test_configs = [
         # (8, 32, 8)
@@ -120,6 +143,8 @@ def test_fp8_group_scaled_gemm():
         print(f"\n{'='*60}")
         print(f"Testing M={M}, K={K}, N={N}")
         print(f"{'='*60}")
+
+        use_mx_ane = True
 
         torch.manual_seed(42)
         input_fp16 = torch.randn(M, K, dtype=torch.float16, device="mps")
@@ -143,13 +168,27 @@ def test_fp8_group_scaled_gemm():
 
         weights_fp16_np = weights_fp16_t.cpu().numpy()
 
-        output_ane = matmul(input_fp16_np, weights_fp16_np)
+        if use_mx_ane:
+            output_mx_ane = dispatch_matmul(input_fp16, weights_fp16, weights_fp16_np)
 
-        max_error = np.max(np.abs(output_torch.cpu().numpy() - output_ane))
-        print(f"Max error between torch and mlx: {max_error:.6f}")
+            if use_mx_ane:
+                torch.mps.synchronize()
 
-        # print(f"diff : {output_ane - output_torch.cpu().numpy()}")
-        print(f"ane type : {output_ane.dtype}")
+            diff = output_torch - output_mx_ane
+
+            max_error = np.max(np.abs(diff.cpu().numpy()))
+            print(f"Max error between torch and mlx: {max_error:.6f}")
+            print(f"diff : {diff}")
+        else:
+            output_ane = matmul(input_fp16_np, weights_fp16_np)
+
+            diff = output_torch.cpu().numpy() - output_ane
+
+            max_error = np.max(np.abs(diff))
+            print(f"Max error between torch and mlx: {max_error:.6f}")
+
+            # print(f"diff : {diff}")
+            # print(f"ane type : {output_ane.dtype}")
 
         # Performance benchmark for ANE
 
@@ -160,7 +199,13 @@ def test_fp8_group_scaled_gemm():
         torch.mps.synchronize()
 
         for _ in range(10):
-            _ = matmul(input_fp16_np, weights_fp16_np)
+            if use_mx_ane:
+                _ = dispatch_matmul(input_fp16, weights_fp16, weights_fp16_np)
+            else:
+                _ = matmul(input_fp16_np, weights_fp16_np)
+
+        if use_mx_ane:
+            torch.mps.synchronize()
 
         # Benchmark Pytorch MPS backend
         start_time = time.time()
@@ -172,12 +217,18 @@ def test_fp8_group_scaled_gemm():
         # Benchmark for ANE
         start_time = time.time()
         for _ in range(10):
-            _ = matmul(input_fp16_np, weights_fp16_np)
+            if use_mx_ane:
+                _ = dispatch_matmul(input_fp16, weights_fp16, weights_fp16_np)
+            else:
+                _ = matmul(input_fp16_np, weights_fp16_np)
+
+        if use_mx_ane:
+            torch.mps.synchronize()
 
         mlx_elpase = (time.time() - start_time)/ 10 * 1000
         
         print(f"fp16x{M}x{N}x{K} Pytorch MPS backend average time over 10 runs: {torch_elpase:.2f} ms")
-        print(f"fp16x{M}x{N}x{K} ANE backend average time over 10 runs: {mlx_elpase:.2f} ms")
+        print(f"fp16x{M}x{N}x{K} {'ANE_METAL_MIX' if use_mx_ane else 'ANE'} backend average time over 10 runs: {mlx_elpase:.2f} ms")
         
 
 if __name__ == "__main__":
