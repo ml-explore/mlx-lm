@@ -418,7 +418,8 @@ def generate_step(
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
-            n_to_process = min(prefill_step_size, prompt.size - 1)
+            remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+            n_to_process = min(prefill_step_size, remaining)
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(

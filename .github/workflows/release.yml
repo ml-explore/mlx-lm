@@ -1,0 +1,41 @@
+name: PyPI Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  build_release:
+    if: github.repository == 'ml-explore/mlx'
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mlx-lm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Build package
+        shell: sh
+        run: |
+          pip install build
+          python -m build
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          overwrite: true
+          name: mlx-lm
+          path: dist/*
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://upload.pypi.org/legacy/
