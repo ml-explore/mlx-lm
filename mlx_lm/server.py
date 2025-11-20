@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import copy
 import json
 import logging
 import platform
@@ -8,6 +9,7 @@ import socket
 import time
 import uuid
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -145,6 +147,145 @@ def process_message_content(messages):
             message["content"] = ""
 
 
+class LRUPromptCache:
+
+    @dataclass
+    class CacheEntry:
+        prompt_cache: List[Any]
+        count: int
+
+    @dataclass
+    class SearchResult:
+        model: Any
+        exact: List[int]
+        shorter: List[int]
+        longer: List[int]
+        common_prefix: int
+
+    def __init__(self, max_size: int = 10):
+        self.max_size = max_size
+        self._cache = {}
+        self._lru = deque()
+
+    def _search(self, model, tokens):
+        """Search the cache for a prompt cache. Return exact or close match."""
+        if model not in self._cache:
+            return self.SearchResult(model, None, None, None, 0)
+
+        current = self._cache[model]
+        last_cache_index = -1
+        index = 0
+
+        while index < len(tokens) and tokens[index] in current:
+            current = current[tokens[index]]
+            if "cache" in current:
+                last_cache_index = index
+            index += 1
+
+        # Exact match no need to search for longer or shorter caches
+        if last_cache_index == len(tokens) - 1:
+            return self.SearchResult(model, tokens, None, None, 0)
+
+        # Find the shorter cache
+        shorter = None
+        if last_cache_index > 0:
+            shorter = tokens[: last_cache_index + 1]
+
+        # Check for caches that are longer
+        longer = None
+        common_prefix = index
+        if index > 0 and last_cache_index <= 0:
+            best = None
+            stack = [(current, [])]
+            while stack:
+                current, extra = stack.pop()
+                if "cache" in current:
+                    if best is None or len(extra) < len(best):
+                        best = extra
+                else:
+                    for tok in current:
+                        stack.append((current[tok], extra + [tok]))
+            longer = tokens[:index] + best
+        return self.SearchResult(model, None, shorter, longer, common_prefix)
+
+    def _get(self, model, tokens):
+        current = self._cache[model]
+        for tok in tokens:
+            current = current[tok]
+        return current["cache"]
+
+    def _delete(self, model, tokens):
+        path = [self._cache[model]]
+        for tok in tokens:
+            path.append(path[-1][tok])
+        del path[-1]["cache"]
+        for i in reversed(range(len(tokens))):
+            d_prev, d, t = path[i], path[i + 1], tokens[i]
+            if len(d) > 0:
+                break
+            del d_prev[t]
+
+    def _extract(self, model, tokens):
+        cache_entry = self._get(model, tokens)
+        if cache_entry.count == 1:
+            self._delete(model, tokens)
+            self._lru.remove((model, tokens))
+            return cache_entry
+
+        cache_entry.count -= 1
+        return self.CacheEntry(
+            copy.deepcopy(cache_entry.prompt_cache),
+            1,
+        )
+
+    def fetch_nearest_cache(self, model, tokens):
+        result = self._search(model, tokens)
+        if result.exact is not None:
+            cache_entry = self._extract(result.model, result.exact)
+            return cache_entry.prompt_cache, []
+
+        if result.shorter is not None:
+            cache_entry = self._extract(result.model, result.shorter)
+            prefix_len = len(result.shorter)
+            return cache_entry.prompt_cache, tokens[prefix_len:]
+
+        if result.longer is not None:
+            cache_entry = self._get(result.model, result.longer)
+            if can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache_entry = self.CacheEntry(
+                    copy.deepcopy(cache_entry.prompt_cache),
+                    1,
+                )
+                num_to_trim = len(result.longer) - result.common_prefix
+                trim_prompt_cache(cache_entry.prompt_cache, num_to_trim)
+                return cache_entry.prompt_cache, tokens[result.common_prefix :]
+
+        return None, tokens
+
+    def insert_cache(self, model, tokens, prompt_cache):
+        if model not in self._cache:
+            self._cache[model] = {}
+        current = self._cache[model]
+        for tok in tokens:
+            if tok not in current:
+                current[tok] = {}
+            current = current[tok]
+
+        remove_first = False
+        if "cache" in current:
+            current["cache"].count += 1
+            remove_first = True
+        else:
+            current["cache"] = self.CacheEntry(prompt_cache, 1)
+
+        if remove_first:
+            self._lru.remove((model, tokens))
+        self._lru.append((model, tokens))
+        if len(self._lru) > self.max_size:
+            model, tokens = self._lru.popleft()
+            self._delete(model, tokens)
+
+
 @dataclass
 class PromptCache:
     cache: List[Any] = field(default_factory=list)
@@ -247,7 +388,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         self.created = int(time.time())
         self.model_provider = model_provider
-        self.prompt_cache = prompt_cache or PromptCache()
+        self.prompt_cache = prompt_cache or LRUPromptCache()
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
         super().__init__(*args, **kwargs)
 
@@ -538,88 +679,33 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
-    def reset_prompt_cache(self, prompt):
-        """Resets the prompt cache and associated state.
-
-        Args:
-            prompt (List[int]): The tokenized new prompt which will populate the
-                reset cache.
-        """
-        logging.debug(f"*** Resetting cache. ***")
-        self.prompt_cache.model_key = self.model_provider.model_key
-        self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
-        if self.model_provider.draft_model is not None:
-            self.prompt_cache.cache += make_prompt_cache(
-                self.model_provider.draft_model
-            )
-        self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
-
     def get_prompt_cache(self, prompt):
         """
-        Determines the portion of the prompt that needs processing by comparing
-        it to the cached prompt and attempting to reuse the common prefix.
+        Given the prompt find the closest KV cache that can be extended to the
+        passed in prompt.
 
-        This function updates the internal prompt cache state (tokens and model cache)
-        based on the comparison. If a common prefix exists, it attempts to trim
-        the model cache (if supported) to match the common prefix length, avoiding
-        recomputation.
+        If one couldn't be found then make a new one.
 
         Args:
             prompt (List[int]): The tokenized new prompt.
 
         Returns:
-            List[int]: The suffix of the prompt that actually needs to be processed
-                       by the model. This will be the full prompt if the cache is
-                       reset or cannot be effectively used.
+            List[Any]: The prompt cache object
+            List[int]: The tokens that are in the returned object
+            List[int]: The remaining tokens to be added
         """
-        cache_len = len(self.prompt_cache.tokens)
-        prompt_len = len(prompt)
-        com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
+        cache, rest = self.prompt_cache.fetch_nearest_cache(
+            self.model_provider.model_key, prompt
+        )
+        cache_key = prompt[: len(prompt) - len(rest)]
 
-        # Leave at least one token in the prompt
-        com_prefix_len = min(com_prefix_len, len(prompt) - 1)
+        # Make a new cache for the model
+        if cache is None:
+            cache = make_prompt_cache(self.model_provider.model)
+            if self.model_provider.draft_model is not None:
+                cache += make_prompt_cache(self.model_provider.draft_model)
 
-        # Condition 1: Model changed or no common prefix at all. Reset cache.
-        if (
-            self.prompt_cache.model_key != self.model_provider.model_key
-            or com_prefix_len == 0
-        ):
-            self.reset_prompt_cache(prompt)
-
-        # Condition 2: Common prefix exists and matches cache length. Process suffix.
-        elif com_prefix_len == cache_len:
-            logging.debug(
-                f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
-            )
-            prompt = prompt[com_prefix_len:]
-            self.prompt_cache.tokens.extend(prompt)
-
-        # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
-        elif com_prefix_len < cache_len:
-            logging.debug(
-                f"*** Common prefix ({com_prefix_len}) shorter than cache ({cache_len}). Attempting trim. ***"
-            )
-
-            if can_trim_prompt_cache(self.prompt_cache.cache):
-                num_to_trim = cache_len - com_prefix_len
-                logging.debug(f"    Trimming {num_to_trim} tokens from cache.")
-                trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
-                self.prompt_cache.tokens = self.prompt_cache.tokens[:com_prefix_len]
-                prompt = prompt[com_prefix_len:]
-                self.prompt_cache.tokens.extend(prompt)
-            else:
-                logging.debug(f"    Cache cannot be trimmed. Resetting cache.")
-                self.reset_prompt_cache(prompt)
-
-        # This case should logically not be reached if com_prefix_len <= cache_len
-        else:
-            logging.error(
-                f"Unexpected cache state: com_prefix_len ({com_prefix_len}) > cache_len ({cache_len}). Resetting cache."
-            )
-            self.reset_prompt_cache(prompt)
-
-        logging.debug(f"Returning {len(prompt)} tokens for processing.")
-        return prompt
+        return cache, cache_key, rest
 
     def handle_completion(
         self,
@@ -645,7 +731,7 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = []
         top_tokens = []
 
-        prompt = self.get_prompt_cache(prompt)
+        cache, cache_key, prompt = self.get_prompt_cache(prompt)
 
         text = ""
         tic = time.perf_counter()
@@ -688,6 +774,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     # Client disconnected, ignore
                     pass
 
+        cache_key += prompt
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -695,7 +782,7 @@ class APIHandler(BaseHTTPRequestHandler):
             max_tokens=self.max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
-            prompt_cache=self.prompt_cache.cache,
+            prompt_cache=cache,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
             prompt_progress_callback=keepalive_callback,
@@ -720,7 +807,7 @@ class APIHandler(BaseHTTPRequestHandler):
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
-            self.prompt_cache.tokens.append(token)
+            cache_key.append(token)
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
@@ -807,6 +894,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response_json)
             self.wfile.flush()
+
+        self.prompt_cache.insert_cache(self.model_provider.model_key, cache_key, cache)
 
     def completion_usage_response(
         self,
@@ -947,7 +1036,7 @@ def run(
     handler_class=APIHandler,
 ):
     server_address = (host, port)
-    prompt_cache = PromptCache()
+    prompt_cache = LRUPromptCache()
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
