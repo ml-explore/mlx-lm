@@ -32,7 +32,7 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import common_prefix_len, load
+from .utils import load
 
 
 def get_system_fingerprint():
