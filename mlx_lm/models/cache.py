@@ -728,6 +728,8 @@ class BatchKVCache(_BaseCache):
 
     def update_and_fetch(self, keys, values):
         prev = self._idx
+        self.rebatch(keys.shape[0])
+
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
@@ -753,6 +755,34 @@ class BatchKVCache(_BaseCache):
 
     def __len__(self):
         return self._idx
+
+    def rebatch(self, batch_size: int):
+        """Resize cached batch dimension to match the incoming batch."""
+        if self.keys is None or self.keys.shape[0] == batch_size:
+            return
+
+        current_batch = self.keys.shape[0]
+        if batch_size < current_batch:
+            self.keys = self.keys[:batch_size]
+            self.values = self.values[:batch_size]
+            self.offset = self.offset[:batch_size]
+            self.left_padding = self.left_padding[:batch_size]
+            return
+
+        pad = batch_size - current_batch
+        pad_k = mx.zeros(
+            (pad, self.keys.shape[1], self.keys.shape[2], self.keys.shape[3]),
+            self.keys.dtype,
+        )
+        pad_v = mx.zeros(
+            (pad, self.values.shape[1], self.values.shape[2], self.values.shape[3]),
+            self.values.dtype,
+        )
+        self.keys = mx.concatenate([self.keys, pad_k], axis=0)
+        self.values = mx.concatenate([self.values, pad_v], axis=0)
+        zero_pad = mx.zeros(pad, dtype=self.offset.dtype)
+        self.offset = mx.concatenate([self.offset, zero_pad], axis=0)
+        self.left_padding = mx.concatenate([self.left_padding, zero_pad], axis=0)
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
