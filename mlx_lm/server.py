@@ -775,6 +775,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     pass
 
         cache_key += prompt
+        prompt_token_count = len(cache_key)
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -864,11 +865,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                original_prompt_length = (
-                    len(self.prompt_cache.tokens) - len(tokens) + len(prompt)
-                )
                 response = self.completion_usage_response(
-                    original_prompt_length, len(tokens)
+                    prompt_token_count, len(tokens)
                 )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
@@ -878,7 +876,7 @@ class APIHandler(BaseHTTPRequestHandler):
             response = self.generate_response(
                 text,
                 finish_reason,
-                len(prompt),
+                prompt_token_count,
                 len(tokens),
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
