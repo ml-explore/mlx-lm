@@ -79,7 +79,9 @@ class SlotKVCache:
             self._validate_slot(s)
         with self._lock:
             max_len = max((self._lengths[s] for s in slots), default=0)
-            gathered_k = np.zeros((len(slots), max_len, self.kv_heads, self.head_dim), dtype=self.dtype)
+            gathered_k = np.zeros(
+                (len(slots), max_len, self.kv_heads, self.head_dim), dtype=self.dtype
+            )
             gathered_v = np.zeros_like(gathered_k)
             for i, slot in enumerate(slots):
                 length = self._lengths[slot]

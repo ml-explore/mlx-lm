@@ -13,7 +13,9 @@ class SlotKVCacheTests(unittest.TestCase):
         self.cache = SlotKVCache(max_slots=3, capacity_tokens=8, kv_heads=2, head_dim=4)
 
     def _kv(self, tokens, base=0):
-        keys = np.arange(base, base + tokens * 8, dtype=np.float32).reshape(tokens, 2, 4)
+        keys = np.arange(base, base + tokens * 8, dtype=np.float32).reshape(
+            tokens, 2, 4
+        )
         values = keys + 100
         return keys, values
 

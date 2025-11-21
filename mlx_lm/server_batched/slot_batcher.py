@@ -8,9 +8,9 @@ from typing import Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
 
+from .sampling import select_tokens_argmax
 from .slot_allocator import SlotAllocator
 from .slot_kv_cache import SlotKVCache
-from .sampling import select_tokens_argmax
 
 
 @dataclass

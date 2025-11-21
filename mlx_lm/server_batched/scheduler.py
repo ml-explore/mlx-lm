@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from collections import deque
 import threading
 import time
+from collections import deque
 from typing import Deque, List
 
 from .state import SequenceContext
@@ -75,7 +75,9 @@ class Scheduler:
 
             if self._stop or not self._active:
                 stats = self.runner.collect_step_stats()
-                self._last_prefill_tokens = stats.get("prefill_tokens", self._last_prefill_tokens)
+                self._last_prefill_tokens = stats.get(
+                    "prefill_tokens", self._last_prefill_tokens
+                )
                 self._last_decode_batch = 0
                 self._last_step_metrics = self._compose_metrics(
                     stats=stats,
@@ -93,7 +95,9 @@ class Scheduler:
         with self._lock:
             self._active = [ctx for ctx in self._active if not ctx.state.finished]
             stats = decode_stats or self.runner.collect_step_stats()
-            self._last_prefill_tokens = stats.get("prefill_tokens", self._last_prefill_tokens)
+            self._last_prefill_tokens = stats.get(
+                "prefill_tokens", self._last_prefill_tokens
+            )
             self._last_step_metrics = self._compose_metrics(
                 stats=stats,
                 prefill_sequences=ready_count,

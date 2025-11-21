@@ -2,6 +2,7 @@
 # ABOUTME: Ensures slot allocation, release, and decode selection.
 
 import unittest
+
 import numpy as np
 
 from mlx_lm.server_batched.slot_allocator import SlotAllocator

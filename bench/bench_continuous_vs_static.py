@@ -18,6 +18,7 @@ from statistics import mean, median
 from typing import List, Optional
 
 import mlx.core as mx
+
 from mlx_lm import batch_generate, load
 from mlx_lm.server_batched.engine import ModelRunner
 from mlx_lm.server_batched.runtime import ContinuousBatchingRuntime
@@ -48,7 +49,9 @@ def poisson_arrivals(lmbda: float, n: int):
 
 def summarize(name: str, results: List[Result]):
     if not results:
-        print(f"[{name}] n=0 tokens=0 wall=0.00s tokens/s=0.00 ttft mean=0.0ms median=0.0ms p95=0.0ms")
+        print(
+            f"[{name}] n=0 tokens=0 wall=0.00s tokens/s=0.00 ttft mean=0.0ms median=0.0ms p95=0.0ms"
+        )
         return 0.0, 0.0, 0
 
     start_ns = min(r.submit_ns for r in results)
@@ -201,14 +204,18 @@ def main():
     prompts = [base_prompt[: args.prompt_len] for _ in range(args.n)]
 
     static_results = run_static(model, tokenizer, prompts, args.max_tokens)
-    static_tps, static_wall, static_tokens = summarize("static_batch_generate", static_results)
+    static_tps, static_wall, static_tokens = summarize(
+        "static_batch_generate", static_results
+    )
 
     est_service = max(args.max_tokens / 200.0, 0.01)
     lmbda = max(0.1, args.concurrency / est_service)
     continuous_results = run_continuous(
         model, tokenizer, prompts, args.max_tokens, lmbda
     )
-    cont_tps, cont_wall, cont_tokens = summarize("continuous_runtime", continuous_results)
+    cont_tps, cont_wall, cont_tokens = summarize(
+        "continuous_runtime", continuous_results
+    )
 
     print(
         json.dumps(

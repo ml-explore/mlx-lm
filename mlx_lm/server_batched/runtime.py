@@ -139,7 +139,7 @@ class ContinuousBatchingRuntime:
             elapsed = (time.time_ns() - ctx.decode_started_ns) / 1e9
             if elapsed > 0:
                 generation_tps = generation_tokens / elapsed
-        vocab_size = getattr(self.runner.tokenizer, 'vocab_size', 1) or 1
+        vocab_size = getattr(self.runner.tokenizer, "vocab_size", 1) or 1
         return GenerationResponse(
             text="",
             token=ctx.history_tokens[-1] if ctx.history_tokens else 0,

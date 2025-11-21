@@ -8,14 +8,15 @@ import platform
 import signal
 import socket
 import sys
+import threading
 import time
 import uuid
 import warnings
-import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Dict,
     List,
@@ -25,7 +26,6 @@ from typing import (
     Sequence,
     Tuple,
     Union,
-    TYPE_CHECKING,
 )
 
 import mlx.core as mx
@@ -35,10 +35,10 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import common_prefix_len, load
-from .server_batched.handler import maybe_handle_continuous_batching
 from .server_batched.config import create_arg_parser
+from .server_batched.handler import maybe_handle_continuous_batching
 from .server_batched.runtime import create_runtime
+from .utils import common_prefix_len, load
 
 
 def get_system_fingerprint():
@@ -891,7 +891,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     original_prompt_length = len(prompt_for_usage)
                 else:
                     original_prompt_length = (
-                        len(self.prompt_cache.tokens) - len(tokens) + len(prompt_for_usage)
+                        len(self.prompt_cache.tokens)
+                        - len(tokens)
+                        + len(prompt_for_usage)
                     )
                 response = self.completion_usage_response(
                     original_prompt_length, len(tokens)

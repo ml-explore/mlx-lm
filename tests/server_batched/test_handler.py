@@ -262,7 +262,9 @@ class HandlerFallbackTests(unittest.TestCase):
                 finish_reason="stop",
             )
         ]
-        with mock.patch("mlx_lm.server.stream_generate", return_value=iter([])) as mock_stream:
+        with mock.patch(
+            "mlx_lm.server.stream_generate", return_value=iter([])
+        ) as mock_stream:
             with mock.patch(
                 "mlx_lm.server.maybe_handle_continuous_batching",
                 return_value=("req-batch", iter(responses)),

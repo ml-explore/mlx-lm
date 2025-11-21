@@ -5,7 +5,9 @@ import argparse
 from typing import Optional
 
 
-def create_arg_parser(parser: Optional[argparse.ArgumentParser] = None) -> argparse.ArgumentParser:
+def create_arg_parser(
+    parser: Optional[argparse.ArgumentParser] = None,
+) -> argparse.ArgumentParser:
     parser = parser or argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--enable-continuous-batching",

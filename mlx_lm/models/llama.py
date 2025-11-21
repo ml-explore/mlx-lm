@@ -1,9 +1,8 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
-
-import logging
 
 import mlx.core as mx
 import mlx.nn as nn

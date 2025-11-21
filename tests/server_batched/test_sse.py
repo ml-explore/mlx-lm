@@ -56,7 +56,11 @@ class FakeRunner:
         repetition_penalty,
         repetition_context_size,
     ):
-        state = SequenceState(request_id=request_id, prompt_len=len(prompt_tokens), max_new_tokens=max_new_tokens)
+        state = SequenceState(
+            request_id=request_id,
+            prompt_len=len(prompt_tokens),
+            max_new_tokens=max_new_tokens,
+        )
         ctx = SequenceContext(
             state=state,
             prompt_tokens=list(prompt_tokens),

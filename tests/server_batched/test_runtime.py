@@ -9,7 +9,6 @@ import time
 import types
 import unittest
 
-
 from mlx_lm.generate import GenerationResponse
 from mlx_lm.server_batched.runtime import ContinuousBatchingRuntime
 from mlx_lm.server_batched.state import SequenceContext, SequenceState
@@ -50,7 +49,9 @@ class FakeRunner:
         repetition_penalty,
         repetition_context_size,
     ):
-        state = SequenceState(request_id=request_id, prompt_len=len(prompt), max_new_tokens=max_new_tokens)
+        state = SequenceState(
+            request_id=request_id, prompt_len=len(prompt), max_new_tokens=max_new_tokens
+        )
         ctx = SequenceContext(
             state=state,
             prompt_tokens=list(prompt),
@@ -72,18 +73,20 @@ class FakeRunner:
         for ctx in contexts:
             ctx.state.generated_tokens += 1
             ctx.state.finished = True
-            ctx.enqueue_event(GenerationResponse(
-                text="hello",
-                token=1,
-                logprobs=None,
-                from_draft=False,
-                prompt_tokens=ctx.state.prompt_len,
-                prompt_tps=0.0,
-                generation_tokens=ctx.state.generated_tokens,
-                generation_tps=0.0,
-                peak_memory=0.0,
-                finish_reason="stop",
-            ))
+            ctx.enqueue_event(
+                GenerationResponse(
+                    text="hello",
+                    token=1,
+                    logprobs=None,
+                    from_draft=False,
+                    prompt_tokens=ctx.state.prompt_len,
+                    prompt_tps=0.0,
+                    generation_tokens=ctx.state.generated_tokens,
+                    generation_tps=0.0,
+                    peak_memory=0.0,
+                    finish_reason="stop",
+                )
+            )
         return {
             "decode_iterations": 1 if contexts else 0,
             "decode_tokens": len(contexts),

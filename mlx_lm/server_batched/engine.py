@@ -12,10 +12,10 @@ import mlx.nn as nn
 
 from ..generate import BatchGenerator, GenerationResponse
 from ..sample_utils import make_logits_processors, make_sampler
-from .state import SequenceContext, SequenceState
 from .slot_allocator import SlotAllocator
 from .slot_batcher import SlotBatcher
 from .slot_kv_cache import SlotKVCache
+from .state import SequenceContext, SequenceState
 
 
 class ModelRunner:
@@ -127,7 +127,9 @@ class ModelRunner:
         slot = self.slot_batcher.register(request_id)
         ctx.state.slot_id = slot
         ctx.detokenizer = self.tokenizer.detokenizer
-        ctx.last_token_id = prompt_tokens[-1] if prompt_tokens else self.tokenizer.eos_token_id
+        ctx.last_token_id = (
+            prompt_tokens[-1] if prompt_tokens else self.tokenizer.eos_token_id
+        )
         ctx.history_tokens = list(prompt_tokens)
         ctx.stop_sequences = list(stopping_cfg.get("stop_id_sequences", []))
         return ctx
@@ -162,9 +164,9 @@ class ModelRunner:
             and not ctx.prompt_inserted
             and ctx.prompt_tokens
         ):
-            uid = self.generator.insert(
-                [ctx.prompt_tokens], ctx.state.max_new_tokens
-            )[0]
+            uid = self.generator.insert([ctx.prompt_tokens], ctx.state.max_new_tokens)[
+                0
+            ]
             ctx.generator_uid = uid
             ctx.prompt_inserted = True
             ctx.prefill_completed_ns = time.time_ns()
@@ -226,13 +228,13 @@ class ModelRunner:
                     ctx.detokenizer.finalize()
                     final_segment = ctx.detokenizer.last_segment or ""
                     ctx.enqueue_event(
-                    self._build_response(
-                        ctx,
-                        token_id,
-                        logprobs,
-                        final_segment,
-                        finish_reason=finish_reason,
-                    )
+                        self._build_response(
+                            ctx,
+                            token_id,
+                            logprobs,
+                            final_segment,
+                            finish_reason=finish_reason,
+                        )
                     )
                     self.uid_to_context.pop(response.uid, None)
                     if ctx.state.slot_id is not None:
@@ -254,7 +256,9 @@ class ModelRunner:
 
     def debug_state(self) -> Dict[str, int]:
         active = getattr(self.generator, "active_batch", None)
-        batch_size = len(active.uids) if active is not None and hasattr(active, "uids") else 0
+        batch_size = (
+            len(active.uids) if active is not None and hasattr(active, "uids") else 0
+        )
         return {
             "generator_active": batch_size,
             "uid_count": len(self.uid_to_context),
@@ -302,7 +306,9 @@ class ModelRunner:
         ctx.detokenizer.add_token(token_id)
         return ctx.detokenizer.last_segment
 
-    def _evaluate_stop_conditions(self, ctx: SequenceContext, token_id: int) -> Optional[str]:
+    def _evaluate_stop_conditions(
+        self, ctx: SequenceContext, token_id: int
+    ) -> Optional[str]:
         eos = ctx.stopping_settings.get("eos_token_id", self.tokenizer.eos_token_id)
         if token_id == eos:
             return "stop"

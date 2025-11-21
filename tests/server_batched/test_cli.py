@@ -21,9 +21,7 @@ _CONFIG_PATH = (
     / "server_batched"
     / "config.py"
 )
-_SPEC = importlib.util.spec_from_file_location(
-    f"{PACKAGE_NAME}.config", _CONFIG_PATH
-)
+_SPEC = importlib.util.spec_from_file_location(f"{PACKAGE_NAME}.config", _CONFIG_PATH)
 CONFIG_MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = CONFIG_MODULE
 _SPEC.loader.exec_module(CONFIG_MODULE)

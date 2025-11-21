@@ -1048,7 +1048,9 @@ class BatchGenerator:
         num_active = len(batch) if batch else 0
         num_to_add = self.completion_batch_size - num_active
         while num_to_add > 0 and self.unprocessed_prompts:
-            take = min(self.prefill_batch_size, num_to_add, len(self.unprocessed_prompts))
+            take = min(
+                self.prefill_batch_size, num_to_add, len(self.unprocessed_prompts)
+            )
             prompts = self.unprocessed_prompts[:take]
             if not prompts:
                 break

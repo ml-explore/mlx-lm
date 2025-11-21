@@ -4,6 +4,7 @@
 import sys
 import types
 
+
 class _FakeArray(list):
     def tolist(self):
         return list(self)
@@ -28,7 +29,9 @@ def ensure_mlx_stub():
     core_module.default_device = lambda: None
     core_module.new_stream = lambda *_: object()
     core_module.logsumexp = lambda logits, axis=-1, keepdims=True: 0
-    core_module.zeros = lambda shape, dtype=None: [[0] * (shape[-1] if isinstance(shape, tuple) else 1)]
+    core_module.zeros = lambda shape, dtype=None: [
+        [0] * (shape[-1] if isinstance(shape, tuple) else 1)
+    ]
     core_module.argmax = lambda array, axis=-1: types.SimpleNamespace(item=lambda: 0)
     core_module.argpartition = lambda arr, kth, axis=-1: _FakeArray([0])
     core_module.argsort = lambda arr, axis=-1: _FakeArray([0])
@@ -164,7 +167,9 @@ def ensure_mlx_stub():
 
     if "mlx_lm.server_batched" not in sys.modules:
         subpkg = types.ModuleType("mlx_lm.server_batched")
-        subpkg.__path__ = [str(Path(__file__).resolve().parents[2] / "mlx_lm" / "server_batched")]
+        subpkg.__path__ = [
+            str(Path(__file__).resolve().parents[2] / "mlx_lm" / "server_batched")
+        ]
         from importlib.machinery import ModuleSpec
 
         spec = ModuleSpec(name="mlx_lm.server_batched", loader=None, is_package=True)

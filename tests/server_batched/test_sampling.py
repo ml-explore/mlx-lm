@@ -2,6 +2,7 @@
 # ABOUTME: Validates argmax selection and selected logprobs.
 
 import unittest
+
 import numpy as np
 
 from mlx_lm.server_batched.sampling import select_tokens_argmax, selected_logprobs
@@ -17,6 +18,7 @@ class SamplingTests(unittest.TestCase):
         logits = np.array([[0.0, 2.0], [1.0, 0.0]], dtype=np.float32)
         tokens = np.array([1, 0])
         logps = selected_logprobs(logits, tokens)
+
         # Compute manually via log-softmax
         def log_softmax(row):
             exps = np.exp(row - row.max())

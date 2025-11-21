@@ -8,7 +8,6 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 from ..generate import GenerationResponse
 
 
-
 def maybe_handle_continuous_batching(
     handler,
     *,
