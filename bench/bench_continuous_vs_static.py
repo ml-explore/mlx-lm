@@ -154,8 +154,11 @@ def run_continuous(model, tokenizer, prompts, max_tokens, lmbda):
         first_ns = None
         finish_ns = submit_ns
         final_tokens = 0
+        deadline = time.perf_counter() + 60.0  # guard against hung generators
         try:
             for response in generator:
+                if time.perf_counter() > deadline:
+                    break
                 if first_ns is None and response.generation_tokens > 0:
                     first_ns = time.perf_counter_ns()
                 final_tokens = response.generation_tokens
