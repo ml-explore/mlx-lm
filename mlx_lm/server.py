@@ -11,7 +11,7 @@ import uuid
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
@@ -32,7 +32,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import stream_generate
+from .generate import BatchGenerator, stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import load
@@ -355,6 +355,15 @@ class GenerationContext:
     prompt: List[int]
 
 
+@dataclass
+class Response:
+    text: str
+    token: int
+    logprob: float
+    finish_reason: Optional[str]
+    top_tokens: Optional[Tuple[int, float]]
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -444,34 +453,56 @@ class ResponseGenerator:
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
-    def _tokenize_chat(self, tokenizer, messages, tools=None, role_mapping=None):
-        if tokenizer.chat_template:
-            process_message_content(messages)
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tools,
-                add_generation_prompt=True,
-                **self.model_provider.cli_args.chat_template_args,
-            )
-        else:
-            prompt = convert_chat(messages, role_mapping)
-            prompt = tokenizer.encode(prompt)
+    def _tokenize(self, tokenizer, request):
+        if request.request_type == "chat":
+            messages = request.messages
+            tools = request.tools
+            role_mapping = request.role_mapping
 
-        return prompt
+            if tokenizer.chat_template:
+                process_message_content(messages)
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tools,
+                    add_generation_prompt=True,
+                    **self.model_provider.cli_args.chat_template_args,
+                )
+            else:
+                return tokenizer.encode(convert_chat(messages, role_mapping))
+        else:
+            return tokenizer.encode(request.prompt)
+
+    def _is_batchable(self, args):
+        if (
+            args.model.draft != "default_model"
+            or self.model_provider.cli_args.draft_model is not None
+        ):
+            return False
+        if args.logits.logit_bias is not None:
+            return False
+        if args.logits.repetition_penalty != 0:
+            return False
+        if args.logprobs > 0:
+            return False
+        if args.seed is not None:
+            return False
+
+        return True
 
     def _generate(self):
         current_model = None
         current_sampling = None
-        current_logits_proc = None
+        current_tokenizer = None
+        current_model_key = None
+        batch_generator = None
+        drain_batch = False
+        batch_results = {}
 
         unprocessed_requests = []
 
         def get_next_request():
-            nonlocal unprocessed_requests
-
             if unprocessed_requests:
-                r, *unprocessed_requests = unprocessed_requests
-                return r
+                return unprocessed_requests.pop()
             else:
                 try:
                     return self.requests.get_nowait()
@@ -479,9 +510,145 @@ class ResponseGenerator:
                     return None
 
         while True:
-            request = get_next_request()
+            request = None
+            if not drain_batch and len(batch_results) < 100:
+                request = get_next_request()
+
+            # We got a request
             if request is not None:
-                self._serve_single(request)
+                rqueue, request, args = request
+
+                is_batchable = self._is_batchable(args)
+
+                # Can it be added to the current batch?
+                if (
+                    batch_generator is not None
+                    and current_model == args.model
+                    and current_sampling == args.sampling
+                    and is_batchable
+                ):
+                    prompt = self._tokenize(current_tokenizer, request)
+                    ctx = GenerationContext(
+                        has_tool_calling=tokenizer.has_tool_calling,
+                        tool_call_start=tokenizer.tool_call_start,
+                        tool_call_end=tokenizer.tool_call_end,
+                        eos_token_id=tokenizer.eos_token_id,
+                        stop_token_sequences=[
+                            tokenizer.encode(stop_word, add_special_tokens=False)
+                            for stop_word in args.stop_words
+                        ],
+                        prompt=prompt,
+                    )
+                    rqueue.put(ctx)
+
+                    cache, rest = self.prompt_cache.fetch_nearest_cache(
+                        current_model_key, prompt
+                    )
+                    if cache is None:
+                        cache = make_prompt_cache(self.model_provider.model)
+
+                    (uid,) = batch_generator.insert(
+                        [rest], args.max_tokens, caches=[cache]
+                    )
+                    batch_results[uid] = {
+                        "cache_key": prompt[:],
+                        "rqueue": rqueue,
+                        "detokenizer": tokenizer.detokenizer,
+                    }
+                    continue
+
+                # We have no batch and it actually is not a batchable request
+                # so serve single sequence at a time.
+                elif batch_generator is None and not is_batchable:
+                    self._serve_single((rqueue, request, args))
+                    continue
+
+                # No batch so make one and serve this batched
+                elif batch_generator is None:
+                    try:
+                        model, tokenizer = self.model_provider.load(
+                            args.model.model, args.model.adapter, args.model.draft
+                        )
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+
+                    current_model = args.model
+                    current_sampling = args.sampling
+                    current_tokenizer = tokenizer
+                    current_model_key = self.model_provider.model_key
+                    batch_results = {}
+                    batch_generator = BatchGenerator(
+                        model,
+                        stop_tokens=tokenizer.eos_token_ids,
+                        sampler=make_sampler(
+                            args.sampling.temperature,
+                            top_p=args.sampling.top_p,
+                            top_k=args.sampling.top_k,
+                            min_p=args.sampling.min_p,
+                            xtc_probability=args.sampling.xtc_probability,
+                            xtc_threshold=args.sampling.xtc_threshold,
+                            xtc_special_tokens=[
+                                tokenizer.eos_token_id,
+                                tokenizer.encode("\n"),
+                            ],
+                        ),
+                    )
+                    unprocessed_requests.append((rqueue, request, args))
+                    continue
+
+                # We have a batch but this request cannot be added to the
+                # batch so drain it to process the request.
+                else:
+                    drain_batch = True
+                    unprocessed_requests.append((rqueue, request, args))
+                    continue
+
+            # No request so serve from the current batch
+            elif batch_generator is not None:
+                if len(batch_results) == 0:
+                    if drain_batch:
+                        current_model = None
+                        current_sampling = None
+                        current_tokenizer = None
+                        current_model_key = None
+                        batch_generator = None
+                        drain_batch = False
+                    continue
+
+                responses = batch_generator.next()
+                for r in responses:
+                    result = batch_results[r.uid]
+                    result["cache_key"].append(r.token)
+                    result["detokenizer"].add_token(r.token)
+
+                    top_tokens = None
+                    if args.logprobs > 0:
+                        sorted_indices = mx.argpartition(
+                            -gen.logprobs, kth=args.logprobs - 1
+                        )
+                        top_indices = sorted_indices[: args.logprobs]
+                        top_logprobs = gen.logprobs[top_indices]
+                        top_token_info = zip(
+                            top_indices.tolist(), top_logprobs.tolist()
+                        )
+                        top_tokens = tuple(top_token_info)
+                    result["rqueue"].put(
+                        Response(
+                            result["detokenizer"].last_segment,
+                            r.token,
+                            r.logprobs[r.token].item(),
+                            r.finish_reason,
+                            top_tokens,
+                        )
+                    )
+
+                    if r.finish_reason is not None:
+                        result["rqueue"].put(None)
+                        self.prompt_cache.insert_cache(
+                            current_model_key, result["cache_key"], r.prompt_cache
+                        )
+                        del batch_results[r.uid]
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -494,12 +661,7 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt
-            if request.request_type == "chat":
-                prompt = self._tokenize_chat(
-                    tokenizer, request.messages, request.tools, request.role_mapping
-                )
-            else:
-                prompt = tokenizer.encode(request.prompt)
+            prompt = self._tokenize(tokenizer, request)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -542,14 +704,13 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
-            cache_key = prompt[: len(prompt) - len(rest)]
+            cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
-            cache_key += rest
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -562,7 +723,25 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 # TODO: prompt progress callback
             ):
-                rqueue.put(gen)
+                top_tokens = None
+                if args.logprobs > 0:
+                    sorted_indices = mx.argpartition(
+                        -gen.logprobs, kth=args.logprobs - 1
+                    )
+                    top_indices = sorted_indices[: args.logprobs]
+                    top_logprobs = gen.logprobs[top_indices]
+                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
+                    top_tokens = tuple(top_token_info)
+
+                rqueue.put(
+                    Response(
+                        gen.text,
+                        gen.token,
+                        gen.logprobs[gen.token].item(),
+                        gen.finish_reason,
+                        top_tokens,
+                    )
+                )
                 cache_key.append(gen.token)
             rqueue.put(None)
 
@@ -971,15 +1150,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # Save the token and its logprob
             tokens.append(gen.token)
-            token_logprobs.append(gen.logprobs[gen.token].item())
+            token_logprobs.append(gen.logprob)
 
             # If requested save the k top logprobs
-            if args.logprobs > 0:
-                sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
-                top_indices = sorted_indices[: self.logprobs]
-                top_logprobs = logprobs[top_indices]
-                top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                top_tokens.append(tuple(top_token_info))
+            if gen.top_tokens is not None:
+                top_tokens.append(gen.top_tokens)
 
             # Check if we should stop early
             # TODO: This doesn't actually stop generation in the generation
@@ -990,8 +1165,8 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             if stop_condition.stop_met:
                 finish_reason = "stop"
-                tokens = tokens[: -stop_condition.trim_length]
-                text = text[: -stop_condition.trim_text_length]
+                tokens = tokens[: len(tokens) - stop_condition.trim_length]
+                text = text[: len(text) - stop_condition.trim_text_length]
                 segment = ""
                 break
 
@@ -1017,9 +1192,9 @@ class APIHandler(BaseHTTPRequestHandler):
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
-        logging.debug(f"Prompt: {gen.prompt_tps:.3f} tokens-per-sec")
-        logging.debug(f"Generation: {gen.generation_tps:.3f} tokens-per-sec")
-        logging.debug(f"Peak memory: {gen.peak_memory:.3f} GB")
+        # logging.debug(f"Prompt: {gen.prompt_tps:.3f} tokens-per-sec")
+        # logging.debug(f"Generation: {gen.generation_tps:.3f} tokens-per-sec")
+        # logging.debug(f"Peak memory: {gen.peak_memory:.3f} GB")
 
         if self.stream:
             response = self.generate_response(
@@ -1189,7 +1364,7 @@ def run(
     host: str,
     port: int,
     model_provider: ModelProvider,
-    server_class=HTTPServer,
+    server_class=ThreadingHTTPServer,
     handler_class=APIHandler,
 ):
     server_address = (host, port)
