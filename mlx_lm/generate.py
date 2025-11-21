@@ -1026,6 +1026,13 @@ class BatchGenerator:
         )
 
     def _step(self, input_tokens: mx.array, prompt_cache: List[Any]):
+        # Align caches to the current batch size before attention masks are built.
+        batch_size = input_tokens.shape[0]
+        for c in prompt_cache or []:
+            rebatch = getattr(c, "rebatch", None)
+            if rebatch is not None:
+                rebatch(batch_size)
+
         logits = self.model(input_tokens, cache=prompt_cache)
         logits = logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)

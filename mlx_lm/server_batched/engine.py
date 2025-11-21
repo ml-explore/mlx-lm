@@ -185,6 +185,33 @@ class ModelRunner:
 
         now = time.time_ns()
         missing_uids = []
+
+        if not responses and self.uid_to_context:
+            active_batch = getattr(self.generator, "active_batch", None)
+            if active_batch is None or getattr(active_batch, "uids", []):
+                for uid, ctx in list(self.uid_to_context.items()):
+                    if ctx.state.finished:
+                        self.uid_to_context.pop(uid, None)
+                        continue
+                    ctx.state.finished = True
+                    if hasattr(ctx, "detokenizer"):
+                        ctx.detokenizer.finalize()
+                        final_segment = ctx.detokenizer.last_segment or ""
+                    else:
+                        final_segment = ""
+                    logprobs = mx.zeros((1,))
+                    token_id = getattr(ctx, "last_token_id", 0)
+                    ctx.enqueue_event(
+                        self._build_response(
+                            ctx,
+                            token_id,
+                            logprobs,
+                            final_segment,
+                            finish_reason="stop",
+                        )
+                    )
+                    self.uid_to_context.pop(uid, None)
+
         for response in responses or ():
             ctx = self.uid_to_context.get(response.uid)
             if ctx is None or ctx.state.finished:
