@@ -256,9 +256,10 @@ class LRUPromptCache:
                     copy.deepcopy(cache_entry.prompt_cache),
                     1,
                 )
-                num_to_trim = len(result.longer) - result.common_prefix
+                prefix = min(len(tokens) - 1, result.common_prefix)
+                num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache_entry.prompt_cache, num_to_trim)
-                return cache_entry.prompt_cache, tokens[result.common_prefix :]
+                return cache_entry.prompt_cache, tokens[prefix:]
 
         return None, tokens
 
