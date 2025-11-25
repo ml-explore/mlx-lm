@@ -29,6 +29,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.txt
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -137,3 +138,8 @@ dmypy.json
 
 # .DS_Store files
 .DS_Store
+prompt_files/llama3_p1_out512.txt
+benchmark2.py
+benchmarking.py
+mlx_lm/mlx-commands
+test_ttft_optimized.py

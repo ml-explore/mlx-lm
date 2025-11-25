@@ -272,6 +272,7 @@ class GenerationResponse:
         generation_tokens (int): The number of generated tokens.
         generation_tps (float): The tokens-per-second for generation.
         peak_memory (float): The peak memory used so far in GB.
+        ttft (float): Time to first token in seconds.
         finish_reason (str): The reason the response is being sent: "length", "stop" or `None`
     """
 
@@ -284,6 +285,7 @@ class GenerationResponse:
     generation_tokens: int
     generation_tps: float
     peak_memory: float
+    ttft: float
     finish_reason: Optional[str] = None
 
 
@@ -695,11 +697,14 @@ def stream_generate(
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
+        ttft = 0.0
+        generation_tic = 0.0
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
+                ttft = prompt_time
+                generation_tic = time.perf_counter()
             if token in tokenizer.eos_token_ids:
                 break
 
@@ -715,8 +720,9 @@ def stream_generate(
                 prompt_tokens=prompt.size,
                 prompt_tps=prompt_tps,
                 generation_tokens=n + 1,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                generation_tps=(n + 1) / (time.perf_counter() - generation_tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
+                ttft=ttft,
                 finish_reason=None,
             )
 
@@ -729,8 +735,9 @@ def stream_generate(
             prompt_tokens=prompt.size,
             prompt_tps=prompt_tps,
             generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
+            generation_tps=(n + 1) / (time.perf_counter() - generation_tic),
             peak_memory=mx.get_peak_memory() / 1e9,
+            ttft=ttft,
             finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
         )
 
@@ -773,6 +780,7 @@ def generate(
             f"Prompt: {response.prompt_tokens} tokens, "
             f"{response.prompt_tps:.3f} tokens-per-sec"
         )
+        print(f"Time to first token: {response.ttft:.3f} sec")
         print(
             f"Generation: {response.generation_tokens} tokens, "
             f"{response.generation_tps:.3f} tokens-per-sec"
@@ -806,6 +814,7 @@ class BatchStats:
         generation_tps (float): The tokens-per-second for generation.
         generation_time (float): The time in seconds spent in generation .
         peak_memory (float): The peak memory used so far in GB.
+        ttft (float): Time to first token in seconds.
     """
 
     prompt_tokens: int = 0
@@ -815,6 +824,7 @@ class BatchStats:
     generation_tps: float = 0
     generation_time: float = 0
     peak_memory: float = 0
+    ttft: float = 0.0
 
 
 @dataclass
@@ -941,6 +951,8 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self._stats = BatchStats()
+        self._first_token_generated = False
+        self._start_time = None
 
         self.active_batch = None
 
@@ -1043,6 +1055,10 @@ class BatchGenerator:
     def _next(self):
         tic = time.perf_counter()
 
+        # Track start time for TTFT measurement
+        if self._start_time is None:
+            self._start_time = tic
+
         prompt_processing = False
         batch = self.active_batch
         num_active = len(batch) if batch else 0
@@ -1084,6 +1100,12 @@ class BatchGenerator:
 
         y = y.tolist()
         toc = time.perf_counter()
+
+        # Capture TTFT when first token is generated
+        if not self._first_token_generated:
+            self._stats.ttft = toc - self._start_time
+            self._first_token_generated = True
+
         if prompt_processing:
             self._stats.prompt_time += toc - tic
         else:

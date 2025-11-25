@@ -103,7 +103,7 @@ def main():
     rprint("Running warmup..")
     _bench()
 
-    report_keys = ["prompt_tps", "generation_tps", "peak_memory"]
+    report_keys = ["prompt_tps", "ttft", "generation_tps", "peak_memory"]
     rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
