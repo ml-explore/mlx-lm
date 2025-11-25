@@ -238,6 +238,11 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "compressed-tensors":
+            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     model.load_weights(list(weights.items()), strict=strict)
 

@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 
 
@@ -76,9 +77,8 @@ class Olmo3Attention(nn.Module):
         self.k_norm = nn.RMSNorm(
             args.num_key_value_heads * self.head_dim, eps=args.rms_norm_eps
         )
-        self.is_full = args.layer_types[layer_idx] == "full_attention"
 
-        if self.is_full:
+        if args.layer_types[layer_idx] != "full_attention":
             self.rope = nn.RoPE(self.head_dim, traditional=False, base=args.rope_theta)
         else:
             self.rope = initialize_rope(
@@ -224,3 +224,12 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def make_cache(self):
+        caches = []
+        for lt in self.model.layer_types:
+            if lt == "full_attention":
+                caches.append(KVCache())
+            else:
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+        return caches
