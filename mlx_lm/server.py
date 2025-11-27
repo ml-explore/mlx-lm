@@ -30,8 +30,11 @@ from typing import (
     Union,
 )
 
+
 # Use threaded HTTP handling so concurrent requests do not block each other.
-HTTPServer = ThreadingHTTPServer
+class HTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
