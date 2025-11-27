@@ -1,13 +1,18 @@
+# ABOUTME: Exercises HTTP API server endpoints and prompt cache behaviors.
+# ABOUTME: Verifies streaming/completions, model listing, and server threading traits.
 # Copyright © 2024 Apple Inc.
 
 import http
 import io
 import json
+import logging
+import socketserver
 import threading
 import unittest
 
 import requests
 
+from mlx_lm import server as server_mod
 from mlx_lm.server import APIHandler
 from mlx_lm.utils import load
 
@@ -54,7 +59,7 @@ class TestServer(unittest.TestCase):
     def setUpClass(cls):
         cls.model_provider = DummyModelProvider()
         cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
+        cls.httpd = server_mod.HTTPServer(
             cls.server_address,
             lambda *args, **kwargs: APIHandler(cls.model_provider, *args, **kwargs),
         )
@@ -68,6 +73,9 @@ class TestServer(unittest.TestCase):
         cls.httpd.shutdown()
         cls.httpd.server_close()
         cls.server_thread.join()
+
+    def test_server_is_threaded(self):
+        self.assertIsInstance(self.httpd, socketserver.ThreadingMixIn)
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -95,6 +103,25 @@ class TestServer(unittest.TestCase):
             first_text,
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
+
+    def test_request_summary_logging_includes_throughput(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+
+        post_data = {
+            "model": "default_model",
+            "prompt": "quick test",
+            "max_tokens": 4,
+            "temperature": 0.0,
+        }
+
+        with self.assertLogs(level="INFO") as captured:
+            response = requests.post(url, json=post_data)
+
+        self.assertEqual(response.status_code, 200)
+        all_logs = "\n".join(captured.output)
+        self.assertIn("request_id=", all_logs)
+        self.assertIn("prompt_tps", all_logs)
+        self.assertIn("generation_tps", all_logs)
 
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
@@ -200,7 +227,7 @@ class TestServerWithDraftModel(unittest.TestCase):
     def setUpClass(cls):
         cls.model_provider = DummyModelProvider(with_draft=True)
         cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
+        cls.httpd = server_mod.HTTPServer(
             cls.server_address,
             lambda *args, **kwargs: APIHandler(cls.model_provider, *args, **kwargs),
         )

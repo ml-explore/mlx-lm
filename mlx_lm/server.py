@@ -1,5 +1,6 @@
+# ABOUTME: Hosts the HTTP API surface for text and chat completions on mlx models.
+# ABOUTME: Parses requests, streams tokens, manages caching, and wires batching runtime.
 # Copyright © 2023-2024 Apple Inc.
-
 import argparse
 import atexit
 import json
@@ -12,8 +13,9 @@ import threading
 import time
 import uuid
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -28,11 +30,14 @@ from typing import (
     Union,
 )
 
+# Use threaded HTTP handling so concurrent requests do not block each other.
+HTTPServer = ThreadingHTTPServer
+
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import stream_generate
+from .generate import GenerationResponse, stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .server_batched.config import create_arg_parser
@@ -158,6 +163,7 @@ class PromptCache:
     cache: List[Any] = field(default_factory=list)
     model_key: Tuple[str, Optional[str]] = ("", None, None)
     tokens: List[int] = field(default_factory=list)
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 class ModelProvider:
@@ -168,6 +174,7 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        self.lock = threading.Lock()
 
         # Preload the default model if it is provided
         self.default_model_map = {}
@@ -177,68 +184,71 @@ class ModelProvider:
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self.default_model_map.get(model_path, model_path)
-        if self.model_key == (model_path, adapter_path, draft_model_path):
+        with self.lock:
+            model_path = self.default_model_map.get(model_path, model_path)
+            if self.model_key == (model_path, adapter_path, draft_model_path):
+                return self.model, self.tokenizer
+
+            # Remove the old model if it exists.
+            self.model = None
+            self.tokenizer = None
+            self.model_key = None
+            self.draft_model = None
+
+            # Building tokenizer_config
+            tokenizer_config = {
+                "trust_remote_code": True if self.cli_args.trust_remote_code else None
+            }
+            if self.cli_args.chat_template:
+                tokenizer_config["chat_template"] = self.cli_args.chat_template
+
+            if model_path == "default_model":
+                if self.cli_args.model is None:
+                    raise ValueError(
+                        "A model path has to be given as a CLI "
+                        "argument or in the HTTP request"
+                    )
+                adapter_path = adapter_path or self.cli_args.adapter_path
+                model, tokenizer = load(
+                    self.cli_args.model,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
+            else:
+                model, tokenizer = load(
+                    model_path,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
+
+            if self.cli_args.use_default_chat_template:
+                if tokenizer.chat_template is None:
+                    tokenizer.chat_template = tokenizer.default_chat_template
+
+            self.model_key = (model_path, adapter_path, draft_model_path)
+            self.model = model
+            self.tokenizer = tokenizer
+
+            def validate_draft_tokenizer(draft_tokenizer):
+                # Check if tokenizers are compatible
+                if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                    logging.warning(
+                        "Draft model tokenizer does not match model tokenizer. "
+                        "Speculative decoding may not work as expected."
+                    )
+
+            # Load draft model if specified
+            if (
+                draft_model_path == "default_model"
+                and self.cli_args.draft_model is not None
+            ):
+                self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+                validate_draft_tokenizer(draft_tokenizer)
+
+            elif draft_model_path is not None and draft_model_path != "default_model":
+                self.draft_model, draft_tokenizer = load(draft_model_path)
+                validate_draft_tokenizer(draft_tokenizer)
             return self.model, self.tokenizer
-
-        # Remove the old model if it exists.
-        self.model = None
-        self.tokenizer = None
-        self.model_key = None
-        self.draft_model = None
-
-        # Building tokenizer_config
-        tokenizer_config = {
-            "trust_remote_code": True if self.cli_args.trust_remote_code else None
-        }
-        if self.cli_args.chat_template:
-            tokenizer_config["chat_template"] = self.cli_args.chat_template
-
-        if model_path == "default_model":
-            if self.cli_args.model is None:
-                raise ValueError(
-                    "A model path has to be given as a CLI "
-                    "argument or in the HTTP request"
-                )
-            adapter_path = adapter_path or self.cli_args.adapter_path
-            model, tokenizer = load(
-                self.cli_args.model,
-                adapter_path=adapter_path,
-                tokenizer_config=tokenizer_config,
-            )
-        else:
-            model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
-            )
-
-        if self.cli_args.use_default_chat_template:
-            if tokenizer.chat_template is None:
-                tokenizer.chat_template = tokenizer.default_chat_template
-
-        self.model_key = (model_path, adapter_path, draft_model_path)
-        self.model = model
-        self.tokenizer = tokenizer
-
-        def validate_draft_tokenizer(draft_tokenizer):
-            # Check if tokenizers are compatible
-            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
-                logging.warning(
-                    "Draft model tokenizer does not match model tokenizer. "
-                    "Speculative decoding may not work as expected."
-                )
-
-        # Load draft model if specified
-        if (
-            draft_model_path == "default_model"
-            and self.cli_args.draft_model is not None
-        ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
-            validate_draft_tokenizer(draft_tokenizer)
-
-        elif draft_model_path is not None and draft_model_path != "default_model":
-            self.draft_model, draft_tokenizer = load(draft_model_path)
-            validate_draft_tokenizer(draft_tokenizer)
-        return self.model, self.tokenizer
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -620,14 +630,15 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt (List[int]): The tokenized new prompt which will populate the
                 reset cache.
         """
-        logging.debug(f"*** Resetting cache. ***")
-        self.prompt_cache.model_key = self.model_provider.model_key
-        self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
-        if self.model_provider.draft_model is not None:
-            self.prompt_cache.cache += make_prompt_cache(
-                self.model_provider.draft_model
-            )
-        self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
+        with self.prompt_cache.lock:
+            logging.debug(f"*** Resetting cache. ***")
+            self.prompt_cache.model_key = self.model_provider.model_key
+            self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
+            if self.model_provider.draft_model is not None:
+                self.prompt_cache.cache += make_prompt_cache(
+                    self.model_provider.draft_model
+                )
+            self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
 
     def get_prompt_cache(self, prompt):
         """
@@ -647,54 +658,55 @@ class APIHandler(BaseHTTPRequestHandler):
                        by the model. This will be the full prompt if the cache is
                        reset or cannot be effectively used.
         """
-        cache_len = len(self.prompt_cache.tokens)
-        prompt_len = len(prompt)
-        com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
+        with self.prompt_cache.lock:
+            cache_len = len(self.prompt_cache.tokens)
+            prompt_len = len(prompt)
+            com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
 
-        # Leave at least one token in the prompt
-        com_prefix_len = min(com_prefix_len, len(prompt) - 1)
+            # Leave at least one token in the prompt
+            com_prefix_len = min(com_prefix_len, len(prompt) - 1)
 
-        # Condition 1: Model changed or no common prefix at all. Reset cache.
-        if (
-            self.prompt_cache.model_key != self.model_provider.model_key
-            or com_prefix_len == 0
-        ):
-            self.reset_prompt_cache(prompt)
-
-        # Condition 2: Common prefix exists and matches cache length. Process suffix.
-        elif com_prefix_len == cache_len:
-            logging.debug(
-                f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
-            )
-            prompt = prompt[com_prefix_len:]
-            self.prompt_cache.tokens.extend(prompt)
-
-        # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
-        elif com_prefix_len < cache_len:
-            logging.debug(
-                f"*** Common prefix ({com_prefix_len}) shorter than cache ({cache_len}). Attempting trim. ***"
-            )
-
-            if can_trim_prompt_cache(self.prompt_cache.cache):
-                num_to_trim = cache_len - com_prefix_len
-                logging.debug(f"    Trimming {num_to_trim} tokens from cache.")
-                trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
-                self.prompt_cache.tokens = self.prompt_cache.tokens[:com_prefix_len]
-                prompt = prompt[com_prefix_len:]
-                self.prompt_cache.tokens.extend(prompt)
-            else:
-                logging.debug(f"    Cache cannot be trimmed. Resetting cache.")
+            # Condition 1: Model changed or no common prefix at all. Reset cache.
+            if (
+                self.prompt_cache.model_key != self.model_provider.model_key
+                or com_prefix_len == 0
+            ):
                 self.reset_prompt_cache(prompt)
 
-        # This case should logically not be reached if com_prefix_len <= cache_len
-        else:
-            logging.error(
-                f"Unexpected cache state: com_prefix_len ({com_prefix_len}) > cache_len ({cache_len}). Resetting cache."
-            )
-            self.reset_prompt_cache(prompt)
+            # Condition 2: Common prefix exists and matches cache length. Process suffix.
+            elif com_prefix_len == cache_len:
+                logging.debug(
+                    f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
+                )
+                prompt = prompt[com_prefix_len:]
+                self.prompt_cache.tokens.extend(prompt)
 
-        logging.debug(f"Returning {len(prompt)} tokens for processing.")
-        return prompt
+            # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
+            elif com_prefix_len < cache_len:
+                logging.debug(
+                    f"*** Common prefix ({com_prefix_len}) shorter than cache ({cache_len}). Attempting trim. ***"
+                )
+
+                if can_trim_prompt_cache(self.prompt_cache.cache):
+                    num_to_trim = cache_len - com_prefix_len
+                    logging.debug(f"    Trimming {num_to_trim} tokens from cache.")
+                    trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
+                    self.prompt_cache.tokens = self.prompt_cache.tokens[:com_prefix_len]
+                    prompt = prompt[com_prefix_len:]
+                    self.prompt_cache.tokens.extend(prompt)
+                else:
+                    logging.debug(f"    Cache cannot be trimmed. Resetting cache.")
+                    self.reset_prompt_cache(prompt)
+
+            # This case should logically not be reached if com_prefix_len <= cache_len
+            else:
+                logging.error(
+                    f"Unexpected cache state: com_prefix_len ({com_prefix_len}) > cache_len ({cache_len}). Resetting cache."
+                )
+                self.reset_prompt_cache(prompt)
+
+            logging.debug(f"Returning {len(prompt)} tokens for processing.")
+            return prompt
 
     def handle_completion(
         self,
@@ -761,167 +773,203 @@ class APIHandler(BaseHTTPRequestHandler):
         text = ""
         tic = time.perf_counter()
 
-        if batching_result is not None:
-            continuous_mode = True
-            _, token_generator = batching_result
-            prompt_for_usage = prompt_tokens
-            logits_processors = None
-        else:
-            continuous_mode = False
-            prompt_for_usage = self.get_prompt_cache(prompt_tokens)
-            sampler = make_sampler(**sampler_settings)
-            logits_processors = make_logits_processors(
-                self.logit_bias,
-                self.repetition_penalty,
-                self.repetition_context_size,
-            )
+        continuous_mode = batching_result is not None
+        cache_guard = nullcontext() if continuous_mode else self.prompt_cache.lock
 
-            def keepalive_callback(processed_tokens, total_tokens):
-                logging.info(
-                    f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-                )
-                if self.stream:
-                    try:
-                        self.wfile.write(
-                            f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                        )
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
-
-            token_generator = stream_generate(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                prompt=prompt_for_usage,
-                max_tokens=self.max_tokens,
-                sampler=sampler,
-                logits_processors=logits_processors,
-                prompt_cache=self.prompt_cache.cache,
-                draft_model=self.model_provider.draft_model,
-                num_draft_tokens=self.num_draft_tokens,
-                prompt_progress_callback=keepalive_callback,
-            )
-
-        if self.stream:
-            self.end_headers()
-            logging.debug("Starting stream:")
-        else:
-            logging.debug("Starting completion:")
-
-        for gen_response in token_generator:
-            logging.debug(gen_response.text)
-
-            if (
-                self.tokenizer.has_tool_calling
-                and gen_response.text == self.tokenizer.tool_call_start
-            ):
-                in_tool_call = True
-            elif in_tool_call:
-                if gen_response.text == self.tokenizer.tool_call_end:
-                    tool_calls.append(tool_text)
-                    tool_text = ""
-                    in_tool_call = False
-                else:
-                    tool_text += gen_response.text
+        with cache_guard:
+            if continuous_mode:
+                _, token_generator = batching_result
+                prompt_for_usage = prompt_tokens
+                logits_processors = None
             else:
-                text += gen_response.text
-                segment += gen_response.text
-            token = gen_response.token
-            logprobs = gen_response.logprobs
-            tokens.append(token)
-            if not continuous_mode:
-                self.prompt_cache.tokens.append(token)
+                prompt_for_usage = self.get_prompt_cache(prompt_tokens)
+                sampler = make_sampler(**sampler_settings)
+                logits_processors = make_logits_processors(
+                    self.logit_bias,
+                    self.repetition_penalty,
+                    self.repetition_context_size,
+                )
 
-            if self.logprobs > 0:
-                sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
-                top_indices = sorted_indices[: self.logprobs]
-                top_logprobs = logprobs[top_indices]
-                top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                top_tokens.append(tuple(top_token_info))
-
-            token_logprobs.append(logprobs[token].item())
-
-            stop_condition = stopping_criteria(
-                tokens, stop_id_sequences, self.tokenizer.eos_token_id
-            )
-            if stop_condition.stop_met:
-                finish_reason = "stop"
-                if stop_condition.trim_length:
-                    stop_sequence_suffix = self.tokenizer.decode(
-                        tokens[-stop_condition.trim_length :]
+                def keepalive_callback(processed_tokens, total_tokens):
+                    logging.info(
+                        f"Prompt processing progress: {processed_tokens}/{total_tokens}"
                     )
-                    text = text[: -len(stop_sequence_suffix)]
-                segment = ""
-                break
+                    if self.stream:
+                        try:
+                            self.wfile.write(
+                                f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                            )
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
 
-            if self.stream and not in_tool_call:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
-                if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in stop_id_sequences
-                    )
+                token_generator = stream_generate(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    prompt=prompt_for_usage,
+                    max_tokens=self.max_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    prompt_cache=self.prompt_cache.cache,
+                    draft_model=self.model_provider.draft_model,
+                    num_draft_tokens=self.num_draft_tokens,
+                    prompt_progress_callback=keepalive_callback,
+                )
+
+            if self.stream:
+                self.end_headers()
+                logging.debug("Starting stream:")
+            else:
+                logging.debug("Starting completion:")
+
+            gen_response: Optional[GenerationResponse] = None
+            for gen_response in token_generator:
+                logging.debug(gen_response.text)
+
+                if (
+                    self.tokenizer.has_tool_calling
+                    and gen_response.text == self.tokenizer.tool_call_start
                 ):
-                    continue
-                elif segment or tool_calls:
-                    response = self.generate_response(
-                        segment, None, tool_calls=tool_calls
-                    )
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                    self.wfile.flush()
-                    segment = ""
-                    tool_calls = []
-
-        if gen_response.finish_reason is not None:
-            finish_reason = gen_response.finish_reason
-
-        logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
-        logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
-        logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
-
-        if self.stream:
-            response = self.generate_response(
-                segment, finish_reason, tool_calls=tool_calls
-            )
-            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-            self.wfile.flush()
-            if self.stream_options is not None and self.stream_options["include_usage"]:
-                if continuous_mode:
-                    original_prompt_length = len(prompt_for_usage)
+                    in_tool_call = True
+                elif in_tool_call:
+                    if gen_response.text == self.tokenizer.tool_call_end:
+                        tool_calls.append(tool_text)
+                        tool_text = ""
+                        in_tool_call = False
+                    else:
+                        tool_text += gen_response.text
                 else:
-                    original_prompt_length = (
-                        len(self.prompt_cache.tokens)
-                        - len(tokens)
-                        + len(prompt_for_usage)
-                    )
-                response = self.completion_usage_response(
-                    original_prompt_length, len(tokens)
+                    text += gen_response.text
+                    segment += gen_response.text
+                token = gen_response.token
+                logprobs = gen_response.logprobs
+                tokens.append(token)
+                if not continuous_mode:
+                    self.prompt_cache.tokens.append(token)
+
+                if self.logprobs > 0:
+                    sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
+                    top_indices = sorted_indices[: self.logprobs]
+                    top_logprobs = logprobs[top_indices]
+                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
+                    top_tokens.append(tuple(top_token_info))
+
+                token_logprobs.append(logprobs[token].item())
+
+                stop_condition = stopping_criteria(
+                    tokens, stop_id_sequences, self.tokenizer.eos_token_id
+                )
+                if stop_condition.stop_met:
+                    finish_reason = "stop"
+                    if stop_condition.trim_length:
+                        stop_sequence_suffix = self.tokenizer.decode(
+                            tokens[-stop_condition.trim_length :]
+                        )
+                        text = text[: -len(stop_sequence_suffix)]
+                    segment = ""
+                    break
+
+                if self.stream and not in_tool_call:
+                    # If the end of tokens overlaps with a stop sequence, generate new
+                    # tokens until we know if the stop sequence is hit or not
+                    if any(
+                        (
+                            sequence_overlap(tokens, sequence)
+                            for sequence in stop_id_sequences
+                        )
+                    ):
+                        continue
+                    elif segment or tool_calls:
+                        response = self.generate_response(
+                            segment, None, tool_calls=tool_calls
+                        )
+                        self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                        self.wfile.flush()
+                        segment = ""
+                        tool_calls = []
+
+            if gen_response and gen_response.finish_reason is not None:
+                finish_reason = gen_response.finish_reason
+
+            if gen_response:
+                logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
+                logging.debug(
+                    f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec"
+                )
+                logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
+
+            if self.stream:
+                response = self.generate_response(
+                    segment, finish_reason, tool_calls=tool_calls
                 )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
-            self.wfile.write("data: [DONE]\n\n".encode())
-            self.wfile.flush()
-        else:
-            response = self.generate_response(
-                text,
-                finish_reason,
-                len(prompt),
-                len(tokens),
-                token_logprobs=token_logprobs,
-                top_tokens=top_tokens,
-                tokens=tokens,
-                tool_calls=tool_calls,
-            )
-            response_json = json.dumps(response).encode()
-            indent = "\t"  # Backslashes can't be inside of f-strings
-            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
+                if (
+                    self.stream_options is not None
+                    and self.stream_options["include_usage"]
+                ):
+                    if continuous_mode:
+                        original_prompt_length = len(prompt_for_usage)
+                    else:
+                        original_prompt_length = (
+                            len(self.prompt_cache.tokens)
+                            - len(tokens)
+                            + len(prompt_for_usage)
+                        )
+                    response = self.completion_usage_response(
+                        original_prompt_length, len(tokens)
+                    )
+                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+            else:
+                response = self.generate_response(
+                    text,
+                    finish_reason,
+                    len(prompt),
+                    len(tokens),
+                    token_logprobs=token_logprobs,
+                    top_tokens=top_tokens,
+                    tokens=tokens,
+                    tool_calls=tool_calls,
+                )
+                response_json = json.dumps(response).encode()
+                indent = "\t"  # Backslashes can't be inside of f-strings
+                logging.debug(
+                    f"Outgoing Response: {json.dumps(response, indent=indent)}"
+                )
 
-            # Send an additional Content-Length header when it is known
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json)
-            self.wfile.flush()
+                # Send an additional Content-Length header when it is known
+                self.send_header("Content-Length", str(len(response_json)))
+                self.end_headers()
+                self.wfile.write(response_json)
+                self.wfile.flush()
+
+            if gen_response:
+                prompt_tokens_count = getattr(
+                    gen_response, "prompt_tokens", len(prompt_tokens)
+                )
+                completion_tokens_count = getattr(
+                    gen_response, "generation_tokens", len(tokens)
+                )
+                total_ms = (time.perf_counter() - tic) * 1000
+                total_tokens = prompt_tokens_count + completion_tokens_count
+                total_tps = total_tokens / (total_ms / 1000) if total_ms > 0 else 0.0
+                logging.info(
+                    "request_id=%s model=%s prompt_tokens=%d completion_tokens=%d "
+                    "prompt_tps=%.3f generation_tps=%.3f total_tokens=%d total_tps=%.3f latency_ms=%.1f finish_reason=%s",
+                    self.request_id,
+                    self.requested_model,
+                    prompt_tokens_count,
+                    completion_tokens_count,
+                    getattr(gen_response, "prompt_tps", 0.0),
+                    getattr(gen_response, "generation_tps", 0.0),
+                    total_tokens,
+                    total_tps,
+                    total_ms,
+                    finish_reason,
+                )
 
     def completion_usage_response(
         self,
