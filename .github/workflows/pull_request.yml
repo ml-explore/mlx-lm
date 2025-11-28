@@ -1,0 +1,41 @@
+name: Build and Test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/head/main' }}
+
+jobs:
+  check_lint:
+    if: github.repository == 'ml-explore/mlx-lm'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: pre-commit/action@v3.0.1
+
+  mac_build_and_test:
+    if: github.repository == 'ml-explore/mlx-lm'
+    runs-on: [self-hosted, macos]
+    needs: check_lint
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-macos
+      - name: Install test dependencies
+        shell: bash -l {0}
+        run: |
+          pip install unittest-xml-reporting
+          pip install -e ".[test]"
+      - name: Run tests
+        shell: bash -l {0}
+        run: |
+          python -m xmlrunner discover -v tests -o test-results/

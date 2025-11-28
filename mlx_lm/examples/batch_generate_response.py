@@ -26,7 +26,26 @@ prompts = [
 ]
 
 # Set `verbose=True` to see generation statistics
-result = batch_generate(model, tokenizer, prompts, verbose=False, max_tokens=128)
+result = batch_generate(
+    model, tokenizer, prompts, verbose=False, return_prompt_caches=True
+)
+print(result.texts[-1])
 
-# The returned result contains texts completions in the same order as prompts
-print(result.texts[0])
+prompts = [
+    "Could you summarize that?",
+    "And what about the sea?",
+    "Try again?",
+    "And Mt Olympus?",
+]
+prompts = [
+    tokenizer.apply_chat_template(
+        [{"role": "user", "content": p}],
+        add_generation_prompt=True,
+    )
+    for p in prompts
+]
+
+result = batch_generate(
+    model, tokenizer, prompts, verbose=False, prompt_caches=result.caches
+)
+print(result.texts[-1])

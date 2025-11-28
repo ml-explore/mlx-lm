@@ -7,6 +7,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import (
     Any,
     Callable,
@@ -785,6 +786,12 @@ def _left_pad_prompts(prompts, max_length=None):
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
+def _right_pad_prompts(prompts, max_length=None):
+    if max_length is None:
+        max_length = max(len(p) for p in prompts)
+    return mx.array([p + [0] * (max_length - len(p)) for p in prompts])
+
+
 @dataclass
 class BatchStats:
     """
@@ -821,6 +828,7 @@ class BatchResponse:
 
     texts: List[str]
     stats: BatchStats
+    caches: Optional[List[List[Any]]]
 
 
 @dataclass
@@ -857,6 +865,9 @@ class Batch:
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
+    def extract_cache(self, idx):
+        return [c.extract(idx) for c in self.cache]
+
 
 def _make_cache(model, left_padding):
     """
@@ -886,6 +897,22 @@ def _make_cache(model, left_padding):
         return [BatchKVCache(left_padding) for _ in model.layers]
 
 
+def _merge_caches(caches):
+    batch_cache = []
+    for i in range(len(caches[0])):
+        cache = None
+        if isinstance(caches[0][i], KVCache):
+            cache = BatchKVCache.merge([c[i] for c in caches])
+        elif isinstance(caches[0][i], RotatingKVCache):
+            cache = BatchRotatingKVCache.merge([c[i] for c in caches])
+        else:
+            raise ValueError(
+                f"{type(caches[0][i])} does not yet support batching with history"
+            )
+        batch_cache.append(cache)
+    return batch_cache
+
+
 class BatchGenerator:
     @dataclass
     class Response:
@@ -893,6 +920,7 @@ class BatchGenerator:
         token: int
         logprobs: mx.array
         finish_reason: Optional[str]
+        prompt_cache: Callable[[], List[Any]]
 
     def __init__(
         self,
@@ -916,44 +944,85 @@ class BatchGenerator:
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
-        self.completion_batch_size = completion_batch_size
+        self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self._stats = BatchStats()
 
         self.active_batch = None
 
-    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+    def insert(
+        self, prompts, max_tokens: Union[List[int], int, None] = None, caches=None
+    ):
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
-        for p, m in zip(prompts, max_tokens):
-            self.unprocessed_prompts.append((self.uid_count, p, m))
+        if caches is None:
+            caches = [None] * len(prompts)
+        for i in range(len(prompts)):
+            if caches[i] is None:
+                caches[i] = cache.make_prompt_cache(self.model)
+
+        for p, m, c in zip(prompts, max_tokens, caches):
+            self.unprocessed_prompts.append((self.uid_count, p, m, c))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
         self.unprocessed_prompts = sorted(
-            self.unprocessed_prompts, key=lambda x: len(x[1])
+            self.unprocessed_prompts, key=lambda x: len(x[1]) + cache.cache_length(x[3])
         )
         return uids
 
     def _process_prompts(self, prompts):
-        uids, inputs, max_tokens = zip(*prompts)
+        uids, inputs, max_tokens, caches = zip(*prompts)
+
+        cache_lengths = [cache.cache_length(c) for c in caches]
+        max_cache_length = max(cache_lengths)
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
-        batch_size = self.prefill_batch_size
+        padding = [max_length - l for l in lengths]
+
         self._stats.prompt_tokens += sum(lengths)
-        left_padding = [max_length - l for l in lengths]
-        inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        prompt_cache = _make_cache(self.model, left_padding)
+        # New prompts so
+        #   1. Left-pad the inputs
+        #   2. Process
+        if max_cache_length == 0:
+            inputs = _left_pad_prompts(inputs, max_length=max_length)
+            prompt_cache = _make_cache(self.model, padding)
 
-        while inputs.shape[1] > 1:
-            n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-            self.model(inputs[:, :n_to_process], cache=prompt_cache)
+            while inputs.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                inputs = inputs[:, n_to_process:]
+                mx.clear_cache()
+
+        # Further prompt processing so we need to
+        #   1. Merge the KV caches and prepare for right padded prompts
+        #   2. Right pad the inputs
+        #   2. Process
+        #   3. Finalize the KV caches so they are left padded again
+        else:
+            last_inputs = mx.array([p[-1:] for p in inputs])
+            inputs = _right_pad_prompts(inputs, max_length=max_length)
+            prompt_cache = _merge_caches(caches)
+
+            for c in prompt_cache:
+                c.prepare(lengths=lengths, right_padding=padding)
+
+            while inputs.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                inputs = inputs[:, n_to_process:]
+                mx.clear_cache()
+
+            for c in prompt_cache:
+                c.finalize()
             mx.eval([c.state for c in prompt_cache])
-            inputs = inputs[:, n_to_process:]
             mx.clear_cache()
+            inputs = last_inputs
 
         y, logprobs = self._step(inputs, prompt_cache)
         mx.async_eval(y, logprobs)
@@ -1065,6 +1134,7 @@ class BatchGenerator:
         for e, (t, uid, num_tok, max_tok) in enumerate(
             zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
         ):
+            cache = None
             num_tok += 1
             batch.num_tokens[e] = num_tok
             if t in self.stop_tokens:
@@ -1076,7 +1146,9 @@ class BatchGenerator:
             else:
                 finish_reason = None
                 keep_idx.append(e)
-            responses.append(self.Response(uid, t, logprobs[e], finish_reason))
+            if finish_reason is not None:
+                cache = batch.extract_cache(e)
+            responses.append(self.Response(uid, t, logprobs[e], finish_reason, cache))
 
         # Remove any finished completions
         if len(end_idx):
@@ -1097,9 +1169,11 @@ def batch_generate(
     model,
     tokenizer,
     prompts: List[int],
+    prompt_caches: Optional[List[List[Any]]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    return_prompt_caches: bool = False,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1109,12 +1183,17 @@ def batch_generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (List[List[int]]): The input prompts.
+       prompt_caches (List[List[Any]], optional): Pre-computed prompt-caches
+          for each input prompt. Note, unlike ``generate_step``, the caches
+          won't be updated in-place.
        verbose (bool): If ``True``, print tokens and timing information.
           Default: ``False``.
        max_tokens (Union[int, List[int]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
           A list of functions that take tokens and logits and return the processed logits. Default: ``None``.
+       return_prompt_caches (bool): Return the prompt caches in the batch
+          responses. Default: ``False``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
@@ -1131,16 +1210,20 @@ def batch_generate(
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
     with wired_limit(model, [generation_stream]):
-        uids = gen.insert(prompts, max_tokens)
+        uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
         results = {uid: [] for uid in uids}
+        prompt_caches = {}
         while responses := gen.next():
             for r in responses:
-                if verbose and r.finish_reason != None:
-                    fin += 1
-                    print(
-                        f"[batch_generate] Finished processing {fin}/{num_samples} ...",
-                        end="\r",
-                    )
+                if r.finish_reason is not None:
+                    if return_prompt_caches:
+                        prompt_caches[r.uid] = r.prompt_cache
+                    if verbose:
+                        fin += 1
+                        print(
+                            f"[batch_generate] Finished processing {fin}/{num_samples} ...",
+                            end="\r",
+                        )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
     if verbose:
@@ -1149,6 +1232,7 @@ def batch_generate(
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     stats = gen.stats()
+    caches = [prompt_caches[uid] for uid in uids] if return_prompt_caches else None
     if verbose:
         print(
             f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
@@ -1158,7 +1242,7 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return BatchResponse(texts, stats)
+    return BatchResponse(texts, stats, caches)
 
 
 def main():

@@ -1,0 +1,16 @@
+name: 'Setup macOS Environment'
+description: 'Install dependencies for macOS'
+
+inputs:
+  python-version:
+    description: 'Python version to use'
+    required: false
+    default: '3.10'
+
+runs:
+  using: "composite"
+  steps:
+    - uses: conda-incubator/setup-miniconda@v3
+      with:
+        miniconda-version: "latest"
+        python-version: ${{ inputs.python-version }}
