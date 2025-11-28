@@ -8,6 +8,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
+    batch_generate,
     generate,
     stream_generate,
 )
@@ -434,6 +435,50 @@ class TestGenerate(unittest.TestCase):
 
             if rotating:
                 del self.model.make_cache
+
+    def test_batch_generate_with_logits_processors(self):
+        """Test that batch_generate with logits_processors produces correct results."""
+        logit_bias = {0: 2000.0, 1: -20.0}
+        processors = make_logits_processors(logit_bias)
+
+        # Batch generation with processor
+        batch_result = batch_generate(
+            self.model,
+            self.tokenizer,
+            [self.tokenizer.encode("hello")],
+            max_tokens=5,
+            logits_processors=processors,
+            verbose=False,
+        )
+
+        # Should produce valid output
+        self.assertEqual(len(batch_result.texts), 1)
+        self.assertGreater(len(batch_result.texts[0]), 0)
+
+    def test_batch_generate_processors_multi_sample(self):
+        """Test logits_processors with multiple samples in batch."""
+        logit_bias = {0: 1000.0}
+        processors = make_logits_processors(logit_bias)
+
+        prompts = [
+            self.tokenizer.encode("hello"),
+            self.tokenizer.encode("world"),
+            self.tokenizer.encode("test"),
+        ]
+
+        batch_result = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=3,
+            logits_processors=processors,
+            verbose=False,
+        )
+
+        # Should produce output for all prompts
+        self.assertEqual(len(batch_result.texts), 3)
+        for text in batch_result.texts:
+            self.assertGreater(len(text), 0)
 
 
 if __name__ == "__main__":
