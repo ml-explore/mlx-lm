@@ -1,4 +1,4 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 import math
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KCache, KVCache
+from .cache import CacheList, KVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -98,7 +98,7 @@ class Indexer(nn.Module):
         k_pe = self.rope(k_pe, offset=offset)
         k = mx.concatenate([k_pe, k_nope], axis=-1)
         if cache is not None:
-            k = cache.update_and_fetch(k)
+            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
         scores = q @ k.swapaxes(-1, -2)
@@ -520,4 +520,4 @@ class Model(nn.Module):
         return predicate
 
     def make_cache(self):
-        return [CacheList(KVCache(), KCache()) for _ in self.layers]
+        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
