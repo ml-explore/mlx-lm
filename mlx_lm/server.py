@@ -18,6 +18,7 @@ from queue import Queue
 from threading import Condition, Lock, Thread
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -354,6 +355,11 @@ class GenerationContext:
     stop_token_sequences: List[List[int]]
     prompt: List[int]
 
+    _should_stop: bool = False
+
+    def stop(self):
+        self._should_stop = True
+
 
 @dataclass
 class Response:
@@ -509,9 +515,14 @@ class ResponseGenerator:
                 except QueueEmpty:
                     return None
 
+        def progress_callback(info):
+            for uid, processed, total in info:
+                if uid in batch_results:
+                    batch_results[uid]["rqueue"].put((min(processed, total), total))
+
         while True:
             request = None
-            if not drain_batch and len(batch_results) < 100:
+            if not drain_batch:
                 request = get_next_request()
 
             # We got a request
@@ -551,6 +562,7 @@ class ResponseGenerator:
                         [rest], args.max_tokens, caches=[cache]
                     )
                     batch_results[uid] = {
+                        "ctx": ctx,
                         "cache_key": prompt[:],
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
@@ -593,6 +605,7 @@ class ResponseGenerator:
                                 tokenizer.encode("\n"),
                             ],
                         ),
+                        prompt_progress_callback=progress_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -616,42 +629,62 @@ class ResponseGenerator:
                         drain_batch = False
                     continue
 
-                responses = batch_generator.next()
-                for r in responses:
-                    result = batch_results[r.uid]
-                    result["cache_key"].append(r.token)
-                    result["detokenizer"].add_token(r.token)
+                uids_to_remove = []
+                time_budget = 0.5
+                start = time.time()
+                while True:
+                    if time.time() - start > time_budget:
+                        break
 
-                    top_tokens = None
-                    if args.logprobs > 0:
-                        sorted_indices = mx.argpartition(
-                            -gen.logprobs, kth=args.logprobs - 1
-                        )
-                        top_indices = sorted_indices[: args.logprobs]
-                        top_logprobs = gen.logprobs[top_indices]
-                        top_token_info = zip(
-                            top_indices.tolist(), top_logprobs.tolist()
-                        )
-                        top_tokens = tuple(top_token_info)
-                    result["rqueue"].put(
-                        Response(
-                            result["detokenizer"].last_segment,
-                            r.token,
-                            r.logprobs[r.token].item(),
-                            r.finish_reason,
-                            top_tokens,
-                        )
-                    )
+                    responses = batch_generator.next()
+                    if not responses:
+                        break
 
-                    if r.finish_reason is not None:
-                        result["rqueue"].put(None)
-                        self.prompt_cache.insert_cache(
-                            current_model_key, result["cache_key"], r.prompt_cache
+                    for r in responses:
+                        result = batch_results[r.uid]
+                        result["cache_key"].append(r.token)
+                        result["detokenizer"].add_token(r.token)
+
+                        top_tokens = None
+                        if args.logprobs > 0:
+                            sorted_indices = mx.argpartition(
+                                -gen.logprobs, kth=args.logprobs - 1
+                            )
+                            top_indices = sorted_indices[: args.logprobs]
+                            top_logprobs = gen.logprobs[top_indices]
+                            top_token_info = zip(
+                                top_indices.tolist(), top_logprobs.tolist()
+                            )
+                            top_tokens = tuple(top_token_info)
+                        result["rqueue"].put(
+                            Response(
+                                result["detokenizer"].last_segment,
+                                r.token,
+                                r.logprobs[r.token].item(),
+                                r.finish_reason,
+                                top_tokens,
+                            )
                         )
-                        del batch_results[r.uid]
+
+                        if r.finish_reason is not None:
+                            result["rqueue"].put(None)
+                            self.prompt_cache.insert_cache(
+                                current_model_key, result["cache_key"], r.prompt_cache
+                            )
+                            del batch_results[r.uid]
+
+                        if result["ctx"]._should_stop:
+                            uids_to_remove.append(r.uid)
+
+                    if uids_to_remove:
+                        batch_generator.remove(uids_to_remove)
 
     def _serve_single(self, request):
         rqueue, request, args = request
+
+        # Define the progress callback
+        def progress(tokens_processed, tokens_total):
+            rqueue.put((tokens_processed, tokens_total))
 
         try:
             # Load the model and tokenizer
@@ -721,7 +754,7 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
-                # TODO: prompt progress callback
+                prompt_progress_callback=progress,
             ):
                 top_tokens = None
                 if args.logprobs > 0:
@@ -743,6 +776,10 @@ class ResponseGenerator:
                     )
                 )
                 cache_key.append(gen.token)
+
+                if ctx._should_stop:
+                    break
+
             rqueue.put(None)
 
             # Save the KV cache again
@@ -757,6 +794,7 @@ class ResponseGenerator:
         self,
         request: CompletionRequest,
         generation_args: GenerationArguments,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         response_queue = Queue()
         self.requests.put((response_queue, request, generation_args))
@@ -768,6 +806,10 @@ class ResponseGenerator:
                     break
                 if isinstance(response, Exception):
                     raise response
+                if isinstance(response, tuple):
+                    if progress_callback is not None:
+                        progress_callback(*response)
+                    continue
                 yield response
 
         ctx = response_queue.get()
@@ -1094,9 +1136,29 @@ class APIHandler(BaseHTTPRequestHandler):
             seed=self.seed,
         )
 
+        # Create keepalive callback to send SSE comments during long prompt processing
+        def keepalive_callback(processed_tokens, total_tokens):
+            logging.info(
+                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+            )
+            if self.stream:
+                try:
+                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
+                    self.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # Client disconnected, ignore
+                    pass
+
         # Create the token generator
         try:
-            ctx, response = self.response_generator.generate(request, args)
+            ctx, response = self.response_generator.generate(
+                request,
+                args,
+                progress_callback=keepalive_callback,
+            )
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
@@ -1157,14 +1219,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 top_tokens.append(gen.top_tokens)
 
             # Check if we should stop early
-            # TODO: This doesn't actually stop generation in the generation
-            #       thread we should probably have a way to do that via the ctx
-            #       object
             stop_condition = stopping_criteria(
                 tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id
             )
             if stop_condition.stop_met:
                 finish_reason = "stop"
+                ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
                 text = text[: len(text) - stop_condition.trim_text_length]
                 segment = ""
