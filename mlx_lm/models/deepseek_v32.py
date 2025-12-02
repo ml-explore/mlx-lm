@@ -129,8 +129,58 @@ class DeepseekV3YarnRotaryEmbedding(nn.Module):
         )
 
 
-class Indexer(nn.Module):
+class IndexerCache:
+    """
+    Cache for the Indexer module, following the MLX KVCache pattern.
+    Uses efficient in-place slice assignment with pre-allocated buffers.
+    """
+    step = 256
 
+    def __init__(self):
+        self.keys = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys: mx.array) -> mx.array:
+        """
+        Update the key cache and return all keys up to current position.
+        
+        Args:
+            keys: New keys of shape (B, L, head_dim)
+            
+        Returns:
+            All cached keys of shape (B, offset + L, head_dim)
+        """
+        prev = self.offset
+        B, L, head_dim = keys.shape
+        
+        if self.keys is None or (prev + L) > self.keys.shape[1]:
+            n_steps = (self.step + L - 1) // self.step
+            k_shape = (B, n_steps * self.step, head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[:, :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=1)
+            else:
+                self.keys = new_k
+
+        self.offset += L
+        self.keys[:, prev:self.offset, :] = keys
+        return self.keys[:, :self.offset, :]
+
+    def reset(self):
+        """Reset the cache."""
+        self.keys = None
+        self.offset = 0
+
+
+class Indexer(nn.Module):
+    """
+    Indexer module for selecting top-k positions in attention.
+    This implements a fast attention indexing mechanism.
+    
+    The indexer maintains its own cache of keys stored on the main cache object.
+    """
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -140,16 +190,14 @@ class Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
         self.q_lora_rank = config.q_lora_rank
-
-        self.wq_b = nn.Linear(
-            self.q_lora_rank, self.num_heads * self.head_dim, bias=False
-        )
+        
+        self.wq_b = nn.Linear(self.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-
-        self.softmax_scale = self.head_dim**-0.5
-
+        
+        self.softmax_scale = self.head_dim ** -0.5
+        
         # Use standard RoPE for indexer (non-interleaved in PyTorch version)
         self.rope = nn.RoPE(
             dims=self.rope_head_dim,
@@ -161,65 +209,86 @@ class Indexer(nn.Module):
         self,
         x: mx.array,
         qr: mx.array,
+        offset: int = 0,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
-
-        offset = cache.offset if cache is not None else 0
-
+        
         # Query projection
         q = self.wq_b(qr)
         q = q.reshape(B, L, self.num_heads, self.head_dim)
         q_pe, q_nope = mx.split(q, [self.rope_head_dim], axis=-1)
-
+        
         # Apply RoPE to query (non-interleaved)
         q_pe = self.rope(q_pe, offset)
-
+        
         q = mx.concatenate([q_pe, q_nope], axis=-1)
-
-        # Key projection
+        
+        # Key projection for current input
         k = self.wk(x)
         k = self.k_norm(k)
         k_pe, k_nope = mx.split(k, [self.rope_head_dim], axis=-1)
-
+        
         # Apply RoPE to key (non-interleaved)
         k_pe_expanded = k_pe.reshape(B, L, 1, self.rope_head_dim)
         k_pe_expanded = self.rope(k_pe_expanded, offset)
         k_pe = k_pe_expanded.reshape(B, L, self.rope_head_dim)
-
+        
         k = mx.concatenate([k_pe, k_nope], axis=-1)
-
-        keys = k
-
+        
+        # Handle indexer's own cache (stored on main cache object)
+        if cache is not None:
+            # Initialize indexer cache if not present
+            if not hasattr(cache, 'indexer_cache') or cache.indexer_cache is None:
+                cache.indexer_cache = IndexerCache()
+            
+            # Update and fetch keys using efficient cache pattern
+            keys = cache.indexer_cache.update_and_fetch(k)
+        else:
+            keys = k
+        
         # Compute attention weights for indexing
-        # Shape: (B, L, num_heads, head_dim)
+        # Formula from paper: I_{t,s} = sum_j w^I_{t,j} * ReLU(q^I_{t,j} * k^I_s)
         q = q.transpose(0, 2, 1, 3)  # (B, num_heads, L, head_dim)
-
-        # Compute weights projection
-        weights = self.weights_proj(x)  # (B, L, num_heads)
-        weights = weights * (self.num_heads**-0.5)
-
-        # Compute index scores: (B, num_heads, L, seq_len)
+        
+        # Compute per-head weights: (B, L, num_heads)
+        # Source: weights = self.weights_proj(x) * self.n_heads ** -0.5 * self.softmax_scale
+        weights = self.weights_proj(x)
+        weights = weights * (self.num_heads ** -0.5) * self.softmax_scale
+        # Reshape for broadcasting: (B, num_heads, L, 1)
+        weights = weights.transpose(0, 2, 1)[:, :, :, None]
+        
+        # Compute q·k for each head: (B, num_heads, L, seq_len)
         keys_expanded = keys[:, None, :, :]  # (B, 1, seq_len, head_dim)
-        index_scores = (q @ keys_expanded.transpose(0, 1, 3, 2)) * self.softmax_scale
-
-        # Apply weights
-        index_scores = index_scores * weights[:, None, :, None]
-
-        # Average over query positions and heads
-        index_scores = index_scores.mean(axis=(1, 2))  # (B, seq_len)
-
-        # Apply mask if provided
+        qk_scores = q @ keys_expanded.transpose(0, 1, 3, 2)
+        
+        # Apply ReLU activation as per the paper
+        qk_scores = mx.maximum(qk_scores, 0)
+        
+        # Apply per-head weights and sum over heads (not mean)
+        # I_{t,s} = sum_j w_{t,j} * ReLU(q_{t,j} * k_s)
+        index_scores = (qk_scores * weights).sum(axis=1)  # (B, L, seq_len)
+        
+        # Apply causal mask to scores before selecting top-k
+        # This ensures we don't select future positions during prefill
         if mask is not None:
-            # Mask should be (B, L, seq_len) or broadcastable
-            index_scores = index_scores + mask
-
-        # Select top-k indices
+            # mask is boolean (True = can attend, False = cannot)
+            # Convert to additive mask: True -> 0, False -> -inf
+            if mask.dtype == mx.bool_:
+                causal_mask = mx.where(mask, 0.0, float("-inf"))
+            else:
+                causal_mask = mask
+            index_scores = index_scores + causal_mask
+        
+        index_scores_for_topk = index_scores[:, -1, :]  # (B, seq_len)
+        
+    
         seq_len = keys.shape[1]
-        k = min(self.index_topk, seq_len)
-        topk_indices = mx.argpartition(-index_scores, kth=k - 1, axis=-1)[..., :k]
+        topk = min(self.index_topk, seq_len)
+        topk_indices = mx.argpartition(-index_scores_for_topk, kth=topk-1, axis=-1)[..., :topk]
 
+        
         return topk_indices
 
 
@@ -304,7 +373,7 @@ class DeepseekV3Attention(nn.Module):
                 base=self.rope_theta,
                 traditional=True,
             )
-
+        
         # Initialize indexer if enabled
         if self.use_indexer:
             self.indexer = Indexer(config)
@@ -316,6 +385,9 @@ class DeepseekV3Attention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
+        
+        # Save offset before cache update for indexer (must use same offset as main attention)
+        offset = cache.offset if cache is not None else 0
 
         if self.q_lora_rank is None:
             q = self.q_proj(x)
@@ -335,8 +407,8 @@ class DeepseekV3Attention(nn.Module):
         k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
 
         if cache is not None:
-            q_pe = self.rope(q_pe, cache.offset)
-            k_pe = self.rope(k_pe, cache.offset)
+            q_pe = self.rope(q_pe, offset)
+            k_pe = self.rope(k_pe, offset)
             k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
             keys, values = cache.update_and_fetch(
                 mx.concatenate([k_nope, k_pe], axis=-1), values
@@ -349,36 +421,46 @@ class DeepseekV3Attention(nn.Module):
 
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
 
-        index_mask = None
-        if self.use_indexer and qr is not None and mask is not None and L > 1:
+        final_mask = mask
+        seq_len = keys.shape[2]
+        
+        # Always update the indexer cache to keep it in sync with the main cache
+        # But only apply the index mask when seq_len > index_topk
+        if self.use_indexer and qr is not None and cache is not None:
+            # Update indexer cache (must happen every call to stay in sync)
+            topk_indices = self.indexer(x, qr, offset, mask, cache)  # (B, topk)
+            
+            # Only apply index mask when we have more keys than topk threshold
+            if seq_len > self.config.index_topk:
+                # Create index mask using vectorized scatter
+                # Start with all -inf, then set selected positions to 0
+                index_mask = mx.full((B, seq_len), float("-inf")).astype(keys.dtype)
+                
+                # Use put_along_axis to set selected indices to 0
+                zeros = mx.zeros(topk_indices.shape, dtype=index_mask.dtype)
+                index_mask = mx.put_along_axis(index_mask, topk_indices, zeros, axis=-1)
+                
+                # Reshape for attention: (B, 1, 1, seq_len) to broadcast over heads and query positions
+                index_mask = index_mask[:, None, None, :]
+                
+                # Combine with original mask (for causal attention during prefill)
+                if mask is not None:
+                    # mask may be boolean (True = can attend) or float (-inf = cannot attend)
+                    if mask.dtype == mx.bool_:
+                        causal_float_mask = mx.where(mask, 0.0, float("-inf"))
+                    else:
+                        causal_float_mask = mask
+                    final_mask = causal_float_mask + index_mask
+                else:
+                    # mask is None (decode), just use index_mask
+                    final_mask = index_mask
 
-            topk_indices = self.indexer(x, qr, mask, cache)
 
-            # Create index mask: set non-selected positions to -inf
-            seq_len = keys.shape[2]
-            index_mask = mx.full((B, L, seq_len), float("-inf"))
-
-            # Scatter zero values at top-k positions
-            # This is a simplified approach; in practice, you'd need a more efficient scatter
-            for b in range(B):
-                for i in range(L):
-                    indices = topk_indices[b]
-                    index_mask[b, i, indices] = 0.0
-
-            # Combine with original mask
-            if mask is not None:
-                index_mask = index_mask + mask.reshape(B, L, seq_len)
-
-            # Reshape for attention
-            index_mask = index_mask[:, None, :, :]  # (B, 1, L, seq_len)
+                if final_mask is not None and final_mask.dtype != values.dtype:
+                    final_mask = final_mask.astype(values.dtype)
 
         output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=index_mask if index_mask is not None else mask,
+            queries, keys, values, cache=cache, scale=self.scale, mask=final_mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -546,7 +628,7 @@ class DeepseekV3Model(PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(h, cache[0], return_array=True)
 
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
