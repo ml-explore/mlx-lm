@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
-from . import llama
+from . import llama, ministral3
 from .base import BaseModelArgs
 
 
@@ -17,7 +17,8 @@ class ModelArgs(BaseModelArgs):
     text_config: dict
 
     def __post_init__(self):
-        self.text_config["tie_word_embeddings"] = False
+        if "tie_word_embeddings" not in self.text_config:
+            self.text_config["tie_word_embeddings"] = False
 
 
 class Model(nn.Module):
@@ -25,7 +26,14 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.language_model = llama.Model(llama.ModelArgs.from_dict(args.text_config))
+        if args.text_config.get("model_type") == "ministral3":
+            self.language_model = ministral3.Model(
+                ministral3.ModelArgs.from_dict(args.text_config)
+            )
+        else:
+            self.language_model = llama.Model(
+                llama.ModelArgs.from_dict(args.text_config)
+            )
 
     def __call__(
         self,
@@ -41,6 +49,8 @@ class Model(nn.Module):
         weights = tree_unflatten(list(weights.items()))
         weights.pop("vision_tower", None)
         weights.pop("multi_modal_projector", None)
+        lm_weights = dict(tree_flatten(weights["language_model"]))
+        weights["language_model"] = self.language_model.sanitize(lm_weights)
         return dict(tree_flatten(weights))
 
     @property
