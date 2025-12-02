@@ -17,7 +17,7 @@ class ModelArgs(BaseModelArgs):
     text_config: dict
 
     def __post_init__(self):
-        self.text_config["tie_word_embeddings"] = False
+        self.text_config["tie_word_embeddings"] = True
 
 
 class Model(nn.Module):
