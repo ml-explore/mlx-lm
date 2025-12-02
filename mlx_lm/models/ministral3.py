@@ -23,9 +23,7 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
     num_key_value_heads: Optional[int] = None
-    rope_theta: float = 10000
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_parameters: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
     layer_types: Optional[List[str]] = None
     sliding_window: Optional[int] = None
@@ -36,6 +34,15 @@ class ModelArgs(BaseModelArgs):
 
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
+
+
+def _get_llama_4_attn_scale(
+    start: int, stop: int, beta: float, max_position_embeddings: int
+):
+    scaling = 1 + beta * mx.log(
+        1 + mx.floor(mx.arange(start, stop) / max_position_embeddings)
+    )
+    return scaling[:, None]
 
 
 class Attention(nn.Module):
@@ -57,15 +64,16 @@ class Attention(nn.Module):
 
         self.rope = initialize_rope(
             self.head_dim,
-            args.rope_theta,
-            args.rope_traditional,
-            args.rope_scaling,
+            args.rope_parameters["rope_theta"],
+            False,
+            args.rope_parameters,
             args.max_position_embeddings,
         )
 
     def __call__(
         self,
         x: mx.array,
+        attn_scale: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
@@ -78,14 +86,16 @@ class Attention(nn.Module):
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
+        offset = 0
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            offset = cache.offset
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
-
+        queries = queries * attn_scale
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
@@ -125,10 +135,11 @@ class TransformerBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        attn_scale: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), attn_scale, mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -169,6 +180,9 @@ class LanguageModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
+            offset = 0
+        else:
+            offset = cache[0].offset
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         if self.swa_idx is not None:
@@ -176,9 +190,16 @@ class LanguageModel(nn.Module):
                 h, cache[self.swa_idx], window_size=self.sliding_window
             )
 
+        attn_scale = _get_llama_4_attn_scale(
+            offset,
+            offset + inputs.shape[1],
+            self.args.rope_parameters["llama_4_scaling_beta"],
+            self.args.rope_parameters["original_max_position_embeddings"],
+        ).astype(h.dtype)
+
         for layer, cache in zip(self.layers, cache):
             mask = swa_mask if layer.use_sliding else fa_mask
-            h = layer(h, mask, cache=cache)
+            h = layer(h, attn_scale, mask, cache=cache)
 
         return self.norm(h)
 
@@ -219,8 +240,7 @@ class Model(nn.Module):
                 scale_inv = v
                 wk = k.replace("_scale_inv", "")
                 weight = weights[wk]
-                a_scale = weights[k.replace("weight_scale_inv", "activation_scale")]
-                new_weights[wk] = weight * scale_inv * a_scale
+                new_weights[wk] = weight * scale_inv
             elif "activation_scale" in k:
                 continue
             elif k not in new_weights:
