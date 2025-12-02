@@ -456,8 +456,14 @@ class ResponseGenerator:
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
+
+        self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
+
+    def stop_and_join(self):
+        self._stop = True
+        self._generation_thread.join()
 
     def _tokenize(self, tokenizer, request):
         if request.request_type == "chat":
@@ -520,7 +526,7 @@ class ResponseGenerator:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
 
-        while True:
+        while not self._stop:
             request = None
             if not drain_batch:
                 request = get_next_request()
