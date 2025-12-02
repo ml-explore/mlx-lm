@@ -1205,10 +1205,12 @@ def main():
                 add_generation_prompt=not has_prefill,
             )
             prompt = prompt[test_prompt.index("<query>") :]
+        
+        print(prompt)
         prompt = tokenizer.encode(prompt, add_special_tokens=False)
     else:
         prompt = tokenizer.encode(prompt)
-
+    
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:

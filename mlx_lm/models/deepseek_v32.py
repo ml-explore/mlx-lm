@@ -130,10 +130,7 @@ class DeepseekV3YarnRotaryEmbedding(nn.Module):
 
 
 class Indexer(nn.Module):
-    """
-    Indexer module for selecting top-k positions in attention.
-    This implements a fast attention indexing mechanism.
-    """
+
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -166,6 +163,8 @@ class Indexer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
+     
+        offset = cache.offset if cache is not None else 0
         
         # Query projection
         q = self.wq_b(qr)
@@ -173,10 +172,7 @@ class Indexer(nn.Module):
         q_pe, q_nope = mx.split(q, [self.rope_head_dim], axis=-1)
         
         # Apply RoPE to query (non-interleaved)
-        if cache is not None:
-            q_pe = self.rope(q_pe, cache.offset)
-        else:
-            q_pe = self.rope(q_pe)
+        q_pe = self.rope(q_pe, offset)
         
         q = mx.concatenate([q_pe, q_nope], axis=-1)
         
@@ -187,13 +183,12 @@ class Indexer(nn.Module):
         
         # Apply RoPE to key (non-interleaved)
         k_pe_expanded = k_pe.reshape(B, L, 1, self.rope_head_dim)
-        if cache is not None:
-            k_pe_expanded = self.rope(k_pe_expanded, cache.offset)
-        else:
-            k_pe_expanded = self.rope(k_pe_expanded)
+        k_pe_expanded = self.rope(k_pe_expanded, offset)
         k_pe = k_pe_expanded.reshape(B, L, self.rope_head_dim)
         
         k = mx.concatenate([k_pe, k_nope], axis=-1)
+    
+        keys = k
         
         # Compute attention weights for indexing
         # Shape: (B, L, num_heads, head_dim)
@@ -202,16 +197,6 @@ class Indexer(nn.Module):
         # Compute weights projection
         weights = self.weights_proj(x)  # (B, L, num_heads)
         weights = weights * (self.num_heads ** -0.5)
-        
-        # In the reference implementation, they cache keys and compute scores
-        # For MLX, we'll compute attention scores directly
-        if cache is not None:
-            # Update cache with new keys
-            k_expanded = k.reshape(B, L, 1, self.head_dim)
-            keys = cache.update_and_fetch(k_expanded, k_expanded)[0]
-            keys = keys.squeeze(2)  # (B, seq_len, head_dim)
-        else:
-            keys = k
         
         # Compute index scores: (B, num_heads, L, seq_len)
         keys_expanded = keys[:, None, :, :]  # (B, 1, seq_len, head_dim)
@@ -362,10 +347,9 @@ class DeepseekV3Attention(nn.Module):
 
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
 
-        # Apply indexer if enabled and we have qr (for LoRA-based queries)
         index_mask = None
-        if self.use_indexer and qr is not None and mask is not None:
-            # Get top-k indices from indexer
+        if self.use_indexer and qr is not None and mask is not None and L > 1:
+
             topk_indices = self.indexer(x, qr, mask, cache)
             
             # Create index mask: set non-selected positions to -inf
