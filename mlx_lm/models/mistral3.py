@@ -15,6 +15,11 @@ from .base import BaseModelArgs
 class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
+    tie_word_embeddings: Optional[bool] = None
+
+    def __post_init__(self):
+        if self.tie_word_embeddings is None and self.text_config.get("tie_word_embeddings") is None:
+            self.text_config["tie_word_embeddings"] = False
 
 
 class Model(nn.Module):
