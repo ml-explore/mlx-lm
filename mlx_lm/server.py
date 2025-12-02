@@ -272,15 +272,12 @@ class LRUPromptCache:
                 current[tok] = {}
             current = current[tok]
 
-        remove_first = False
         if "cache" in current:
             current["cache"].count += 1
-            remove_first = True
+            self._lru.remove((model, tokens))
         else:
             current["cache"] = self.CacheEntry(prompt_cache, 1)
 
-        if remove_first:
-            self._lru.remove((model, tokens))
         self._lru.append((model, tokens))
         if len(self._lru) > self.max_size:
             model, tokens = self._lru.popleft()
