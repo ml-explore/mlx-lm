@@ -758,6 +758,23 @@ def common_prefix_len(list1, list2):
     return min_len
 
 
+def does_model_support_prompt_cache(model: nn.Module) -> bool:
+    """
+    Check if a model supports prompt caching.
+
+    Models should explicitly declare cache support via the `supports_prompt_cache`
+    class attribute. If not declared, defaults to True (standard autoregressive
+    models use KV cache by default).
+
+    Args:
+        model (nn.Module): The model to check.
+
+    Returns:
+        bool: True if the model supports prompt caching, False otherwise.
+    """
+    return getattr(model, "supports_prompt_cache", True)
+
+
 def does_model_support_input_embeddings(model: nn.Module) -> bool:
     """
     Check if the model supports input_embeddings in its call signature.

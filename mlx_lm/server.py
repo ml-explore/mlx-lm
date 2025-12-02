@@ -30,7 +30,7 @@ from ._version import __version__
 from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import common_prefix_len, load
+from .utils import common_prefix_len, does_model_support_prompt_cache, load
 
 
 def get_system_fingerprint():
@@ -333,7 +333,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
         self.seed = self.body.get("seed", None)
-        self.validate_model_parameters()
+        # Diffusion-specific parameters
+        self.block_length = self.body.get("block_length", 32)
+        self.steps = self.body.get("steps", 32)
+        self.threshold = self.body.get("threshold", 0.95)
+        try:
+            self.validate_model_parameters()
+        except ValueError as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
         if self.seed is not None:
             mx.random.seed(self.seed)
         # Load the model if needed
@@ -434,6 +445,15 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("adapter must be a string")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("seed must be an integer")
+
+        if not isinstance(self.block_length, int) or self.block_length < 1:
+            raise ValueError("block_length must be a positive integer")
+        if not isinstance(self.steps, int) or self.steps < 1:
+            raise ValueError("steps must be a positive integer")
+        if not isinstance(self.threshold, (float, int)) or not (
+            0.0 <= self.threshold <= 1.0
+        ):
+            raise ValueError("threshold must be a float between 0.0 and 1.0")
 
     def generate_response(
         self,
@@ -645,7 +665,9 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = []
         top_tokens = []
 
-        prompt = self.get_prompt_cache(prompt)
+        use_cache = does_model_support_prompt_cache(self.model)
+        if use_cache:
+            prompt = self.get_prompt_cache(prompt)
 
         text = ""
         tic = time.perf_counter()
@@ -695,10 +717,13 @@ class APIHandler(BaseHTTPRequestHandler):
             max_tokens=self.max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
-            prompt_cache=self.prompt_cache.cache,
+            prompt_cache=self.prompt_cache.cache if use_cache else None,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
             prompt_progress_callback=keepalive_callback,
+            block_length=self.block_length,
+            steps=self.steps,
+            threshold=self.threshold,
         ):
             logging.debug(gen_response.text)
 
@@ -720,16 +745,19 @@ class APIHandler(BaseHTTPRequestHandler):
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
-            self.prompt_cache.tokens.append(token)
 
-            if self.logprobs > 0:
-                sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
-                top_indices = sorted_indices[: self.logprobs]
-                top_logprobs = logprobs[top_indices]
-                top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                top_tokens.append(tuple(top_token_info))
+            if use_cache:
+                self.prompt_cache.tokens.append(token)
 
-            token_logprobs.append(logprobs[token].item())
+            if logprobs.size > 0:
+                if self.logprobs > 0:
+                    sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
+                    top_indices = sorted_indices[: self.logprobs]
+                    top_logprobs = logprobs[top_indices]
+                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
+                    top_tokens.append(tuple(top_token_info))
+
+                token_logprobs.append(logprobs[token].item())
 
             stop_condition = stopping_criteria(
                 tokens, stop_id_sequences, self.tokenizer.eos_token_id
@@ -777,11 +805,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                original_prompt_length = (
-                    len(self.prompt_cache.tokens) - len(tokens) + len(prompt)
-                )
                 response = self.completion_usage_response(
-                    original_prompt_length, len(tokens)
+                    gen_response.prompt_tokens, gen_response.generation_tokens
                 )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
@@ -791,8 +816,8 @@ class APIHandler(BaseHTTPRequestHandler):
             response = self.generate_response(
                 text,
                 finish_reason,
-                len(prompt),
-                len(tokens),
+                gen_response.prompt_tokens,
+                gen_response.generation_tokens,
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,

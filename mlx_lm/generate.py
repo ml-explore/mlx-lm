@@ -50,6 +50,9 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_BLOCK_LENGTH = 32
+DEFAULT_STEPS = 32
+DEFAULT_THRESHOLD = 0.95
 
 
 def str2bool(string):
@@ -209,6 +212,24 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--block-length",
+        type=int,
+        default=DEFAULT_BLOCK_LENGTH,
+        help="[Diffusion models only] Number of tokens per block",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_STEPS,
+        help="[Diffusion models only] Number of denoising iterations per block",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help="[Diffusion models only] Confidence threshold for token acceptance",
     )
     return parser
 
@@ -678,60 +699,137 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
+    complete_eos_token_ids = set(tokenizer.eos_token_ids)
+
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
+    if callable(getattr(model, "generate_step", None)) and not draft_model:
+        # Build EOS token set
+        if complete_eos_token_ids:
+            if hasattr(model, "args") and hasattr(model.args, "eos_token_id"):
+                complete_eos_token_ids.add(model.args.eos_token_id)
+            if hasattr(model, "EXTRA_EOS_TOKENS"):
+                for token in model.EXTRA_EOS_TOKENS:
+                    try:
+                        token_ids = tokenizer.encode(token, add_special_tokens=False)
+                        if len(token_ids) == 1:
+                            complete_eos_token_ids.add(token_ids[0])
+                    except Exception:
+                        pass
+
+        # Build kwargs for custom generate_step
+        custom_kwargs = {
+            "max_tokens": kwargs.get("max_tokens", max_tokens),
+            "sampler": kwargs.get("sampler"),
+            "eos_token_ids": (
+                list(complete_eos_token_ids) if complete_eos_token_ids else None
+            ),
+        }
+        # Add diffusion-specific CLI parameters if present
+        for key in ["block_length", "steps", "threshold"]:
+            if key in kwargs:
+                custom_kwargs[key] = kwargs[key]
+
+        batched_prompt = prompt[None] if len(prompt.shape) == 1 else prompt
+
+        def wrap_custom_generator():
+            with mx.stream(generation_stream):
+                for i, (tokens, logprobs) in enumerate(
+                    model.generate_step(inputs=batched_prompt, **custom_kwargs)
+                ):
+                    tokens_list = (
+                        tokens.flatten().tolist()
+                        if isinstance(tokens, mx.array)
+                        else list(tokens)
+                    )
+                    yield (tokens_list, logprobs, False)
+                    if i % 256 == 0:
+                        mx.clear_cache()
+
+        token_generator = wrap_custom_generator()
     else:
-        kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
+        for key in ["block_length", "steps", "threshold"]:
+            kwargs.pop(key, None)
+
+        if draft_model is None:
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = (
+                ([token], logprobs, False)
+                for token, logprobs in generate_step(prompt, model, **kwargs)
+            )
+        else:
+            kwargs.pop("max_kv_size", None)
+            kwargs.pop("prompt_progress_callback", None)
+            token_generator = (
+                ([token], logprobs, from_draft)
+                for token, logprobs, from_draft in speculative_generate_step(
+                    prompt, model, draft_model, **kwargs
+                )
+            )
+
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
+        total_tokens = 0
+        prompt_tps = 0.0
+        last_token = -1
+        last_logprobs = mx.array([])
+        last_from_draft = False
+        finish_reason = None
+
+        for n, (tokens_list, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+            for token in tokens_list:
+                if token in complete_eos_token_ids:
+                    finish_reason = "stop"
+                    break
 
+                detokenizer.add_token(token)
+                total_tokens += 1
+                last_token = token
+                last_logprobs = logprobs
+                last_from_draft = from_draft
+
+                if total_tokens >= max_tokens:
+                    finish_reason = "length"
+                    break
+
+            elapsed = time.perf_counter() - tic
             yield GenerationResponse(
                 text=detokenizer.last_segment,
-                token=token,
-                logprobs=logprobs,
+                token=last_token,
+                logprobs=last_logprobs,
                 from_draft=from_draft,
                 prompt_tokens=prompt.size,
                 prompt_tps=prompt_tps,
-                generation_tokens=n + 1,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                generation_tokens=total_tokens,
+                generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
                 peak_memory=mx.get_peak_memory() / 1e9,
                 finish_reason=None,
             )
 
+            if finish_reason:
+                break
+
+        if not finish_reason:
+            finish_reason = "length"
+
         detokenizer.finalize()
+        elapsed = time.perf_counter() - tic
         yield GenerationResponse(
             text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
+            token=last_token,
+            logprobs=last_logprobs,
+            from_draft=last_from_draft,
             prompt_tokens=prompt.size,
             prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
+            generation_tokens=total_tokens,
+            generation_tps=total_tokens / elapsed if elapsed > 0 else 0.0,
             peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
+            finish_reason=finish_reason,
         )
 
 
@@ -752,7 +850,9 @@ def generate(
        verbose (bool): If ``True``, print tokens and timing information.
            Default: ``False``.
        kwargs: The remaining options get passed to :func:`stream_generate`.
-          See :func:`stream_generate` for more details.
+          See :func:`stream_generate` for more details. For diffusion models
+          (e.g., LLaDA2), additional options include ``block_length``, ``steps``,
+          and ``threshold``.
     """
     if verbose:
         print("=" * 10)
@@ -768,7 +868,7 @@ def generate(
         print("=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return
+            return text
         print(
             f"Prompt: {response.prompt_tokens} tokens, "
             f"{response.prompt_tps:.3f} tokens-per-sec"
@@ -1156,6 +1256,13 @@ def batch_generate(
           See :obj:`BatchGenerator` for more details.
     """
 
+    # Check if model uses custom generation (e.g., diffusion models)
+    if callable(getattr(model, "generate_step", None)):
+        raise NotImplementedError(
+            f"{model.__class__.__name__} uses custom generation and does not support "
+            "batch_generate(). Use generate() or stream_generate() instead."
+        )
+
     gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
     num_samples = len(prompts)
     fin = 0
@@ -1299,6 +1406,25 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
+
+    # Prepare generation kwargs
+    gen_kwargs = {
+        "max_tokens": args.max_tokens,
+        "verbose": args.verbose,
+        "max_kv_size": args.max_kv_size,
+        "prompt_cache": prompt_cache if using_cache else None,
+        "kv_bits": args.kv_bits,
+        "kv_group_size": args.kv_group_size,
+        "quantized_kv_start": args.quantized_kv_start,
+        "draft_model": draft_model,
+        "num_draft_tokens": args.num_draft_tokens,
+        # Diffusion-specific parameters
+        "block_length": args.block_length,
+        "steps": args.steps,
+        "threshold": args.threshold,
+    }
+
+    # Create sampler for all models
     sampler = make_sampler(
         args.temp,
         args.top_p,
@@ -1309,21 +1435,13 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
-    response = generate(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens=args.max_tokens,
-        verbose=args.verbose,
-        sampler=sampler,
-        max_kv_size=args.max_kv_size,
-        prompt_cache=prompt_cache if using_cache else None,
-        kv_bits=args.kv_bits,
-        kv_group_size=args.kv_group_size,
-        quantized_kv_start=args.quantized_kv_start,
-        draft_model=draft_model,
-        num_draft_tokens=args.num_draft_tokens,
-    )
+
+    gen_kwargs["sampler"] = sampler
+
+    # Generate
+    response = generate(model, tokenizer, prompt, **gen_kwargs)
+
+    # Print response if not verbose (verbose mode prints during generation)
     if not args.verbose:
         print(response)
 
