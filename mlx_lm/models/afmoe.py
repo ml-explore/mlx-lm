@@ -15,7 +15,8 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "afmoe"
+    model_type: str
+    layer_types: List[str]
     vocab_size: int = 200192
     hidden_size: int = 2048
     intermediate_size: int = 6144
@@ -23,7 +24,7 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int = 32
     num_attention_heads: int = 32
     num_key_value_heads: int = 4
-    head_dim: Optional[int] = None
+    head_dim: int = 64
     max_position_embeddings: int = 131072
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000
@@ -39,21 +40,8 @@ class ModelArgs(BaseModelArgs):
     score_func: str = "sigmoid"
     n_group: int = 1
     topk_group: int = 1
-    # Attention config
-    layer_types: Optional[List[str]] = None
-    sliding_window: Optional[int] = 2048
-    # muP config
+    sliding_window: int = 2048
     mup_enabled: bool = True
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-        if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
-
-        if self.layer_types is None:
-            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
 
 class Attention(nn.Module):
@@ -68,19 +56,26 @@ class Attention(nn.Module):
 
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(self.hidden_size, self.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.n_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.n_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.n_kv_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.n_heads * self.head_dim, self.hidden_size, bias=False
+        )
 
-        # AfMoE specific: Q/K normalization
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-        # AfMoE specific: attention gating (linear projection for full attention dim)
-        self.gate_proj = nn.Linear(self.hidden_size, self.n_heads * self.head_dim, bias=False)
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.n_heads * self.head_dim, bias=False
+        )
 
-        # RoPE is only used for local (sliding window) attention
         if is_local_attention:
             self.rope = initialize_rope(
                 self.head_dim,
@@ -104,16 +99,17 @@ class Attention(nn.Module):
         keys = self.k_proj(x)
         values = self.v_proj(x)
 
-        # Reshape for multi-head attention
-        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
         keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
 
-        # Apply Q/K normalization
         queries = self.q_norm(queries)
         keys = self.k_norm(keys)
 
-        # Apply RoPE only for local (sliding window) attention
         if self.is_local_attention and self.rope is not None:
             if cache is not None:
                 queries = self.rope(queries, offset=cache.offset)
@@ -122,7 +118,6 @@ class Attention(nn.Module):
                 queries = self.rope(queries)
                 keys = self.rope(keys)
 
-        # Update cache
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
@@ -132,8 +127,7 @@ class Attention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        # Apply attention gating: gate_proj(x) -> [B, L, n_heads * head_dim] -> sigmoid
-        gate = mx.sigmoid(self.gate_proj(x))  # [B, L, n_heads * head_dim]
+        gate = mx.sigmoid(self.gate_proj(x))
         output = output * gate
 
         return self.o_proj(output)
@@ -144,7 +138,11 @@ class MLP(nn.Module):
         super().__init__()
 
         dim = args.hidden_size
-        hidden_dim = intermediate_size if intermediate_size is not None else args.intermediate_size
+        hidden_dim = (
+            intermediate_size
+            if intermediate_size is not None
+            else args.intermediate_size
+        )
 
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
@@ -177,26 +175,23 @@ class AfmoeMoE(nn.Module):
         self.n_group = args.n_group
         self.topk_group = args.topk_group
 
-        # Router with nested structure: router.gate
         self.router = MoERouter(args)
 
-        # Expert bias for routing
         self.expert_bias = mx.zeros((args.num_experts,))
 
-        # Routed experts using SwitchGLU
         self.experts = SwitchGLU(
             args.hidden_size,
             args.moe_intermediate_size,
             args.num_experts,
         )
 
-        # Shared experts
         if args.num_shared_experts > 0:
-            shared_intermediate_size = args.moe_intermediate_size * args.num_shared_experts
+            shared_intermediate_size = (
+                args.moe_intermediate_size * args.num_shared_experts
+            )
             self.shared_experts = MLP(args, intermediate_size=shared_intermediate_size)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Get routing scores
         gates = self.router(x)
 
         if self.score_func == "sigmoid":
@@ -209,8 +204,12 @@ class AfmoeMoE(nn.Module):
 
         # Group-based expert selection if n_group > 1
         if self.n_group > 1:
-            selection_scores = mx.unflatten(selection_scores, axis=-1, shape=(self.n_group, -1))
-            group_scores = mx.topk(selection_scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+            selection_scores = mx.unflatten(
+                selection_scores, axis=-1, shape=(self.n_group, -1)
+            )
+            group_scores = mx.topk(selection_scores, 2, axis=-1).sum(
+                axis=-1, keepdims=True
+            )
             k = self.n_group - self.topk_group
             group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
             selection_scores = mx.put_along_axis(
@@ -222,22 +221,17 @@ class AfmoeMoE(nn.Module):
         k = self.num_experts_per_tok
         inds = mx.argpartition(-selection_scores, kth=k - 1, axis=-1)[..., :k]
 
-        # Get original scores for selected experts (without bias)
         selected_scores = mx.take_along_axis(scores, inds, axis=-1)
 
-        # Normalize scores if enabled
         if self.route_norm and self.num_experts_per_tok > 1:
             denominator = selected_scores.sum(axis=-1, keepdims=True)
             selected_scores = selected_scores / denominator
 
-        # Apply route scale
         selected_scores = selected_scores * self.route_scale
 
-        # Apply experts
         y = self.experts(x, inds)
         y = (y * selected_scores[..., None]).sum(axis=-2).astype(y.dtype)
 
-        # Add shared expert output
         if self.args.num_shared_experts > 0:
             y = y + self.shared_experts(x)
 
@@ -251,18 +245,17 @@ class DecoderLayer(nn.Module):
         self.use_sliding = use_sliding
         self.layer_idx = layer_idx
 
-        # Pass is_local_attention to Attention
         self.self_attn = Attention(args, is_local_attention=use_sliding)
 
-        # First num_dense_layers use regular MLP, rest use MoE
         if layer_idx < args.num_dense_layers:
             self.mlp = MLP(args)
         else:
             self.mlp = AfmoeMoE(args)
 
-        # Dual normalization: 4 layer norms total
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         self.pre_mlp_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_mlp_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -272,12 +265,10 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        # Self-attention with pre and post normalization
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         r = self.post_attention_layernorm(r)
         h = x + r
 
-        # MLP with pre and post normalization
         r = self.mlp(self.pre_mlp_layernorm(h))
         r = self.post_mlp_layernorm(r)
         return h + r
@@ -297,15 +288,12 @@ class AfmoeModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             DecoderLayer(
-                args=args,
-                layer_idx=idx,
-                use_sliding=layer_type == "sliding_attention"
+                args=args, layer_idx=idx, use_sliding=layer_type == "sliding_attention"
             )
             for idx, layer_type in enumerate(self.layer_types)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        # Find indices for full and sliding attention layers
         self.fa_idx = self.layer_types.index("full_attention")
         self.swa_idx = None
         for idx, layer in enumerate(self.layers):
@@ -320,7 +308,6 @@ class AfmoeModel(nn.Module):
     ):
         h = self.embed_tokens(inputs)
 
-        # muP scaling: scale embeddings by sqrt(hidden_size)
         if self.mup_enabled:
             h = h * math.sqrt(self.hidden_size)
 
@@ -365,9 +352,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # Remove unused precomputed rotary freqs
-        weights = {
-            k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k
-        }
+        weights = {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -403,29 +388,17 @@ class Model(nn.Module):
         ]
 
     @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
+
+        return predicate
+
+    @property
     def quant_predicate(self):
-        """
-        Custom quantization predicate for AfMoE model.
-        Keep sensitive layers at 8-bit to reduce error accumulation.
-        This model is particularly sensitive due to muP scaling and dual normalization.
-        """
         def predicate(path, _):
-            # Keep all attention layers at 8-bit
-            if "self_attn" in path:
-                return {"group_size": 64, "bits": 8}
-            # Keep router gate at 8-bit (critical for MoE routing)
             if "router.gate" in path:
                 return {"group_size": 64, "bits": 8}
-            # Keep shared experts at 8-bit
-            if "shared_experts" in path:
-                return {"group_size": 64, "bits": 8}
-            # Keep embeddings at 8-bit (muP scaling amplifies errors)
-            if "embed_tokens" in path:
-                return {"group_size": 64, "bits": 8}
-            # Keep lm_head at 8-bit (final output)
-            if "lm_head" in path:
-                return {"group_size": 64, "bits": 8}
-            # Default: use requested quantization (4-bit for experts)
             return True
 
         return predicate
