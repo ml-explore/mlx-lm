@@ -140,14 +140,16 @@ class Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
         self.q_lora_rank = config.q_lora_rank
-        
-        self.wq_b = nn.Linear(self.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+
+        self.wq_b = nn.Linear(
+            self.q_lora_rank, self.num_heads * self.head_dim, bias=False
+        )
         self.wk = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-        
-        self.softmax_scale = self.head_dim ** -0.5
-        
+
+        self.softmax_scale = self.head_dim**-0.5
+
         # Use standard RoPE for indexer (non-interleaved in PyTorch version)
         self.rope = nn.RoPE(
             dims=self.rope_head_dim,
@@ -163,61 +165,61 @@ class Indexer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
-     
+
         offset = cache.offset if cache is not None else 0
-        
+
         # Query projection
         q = self.wq_b(qr)
         q = q.reshape(B, L, self.num_heads, self.head_dim)
         q_pe, q_nope = mx.split(q, [self.rope_head_dim], axis=-1)
-        
+
         # Apply RoPE to query (non-interleaved)
         q_pe = self.rope(q_pe, offset)
-        
+
         q = mx.concatenate([q_pe, q_nope], axis=-1)
-        
+
         # Key projection
         k = self.wk(x)
         k = self.k_norm(k)
         k_pe, k_nope = mx.split(k, [self.rope_head_dim], axis=-1)
-        
+
         # Apply RoPE to key (non-interleaved)
         k_pe_expanded = k_pe.reshape(B, L, 1, self.rope_head_dim)
         k_pe_expanded = self.rope(k_pe_expanded, offset)
         k_pe = k_pe_expanded.reshape(B, L, self.rope_head_dim)
-        
+
         k = mx.concatenate([k_pe, k_nope], axis=-1)
-    
+
         keys = k
-        
+
         # Compute attention weights for indexing
         # Shape: (B, L, num_heads, head_dim)
         q = q.transpose(0, 2, 1, 3)  # (B, num_heads, L, head_dim)
-        
+
         # Compute weights projection
         weights = self.weights_proj(x)  # (B, L, num_heads)
-        weights = weights * (self.num_heads ** -0.5)
-        
+        weights = weights * (self.num_heads**-0.5)
+
         # Compute index scores: (B, num_heads, L, seq_len)
         keys_expanded = keys[:, None, :, :]  # (B, 1, seq_len, head_dim)
         index_scores = (q @ keys_expanded.transpose(0, 1, 3, 2)) * self.softmax_scale
-        
+
         # Apply weights
         index_scores = index_scores * weights[:, None, :, None]
-        
+
         # Average over query positions and heads
         index_scores = index_scores.mean(axis=(1, 2))  # (B, seq_len)
-        
+
         # Apply mask if provided
         if mask is not None:
             # Mask should be (B, L, seq_len) or broadcastable
             index_scores = index_scores + mask
-        
+
         # Select top-k indices
         seq_len = keys.shape[1]
         k = min(self.index_topk, seq_len)
-        topk_indices = mx.argpartition(-index_scores, kth=k-1, axis=-1)[..., :k]
-        
+        topk_indices = mx.argpartition(-index_scores, kth=k - 1, axis=-1)[..., :k]
+
         return topk_indices
 
 
@@ -302,7 +304,7 @@ class DeepseekV3Attention(nn.Module):
                 base=self.rope_theta,
                 traditional=True,
             )
-        
+
         # Initialize indexer if enabled
         if self.use_indexer:
             self.indexer = Indexer(config)
@@ -351,28 +353,32 @@ class DeepseekV3Attention(nn.Module):
         if self.use_indexer and qr is not None and mask is not None and L > 1:
 
             topk_indices = self.indexer(x, qr, mask, cache)
-            
+
             # Create index mask: set non-selected positions to -inf
             seq_len = keys.shape[2]
             index_mask = mx.full((B, L, seq_len), float("-inf"))
-            
+
             # Scatter zero values at top-k positions
             # This is a simplified approach; in practice, you'd need a more efficient scatter
             for b in range(B):
                 for i in range(L):
                     indices = topk_indices[b]
                     index_mask[b, i, indices] = 0.0
-            
+
             # Combine with original mask
             if mask is not None:
                 index_mask = index_mask + mask.reshape(B, L, seq_len)
-            
+
             # Reshape for attention
             index_mask = index_mask[:, None, :, :]  # (B, 1, L, seq_len)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, 
-            mask=index_mask if index_mask is not None else mask
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=index_mask if index_mask is not None else mask,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
