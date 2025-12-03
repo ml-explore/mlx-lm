@@ -33,7 +33,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, stream_generate
+from .generate import BatchGenerator, generation_stream, stream_generate, wired_limit
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import load
@@ -509,6 +509,7 @@ class ResponseGenerator:
         batch_generator = None
         drain_batch = False
         batch_results = {}
+        old_wired_limit = None
 
         unprocessed_requests = []
 
@@ -596,6 +597,10 @@ class ResponseGenerator:
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
                     batch_results = {}
+                    if mx.metal.is_available():
+                        old_wired_limit = mx.set_wired_limit(
+                            mx.metal.device_info()["max_recommended_working_set_size"]
+                        )
                     batch_generator = BatchGenerator(
                         model,
                         stop_tokens=tokenizer.eos_token_ids,
@@ -633,6 +638,10 @@ class ResponseGenerator:
                         current_model_key = None
                         batch_generator = None
                         drain_batch = False
+                        if old_wired_limit is not None:
+                            mx.synchronize(generation_stream)
+                            mx.set_wired_limit(old_wired_limit)
+                            old_wired_limit = None
                     continue
 
                 uids_to_remove = []
