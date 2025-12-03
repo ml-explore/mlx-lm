@@ -1258,10 +1258,6 @@ class APIHandler(BaseHTTPRequestHandler):
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
-        # logging.debug(f"Prompt: {gen.prompt_tps:.3f} tokens-per-sec")
-        # logging.debug(f"Generation: {gen.generation_tps:.3f} tokens-per-sec")
-        # logging.debug(f"Peak memory: {gen.peak_memory:.3f} GB")
-
         if self.stream:
             response = self.generate_response(
                 segment, finish_reason, tool_calls=tool_calls
