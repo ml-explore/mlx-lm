@@ -103,8 +103,8 @@ class Indexer(nn.Module):
             return None
         scores = q @ k.swapaxes(-1, -2)
         scores = mx.maximum(scores, 0)
-        weights = self.weights_proj(x) * (self.n_heads**-0.5)
-        weights = (weights * self.softmax_scale).swapaxes(-1, -2)[..., None]
+        weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
+        weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
         scores = scores.sum(axis=1)
         if mask is not None:
@@ -131,18 +131,13 @@ class DeepseekV32Attention(nn.Module):
 
         self.scale = self.q_head_dim**-0.5
 
-        if self.q_lora_rank is None:
-            self.q_proj = nn.Linear(
-                self.hidden_size, self.num_heads * self.q_head_dim, bias=False
-            )
-        else:
-            self.q_a_proj = nn.Linear(
-                self.hidden_size, self.q_lora_rank, bias=config.attention_bias
-            )
-            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
-            self.q_b_proj = nn.Linear(
-                self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
-            )
+        self.q_a_proj = nn.Linear(
+            self.hidden_size, self.q_lora_rank, bias=config.attention_bias
+        )
+        self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
+        self.q_b_proj = nn.Linear(
+            self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+        )
 
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size,
@@ -188,11 +183,8 @@ class DeepseekV32Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        if self.q_lora_rank is None:
-            q = self.q_proj(x)
-        else:
-            qr = self.q_a_layernorm(self.q_a_proj(x))
-            q = self.q_b_proj(qr)
+        qr = self.q_a_layernorm(self.q_a_proj(x))
+        q = self.q_b_proj(qr)
 
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
