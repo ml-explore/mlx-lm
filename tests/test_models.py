@@ -936,7 +936,7 @@ class TestModels(unittest.TestCase):
             "tie_word_embeddings": True,
             "layer_types": ["full_attention"] * 4,
         }
-        
+
         args = mistral3.ModelArgs(
             model_type="mistral3",
             text_config=text_config,
