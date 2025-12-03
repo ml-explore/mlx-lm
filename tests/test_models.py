@@ -888,6 +888,64 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_ministral3(self):
+        from mlx_lm.models import ministral3
+
+        args = ministral3.ModelArgs(
+            model_type="ministral3",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+            max_position_embeddings=4096,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.5,
+                "original_max_position_embeddings": 4096,
+            },
+            tie_word_embeddings=True,
+            layer_types=["full_attention", "full_attention", "sliding_attention", "sliding_attention"],
+            sliding_window=512,
+        )
+        model = ministral3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_mistral3(self):
+        from mlx_lm.models import mistral3
+
+        text_config = {
+            "model_type": "ministral3",
+            "hidden_size": 1024,
+            "num_hidden_layers": 4,
+            "intermediate_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 10_000,
+            "max_position_embeddings": 4096,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.5,
+                "original_max_position_embeddings": 4096,
+            },
+            "tie_word_embeddings": True,
+            "layer_types": ["full_attention"] * 4,
+        }
+        
+        args = mistral3.ModelArgs(
+            model_type="mistral3",
+            text_config=text_config,
+        )
+        model = mistral3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, text_config["vocab_size"], text_config["num_hidden_layers"]
+        )
+
     def test_deepseek(self):
         from mlx_lm.models import deepseek
 
