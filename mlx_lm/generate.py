@@ -948,6 +948,22 @@ class BatchGenerator:
 
         self.active_batch = None
 
+        if mx.metal.is_available():
+            self._old_wired_limit = mx.set_wired_limit(
+                mx.metal.device_info()["max_recommended_working_set_size"]
+            )
+        else:
+            self._old_wired_limit = None
+
+    def close(self):
+        if self._old_wired_limit is not None:
+            mx.synchronize(generation_stream)
+            mx.set_wired_limit(self._old_wired_limit)
+            self._old_wired_limit = None
+
+    def __del__(self):
+        self.close()
+
     def insert(
         self, prompts, max_tokens: Union[List[int], int, None] = None, caches=None
     ):
@@ -1196,23 +1212,23 @@ def batch_generate(
     if verbose:
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
-    with wired_limit(model, [generation_stream]):
-        uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
-        results = {uid: [] for uid in uids}
-        prompt_caches = {}
-        while responses := gen.next():
-            for r in responses:
-                if r.finish_reason is not None:
-                    if return_prompt_caches:
-                        prompt_caches[r.uid] = r.prompt_cache
-                    if verbose:
-                        fin += 1
-                        print(
-                            f"[batch_generate] Finished processing {fin}/{num_samples} ...",
-                            end="\r",
-                        )
-                if r.finish_reason != "stop":
-                    results[r.uid].append(r.token)
+    uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
+    results = {uid: [] for uid in uids}
+    prompt_caches = {}
+    while responses := gen.next():
+        for r in responses:
+            if r.finish_reason is not None:
+                if return_prompt_caches:
+                    prompt_caches[r.uid] = r.prompt_cache
+                if verbose:
+                    fin += 1
+                    print(
+                        f"[batch_generate] Finished processing {fin}/{num_samples} ...",
+                        end="\r",
+                    )
+            if r.finish_reason != "stop":
+                results[r.uid].append(r.token)
+    gen.close()
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
 
