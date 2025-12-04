@@ -1042,7 +1042,7 @@ class APIHandler(BaseHTTPRequestHandler):
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
 
-        def parse_function(tool_text):
+        def parse_function(idx, tool_text):
             tool_call = json.loads(tool_text.strip())
             return {
                 "function": {
@@ -1050,7 +1050,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     "arguments": json.dumps(tool_call.get("arguments", "")),
                 },
                 "type": "function",
-                "id": None,
+                "id": str(uuid.uuid4()),
+                "index": idx,
             }
 
         # Static response
@@ -1098,7 +1099,10 @@ class APIHandler(BaseHTTPRequestHandler):
             choice[key_name] = {
                 "role": "assistant",
                 "content": text,
-                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
+                "tool_calls": [
+                    parse_function(idx, tool_text)
+                    for idx, tool_text in enumerate(tool_calls)
+                ],
             }
         elif self.object_type == "text_completion":
             choice.update(text=text)
