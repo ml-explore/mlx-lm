@@ -921,7 +921,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
         self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
         self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
+        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
