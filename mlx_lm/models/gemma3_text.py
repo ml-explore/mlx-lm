@@ -2,13 +2,14 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .rope_utils import initialize_rope
 
 
 @dataclass
@@ -22,12 +23,13 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1.0e-6
     vocab_size: int = 262144
     num_key_value_heads: int = 1
-    rope_global_base_freq: float = 1_000_000.0
+    rope_theta: float = 1_000_000.0
     rope_local_base_freq: float = 10_000.0
-    rope_traditional: bool = False
     query_pre_attn_scalar: float = 256
     sliding_window: int = 512
     sliding_window_pattern: int = 6
+    max_position_embeddings: int = 32768
+    rope_scaling: Dict = None
 
 
 class Attention(nn.Module):
@@ -52,14 +54,12 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
         self.is_sliding = (layer_idx + 1) % args.sliding_window_pattern != 0
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=args.rope_traditional,
-            base=(
-                args.rope_local_base_freq
-                if self.is_sliding
-                else args.rope_global_base_freq
-            ),
+        self.rope = initialize_rope(
+            dims=head_dim,
+            base=(args.rope_local_base_freq if self.is_sliding else args.rope_theta),
+            traditional=False,
+            max_position_embeddings=args.max_position_embeddings,
+            scaling_config=args.rope_scaling,
         )
 
     def __call__(
@@ -187,11 +187,14 @@ class Gemma3Model(nn.Module):
 
         global_mask = create_attention_mask(h, cache[self.sliding_window_pattern - 1])
 
-        sliding_window_mask = create_attention_mask(
-            h,
-            cache[0],
-            window_size=self.window_size,
-        )
+        if self.sliding_window_pattern > 1:
+            sliding_window_mask = create_attention_mask(
+                h,
+                cache[0],
+                window_size=self.window_size,
+            )
+        else:
+            sliding_window_mask = None
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
                 i % self.sliding_window_pattern == self.sliding_window_pattern - 1
