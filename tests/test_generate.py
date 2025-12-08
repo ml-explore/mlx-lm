@@ -81,7 +81,7 @@ class TestGenerate(unittest.TestCase):
 
     def test_stream_generate_speculative(self):
         # Use same model as draft model, this is not a speed test
-        draft_model, _ = load(self.HF_MODEL_PATH)
+        draft_model = self.model
 
         results: List[GenerationResponse] = []
         drafted: List[bool] = []
