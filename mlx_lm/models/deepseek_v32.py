@@ -98,7 +98,7 @@ class Indexer(nn.Module):
         k_pe = self.rope(k_pe, offset=offset)
         k = mx.concatenate([k_pe, k_nope], axis=-1)
         if cache is not None:
-            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
+            k, _ = cache.update_and_fetch(mx.zeros_like(k), mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
         scores = q @ k.swapaxes(-1, -2)
@@ -222,6 +222,11 @@ class DeepseekV32Attention(nn.Module):
             if mask is not None:
                 sparse_mask = sparse_mask & mask
             mask = sparse_mask
+        # Ensure the indexer cache is evaluated even if the topk_indices are unused
+        # to keep the graph from getting too large
+        if cache is not None:
+            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache[0], scale=self.scale, mask=mask
         )

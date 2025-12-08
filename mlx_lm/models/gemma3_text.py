@@ -54,13 +54,20 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
         self.is_sliding = (layer_idx + 1) % args.sliding_window_pattern != 0
 
-        self.rope = initialize_rope(
-            dims=head_dim,
-            base=(args.rope_local_base_freq if self.is_sliding else args.rope_theta),
-            traditional=False,
-            max_position_embeddings=args.max_position_embeddings,
-            scaling_config=args.rope_scaling,
-        )
+        if self.is_sliding:
+            self.rope = initialize_rope(
+                dims=head_dim,
+                base=args.rope_local_base_freq,
+                traditional=False,
+            )
+        else:
+            self.rope = initialize_rope(
+                dims=head_dim,
+                base=args.rope_theta,
+                traditional=False,
+                max_position_embeddings=args.max_position_embeddings,
+                scaling_config=args.rope_scaling,
+            )
 
     def __call__(
         self,
