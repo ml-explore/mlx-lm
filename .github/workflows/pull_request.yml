@@ -27,6 +27,8 @@ jobs:
     if: github.repository == 'ml-explore/mlx-lm'
     runs-on: [self-hosted, macos]
     needs: check_lint
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-macos
