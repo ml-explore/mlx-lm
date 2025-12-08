@@ -274,7 +274,10 @@ class TokenizerWrapper:
         self._tool_call_end = None
 
         THINK_TOKENS = [("<think>", "</think>")]
-        TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
+        TOOL_CALL_TOKENS = [
+            ("<minimax:tool_call>", "</minimax:tool_call>"),
+            ("<tool_call>", "</tool_call>"),
+        ]
 
         vocab = tokenizer.get_vocab()
         for think_start, think_end in THINK_TOKENS:
@@ -282,12 +285,15 @@ class TokenizerWrapper:
                 self._think_start = think_start
                 self._think_end = think_end
                 break
-        if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
-            for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
-                if tool_call_start in vocab and tool_call_end in vocab:
-                    self._tool_call_start = tool_call_start
-                    self._tool_call_end = tool_call_end
-                    break
+        for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
+            if tool_call_start in vocab and tool_call_end in vocab:
+                self._tool_call_start = tool_call_start
+                self._tool_call_end = tool_call_end
+                break
+            elif tokenizer.chat_template and tool_call_start in tokenizer.chat_template:
+                self._tool_call_start = tool_call_start
+                self._tool_call_end = tool_call_end
+                break
 
     def add_eos_token(self, token: str):
         token_id = None

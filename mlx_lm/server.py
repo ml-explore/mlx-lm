@@ -36,6 +36,13 @@ from ._version import __version__
 from .generate import BatchGenerator, stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
+from .tool_parsers import (
+    TOOL_PARSERS,
+    ToolParser,
+    get_tool_parser,
+    parse_tool_calls_to_openai_format,
+    process_tool_call_arguments,
+)
 from .utils import load
 
 
@@ -136,7 +143,7 @@ def process_message_content(messages):
     Convert message content to a format suitable for `apply_chat_template`.
 
     The function operates on messages in place. It converts the 'content' field
-    to a string instead of a list of text fragments.
+    to a string instead of a list of text fragments, and processes tool_calls.
 
     Args:
         message_list (list): A list of dictionaries, where each dictionary may
@@ -148,7 +155,7 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message["content"]
+        content = message.get("content")
         if isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
@@ -158,6 +165,8 @@ def process_message_content(messages):
             message["content"] = "".join(text_fragments)
         elif content is None:
             message["content"] = ""
+
+        process_tool_call_arguments(message)
 
 
 class LRUPromptCache:
@@ -351,6 +360,7 @@ class GenerationContext:
     has_tool_calling: bool
     tool_call_start: str
     tool_call_end: str
+    tool_parser: Optional[ToolParser]
     eos_token_id: int
     stop_token_sequences: List[List[int]]
     prompt: List[int]
@@ -545,10 +555,20 @@ class ResponseGenerator:
                     and is_batchable
                 ):
                     prompt = self._tokenize(current_tokenizer, request)
+
+                    # Get tool parser if specified via CLI
+                    tool_parser_name = getattr(
+                        self.model_provider.cli_args, "tool_call_parser", None
+                    )
+                    tool_parser = None
+                    if tool_parser_name:
+                        tool_parser = get_tool_parser(tool_parser_name)
+
                     ctx = GenerationContext(
                         has_tool_calling=tokenizer.has_tool_calling,
                         tool_call_start=tokenizer.tool_call_start,
                         tool_call_end=tokenizer.tool_call_end,
+                        tool_parser=tool_parser,
                         eos_token_id=tokenizer.eos_token_id,
                         stop_token_sequences=[
                             tokenizer.encode(stop_word, add_special_tokens=False)
@@ -703,11 +723,20 @@ class ResponseGenerator:
             # Prepare the prompt
             prompt = self._tokenize(tokenizer, request)
 
+            # Get tool parser if specified via CLI
+            tool_parser_name = getattr(
+                self.model_provider.cli_args, "tool_call_parser", None
+            )
+            tool_parser = None
+            if tool_parser_name:
+                tool_parser = get_tool_parser(tool_parser_name)
+
             # Start the generation context
             ctx = GenerationContext(
                 has_tool_calling=tokenizer.has_tool_calling,
                 tool_call_start=tokenizer.tool_call_start,
                 tool_call_end=tokenizer.tool_call_end,
+                tool_parser=tool_parser,
                 eos_token_id=tokenizer.eos_token_id,
                 stop_token_sequences=[
                     tokenizer.encode(stop_word, add_special_tokens=False)
@@ -1015,6 +1044,7 @@ class APIHandler(BaseHTTPRequestHandler):
         top_tokens: Optional[List[Dict[int, float]]] = None,
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
+        tool_parser: Optional[ToolParser] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -1033,7 +1063,8 @@ class APIHandler(BaseHTTPRequestHandler):
             top_tokens (Optional[List[Dict[int, float]]]): List of dictionaries mapping
               tokens to logprobs for the top N tokens at each token position.
             tokens (Optional[List[int]]): List of tokens to return with logprobs structure
-            tool_calls (Optional[List[str]]): List of tool calls.
+            tool_calls (Optional[List[str]]): List of raw tool call text strings.
+            tool_parser (Optional[ToolParser]): Parser to use for extracting tool calls.
 
         Returns:
             dict: A dictionary containing the response, in the same format as
@@ -1042,17 +1073,6 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = token_logprobs or []
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
-
-        def parse_function(tool_text):
-            tool_call = json.loads(tool_text.strip())
-            return {
-                "function": {
-                    "name": tool_call.get("name", None),
-                    "arguments": json.dumps(tool_call.get("arguments", "")),
-                },
-                "type": "function",
-                "id": None,
-            }
 
         # Static response
         response = {
@@ -1096,11 +1116,24 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
-            choice[key_name] = {
-                "role": "assistant",
-                "content": text,
-                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
-            }
+            parsed_tool_calls = parse_tool_calls_to_openai_format(tool_calls, tool_parser)
+
+            # Build the message/delta according to OpenAI spec:
+            # - content should be null (None) when only tool_calls are present
+            # - tool_calls should only be included when there are actual tool calls
+            message = {"role": "assistant"}
+
+            # Set content: null if no text and we have tool calls, otherwise the text
+            if parsed_tool_calls and not text.strip():
+                message["content"] = None
+            else:
+                message["content"] = text if text else None
+
+            # Only include tool_calls if there are any
+            if parsed_tool_calls:
+                message["tool_calls"] = parsed_tool_calls
+
+            choice[key_name] = message
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
@@ -1186,6 +1219,7 @@ class APIHandler(BaseHTTPRequestHandler):
         in_tool_call = False
         tool_calls = []
         tool_text = ""
+        has_tool_calls = False  # Track if any tool calls were made (for streaming)
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
@@ -1211,6 +1245,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls.append(tool_text)
                     tool_text = ""
                     in_tool_call = False
+                    has_tool_calls = True  # Mark that we have tool calls
                 else:
                     tool_text += gen.text
             else:
@@ -1230,7 +1265,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id
             )
             if stop_condition.stop_met:
-                finish_reason = "stop"
+                # If we have tool calls, finish_reason should be "tool_calls"
+                # Otherwise it's "stop"
+                finish_reason = "tool_calls" if (tool_calls or has_tool_calls) else "stop"
                 ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
                 text = text[: len(text) - stop_condition.trim_text_length]
@@ -1249,7 +1286,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     continue
                 elif segment or tool_calls:
                     response = self.generate_response(
-                        segment, None, tool_calls=tool_calls
+                        segment,
+                        None,
+                        tool_calls=tool_calls,
+                        tool_parser=ctx.tool_parser,
                     )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
@@ -1259,9 +1299,17 @@ class APIHandler(BaseHTTPRequestHandler):
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
+        # If we have tool calls, finish_reason must be "tool_calls" per OpenAI spec
+        # Use has_tool_calls flag since tool_calls list may have been cleared during streaming
+        if tool_calls or has_tool_calls:
+            finish_reason = "tool_calls"
+
         if self.stream:
             response = self.generate_response(
-                segment, finish_reason, tool_calls=tool_calls
+                segment,
+                finish_reason,
+                tool_calls=tool_calls,
+                tool_parser=ctx.tool_parser,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
@@ -1281,6 +1329,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 top_tokens=top_tokens,
                 tokens=tokens,
                 tool_calls=tool_calls,
+                tool_parser=ctx.tool_parser,
             )
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
@@ -1542,6 +1591,16 @@ def main():
         type=int,
         default=512,
         help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        choices=list(TOOL_PARSERS.keys()),
+        default=None,
+        help=(
+            "Tool call parser to use for extracting function calls from model output. "
+            f"Available parsers: {', '.join(TOOL_PARSERS.keys())}."
+        ),
     )
     parser.add_argument(
         "--chat-template-args",
