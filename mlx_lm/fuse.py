@@ -78,6 +78,7 @@ def main() -> None:
         print("Dequantizing model")
         model = dequantize_model(model)
         config.pop("quantization", None)
+        config.pop("quantization_config", None)
 
     save_path = Path(args.save_path)
     save(

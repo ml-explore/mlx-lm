@@ -224,7 +224,7 @@ class DeepseekV32Attention(nn.Module):
             mask = sparse_mask
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
-        if cache is not None:
+        if cache is not None and cache[0] is not None:
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
         output = scaled_dot_product_attention(
