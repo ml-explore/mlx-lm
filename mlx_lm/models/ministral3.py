@@ -182,7 +182,8 @@ class LanguageModel(nn.Module):
             cache = [None] * len(self.layers)
             offset = 0
         else:
-            offset = cache[0].offset
+            # Convert to Python int for mx.arange compatibility in _get_llama_4_attn_scale
+            offset = int(cache[0].offset)
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         if self.swa_idx is not None:
