@@ -98,7 +98,7 @@ class Indexer(nn.Module):
         k_pe = self.rope(k_pe, offset=offset)
         k = mx.concatenate([k_pe, k_nope], axis=-1)
         if cache is not None:
-            k, _ = cache.update_and_fetch(mx.zeros_like(k), mx.zeros([b, 1, s, 0]))
+            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
         scores = q @ k.swapaxes(-1, -2)
