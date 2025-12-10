@@ -38,12 +38,18 @@ class ModelArgs(BaseModelArgs):
 
 
 def _get_llama_4_attn_scale(
-    start: int, stop: int, beta: float, max_position_embeddings: int
+    start: Union[int, mx.array], length: int, beta: float, max_position_embeddings: int
 ):
-    scaling = 1 + beta * mx.log(
-        1 + mx.floor(mx.arange(start, stop) / max_position_embeddings)
-    )
-    return scaling[:, None]
+    if isinstance(start, mx.array):
+        t = (start[:, None] + mx.arange(length)) / max_position_embeddings
+    else:
+        t = mx.arange(start, start + length) / max_position_embeddings
+        t = t[None]
+
+    scaling = 1 + beta * mx.log(1 + mx.floor(t))
+    scaling = scaling[:, None, :, None]
+
+    return scaling
 
 
 class Attention(nn.Module):
@@ -193,7 +199,7 @@ class LanguageModel(nn.Module):
 
         attn_scale = _get_llama_4_attn_scale(
             offset,
-            offset + inputs.shape[1],
+            inputs.shape[1],
             self.args.rope_parameters["llama_4_scaling_beta"],
             self.args.rope_parameters["original_max_position_embeddings"],
         ).astype(h.dtype)
