@@ -21,6 +21,8 @@ class TestDatasets(unittest.TestCase):
         cls.test_dir = cls.test_dir_fid.name
         if not os.path.isdir(cls.test_dir):
             os.mkdir(cls.test_dir_fid.name)
+        # Only one HF request
+        AutoTokenizer.from_pretrained(HF_MODEL_PATH)
 
     @classmethod
     def tearDownClass(cls):
@@ -37,7 +39,7 @@ class TestDatasets(unittest.TestCase):
         data = {"text": "This is an example for the model."}
         self.save_data(4 * [data])
         args = types.SimpleNamespace(train=True, test=False, data=self.test_dir)
-        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, local_files_only=True)
         train, valid, test = datasets.load_dataset(args, tokenizer)
         self.assertEqual(len(train), 4)
         self.assertEqual(len(valid), 4)
@@ -50,7 +52,7 @@ class TestDatasets(unittest.TestCase):
         data = {"prompt": "What is the capital of France?", "completion": "Paris."}
         self.save_data(4 * [data])
         args = types.SimpleNamespace(train=True, test=False, data=self.test_dir)
-        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, local_files_only=True)
         train, valid, test = datasets.load_dataset(args, tokenizer)
         self.assertEqual(len(train), 4)
         self.assertEqual(len(valid), 4)
@@ -69,7 +71,7 @@ class TestDatasets(unittest.TestCase):
         }
         self.save_data(4 * [data])
         args = types.SimpleNamespace(train=True, test=False, data=self.test_dir)
-        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, local_files_only=True)
         train, valid, test = datasets.load_dataset(args, tokenizer)
         self.assertEqual(len(train), 4)
         self.assertEqual(len(valid), 4)
@@ -91,7 +93,7 @@ class TestDatasets(unittest.TestCase):
             test=False,
             train=True,
         )
-        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, local_files_only=True)
         train, valid, test = datasets.load_dataset(args, tokenizer)
         self.assertTrue(len(train) > 0)
         self.assertTrue(len(train[0]) > 0)

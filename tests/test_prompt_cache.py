@@ -34,6 +34,7 @@ class TestPromptCache(unittest.TestCase):
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()
         cls.test_dir = cls.test_dir_fid.name
+        cls.model, cls.tokenizer = load(HF_MODEL_PATH)
 
     @classmethod
     def tearDownClass(cls):
@@ -132,7 +133,7 @@ class TestPromptCache(unittest.TestCase):
                 self.assertTrue(mx.array_equal(v, lv))
 
     def test_cache_with_generate(self):
-        model, tokenizer = load(HF_MODEL_PATH)
+        model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
         results = list(generate_step(prompt, model, max_tokens=4))
         toks, all_logits = zip(*results)
@@ -212,7 +213,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(num_trimmed, 3)
 
     def test_trim_cache_with_generate(self):
-        model, tokenizer = load(HF_MODEL_PATH)
+        model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
 
         prompt_cache = make_prompt_cache(model)
@@ -289,7 +290,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(metadata, loaded_metadata)
 
     def test_cache_to_quantized(self):
-        model, tokenizer = load(HF_MODEL_PATH)
+        model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
         results = zip(range(4), generate_step(prompt, model))
         toks, all_logits = zip(*(r[1] for r in results))

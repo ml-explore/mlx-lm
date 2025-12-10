@@ -307,7 +307,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
-    prompt_progress_callback: Optional[Callable[[int], int]] = None,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -333,7 +333,7 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
-        prompt_progress_callback (Callable[[int], int]): A call-back which takes the
+        prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
@@ -846,19 +846,19 @@ class Batch:
 
     def filter(self, keep_idx: List[int]):
         self.uids = [self.uids[k] for k in keep_idx]
+        self.logprobs = [self.logprobs[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
         self.token_sequences = [self.token_sequences[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
-        self.logprobs = self.logprobs[keep_idx]
         for c in self.cache:
             c.filter(keep_idx)
 
     def extend(self, other):
         self.uids.extend(other.uids)
         self.y = mx.concatenate([self.y, other.y])
-        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
+        self.logprobs.extend(other.logprobs)
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
         self.token_sequences.extend(other.token_sequences)
@@ -934,6 +934,9 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        prompt_progress_callback: Optional[
+            Callable[[List[Tuple[int, int, int]]], None]
+        ] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -945,9 +948,26 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
 
         self.active_batch = None
+
+        if mx.metal.is_available():
+            self._old_wired_limit = mx.set_wired_limit(
+                mx.metal.device_info()["max_recommended_working_set_size"]
+            )
+        else:
+            self._old_wired_limit = None
+
+    def close(self):
+        if self._old_wired_limit is not None:
+            mx.synchronize(generation_stream)
+            mx.set_wired_limit(self._old_wired_limit)
+            self._old_wired_limit = None
+
+    def __del__(self):
+        self.close()
 
     def insert(
         self, prompts, max_tokens: Union[List[int], int, None] = None, caches=None
@@ -973,6 +993,20 @@ class BatchGenerator:
         )
         return uids
 
+    def remove(self, uids: List[int]):
+        uids = set(uids)
+        if self.active_batch is not None:
+            batch = self.active_batch
+            keep_idx = [e for e, uid in enumerate(batch.uids) if uid not in uids]
+            if len(keep_idx) > 0:
+                batch.filter(keep_idx)
+            else:
+                self.active_batch = None
+
+        for i in reversed(range(len(self.unprocessed_prompts))):
+            if self.unprocessed_prompts[i][0] in uids:
+                self.unprocessed_prompts.pop(i)
+
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches = zip(*prompts)
 
@@ -983,6 +1017,8 @@ class BatchGenerator:
         padding = [max_length - l for l in lengths]
 
         self._stats.prompt_tokens += sum(lengths)
+
+        processed_tokens = 0
 
         # New prompts so
         #   1. Left-pad the inputs
@@ -996,6 +1032,13 @@ class BatchGenerator:
                 self.model(inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
                 mx.clear_cache()
 
         # Further prompt processing so we need to
@@ -1016,6 +1059,13 @@ class BatchGenerator:
                 self.model(inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
                 mx.clear_cache()
 
             for c in prompt_cache:
@@ -1064,7 +1114,7 @@ class BatchGenerator:
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
-        return sampled, logprobs
+        return sampled, list(logprobs)
 
     def stats(self):
         self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
@@ -1209,23 +1259,23 @@ def batch_generate(
     if verbose:
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
-    with wired_limit(model, [generation_stream]):
-        uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
-        results = {uid: [] for uid in uids}
-        prompt_caches = {}
-        while responses := gen.next():
-            for r in responses:
-                if r.finish_reason is not None:
-                    if return_prompt_caches:
-                        prompt_caches[r.uid] = r.prompt_cache
-                    if verbose:
-                        fin += 1
-                        print(
-                            f"[batch_generate] Finished processing {fin}/{num_samples} ...",
-                            end="\r",
-                        )
-                if r.finish_reason != "stop":
-                    results[r.uid].append(r.token)
+    uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
+    results = {uid: [] for uid in uids}
+    prompt_caches = {}
+    while responses := gen.next():
+        for r in responses:
+            if r.finish_reason is not None:
+                if return_prompt_caches:
+                    prompt_caches[r.uid] = r.prompt_cache
+                if verbose:
+                    fin += 1
+                    print(
+                        f"[batch_generate] Finished processing {fin}/{num_samples} ...",
+                        end="\r",
+                    )
+            if r.finish_reason != "stop":
+                results[r.uid].append(r.token)
+    gen.close()
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
 
