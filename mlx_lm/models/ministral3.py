@@ -37,12 +37,30 @@ class ModelArgs(BaseModelArgs):
 
 
 def _get_llama_4_attn_scale(
-    start: int, stop: int, beta: float, max_position_embeddings: int
+    start: Union[int, mx.array],
+    stop: Union[int, mx.array],
+    beta: float,
+    max_position_embeddings: int,
 ):
-    scaling = 1 + beta * mx.log(
-        1 + mx.floor(mx.arange(start, stop) / max_position_embeddings)
-    )
-    return scaling[:, None]
+    # Handle both scalar and array offsets (for batch processing)
+    if isinstance(start, mx.array) and start.ndim > 0:
+        # Batch mode: start and stop are arrays
+        seq_len = int((stop[0] - start[0]).item())
+
+        # positions: [B, seq_len]
+        positions = mx.arange(seq_len)[None, :] + start[:, None]
+
+        scaling = 1 + beta * mx.log(1 + mx.floor(positions / max_position_embeddings))
+        return scaling[:, :, None]  # [B, seq_len, 1]
+    else:
+        # Single sequence mode
+        start_val = int(start.item() if isinstance(start, mx.array) else start)
+        stop_val = int(stop.item() if isinstance(stop, mx.array) else stop)
+
+        scaling = 1 + beta * mx.log(
+            1 + mx.floor(mx.arange(start_val, stop_val) / max_position_embeddings)
+        )
+        return scaling[:, None]
 
 
 class Attention(nn.Module):

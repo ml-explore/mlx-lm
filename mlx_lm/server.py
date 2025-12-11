@@ -489,7 +489,7 @@ class ResponseGenerator:
 
             if tokenizer.chat_template:
                 process_message_content(messages)
-                return tokenizer.apply_chat_template(
+                result = tokenizer.apply_chat_template(
                     messages,
                     tools,
                     add_generation_prompt=True,
@@ -497,9 +497,30 @@ class ResponseGenerator:
                     **self.model_provider.cli_args.chat_template_args,
                 )
             else:
-                return tokenizer.encode(convert_chat(messages, role_mapping))
+                result = tokenizer.encode(convert_chat(messages, role_mapping))
         else:
-            return tokenizer.encode(request.prompt)
+            result = tokenizer.encode(request.prompt)
+
+        # Ensure result is a list of integers
+        if isinstance(result, list):
+            return result
+
+        # Handle BatchEncoding or dict-like objects
+        if hasattr(result, "input_ids"):
+            result = result.input_ids
+
+        # Convert array-like objects to list
+        if hasattr(result, "tolist"):
+            return result.tolist()
+
+        # Last resort: try to convert to list
+        try:
+            return list(result)
+        except (TypeError, ValueError) as e:
+            raise TypeError(
+                f"Could not convert tokenizer result to list. "
+                f"Type: {type(result)}, Error: {e}"
+            )
 
     def _is_batchable(self, args):
         if (
