@@ -532,12 +532,15 @@ class ResponseGenerator:
 
         unprocessed_requests = []
 
-        def get_next_request():
+        def get_next_request(timeout=None):
             if unprocessed_requests:
                 return unprocessed_requests.pop()
             else:
                 try:
-                    return self.requests.get_nowait()
+                    if timeout is not None:
+                        return self.requests.get(timeout=timeout)
+                    else:
+                        return self.requests.get_nowait()
                 except QueueEmpty:
                     return None
 
@@ -549,7 +552,9 @@ class ResponseGenerator:
         while not self._stop:
             request = None
             if not drain_batch:
-                request = get_next_request()
+                # Use timeout when idle (no batch running) to avoid busy-waiting
+                timeout = 0.1 if batch_generator is None else None
+                request = get_next_request(timeout=timeout)
 
             # We got a request
             if request is not None:
