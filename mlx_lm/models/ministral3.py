@@ -36,13 +36,17 @@ class ModelArgs(BaseModelArgs):
             self.layer_types = ["full_attention"] * self.num_hidden_layers
 
 
-def _get_llama_4_attn_scale(
-    start: int, stop: int, beta: float, max_position_embeddings: int
-):
+def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        offset = offset[:, None]
+
     scaling = 1 + beta * mx.log(
-        1 + mx.floor(mx.arange(start, stop) / max_position_embeddings)
+        1 + mx.floor((mx.arange(size) + offset) / max_position_embeddings)
     )
-    return scaling[:, None]
+    if scaling.ndim == 2:
+        return scaling[:, None, :, None]
+    else:
+        return scaling[:, None]
 
 
 class Attention(nn.Module):
@@ -182,8 +186,7 @@ class LanguageModel(nn.Module):
             cache = [None] * len(self.layers)
             offset = 0
         else:
-            # Convert to Python int for mx.arange compatibility in _get_llama_4_attn_scale
-            offset = int(cache[0].offset)
+            offset = cache[0].offset
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         if self.swa_idx is not None:
@@ -192,8 +195,8 @@ class LanguageModel(nn.Module):
             )
 
         attn_scale = _get_llama_4_attn_scale(
+            inputs.shape[1],
             offset,
-            offset + inputs.shape[1],
             self.args.rope_parameters["llama_4_scaling_beta"],
             self.args.rope_parameters["original_max_position_embeddings"],
         ).astype(h.dtype)
