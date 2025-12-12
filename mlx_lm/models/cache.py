@@ -592,6 +592,11 @@ class MambaCache(ArraysCache):
         super().__init__(size=2, left_padding=left_padding)
 
 
+class RwkvCache(ArraysCache):
+    def __init__(self, left_padding: Optional[List[int]] = None):
+        super().__init__(size=3, left_padding=left_padding)
+
+
 class ChunkedKVCache(KVCache):
     def __init__(self, chunk_size):
         super().__init__()
