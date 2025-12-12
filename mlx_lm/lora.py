@@ -5,6 +5,7 @@ import re
 import types
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -75,6 +76,43 @@ CONFIG_DEFAULTS = {
     "report_to": None,
     "project_name": None,
 }
+
+_ITERATION_PATTERN = re.compile(r"(\d+)_adapters\.safetensors$")
+
+
+def _extract_iteration_from_filename(path: Path) -> Optional[int]:
+    match = _ITERATION_PATTERN.match(path.name)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _infer_iteration_offset(
+    adapter_path: Path, resume_adapter_file: Optional[str]
+) -> int:
+    search_dirs = []
+    if resume_adapter_file:
+        resume_path = Path(resume_adapter_file)
+        iteration = _extract_iteration_from_filename(resume_path)
+        if iteration is not None:
+            return iteration
+        search_dirs.append(resume_path.parent)
+    search_dirs.append(adapter_path)
+
+    max_iteration: Optional[int] = None
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for candidate in directory.glob("*_adapters.safetensors"):
+            iteration = _extract_iteration_from_filename(candidate)
+            if iteration is None:
+                continue
+            if max_iteration is None or iteration > max_iteration:
+                max_iteration = iteration
+    return max_iteration or 0
 
 
 def build_parser():
@@ -241,14 +279,20 @@ def train_model(
     if args.resume_adapter_file is not None:
         print(f"Loading fine-tuned weights from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
-
-    print_trainable_parameters(model)
-
     adapter_path = Path(args.adapter_path)
     adapter_path.mkdir(parents=True, exist_ok=True)
 
+    iteration_offset = _infer_iteration_offset(adapter_path, args.resume_adapter_file)
+    if iteration_offset < 0:
+        raise ValueError("Computed iteration offset must be non-negative")
+    if args.resume_adapter_file is not None and iteration_offset > 0:
+        print(f"Continuing from iteration {iteration_offset}.")
+
+    print_trainable_parameters(model)
+
     adapter_file = adapter_path / "adapters.safetensors"
-    save_config(vars(args), adapter_path / "adapter_config.json")
+    config_data = vars(args).copy()
+    save_config(config_data, adapter_path / "adapter_config.json")
 
     # init training args
     training_args = TrainingArgs(
@@ -258,6 +302,7 @@ def train_model(
         steps_per_report=args.steps_per_report,
         steps_per_eval=args.steps_per_eval,
         steps_per_save=args.save_every,
+        iteration_offset=iteration_offset,
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
