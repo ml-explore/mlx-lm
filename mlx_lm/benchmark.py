@@ -78,7 +78,9 @@ def main():
         elif args.shard:
             model, tokenizer, config = sharded_load(args.model, return_config=True)
         else:
-            parser.error("At least one of --pipeline or --shard is required for distributed generation")
+            parser.error(
+                "At least one of --pipeline or --shard is required for distributed generation"
+            )
     else:
         model, tokenizer, config = load(
             args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
