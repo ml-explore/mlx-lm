@@ -54,15 +54,18 @@ class ModelArgs(BaseModelArgs):
 
 
 class MambaRMSNormGated(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(self, hidden_size: int, eps: float, group_size: int):
         super().__init__()
         self.eps = eps
         self.weight = mx.ones(hidden_size)
+        self.group_size = group_size
 
-    def __call__(self, hidden_states: mx.array, gate: mx.array = None) -> mx.array:
+    def __call__(self, x: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
-        return mx.fast.rms_norm(hidden_states, self.weight, self.eps)
+            x = x * nn.silu(gate)
+        x = mx.unflatten(x, axis=-1, shape=(-1, self.group_size))
+        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
+        return self.weight * x.flatten(-2)
 
 
 class NemotronHMamba2Mixer(nn.Module):
@@ -98,8 +101,11 @@ class NemotronHMamba2Mixer(nn.Module):
         self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
         self.D = mx.ones(self.num_heads)
 
+        group_size = self.intermediate_size // self.n_groups
         self.norm = MambaRMSNormGated(
-            self.intermediate_size, eps=args.layer_norm_epsilon
+            self.intermediate_size,
+            eps=args.layer_norm_epsilon,
+            group_size=group_size,
         )
         self.out_proj = nn.Linear(
             self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
@@ -147,7 +153,7 @@ class NemotronHMamba2Mixer(nn.Module):
             self.A_log,
             B,
             C,
-            self.D,
+            self.D.astype(hidden_states.dtype),
             dt,
             self.dt_bias,
             state,
@@ -279,7 +285,7 @@ def group_expert_select(
     norm_topk_prob,
 ):
 
-    scores = mx.sigmoid(gates.astype(mx.float32))
+    orig_scores = scores = mx.sigmoid(gates.astype(mx.float32))
     scores = scores + e_score_correction_bias
     if n_group > 1:
         scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
@@ -293,7 +299,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    scores = mx.take_along_axis(scores, inds, axis=-1)
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
         scores = scores / (denominator + 1e-20)
@@ -488,6 +494,6 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k):
-            return "e_score_correction_bias" not in k
+            return "e_score_correction_bias" not in k and "A_log" not in k
 
         return predicate
