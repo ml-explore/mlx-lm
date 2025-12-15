@@ -15,6 +15,7 @@ from .base import (
 )
 from .cache import KVCache, MambaCache
 from .ssm import ssm_update
+from .switch_layers import SwitchMLP
 
 
 @dataclass()
@@ -37,12 +38,19 @@ class ModelArgs(BaseModelArgs):
     time_step_limit: Tuple[float, float]
     mlp_bias: bool
     layer_norm_epsilon: float
-    rms_norm_eps: float
     use_bias: bool
     use_conv_bias: bool
-    residual_in_fp32: bool
     hybrid_override_pattern: List[str]
     head_dim: Optional[int] = None
+    moe_intermediate_size: Optional[int] = None
+    moe_shared_expert_intermediate_size: Optional[int] = None
+    n_group: Optional[int] = None
+    n_routed_experts: Optional[int] = None
+    n_shared_experts: Optional[int] = None
+    topk_group: Optional[int] = None
+    num_experts_per_tok: Optional[int] = None
+    norm_topk_prob: Optional[bool] = None
+    routed_scaling_factor: Optional[float] = None
 
 
 class MambaRMSNormGated(nn.Module):
@@ -245,24 +253,113 @@ class NemotronHAttention(nn.Module):
 
 
 class NemotronHMLP(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, intermediate_size=None):
         super().__init__()
+        intermediate_size = intermediate_size or args.intermediate_size
+
         self.up_proj = nn.Linear(
-            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
+            args.hidden_size, intermediate_size, bias=args.mlp_bias
         )
         self.down_proj = nn.Linear(
-            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
+            intermediate_size, args.hidden_size, bias=args.mlp_bias
         )
 
     def __call__(self, x):
         return self.down_proj(nn.relu2(self.up_proj(x)))
 
 
+@mx.compile
+def group_expert_select(
+    gates,
+    e_score_correction_bias,
+    top_k,
+    n_group,
+    topk_group,
+    routed_scaling_factor,
+    norm_topk_prob,
+):
+
+    scores = mx.sigmoid(gates.astype(mx.float32))
+    scores = scores + e_score_correction_bias
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        scores = mx.flatten(scores, -2, -1)
+
+    k = top_k
+    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    scores = mx.take_along_axis(scores, inds, axis=-1)
+    if top_k > 1 and norm_topk_prob:
+        denominator = scores.sum(axis=-1, keepdims=True)
+        scores = scores / (denominator + 1e-20)
+    scores = scores * routed_scaling_factor
+
+    return inds, scores
+
+
+class MoEGate(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
+        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
+
+    def __call__(self, x):
+        return group_expert_select(
+            x @ self.weight.T,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
+
+
+class NemotronHMoE(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.switch_mlp = SwitchMLP(
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.n_routed_experts,
+            activation=nn.ReLU2(),
+        )
+
+        self.gate = MoEGate(config)
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_shared_expert_intermediate_size
+            self.shared_experts = NemotronHMLP(
+                config, intermediate_size=intermediate_size
+            )
+
+    def __call__(self, x):
+        inds, scores = self.gate(x)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        if self.config.n_shared_experts is not None:
+            y = y + self.shared_experts(x)
+
+        return y
+
+
 class NemotronHBlock(nn.Module):
     def __init__(self, args: ModelArgs, block_type: str):
         super().__init__()
-        self.residual_in_fp32 = args.residual_in_fp32
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
 
         self.block_type = block_type
 
@@ -272,6 +369,8 @@ class NemotronHBlock(nn.Module):
             self.mixer = NemotronHAttention(args)
         elif self.block_type == "-":
             self.mixer = NemotronHMLP(args)
+        elif self.block_type == "E":
+            self.mixer = NemotronHMoE(args)
 
     def __call__(
         self,
@@ -296,7 +395,7 @@ class NemotronHModel(nn.Module):
             NemotronHBlock(args, block_type)
             for block_type in args.hybrid_override_pattern
         ]
-        self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0
         self.ssm_idx = 0
         for b in args.hybrid_override_pattern:
@@ -372,4 +471,23 @@ class Model(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
+
+        # Stack experts
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"backbone.layers.{l}.mixer"
+            for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
+                if f"{prefix}.experts.0.{m}.weight" in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.experts.{e}.{m}.weight")
+                        for e in range(self.args.n_routed_experts)
+                    ]
+                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+
         return weights
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate
