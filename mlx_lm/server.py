@@ -1235,100 +1235,104 @@ class APIHandler(BaseHTTPRequestHandler):
         # Well finally save the reason for stopping
         finish_reason = "length"
 
-        # Process the generated tokens
-        for gen in response:
-            logging.debug(gen.text)
+        try:
+            # Process the generated tokens
+            for gen in response:
+                logging.debug(gen.text)
 
-            # Gather the text in tool calling or text variables
-            if ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                in_tool_call = True
-            elif in_tool_call:
-                if gen.text == ctx.tool_call_end:
-                    tool_calls.append(tool_text)
-                    tool_text = ""
-                    in_tool_call = False
+                # Gather the text in tool calling or text variables
+                if ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                    in_tool_call = True
+                elif in_tool_call:
+                    if gen.text == ctx.tool_call_end:
+                        tool_calls.append(tool_text)
+                        tool_text = ""
+                        in_tool_call = False
+                    else:
+                        tool_text += gen.text
                 else:
-                    tool_text += gen.text
-            else:
-                text += gen.text
-                segment += gen.text
+                    text += gen.text
+                    segment += gen.text
 
-            # Save the token and its logprob
-            tokens.append(gen.token)
-            token_logprobs.append(gen.logprob)
+                # Save the token and its logprob
+                tokens.append(gen.token)
+                token_logprobs.append(gen.logprob)
 
-            # If requested save the k top logprobs
-            if gen.top_tokens is not None:
-                top_tokens.append(gen.top_tokens)
+                # If requested save the k top logprobs
+                if gen.top_tokens is not None:
+                    top_tokens.append(gen.top_tokens)
 
-            # Check if we should stop early
-            stop_condition = stopping_criteria(
-                tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id
-            )
-            if stop_condition.stop_met:
-                finish_reason = "stop"
-                ctx.stop()
-                tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                text = text[: len(text) - stop_condition.trim_text_length]
-                segment = ""
-                break
-
-            if self.stream and not in_tool_call:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
-                if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in ctx.stop_token_sequences
-                    )
-                ):
-                    continue
-                elif segment or tool_calls:
-                    response = self.generate_response(
-                        segment, None, tool_calls=tool_calls
-                    )
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                    self.wfile.flush()
+                # Check if we should stop early
+                stop_condition = stopping_criteria(
+                    tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id
+                )
+                if stop_condition.stop_met:
+                    finish_reason = "stop"
+                    tokens = tokens[: len(tokens) - stop_condition.trim_length]
+                    text = text[: len(text) - stop_condition.trim_text_length]
                     segment = ""
-                    tool_calls = []
+                    break
 
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
+                if self.stream and not in_tool_call:
+                    # If the end of tokens overlaps with a stop sequence, generate new
+                    # tokens until we know if the stop sequence is hit or not
+                    if any(
+                        (
+                            sequence_overlap(tokens, sequence)
+                            for sequence in ctx.stop_token_sequences
+                        )
+                    ):
+                        continue
+                    elif segment or tool_calls:
+                        response = self.generate_response(
+                            segment, None, tool_calls=tool_calls
+                        )
+                        self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                        self.wfile.flush()
+                        segment = ""
+                        tool_calls = []
 
-        if self.stream:
-            response = self.generate_response(
-                segment, finish_reason, tool_calls=tool_calls
-            )
-            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-            self.wfile.flush()
-            if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(ctx.prompt), len(tokens))
+                if gen.finish_reason is not None:
+                    finish_reason = gen.finish_reason
+
+            if self.stream:
+                response = self.generate_response(
+                    segment, finish_reason, tool_calls=tool_calls
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
-            self.wfile.write("data: [DONE]\n\n".encode())
-            self.wfile.flush()
-        else:
-            response = self.generate_response(
-                text,
-                finish_reason,
-                len(ctx.prompt),
-                len(tokens),
-                token_logprobs=token_logprobs,
-                top_tokens=top_tokens,
-                tokens=tokens,
-                tool_calls=tool_calls,
-            )
-            response_json = json.dumps(response).encode()
-            indent = "\t"  # Backslashes can't be inside of f-strings
-            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
+                if self.stream_options is not None and self.stream_options["include_usage"]:
+                    response = self.completion_usage_response(len(ctx.prompt), len(tokens))
+                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+            else:
+                response = self.generate_response(
+                    text,
+                    finish_reason,
+                    len(ctx.prompt),
+                    len(tokens),
+                    token_logprobs=token_logprobs,
+                    top_tokens=top_tokens,
+                    tokens=tokens,
+                    tool_calls=tool_calls,
+                )
+                response_json = json.dumps(response).encode()
+                indent = "\t"  # Backslashes can't be inside of f-strings
+                logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
 
-            # Send an additional Content-Length header when it is known
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json)
-            self.wfile.flush()
+                # Send an additional Content-Length header when it is known
+                self.send_header("Content-Length", str(len(response_json)))
+                self.end_headers()
+                self.wfile.write(response_json)
+                self.wfile.flush()
 
-        metrics.finish(len(tokens))
+            metrics.finish(len(tokens))
+        except (BrokenPipeError, ConnectionResetError):
+            metrics.cancel()
+        finally:
+            ctx.stop()
 
     def completion_usage_response(
         self,

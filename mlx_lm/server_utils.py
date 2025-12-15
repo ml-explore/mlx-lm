@@ -95,6 +95,10 @@ class RequestMetrics:
         self.stats.request_started()
         self.stats.add_tokens(prompt_tokens=prompt_tokens)
 
+    def cancel(self):
+        logging.info(f"[{self.request_id}] Cancelled")
+        self.stats.request_finished()
+
     def finish(self, generation_tokens: int):
         now = time.perf_counter()
         gen_time = now - self._gen_start if self._gen_start else 0
