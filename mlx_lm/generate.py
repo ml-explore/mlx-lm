@@ -1325,6 +1325,7 @@ def main():
             tokenize=False,
             continue_final_message=has_prefill,
             add_generation_prompt=not has_prefill,
+            return_dict=False,
             **template_kwargs,
         )
 
@@ -1336,6 +1337,7 @@ def main():
                 messages,
                 tokenize=False,
                 continue_final_message=has_prefill,
+                return_dict=False,
                 add_generation_prompt=not has_prefill,
             )
             prompt = prompt[test_prompt.index("<query>") :]

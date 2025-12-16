@@ -55,7 +55,9 @@ if __name__ == "__main__":
     model, tokenizer = pipeline_load(args.model)
 
     messages = [{"role": "user", "content": args.prompt}]
-    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    prompt = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, return_dict=False
+    )
 
     for response in stream_generate(
         model, tokenizer, prompt, max_tokens=args.max_tokens

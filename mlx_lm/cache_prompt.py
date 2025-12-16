@@ -114,7 +114,10 @@ def main():
     if not args.ignore_chat_template and tokenizer.chat_template is not None:
         messages = [{"role": "user", "content": args.prompt}]
         prompt = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=False, continue_final_message=True
+            messages,
+            add_generation_prompt=False,
+            continue_final_message=True,
+            return_dict=False,
         )
 
     else:

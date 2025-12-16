@@ -31,7 +31,10 @@ prompt = "Multiply 12234585 and 48838483920."
 messages = [{"role": "user", "content": prompt}]
 
 prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True, tools=list(tools.values())
+    messages,
+    add_generation_prompt=True,
+    tools=list(tools.values()),
+    return_dict=False,
 )
 
 prompt_cache = make_prompt_cache(model)
@@ -60,6 +63,7 @@ messages = [{"role": "tool", "name": tool_call["name"], "content": tool_result}]
 prompt = tokenizer.apply_chat_template(
     messages,
     add_generation_prompt=True,
+    return_dict=False,
 )
 
 # Generate the final response:

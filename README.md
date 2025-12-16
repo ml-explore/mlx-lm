@@ -71,7 +71,7 @@ prompt = "Write a story about Einstein"
 
 messages = [{"role": "user", "content": prompt}]
 prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True
+    messages, add_generation_prompt=True, return_dict=False,
 )
 
 text = generate(model, tokenizer, prompt=prompt, verbose=True)
@@ -130,7 +130,7 @@ prompt = "Write a story about Einstein"
 
 messages = [{"role": "user", "content": prompt}]
 prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True
+    messages, add_generation_prompt=True, return_dict=False,
 )
 
 for response in stream_generate(model, tokenizer, prompt, max_tokens=512):

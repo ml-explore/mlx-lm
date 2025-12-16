@@ -21,6 +21,7 @@ prompts = [
     tokenizer.apply_chat_template(
         [{"role": "user", "content": p}],
         add_generation_prompt=True,
+        return_dict=False,
     )
     for p in prompts
 ]
@@ -41,6 +42,7 @@ prompts = [
     tokenizer.apply_chat_template(
         [{"role": "user", "content": p}],
         add_generation_prompt=True,
+        return_dict=False,
     )
     for p in prompts
 ]

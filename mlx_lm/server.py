@@ -494,6 +494,7 @@ class ResponseGenerator:
                     tools,
                     add_generation_prompt=True,
                     tokenize=True,
+                    return_dict=False,
                     **self.model_provider.cli_args.chat_template_args,
                 )
             else:
@@ -552,7 +553,6 @@ class ResponseGenerator:
         while not self._stop:
             request = None
             if not drain_batch:
-                # Use timeout when idle (no batch running) to avoid busy-waiting
                 timeout = 0.1 if batch_generator is None else None
                 request = get_next_request(timeout=timeout)
 
