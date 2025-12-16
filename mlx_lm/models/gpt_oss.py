@@ -233,34 +233,58 @@ class Model(nn.Module):
         if any("gate_proj.weight" in k for k in weights.keys()):
             return weights  # already sanitized
 
+        # Explicit format detection: MXFP4 uses paired _blocks/_scales suffixes
+        has_blocks = any("_blocks" in k for k in weights.keys())
+        has_scales = any("_scales" in k for k in weights.keys())
+        if has_blocks != has_scales:
+            import warnings
+
+            warnings.warn(
+                f"gpt_oss: Unexpected weight format - has _blocks={has_blocks}, "
+                f"has _scales={has_scales}. Expected both or neither."
+            )
+        is_mxfp4 = has_blocks and has_scales
+
         new_weights = {}
         for k, v in weights.items():
             if "gate_up_proj" in k and "bias" not in k:
-                if "_blocks" in k:
+                if is_mxfp4 and "_blocks" in k:
                     v = v.view(mx.uint32).flatten(-2)
                     k = k.replace("_blocks", ".weight")
-                if "_scales" in k:
+                    gate_v = mx.contiguous(v[..., ::2, :])
+                    up_v = mx.contiguous(v[..., 1::2, :])
+                elif is_mxfp4 and "_scales" in k:
                     k = k.replace("_scales", ".scales")
-                new_weights[k.replace("gate_up_proj", "gate_proj")] = mx.contiguous(
-                    v[..., ::2, :]
-                )
-                new_weights[k.replace("gate_up_proj", "up_proj")] = mx.contiguous(
-                    v[..., 1::2, :]
-                )
+                    gate_v = mx.contiguous(v[..., ::2, :])
+                    up_v = mx.contiguous(v[..., 1::2, :])
+                elif not is_mxfp4:
+                    # HF format: interleaved split + transpose to (experts, OUT, IN)
+                    # Ref: github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py
+                    k = k + ".weight"
+                    gate_v = mx.contiguous(v[..., ::2].swapaxes(-1, -2))
+                    up_v = mx.contiguous(v[..., 1::2].swapaxes(-1, -2))
+                else:
+                    continue  # skip unexpected keys in MXFP4 mode
+                new_weights[k.replace("gate_up_proj", "gate_proj")] = gate_v
+                new_weights[k.replace("gate_up_proj", "up_proj")] = up_v
             elif "down_proj" in k and "bias" not in k:
-                if "_blocks" in k:
+                if is_mxfp4 and "_blocks" in k:
                     v = v.view(mx.uint32).flatten(-2)
                     k = k.replace("_blocks", ".weight")
-                if "_scales" in k:
+                elif is_mxfp4 and "_scales" in k:
                     k = k.replace("_scales", ".scales")
+                elif not is_mxfp4:
+                    # HF format: transpose to (experts, OUT, IN)
+                    k = k + ".weight"
+                    v = mx.contiguous(v.swapaxes(-1, -2))
+                else:
+                    continue  # skip unexpected keys in MXFP4 mode
                 new_weights[k] = v
             elif "gate_up_proj_bias" in k:
-                new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = (
-                    mx.contiguous(v[..., ::2])
-                )
-                new_weights[k.replace("gate_up_proj_bias", "up_proj.bias")] = (
-                    mx.contiguous(v[..., 1::2])
-                )
+                gate_b = mx.contiguous(v[..., ::2])
+                up_b = mx.contiguous(v[..., 1::2])
+                new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = gate_b
+                new_weights[k.replace("gate_up_proj_bias", "up_proj.bias")] = up_b
             elif "down_proj_bias" in k:
                 new_weights[k.replace("down_proj_bias", "down_proj.bias")] = v
             else:
@@ -274,9 +298,38 @@ class Model(nn.Module):
 
     @property
     def quant_predicate(self):
+        """Default quantization predicate - keep routers at higher precision."""
+
         def predicate(path, _):
             if path.endswith("router"):
                 return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def quant_predicate_mxfp4(self):
+        """
+        MXFP4-specific predicate matching OpenAI's modules_to_not_convert:
+        - model.layers.*.self_attn (all attention projections)
+        - model.layers.*.mlp.router
+        - model.embed_tokens
+        - lm_head
+        """
+
+        def predicate(path, _):
+            # Keep attention layers at full precision
+            if ".self_attn." in path:
+                return False
+            # Keep routers at full precision
+            if path.endswith("router"):
+                return False
+            # Keep embeddings at full precision
+            if path.endswith("embed_tokens"):
+                return False
+            # Keep lm_head at full precision
+            if path.endswith("lm_head"):
+                return False
             return True
 
         return predicate

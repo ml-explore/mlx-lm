@@ -592,7 +592,14 @@ def quantize_model(
     """
     quantized_config = copy.deepcopy(config)
 
-    quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    # Check for mode-specific predicate first (e.g., quant_predicate_mxfp4)
+    # This allows models to define different quantization strategies per mode
+    mode_specific_predicate = getattr(model, f"quant_predicate_{mode}", None)
+    quant_predicate = (
+        quant_predicate
+        or mode_specific_predicate
+        or getattr(model, "quant_predicate", None)
+    )
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that

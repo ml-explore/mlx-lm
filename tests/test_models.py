@@ -2177,6 +2177,92 @@ class TestModels(unittest.TestCase):
             self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
             self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def test_gpt_oss_sanitize_hf(self):
+        """Test gpt_oss sanitize handles HF format weights.
+
+        HF format weights use interleaved gate/up outputs
+        (see transformers modeling_gpt_oss.py: gate, up = gate_up[..., ::2], gate_up[..., 1::2])
+        and store as (experts, IN, OUT) vs SwitchLinear's (experts, OUT, IN).
+        """
+        from mlx_lm.models.gpt_oss import Model, ModelArgs
+
+        args = ModelArgs(
+            model_type="gpt_oss",
+            num_hidden_layers=2,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            vocab_size=100,
+            hidden_size=32,
+            intermediate_size=32,
+            head_dim=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        model = Model(args)
+
+        # Simulate unquantized weights: (experts, hidden_size, intermediate*2)
+        # with interleaved gate/up in last dimension
+        num_experts = 4
+        hidden = 32
+        intermediate = 32
+
+        # Create interleaved gate_up: columns 0,2,4...=gate, 1,3,5...=up
+        gate_data = mx.random.normal((num_experts, hidden, intermediate))
+        up_data = mx.random.normal((num_experts, hidden, intermediate))
+        # Interleave along last dim by stacking and reshaping
+        gate_up = mx.stack([gate_data, up_data], axis=-1).reshape(
+            num_experts, hidden, intermediate * 2
+        )
+
+        down_proj = mx.random.normal((num_experts, intermediate, hidden))
+
+        # Biases with distinguishable values to verify split correctness
+        gate_bias = mx.full((num_experts, intermediate), 1.0)
+        up_bias = mx.full((num_experts, intermediate), 2.0)
+        gate_up_bias = mx.stack([gate_bias, up_bias], axis=-1).reshape(
+            num_experts, intermediate * 2
+        )
+        down_bias = mx.full((num_experts, hidden), 3.0)
+
+        weights = {
+            "model.layers.0.mlp.experts.gate_up_proj": gate_up,
+            "model.layers.0.mlp.experts.down_proj": down_proj,
+            "model.layers.0.mlp.experts.gate_up_proj_bias": gate_up_bias,
+            "model.layers.0.mlp.experts.down_proj_bias": down_bias,
+        }
+
+        sanitized = model.sanitize(weights)
+
+        # Check gate_proj and up_proj were split and transposed correctly
+        self.assertIn("model.layers.0.mlp.experts.gate_proj.weight", sanitized)
+        self.assertIn("model.layers.0.mlp.experts.up_proj.weight", sanitized)
+        self.assertIn("model.layers.0.mlp.experts.down_proj.weight", sanitized)
+
+        gate_w = sanitized["model.layers.0.mlp.experts.gate_proj.weight"]
+        up_w = sanitized["model.layers.0.mlp.experts.up_proj.weight"]
+        down_w = sanitized["model.layers.0.mlp.experts.down_proj.weight"]
+
+        # Shape should be (experts, OUT, IN) = (4, 32, 32)
+        self.assertEqual(gate_w.shape, (num_experts, intermediate, hidden))
+        self.assertEqual(up_w.shape, (num_experts, intermediate, hidden))
+        self.assertEqual(down_w.shape, (num_experts, hidden, intermediate))
+
+        # Verify values: after interleaved split + transpose,
+        # gate_w should equal gate_data transposed
+        mx.eval(gate_w, up_w, gate_data, up_data)
+        self.assertTrue(mx.allclose(gate_w, gate_data.swapaxes(-1, -2), atol=1e-5))
+        self.assertTrue(mx.allclose(up_w, up_data.swapaxes(-1, -2), atol=1e-5))
+
+        # Verify bias split: gate_bias=1.0, up_bias=2.0, down_bias=3.0
+        gate_b = sanitized["model.layers.0.mlp.experts.gate_proj.bias"]
+        up_b = sanitized["model.layers.0.mlp.experts.up_proj.bias"]
+        down_b = sanitized["model.layers.0.mlp.experts.down_proj.bias"]
+        mx.eval(gate_b, up_b, down_b)
+        self.assertTrue(mx.allclose(gate_b, mx.full((num_experts, intermediate), 1.0)))
+        self.assertTrue(mx.allclose(up_b, mx.full((num_experts, intermediate), 2.0)))
+        self.assertTrue(mx.allclose(down_b, mx.full((num_experts, hidden), 3.0)))
+
 
 if __name__ == "__main__":
     unittest.main()
