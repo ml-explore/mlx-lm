@@ -279,9 +279,11 @@ class GenerationResponse:
     logprobs: mx.array
     from_draft: bool
     prompt_tokens: int
+    prompt_time: float
     prompt_tps: float
     generation_tokens: int
     generation_tps: float
+    total_generation_time: float
     peak_memory: float
     finish_reason: Optional[str] = None
 
@@ -705,15 +707,19 @@ def stream_generate(
             if (n + 1) == max_tokens:
                 break
 
+                
+
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
                 logprobs=logprobs,
                 from_draft=from_draft,
                 prompt_tokens=prompt.size,
+                prompt_time=prompt_time,
                 prompt_tps=prompt_tps,
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
+                total_generation_time = time.perf_counter() - tic, 
                 peak_memory=mx.get_peak_memory() / 1e9,
                 finish_reason=None,
             )
@@ -725,9 +731,11 @@ def stream_generate(
             logprobs=logprobs,
             from_draft=from_draft,
             prompt_tokens=prompt.size,
+            prompt_time=prompt_time,
             prompt_tps=prompt_tps,
             generation_tokens=n + 1,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
+            total_generation_time = time.perf_counter() - tic, 
             peak_memory=mx.get_peak_memory() / 1e9,
             finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
         )

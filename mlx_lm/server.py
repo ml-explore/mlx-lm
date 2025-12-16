@@ -526,7 +526,7 @@ class APIHandler(BaseHTTPRequestHandler):
             response["usage"] = {
                 "prompt_tokens": prompt_token_count,
                 "completion_tokens": completion_token_count,
-                "total_tokens": prompt_token_count + completion_token_count,
+                "total_tokens": prompt_token_count + completion_token_count
             }
 
         choice = response["choices"][0]
@@ -580,6 +580,11 @@ class APIHandler(BaseHTTPRequestHandler):
                        by the model. This will be the full prompt if the cache is
                        reset or cannot be effectively used.
         """
+        # TESTING ONLY, Added by Jia Wei: Force full prompt recomputation. Must remove it after testing. Will gain performance boosts to have cache. Now we remove the cache for testing only. Line below must be removed after testing. 
+        self.reset_prompt_cache(prompt)
+        return prompt
+        # TESTING ONLY, Added by Jia Wei. Line above must be removed after testing.
+    
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
         com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
@@ -777,11 +782,16 @@ class APIHandler(BaseHTTPRequestHandler):
         logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
         logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
         logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
+        logging.debug(f"Prefill time: {gen_response.prompt_time:.3f} sec")
+        logging.debug(f"Generation time: {gen_response.total_generation_time:.3f} sec")
 
         if self.stream:
             response = self.generate_response(
                 segment, finish_reason, tool_calls=tool_calls
             )
+            
+         
+            
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
@@ -791,6 +801,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 response = self.completion_usage_response(
                     original_prompt_length, len(tokens)
                 )
+                response['metrics'] = {"prefill_tps": int(gen_response.prompt_tps), "prefill_time": round(float(gen_response.prompt_time), 4),
+                                       "generation_tps": int(gen_response.generation_tps), "total_generation_time": round(float(gen_response.total_generation_time), 4), "peak_memory": int(gen_response.peak_memory)}
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
@@ -804,8 +816,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
-                tool_calls=tool_calls,
+                tool_calls=tool_calls
             )
+            response['metrics'] = {"prefill_tps": int(gen_response.prompt_tps), "prefill_time": round(float(gen_response.prompt_time), 3),
+                                       "generation_tps": int(gen_response.generation_tps), "total_generation_time": round(float(gen_response.total_generation_time), 3), "peak_memory": int(gen_response.peak_memory)}
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
             logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
