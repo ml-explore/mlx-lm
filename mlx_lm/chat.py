@@ -80,10 +80,9 @@ def setup_arg_parser():
         help="System prompt to be used for the chat template",
     )
     parser.add_argument(
-        "--shard", action="store_true", help="Shard the model to nodes across width"
-    )
-    parser.add_argument(
-        "--pipeline", action="store_true", help="Shard the model to nodes across depth"
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
     )
     return parser
 
@@ -94,6 +93,8 @@ def main():
 
     group = mx.distributed.init()
     rank = group.rank()
+    pipeline_group = group if args.pipeline else None
+    tensor_group = group if not args.pipeline else None
 
     def rprint(*args, **kwargs):
         if rank == 0:
@@ -105,14 +106,7 @@ def main():
     if group.size() > 1:
         if args.adapter_path:
             parser.error("Adapters not supported in distributed mode")
-        if args.pipeline:
-            model, tokenizer = pipeline_load(args.model)
-        elif args.shard:
-            model, tokenizer = sharded_load(args.model)
-        else:
-            parser.error(
-                "At least one of --pipeline or --shard is required for distributed generation"
-            )
+        model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
     else:
         model, tokenizer = load(
             args.model,

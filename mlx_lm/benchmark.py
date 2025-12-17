@@ -50,10 +50,9 @@ def setup_arg_parser():
         type=int,
     )
     parser.add_argument(
-        "--shard", action="store_true", help="Shard the model to nodes across width"
-    )
-    parser.add_argument(
-        "--pipeline", action="store_true", help="Shard the model to nodes across depth"
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
     )
     return parser
 
@@ -65,6 +64,8 @@ def main():
 
     group = mx.distributed.init()
     rank = group.rank()
+    pipeline_group = group if args.pipeline else None
+    tensor_group = group if not args.pipeline else None
 
     def rprint(*args, **kwargs):
         if rank == 0:
@@ -73,14 +74,9 @@ def main():
     model_path = args.model or DEFAULT_MODEL
 
     if group.size() > 1:
-        if args.pipeline:
-            model, tokenizer, config = pipeline_load(args.model, return_config=True)
-        elif args.shard:
-            model, tokenizer, config = sharded_load(args.model, return_config=True)
-        else:
-            parser.error(
-                "At least one of --pipeline or --shard is required for distributed generation"
-            )
+        model, tokenizer, config = sharded_load(
+            args.model, pipeline_group, tensor_group, return_config=True
+        )
     else:
         model, tokenizer, config = load(
             args.model, return_config=True, tokenizer_config={"trust_remote_code": True}

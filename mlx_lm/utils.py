@@ -333,7 +333,12 @@ def load(
         return model, tokenizer
 
 
-def pipeline_load(repo, return_config=False):
+def sharded_load(
+    repo,
+    pipeline_group: Optional[mx.distributed.Group] = None,
+    tensor_group: Optional[mx.distributed.Group] = None,
+    return_config: bool = False,
+):
     # Get model path with everything but weight safetensors
     model_path = _download(
         repo,
@@ -349,27 +354,50 @@ def pipeline_load(repo, return_config=False):
         ],
     )
 
-    # Lazy load and shard model to figure out which weights we need
+    # Lazy load model to figure out what type of sharding we can do and which
+    # weights we need to download.
     model, config = load_model(model_path, lazy=True, strict=False)
 
-    group = mx.distributed.init()
-    rank = group.rank()
-    model.model.pipeline(group)
+    has_pipelining = hasattr(model.model, "pipeline")
+    has_tensor_parallel = hasattr(model, "shard")
 
-    # Figure out which files we need for the local shard
-    with open(model_path / "model.safetensors.index.json", "r") as fid:
-        weight_index = json.load(fid)["weight_map"]
+    if pipeline_group is not None and not has_pipelining:
+        raise ValueError(
+            "The model does not support pipelining but a pipeline_group was provided"
+        )
+    if tensor_group is not None and not has_tensor_parallel:
+        raise ValueError(
+            "The model does not support tensor parallelism but a tensor_group was provided"
+        )
+    if not has_pipelining and not has_tensor_parallel:
+        raise ValueError("The model does not support any sharding")
 
-    local_files = set()
-    for k, _ in tree_flatten(model.parameters()):
-        if file_name := weight_index.get(k, None) is None:
-            raise ValueError(
-                "Pipeline loading is only supported for MLX converted models."
-            )
-        local_files.add(weight_index[k])
+    if pipeline_group is tensor_group is None:
+        if has_tensor_parallel:
+            tensor_group = mx.distributed.init()
+        elif has_pipelining:
+            pipeline_group = mx.distributed.init()
 
-    # Download weights for local shard
-    _download(repo, allow_patterns=local_files)
+    # If pipelining then figure out which files we need for the local shard
+    if pipeline_group is not None:
+        model.model.pipeline(pipeline_group)
+
+        # Figure out which files we need for the local shard
+        with open(model_path / "model.safetensors.index.json", "r") as fid:
+            weight_index = json.load(fid)["weight_map"]
+
+        local_files = set()
+        for k, _ in tree_flatten(model.parameters()):
+            if file_name := weight_index.get(k, None) is None:
+                raise ValueError(
+                    "Pipeline loading is only supported for MLX converted models."
+                )
+            local_files.add(weight_index[k])
+
+        # Download weights for local shard
+        _download(repo, allow_patterns=local_files)
+    else:
+        _download(repo)
 
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
@@ -378,7 +406,10 @@ def pipeline_load(repo, return_config=False):
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)
-    model.model.pipeline(group)
+    if tensor_group is not None:
+        model.shard(tensor_group)
+    if pipeline_group is not None:
+        model.model.pipeline(pipeline_group)
     mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
@@ -389,26 +420,8 @@ def pipeline_load(repo, return_config=False):
         return model, tokenizer
 
 
-def sharded_load(repo, return_config=False):
-    # Download the model and load the metadata
-    model_path = _download(repo)
-    model, config = load_model(model_path, lazy=True, strict=True)
-    tokenizer = load_tokenizer(
-        model_path,
-        {"trust_remote_code": True},
-        eos_token_ids=config.get("eos_token_id", None),
-    )
-
-    # Shard the model and load it into memory
-    model.shard()
-    mx.eval(model.parameters())
-
-    # Synchronize processes to avoid timeout
-    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
-    if return_config:
-        return model, tokenizer, config
-    else:
-        return model, tokenizer
+def pipeline_load(repo, return_config=False):
+    return sharded_load(repo, mx.distributed.init(), None, return_config)
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
