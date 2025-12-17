@@ -139,7 +139,7 @@ def ssm_attn(
 
     dt = compute_dt(dt, dt_bias, time_step_limit)
     repeats = h // g
-    A = -mx.exp(A_log)
+    A = -mx.exp(A_log).astype(dt.dtype)
     dtA = dt * A.reshape(1, 1, -1)
     dtx = dt.reshape(b, l, h, 1) * x
 
