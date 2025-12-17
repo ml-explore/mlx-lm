@@ -447,5 +447,100 @@ class TestScheduleConfig(unittest.TestCase):
         self.assertEqual(mock_default_loss.call_count, 3)
 
 
+class TestTokenizerConfig(unittest.TestCase):
+    def test_tokenizer_config_from_yaml(self):
+        """Test that tokenizer_config is properly passed from config to tokenizer"""
+        import tempfile
+        import types
+        from unittest.mock import patch
+
+        # Create a temporary chat template file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jinja", delete=False) as f:
+            f.write("test template {{ messages }}")
+            template_file = f.name
+
+        try:
+            # Mock the load function to capture tokenizer_config
+            with patch("mlx_lm.lora.load") as mock_load:
+                mock_load.return_value = (MagicMock(), MagicMock())
+
+                with patch("mlx_lm.lora.load_dataset") as mock_load_dataset:
+                    mock_load_dataset.return_value = ([], [], [])
+
+                    with patch("mlx_lm.lora.evaluate_model") as mock_evaluate:
+                        # Create args with tokenizer_config
+                        args = types.SimpleNamespace(
+                            model="test-model",
+                            tokenizer_config={
+                                "trust_remote_code": True,
+                                "chat_template_file": template_file,
+                            },
+                            train=False,
+                            test=True,
+                            adapter_path="",
+                            seed=0,
+                            report_to=None,
+                            project_name=None,
+                        )
+
+                        # Run the function
+                        lora.run(args)
+
+                        # Verify load was called with correct tokenizer_config
+                        mock_load.assert_called_once()
+                        call_args = mock_load.call_args
+                        tokenizer_config = call_args[1]["tokenizer_config"]
+
+                        # Should have trust_remote_code
+                        self.assertTrue(tokenizer_config["trust_remote_code"])
+                        # Should have chat_template (loaded from file)
+                        self.assertEqual(
+                            tokenizer_config["chat_template"],
+                            "test template {{ messages }}",
+                        )
+                        # chat_template_file should be removed after loading
+                        self.assertNotIn("chat_template_file", tokenizer_config)
+        finally:
+            import os
+
+            os.unlink(template_file)
+
+    def test_tokenizer_config_inline_template(self):
+        """Test that inline chat_template is passed through correctly"""
+        import types
+        from unittest.mock import patch
+
+        inline_template = "inline {{ test }}"
+
+        with patch("mlx_lm.lora.load") as mock_load:
+            mock_load.return_value = (MagicMock(), MagicMock())
+
+            with patch("mlx_lm.lora.load_dataset") as mock_load_dataset:
+                mock_load_dataset.return_value = ([], [], [])
+
+                with patch("mlx_lm.lora.evaluate_model") as mock_evaluate:
+                    args = types.SimpleNamespace(
+                        model="test-model",
+                        tokenizer_config={
+                            "trust_remote_code": True,
+                            "chat_template": inline_template,
+                        },
+                        train=False,
+                        test=True,
+                        adapter_path="",
+                        seed=0,
+                        report_to=None,
+                        project_name=None,
+                    )
+
+                    lora.run(args)
+
+                    mock_load.assert_called_once()
+                    call_args = mock_load.call_args
+                    tokenizer_config = call_args[1]["tokenizer_config"]
+
+                    self.assertEqual(tokenizer_config["chat_template"], inline_template)
+
+
 if __name__ == "__main__":
     unittest.main()
