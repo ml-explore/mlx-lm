@@ -5,7 +5,9 @@ import copy
 import json
 import logging
 import platform
+import select
 import socket
+import subprocess
 import time
 import uuid
 import warnings
@@ -15,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
+from socketserver import BaseRequestHandler, ThreadingTCPServer
 from threading import Condition, Lock, Thread
 from typing import (
     Any,
@@ -40,7 +43,7 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load
+from .utils import load, sharded_load
 
 
 def get_system_fingerprint():
@@ -394,6 +397,13 @@ class ModelProvider:
         self.draft_model = None
         self.is_batchable = False
 
+        group = mx.distributed.init()
+        self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
+        self.tensor_group = (
+            group if group.size() > 1 and not cli_args.pipeline else None
+        )
+        self.is_distributed = group.size() > 1
+
         # Preload the default model if it is provided
         self.default_model_map = {}
         if self.cli_args.model is not None:
@@ -426,15 +436,29 @@ class ModelProvider:
                     "argument or in the HTTP request"
                 )
             adapter_path = adapter_path or self.cli_args.adapter_path
-            model, tokenizer = load(
-                self.cli_args.model,
-                adapter_path=adapter_path,
-                tokenizer_config=tokenizer_config,
-            )
+            # TODO: Generalize distributed load
+            if self.is_distributed:
+                model, tokenizer = sharded_load(
+                    self.cli_args.model, self.pipeline_group, self.tensor_group
+                )
+            else:
+                model, tokenizer = load(
+                    self.cli_args.model,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
         else:
-            model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
-            )
+            # TODO: Generalize distributed load
+            if self.is_distributed:
+                model, tokenizer = sharded_load(
+                    model_path, self.pipeline_group, self.tensor_group
+                )
+            else:
+                model, tokenizer = load(
+                    model_path,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
@@ -1515,7 +1539,67 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def run(
+class ProxyHandler(BaseRequestHandler):
+    def __init__(self, upstreams, *args, **kwargs):
+        self.upstreams = upstreams
+        super().__init__(*args, **kwargs)
+
+    def handle(self):
+        self.request.setblocking(False)
+        upstreams = [socket.create_connection(u) for u in self.upstreams]
+        for u in upstreams:
+            u.setblocking(False)
+
+        to_read = upstreams + [self.request]
+        to_write = upstreams + [self.request]
+        up_buffers = [b"" for u in upstreams]
+        down_buffer = b""
+        while len(to_read) > 1 or down_buffer or any(up_buffers):
+            rs, ws, _ = select.select(to_read, to_write, [])
+            for r in rs:
+                if r == self.request:
+                    data = self.request.recv(8192)
+                    if data:
+                        for i in range(len(up_buffers)):
+                            up_buffers[i] += data
+                    else:
+                        to_read.remove(self.request)
+                elif r == upstreams[0]:
+                    data = upstreams[0].recv(8192)
+                    if data:
+                        down_buffer += data
+                    else:
+                        to_read.remove(upstreams[0])
+                else:
+                    data = r.recv(8192)
+                    if not data:
+                        to_read.remove(r)
+            for w in ws:
+                if w == self.request:
+                    if len(down_buffer) > 0:
+                        sent = self.request.send(down_buffer)
+                        down_buffer = down_buffer[sent:]
+                else:
+                    idx = to_write.index(w)
+                    if len(up_buffers[idx]) > 0:
+                        sent = w.send(up_buffers[idx])
+                        up_buffers[idx] = up_buffers[idx][sent:]
+
+
+def get_peer_ips(port):
+    our_ip = subprocess.run(
+        ["ipconfig", "getifaddr", "en0"], capture_output=True, text=True
+    ).stdout.strip()
+    our_ip += " " * (15 - len(our_ip))
+    our_ip = our_ip[:15].encode()
+    all_ips = mx.distributed.all_gather(mx.array(our_ip)[None])
+    all_ips = [bytes(ip).decode().strip() for ip in all_ips]
+    all_ips = [(ip, port + i) for i, ip in enumerate(all_ips)]
+
+    return all_ips
+
+
+def _run_http_server(
     host: str,
     port: int,
     model_provider: ModelProvider,
@@ -1547,6 +1631,36 @@ def run(
     except KeyboardInterrupt:
         httpd.shutdown()
         response_generator.stop_and_join()
+
+
+def run(
+    host: str,
+    port: int,
+    model_provider: ModelProvider,
+    server_class=ThreadingHTTPServer,
+    handler_class=APIHandler,
+):
+    group = mx.distributed.init()
+    if group.size() == 1:
+        _run_http_server(host, port, model_provider, server_class, handler_class)
+        return
+
+    ips = get_peer_ips(port + 1)
+    http_ip, http_port = ips[group.rank()]
+    http_thread = Thread(
+        target=_run_http_server,
+        args=(http_ip, http_port, model_provider, server_class, handler_class),
+    )
+    http_thread.start()
+
+    if group.rank() == 0:
+        server = ThreadingTCPServer(
+            (host, port),
+            lambda *args, **kwargs: ProxyHandler(ips, *args, **kwargs),
+        )
+        server.serve_forever()
+
+    http_thread.join()
 
 
 def main():
@@ -1644,6 +1758,11 @@ def main():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
+    )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
