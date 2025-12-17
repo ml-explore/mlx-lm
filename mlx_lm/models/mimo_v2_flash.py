@@ -98,7 +98,6 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -173,7 +172,7 @@ def group_expert_select(
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / denominator
+        scores = scores / (denominator + 1e-20)
     scores = scores * routed_scaling_factor
 
     return inds, scores
