@@ -140,7 +140,8 @@ def main():
             messages.append({"role": "system", "content": args.system_prompt})
         messages.append({"role": "user", "content": query})
         prompt = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_dict=False
+            messages,
+            add_generation_prompt=True,
         )
         for response in stream_generate(
             model,

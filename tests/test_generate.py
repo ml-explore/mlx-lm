@@ -47,7 +47,6 @@ class TestGenerate(unittest.TestCase):
             [{"role": "user", "content": "Write a story about Einstein"}],
             tokenize=True,
             add_generation_prompt=True,
-            return_dict=False,
         )
 
         tokens = []
@@ -93,7 +92,6 @@ class TestGenerate(unittest.TestCase):
         prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            return_dict=False,
         )
 
         for generation_result in stream_generate(
@@ -122,7 +120,6 @@ class TestGenerate(unittest.TestCase):
         prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            return_dict=False,
         )
         prompt_embeddings = self.model.model.embed_tokens(prompt)
 
@@ -147,7 +144,6 @@ class TestGenerate(unittest.TestCase):
         prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            return_dict=False,
         )
         prompt_embeddings = self.model.model.embed_tokens(prompt)
 
@@ -192,7 +188,6 @@ class TestGenerate(unittest.TestCase):
                 [{"role": "user", "content": p}],
                 tokenize=True,
                 add_generation_prompt=True,
-                return_dict=False,
             )
             for p in prompts
         ]
@@ -227,7 +222,6 @@ class TestGenerate(unittest.TestCase):
                 [{"role": "user", "content": p}],
                 tokenize=True,
                 add_generation_prompt=True,
-                return_dict=False,
             )
             for p in prompts
         ]
@@ -278,7 +272,6 @@ class TestGenerate(unittest.TestCase):
                 [{"role": "user", "content": p}],
                 tokenize=True,
                 add_generation_prompt=True,
-                return_dict=False,
             )
             for p in prompts
         ]
@@ -324,7 +317,6 @@ class TestGenerate(unittest.TestCase):
                 [{"role": "user", "content": p}],
                 tokenize=True,
                 add_generation_prompt=True,
-                return_dict=False,
             )
             for p in prompts
         ]
@@ -382,7 +374,6 @@ class TestGenerate(unittest.TestCase):
                     [{"role": "user", "content": p}],
                     tokenize=True,
                     add_generation_prompt=True,
-                    return_dict=False,
                 )
                 for p in prompts_a
             ]
@@ -397,7 +388,6 @@ class TestGenerate(unittest.TestCase):
                     [{"role": "user", "content": p}],
                     tokenize=True,
                     add_generation_prompt=True,
-                    return_dict=False,
                 )
                 for p in prompts_b
             ]

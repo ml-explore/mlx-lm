@@ -117,7 +117,6 @@ def main():
             messages,
             add_generation_prompt=False,
             continue_final_message=True,
-            return_dict=False,
         )
 
     else:

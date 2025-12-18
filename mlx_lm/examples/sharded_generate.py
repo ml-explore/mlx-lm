@@ -64,7 +64,8 @@ if __name__ == "__main__":
 
     messages = [{"role": "user", "content": args.prompt}]
     prompt = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, return_dict=False
+        messages,
+        add_generation_prompt=True,
     )
 
     for response in stream_generate(

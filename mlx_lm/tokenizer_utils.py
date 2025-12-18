@@ -278,6 +278,10 @@ class TokenizerWrapper:
                     self._tool_call_end = tool_call_end
                     break
 
+    def apply_chat_template(self, *args, **kwargs):
+        kwargs["return_dict"] = False
+        return self._tokenizer.apply_chat_template(*args, **kwargs)
+
     def add_eos_token(self, token: str):
         token_id = None
         try:

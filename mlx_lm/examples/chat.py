@@ -16,7 +16,8 @@ prompt_cache = make_prompt_cache(model)
 prompt = "Hi my name is <Name>."
 messages = [{"role": "user", "content": prompt}]
 prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True, return_dict=False
+    messages,
+    add_generation_prompt=True,
 )
 
 # Assistant response
@@ -32,7 +33,8 @@ response = generate(
 prompt = "What's my name?"
 messages = [{"role": "user", "content": prompt}]
 prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True, return_dict=False
+    messages,
+    add_generation_prompt=True,
 )
 
 # Assistant response

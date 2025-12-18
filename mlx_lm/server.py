@@ -494,7 +494,6 @@ class ResponseGenerator:
                     tools,
                     add_generation_prompt=True,
                     tokenize=True,
-                    return_dict=False,
                     **self.model_provider.cli_args.chat_template_args,
                 )
             else:
