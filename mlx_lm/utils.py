@@ -5,7 +5,6 @@ import glob
 import importlib
 import inspect
 import json
-import logging
 import os
 import resource
 import shutil
@@ -71,7 +70,6 @@ def _get_classes(config: dict):
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
         msg = f"Model type {model_type} not supported."
-        logging.error(msg)
         raise ValueError(msg)
 
     return arch.Model, arch.ModelArgs
@@ -145,13 +143,8 @@ def hf_repo_to_path(hf_repo):
 
 
 def load_config(model_path: Path) -> dict:
-    try:
-        with open(model_path / "config.json", "r") as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        logging.error(f"Config file not found in {model_path}")
-        raise
-    return config
+    with open(model_path / "config.json", "r") as f:
+        return json.load(f)
 
 
 def load_model(
