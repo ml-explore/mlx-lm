@@ -551,6 +551,7 @@ class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         self.left_padding = mx.array(left_padding) if left_padding else None
+        self._lengths = None
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -588,15 +589,20 @@ class ArraysCache(_BaseCache):
             ]
         return cache
 
-    def prepare(self, **kwargs):
-        pass
+    def prepare(self, lengths=None, **kwargs):
+        if lengths is not None:
+            self._lengths = mx.array(lengths)
 
     def finalize(self, **kwargs):
         pass
 
     def make_mask(self, N: int):
         if self.cache[0] is None and self.left_padding is not None:
-            return mx.arange(N) >= self.left_padding[:, None]
+            idx = mx.arange(N)
+            mask = idx >= self.left_padding[:, None]
+            if self._lengths is not None:
+                mask = mx.logical_and(mask, idx < self._lengths[:, None])
+            return mask
         else:
             return None
 
