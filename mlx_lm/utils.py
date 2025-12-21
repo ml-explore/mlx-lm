@@ -160,6 +160,7 @@ def load_model(
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -176,6 +177,11 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
+        weight_loader (Callable[[str], Dict[str, Any]], optional): A custom function
+            for loading weights from a file path. The function should accept a file
+            path string and return a dictionary mapping weight names to arrays.
+            Defaults to ``mx.load``. This can be used to implement custom loading
+            strategies such as distributed weight streaming or encrypted weights.
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
@@ -194,9 +200,10 @@ def load_model(
         logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
+    _loader = weight_loader if weight_loader is not None else mx.load
     weights = {}
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(_loader(wf))
 
     model_class, model_args_class = get_model_classes(config=config)
 
@@ -289,6 +296,7 @@ def load(
     lazy: bool = False,
     return_config: bool = False,
     revision: Optional[str] = None,
+    weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -309,6 +317,8 @@ def load(
             when needed. Default: ``False``
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+        weight_loader (Callable[[str], Dict[str, Any]], optional): A custom function
+            for loading weights from a file path. Defaults to ``mx.load``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -319,7 +329,9 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(model_path, lazy, model_config=model_config)
+    model, config = load_model(
+        model_path, lazy, model_config=model_config, weight_loader=weight_loader
+    )
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
