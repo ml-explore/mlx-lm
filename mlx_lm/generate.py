@@ -1302,15 +1302,9 @@ def main():
     if args.chat_template_config is not None:
         template_kwargs = json.loads(args.chat_template_config)
 
-    if args.use_default_chat_template:
-        if tokenizer.chat_template is None:
-            tokenizer.chat_template = tokenizer.default_chat_template
-    elif using_cache:
-        tokenizer.chat_template = json.loads(metadata["chat_template"])
-
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
     prompt = sys.stdin.read() if prompt == "-" else prompt
-    if not args.ignore_chat_template and tokenizer.chat_template is not None:
+    if not args.ignore_chat_template and tokenizer.has_chat_template:
         if args.system_prompt is not None:
             messages = [{"role": "system", "content": args.system_prompt}]
         else:

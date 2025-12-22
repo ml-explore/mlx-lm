@@ -267,6 +267,9 @@ class TokenizerWrapper:
         self._tool_call_start = None
         self._tool_call_end = None
         self._chat_template = chat_template
+        self.has_chat_template = (
+            tokenizer.chat_template is not None or chat_template is not None
+        )
 
         THINK_TOKENS = [("<think>", "</think>")]
         TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
@@ -283,10 +286,6 @@ class TokenizerWrapper:
                     self._tool_call_start = tool_call_start
                     self._tool_call_end = tool_call_end
                     break
-
-    @property
-    def chat_template(self):
-        return self._tokenizer.chat_template or self._chat_template
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:

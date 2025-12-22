@@ -42,16 +42,6 @@ def setup_arg_parser():
         help="End of sequence token for tokenizer",
     )
     parser.add_argument(
-        "--ignore-chat-template",
-        action="store_true",
-        help="Use the raw prompt without the tokenizer's chat template.",
-    )
-    parser.add_argument(
-        "--use-default-chat-template",
-        action="store_true",
-        help="Use the default chat template",
-    )
-    parser.add_argument(
         "--max-kv-size",
         type=int,
         default=None,
@@ -107,11 +97,7 @@ def main():
 
     args.prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
 
-    if args.use_default_chat_template:
-        if tokenizer.chat_template is None:
-            tokenizer.chat_template = tokenizer.default_chat_template
-
-    if not args.ignore_chat_template and tokenizer.chat_template is not None:
+    if tokenizer.has_chat_template:
         messages = [{"role": "user", "content": args.prompt}]
         prompt = tokenizer.apply_chat_template(
             messages,
@@ -155,7 +141,6 @@ def main():
     print("Saving...")
     metadata = {}
     metadata["model"] = args.model
-    metadata["chat_template"] = json.dumps(tokenizer.chat_template)
     metadata["tokenizer_config"] = json.dumps(tokenizer_config)
     save_prompt_cache(args.prompt_cache_file, cache, metadata)
 
