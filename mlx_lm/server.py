@@ -659,6 +659,8 @@ class ResponseGenerator:
                                 tokenizer.encode("\n"),
                             ],
                         ),
+                        completion_batch_size=self.cli_args.decode_concurrency,
+                        prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -1686,6 +1688,18 @@ def main():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
+    )
+    parser.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=32,
+        help="When a request is batchable then decode that many requests in parallel",
+    )
+    parser.add_argument(
+        "--prompt-concurrency",
+        type=int,
+        default=8,
+        help="When a request is batchable then process that many prompts in parallel",
     )
     parser.add_argument(
         "--pipeline",
