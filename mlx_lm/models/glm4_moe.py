@@ -261,10 +261,6 @@ class LanguageModel(PipelineMixin, nn.Module):
         self.layers = [
             DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
         ]
-        self.start_idx = 0
-        self.end_idx = len(self.layers)
-        self.num_layers = self.end_idx
-
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
