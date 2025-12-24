@@ -295,7 +295,8 @@ class LanguageModel(PipelineMixin, nn.Module):
                 cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         # Broadcast h while keeping it in the graph
-        h = mx.distributed.all_gather(h)[: h.shape[0]]
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
