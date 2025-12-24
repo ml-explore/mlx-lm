@@ -465,7 +465,7 @@ class Model(nn.Module):
             # Shard the MoE. Shard in place since the MoE should be responsible
             # for aggregating the results.
             else:
-                layer.mlp.sharding_group = group = group
+                layer.mlp.sharding_group = group
                 shard_inplace(
                     layer.mlp.shared_experts.gate_proj, "all-to-sharded", group=group
                 )
