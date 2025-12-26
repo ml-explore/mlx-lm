@@ -49,6 +49,7 @@ MODEL_REMAPPING = {
     "falcon_mamba": "mamba",
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
+    "minimax_m2": "minimax",
 }
 
 MAX_FILE_SIZE_GB = 5
