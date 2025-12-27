@@ -144,22 +144,17 @@ def hf_repo_to_path(hf_repo):
 
 
 def load_config(model_path: Path) -> dict:
-    config_file = model_path / "config.json"
-    if not config_file.exists():
-        raise FileNotFoundError(f"Config file not found in {model_path}")
-    
-    with open(config_file, "r") as f:
+    with open(model_path / "config.json", "r") as f:
         config = json.load(f)
-    
+
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
         with open(generation_config_file, "r") as f:
             generation_config = json.load(f)
-        
-        # eos_token_id should be loaded from generation_config.json
-        if "eos_token_id" in generation_config:
-            config["eos_token_id"] = generation_config["eos_token_id"]
-    
+
+        if eos_token_id := generation_config.get("eos_token_id", False):
+            config["eos_token_id"] = eos_token_id
+
     return config
 
 
