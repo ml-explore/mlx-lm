@@ -145,7 +145,17 @@ def hf_repo_to_path(hf_repo):
 
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
-        return json.load(f)
+        config = json.load(f)
+
+    generation_config_file = model_path / "generation_config.json"
+    if generation_config_file.exists():
+        with open(generation_config_file, "r") as f:
+            generation_config = json.load(f)
+
+        if eos_token_id := generation_config.get("eos_token_id", False):
+            config["eos_token_id"] = eos_token_id
+
+    return config
 
 
 def load_model(
