@@ -179,7 +179,17 @@ def configure_parser() -> argparse.ArgumentParser:
         description="Convert Hugging Face model to MLX format"
     )
 
-    parser.add_argument("--hf-path", type=str, help="Path to the Hugging Face model.")
+    parser.add_argument(
+        "--hf-path",
+        type=str,
+        help="Path to the model (Hugging Face repo or local path).",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        dest="model_path",
+        help="Path to the model (Hugging Face repo or local path).",
+    )
     parser.add_argument(
         "--mlx-path", type=str, default="mlx_model", help="Path to save the MLX model."
     )
@@ -238,6 +248,12 @@ def configure_parser() -> argparse.ArgumentParser:
 def main():
     parser = configure_parser()
     args = parser.parse_args()
+    if args.model_path and args.hf_path and args.model_path != args.hf_path:
+        raise ValueError("Please pass only one of --model-path or --hf-path.")
+    if args.model_path and not args.hf_path:
+        args.hf_path = args.model_path
+    if args.model_path is not None:
+        delattr(args, "model_path")
     convert(**vars(args))
 
 
