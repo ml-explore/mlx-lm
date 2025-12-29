@@ -65,7 +65,13 @@ class SuScaledRoPE(nn.Module):
 
     def __call__(self, x, offset: int = 0):
         seq_len = offset + x.shape[-2]
-        if seq_len > self.original_max_position_embeddings:
+
+        if isinstance(seq_len, mx.array):
+            seq_len_scalar = seq_len.max().item()
+        else:
+            seq_len_scalar = seq_len
+
+        if seq_len_scalar > self.original_max_position_embeddings:
             freqs = self._long_freqs
             scale = self._long_scale
         else:
