@@ -552,7 +552,11 @@ class ResponseGenerator:
         while not self._stop:
             request = None
             if not drain_batch:
-                timeout = 0.1 if batch_generator is None else None
+                timeout = (
+                    None
+                    if (batch_generator is not None and len(batch_results) > 0)
+                    else 0.1
+                )
                 request = get_next_request(timeout=timeout)
 
             # We got a request
