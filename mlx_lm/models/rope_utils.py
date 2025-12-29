@@ -47,8 +47,7 @@ class SuScaledRoPE(nn.Module):
         self.dim = dims
 
         freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
-        self._short_freqs = mx.array(short_factor, dtype=mx.float32) * freqs
-        self._long_freqs = mx.array(long_factor, dtype=mx.float32) * freqs
+        self._freqs = mx.array(long_factor, dtype=mx.float32) * freqs
 
         def default_scale(factor):
             return math.sqrt(
@@ -56,23 +55,10 @@ class SuScaledRoPE(nn.Module):
             )
 
         factor = max_position_embeddings / original_max_position_embeddings
-        self._short_scale = short_mscale or (
-            1.0 if factor <= 1.0 else default_scale(factor)
-        )
-        self._long_scale = long_mscale or (
-            1.0 if factor <= 1.0 else default_scale(factor)
-        )
+        self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
 
-    def __call__(self, x, offset: int = 0):
-        seq_len = offset + x.shape[-2]
-        if seq_len > self.original_max_position_embeddings:
-            freqs = self._long_freqs
-            scale = self._long_scale
-        else:
-            freqs = self._short_freqs
-            scale = self._short_scale
-
-        x[..., : self.dim] = scale * x[..., : self.dim]
+    def __call__(self, x, offset: Union[int, mx.array] = 0):
+        x[..., : self.dim] = self._scale * x[..., : self.dim]
         return mx.fast.rope(
             x,
             self.dim,
@@ -80,7 +66,7 @@ class SuScaledRoPE(nn.Module):
             base=None,
             scale=1.0,
             offset=offset,
-            freqs=freqs,
+            freqs=self._freqs,
         )
 
 
