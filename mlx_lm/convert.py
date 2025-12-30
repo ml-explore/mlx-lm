@@ -187,17 +187,23 @@ def configure_parser() -> argparse.ArgumentParser:
         "-q", "--quantize", help="Generate a quantized model.", action="store_true"
     )
     parser.add_argument(
-        "--q-group-size", help="Group size for quantization.", type=int, default=64
+        "--q-group-size",
+        help="Group size for quantization.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
-        "--q-bits", help="Bits per weight for quantization.", type=int, default=4
+        "--q-bits",
+        help="Bits per weight for quantization.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--q-mode",
         help="The quantization mode.",
         type=str,
         default="affine",
-        choices=["affine", "mxfp4"],
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
     )
     parser.add_argument(
         "--quant-predicate",
