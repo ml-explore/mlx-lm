@@ -611,8 +611,8 @@ def save_model(
 def quantize_model(
     model: nn.Module,
     config: dict,
-    group_size: int,
-    bits: int,
+    group_size: Optional[int],
+    bits: Optional[int],
     mode: str = "affine",
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
@@ -622,8 +622,8 @@ def quantize_model(
     Args:
         model (nn.Module): The model to be quantized.
         config (dict): Model configuration.
-        group_size (int): Group size for quantization.
-        bits (int): Bits per weight for quantization.
+        group_size (Optional[int]): Group size for quantization.
+        bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
@@ -633,9 +633,21 @@ def quantize_model(
     Returns:
         Tuple: Tuple containing quantized model and config.
     """
+
+    def defaults_for_mode(mode, group_size, bits):
+        mode_defaults = {
+            "affine": (64, 4),
+            "mxfp4": (32, 4),
+            "nvfp4": (16, 4),
+            "mxfp8": (32, 8),
+        }
+        default_group_size, default_bits = mode_defaults[mode]
+        return group_size or default_group_size, bits or default_bits
+
     quantized_config = copy.deepcopy(config)
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    group_size, bits = defaults_for_mode(mode, group_size, bits)
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
