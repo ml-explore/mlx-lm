@@ -1411,20 +1411,6 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
 
-        from pathlib import Path
-
-        # ===== 1. 注册 CLI 启动的本地模型 =====
-        local_models = []
-        cli_model_path = self.response_generator.cli_args.model
-        if cli_model_path:
-            model_id = str(Path(cli_model_path).resolve())
-            local_models.append({
-                "id": model_id,
-                "object": "model",
-                "created": self.created,
-                "owned_by": "mlx-local",
-            })
-
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
         parts = self.path.split("/")
@@ -1449,7 +1435,7 @@ class APIHandler(BaseHTTPRequestHandler):
         ]
 
         # Create a list of available models
-        hf_models = [
+        models = [
             {
                 "id": repo.repo_id,
                 "object": "model",
@@ -1458,8 +1444,17 @@ class APIHandler(BaseHTTPRequestHandler):
             for repo in downloaded_models
         ]
 
-        # ===== 3. 合并 =====
-        models = local_models + hf_models
+        if self.response_generator.cli_args.model:
+            model_path = Path(self.response_generator.cli_args.model)
+            if model_path.exists():
+                model_id = str(model_path.resolve())
+                models.append(
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "created": self.created,
+                    }
+                )
 
         response = {"object": "list", "data": models}
 
