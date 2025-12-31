@@ -2,6 +2,10 @@
 
 import json
 
+tool_call_start = "<tool_call>"
+
+tool_call_end = "</tool_call>"
+
 
 def parse_tool_text(text, tools=None):
     tool_call = json.loads(text.strip())

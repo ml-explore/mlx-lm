@@ -256,6 +256,8 @@ class TokenizerWrapper:
         detokenizer_class=NaiveStreamingDetokenizer,
         eos_token_ids=None,
         chat_template=None,
+        tool_call_start=None,
+        tool_call_end=None,
         tool_parser=None,
     ):
         self._tokenizer = tokenizer
@@ -267,18 +269,19 @@ class TokenizerWrapper:
         )
         self._think_start = None
         self._think_end = None
-        self._tool_call_start = None
-        self._tool_call_end = None
+        self._think_start_id = None
+        self._think_end_id = None
+
         self._chat_template = chat_template
         self.has_chat_template = (
             tokenizer.chat_template is not None or chat_template is not None
         )
         self._tool_parser = tool_parser or default_tool_parser
-
-        THINK_TOKENS = [("<think>", "</think>")]
-        TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
+        self._tool_call_start = tool_call_start
+        self._tool_call_end = tool_call_end
 
         vocab = tokenizer.get_vocab()
+        THINK_TOKENS = [("<think>", "</think>")]
         for think_start, think_end in THINK_TOKENS:
             if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
@@ -286,12 +289,12 @@ class TokenizerWrapper:
                 self._think_start_id = vocab[think_start]
                 self._think_end_id = vocab[think_end]
                 break
-        if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
-            for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
-                if tool_call_start in vocab and tool_call_end in vocab:
-                    self._tool_call_start = tool_call_start
-                    self._tool_call_end = tool_call_end
-                    break
+
+        # Fallback to defaults if no tool call tokens are provided
+        if tool_call_start and tool_call_start not in vocab:
+            raise ValueError("Tool call start token not in vocab")
+        if tool_call_end and tool_call_end not in vocab:
+            raise ValueError("Tool call end token not in vocab")
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
@@ -486,6 +489,8 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
     tool_parser = None
+    tool_call_start = None
+    tool_call_end = None
     if tokenizer_config_file.exists():
         with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
             try:
@@ -499,9 +504,12 @@ def load(
                 f"mlx_lm.chat_templates.{chat_template_type}"
             ).apply_chat_template
         if tool_parser_type := tokenizer_config.get("tool_parser_type", False):
-            tool_parser = importlib.import_module(
+            tool_parser_module = importlib.import_module(
                 f"mlx_lm.tool_parsers.{tool_parser_type}"
-            ).parse_tool_call
+            )
+            tool_parser = tool_module.parse_tool_call
+            tool_call_start = tool_module.tool_call_start
+            tool_call_end = tool_module.tool_call_end
 
     if return_tokenizer:
         kwargs = tokenizer_config_extra or {}
@@ -511,6 +519,8 @@ def load(
             eos_token_ids=eos_token_ids,
             chat_template=chat_template,
             tool_parser=tool_parser,
+            tool_call_start=tool_call_start,
+            tool_call_end=tool_call_end,
         )
     else:
         return detokenizer_class

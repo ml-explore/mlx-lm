@@ -2,7 +2,7 @@
 
 """
 Modified from:
-https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/qwen3coder_tool_parser.py
+https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/qwen3coder_tool_parser.py
 """
 import ast
 import json
@@ -97,6 +97,11 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
         "name": function_name,
         "arguments": json.dumps(param_dict, ensure_ascii=False),
     }
+
+
+tool_call_start = "<tool_call>"
+
+tool_call_end = "</tool_call>"
 
 
 def parse_tool_call(

@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from mlx_lm.tool_parsers import json_tools, qwen3_coder
+from mlx_lm.tool_parsers import function_gemma, json_tools, qwen3_coder
 
 
 class TestToolParsing(unittest.TestCase):
@@ -48,6 +48,15 @@ class TestToolParsing(unittest.TestCase):
         expected = {
             "name": "multiply",
             "arguments": '{"a": 12234585, "b": 48838483920}',
+        }
+        self.assertEqual(tool_call, expected)
+
+    def test_function_gemma(self):
+        text = "call:get_current_temperature{location:<escape>London<escape>}"
+        tool_call = function_gemma.parse_tool_calls(text)
+        expected = {
+            "name": "get_current_temperature",
+            "arguments": '{"location": "London"}',
         }
         self.assertEqual(tool_call, expected)
 
