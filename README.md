@@ -170,7 +170,7 @@ mlx_lm.generate --help
 To quantize a model from the command line run:
 
 ```
-mlx_lm.convert --hf-path mistralai/Mistral-7B-Instruct-v0.3 -q
+mlx_lm.convert --model mistralai/Mistral-7B-Instruct-v0.3 -q
 ```
 
 For more options run:
@@ -185,7 +185,7 @@ You can upload new models to Hugging Face by specifying `--upload-repo` to
 
 ```
 mlx_lm.convert \
-    --hf-path mistralai/Mistral-7B-Instruct-v0.3 \
+    --model mistralai/Mistral-7B-Instruct-v0.3 \
     -q \
     --upload-repo mlx-community/my-4bit-mistral
 ```
