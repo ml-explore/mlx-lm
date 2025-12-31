@@ -179,8 +179,6 @@ For more options run:
 mlx_lm.convert --help
 ```
 
-`--hf-path` is still supported for backwards compatibility.
-
 You can upload new models to Hugging Face by specifying `--upload-repo` to
 `convert`. For example, to upload a quantized Mistral-7B model to the
 [MLX Hugging Face community](https://huggingface.co/mlx-community) you can do:
