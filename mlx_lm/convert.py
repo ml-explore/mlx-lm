@@ -183,7 +183,7 @@ def configure_parser() -> argparse.ArgumentParser:
         "--hf-path",
         "--model",
         type=str,
-        help="Path to the model. This can be a local path or a Hugging Face model hub identifier.",
+        help="Path to the model. This can be a local path or a Hugging Face Hub model identifier.",
     )
     parser.add_argument(
         "--mlx-path", type=str, default="mlx_model", help="Path to save the MLX model."
