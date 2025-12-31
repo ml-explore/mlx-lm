@@ -487,7 +487,7 @@ class ResponseGenerator:
             tools = request.tools
             role_mapping = request.role_mapping
 
-            if tokenizer.chat_template:
+            if tokenizer.has_chat_template:
                 process_message_content(messages)
                 return tokenizer.apply_chat_template(
                     messages,
