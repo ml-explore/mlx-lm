@@ -1444,6 +1444,18 @@ class APIHandler(BaseHTTPRequestHandler):
             for repo in downloaded_models
         ]
 
+        if self.response_generator.cli_args.model:
+            model_path = Path(self.response_generator.cli_args.model)
+            if model_path.exists():
+                model_id = str(model_path.resolve())
+                models.append(
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "created": self.created,
+                    }
+                )
+
         response = {"object": "list", "data": models}
 
         response_json = json.dumps(response).encode()

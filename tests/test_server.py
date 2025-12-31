@@ -40,6 +40,7 @@ class DummyModelProvider:
                 "min_p": 0.0,
                 "max_tokens": 512,
                 "chat_template_args": {},
+                "model": None,
             },
         )
 
