@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+from .tool_parsers.json_tools import parse_tool_text as default_tool_parser
+
 
 class StreamingDetokenizer:
     """The streaming detokenizer interface so that we can detokenize one token at a time.
@@ -254,6 +256,7 @@ class TokenizerWrapper:
         detokenizer_class=NaiveStreamingDetokenizer,
         eos_token_ids=None,
         chat_template=None,
+        tool_parser=None,
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
@@ -270,6 +273,7 @@ class TokenizerWrapper:
         self.has_chat_template = (
             tokenizer.chat_template is not None or chat_template is not None
         )
+        self._tool_parser = tool_parser or default_tool_parser
 
         THINK_TOKENS = [("<think>", "</think>")]
         TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
@@ -279,6 +283,8 @@ class TokenizerWrapper:
             if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
                 self._think_end = think_end
+                self._think_start_id = vocab[think_start]
+                self._think_end_id = vocab[think_end]
                 break
         if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
             for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
@@ -318,8 +324,16 @@ class TokenizerWrapper:
         return self._think_start
 
     @property
+    def think_start_id(self):
+        return self._think_start_id
+
+    @property
     def think_end(self):
         return self._think_end
+
+    @property
+    def think_end_id(self):
+        return self._think_end_id
 
     @property
     def has_tool_calling(self):
@@ -332,6 +346,10 @@ class TokenizerWrapper:
     @property
     def tool_call_end(self):
         return self._tool_call_end
+
+    @property
+    def tool_parser(self):
+        return self._tool_parser
 
     @property
     def detokenizer(self):
@@ -466,7 +484,8 @@ def load(
         eos_token_ids = [eos_token_ids]
 
     tokenizer_config_file = model_path / "tokenizer_config.json"
-    custom_tokenizer = None
+    chat_template = None
+    tool_parser = None
     if tokenizer_config_file.exists():
         with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
             try:
@@ -475,10 +494,14 @@ def load(
                 raise JSONDecodeError(
                     "Failed to parse tokenizer_config.json", e.doc, e.pos
                 )
-        if tokenizer_type := tokenizer_config.get("tokenizer_type", False):
-            custom_tokenizer = importlib.import_module(
-                f"mlx_lm.tokenizers.{tokenizer_type}"
-            )
+        if chat_template_type := tokenizer_config.get("chat_template_type", False):
+            chat_template = importlib.import_module(
+                f"mlx_lm.chat_templates.{chat_template_type}"
+            ).apply_chat_template
+        if tool_parser_type := tokenizer_config.get("tool_parser_type", False):
+            tool_parser = importlib.import_module(
+                f"mlx_lm.tool_parsers.{tool_parser_type}"
+            ).parse_tool_call
 
     if return_tokenizer:
         kwargs = tokenizer_config_extra or {}
@@ -486,7 +509,8 @@ def load(
             AutoTokenizer.from_pretrained(model_path, **kwargs),
             detokenizer_class,
             eos_token_ids=eos_token_ids,
-            chat_template=getattr(custom_tokenizer, "apply_chat_template", None),
+            chat_template=chat_template,
+            tool_parser=tool_parser,
         )
     else:
         return detokenizer_class

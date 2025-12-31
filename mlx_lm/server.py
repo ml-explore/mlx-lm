@@ -357,7 +357,10 @@ class GenerationContext:
     has_tool_calling: bool
     tool_call_start: str
     tool_call_end: str
+    tool_parser: Callable[[str, Any], Dict]
     has_thinking: bool
+    think_start_id: int
+    think_end_id: int
     think_end: str
     eos_token_ids: set
     stop_token_sequences: List[List[int]]
@@ -579,8 +582,11 @@ class ResponseGenerator:
                         has_tool_calling=tokenizer.has_tool_calling,
                         tool_call_start=tokenizer.tool_call_start,
                         tool_call_end=tokenizer.tool_call_end,
+                        tool_parser=tokenizer.tool_parser,
                         has_thinking=tokenizer.has_thinking,
+                        think_start_id=tokenizer.think_start_id,
                         think_end=tokenizer.think_end,
+                        think_end_id=tokenizer.think_end_id,
                         eos_token_ids=tokenizer.eos_token_ids,
                         stop_token_sequences=[
                             tokenizer.encode(stop_word, add_special_tokens=False)
@@ -741,8 +747,11 @@ class ResponseGenerator:
                 has_tool_calling=tokenizer.has_tool_calling,
                 tool_call_start=tokenizer.tool_call_start,
                 tool_call_end=tokenizer.tool_call_end,
+                tool_parser=tokenizer.tool_parser,
                 has_thinking=tokenizer.has_thinking,
+                think_start_id=tokenizer.think_start_id,
                 think_end=tokenizer.think_end,
+                think_end_id=tokenizer.think_end_id,
                 eos_token_ids=tokenizer.eos_token_ids,
                 stop_token_sequences=[
                     tokenizer.encode(stop_word, add_special_tokens=False)
@@ -1080,17 +1089,6 @@ class APIHandler(BaseHTTPRequestHandler):
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
 
-        def parse_function(tool_text):
-            tool_call = json.loads(tool_text.strip())
-            return {
-                "function": {
-                    "name": tool_call.get("name", None),
-                    "arguments": json.dumps(tool_call.get("arguments", "")),
-                },
-                "type": "function",
-                "id": None,
-            }
-
         # Static response
         response = {
             "id": self.request_id,
@@ -1137,7 +1135,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "role": "assistant",
                 "content": text,
                 "reasoning": reasoning_text,
-                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
+                "tool_calls": tool_calls,
             }
         elif self.object_type == "text_completion":
             choice.update(text=text)
@@ -1225,8 +1223,23 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_calls = []
         tool_text = ""
 
-        # Start out in reasoning if the model is a reasoning model
-        in_reasoning = ctx.has_thinking
+        def parse_tools(tool_calls):
+            return [
+                {
+                    "function": ctx.tool_parser(tool_text, request.tools),
+                    "type": "function",
+                    "id": None,
+                }
+                for tool_text in tool_calls
+            ]
+
+        # Start out in reasoning if the model is a reasoning model and the
+        # prompt has an open think token but no closing think token
+        in_reasoning = (
+            ctx.has_thinking
+            and ctx.think_start_id in ctx.prompt
+            and ctx.think_end_id not in ctx.prompt
+        )
         reasoning_text = ""
 
         # Variables to save the generated tokens and the corresponding probs
@@ -1300,7 +1313,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     response = self.generate_response(
                         segment,
                         None,
-                        tool_calls=tool_calls,
+                        tool_calls=parse_tools(tool_calls),
                         reasoning_text=reasoning_text,
                     )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
@@ -1316,7 +1329,7 @@ class APIHandler(BaseHTTPRequestHandler):
             response = self.generate_response(
                 segment,
                 finish_reason,
-                tool_calls=tool_calls,
+                tool_calls=parse_tools(tool_calls),
                 reasoning_text=reasoning_text,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
@@ -1337,7 +1350,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 top_tokens=top_tokens,
                 tokens=tokens,
                 reasoning_text=reasoning_text,
-                tool_calls=tool_calls,
+                tool_calls=parse_tools(tool_calls),
             )
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
