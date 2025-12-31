@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
-from .cache import RwkvCache
+from .cache import ArraysCache
 
 
 @dataclass
@@ -219,10 +219,10 @@ class Rwkv7ChannelMixing(nn.Module):
         self.token_shift = TokenShift()
 
     def __call__(self, x, cache) -> mx.array:
-        token_shift_cache = cache[2] if cache is not None else None
-        x_prev = self.token_shift(x, token_shift_cache)
+        state = cache[2] if cache is not None else None
+        x_prev = self.token_shift(x, state)
         xx = addcmul(x, x_prev - x, self.x_k)
-        if isinstance(cache, RwkvCache):
+        if cache is not None:
             cache[2] = x[:, -1:, :]
         return self.value(nn.relu2(self.key(xx)))
 
@@ -290,18 +290,16 @@ class Rwkv7TimeMixing(nn.Module):
             bias=False,
         )
 
-    def _wkv7(self, r, w, k, v, a, b, state, use_kernel: bool = True):
+    def _wkv7(self, r, w, k, v, a, b, state):
         B, L, _, _ = r.shape
         if state is None:
             state = mx.zeros(
                 (B, self.num_heads, self.head_dim, self.head_dim), dtype=r.dtype
             )
 
-        if (
-            not use_kernel
-            or mx.default_device() != mx.gpu
-            or not mx.metal.is_available()
-        ):
+        if mx.default_device() == mx.gpu and mx.metal.is_available():
+            return wkv7_kernel(r, w, k, v, a, b, state)
+        else:
             ys = []
             for t in range(L):
                 y, state = _wkv7_step_ops(
@@ -311,8 +309,6 @@ class Rwkv7TimeMixing(nn.Module):
 
             y = mx.stack(ys, axis=1).astype(r.dtype)
             return y, state
-        else:
-            return wkv7_kernel(r, w, k, v, a, b, state)
 
     def __call__(self, x, v_first, cache):
         if cache is None:
@@ -362,7 +358,7 @@ class Rwkv7TimeMixing(nn.Module):
             out + (receptance * key * self.r_k).sum(axis=-1, keepdims=True) * value
         ).reshape([B, L, D])
 
-        if isinstance(cache, RwkvCache):
+        if cache is not None:
             cache[0] = x[:, -1:, :]
             cache[1] = new_state_cache
 
@@ -383,7 +379,7 @@ class Rwkv7Layer(nn.Module):
 
     def __call__(self, x, v_first, cache):
         if self.layer_idx == 0:
-            x = self.pre_norm(x).astype(mx.float16)
+            x = self.pre_norm(x)
 
         h, v_first = self.attn(self.attn_norm(x), v_first, cache)
         h = x + h
@@ -421,8 +417,6 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache=None):
-        B, T = inputs.shape
-
         x = self.model(inputs, cache)
 
         if self.args.tie_word_embeddings:
@@ -433,7 +427,7 @@ class Model(nn.Module):
         return logits
 
     def make_cache(self):
-        return [RwkvCache() for _ in range(len(self.layers))]
+        return [ArraysCache(size=3) for _ in range(len(self.layers))]
 
     @property
     def layers(self):
@@ -441,8 +435,6 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         for k, v in weights.items():
-            if v.dtype == mx.bfloat16 and "embeddings" not in k:
-                weights[k] = v.astype(mx.float16)
             if "k_k" in k or "k_a" in k or "g_norm" in k:
                 weights[k] = weights[k].reshape(
                     self.args.hidden_size // self.args.head_dim, self.args.head_dim
