@@ -1252,6 +1252,48 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_iquestcoder(self):
+        from mlx_lm.models import iquestcoder
+
+        args = iquestcoder.ModelArgs(
+            model_type="iquestcoder",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+            rope_theta=500000.0,
+            tie_word_embeddings=False,
+        )
+        model = iquestcoder.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Test with QKV clipping (OLMo feature)
+        args_with_clip = iquestcoder.ModelArgs(
+            model_type="iquestcoder",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+            rope_theta=500000.0,
+            tie_word_embeddings=False,
+            clip_qkv=8.0,
+        )
+        model_with_clip = iquestcoder.Model(args_with_clip)
+        self.model_test_runner(
+            model_with_clip,
+            args_with_clip.model_type,
+            args_with_clip.vocab_size,
+            args_with_clip.num_hidden_layers,
+        )
+
     def test_smollm3(self):
         from mlx_lm.models import smollm3
 
@@ -1552,6 +1594,21 @@ class TestModels(unittest.TestCase):
                 "mlp_bias": False,
                 "model_type": "helium",
                 "rope_theta": 1000,
+                "tie_word_embeddings": False,
+            },
+            {
+                "model_type": "iquestcoder",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "rope_theta": 500000.0,
+                "max_position_embeddings": 1000,
+                "attention_bias": False,
+                "mlp_bias": False,
                 "tie_word_embeddings": False,
             },
             {
