@@ -166,6 +166,99 @@ def process_message_content(messages):
             message["content"] = ""
 
 
+def normalize_tools(tools):
+    if tools is None:
+        return None
+    if isinstance(tools, str):
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "`tools` must be a JSON array or object, not a string."
+            ) from exc
+    if isinstance(tools, dict):
+        tools = [tools]
+    if isinstance(tools, list) and any(isinstance(tool, str) for tool in tools):
+        normalized = []
+        for tool in tools:
+            if isinstance(tool, str):
+                try:
+                    tool = json.loads(tool)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "`tools` entries must be objects or JSON strings."
+                    ) from exc
+            normalized.append(tool)
+        tools = normalized
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError("`tools` entries must be objects.")
+        func = tool.get("function")
+        if isinstance(func, str):
+            try:
+                func = json.loads(func)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "`tools[].function` must be an object or JSON string."
+                ) from exc
+            tool["function"] = func
+        if isinstance(func, dict):
+            params = func.get("parameters")
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "`tools[].function.parameters` must be an object or JSON string."
+                    ) from exc
+                func["parameters"] = params
+    return tools
+
+
+def normalize_message_tools(messages):
+    for message in messages:
+        if "tools" in message:
+            message["tools"] = normalize_tools(message["tools"])
+
+
+def normalize_message_tool_calls(messages):
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            continue
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except json.JSONDecodeError:
+                tool_calls = [{"function": {"arguments": {"__raw": tool_calls}}}]
+        normalized_calls = []
+        for tool_call in tool_calls:
+            if isinstance(tool_call, str):
+                try:
+                    tool_call = json.loads(tool_call)
+                except json.JSONDecodeError:
+                    tool_call = {"function": {"arguments": {"__raw": tool_call}}}
+            if isinstance(tool_call, dict):
+                func = tool_call.get("function")
+                if isinstance(func, str):
+                    try:
+                        func = json.loads(func)
+                        tool_call["function"] = func
+                    except json.JSONDecodeError:
+                        func = {"arguments": {"__raw": func}}
+                        tool_call["function"] = func
+                if isinstance(func, dict):
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {"__raw": args}
+                        func["arguments"] = args
+            normalized_calls.append(tool_call)
+        message["tool_calls"] = normalized_calls
+
+
 class LRUPromptCache:
 
     @dataclass
@@ -494,6 +587,8 @@ class ResponseGenerator:
 
             if tokenizer.has_chat_template:
                 process_message_content(messages)
+                normalize_message_tools(messages)
+                normalize_message_tool_calls(messages)
                 return tokenizer.apply_chat_template(
                     messages,
                     tools,
@@ -577,7 +672,11 @@ class ResponseGenerator:
                     and current_sampling == args.sampling
                     and is_batchable
                 ):
-                    prompt = self._tokenize(current_tokenizer, request)
+                    try:
+                        prompt = self._tokenize(current_tokenizer, request)
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
                     ctx = GenerationContext(
                         has_tool_calling=tokenizer.has_tool_calling,
                         tool_call_start=tokenizer.tool_call_start,
@@ -1052,7 +1151,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def generate_response(
         self,
         text: str,
-        finish_reason: Union[Literal["length", "stop"], None],
+        finish_reason: Union[Literal["length", "stop", "tool_calls"], None],
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
         token_logprobs: Optional[List[float]] = None,
@@ -1067,8 +1166,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         Args:
             text (str): Text generated by model
-            finish_reason (Union[Literal["length", "stop"], None]): The reason the
-              response is being sent: "length", "stop" or `None`.
+            finish_reason (Union[Literal["length", "stop", "tool_calls"], None]):
+              The reason the response is being sent: "length", "stop",
+              "tool_calls" or `None`.
             prompt_token_count (Optional[int]): The number of tokens in the prompt,
               used to populate the "usage" field (not used when stream).
             completion_token_count (Optional[int]): The number of tokens in the
@@ -1259,10 +1359,13 @@ class APIHandler(BaseHTTPRequestHandler):
         # Process the generated tokens
         for gen in response:
             logging.debug(gen.text)
+            tool_call_complete = False
 
             # Gather the text in tool calling or text variables
-            if in_reasoning:
-                if gen.text == ctx.think_end:
+            if ctx.has_thinking and gen.token == ctx.think_start_id:
+                in_reasoning = True
+            elif in_reasoning:
+                if ctx.has_thinking and gen.token == ctx.think_end_id:
                     in_reasoning = False
                 else:
                     reasoning_text += gen.text
@@ -1273,6 +1376,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls.append(tool_text)
                     tool_text = ""
                     in_tool_call = False
+                    tool_call_complete = True
                 else:
                     tool_text += gen.text
             else:
@@ -1300,6 +1404,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
                 text = text[: len(text) - stop_condition.trim_text_length]
                 segment = ""
+                break
+            if tool_call_complete:
+                finish_reason = "tool_calls"
+                ctx.stop()
                 break
 
             if self.stream and not in_tool_call:
@@ -1344,6 +1452,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write("data: [DONE]\n\n".encode())
             self.wfile.flush()
         else:
+            if tool_calls and finish_reason != "tool_calls":
+                finish_reason = "tool_calls"
             response = self.generate_response(
                 text,
                 finish_reason,
@@ -1399,11 +1509,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
 
+        tools = normalize_tools(body.get("tools"))
+
         return CompletionRequest(
             "chat",
             "",
             body["messages"],
-            body.get("tools") or None,
+            tools or None,
             body.get("role_mapping"),
         )
 
