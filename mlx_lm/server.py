@@ -453,6 +453,7 @@ class GenerationContext:
     tool_parser: Callable[[str, Any], Dict]
     has_thinking: bool
     think_start_id: int
+    think_start: str
     think_end_id: int
     think_end: str
     eos_token_ids: set
@@ -684,6 +685,7 @@ class ResponseGenerator:
                         tool_parser=tokenizer.tool_parser,
                         has_thinking=tokenizer.has_thinking,
                         think_start_id=tokenizer.think_start_id,
+                        think_start=tokenizer.think_start,
                         think_end=tokenizer.think_end,
                         think_end_id=tokenizer.think_end_id,
                         eos_token_ids=tokenizer.eos_token_ids,
@@ -849,6 +851,7 @@ class ResponseGenerator:
                 tool_parser=tokenizer.tool_parser,
                 has_thinking=tokenizer.has_thinking,
                 think_start_id=tokenizer.think_start_id,
+                think_start=tokenizer.think_start,
                 think_end=tokenizer.think_end,
                 think_end_id=tokenizer.think_end_id,
                 eos_token_ids=tokenizer.eos_token_ids,
