@@ -502,7 +502,7 @@ def load(
             chat_template = importlib.import_module(
                 f"mlx_lm.chat_templates.{chat_template_type}"
             ).apply_chat_template
-        if tool_module is not None and (
+        if tool_module is None and (
             tool_parser_type := tokenizer_config.get("tool_parser_type", False)
         ):
             tool_module = importlib.import_module(
