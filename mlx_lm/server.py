@@ -1344,6 +1344,8 @@ class APIHandler(BaseHTTPRequestHandler):
             ctx.think_start_id
         ) > ctx.prompt.count(ctx.think_end_id)
         reasoning_text = ""
+        emit_think_tags = ctx.has_thinking
+        injected_think_start = False
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
@@ -1356,6 +1358,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Well finally save the reason for stopping
         finish_reason = "length"
+        if emit_think_tags and in_reasoning:
+            text += ctx.think_start
+            segment += ctx.think_start
+            injected_think_start = True
         # Process the generated tokens
         for gen in response:
             logging.debug(gen.text)
@@ -1368,11 +1374,30 @@ class APIHandler(BaseHTTPRequestHandler):
             # Gather the text in tool calling or text variables
             if is_think_start:
                 in_reasoning = True
+                if emit_think_tags and not injected_think_start:
+                    if gen.text and gen.text != ctx.think_start:
+                        text += gen.text
+                        segment += gen.text
+                    else:
+                        text += ctx.think_start
+                        segment += ctx.think_start
+                    injected_think_start = True
             elif is_think_end:
                 in_reasoning = False
+                if emit_think_tags:
+                    if gen.text and gen.text != ctx.think_end:
+                        text += gen.text
+                        segment += gen.text
+                    else:
+                        text += ctx.think_end
+                        segment += ctx.think_end
             elif in_reasoning:
-                reasoning_text += gen.text
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                if emit_think_tags:
+                    text += gen.text
+                    segment += gen.text
+                else:
+                    reasoning_text += gen.text
+            elif is_tool_call_start:
                 in_tool_call = True
             elif in_tool_call:
                 if gen.text == ctx.tool_call_end:
@@ -1382,7 +1407,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_call_complete = True
                 else:
                     tool_text += gen.text
-            if not (is_tool_call_start or is_tool_call_end or in_tool_call):
+            elif not (is_tool_call_start or is_tool_call_end or in_tool_call):
                 text += gen.text
                 segment += gen.text
 
@@ -1440,11 +1465,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason = gen.finish_reason
 
         if self.stream:
+            reasoning_payload = None if emit_think_tags else reasoning_text
             response = self.generate_response(
                 segment,
                 finish_reason,
                 tool_calls=parse_tools(tool_calls),
-                reasoning_text=reasoning_text,
+                reasoning_text=reasoning_payload,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
@@ -1457,6 +1483,7 @@ class APIHandler(BaseHTTPRequestHandler):
         else:
             if tool_calls and finish_reason != "tool_calls":
                 finish_reason = "tool_calls"
+            reasoning_payload = None if emit_think_tags else reasoning_text
             response = self.generate_response(
                 text,
                 finish_reason,
@@ -1465,7 +1492,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
-                reasoning_text=reasoning_text,
+                reasoning_text=reasoning_payload,
                 tool_calls=parse_tools(tool_calls),
             )
             response_json = json.dumps(response).encode()
