@@ -1222,24 +1222,27 @@ class APIHandler(BaseHTTPRequestHandler):
         in_tool_call = False
         tool_calls = []
         tool_text = ""
+        tool_idx = 0
 
         def parse_tools(tool_calls):
-            return [
+            nonlocal tool_idx
+            out = [
                 {
                     "function": ctx.tool_parser(tool_text, request.tools),
                     "type": "function",
-                    "id": None,
+                    "id": str(uuid.uuid4()),
+                    "index": tool_idx + i,
                 }
-                for tool_text in tool_calls
+                for i, tool_text in enumerate(tool_calls)
             ]
+            tool_idx += len(tool_calls)
+            return out
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token
-        in_reasoning = (
-            ctx.has_thinking
-            and ctx.think_start_id in ctx.prompt
-            and ctx.think_end_id not in ctx.prompt
-        )
+        in_reasoning = ctx.has_thinking and ctx.prompt.count(
+            ctx.think_start_id
+        ) > ctx.prompt.count(ctx.think_end_id)
         reasoning_text = ""
 
         # Variables to save the generated tokens and the corresponding probs
