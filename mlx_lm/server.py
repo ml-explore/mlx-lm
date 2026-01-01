@@ -1360,15 +1360,17 @@ class APIHandler(BaseHTTPRequestHandler):
         for gen in response:
             logging.debug(gen.text)
             tool_call_complete = False
+            suppress_text = False
 
             # Gather the text in tool calling or text variables
             if ctx.has_thinking and gen.token == ctx.think_start_id:
                 in_reasoning = True
+                suppress_text = True
+            elif ctx.has_thinking and gen.token == ctx.think_end_id:
+                in_reasoning = False
+                suppress_text = True
             elif in_reasoning:
-                if ctx.has_thinking and gen.token == ctx.think_end_id:
-                    in_reasoning = False
-                else:
-                    reasoning_text += gen.text
+                reasoning_text += gen.text
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 in_tool_call = True
             elif in_tool_call:
@@ -1379,7 +1381,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_call_complete = True
                 else:
                     tool_text += gen.text
-            else:
+            elif not suppress_text:
                 text += gen.text
                 segment += gen.text
 
