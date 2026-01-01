@@ -22,6 +22,7 @@ LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
   - [Generate](#Generate)
 - [Fuse](#Fuse)
 - [Data](#Data)
+- [Custom Chat Templates](#Custom-Chat-Templates)
 - [Memory Issues](#Memory-Issues)
 
 ## Run
@@ -359,6 +360,28 @@ How can I assistant you today.<|im_end|>
 If you are unsure of the format to use, the `chat` or `completions` are good to
 start with. For custom requirements on the format of the dataset, use the
 `text` format to assemble the content yourself.
+
+## Custom Chat Templates
+
+You can customize the tokenizer behavior, including specifying a custom chat
+template, using the `tokenizer_config` option in your YAML config file:
+
+```yaml
+tokenizer_config:
+  trust_remote_code: true
+  chat_template_file: "path/to/chat_template.jinja"
+```
+
+The `chat_template_file` option loads a Jinja2 template from the specified file
+path. Alternatively, you can provide the template directly as a string:
+
+```yaml
+tokenizer_config:
+  chat_template: "{% for message in messages %}..."
+```
+
+Any options specified in `tokenizer_config` are passed to the HuggingFace
+`AutoTokenizer.from_pretrained()` function.
 
 ## Memory Issues
 
