@@ -164,6 +164,11 @@ def process_message_content(messages):
             message["content"] = "".join(text_fragments)
         elif content is None:
             message["content"] = ""
+        if tool_calls := message.get("tool_calls", False):
+            for tool_call in tool_calls:
+                if func := tool_call.get("function", False):
+                    if args := func.get("arguments", False):
+                        func["arguments"] = json.loads(args)
 
 
 class LRUPromptCache:
@@ -1225,6 +1230,8 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_idx = 0
 
         def parse_tools(tool_calls):
+            if not tool_calls:
+                return []
             nonlocal tool_idx
             out = [
                 {
@@ -1240,9 +1247,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token
-        in_reasoning = ctx.has_thinking and ctx.prompt.count(
-            ctx.think_start_id
-        ) > ctx.prompt.count(ctx.think_end_id)
+        in_reasoning = False
+        if ctx.has_thinking:
+            for i in range(len(ctx.prompt) - 1, -1, -1):
+                if ctx.prompt[i] == ctx.think_end_id:
+                    break
+                elif ctx.prompt[i] == ctx.think_start_id:
+                    in_reasoning = True
+                    break
         reasoning_text = ""
 
         # Variables to save the generated tokens and the corresponding probs
