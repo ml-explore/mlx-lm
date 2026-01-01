@@ -10,7 +10,7 @@ class TestToolParsing(unittest.TestCase):
         tool_text = (
             '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}'
         )
-        tool_call = json_tools.parse_tool_text(tool_text, None)
+        tool_call = json_tools.parse_tool_call(tool_text)
         expected = {
             "name": "multiply",
             "arguments": '{"a": 12234585, "b": 48838483920}',
@@ -53,7 +53,7 @@ class TestToolParsing(unittest.TestCase):
 
     def test_function_gemma(self):
         text = "call:get_current_temperature{location:<escape>London<escape>}"
-        tool_call = function_gemma.parse_tool_calls(text)
+        tool_call = function_gemma.parse_tool_call(text)
         expected = {
             "name": "get_current_temperature",
             "arguments": '{"location": "London"}',

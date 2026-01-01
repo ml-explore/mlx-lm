@@ -10,6 +10,7 @@ from mlx_lm.tokenizer_utils import (
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
 )
+from mlx_lm.tool_parsers import json_tools
 from mlx_lm.utils import load_tokenizer
 
 
@@ -85,7 +86,7 @@ class TestTokenizers(unittest.TestCase):
 
     def test_tool_calling(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
-        tokenizer = load_tokenizer(tokenizer_repo)
+        tokenizer = load_tokenizer(tokenizer_repo, tool_module=json_tools)
         self.assertTrue(tokenizer.has_tool_calling)
         self.assertEqual(tokenizer.tool_call_start, "<tool_call>")
         self.assertEqual(tokenizer.tool_call_end, "</tool_call>")

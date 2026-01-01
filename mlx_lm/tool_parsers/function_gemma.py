@@ -14,7 +14,7 @@ _tool_call_regex = re.compile(r"call:(\w+)\{(.*?)\}", re.DOTALL)
 _arg_regex = re.compile(r"(\w+):<escape>(.*?)<escape>", re.DOTALL)
 
 
-def parse_tool_calls(text: str, _: Optional[Any] = None):
+def parse_tool_call(text: str, _: Optional[Any] = None):
     match = _tool_call_regex.findall(text)
     if not match:
         raise ValueError("No function provided.")

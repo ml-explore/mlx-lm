@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-from .tool_parsers.json_tools import parse_tool_text as default_tool_parser
+from .tool_parsers.json_tools import parse_tool_call as default_tool_parser
 
 
 class StreamingDetokenizer:
@@ -457,6 +457,7 @@ def load(
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
     return_tokenizer=True,
     eos_token_ids=None,
+    tool_module=None,
 ) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
@@ -488,9 +489,7 @@ def load(
 
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
-    tool_parser = None
-    tool_call_start = None
-    tool_call_end = None
+
     if tokenizer_config_file.exists():
         with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
             try:
@@ -503,13 +502,21 @@ def load(
             chat_template = importlib.import_module(
                 f"mlx_lm.chat_templates.{chat_template_type}"
             ).apply_chat_template
-        if tool_parser_type := tokenizer_config.get("tool_parser_type", False):
-            tool_parser_module = importlib.import_module(
+        if tool_module is not None and (
+            tool_parser_type := tokenizer_config.get("tool_parser_type", False)
+        ):
+            tool_module = importlib.import_module(
                 f"mlx_lm.tool_parsers.{tool_parser_type}"
             )
-            tool_parser = tool_module.parse_tool_call
-            tool_call_start = tool_module.tool_call_start
-            tool_call_end = tool_module.tool_call_end
+
+    if tool_module is not None:
+        tool_parser = tool_module.parse_tool_call
+        tool_call_start = tool_module.tool_call_start
+        tool_call_end = tool_module.tool_call_end
+    else:
+        tool_parser = None
+        tool_call_start = None
+        tool_call_end = None
 
     if return_tokenizer:
         kwargs = tokenizer_config_extra or {}
