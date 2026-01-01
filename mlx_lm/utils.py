@@ -50,6 +50,7 @@ MODEL_REMAPPING = {
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
+    "iquestcoder": "llama",
 }
 
 MAX_FILE_SIZE_GB = 5
