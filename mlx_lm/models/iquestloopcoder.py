@@ -145,15 +145,10 @@ class Attention(nn.Module):
         keys: mx.array,
         values: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
     ) -> mx.array:
         B, _, L, _ = queries.shape
-
-        if cache is not None:
-            keys, values = cache.update_and_fetch(keys, values)
-
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, cache=None, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -271,7 +266,7 @@ class IQuestLoopCoderModel(nn.Module):
             q1, k1, v1 = layer.self_attn.get_qkv(h_norm, offset=0)
             loop1_kv.append((k1, v1))
 
-            r = layer.self_attn.forward_with_precomputed_qkv(q1, k1, v1, mask, None)
+            r = layer.self_attn.forward_with_precomputed_qkv(q1, k1, v1, mask)
             h = h + r
             r = layer.mlp(layer.post_attention_layernorm(h))
             h = h + r
