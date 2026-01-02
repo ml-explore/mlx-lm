@@ -1229,21 +1229,26 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         tool_idx = 0
 
+        def parse_single_tool(tool_text):
+            nonlocal tool_idx
+            tool_call = ctx.tool_parser(tool_text, request.tools)
+            tool_call["arguments"] = json.dumps(
+                tool_call["arguments"], ensure_ascii=False
+            )
+            out = {
+                "function": tool_call,
+                "type": "function",
+                "id": str(uuid.uuid4()),
+            }
+            if self.stream:
+                out["index"] = tool_idx
+                tool_idx += 1
+            return out
+
         def parse_tools(tool_calls):
             if not tool_calls:
                 return []
-            nonlocal tool_idx
-            out = [
-                {
-                    "function": ctx.tool_parser(tool_text, request.tools),
-                    "type": "function",
-                    "id": str(uuid.uuid4()),
-                    "index": tool_idx + i,
-                }
-                for i, tool_text in enumerate(tool_calls)
-            ]
-            tool_idx += len(tool_calls)
-            return out
+            return [parse_single_tool(tool_text) for tool_text in tool_calls]
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token

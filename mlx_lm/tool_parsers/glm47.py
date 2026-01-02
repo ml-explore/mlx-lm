@@ -62,7 +62,4 @@ def parse_tool_call(text: str, tools: list[Any] | None = None):
         if not _is_string_type(func_name, arg_key, tools):
             arg_val = _deserialize(arg_val)
         arg_dct[arg_key] = arg_val
-    return {
-        "name": func_name,
-        "arguments": json.dumps(arg_dct, ensure_ascii=False),
-    }
+    return dict(name=func_name, arguments=arg_dct)

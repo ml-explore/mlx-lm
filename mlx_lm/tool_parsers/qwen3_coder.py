@@ -93,10 +93,7 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
         param_dict[param_name] = _convert_param_value(
             param_value, param_name, param_config
         )
-    return {
-        "name": function_name,
-        "arguments": json.dumps(param_dict, ensure_ascii=False),
-    }
+    return dict(name=function_name, arguments=param_dict)
 
 
 tool_call_start = "<tool_call>"

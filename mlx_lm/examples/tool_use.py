@@ -54,7 +54,7 @@ response = generate(
 start_tool = response.find(tokenizer.tool_call_start) + len(tokenizer.tool_call_start)
 end_tool = response.find(tokenizer.tool_call_end)
 tool_call = tokenizer.tool_parser(response[start_tool:end_tool].strip())
-tool_result = tools[tool_call["name"]](**json.loads(tool_call["arguments"]))
+tool_result = tools[tool_call["name"]](**tool_call["arguments"])
 
 # Put the tool result in the prompt
 messages = [{"role": "tool", "name": tool_call["name"], "content": tool_result}]
