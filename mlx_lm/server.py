@@ -1654,6 +1654,9 @@ def main():
         default="{}",
     )
     args = parser.parse_args()
+    if mx.metal.is_available():
+        wired_limit = mx.metal.device_info()["max_recommended_working_set_size"]
+        mx.set_wired_limit(wired_limit)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
