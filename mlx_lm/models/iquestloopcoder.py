@@ -20,6 +20,18 @@ def _compute_gate(query: mx.array, weight: mx.array, bias: mx.array) -> mx.array
     return mx.sigmoid(gate_logits)[..., None]
 
 
+@partial(mx.compile, shapeless=True)
+def _silu_mul(gate: mx.array, up: mx.array) -> mx.array:
+    return nn.silu(gate) * up
+
+
+@partial(mx.compile, shapeless=True)
+def _mix_attention(
+    gate: mx.array, attn_global: mx.array, attn_local: mx.array
+) -> mx.array:
+    return gate * attn_global + (1 - gate) * attn_local
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -157,7 +169,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=args.mlp_bias)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(_silu_mul(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):
@@ -205,7 +217,7 @@ class TransformerBlock(nn.Module):
             window_mask = create_causal_mask(L, offset, window_size=window_size)
             attn_local = self.self_attn.forward_with_kv(q2, k2, v2, window_mask)
 
-        mixed = gate * attn_global + (1 - gate) * attn_local
+        mixed = _mix_attention(gate, attn_global, attn_local)
         mixed = mixed.transpose(0, 2, 1, 3).reshape(B, L, -1)
         r = self.self_attn.o_proj(mixed)
 
@@ -324,7 +336,7 @@ class IQuestLoopCoderModel(nn.Module):
                     q2, k2_window, v2_window, mask=None, cache=c[1]
                 )
 
-                mixed = gate * attn_global + (1 - gate) * attn_local
+                mixed = _mix_attention(gate, attn_global, attn_local)
                 r = layer.self_attn.o_proj(
                     mixed.transpose(0, 2, 1, 3).reshape(B, L, -1)
                 )
