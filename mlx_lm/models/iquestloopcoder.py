@@ -277,24 +277,23 @@ class IQuestLoopCoderModel(nn.Module):
             h = h + r
 
         loop2_kv = []
-        for loop_idx in range(2, self.loop_num + 1):
-            for i, (layer, (k1, v1), gate_proj) in enumerate(
-                zip(self.layers, loop1_kv, self.gate_projections)
-            ):
-                h = layer.forward_loop2(
-                    h,
-                    k1,
-                    v1,
-                    gate_proj,
-                    mask,
-                    offset=0,
-                    window_size=self.loop_window_size,
-                )
+        for layer, (k1, v1), gate_proj in zip(
+            self.layers, loop1_kv, self.gate_projections
+        ):
+            h = layer.forward_loop2(
+                h,
+                k1,
+                v1,
+                gate_proj,
+                mask,
+                offset=0,
+                window_size=self.loop_window_size,
+            )
 
-                if cache is not None and loop_idx == 2:
-                    h_norm = layer.input_layernorm(h)
-                    _, k2, v2 = layer.self_attn.get_qkv(h_norm, offset=0)
-                    loop2_kv.append((k2, v2))
+            if cache is not None:
+                h_norm = layer.input_layernorm(h)
+                _, k2, v2 = layer.self_attn.get_qkv(h_norm, offset=0)
+                loop2_kv.append((k2, v2))
 
         if cache is not None:
             for c, (k1, v1), (k2, v2) in zip(cache, loop1_kv, loop2_kv):
@@ -325,30 +324,27 @@ class IQuestLoopCoderModel(nn.Module):
             r = layer.mlp(layer.post_attention_layernorm(h))
             h = h + r
 
-        for _ in range(2, self.loop_num + 1):
-            for layer, c, gate_proj in zip(self.layers, cache, self.gate_projections):
-                h_norm = layer.input_layernorm(h)
-                q2, k2, v2 = layer.self_attn.get_qkv(h_norm, offset)
-                gate = gate_proj(q2)
+        for layer, c, gate_proj in zip(self.layers, cache, self.gate_projections):
+            h_norm = layer.input_layernorm(h)
+            q2, k2, v2 = layer.self_attn.get_qkv(h_norm, offset)
+            gate = gate_proj(q2)
 
-                k1_full, v1_full = c[0].state
-                attn_global = layer.self_attn.forward_with_kv(
-                    q2, k1_full, v1_full, mask=None, cache=c[0]
-                )
+            k1_full, v1_full = c[0].state
+            attn_global = layer.self_attn.forward_with_kv(
+                q2, k1_full, v1_full, mask=None, cache=c[0]
+            )
 
-                k2_window, v2_window = c[1].update_and_fetch(k2, v2)
-                attn_local = layer.self_attn.forward_with_kv(
-                    q2, k2_window, v2_window, mask=None, cache=c[1]
-                )
+            k2_window, v2_window = c[1].update_and_fetch(k2, v2)
+            attn_local = layer.self_attn.forward_with_kv(
+                q2, k2_window, v2_window, mask=None, cache=c[1]
+            )
 
-                mixed = _mix_attention(gate, attn_global, attn_local)
-                r = layer.self_attn.o_proj(
-                    mixed.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                )
+            mixed = _mix_attention(gate, attn_global, attn_local)
+            r = layer.self_attn.o_proj(mixed.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
-                h = h + r
-                r = layer.mlp(layer.post_attention_layernorm(h))
-                h = h + r
+            h = h + r
+            r = layer.mlp(layer.post_attention_layernorm(h))
+            h = h + r
 
         return self.norm(h)
 
