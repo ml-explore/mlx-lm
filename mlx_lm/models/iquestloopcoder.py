@@ -127,7 +127,7 @@ class Attention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
-    def forward_with_kv(
+    def attention(
         self,
         queries: mx.array,
         keys: mx.array,
@@ -138,20 +138,6 @@ class Attention(nn.Module):
         return scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
-
-    def forward_with_precomputed_qkv(
-        self,
-        queries: mx.array,
-        keys: mx.array,
-        values: mx.array,
-        mask: Optional[mx.array] = None,
-    ) -> mx.array:
-        B, _, L, _ = queries.shape
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=None, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
 
 
 class MLP(nn.Module):
@@ -197,20 +183,20 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         offset: int = 0,
         window_size: int = 64,
-    ) -> mx.array:
+    ) -> Tuple[mx.array, mx.array, mx.array]:
         B, L, _ = x.shape
         h_norm = self.input_layernorm(x)
 
         q2, k2, v2 = self.self_attn.get_qkv(h_norm, offset)
         gate = gate_proj(q2)
 
-        attn_global = self.self_attn.forward_with_kv(q2, k1, v1, mask)
+        attn_global = self.self_attn.attention(q2, k1, v1, mask)
 
         if L <= window_size:
-            attn_local = self.self_attn.forward_with_kv(q2, k2, v2, mask)
+            attn_local = self.self_attn.attention(q2, k2, v2, mask)
         else:
             window_mask = create_causal_mask(L, offset, window_size=window_size)
-            attn_local = self.self_attn.forward_with_kv(q2, k2, v2, window_mask)
+            attn_local = self.self_attn.attention(q2, k2, v2, window_mask)
 
         mixed = _mix_attention(gate, attn_global, attn_local)
         mixed = mixed.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -218,7 +204,7 @@ class TransformerBlock(nn.Module):
 
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        return h + r, k2, v2
 
 
 class IQuestLoopCoderModel(nn.Module):
@@ -266,7 +252,8 @@ class IQuestLoopCoderModel(nn.Module):
             q1, k1, v1 = layer.self_attn.get_qkv(h_norm, offset=0)
             loop1_kv.append((k1, v1))
 
-            r = layer.self_attn.forward_with_precomputed_qkv(q1, k1, v1, mask)
+            out = layer.self_attn.attention(q1, k1, v1, mask)
+            r = layer.self_attn.o_proj(out.transpose(0, 2, 1, 3).reshape(h.shape))
             h = h + r
             r = layer.mlp(layer.post_attention_layernorm(h))
             h = h + r
@@ -275,7 +262,7 @@ class IQuestLoopCoderModel(nn.Module):
         for layer, (k1, v1), gate_proj in zip(
             self.layers, loop1_kv, self.gate_projections
         ):
-            h = layer.forward_loop2(
+            h, k2, v2 = layer.forward_loop2(
                 h,
                 k1,
                 v1,
@@ -284,11 +271,7 @@ class IQuestLoopCoderModel(nn.Module):
                 offset=0,
                 window_size=self.loop_window_size,
             )
-
-            if cache is not None:
-                h_norm = layer.input_layernorm(h)
-                _, k2, v2 = layer.self_attn.get_qkv(h_norm, offset=0)
-                loop2_kv.append((k2, v2))
+            loop2_kv.append((k2, v2))
 
         if cache is not None:
             for c, (k1, v1), (k2, v2) in zip(cache, loop1_kv, loop2_kv):
@@ -325,14 +308,10 @@ class IQuestLoopCoderModel(nn.Module):
             gate = gate_proj(q2)
 
             k1_full, v1_full = c[0].state
-            attn_global = layer.self_attn.forward_with_kv(
-                q2, k1_full, v1_full, mask=None, cache=c[0]
-            )
+            attn_global = layer.self_attn.attention(q2, k1_full, v1_full, cache=c[0])
 
             k2_window, v2_window = c[1].update_and_fetch(k2, v2)
-            attn_local = layer.self_attn.forward_with_kv(
-                q2, k2_window, v2_window, mask=None, cache=c[1]
-            )
+            attn_local = layer.self_attn.attention(q2, k2_window, v2_window, cache=c[1])
 
             mixed = _mix_attention(gate, attn_global, attn_local)
             r = layer.self_attn.o_proj(mixed.transpose(0, 2, 1, 3).reshape(B, L, -1))
