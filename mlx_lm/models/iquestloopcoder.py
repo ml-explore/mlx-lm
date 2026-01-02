@@ -229,6 +229,7 @@ class TransformerBlock(nn.Module):
 class IQuestLoopCoderModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        assert args.loop_num == 2, f"Only loop_num=2 is supported, got {args.loop_num}"
         self.args = args
         self.vocab_size = args.vocab_size
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -246,7 +247,7 @@ class IQuestLoopCoderModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache: Optional[List[Tuple[KVCache, KVCache]]] = None,
+        cache: Optional[List[Any]] = None,
     ):
         h = self.embed_tokens(inputs)
         is_prefill = cache is None or cache[0][0].offset == 0
@@ -259,7 +260,7 @@ class IQuestLoopCoderModel(nn.Module):
     def _forward_prefill(
         self,
         h: mx.array,
-        cache: Optional[List[Tuple[KVCache, KVCache]]],
+        cache: Optional[List[Any]],
     ):
         L = h.shape[1]
         mask = create_causal_mask(L) if L > 1 else None
@@ -275,9 +276,10 @@ class IQuestLoopCoderModel(nn.Module):
             r = layer.mlp(layer.post_attention_layernorm(h))
             h = h + r
 
-        for _ in range(2, self.loop_num + 1):
-            for layer, (k1, v1), gate_proj in zip(
-                self.layers, loop1_kv, self.gate_projections
+        loop2_kv = []
+        for loop_idx in range(2, self.loop_num + 1):
+            for i, (layer, (k1, v1), gate_proj) in enumerate(
+                zip(self.layers, loop1_kv, self.gate_projections)
             ):
                 h = layer.forward_loop2(
                     h,
@@ -289,19 +291,22 @@ class IQuestLoopCoderModel(nn.Module):
                     window_size=self.loop_window_size,
                 )
 
+                if cache is not None and loop_idx == 2:
+                    h_norm = layer.input_layernorm(h)
+                    _, k2, v2 = layer.self_attn.get_qkv(h_norm, offset=0)
+                    loop2_kv.append((k2, v2))
+
         if cache is not None:
-            for layer, c, (k1, v1) in zip(self.layers, cache, loop1_kv):
-                h_norm = layer.input_layernorm(h)
-                _, k_final, v_final = layer.self_attn.get_qkv(h_norm, offset=0)
+            for c, (k1, v1), (k2, v2) in zip(cache, loop1_kv, loop2_kv):
                 c[0].update_and_fetch(k1, v1)
-                c[1].update_and_fetch(k_final, v_final)
+                c[1].update_and_fetch(k2, v2)
 
         return self.norm(h)
 
     def _forward_generate(
         self,
         h: mx.array,
-        cache: List[Tuple[KVCache, KVCache]],
+        cache: List[Any],
     ):
         B, L, _ = h.shape
         offset = cache[0][0].offset
