@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -138,12 +139,21 @@ class MoE(nn.Module):
             intermediate_size = args.moe_intermediate_size * args.num_shared_experts
             self.shared_experts = MLP(args, intermediate_size=intermediate_size)
 
+        self.sharding_group = None
+
     def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if hasattr(self, "shared_experts"):
             y = y + self.shared_experts(x)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
         return y
 
 
@@ -381,3 +391,59 @@ class Model(nn.Module):
             else:
                 caches.append(KVCache())
         return caches
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+
+        for layer in self.model.layers:
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            if isinstance(layer.mlp, MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+            else:
+                layer.mlp.sharding_group = group
+                if hasattr(layer.mlp, "shared_experts"):
+                    shard_inplace(
+                        layer.mlp.shared_experts.gate_proj,
+                        "all-to-sharded",
+                        group=group,
+                    )
+                    shard_inplace(
+                        layer.mlp.shared_experts.down_proj,
+                        "sharded-to-all",
+                        group=group,
+                    )
+                    shard_inplace(
+                        layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
+                    )
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
