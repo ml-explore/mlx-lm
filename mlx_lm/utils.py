@@ -267,9 +267,7 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     return _load_adapters(model, adapter_path)
 
 
-def load_tokenizer(
-    model_path, tokenizer_config_extra=None, eos_token_ids=None, tool_module=None
-):
+def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
     """
@@ -290,7 +288,6 @@ def load_tokenizer(
         model_path,
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
-        tool_module=tool_module,
     )
 
 

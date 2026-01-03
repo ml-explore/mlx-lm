@@ -452,12 +452,27 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
+def _infer_tool_parser(chat_template):
+    """Attempt to auto-infer a tool parser from the chat template."""
+    if not isinstance(chat_template, str):
+        return None
+    elif "<minimax:tool_call>" in chat_template:
+        return "minimax_m2"
+    elif "<start_function_call>" in chat_template:
+        return "function_gemma"
+    elif "<arg_key>" in chat_template:
+        return "glm47"
+    elif "<tool_call>\n<function=" in chat_template:
+        return "qwen3_coder"
+    elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
+        return "json_tools"
+    return None
+
+
 def load(
     model_path,
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
-    return_tokenizer=True,
     eos_token_ids=None,
-    tool_module=None,
 ) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
@@ -490,47 +505,41 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    if tokenizer_config_file.exists():
-        with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
-            try:
-                tokenizer_config = json.load(fid)
-            except JSONDecodeError as e:
-                raise JSONDecodeError(
-                    "Failed to parse tokenizer_config.json", e.doc, e.pos
-                )
-        if chat_template_type := tokenizer_config.get("chat_template_type", False):
-            chat_template = importlib.import_module(
-                f"mlx_lm.chat_templates.{chat_template_type}"
-            ).apply_chat_template
-        if tool_module is None and (
-            tool_parser_type := tokenizer_config.get("tool_parser_type", False)
-        ):
-            tool_module = importlib.import_module(
-                f"mlx_lm.tool_parsers.{tool_parser_type}"
-            )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, **(tokenizer_config_extra or {})
+    )
 
-    if tool_module is not None:
+    tokenizer_config = tokenizer.init_kwargs
+
+    if chat_template_type := tokenizer_config.get("chat_template_type", False):
+        chat_template = importlib.import_module(
+            f"mlx_lm.chat_templates.{chat_template_type}"
+        ).apply_chat_template
+
+    tool_parser_type = tokenizer_config.get(
+        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
+    )
+
+    if tool_parser_type is not None:
+        tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
         tool_parser = tool_module.parse_tool_call
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end
+        tokenizer_config["tool_parser_type"] = tool_parser_type
     else:
         tool_parser = None
         tool_call_start = None
         tool_call_end = None
 
-    if return_tokenizer:
-        kwargs = tokenizer_config_extra or {}
-        return TokenizerWrapper(
-            AutoTokenizer.from_pretrained(model_path, **kwargs),
-            detokenizer_class,
-            eos_token_ids=eos_token_ids,
-            chat_template=chat_template,
-            tool_parser=tool_parser,
-            tool_call_start=tool_call_start,
-            tool_call_end=tool_call_end,
-        )
-    else:
-        return detokenizer_class
+    return TokenizerWrapper(
+        tokenizer,
+        detokenizer_class,
+        eos_token_ids=eos_token_ids,
+        chat_template=chat_template,
+        tool_parser=tool_parser,
+        tool_call_start=tool_call_start,
+        tool_call_end=tool_call_end,
+    )
 
 
 def no_bos_or_eos(sequence: List, bos: int, eos: int) -> List:
