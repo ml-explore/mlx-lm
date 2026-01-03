@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+from .tool_parsers.json_tools import parse_tool_call as default_tool_parser
+
 
 class StreamingDetokenizer:
     """The streaming detokenizer interface so that we can detokenize one token at a time.
@@ -254,6 +256,9 @@ class TokenizerWrapper:
         detokenizer_class=NaiveStreamingDetokenizer,
         eos_token_ids=None,
         chat_template=None,
+        tool_call_start=None,
+        tool_call_end=None,
+        tool_parser=None,
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
@@ -264,28 +269,32 @@ class TokenizerWrapper:
         )
         self._think_start = None
         self._think_end = None
-        self._tool_call_start = None
-        self._tool_call_end = None
+        self._think_start_id = None
+        self._think_end_id = None
+
         self._chat_template = chat_template
         self.has_chat_template = (
             tokenizer.chat_template is not None or chat_template is not None
         )
-
-        THINK_TOKENS = [("<think>", "</think>")]
-        TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
+        self._tool_parser = tool_parser or default_tool_parser
+        self._tool_call_start = tool_call_start
+        self._tool_call_end = tool_call_end
 
         vocab = tokenizer.get_vocab()
+        THINK_TOKENS = [("<think>", "</think>")]
         for think_start, think_end in THINK_TOKENS:
             if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
                 self._think_end = think_end
+                self._think_start_id = vocab[think_start]
+                self._think_end_id = vocab[think_end]
                 break
-        if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
-            for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
-                if tool_call_start in vocab and tool_call_end in vocab:
-                    self._tool_call_start = tool_call_start
-                    self._tool_call_end = tool_call_end
-                    break
+
+        # Fallback to defaults if no tool call tokens are provided
+        if tool_call_start and tool_call_start not in vocab:
+            raise ValueError("Tool call start token not in vocab")
+        if tool_call_end and tool_call_end not in vocab:
+            raise ValueError("Tool call end token not in vocab")
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
@@ -318,8 +327,16 @@ class TokenizerWrapper:
         return self._think_start
 
     @property
+    def think_start_id(self):
+        return self._think_start_id
+
+    @property
     def think_end(self):
         return self._think_end
+
+    @property
+    def think_end_id(self):
+        return self._think_end_id
 
     @property
     def has_tool_calling(self):
@@ -332,6 +349,10 @@ class TokenizerWrapper:
     @property
     def tool_call_end(self):
         return self._tool_call_end
+
+    @property
+    def tool_parser(self):
+        return self._tool_parser
 
     @property
     def detokenizer(self):
@@ -431,10 +452,26 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
+def _infer_tool_parser(chat_template):
+    """Attempt to auto-infer a tool parser from the chat template."""
+    if not isinstance(chat_template, str):
+        return None
+    elif "<minimax:tool_call>" in chat_template:
+        return "minimax_m2"
+    elif "<start_function_call>" in chat_template:
+        return "function_gemma"
+    elif "<arg_key>" in chat_template:
+        return "glm47"
+    elif "<tool_call>\n<function=" in chat_template:
+        return "qwen3_coder"
+    elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
+        return "json_tools"
+    return None
+
+
 def load(
     model_path,
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
-    return_tokenizer=True,
     eos_token_ids=None,
 ) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
@@ -466,30 +503,43 @@ def load(
         eos_token_ids = [eos_token_ids]
 
     tokenizer_config_file = model_path / "tokenizer_config.json"
-    custom_tokenizer = None
-    if tokenizer_config_file.exists():
-        with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
-            try:
-                tokenizer_config = json.load(fid)
-            except JSONDecodeError as e:
-                raise JSONDecodeError(
-                    "Failed to parse tokenizer_config.json", e.doc, e.pos
-                )
-        if tokenizer_type := tokenizer_config.get("tokenizer_type", False):
-            custom_tokenizer = importlib.import_module(
-                f"mlx_lm.tokenizers.{tokenizer_type}"
-            )
+    chat_template = None
 
-    if return_tokenizer:
-        kwargs = tokenizer_config_extra or {}
-        return TokenizerWrapper(
-            AutoTokenizer.from_pretrained(model_path, **kwargs),
-            detokenizer_class,
-            eos_token_ids=eos_token_ids,
-            chat_template=getattr(custom_tokenizer, "apply_chat_template", None),
-        )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, **(tokenizer_config_extra or {})
+    )
+
+    tokenizer_config = tokenizer.init_kwargs
+
+    if chat_template_type := tokenizer_config.get("chat_template_type", False):
+        chat_template = importlib.import_module(
+            f"mlx_lm.chat_templates.{chat_template_type}"
+        ).apply_chat_template
+
+    tool_parser_type = tokenizer_config.get(
+        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
+    )
+
+    if tool_parser_type is not None:
+        tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
+        tool_parser = tool_module.parse_tool_call
+        tool_call_start = tool_module.tool_call_start
+        tool_call_end = tool_module.tool_call_end
+        tokenizer_config["tool_parser_type"] = tool_parser_type
     else:
-        return detokenizer_class
+        tool_parser = None
+        tool_call_start = None
+        tool_call_end = None
+
+    return TokenizerWrapper(
+        tokenizer,
+        detokenizer_class,
+        eos_token_ids=eos_token_ids,
+        chat_template=chat_template,
+        tool_parser=tool_parser,
+        tool_call_start=tool_call_start,
+        tool_call_end=tool_call_end,
+    )
 
 
 def no_bos_or_eos(sequence: List, bos: int, eos: int) -> List:

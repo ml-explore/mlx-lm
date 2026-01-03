@@ -286,7 +286,9 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         ],
     )
     return _load_tokenizer(
-        model_path, tokenizer_config_extra, eos_token_ids=eos_token_ids
+        model_path,
+        tokenizer_config_extra,
+        eos_token_ids=eos_token_ids,
     )
 
 
