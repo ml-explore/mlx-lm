@@ -1,3 +1,5 @@
+# Copyright © 2025 Apple Inc.
+
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -47,7 +49,7 @@ class YoutuLLMAttention(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
-        self.scale = self.q_head_dim ** -0.5
+        self.scale = self.q_head_dim**-0.5
 
         if self.q_lora_rank is None:
             self.q_proj = nn.Linear(
@@ -90,10 +92,10 @@ class YoutuLLMAttention(nn.Module):
         )
 
     def __call__(
-            self,
-            x: mx.array,
-            mask: Optional[mx.array] = None,
-            cache: Optional[Any] = None,
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -164,10 +166,10 @@ class YoutuLLMDecoderLayer(nn.Module):
         )
 
     def __call__(
-            self,
-            x: mx.array,
-            mask: Optional[mx.array] = None,
-            cache: Optional[Any] = None,
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -182,7 +184,6 @@ class YoutuLLMModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
             YoutuLLMDecoderLayer(config=config) for _ in range(config.num_hidden_layers)
@@ -190,15 +191,11 @@ class YoutuLLMModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
-            self,
-            inputs: mx.array,
-            cache=None,
-            input_embeddings: Optional[mx.array] = None,
+        self,
+        inputs: mx.array,
+        cache=None,
     ):
-        if input_embeddings is not None:
-            h = input_embeddings
-        else:
-            h = self.embed_tokens(inputs)
+        h = self.embed_tokens(inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -220,12 +217,11 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
-            self,
-            inputs: mx.array,
-            cache=None,
-            input_embeddings: Optional[mx.array] = None,
+        self,
+        inputs: mx.array,
+        cache=None,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        out = self.model(inputs, cache)
         if self.config.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
