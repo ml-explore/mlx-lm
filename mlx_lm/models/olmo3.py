@@ -233,3 +233,9 @@ class Model(nn.Module):
             else:
                 caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches
+
+    def sanitize(self, weights):
+        # Remove unused precomputed rotary freqs
+        return {
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+        }
