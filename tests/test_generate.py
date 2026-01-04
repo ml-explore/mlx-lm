@@ -356,6 +356,81 @@ class TestGenerate(unittest.TestCase):
 
         del self.model.make_cache
 
+    def test_batch_generate_with_logits_processors(self):
+        """Test that batch_generate with logits_processors produces correct results."""
+        logit_bias = {0: 2000.0, 1: -2000.0}
+        processors = make_logits_processors(logit_bias)
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+        prompt = self.tokenizer.encode("hello")
+        uids = batch_gen.insert([prompt])
+        response = batch_gen.next()[0]
+        logprobs = response.logprobs
+        self.assertEqual(logprobs[0].item(), 0.0)
+        self.assertEqual(logprobs.argmin().item(), 1)
+
+        del batch_gen
+
+        logit_bias = {0: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+
+        (uid0,) = batch_gen.insert([prompt])
+
+        logit_bias = {1: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        (uid1,) = batch_gen.insert([prompt], logits_processors=[processors])
+
+        logit_bias = {2: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        (uid2,) = batch_gen.insert([prompt], logits_processors=[processors])
+
+        responses = batch_gen.next()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid0].logprobs[0].item(), 0.0)
+        self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
+        self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
+
+    def test_batch_generate_with_samplers(self):
+        """Test that batch_generate with logits_processors produces correct results."""
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            sampler=lambda _: mx.array([1]),
+        )
+        prompt = self.tokenizer.encode("hello")
+        uids = batch_gen.insert([prompt])
+        response = batch_gen.next()[0]
+        self.assertEqual(response.token, 1)
+
+        del batch_gen
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            sampler=lambda _: mx.array([1]),
+        )
+
+        (uid0,) = batch_gen.insert([prompt])
+        uid1, uid2 = batch_gen.insert(
+            [prompt, prompt],
+            samplers=[lambda _: mx.array([2]), lambda _: mx.array([3])],
+        )
+
+        responses = batch_gen.next()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid0].token, 1)
+        self.assertEqual(responses[uid1].token, 2)
+        self.assertEqual(responses[uid2].token, 3)
+
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
             if rotating:
@@ -435,50 +510,6 @@ class TestGenerate(unittest.TestCase):
 
             if rotating:
                 del self.model.make_cache
-
-    def test_batch_generate_with_logits_processors(self):
-        """Test that batch_generate with logits_processors produces correct results."""
-        logit_bias = {0: 2000.0, 1: -20.0}
-        processors = make_logits_processors(logit_bias)
-
-        # Batch generation with processor
-        batch_result = batch_generate(
-            self.model,
-            self.tokenizer,
-            [self.tokenizer.encode("hello")],
-            max_tokens=5,
-            logits_processors=processors,
-            verbose=False,
-        )
-
-        # Should produce valid output
-        self.assertEqual(len(batch_result.texts), 1)
-        self.assertGreater(len(batch_result.texts[0]), 0)
-
-    def test_batch_generate_processors_multi_sample(self):
-        """Test logits_processors with multiple samples in batch."""
-        logit_bias = {0: 1000.0}
-        processors = make_logits_processors(logit_bias)
-
-        prompts = [
-            self.tokenizer.encode("hello"),
-            self.tokenizer.encode("world"),
-            self.tokenizer.encode("test"),
-        ]
-
-        batch_result = batch_generate(
-            self.model,
-            self.tokenizer,
-            prompts,
-            max_tokens=3,
-            logits_processors=processors,
-            verbose=False,
-        )
-
-        # Should produce output for all prompts
-        self.assertEqual(len(batch_result.texts), 3)
-        for text in batch_result.texts:
-            self.assertGreater(len(text), 0)
 
 
 if __name__ == "__main__":
