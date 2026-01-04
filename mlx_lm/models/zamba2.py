@@ -50,13 +50,17 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 4096
     tie_word_embeddings: bool = True
     use_conv_bias: bool = True
-    use_mem_rope: bool = True  # Whether to apply RoPE in attention (model-dependent; e.g. 1.2B/7B=True, 2.7B=False)
+    use_mem_rope: bool = (
+        True  # Whether to apply RoPE in attention (model-dependent; e.g. 1.2B/7B=True, 2.7B=False)
+    )
 
     def __post_init__(self):
         # Compute hybrid_layer_ids from layers_block_type if provided
         if self.hybrid_layer_ids is None:
             if self.layers_block_type is not None:
-                self.hybrid_layer_ids = [i for i, t in enumerate(self.layers_block_type) if t == "hybrid"]
+                self.hybrid_layer_ids = [
+                    i for i, t in enumerate(self.layers_block_type) if t == "hybrid"
+                ]
             else:
                 # Default for 54-layer model
                 self.hybrid_layer_ids = [6, 12, 18, 24, 30, 36, 42, 47, 51]
@@ -65,7 +69,9 @@ class ModelArgs(BaseModelArgs):
         if self.attention_hidden_size is None:
             self.attention_hidden_size = 2 * self.hidden_size
         if self.attention_head_dim is None:
-            self.attention_head_dim = self.attention_hidden_size // self.num_attention_heads
+            self.attention_head_dim = (
+                self.attention_hidden_size // self.num_attention_heads
+            )
 
         # Mamba dimensions
         self.mamba_d_ssm = self.mamba_expand * self.hidden_size
@@ -81,13 +87,20 @@ class ModelArgs(BaseModelArgs):
 class Zamba2RMSNormGated(nn.Module):
     """RMSNorm w/ optional SiLU gating, following Zamba2 pattern."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-5, norm_before_gate: bool = False):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-5,
+        norm_before_gate: bool = False
+    ):
         super().__init__()
         self.weight = mx.ones((hidden_size,))
         self.eps = eps
         self.norm_before_gate = norm_before_gate
 
-    def __call__(self, hidden_states: mx.array, gate: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self, hidden_states: mx.array, gate: Optional[mx.array] = None
+    ) -> mx.array:
         if not self.norm_before_gate and gate is not None:
             hidden_states = hidden_states * nn.silu(gate)
 
@@ -156,15 +169,16 @@ class Zamba2MambaMixer(nn.Module):
         padded_input = mx.concatenate([conv_state, conv_input], axis=1)
 
         if cache is not None:
-            cache[0] = padded_input[:, -(self.conv_kernel_size - 1):]
+            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :]
 
         conv_output = self.conv1d(padded_input)
         return nn.silu(conv_output)
 
     def __call__(
-        self, x: mx.array,
+        self,
+        x: mx.array,
         cache: Optional[MambaCache] = None,
-        mask: Optional[mx.array] = None
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = x.shape
 
@@ -187,7 +201,9 @@ class Zamba2MambaMixer(nn.Module):
             axis=-1,
         )
 
-        hidden_states = hidden_states.reshape(batch_size, seq_len, self.n_mamba_heads, self.head_dim)
+        hidden_states = hidden_states.reshape(
+            batch_size, seq_len, self.n_mamba_heads, self.head_dim
+        )
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
 
@@ -241,12 +257,20 @@ class Zamba2Attention(nn.Module):
         self.use_mem_rope = args.use_mem_rope
 
         # Q, K, V projections from attention_hidden_size (concatenated input)
-        self.q_proj = nn.Linear(self.attention_hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.attention_hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.attention_hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(
+            self.attention_hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.attention_hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.attention_hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
 
         # Output projection to hidden_size
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
 
         # Adapters for Q, K, V: one per hybrid layer position
         # HF uses nn.Identity placeholders for blocks that don't own the adapter.
@@ -258,20 +282,44 @@ class Zamba2Attention(nn.Module):
                 if i % self.num_mem_blocks == self.block_id:
                     self.linear_q_adapter_list.append(
                         [
-                            nn.Linear(self.attention_hidden_size, args.adapter_rank, bias=False),
-                            nn.Linear(args.adapter_rank, self.num_heads * self.head_dim, bias=False),
+                            nn.Linear(
+                                self.attention_hidden_size,
+                                args.adapter_rank,
+                                bias=False,
+                            ),
+                            nn.Linear(
+                                args.adapter_rank,
+                                self.num_heads * self.head_dim,
+                                bias=False,
+                            ),
                         ]
                     )
                     self.linear_k_adapter_list.append(
                         [
-                            nn.Linear(self.attention_hidden_size, args.adapter_rank, bias=False),
-                            nn.Linear(args.adapter_rank, self.num_kv_heads * self.head_dim, bias=False),
+                            nn.Linear(
+                                self.attention_hidden_size,
+                                args.adapter_rank,
+                                bias=False,
+                            ),
+                            nn.Linear(
+                                args.adapter_rank,
+                                self.num_kv_heads * self.head_dim,
+                                bias=False,
+                            ),
                         ]
                     )
                     self.linear_v_adapter_list.append(
                         [
-                            nn.Linear(self.attention_hidden_size, args.adapter_rank, bias=False),
-                            nn.Linear(args.adapter_rank, self.num_kv_heads * self.head_dim, bias=False),
+                            nn.Linear(
+                                self.attention_hidden_size,
+                                args.adapter_rank,
+                                bias=False,
+                            ),
+                            nn.Linear(
+                                args.adapter_rank,
+                                self.num_kv_heads * self.head_dim,
+                                bias=False,
+                            ),
                         ]
                     )
                 else:
@@ -333,7 +381,9 @@ class Zamba2Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        output = scaled_dot_product_attention(queries, keys, values, cache=cache, scale=self.scale, mask=mask)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -352,7 +402,9 @@ class Zamba2MLP(nn.Module):
         self.block_id = block_id
         self.hidden_act = args.hidden_act
 
-        self.gate_up_proj = nn.Linear(args.hidden_size, 2 * args.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(
+            args.hidden_size, 2 * args.intermediate_size, bias=False
+        )
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
         if self.use_adapters:
@@ -362,7 +414,11 @@ class Zamba2MLP(nn.Module):
                     self.gate_up_proj_adapter_list.append(
                         [
                             nn.Linear(args.hidden_size, args.adapter_rank, bias=False),
-                            nn.Linear(args.adapter_rank, 2 * args.intermediate_size, bias=False),
+                            nn.Linear(
+                                args.adapter_rank,
+                                2 * args.intermediate_size,
+                                bias=False,
+                            ),
                         ]
                     )
                 else:
@@ -397,11 +453,17 @@ class Zamba2SharedTransformerBlock(nn.Module):
         super().__init__()
         self.block_id = block_id
         # Input layernorm operates on concatenated input (attention_hidden_size)
-        self.input_layernorm = nn.RMSNorm(args.attention_hidden_size, eps=args.rms_norm_eps)
-        self.self_attn = Zamba2Attention(args, num_adapters=num_hybrid_layers, block_id=block_id)
+        self.input_layernorm = nn.RMSNorm(
+            args.attention_hidden_size, eps=args.rms_norm_eps
+        )
+        self.self_attn = Zamba2Attention(
+            args, num_adapters=num_hybrid_layers, block_id=block_id
+        )
         # Pre-FF layernorm operates on hidden_size (after attention output)
         self.pre_ff_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.feed_forward = Zamba2MLP(args, num_adapters=num_hybrid_layers, block_id=block_id)
+        self.feed_forward = Zamba2MLP(
+            args, num_adapters=num_hybrid_layers, block_id=block_id
+        )
 
     def __call__(
         self,
@@ -750,19 +812,25 @@ class Model(nn.Module):
 
                     # Attention + norms are 1:1.
                     if (
-                        rest.startswith("self_attn.") or
-                        rest.startswith("input_layernorm.") or
-                        rest.startswith("pre_ff_layernorm.")
+                        rest.startswith("self_attn.")
+                        or rest.startswith("input_layernorm.")
+                        or rest.startswith("pre_ff_layernorm.")
                     ):
-                        sanitized[f"model.shared_transformers.{block_id}.{rest}"] = value
+                        sanitized[f"model.shared_transformers.{block_id}.{rest}"] = (
+                            value
+                        )
                         continue
 
                     # Feed-forward projection weights.
                     if rest == "feed_forward.linear_fc1.weight":
-                        sanitized[f"model.shared_transformers.{block_id}.feed_forward.gate_up_proj.weight"] = value
+                        sanitized[
+                            f"model.shared_transformers.{block_id}.feed_forward.gate_up_proj.weight"
+                        ] = value
                         continue
                     if rest == "feed_forward.linear_fc2.weight":
-                        sanitized[f"model.shared_transformers.{block_id}.feed_forward.down_proj.weight"] = value
+                        sanitized[
+                            f"model.shared_transformers.{block_id}.feed_forward.down_proj.weight"
+                        ] = value
                         continue
 
                     # Feed-forward LoRA weights.
@@ -776,7 +844,8 @@ class Model(nn.Module):
                         except ValueError:
                             continue
                         sanitized[
-                            f"model.shared_transformers.{block_id}.feed_forward.gate_up_proj_adapter_list.{adapter_idx}.0.weight"] = value
+                            f"model.shared_transformers.{block_id}.feed_forward.gate_up_proj_adapter_list.{adapter_idx}.0.weight"
+                        ] = value
                         continue
 
                     if b_marker in key:
