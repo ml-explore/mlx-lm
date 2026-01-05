@@ -222,8 +222,9 @@ class OuroModel(nn.Module):
         pdf = []
         remaining = mx.ones_like(gates[0].squeeze(-1))
 
-        for gate in gates[:-1]:
-            lambda_i = mx.sigmoid(gate.squeeze(-1))
+        lambdas = [mx.sigmoid(gate.squeeze(-1)) for gate in gates[:-1]]
+
+        for lambda_i in lambdas:
             p_i = lambda_i * remaining
             remaining = remaining * (1.0 - lambda_i)
             pdf.append(p_i)
