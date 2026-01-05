@@ -1,13 +1,15 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
+from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 
 
@@ -20,12 +22,33 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    num_key_value_heads: int
-    max_position_embeddings: int
-    rope_theta: float
-    head_dim: int
-    tie_word_embeddings: bool
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    head_dim: Optional[int] = None
+    max_position_embeddings: Optional[int] = None
+    num_key_value_heads: Optional[int] = None
+    rope_parameters: Optional[Dict[str, Union[float, str]]] = None
+    tie_word_embeddings: bool = True
+    layer_types: Optional[List[str]] = None
+    sliding_window: Optional[int] = None
+
+    def __post_init__(self):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
+
+
+def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        offset = offset[:, None]
+
+    scaling = 1 + beta * mx.log(
+        1 + mx.floor((mx.arange(size) + offset) / max_position_embeddings)
+    )
+    if scaling.ndim == 2:
+        return scaling[:, None, :, None]
+    else:
+        return scaling[:, None]
 
 
 class Attention(nn.Module):
@@ -34,10 +57,10 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.head_dim
+        self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
+
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -45,19 +68,18 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.rope = initialize_rope(
-            head_dim,
-            base=args.rope_theta,
-            traditional=False,
-            scaling_config=args.rope_scaling,
-            max_position_embeddings=args.max_position_embeddings,
+            self.head_dim,
+            args.rope_parameters["rope_theta"],
+            False,
+            args.rope_parameters,
+            args.max_position_embeddings,
         )
 
     def __call__(
         self,
         x: mx.array,
+        attn_scale: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
@@ -65,32 +87,35 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
+        # Prepare the queries, keys and values for the attention computation
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
+        offset = 0
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            offset = cache.offset
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
-
+        queries = queries * attn_scale
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, args: ModelArgs):
         super().__init__()
+
+        dim = args.hidden_size
+        hidden_dim = args.intermediate_size
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -100,12 +125,13 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, use_sliding: bool = False):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
+        self.use_sliding = use_sliding
         self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
@@ -115,28 +141,49 @@ class TransformerBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        attn_scale: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), attn_scale, mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
         return out
 
 
-class Qwen3Model(nn.Module):
+class LanguageModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
-        assert self.vocab_size > 0
+        self.layer_types = args.layer_types
+        self.sliding_window = args.sliding_window
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(args=args, use_sliding=layer_type == "sliding_attention")
+            for layer_type in self.layer_types
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fa_idx = self.layer_types.index("full_attention")
+        self.swa_idx = None
+        for e, l in enumerate(self.layers):
+            if l.use_sliding:
+                self.swa_idx = e
+                break
+
+    def pipeline(self, group):
+        super().pipeline(group)
+        self.fa_idx = None
+        self.swa_idx = None
+        for e, l in enumerate(self.pipeline_layers):
+            if self.swa_idx is None and l.use_sliding:
+                self.swa_idx = e
+            elif self.fa_idx is None and not l.use_sliding:
+                self.fa_idx = e
+            if self.fa_idx is not None and self.swa_idx is not None:
+                break
 
     def __call__(
         self,
@@ -149,12 +196,47 @@ class Qwen3Model(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
-        if cache is None:
-            cache = [None] * len(self.layers)
-        mask = create_attention_mask(h, cache[0])
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+        if cache is None:
+            cache = [None] * len(self.pipeline_layers)
+            offset = 0
+        else:
+            offset = cache[0].offset
+
+        swa_mask = fa_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        if self.swa_idx is not None:
+            swa_mask = create_attention_mask(
+                h, cache[self.swa_idx], window_size=self.sliding_window
+            )
+
+        attn_scale = _get_llama_4_attn_scale(
+            inputs.shape[1],
+            offset,
+            self.args.rope_parameters["llama_4_scaling_beta"],
+            self.args.rope_parameters["original_max_position_embeddings"],
+        ).astype(h.dtype)
+
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for l, c in zip(self.pipeline_layers, cache):
+            mask = swa_mask if l.use_sliding else fa_mask
+            h = l(h, attn_scale, mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -164,7 +246,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen3Model(args)
+        self.model = LanguageModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -182,8 +264,26 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
+        # Remove unused precomputed rotary freqs
+        weights = {
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+        }
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+
+        new_weights = {}
+        for k, v in weights.items():
+            if "weight_scale_inv" in k:
+                scale_inv = v
+                wk = k.replace("_scale_inv", "")
+                weight = weights[wk]
+                new_weights[wk] = weight * scale_inv
+            elif "activation_scale" in k:
+                continue
+            elif k not in new_weights:
+                new_weights[k] = v
+        weights = new_weights
+
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
@@ -219,4 +319,14 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
+
+    def make_cache(self):
+        return [
+            (
+                RotatingKVCache(max_size=self.model.sliding_window)
+                if layer.use_sliding
+                else KVCache()
+            )
+            for layer in self.layers
+        ]

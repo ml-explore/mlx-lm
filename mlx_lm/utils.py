@@ -5,7 +5,6 @@ import glob
 import importlib
 import inspect
 import json
-import logging
 import os
 import resource
 import shutil
@@ -50,6 +49,8 @@ MODEL_REMAPPING = {
     "falcon_mamba": "mamba",
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
+    "minimax_m2": "minimax",
+    "iquestcoder": "llama",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -71,7 +72,6 @@ def _get_classes(config: dict):
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
         msg = f"Model type {model_type} not supported."
-        logging.error(msg)
         raise ValueError(msg)
 
     return arch.Model, arch.ModelArgs
@@ -145,12 +145,21 @@ def hf_repo_to_path(hf_repo):
 
 
 def load_config(model_path: Path) -> dict:
-    try:
-        with open(model_path / "config.json", "r") as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        logging.error(f"Config file not found in {model_path}")
-        raise
+    with open(model_path / "config.json", "r") as f:
+        config = json.load(f)
+
+    generation_config_file = model_path / "generation_config.json"
+    if generation_config_file.exists():
+        generation_config = {}
+        try:
+            with open(generation_config_file, "r") as f:
+                generation_config = json.load(f)
+        except json.JSONDecodeError:
+            pass
+
+        if eos_token_id := generation_config.get("eos_token_id", False):
+            config["eos_token_id"] = eos_token_id
+
     return config
 
 
@@ -333,7 +342,12 @@ def load(
         return model, tokenizer
 
 
-def pipeline_load(repo, return_config=False):
+def sharded_load(
+    repo,
+    pipeline_group: Optional[mx.distributed.Group] = None,
+    tensor_group: Optional[mx.distributed.Group] = None,
+    return_config: bool = False,
+):
     # Get model path with everything but weight safetensors
     model_path = _download(
         repo,
@@ -349,27 +363,50 @@ def pipeline_load(repo, return_config=False):
         ],
     )
 
-    # Lazy load and shard model to figure out which weights we need
+    # Lazy load model to figure out what type of sharding we can do and which
+    # weights we need to download.
     model, config = load_model(model_path, lazy=True, strict=False)
 
-    group = mx.distributed.init()
-    rank = group.rank()
-    model.model.pipeline(group)
+    has_pipelining = hasattr(model.model, "pipeline")
+    has_tensor_parallel = hasattr(model, "shard")
 
-    # Figure out which files we need for the local shard
-    with open(model_path / "model.safetensors.index.json", "r") as fid:
-        weight_index = json.load(fid)["weight_map"]
+    if pipeline_group is not None and not has_pipelining:
+        raise ValueError(
+            "The model does not support pipelining but a pipeline_group was provided"
+        )
+    if tensor_group is not None and not has_tensor_parallel:
+        raise ValueError(
+            "The model does not support tensor parallelism but a tensor_group was provided"
+        )
+    if not has_pipelining and not has_tensor_parallel:
+        raise ValueError("The model does not support any sharding")
 
-    local_files = set()
-    for k, _ in tree_flatten(model.parameters()):
-        if file_name := weight_index.get(k, None) is None:
-            raise ValueError(
-                "Pipeline loading is only supported for MLX converted models."
-            )
-        local_files.add(weight_index[k])
+    if pipeline_group is tensor_group is None:
+        if has_tensor_parallel:
+            tensor_group = mx.distributed.init()
+        elif has_pipelining:
+            pipeline_group = mx.distributed.init()
 
-    # Download weights for local shard
-    _download(repo, allow_patterns=local_files)
+    # If pipelining then figure out which files we need for the local shard
+    if pipeline_group is not None:
+        model.model.pipeline(pipeline_group)
+
+        # Figure out which files we need for the local shard
+        with open(model_path / "model.safetensors.index.json", "r") as fid:
+            weight_index = json.load(fid)["weight_map"]
+
+        local_files = set()
+        for k, _ in tree_flatten(model.parameters()):
+            if file_name := weight_index.get(k, None) is None:
+                raise ValueError(
+                    "Pipeline loading is only supported for MLX converted models."
+                )
+            local_files.add(weight_index[k])
+
+        # Download weights for local shard
+        _download(repo, allow_patterns=local_files)
+    else:
+        _download(repo)
 
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
@@ -378,7 +415,10 @@ def pipeline_load(repo, return_config=False):
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)
-    model.model.pipeline(group)
+    if tensor_group is not None:
+        model.shard(tensor_group)
+    if pipeline_group is not None:
+        model.model.pipeline(pipeline_group)
     mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
@@ -387,6 +427,10 @@ def pipeline_load(repo, return_config=False):
         return model, tokenizer, config
     else:
         return model, tokenizer
+
+
+def pipeline_load(repo, return_config=False):
+    return sharded_load(repo, mx.distributed.init(), None, return_config)
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
@@ -486,7 +530,7 @@ def upload_to_hub(path: str, upload_repo: str):
         if tokenizer.chat_template is not None:
             messages = [{{"role": "user", "content": prompt}}]
             prompt = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True
+                messages, add_generation_prompt=True, return_dict=False,
             )
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
@@ -568,8 +612,8 @@ def save_model(
 def quantize_model(
     model: nn.Module,
     config: dict,
-    group_size: int,
-    bits: int,
+    group_size: Optional[int],
+    bits: Optional[int],
     mode: str = "affine",
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
@@ -579,8 +623,8 @@ def quantize_model(
     Args:
         model (nn.Module): The model to be quantized.
         config (dict): Model configuration.
-        group_size (int): Group size for quantization.
-        bits (int): Bits per weight for quantization.
+        group_size (Optional[int]): Group size for quantization.
+        bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
@@ -590,9 +634,21 @@ def quantize_model(
     Returns:
         Tuple: Tuple containing quantized model and config.
     """
+
+    def defaults_for_mode(mode, group_size, bits):
+        mode_defaults = {
+            "affine": (64, 4),
+            "mxfp4": (32, 4),
+            "nvfp4": (16, 4),
+            "mxfp8": (32, 8),
+        }
+        default_group_size, default_bits = mode_defaults[mode]
+        return group_size or default_group_size, bits or default_bits
+
     quantized_config = copy.deepcopy(config)
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    group_size, bits = defaults_for_mode(mode, group_size, bits)
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that

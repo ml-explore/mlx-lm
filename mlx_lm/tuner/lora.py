@@ -37,22 +37,19 @@ class LoRALinear(nn.Module):
         weight = linear.weight
         is_quantized = isinstance(linear, nn.QuantizedLinear)
 
-        # Use the same type as the linear weight if not quantized
-        dtype = weight.dtype
-
         if is_quantized:
-            dtype = linear.scales.dtype
             weight = mx.dequantize(
                 weight,
                 linear.scales,
                 linear.biases,
-                linear.group_size,
-                linear.bits,
+                group_size=linear.group_size,
+                bits=linear.bits,
+                mode=linear.mode,
             )
         output_dims, input_dims = weight.shape
         fused_linear = nn.Linear(input_dims, output_dims, bias=bias)
 
-        delta = ((self.scale * self.lora_b.T) @ self.lora_a.T).astype(dtype)
+        delta = ((self.scale * self.lora_b.T) @ self.lora_a.T).astype(weight.dtype)
         fused_linear.weight = weight + delta
         if bias:
             fused_linear.bias = linear.bias
@@ -62,6 +59,7 @@ class LoRALinear(nn.Module):
                 fused_linear,
                 linear.group_size,
                 linear.bits,
+                mode=linear.mode,
             )
 
         return fused_linear
@@ -125,29 +123,28 @@ class LoRASwitchLinear(nn.Module):
         weight = linear.weight
         is_quantized = isinstance(linear, QuantizedSwitchLinear)
 
-        # Use the same type as the linear weight if not quantized
-        dtype = weight.dtype
-
         if is_quantized:
-            dtype = mx.float16
             weight = mx.dequantize(
                 weight,
                 linear.scales,
                 linear.biases,
-                linear.group_size,
-                linear.bits,
+                group_size=linear.group_size,
+                bits=linear.bits,
+                mode=linear.mode,
             )
         num_experts, output_dims, input_dims = weight.shape
         fused_linear = SwitchLinear(input_dims, output_dims, num_experts, bias=bias)
 
-        lora_b = (self.scale * self.lora_b).astype(dtype)
-        lora_a = self.lora_a.reshape(num_experts, -1, input_dims).astype(dtype)
-        fused_linear.weight = weight + lora_b @ lora_a
+        lora_b = self.scale * self.lora_b
+        lora_a = self.lora_a.reshape(num_experts, -1, input_dims)
+        fused_linear.weight = weight + (lora_b @ lora_a).astype(weight.dtype)
         if bias:
             fused_linear.bias = linear.bias
 
         if is_quantized and not dequantize:
-            fused_linear = fused_linear.to_quantized(linear.group_size, linear.bits)
+            fused_linear = fused_linear.to_quantized(
+                group_size=linear.group_size, bits=linear.bits, mode=linear.mode
+            )
 
         return fused_linear
 
@@ -224,30 +221,28 @@ class LoRAEmbedding(nn.Module):
         weight = embedding.weight
         is_quantized = isinstance(embedding, nn.QuantizedEmbedding)
 
-        # Use the same type as the linear weight if not quantized
-        dtype = weight.dtype
-
         if is_quantized:
-            dtype = embedding.scales.dtype
             weight = mx.dequantize(
                 weight,
                 embedding.scales,
                 embedding.biases,
-                embedding.group_size,
-                embedding.bits,
+                group_size=embedding.group_size,
+                bits=embedding.bits,
+                mode=embedding.mode,
             )
         num_embeddings, dims = weight.shape
         fused_embedding = nn.Embedding(num_embeddings, dims)
 
-        lora_a = (self.scale * self.lora_a).astype(dtype)
-        lora_b = self.lora_b.astype(dtype)
-        fused_embedding.weight = weight + lora_a @ lora_b
+        lora_a = self.scale * self.lora_a
+        lora_b = self.lora_b
+        fused_embedding.weight = weight + (lora_a @ lora_b).astype(weight.dtype)
 
         if is_quantized and not dequantize:
             fused_embedding = nn.QuantizedEmbedding.from_embedding(
                 fused_embedding,
-                embedding.group_size,
-                embedding.bits,
+                group_size=embedding.group_size,
+                bits=embedding.bits,
+                mode=embedding.mode,
             )
 
         return fused_embedding

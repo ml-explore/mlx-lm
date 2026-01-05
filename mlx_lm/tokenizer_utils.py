@@ -1,3 +1,4 @@
+import importlib
 import json
 from functools import partial
 from json import JSONDecodeError
@@ -89,11 +90,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if self._current_text.endswith("\ufffd") or (
-                self._tokenizer.clean_up_tokenization_spaces
-                and len(self._current_text) > 0
-                and self._current_text[-1] == " "
-            ):
+            if self._current_text.endswith("\ufffd"):
                 self._current_text = self._current_text[:-1]
         if self._current_text and self._current_text[-1] == "\n":
             self._text += self._current_text
@@ -161,8 +158,6 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _space_matches = (".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re")
 
     def __init__(self, tokenizer):
-        self.clean_spaces = tokenizer.clean_up_tokenization_spaces
-
         # Extract the tokens in a list from id to text
         self.tokenmap = [None] * len(tokenizer.vocab)
         for value, tokenid in tokenizer.vocab.items():
@@ -197,8 +192,6 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             return current_text
         elif not self.text:
             return current_text[1:]
-        elif self.clean_spaces and current_text[1:].startswith(self._space_matches):
-            return current_text[1:]
         return current_text
 
     def add_token(self, token):
@@ -208,10 +201,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         text = self._decode_bytes(self._unflushed)
 
         # For multi-byte utf-8 wait until they are complete
-        # For single spaces wait until the next token to clean it if needed
-        if not text.endswith("\ufffd") and not (
-            len(v) == 1 and self._byte_decoder.get(v[0]) == 32
-        ):
+        if not text.endswith("\ufffd"):
             self.text += self._maybe_trim_space(text)
             self._unflushed = ""
 
@@ -259,7 +249,11 @@ class TokenizerWrapper:
     """
 
     def __init__(
-        self, tokenizer, detokenizer_class=NaiveStreamingDetokenizer, eos_token_ids=None
+        self,
+        tokenizer,
+        detokenizer_class=NaiveStreamingDetokenizer,
+        eos_token_ids=None,
+        chat_template=None,
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
@@ -272,6 +266,10 @@ class TokenizerWrapper:
         self._think_end = None
         self._tool_call_start = None
         self._tool_call_end = None
+        self._chat_template = chat_template
+        self.has_chat_template = (
+            tokenizer.chat_template is not None or chat_template is not None
+        )
 
         THINK_TOKENS = [("<think>", "</think>")]
         TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
@@ -288,6 +286,16 @@ class TokenizerWrapper:
                     self._tool_call_start = tool_call_start
                     self._tool_call_end = tool_call_end
                     break
+
+    def apply_chat_template(self, *args, tokenize=True, **kwargs):
+        if self._chat_template is not None:
+            out = self._chat_template(*args, **kwargs)
+            if tokenize:
+                out = self._tokenizer.encode(out, add_special_tokens=False)
+            return out
+
+        kwargs["return_dict"] = False
+        return self._tokenizer.apply_chat_template(*args, tokenize=tokenize, **kwargs)
 
     def add_eos_token(self, token: str):
         token_id = None
@@ -457,12 +465,28 @@ def load(
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
 
+    tokenizer_config_file = model_path / "tokenizer_config.json"
+    custom_tokenizer = None
+    if tokenizer_config_file.exists():
+        with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
+            try:
+                tokenizer_config = json.load(fid)
+            except JSONDecodeError as e:
+                raise JSONDecodeError(
+                    "Failed to parse tokenizer_config.json", e.doc, e.pos
+                )
+        if tokenizer_type := tokenizer_config.get("tokenizer_type", False):
+            custom_tokenizer = importlib.import_module(
+                f"mlx_lm.tokenizers.{tokenizer_type}"
+            )
+
     if return_tokenizer:
         kwargs = tokenizer_config_extra or {}
         return TokenizerWrapper(
             AutoTokenizer.from_pretrained(model_path, **kwargs),
             detokenizer_class,
             eos_token_ids=eos_token_ids,
+            chat_template=getattr(custom_tokenizer, "apply_chat_template", None),
         )
     else:
         return detokenizer_class

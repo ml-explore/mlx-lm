@@ -43,18 +43,22 @@ class SuScaledRoPE(nn.Module):
             long_mscale (float, optional): Scale the input prior to embedding.
         """
         super().__init__()
-        freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
-        self._freqs = mx.array(long_factor, dtype=mx.float32) * freqs
         self.original_max_position_embeddings = original_max_position_embeddings
-        self.scale = long_mscale or math.sqrt(
-            1
-            + math.log(max_position_embeddings / original_max_position_embeddings)
-            / math.log(original_max_position_embeddings)
-        )
         self.dim = dims
 
-    def __call__(self, x, offset: int = 0):
-        x[..., : self.dim] = self.scale * x[..., : self.dim]
+        freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+        self._freqs = mx.array(long_factor, dtype=mx.float32) * freqs
+
+        def default_scale(factor):
+            return math.sqrt(
+                1 + math.log(factor) / math.log(original_max_position_embeddings)
+            )
+
+        factor = max_position_embeddings / original_max_position_embeddings
+        self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
+
+    def __call__(self, x, offset: Union[int, mx.array] = 0):
+        x[..., : self.dim] = self._scale * x[..., : self.dim]
         return mx.fast.rope(
             x,
             self.dim,
@@ -168,9 +172,7 @@ class YarnRoPE(nn.Module):
             scaling_factor, mscale_all_dim
         )
         freq_extra = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
-        freq_inter = scaling_factor * base ** (
-            mx.arange(0, dims, 2, dtype=mx.float32) / dims
-        )
+        freq_inter = scaling_factor * freq_extra
         low, high = yarn_find_correction_range()
         freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dims // 2)
         self._freqs = (freq_inter * freq_extra) / (

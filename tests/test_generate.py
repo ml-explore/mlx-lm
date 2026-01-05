@@ -8,6 +8,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
+    batch_generate,
     generate,
     stream_generate,
 )
@@ -81,7 +82,7 @@ class TestGenerate(unittest.TestCase):
 
     def test_stream_generate_speculative(self):
         # Use same model as draft model, this is not a speed test
-        draft_model, _ = load(self.HF_MODEL_PATH)
+        draft_model = self.model
 
         results: List[GenerationResponse] = []
         drafted: List[bool] = []
@@ -90,7 +91,8 @@ class TestGenerate(unittest.TestCase):
         sampler = make_sampler(temp=0.0)
         messages = [{"role": "user", "content": "hello"}]
         prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages,
+            add_generation_prompt=True,
         )
 
         for generation_result in stream_generate(
@@ -117,7 +119,8 @@ class TestGenerate(unittest.TestCase):
         # get prompt embeddings
         messages = [{"role": "user", "content": "Say 'TEST' and nothing else"}]
         prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages,
+            add_generation_prompt=True,
         )
         prompt_embeddings = self.model.model.embed_tokens(prompt)
 
@@ -140,7 +143,8 @@ class TestGenerate(unittest.TestCase):
         # get prompt embeddings
         messages = [{"role": "user", "content": "Say 'TEST' and nothing else"}]
         prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages,
+            add_generation_prompt=True,
         )
         prompt_embeddings = self.model.model.embed_tokens(prompt)
 
@@ -351,6 +355,161 @@ class TestGenerate(unittest.TestCase):
                 )
 
         del self.model.make_cache
+
+    def test_batch_generate_with_logits_processors(self):
+        """Test that batch_generate with logits_processors produces correct results."""
+        logit_bias = {0: 2000.0, 1: -2000.0}
+        processors = make_logits_processors(logit_bias)
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+        prompt = self.tokenizer.encode("hello")
+        uids = batch_gen.insert([prompt])
+        response = batch_gen.next()[0]
+        logprobs = response.logprobs
+        self.assertEqual(logprobs[0].item(), 0.0)
+        self.assertEqual(logprobs.argmin().item(), 1)
+
+        del batch_gen
+
+        logit_bias = {0: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+
+        (uid0,) = batch_gen.insert([prompt])
+
+        logit_bias = {1: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        (uid1,) = batch_gen.insert([prompt], logits_processors=[processors])
+
+        logit_bias = {2: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        (uid2,) = batch_gen.insert([prompt], logits_processors=[processors])
+
+        responses = batch_gen.next()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid0].logprobs[0].item(), 0.0)
+        self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
+        self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
+
+    def test_batch_generate_with_samplers(self):
+        """Test that batch_generate with logits_processors produces correct results."""
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            sampler=lambda _: mx.array([1]),
+        )
+        prompt = self.tokenizer.encode("hello")
+        uids = batch_gen.insert([prompt])
+        response = batch_gen.next()[0]
+        self.assertEqual(response.token, 1)
+
+        del batch_gen
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            sampler=lambda _: mx.array([1]),
+        )
+
+        (uid0,) = batch_gen.insert([prompt])
+        uid1, uid2 = batch_gen.insert(
+            [prompt, prompt],
+            samplers=[lambda _: mx.array([2]), lambda _: mx.array([3])],
+        )
+
+        responses = batch_gen.next()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid0].token, 1)
+        self.assertEqual(responses[uid1].token, 2)
+        self.assertEqual(responses[uid2].token, 3)
+
+    def test_batch_continued_generation(self):
+        for rotating in [False, True]:
+            if rotating:
+                self.model.make_cache = lambda: [
+                    RotatingKVCache(max_size=4) for _ in self.model.layers
+                ]
+
+            # Make the prompts
+            prompts_a = [
+                "Write a story about Einstein",
+                "Hi",
+                "What time is it?",
+                "How tall is Mt Everest?",
+            ]
+            prompts_a = [
+                self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+                for p in prompts_a
+            ]
+            prompts_b = [
+                "Another one",
+                "sup?",
+                "And how about the date?",
+                "Mt Olympus?",
+            ]
+            prompts_b = [
+                self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+                for p in prompts_b
+            ]
+
+            # Generate once
+            batch_gen = BatchGenerator(
+                self.model,
+                stop_tokens=self.tokenizer.eos_token_ids,
+                max_tokens=10,
+                prefill_batch_size=1,
+                prefill_step_size=8,
+                completion_batch_size=2,
+            )
+            uids = batch_gen.insert(prompts_a)
+            caches = {uid: None for uid in uids}
+            while responses := batch_gen.next():
+                for r in responses:
+                    if r.finish_reason is not None:
+                        caches[r.uid] = r.prompt_cache
+            caches = [caches[uid] for uid in uids]
+
+            # Generate the 2nd time
+            uids = batch_gen.insert(prompts_b, caches=caches)
+            batch_responses = {uid: [] for uid in uids}
+            while responses := batch_gen.next():
+                for r in responses:
+                    batch_responses[r.uid].append(r.logprobs)
+
+            for e, uid in enumerate(uids):
+                for i, response in enumerate(
+                    stream_generate(
+                        self.model,
+                        self.tokenizer,
+                        prompts_b[e],
+                        max_tokens=10,
+                        prompt_cache=caches[e],
+                    )
+                ):
+                    batch_logprobs = batch_responses[uid][i]
+                    logprobs = response.logprobs
+                    self.assertTrue(
+                        mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
+                    )
+
+            if rotating:
+                del self.model.make_cache
 
 
 if __name__ == "__main__":

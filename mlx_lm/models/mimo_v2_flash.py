@@ -1,75 +1,91 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2024 Apple Inc.
 
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .pipeline import PipelineMixin
+from .cache import KVCache, RotatingKVCache
 from .switch_layers import SwitchGLU
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
+    num_experts_per_tok: int
+    hybrid_layer_pattern: List[int]
+    moe_layer_freq: List[int]
+    add_swa_attention_sink_bias: bool
+    add_full_attention_sink_bias: bool
+    sliding_window_size: int
     vocab_size: int
     hidden_size: int
     intermediate_size: int
-    max_position_embeddings: int
     moe_intermediate_size: int
-    norm_topk_prob: bool
-    num_attention_heads: int
-    n_group: int
-    head_dim: int
-    topk_group: int
-    n_shared_experts: int
-    n_routed_experts: int
-    routed_scaling_factor: float
-    num_experts_per_tok: int
-    first_k_dense_replace: int
     num_hidden_layers: int
+    num_attention_heads: int
     num_key_value_heads: int
-    rms_norm_eps: float
+    n_shared_experts: Optional[int]
+    n_routed_experts: Optional[int]
+    routed_scaling_factor: Optional[float]
+    topk_method: str
+    scoring_func: str
+    norm_topk_prob: bool
+    n_group: int
+    topk_group: int
+    max_position_embeddings: int
+    layernorm_epsilon: float
     rope_theta: float
-    rope_scaling: Optional[Dict]
-    use_qk_norm: bool
-    tie_word_embeddings: bool
-    attention_bias: bool
-    partial_rotary_factor: float
-    scoring_func: str = "sigmoid"
-    topk_method: str = "noaux_tc"
+    swa_rope_theta: float
+    swa_num_attention_heads: int
+    swa_num_key_value_heads: int
+    head_dim: int
+    v_head_dim: int
+    swa_head_dim: int
+    swa_v_head_dim: int
+    partial_rotary_factor: int
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, is_sliding_window: bool):
         super().__init__()
 
         dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        self.is_sliding_window = is_sliding_window
+        if self.is_sliding_window:
+            self.n_heads = n_heads = args.swa_num_attention_heads
+            self.n_kv_heads = n_kv_heads = args.swa_num_key_value_heads
+            self.has_sinks = args.add_swa_attention_sink_bias
+            head_dim = args.swa_head_dim
+            v_head_dim = args.swa_v_head_dim
+            rope_theta = args.swa_rope_theta
+        else:
+            self.n_heads = n_heads = args.num_attention_heads
+            self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+            self.has_sinks = args.add_full_attention_sink_bias
+            head_dim = args.head_dim
+            v_head_dim = args.v_head_dim
+            rope_theta = args.rope_theta
 
-        head_dim = args.head_dim
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=args.attention_bias)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.attention_bias)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.attention_bias)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
-
-        self.use_qk_norm = args.use_qk_norm
-        if self.use_qk_norm:
-            self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-            self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * v_head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * v_head_dim, dim, bias=False)
+        if self.has_sinks:
+            self.attention_sink_bias = mx.ones((self.n_heads,))
+        else:
+            self.attention_sink_bias = None
 
         self.rope = nn.RoPE(
-            int(head_dim * args.partial_rotary_factor),
+            int(args.partial_rotary_factor * head_dim),
             traditional=False,
-            base=args.rope_theta,
+            base=rope_theta,
         )
 
     def __call__(
@@ -82,16 +98,10 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.n_heads, -1)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1)
-
-        if self.use_qk_norm:
-            queries = self.q_norm(queries)
-            keys = self.k_norm(keys)
-
-        queries = queries.transpose(0, 2, 1, 3)
-        keys = keys.transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
@@ -101,7 +111,13 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attention_sink_bias,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -156,7 +172,7 @@ def group_expert_select(
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / denominator
+        scores = scores / (denominator + 1e-20)
     scores = scores * routed_scaling_factor
 
     return inds, scores
@@ -169,7 +185,11 @@ class MoEGate(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
+        self.routed_scaling_factor = (
+            config.routed_scaling_factor
+            if config.routed_scaling_factor is not None
+            else 1.0
+        )
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
@@ -206,39 +226,27 @@ class MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size
             )
 
-        self.sharding_group = None
-
     def __call__(self, x):
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(x)
 
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-
         return y
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: ModelArgs, layer_idx: int):
+    def __init__(self, config: ModelArgs, is_moe, is_sliding_window):
         super().__init__()
-        self.self_attn = Attention(config)
-        self.mlp = (
-            MoE(config)
-            if (
-                config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-            )
-            else MLP(config)
+        self.self_attn = Attention(config, is_sliding_window)
+        self.mlp = MoE(config) if is_moe else MLP(config)
+        self.is_sliding_window = is_sliding_window
+        self.input_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon
         )
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.layernorm_epsilon
         )
 
     def __call__(
@@ -253,15 +261,23 @@ class DecoderLayer(nn.Module):
         return h + r
 
 
-class LanguageModel(PipelineMixin, nn.Module):
+class LanguageModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
+            DecoderLayer(
+                config,
+                is_moe=config.moe_layer_freq[idx] == 1,
+                is_sliding_window=config.hybrid_layer_pattern[idx] == 1,
+            )
+            for idx in range(config.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.swa_idx = config.hybrid_layer_pattern.index(1)
+        self.ga_idx = config.hybrid_layer_pattern.index(0)
+        self.sliding_window_size = config.sliding_window_size
 
     def __call__(
         self,
@@ -270,29 +286,17 @@ class LanguageModel(PipelineMixin, nn.Module):
     ) -> mx.array:
         h = self.embed_tokens(x)
 
-        pipeline_rank = self.pipeline_rank
-        pipeline_size = self.pipeline_size
-
         if cache is None:
-            cache = [None] * len(self.pipeline_layers)
-        mask = create_attention_mask(h, cache[0])
+            cache = [None] * len(self.layers)
 
-        # Receive from the previous process in the pipeline
-        if pipeline_rank < pipeline_size - 1:
-            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+        full_mask = create_attention_mask(x, cache[self.ga_idx])
+        swa_mask = create_attention_mask(
+            x, cache[self.swa_idx], window_size=self.sliding_window_size
+        )
 
-        for l, c in zip(self.pipeline_layers, cache):
+        for l, c in zip(self.layers, cache):
+            mask = swa_mask if l.is_sliding_window else full_mask
             h = l(h, mask, cache=c)
-
-        # Send to the next process in the pipeline
-        if pipeline_rank != 0:
-            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
-            if cache[-1] is not None:
-                cache[-1].keys = mx.depends(cache[-1].keys, h)
-
-        # Broadcast h while keeping it in the graph
-        if pipeline_size > 1:
-            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -314,7 +318,33 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        mpt_layer = self.args.num_hidden_layers
+        def dequant(weight, scale_inv):
+            dtype = weight.dtype
+            bs = 128  # block size
+            m, n = weight.shape
+            pad_bottom = bs * scale_inv.shape[0] - m
+            pad_side = bs * scale_inv.shape[1] - n
+            weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+            weight = weight.reshape(
+                ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
+            )
+            weight = (weight * scale_inv[:, None, :, None]).reshape(
+                m + pad_bottom, n + pad_side
+            )
+            return weight[:m, :n].astype(dtype)
+
+        # Dequantize fp8
+        new_weights = {}
+        for k, v in weights.items():
+            if "weight_scale_inv" in k:
+                scale_inv = v
+                wk = k.replace("_scale_inv", "")
+                weight = weights[wk]
+                weight = dequant(weight, scale_inv)
+                new_weights[wk] = weight
+            elif k not in new_weights:
+                new_weights[k] = v
+        weights = new_weights
 
         # Stack experts
         for l in range(self.args.num_hidden_layers):
@@ -329,70 +359,11 @@ class Model(nn.Module):
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
         # Remove multi-token prediction layer
-        return {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith(f"model.layers.{mpt_layer}")
-        }
-
-    def shard(self, group: Optional[mx.distributed.Group] = None):
-        group = group or mx.distributed.init()
-        N = group.size()
-        for layer in self.model.layers:
-            # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
-
-            # Shard the MLP
-            if isinstance(layer.mlp, MLP):
-                layer.mlp.gate_proj = shard_linear(
-                    layer.mlp.gate_proj, "all-to-sharded", group=group
-                )
-                layer.mlp.down_proj = shard_linear(
-                    layer.mlp.down_proj, "sharded-to-all", group=group
-                )
-                layer.mlp.up_proj = shard_linear(
-                    layer.mlp.up_proj, "all-to-sharded", group=group
-                )
-
-            # Shard the MoE. Shard in place since the MoE should be responsible
-            # for aggregating the results.
-            else:
-                layer.mlp.sharding_group = group
-                shard_inplace(
-                    layer.mlp.shared_experts.gate_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.shared_experts.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
-                )
+        return {k: v for k, v in weights.items() if not k.startswith("model.mtp")}
 
     @property
     def layers(self):
-        return self.model.pipeline_layers
+        return self.model.layers
 
     @property
     def cast_predicate(self):
@@ -400,3 +371,12 @@ class Model(nn.Module):
             return "e_score_correction_bias" not in k
 
         return predicate
+
+    def make_cache(self):
+        caches = []
+        for l in self.layers:
+            if l.is_sliding_window:
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window_size))
+            else:
+                caches.append(KVCache())
+        return caches

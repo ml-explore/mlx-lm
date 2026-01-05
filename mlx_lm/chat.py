@@ -7,7 +7,7 @@ import mlx.core as mx
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
-from .utils import load
+from .utils import load, sharded_load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
@@ -79,6 +79,11 @@ def setup_arg_parser():
         default=None,
         help="System prompt to be used for the chat template",
     )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
+    )
     return parser
 
 
@@ -86,28 +91,42 @@ def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
 
+    group = mx.distributed.init()
+    rank = group.rank()
+    pipeline_group = group if args.pipeline else None
+    tensor_group = group if not args.pipeline else None
+
+    def rprint(*args, **kwargs):
+        if rank == 0:
+            print(*args, **kwargs)
+
     if args.seed is not None:
         mx.random.seed(args.seed)
 
-    model, tokenizer = load(
-        args.model,
-        adapter_path=args.adapter_path,
-        tokenizer_config={
-            "trust_remote_code": True if args.trust_remote_code else None
-        },
-    )
+    if group.size() > 1:
+        if args.adapter_path:
+            parser.error("Adapters not supported in distributed mode")
+        model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
+    else:
+        model, tokenizer = load(
+            args.model,
+            adapter_path=args.adapter_path,
+            tokenizer_config={
+                "trust_remote_code": True if args.trust_remote_code else None
+            },
+        )
 
     def print_help():
-        print("The command list:")
-        print("- 'q' to exit")
-        print("- 'r' to reset the chat")
-        print("- 'h' to display these commands")
+        rprint("The command list:")
+        rprint("- 'q' to exit")
+        rprint("- 'r' to reset the chat")
+        rprint("- 'h' to display these commands")
 
-    print(f"[INFO] Starting chat session with {args.model}.")
+    rprint(f"[INFO] Starting chat session with {args.model}.")
     print_help()
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
     while True:
-        query = input(">> ")
+        query = input(">> " if rank == 0 else "")
         if query == "q":
             break
         if query == "r":
@@ -120,7 +139,10 @@ def main():
         if args.system_prompt is not None:
             messages.append({"role": "system", "content": args.system_prompt})
         messages.append({"role": "user", "content": query})
-        prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+        )
         for response in stream_generate(
             model,
             tokenizer,
@@ -137,8 +159,8 @@ def main():
             ),
             prompt_cache=prompt_cache,
         ):
-            print(response.text, flush=True, end="")
-        print()
+            rprint(response.text, flush=True, end="")
+        rprint()
 
 
 if __name__ == "__main__":

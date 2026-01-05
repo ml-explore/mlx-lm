@@ -57,7 +57,11 @@ class ChatDataset:
     def process(self, d):
         messages = d[self.chat_key]
         tools = d.get("tools", None)
-        tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
+        tokens = self.tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            return_dict=False,
+        )
         if self.mask_prompt:
             add_generation_prompt = messages[-1].get("role") == "assistant"
             offset = len(
@@ -65,6 +69,7 @@ class ChatDataset:
                     messages[:-1],
                     tools=tools,
                     add_generation_prompt=add_generation_prompt,
+                    return_dict=False,
                 )
             )
             return (tokens, offset)
@@ -105,11 +110,16 @@ class CompletionsDataset:
             {"role": "user", "content": d[self.prompt_key]},
             {"role": "assistant", "content": d[self.completion_key]},
         ]
-        tokens = self.tokenizer.apply_chat_template(messages, tools=tools)
+        tokens = self.tokenizer.apply_chat_template(
+            messages, tools=tools, return_dict=False
+        )
         if self.mask_prompt:
             offset = len(
                 self.tokenizer.apply_chat_template(
-                    messages[0], tools=tools, add_generation_prompt=True
+                    messages[0],
+                    tools=tools,
+                    add_generation_prompt=True,
+                    return_dict=False,
                 )
             )
             return (tokens, offset)

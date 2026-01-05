@@ -26,7 +26,7 @@ from tqdm import tqdm
 from .generate import batch_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
-from .utils import common_prefix_len, load
+from .utils import load
 
 DEFAULT_MAX_TOKENS = 8192
 
