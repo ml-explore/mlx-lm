@@ -15,39 +15,37 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "exaone_moe"
-    vocab_size: int = 153600
-    hidden_size: int = 6144
-    intermediate_size: int = 18432
-    moe_intermediate_size: int = 2048
-    num_hidden_layers: int = 48
-    num_attention_heads: int = 64
-    num_key_value_heads: int = 8
-    head_dim: int = 128
-    num_experts: int = 128
-    num_experts_per_tok: int = 8
-    num_shared_experts: int = 1
+    model_type: str
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    moe_intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    num_experts: int
+    num_experts_per_tok: int
+    num_shared_experts: int
+    rms_norm_eps: float
+    max_position_embeddings: int
+    sliding_window: int
+    layer_types: List[str]
+    is_moe_layer: List[bool]
     n_group: int = 1
     topk_group: int = 1
     routed_scaling_factor: float = 2.5
     norm_topk_prob: bool = True
     scoring_func: str = "sigmoid"
     topk_method: str = "noaux_tc"
-    max_position_embeddings: int = 262144
-    rms_norm_eps: float = 1e-5
-    rope_theta: float = 1000000
+    rope_theta: float = 1000000.0
     rope_scaling: Optional[dict] = None
     rope_parameters: Optional[dict] = None
-    sliding_window: int = 128
-    sliding_window_pattern: str = "LLLG"
-    layer_types: Optional[List[str]] = None
-    is_moe_layer: Optional[List[bool]] = None
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
-        if self.rope_parameters is not None:
-            if "rope_theta" in self.rope_parameters:
-                self.rope_theta = self.rope_parameters["rope_theta"]
+        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
+            self.rope_theta = self.rope_parameters["rope_theta"]
 
 
 @mx.compile
@@ -135,9 +133,14 @@ class MoE(nn.Module):
 
         self.gate = MoEGate(args)
 
-        if args.num_shared_experts is not None and args.num_shared_experts > 0:
-            intermediate_size = args.moe_intermediate_size * args.num_shared_experts
-            self.shared_experts = MLP(args, intermediate_size=intermediate_size)
+        self.shared_experts = (
+            MLP(
+                args,
+                intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
+            )
+            if args.num_shared_experts is not None and args.num_shared_experts > 0
+            else None
+        )
 
         self.sharding_group = None
 
@@ -148,7 +151,7 @@ class MoE(nn.Module):
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-        if hasattr(self, "shared_experts"):
+        if self.shared_experts is not None:
             y = y + self.shared_experts(x)
 
         if self.sharding_group is not None:
@@ -183,14 +186,8 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-        if args.layer_types is not None:
-            self.is_sliding_window = args.layer_types[layer_idx] == "sliding_attention"
-            self.apply_rope_all_layers = "sliding_attention" not in args.layer_types
-        else:
-            pattern = args.sliding_window_pattern
-            self.is_sliding_window = pattern[layer_idx % len(pattern)] == "L"
-            self.apply_rope_all_layers = False
-
+        self.is_sliding_window = args.layer_types[layer_idx] == "sliding_attention"
+        self.apply_rope_all_layers = "sliding_attention" not in args.layer_types
         self.use_rope = self.is_sliding_window or self.apply_rope_all_layers
 
         if self.use_rope:
@@ -241,13 +238,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
 
         self.self_attn = Attention(args, layer_idx)
-
-        if args.is_moe_layer is not None:
-            is_moe = args.is_moe_layer[layer_idx]
-        else:
-            is_moe = layer_idx > 0
-
-        self.mlp = MoE(args) if is_moe else MLP(args)
+        self.mlp = MoE(args) if args.is_moe_layer[layer_idx] else MLP(args)
         self.is_sliding_window = self.self_attn.is_sliding_window
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -339,9 +330,7 @@ class Model(nn.Module):
         weights = new_weights
 
         for l in range(self.args.num_hidden_layers):
-            if self.args.is_moe_layer is not None and not self.args.is_moe_layer[l]:
-                continue
-            if self.args.is_moe_layer is None and l == 0:
+            if not self.args.is_moe_layer[l]:
                 continue
 
             prefix = f"model.layers.{l}"
@@ -424,7 +413,7 @@ class Model(nn.Module):
                 )
             else:
                 layer.mlp.sharding_group = group
-                if hasattr(layer.mlp, "shared_experts"):
+                if layer.mlp.shared_experts is not None:
                     shard_inplace(
                         layer.mlp.shared_experts.gate_proj,
                         "all-to-sharded",
