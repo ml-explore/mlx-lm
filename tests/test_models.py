@@ -2111,6 +2111,7 @@ class TestModels(unittest.TestCase):
                 "routed_scaling_factor": 2.5,
                 "norm_topk_prob": True,
                 "sliding_window": 32,
+                "max_position_embeddings": 1000,
                 "rms_norm_eps": 1e-5,
                 "rope_theta": 1000.0,
                 "layer_types": [
