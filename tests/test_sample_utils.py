@@ -2,10 +2,28 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, apply_xtc
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    apply_xtc,
+    make_sampler,
+)
 
 
 class TestSampleUtils(unittest.TestCase):
+    def test_make_sampler_temp_zero_uses_argmax(self):
+        sampler = make_sampler(temp=0)
+        logits = mx.array([[-10.0, -5.0, -1.0, -8.0]])
+        result = sampler(logits)
+        self.assertEqual(result.item(), 2)
+
+    def test_make_sampler_temp_one_uses_argmax(self):
+        sampler = make_sampler(temp=1.0)
+        logits = mx.array([[-8.0, -1.0, -5.0, -10.0]])
+        result = sampler(logits)
+        self.assertEqual(result.item(), 1)
+
     def test_apply_top_p(self):
         probs = mx.array([0.9, 0.0, 0.0, 0.1])[None]
         logits = mx.log(probs)

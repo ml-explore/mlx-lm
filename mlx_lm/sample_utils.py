@@ -43,7 +43,7 @@ def make_sampler(
         Callable[mx.array, mx.array]:
             A sampler which takes log-probabilities and returns tokens.
     """
-    if temp == 0:
+    if temp == 0 or temp == 1.0:
         return lambda x: mx.argmax(x, axis=-1)
 
     # Create sampler chain
