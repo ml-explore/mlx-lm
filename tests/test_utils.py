@@ -124,5 +124,85 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(hasattr(model, "qwenWeights"))
 
 
+    def test_awq_weight_transformation(self):
+        """Test transformation of AutoAWQ packed weights to MLX format."""
+        from mlx_lm.utils import _unpack_awq_weights, _transform_awq_weights
+
+        # Test unpacking 4-bit weights
+        bits = 4
+        pack_factor = 32 // bits  # 8 values per uint32
+
+        # Create a simple packed weight: [2, 4] containing 2*32=64 values
+        # Each uint32 holds 8 4-bit values (0-15)
+        out_features = 2
+        packed_in = 4
+        in_features = packed_in * pack_factor  # 32
+
+        # Create test data: pack values 0,1,2,3,4,5,6,7 into each uint32
+        packed_values = []
+        for _ in range(out_features * packed_in):
+            val = 0
+            for i in range(pack_factor):
+                val |= (i % 16) << (i * bits)
+            packed_values.append(val)
+
+        qweight = mx.array(packed_values, dtype=mx.uint32).reshape(out_features, packed_in)
+
+        # Test unpacking function directly
+        unpacked = _unpack_awq_weights(qweight, bits)
+        self.assertEqual(unpacked.shape, (out_features, in_features))
+
+        # Verify unpacked values
+        for row in range(out_features):
+            for col in range(in_features):
+                expected = col % pack_factor
+                self.assertEqual(unpacked[row, col].item(), expected)
+
+        # Test full transformation
+        group_size = 8
+        n_groups = in_features // group_size
+
+        # Create mock AWQ weights dict
+        # qzeros shape: [n_groups, out_features // pack_factor]
+        qzeros_packed_out = out_features // pack_factor if out_features >= pack_factor else 1
+        weights = {
+            "layer.qweight": qweight,
+            "layer.scales": mx.ones((n_groups, out_features), dtype=mx.float16),
+            "layer.qzeros": mx.zeros((n_groups, qzeros_packed_out), dtype=mx.uint32),
+            "layer.other_param": mx.array([1.0, 2.0]),
+        }
+
+        quantization_config = {"bits": bits, "group_size": group_size}
+        new_weights, mlx_quant = _transform_awq_weights(weights, quantization_config)
+
+        # Verify transformation results
+        self.assertIn("layer.weight", new_weights)
+        self.assertIn("layer.scales", new_weights)
+        self.assertIn("layer.biases", new_weights)
+        self.assertIn("layer.other_param", new_weights)
+        self.assertNotIn("layer.qweight", new_weights)
+        self.assertNotIn("layer.qzeros", new_weights)
+
+        # Verify weight is preserved (same packed format)
+        self.assertTrue(mx.array_equal(new_weights["layer.weight"], qweight))
+
+        # Verify scales shape is transposed to [out_features, n_groups]
+        self.assertEqual(new_weights["layer.scales"].shape, (out_features, n_groups))
+        self.assertEqual(new_weights["layer.biases"].shape, (out_features, n_groups))
+
+        self.assertEqual(mlx_quant["bits"], bits)
+        self.assertEqual(mlx_quant["group_size"], group_size)
+
+        # Test that g_idx raises an error
+        weights_with_gidx = {
+            "layer.qweight": qweight,
+            "layer.scales": mx.ones((n_groups, out_features), dtype=mx.float16),
+            "layer.g_idx": mx.arange(in_features),
+        }
+        with self.assertRaises(ValueError) as context:
+            _transform_awq_weights(weights_with_gidx, quantization_config)
+        self.assertIn("g_idx", str(context.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
