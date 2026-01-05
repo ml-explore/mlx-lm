@@ -2115,6 +2115,15 @@ class TestModels(unittest.TestCase):
                 "gate_low_rank_dim": 16,
                 "decay_low_rank_dim": 16,
             },
+            {
+                "model_type": "youtu_llm",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "kv_lora_rank": 128,
+                "q_lora_rank": 256,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
