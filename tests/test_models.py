@@ -2122,6 +2122,15 @@ class TestModels(unittest.TestCase):
                 "is_moe_layer": [False, True, True, True],
                 "tie_word_embeddings": False,
             },
+            {
+                "model_type": "youtu_llm",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "kv_lora_rank": 128,
+                "q_lora_rank": 256,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
