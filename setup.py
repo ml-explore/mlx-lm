@@ -32,7 +32,14 @@ setup(
         "pyyaml",
         "jinja2",
     ],
-    packages=["mlx_lm", "mlx_lm.models", "mlx_lm.quant", "mlx_lm.tuner"],
+    packages=[
+        "mlx_lm",
+        "mlx_lm.models",
+        "mlx_lm.quant",
+        "mlx_lm.tuner",
+        "mlx_lm.tool_parsers",
+        "mlx_lm.chat_templates",
+    ],
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets", "lm-eval"],
