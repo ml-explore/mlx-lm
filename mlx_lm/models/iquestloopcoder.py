@@ -174,38 +174,6 @@ class TransformerBlock(nn.Module):
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
 
-    def forward_loop2(
-        self,
-        x: mx.array,
-        k1: mx.array,
-        v1: mx.array,
-        gate_proj: LoopGateProjection,
-        mask: Optional[mx.array] = None,
-        offset: int = 0,
-        window_size: int = 64,
-    ) -> Tuple[mx.array, mx.array, mx.array]:
-        B, L, _ = x.shape
-        h_norm = self.input_layernorm(x)
-
-        q2, k2, v2 = self.self_attn.get_qkv(h_norm, offset)
-        gate = gate_proj(q2)
-
-        attn_global = self.self_attn.attention(q2, k1, v1, mask)
-
-        if L <= window_size:
-            attn_local = self.self_attn.attention(q2, k2, v2, mask)
-        else:
-            window_mask = create_causal_mask(L, offset, window_size=window_size)
-            attn_local = self.self_attn.attention(q2, k2, v2, window_mask)
-
-        mixed = _mix_attention(gate, attn_global, attn_local)
-        mixed = mixed.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        r = self.self_attn.o_proj(mixed)
-
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r, k2, v2
-
 
 class IQuestLoopCoderModel(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -230,92 +198,60 @@ class IQuestLoopCoderModel(nn.Module):
         inputs: mx.array,
         cache: Optional[List[Any]] = None,
     ):
+        B, L = inputs.shape[:2]
         h = self.embed_tokens(inputs)
-        is_prefill = cache is None or cache[0][0].offset == 0
 
-        if is_prefill:
-            return self._forward_prefill(h, cache)
-        else:
-            return self._forward_generate(h, cache)
-
-    def _forward_prefill(
-        self,
-        h: mx.array,
-        cache: Optional[List[Any]],
-    ):
-        L = h.shape[1]
-        mask = create_causal_mask(L) if L > 1 else None
+        offset = cache[0][0].offset if cache is not None else 0
+        mask = create_causal_mask(L, offset) if L > 1 else None
+        window_mask = (
+            create_causal_mask(L, offset, window_size=self.loop_window_size)
+            if L > self.loop_window_size
+            else mask
+        )
 
         loop1_kv = []
-        for layer in self.layers:
-            h_norm = layer.input_layernorm(h)
-            q1, k1, v1 = layer.self_attn.get_qkv(h_norm, offset=0)
-            loop1_kv.append((k1, v1))
-
-            out = layer.self_attn.attention(q1, k1, v1, mask)
-            r = layer.self_attn.o_proj(out.transpose(0, 2, 1, 3).reshape(h.shape))
-            h = h + r
-            r = layer.mlp(layer.post_attention_layernorm(h))
-            h = h + r
-
-        loop2_kv = []
-        for layer, (k1, v1), gate_proj in zip(
-            self.layers, loop1_kv, self.gate_projections
-        ):
-            h, k2, v2 = layer.forward_loop2(
-                h,
-                k1,
-                v1,
-                gate_proj,
-                mask,
-                offset=0,
-                window_size=self.loop_window_size,
-            )
-            loop2_kv.append((k2, v2))
-
-        if cache is not None:
-            for c, (k1, v1), (k2, v2) in zip(cache, loop1_kv, loop2_kv):
-                c[0].update_and_fetch(k1, v1)
-                c[1].update_and_fetch(k2, v2)
-
-        return self.norm(h)
-
-    def _forward_generate(
-        self,
-        h: mx.array,
-        cache: List[Any],
-    ):
-        B, L, _ = h.shape
-        offset = cache[0][0].offset
-
-        for layer, c in zip(self.layers, cache):
+        for i, layer in enumerate(self.layers):
             h_norm = layer.input_layernorm(h)
             q1, k1, v1 = layer.self_attn.get_qkv(h_norm, offset)
-            k1_full, v1_full = c[0].update_and_fetch(k1, v1)
 
-            out = scaled_dot_product_attention(
-                q1, k1_full, v1_full, cache=c[0], scale=layer.self_attn.scale, mask=None
+            if cache is not None:
+                k1_full, v1_full = cache[i][0].update_and_fetch(k1, v1)
+            else:
+                k1_full, v1_full = k1, v1
+            loop1_kv.append((k1_full, v1_full))
+
+            out = layer.self_attn.attention(
+                q1, k1_full, v1_full, mask, cache=cache[i][0] if cache else None
             )
             r = layer.self_attn.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
-
             h = h + r
             r = layer.mlp(layer.post_attention_layernorm(h))
             h = h + r
 
-        for layer, c, gate_proj in zip(self.layers, cache, self.gate_projections):
+        for i, (layer, gate_proj) in enumerate(zip(self.layers, self.gate_projections)):
             h_norm = layer.input_layernorm(h)
             q2, k2, v2 = layer.self_attn.get_qkv(h_norm, offset)
             gate = gate_proj(q2)
 
-            k1_full, v1_full = c[0].state
-            attn_global = layer.self_attn.attention(q2, k1_full, v1_full, cache=c[0])
+            k1_full, v1_full = loop1_kv[i]
+            attn_global = layer.self_attn.attention(
+                q2, k1_full, v1_full, mask, cache=cache[i][0] if cache else None
+            )
 
-            k2_window, v2_window = c[1].update_and_fetch(k2, v2)
-            attn_local = layer.self_attn.attention(q2, k2_window, v2_window, cache=c[1])
+            if cache is not None:
+                k2_window, v2_window = cache[i][1].update_and_fetch(k2, v2)
+            else:
+                k2_window, v2_window = k2, v2
+            attn_local = layer.self_attn.attention(
+                q2,
+                k2_window,
+                v2_window,
+                window_mask,
+                cache=cache[i][1] if cache else None,
+            )
 
             mixed = _mix_attention(gate, attn_global, attn_local)
             r = layer.self_attn.o_proj(mixed.transpose(0, 2, 1, 3).reshape(B, L, -1))
-
             h = h + r
             r = layer.mlp(layer.post_attention_layernorm(h))
             h = h + r
