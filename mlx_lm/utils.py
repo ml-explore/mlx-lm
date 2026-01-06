@@ -5,6 +5,7 @@ import glob
 import importlib
 import inspect
 import json
+import logging
 import os
 import resource
 import shutil
@@ -202,6 +203,50 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
+def _convert_pt_to_mlx(model_path: Path) -> None:
+    """
+    Convert PyTorch .bin weights to safetensors format for MLX.
+
+    Args:
+        model_path (Path): Path to the model directory containing pytorch_model.bin
+
+    Raises:
+        ImportError: If torch is not installed
+    """
+    try:
+        import torch
+    except ImportError:
+        raise ImportError(
+            "PyTorch is required to convert pytorch_model.bin files. "
+            "Install it with: pip install torch"
+        )
+
+    from safetensors.torch import save_file
+
+    bin_files = list(model_path.glob("pytorch_model*.bin"))
+    if not bin_files:
+        return
+
+    logging.info("Converting PyTorch weights to safetensors format...")
+
+    all_weights = {}
+    for bin_file in bin_files:
+        weights = torch.load(bin_file, map_location="cpu", weights_only=True)
+        all_weights.update(weights)
+
+    # Handle shared/tied weights by cloning them to separate tensors
+    # This is common in models where embed_tokens and lm_head share weights
+    processed_weights = {}
+    for k, v in all_weights.items():
+        # Clone tensors to break shared memory
+        processed_weights[k] = v.clone()
+
+    # Save as safetensors
+    output_path = model_path / "model.safetensors"
+    save_file(processed_weights, output_path)
+    logging.info(f"Saved converted weights to {output_path}")
+
+
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -239,6 +284,19 @@ def _download(
                 allow_patterns=allow_patterns,
             )
         )
+
+        # Check if we got safetensors, if not try to get .bin files
+        safetensor_files = list(model_path.glob("model*.safetensors"))
+        if not safetensor_files:
+            # Try to download pytorch_model.bin files
+            bin_patterns = allow_patterns + ["pytorch_model*.bin"]
+            model_path = Path(
+                snapshot_download(
+                    path_or_hf_repo,
+                    revision=revision,
+                    allow_patterns=bin_patterns,
+                )
+            )
 
     return model_path
 
@@ -301,6 +359,13 @@ def load_model(
         config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
+
+    # If no safetensors found, try to convert from pytorch_model.bin
+    if not weight_files:
+        bin_files = glob.glob(str(model_path / "pytorch_model*.bin"))
+        if bin_files:
+            _convert_pt_to_mlx(model_path)
+            weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:
         logging.error(f"No safetensors found in {model_path}")
