@@ -56,63 +56,24 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 
-def _unpack_awq_weights(
-    qweight: mx.array, bits: int, gemm_order: bool = True
-) -> mx.array:
-    """
-    Unpack AWQ/GPTQ quantized weights from packed uint32 format.
-
-    Args:
-        qweight: Packed weights of shape [out_features, in_features // pack_factor]
-            where pack_factor = 32 // bits
-        bits: Number of bits per weight (typically 4)
-        gemm_order: If True, apply AutoAWQ GEMM interleaved unpacking order.
-            AutoAWQ GEMM packs values with order_map = [0, 2, 4, 6, 1, 3, 5, 7],
-            meaning nibble i contains the value originally at position order_map[i].
-
-    Returns:
-        Unpacked weights of shape [out_features, in_features] as uint32
-    """
+def _unpack_awq_weights(qweight: mx.array) -> mx.array:
+    bits = 4
     pack_factor = 32 // bits
     out_features, packed_in = qweight.shape
     in_features = packed_in * pack_factor
-
-    # Create bit masks and shifts for unpacking
     mask = (1 << bits) - 1  # e.g., 0xF for 4-bit
-
-    # Vectorized unpacking: create shifts array and broadcast
-    shifts = mx.arange(pack_factor) * bits  # [0, 4, 8, 12, 16, 20, 24, 28] for 4-bit
-    unpacked = (
-        qweight[..., None] >> shifts
-    ) & mask  # [out_features, packed_in, pack_factor]
-
-    if gemm_order and bits == 4:
-        inverse_order = mx.array([0, 4, 1, 5, 2, 6, 3, 7])
-        unpacked = unpacked[..., inverse_order]
-
-    unpacked = unpacked.reshape(out_features, in_features)
-
-    return unpacked
+    shifts = mx.array([0, 4, 1, 5, 2, 6, 3, 7]) * bits
+    unpacked = (qweight[..., None] >> shifts) & mask
+    return unpacked.reshape(out_features, in_features)
 
 
 def _transform_awq_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
 ) -> Tuple[Dict[str, mx.array], Dict[str, Any]]:
-    """
-    Transform AutoAWQ/GPTQ packed weights to MLX quantization format.
-
-    AutoAWQ format (weights are transposed):
-        - layer.qweight: Packed quantized weights (int32), shape [in_features, out_features // pack_factor]
-        - layer.qzeros: Packed zero points (int32), shape [n_groups, out_features // pack_factor]
-        - layer.scales: Quantization scales (float16), shape [n_groups, out_features]
-
-    MLX QuantizedLinear format:
-        - layer.weight: Quantized weights (uint32), shape [out_features, in_features // pack_factor]
-        - layer.scales: Quantization scales, shape [out_features, n_groups]
-        - layer.biases: Quantization biases (derived from zeros), shape [out_features, n_groups]
-    """
     bits = quantization_config.get("bits", 4)
+    if bits != 4:
+        raise ValueError(f"Only {bits=} is supported for AutoAWQ/GPTQ models.")
     group_size = quantization_config.get("group_size", 128)
 
     new_weights = {}
@@ -144,7 +105,7 @@ def _transform_awq_weights(
             n_groups = in_features // group_size
 
             # Unpack qweight: [in_features, out_features // pack_factor] -> [in_features, out_features]
-            unpacked_weight = _unpack_awq_weights(qweight, bits)
+            unpacked_weight = _unpack_awq_weights(qweight)
             # Transpose to MLX format: [out_features, in_features]
             unpacked_weight = unpacked_weight.T
 
@@ -163,7 +124,7 @@ def _transform_awq_weights(
                 qzeros = weights[qzeros_key]
                 # qzeros shape: [n_groups, out_features // pack_factor]
                 # Unpack to get [n_groups, out_features]
-                unpacked_zeros = _unpack_awq_weights(qzeros, bits)
+                unpacked_zeros = _unpack_awq_weights(qzeros)
                 # Transpose to [out_features, n_groups]
                 unpacked_zeros = unpacked_zeros.T
 
@@ -184,7 +145,6 @@ def _transform_awq_weights(
         elif not any(
             key.endswith(suffix) for suffix in [".qweight", ".qzeros", ".scales"]
         ):
-            # Keep non-quantization-related weights as-is
             new_weights[key] = weights[key]
 
     for k, w in new_weights.items():
