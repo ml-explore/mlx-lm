@@ -535,6 +535,8 @@ class ResponseGenerator:
             return tokenizer.encode(request.prompt)
 
     def _is_batchable(self, args):
+        if getattr(self.model_provider.cli_args, "no_batch", False):
+            return False
         if (
             args.model.draft != "default_model"
             or self.model_provider.cli_args.draft_model is not None
@@ -1644,6 +1646,11 @@ def main():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
+    )
+    parser.add_argument(
+        "--no-batch",
+        action="store_true",
+        help="Disable request batching (useful for models with sliding_window that have BatchRotatingKVCache merge issues)",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
