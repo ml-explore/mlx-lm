@@ -6,7 +6,7 @@ from mlx_lm import generate, load
 from mlx_lm.models.cache import make_prompt_cache
 
 # Specify the checkpoint
-checkpoint = "mlx-community/Qwen2.5-32B-Instruct-4bit"
+checkpoint = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 
 # Load the corresponding model and tokenizer
 model, tokenizer = load(path_or_hf_repo=checkpoint)
@@ -49,12 +49,11 @@ response = generate(
 )
 
 # Parse the tool call:
-# (Note, the tool call format is model specific)
-tool_open = "<tool_call>"
-tool_close = "</tool_call>"
-start_tool = response.find(tool_open) + len(tool_open)
-end_tool = response.find(tool_close)
-tool_call = json.loads(response[start_tool:end_tool].strip())
+# - The tool call format is model specific.
+# - The tokenizer's tool parser expects tool call text to be already extracted.
+start_tool = response.find(tokenizer.tool_call_start) + len(tokenizer.tool_call_start)
+end_tool = response.find(tokenizer.tool_call_end)
+tool_call = tokenizer.tool_parser(response[start_tool:end_tool].strip())
 tool_result = tools[tool_call["name"]](**tool_call["arguments"])
 
 # Put the tool result in the prompt

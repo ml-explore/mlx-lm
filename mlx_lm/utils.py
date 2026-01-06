@@ -56,6 +56,109 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 
+def _unpack_awq_weights(qweight: mx.array) -> mx.array:
+    bits = 4
+    pack_factor = 32 // bits
+    out_features, packed_in = qweight.shape
+    in_features = packed_in * pack_factor
+    mask = (1 << bits) - 1  # e.g., 0xF for 4-bit
+    shifts = mx.array([0, 4, 1, 5, 2, 6, 3, 7]) * bits
+    unpacked = (qweight[..., None] >> shifts) & mask
+    return unpacked.reshape(out_features, in_features)
+
+
+def _transform_awq_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Dict[str, Any]]:
+    bits = quantization_config.get("bits", 4)
+    if bits != 4:
+        raise ValueError(f"Only {bits=} is supported for AutoAWQ/GPTQ models.")
+    group_size = quantization_config.get("group_size", 128)
+
+    new_weights = {}
+
+    for key in list(weights.keys()):
+        if key.endswith(".g_idx"):
+            raise ValueError(
+                f"Found {key} in weights. Models with non-contiguous group indices "
+                "(g_idx) are not currently supported. Please use a model without g_idx "
+                "or re-quantize the model using mlx_lm.convert."
+            )
+
+        if key.endswith(".qweight"):
+            prefix = key[:-8]  # Remove ".qweight"
+
+            qweight = weights[f"{prefix}.qweight"]
+            scales_key = f"{prefix}.scales"
+            qzeros_key = f"{prefix}.qzeros"
+
+            scales = weights[scales_key]
+
+            # AutoAWQ stores qweight as [in_features, out_features // pack_factor]
+            # MLX expects [out_features, in_features // pack_factor]
+            # We need to unpack, transpose, and repack
+
+            pack_factor = 32 // bits
+            in_features, packed_out = qweight.shape
+            out_features = packed_out * pack_factor
+            n_groups = in_features // group_size
+
+            # Unpack qweight: [in_features, out_features // pack_factor] -> [in_features, out_features]
+            unpacked_weight = _unpack_awq_weights(qweight)
+            # Transpose to MLX format: [out_features, in_features]
+            unpacked_weight = unpacked_weight.T
+
+            # Repack for MLX: [out_features, in_features] -> [out_features, in_features // pack_factor]
+            packed_in = in_features // pack_factor
+            repacked = unpacked_weight.reshape(out_features, packed_in, pack_factor)
+            shifts = mx.arange(pack_factor) * bits
+            weight = (
+                (repacked.astype(mx.uint32) << shifts).sum(axis=-1).astype(mx.uint32)
+            )
+
+            scales = mx.contiguous(scales.T)
+
+            # Handle qzeros if present (asymmetric quantization)
+            if qzeros_key in weights:
+                qzeros = weights[qzeros_key]
+                # qzeros shape: [n_groups, out_features // pack_factor]
+                # Unpack to get [n_groups, out_features]
+                unpacked_zeros = _unpack_awq_weights(qzeros)
+                # Transpose to [out_features, n_groups]
+                unpacked_zeros = unpacked_zeros.T
+
+                # Compute biases: MLX dequant = weight * scale + bias
+                # AWQ dequant = (weight - zero) * scale
+                # So: bias = -zero * scale
+                biases = -unpacked_zeros.astype(mx.float32) * scales
+            else:
+                # Symmetric quantization - zeros are implicitly 2^(bits-1)
+                zero_point = 1 << (bits - 1)  # e.g., 8 for 4-bit
+                biases = mx.full(scales.shape, -zero_point, dtype=mx.float32) * scales
+
+            new_weights[f"{prefix}.weight"] = weight
+            new_weights[f"{prefix}.scales"] = scales
+            new_weights[f"{prefix}.biases"] = biases.astype(scales.dtype)
+            model_dtype = scales.dtype
+
+        elif not any(
+            key.endswith(suffix) for suffix in [".qweight", ".qzeros", ".scales"]
+        ):
+            new_weights[key] = weights[key]
+
+    for k, w in new_weights.items():
+        if mx.issubdtype(w.dtype, mx.floating):
+            new_weights[k] = w.astype(model_dtype)
+
+    mlx_quantization = {
+        "group_size": group_size,
+        "bits": bits,
+    }
+
+    return new_weights, mlx_quantization
+
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -252,6 +355,12 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method in ("awq", "gptq"):
+            # Transform AutoAWQ/GPTQ packed weights to MLX format
+            weights, quantization = _transform_awq_weights(weights, quantization_config)
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -286,7 +395,9 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         ],
     )
     return _load_tokenizer(
-        model_path, tokenizer_config_extra, eos_token_ids=eos_token_ids
+        model_path,
+        tokenizer_config_extra,
+        eos_token_ids=eos_token_ids,
     )
 
 

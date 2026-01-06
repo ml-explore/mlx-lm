@@ -58,9 +58,9 @@ class StopCondition(NamedTuple):
 
 def stopping_criteria(
     tokens: List[int],
+    eos_token_ids: set,
     stop_id_sequences: List[List[int]],
     stop_words: List[str],
-    eos_token_id: Union[int, None],
 ) -> StopCondition:
     """
     Determines whether the token generation should stop based on predefined
@@ -68,14 +68,14 @@ def stopping_criteria(
 
     Args:
         tokens (List[int]): The current sequence of generated tokens.
+        eos_token_ids (set): The token IDs that represents the
+          end-of-sequence. If the last token in ``tokens`` is in the set,
+          the generation should stop.
         stop_id_sequences (List[List[[int]]): A list of integer lists, each
           representing a sequence of token IDs. If the end of the `tokens`
           list matches any of these sequences, the generation should stop.
         stop_words (List[str]): The stop words that correspond to the
             ``stop_id_sequences``.
-        eos_token_id (Union[int, None]): The token ID that represents the
-          end-of-sequence. If the last token in `tokens` matches this, the
-          generation should stop.
 
     Returns:
         StopCondition: A named tuple indicating whether the stop condition has
@@ -83,7 +83,7 @@ def stopping_criteria(
           end if it has (`trim_length`) as well as the text that should be
           trimmed.
     """
-    if tokens and tokens[-1] == eos_token_id:
+    if tokens and tokens[-1] in eos_token_ids:
         return StopCondition(stop_met=True, trim_length=0, trim_text_length=0)
 
     for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
@@ -164,6 +164,11 @@ def process_message_content(messages):
             message["content"] = "".join(text_fragments)
         elif content is None:
             message["content"] = ""
+        if tool_calls := message.get("tool_calls", False):
+            for tool_call in tool_calls:
+                if func := tool_call.get("function", False):
+                    if args := func.get("arguments", False):
+                        func["arguments"] = json.loads(args)
 
 
 class LRUPromptCache:
@@ -357,7 +362,12 @@ class GenerationContext:
     has_tool_calling: bool
     tool_call_start: str
     tool_call_end: str
-    eos_token_id: int
+    tool_parser: Callable[[str, Any], Dict]
+    has_thinking: bool
+    think_start_id: int
+    think_end_id: int
+    think_end: str
+    eos_token_ids: set
     stop_token_sequences: List[List[int]]
     prompt: List[int]
 
@@ -593,7 +603,12 @@ class ResponseGenerator:
                         has_tool_calling=tokenizer.has_tool_calling,
                         tool_call_start=tokenizer.tool_call_start,
                         tool_call_end=tokenizer.tool_call_end,
-                        eos_token_id=tokenizer.eos_token_id,
+                        tool_parser=tokenizer.tool_parser,
+                        has_thinking=tokenizer.has_thinking,
+                        think_start_id=tokenizer.think_start_id,
+                        think_end=tokenizer.think_end,
+                        think_end_id=tokenizer.think_end_id,
+                        eos_token_ids=tokenizer.eos_token_ids,
                         stop_token_sequences=[
                             tokenizer.encode(stop_word, add_special_tokens=False)
                             for stop_word in args.stop_words
@@ -685,7 +700,8 @@ class ResponseGenerator:
                     for r in responses:
                         result = batch_results[r.uid]
                         result["cache_key"].append(r.token)
-                        result["detokenizer"].add_token(r.token)
+                        if r.finish_reason != "stop":
+                            result["detokenizer"].add_token(r.token)
 
                         top_tokens = None
                         if args.logprobs > 0:
@@ -743,7 +759,12 @@ class ResponseGenerator:
                 has_tool_calling=tokenizer.has_tool_calling,
                 tool_call_start=tokenizer.tool_call_start,
                 tool_call_end=tokenizer.tool_call_end,
-                eos_token_id=tokenizer.eos_token_id,
+                tool_parser=tokenizer.tool_parser,
+                has_thinking=tokenizer.has_thinking,
+                think_start_id=tokenizer.think_start_id,
+                think_end=tokenizer.think_end,
+                think_end_id=tokenizer.think_end_id,
+                eos_token_ids=tokenizer.eos_token_ids,
                 stop_token_sequences=[
                     tokenizer.encode(stop_word, add_special_tokens=False)
                     for stop_word in args.stop_words
@@ -1035,6 +1056,7 @@ class APIHandler(BaseHTTPRequestHandler):
         top_tokens: Optional[List[Dict[int, float]]] = None,
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
+        reasoning_text: Optional[str] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -1054,6 +1076,7 @@ class APIHandler(BaseHTTPRequestHandler):
               tokens to logprobs for the top N tokens at each token position.
             tokens (Optional[List[int]]): List of tokens to return with logprobs structure
             tool_calls (Optional[List[str]]): List of tool calls.
+            reasoning_text (Optional[str]): The reasoning text generated by the model.
 
         Returns:
             dict: A dictionary containing the response, in the same format as
@@ -1062,17 +1085,6 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = token_logprobs or []
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
-
-        def parse_function(tool_text):
-            tool_call = json.loads(tool_text.strip())
-            return {
-                "function": {
-                    "name": tool_call.get("name", None),
-                    "arguments": json.dumps(tool_call.get("arguments", "")),
-                },
-                "type": "function",
-                "id": None,
-            }
 
         # Static response
         response = {
@@ -1119,7 +1131,8 @@ class APIHandler(BaseHTTPRequestHandler):
             choice[key_name] = {
                 "role": "assistant",
                 "content": text,
-                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
+                "reasoning": reasoning_text,
+                "tool_calls": tool_calls,
             }
         elif self.object_type == "text_completion":
             choice.update(text=text)
@@ -1204,8 +1217,43 @@ class APIHandler(BaseHTTPRequestHandler):
         # Variables to save the tool calls in as they are being generated by
         # the model.
         in_tool_call = False
+        made_tool_call = False
         tool_calls = []
         tool_text = ""
+        tool_idx = 0
+
+        def parse_single_tool(tool_text):
+            nonlocal tool_idx
+            tool_call = ctx.tool_parser(tool_text, request.tools)
+            tool_call["arguments"] = json.dumps(
+                tool_call["arguments"], ensure_ascii=False
+            )
+            out = {
+                "function": tool_call,
+                "type": "function",
+                "id": str(uuid.uuid4()),
+            }
+            if self.stream:
+                out["index"] = tool_idx
+                tool_idx += 1
+            return out
+
+        def parse_tools(tool_calls):
+            if not tool_calls:
+                return []
+            return [parse_single_tool(tool_text) for tool_text in tool_calls]
+
+        # Start out in reasoning if the model is a reasoning model and the
+        # prompt has an open think token but no closing think token
+        in_reasoning = False
+        if ctx.has_thinking:
+            for i in range(len(ctx.prompt) - 1, -1, -1):
+                if ctx.prompt[i] == ctx.think_end_id:
+                    break
+                elif ctx.prompt[i] == ctx.think_start_id:
+                    in_reasoning = True
+                    break
+        reasoning_text = ""
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
@@ -1218,13 +1266,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Well finally save the reason for stopping
         finish_reason = "length"
-
         # Process the generated tokens
         for gen in response:
             logging.debug(gen.text)
 
             # Gather the text in tool calling or text variables
-            if ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+            if in_reasoning:
+                if gen.text == ctx.think_end:
+                    in_reasoning = False
+                else:
+                    reasoning_text += gen.text
+            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                made_tool_call = True
                 in_tool_call = True
             elif in_tool_call:
                 if gen.text == ctx.tool_call_end:
@@ -1247,10 +1300,13 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # Check if we should stop early
             stop_condition = stopping_criteria(
-                tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id
+                tokens,
+                ctx.eos_token_ids,
+                ctx.stop_token_sequences,
+                stop_words,
             )
             if stop_condition.stop_met:
-                finish_reason = "stop"
+                finish_reason = "tool_call" if made_tool_call else "stop"
                 ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
                 text = text[: len(text) - stop_condition.trim_text_length]
@@ -1267,12 +1323,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
-                elif segment or tool_calls:
+                elif segment or tool_calls or reasoning_text:
                     response = self.generate_response(
-                        segment, None, tool_calls=tool_calls
+                        segment,
+                        None,
+                        tool_calls=parse_tools(tool_calls),
+                        reasoning_text=reasoning_text,
                     )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
+                    reasoning_text = ""
                     segment = ""
                     tool_calls = []
 
@@ -1281,7 +1341,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if self.stream:
             response = self.generate_response(
-                segment, finish_reason, tool_calls=tool_calls
+                segment,
+                finish_reason,
+                tool_calls=parse_tools(tool_calls),
+                reasoning_text=reasoning_text,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
@@ -1300,7 +1363,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
-                tool_calls=tool_calls,
+                reasoning_text=reasoning_text,
+                tool_calls=parse_tools(tool_calls),
             )
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
@@ -1582,6 +1646,9 @@ def main():
         default="{}",
     )
     args = parser.parse_args()
+    if mx.metal.is_available():
+        wired_limit = mx.metal.device_info()["max_recommended_working_set_size"]
+        mx.set_wired_limit(wired_limit)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
