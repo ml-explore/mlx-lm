@@ -509,6 +509,39 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_sov30_moe(self):
+        from mlx_lm.models import sov30_moe
+
+        args = sov30_moe.ModelArgs(
+            model_type="sov30_moe",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=1000,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            num_experts_per_tok=2,
+            num_experts=4,
+            moe_intermediate_size=128,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            first_k_dense_replace=1,
+            n_group=2,
+            topk_group=2,
+            routed_scaling_factor=1.0,
+            num_shared_experts=1,
+        )
+        model = sov30_moe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
