@@ -551,6 +551,7 @@ class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         self.left_padding = mx.array(left_padding) if left_padding else None
+        self._lengths = None
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -582,7 +583,11 @@ class ArraysCache(_BaseCache):
 
     def make_mask(self, N: int):
         if self.cache[0] is None and self.left_padding is not None:
-            return mx.arange(N) >= self.left_padding[:, None]
+            idx = mx.arange(N)
+            mask = idx >= self.left_padding[:, None]
+            if self._lengths is not None:
+                mask = mx.logical_and(mask, idx < self._lengths[:, None])
+            return mask
         else:
             return None
 
@@ -629,6 +634,7 @@ class ArraysCache(_BaseCache):
         result = cls.__new__(cls)
         result.cache = merged_cache
         result.left_padding = mx.array([0] * len(caches))
+        result._lengths = None
         return result
 
     def extract(self, idx):
@@ -647,18 +653,19 @@ class ArraysCache(_BaseCache):
             for c in self.cache
         ]
         result.left_padding = None
+        result._lengths = None
         return result
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         """
         Prepare the cache for batch processing with padding information.
 
-        For ArraysCache, this primarily updates the left_padding attribute
-        which is used for mask generation.
+        For ArraysCache, this updates the left_padding and _lengths attributes
+        which are used for mask generation.
 
         Args:
             left_padding: List of left padding amounts per batch entry.
-            lengths: Not used for ArraysCache.
+            lengths: List of sequence lengths per batch entry (for right padding).
             right_padding: Not used for ArraysCache.
         """
         if left_padding is not None:
@@ -666,6 +673,8 @@ class ArraysCache(_BaseCache):
                 self.left_padding = self.left_padding + mx.array(left_padding)
             else:
                 self.left_padding = mx.array(left_padding)
+        if lengths is not None:
+            self._lengths = mx.array(lengths)
 
     def finalize(self):
         """

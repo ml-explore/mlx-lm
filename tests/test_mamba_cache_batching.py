@@ -239,6 +239,76 @@ class TestArraysCachePrepareFinalize(unittest.TestCase):
         self.assertEqual(cache.cache[0].tolist(), original_0)
         self.assertEqual(cache.cache[1].tolist(), original_1)
 
+    def test_prepare_with_lengths(self):
+        """Test prepare() sets _lengths for right padding."""
+        cache = MambaCache()
+        cache._lengths = None
+
+        cache.prepare(lengths=[2, 3, 4])
+
+        self.assertEqual(cache._lengths.tolist(), [2, 3, 4])
+
+
+class TestArraysCacheMakeMask(unittest.TestCase):
+    """Test ArraysCache.make_mask() with left padding and lengths."""
+
+    def test_mask_left_padding_only(self):
+        """Test mask generation with left padding only."""
+        from mlx_lm.models.cache import ArraysCache
+
+        left_padding = [1, 2]
+        cache = ArraysCache(size=2, left_padding=left_padding)
+
+        mask = cache.make_mask(4)
+        # Expected:
+        # Row 0: [F, T, T, T] (pad 1)
+        # Row 1: [F, F, T, T] (pad 2)
+
+        self.assertIsNotNone(mask)
+        self.assertTrue(mx.array_equal(mask[0], mx.array([False, True, True, True])))
+        self.assertTrue(mx.array_equal(mask[1], mx.array([False, False, True, True])))
+
+    def test_mask_with_lengths(self):
+        """Test mask generation with lengths (right padding)."""
+        from mlx_lm.models.cache import ArraysCache
+
+        cache = ArraysCache(size=2, left_padding=[0, 0])
+        cache.prepare(lengths=[2, 1])
+        # N=3.
+        # Row 0: lengths 2. Valid 0, 1. Mask idx < 2.
+        # Row 1: lengths 1. Valid 0. Mask idx < 1.
+
+        mask = cache.make_mask(3)
+        # Expected:
+        # Row 0: [T, T, F]
+        # Row 1: [T, F, F]
+
+        self.assertIsNotNone(mask)
+        self.assertTrue(mx.array_equal(mask[0], mx.array([True, True, False])))
+        self.assertTrue(mx.array_equal(mask[1], mx.array([True, False, False])))
+
+    def test_mask_mixed_padding_and_lengths(self):
+        """Test mask with both left padding and lengths."""
+        from mlx_lm.models.cache import ArraysCache
+
+        cache = ArraysCache(size=2, left_padding=[1])
+        cache.prepare(lengths=[2])
+
+        mask = cache.make_mask(3)
+        # left_padding=1: idx >= 1 → [F, T, T]
+        # lengths=2: idx < 2 → [T, T, F]
+        # Combined: [F, T, F]
+        self.assertTrue(mx.array_equal(mask[0], mx.array([False, True, False])))
+
+    def test_mask_no_left_padding(self):
+        """Test that mask returns None when no left_padding set."""
+        from mlx_lm.models.cache import ArraysCache
+
+        cache = ArraysCache(size=2)
+        mask = cache.make_mask(4)
+
+        self.assertIsNone(mask)
+
 
 if __name__ == "__main__":
     unittest.main()
