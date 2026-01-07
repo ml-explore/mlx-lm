@@ -1546,7 +1546,11 @@ def run(
         "it only implements basic security checks."
     )
     logging.info(f"Starting httpd at {host} on port {port}...")
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        httpd.shutdown()
+        response_generator.stop_and_join()
 
 
 def main():
