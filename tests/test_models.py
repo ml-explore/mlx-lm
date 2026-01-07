@@ -1252,6 +1252,29 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_iquestloopcoder(self):
+        from mlx_lm.models import iquestloopcoder
+
+        args = iquestloopcoder.ModelArgs(
+            model_type="iquestloopcoder",
+            hidden_size=256,
+            num_hidden_layers=2,
+            intermediate_size=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=1000,
+            rope_theta=500000.0,
+            tie_word_embeddings=False,
+            loop_num=2,
+            loop_window_size=32,
+        )
+        model = iquestloopcoder.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_smollm3(self):
         from mlx_lm.models import smollm3
 
