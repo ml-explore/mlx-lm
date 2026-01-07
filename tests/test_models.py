@@ -1263,6 +1263,7 @@ class TestModels(unittest.TestCase):
             num_attention_heads=4,
             num_key_value_heads=2,
             rms_norm_eps=1e-5,
+            head_dim=32,
             vocab_size=1000,
             rope_theta=500000.0,
             tie_word_embeddings=False,

@@ -8,16 +8,16 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
 
-from .base import BaseModelArgs, create_causal_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache, RotatingKVCache
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 
 
 @partial(mx.compile, shapeless=True)
 def _compute_gate(query: mx.array, weight: mx.array, bias: mx.array) -> mx.array:
-    gate_logits = mx.sum(query * weight[None, :, None, :], axis=-1)
-    gate_logits = gate_logits + bias[None, :, None]
-    return mx.sigmoid(gate_logits)[..., None]
+    gate_logits = query @ weight[:, None, :].swapaxes(-1, -2)
+    gate_logits = gate_logits + bias[..., None, None]
+    return mx.sigmoid(gate_logits)
 
 
 @partial(mx.compile, shapeless=True)
@@ -41,9 +41,9 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    head_dim: Optional[int] = None
+    head_dim: int
+    num_key_value_heads: int
     max_position_embeddings: int = 131072
-    num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
     rope_theta: float = 500000.0
@@ -51,12 +51,6 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     loop_num: int = 2
     loop_window_size: int = 64
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-        if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
 
 
 class LoopGateProjection(nn.Module):
@@ -107,26 +101,6 @@ class Attention(nn.Module):
 
         return queries, keys, values
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
-
-        queries, keys, values = self.get_qkv(x, offset)
-
-        if cache is not None:
-            keys, values = cache.update_and_fetch(keys, values)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
-
     def attention(
         self,
         queries: mx.array,
@@ -163,17 +137,6 @@ class TransformerBlock(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
-
 
 class IQuestLoopCoderModel(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -201,53 +164,46 @@ class IQuestLoopCoderModel(nn.Module):
         B, L = inputs.shape[:2]
         h = self.embed_tokens(inputs)
 
-        offset = cache[0][0].offset if cache is not None else 0
-        mask = create_causal_mask(L, offset) if L > 1 else None
-        window_mask = (
-            create_causal_mask(L, offset, window_size=self.loop_window_size)
-            if L > self.loop_window_size
-            else mask
+        if cache is None:
+            cache = [None] * (2 * len(self.layers))
+
+        offset = cache[0].offset if cache[0] is not None else 0
+        mask = create_attention_mask(h, cache[0])
+        window_mask = create_attention_mask(
+            h, cache[len(self.layers)], window_size=self.loop_window_size
         )
 
         loop1_kv = []
-        for i, layer in enumerate(self.layers):
+        for layer, c in zip(self.layers, cache):
             h_norm = layer.input_layernorm(h)
             q1, k1, v1 = layer.self_attn.get_qkv(h_norm, offset)
 
-            if cache is not None:
-                k1_full, v1_full = cache[i][0].update_and_fetch(k1, v1)
-            else:
-                k1_full, v1_full = k1, v1
-            loop1_kv.append((k1_full, v1_full))
+            if c is not None:
+                k1, v1 = c.update_and_fetch(k1, v1)
+            loop1_kv.append((k1, v1))
 
-            out = layer.self_attn.attention(
-                q1, k1_full, v1_full, mask, cache=cache[i][0] if cache else None
-            )
+            out = layer.self_attn.attention(q1, k1, v1, mask, cache=c)
             r = layer.self_attn.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
             h = h + r
             r = layer.mlp(layer.post_attention_layernorm(h))
             h = h + r
 
-        for i, (layer, gate_proj) in enumerate(zip(self.layers, self.gate_projections)):
+        for layer, gate_proj, c, (k1, v1) in zip(
+            self.layers, self.gate_projections, cache[len(self.layers) :], loop1_kv
+        ):
             h_norm = layer.input_layernorm(h)
             q2, k2, v2 = layer.self_attn.get_qkv(h_norm, offset)
             gate = gate_proj(q2)
+            attn_global = layer.self_attn.attention(q2, k1, v1, mask, cache=c)
 
-            k1_full, v1_full = loop1_kv[i]
-            attn_global = layer.self_attn.attention(
-                q2, k1_full, v1_full, mask, cache=cache[i][0] if cache else None
-            )
-
-            if cache is not None:
-                k2_window, v2_window = cache[i][1].update_and_fetch(k2, v2)
-            else:
-                k2_window, v2_window = k2, v2
+            if c is not None:
+                k2, v2 = c.update_and_fetch(k2, v2)
             attn_local = layer.self_attn.attention(
                 q2,
-                k2_window,
-                v2_window,
+                k2,
+                v2,
                 window_mask,
-                cache=cache[i][1] if cache else None,
+                cache=c,
             )
 
             mixed = _mix_attention(gate, attn_global, attn_local)
@@ -279,9 +235,6 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
-
-    def sanitize(self, weights):
-        return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
@@ -327,7 +280,6 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [
-            CacheList(KVCache(), RotatingKVCache(max_size=self.args.loop_window_size))
-            for _ in self.layers
+        return [KVCache() for _ in self.layers] + [
+            RotatingKVCache(max_size=self.args.loop_window_size) for _ in self.layers
         ]
