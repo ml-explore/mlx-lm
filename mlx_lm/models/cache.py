@@ -1157,12 +1157,10 @@ class BatchRotatingKVCache(_BaseCache):
             cache.keys = mx.roll(cache.keys, -self._idx, axis=2)
             cache.values = mx.roll(cache.values, -self._idx, axis=2)
             cache._idx = self.max_size
-        if padding > 0:
-            cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
-            cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+        cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
+        cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
         cache.offset = offset
         cache._idx = cache.keys.shape[2]
-
         return cache
 
     @classmethod
@@ -1185,8 +1183,8 @@ class BatchRotatingKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, c) in enumerate(zip(padding, caches)):
-            keys[i : i + 1, :, p : p + c.offset] = c._temporal_order(c.keys)
-            values[i : i + 1, :, p : p + c.offset] = c._temporal_order(c.values)
+            keys[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.keys)
+            values[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.values)
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys

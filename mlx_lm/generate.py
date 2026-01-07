@@ -1071,7 +1071,8 @@ class BatchGenerator:
             prompt_cache = _merge_caches(caches)
 
             for c in prompt_cache:
-                c.prepare(lengths=lengths, right_padding=padding)
+                # subtract one from lengths since we don't process the last token during prefill
+                c.prepare(lengths=[l - 1 for l in lengths], right_padding=padding)
 
             while inputs.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
@@ -1096,6 +1097,7 @@ class BatchGenerator:
         y, logprobs = self._step(
             inputs, prompt_cache, samplers, logits_processors, tokens
         )
+
         mx.async_eval(y, logprobs)
 
         return Batch(
