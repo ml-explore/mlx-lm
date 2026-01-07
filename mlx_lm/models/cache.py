@@ -586,6 +586,95 @@ class ArraysCache(_BaseCache):
         else:
             return None
 
+    @classmethod
+    def merge(cls, caches):
+        """
+        Merge multiple ArraysCache instances into a single batched cache.
+
+        Each cache's arrays are concatenated along axis 0 (batch dimension).
+        Handles cases where some cache entries may be None.
+
+        Args:
+            caches: List of ArraysCache instances to merge.
+
+        Returns:
+            A new ArraysCache instance containing the merged cache data.
+        """
+        if not caches:
+            raise ValueError("Cannot merge empty list of caches")
+
+        size = len(caches[0].cache)
+        if not all(len(c.cache) == size for c in caches):
+            raise ValueError("All caches must have the same size")
+
+        merged_cache = [None] * size
+
+        for i in range(size):
+            arrays = [c.cache[i] for c in caches]
+            if all(a is None for a in arrays):
+                merged_cache[i] = None
+            elif any(a is None for a in arrays):
+                # Some caches have state, some don't - initialize empty ones
+                template = next(a for a in arrays if a is not None)
+                batch_shape = (1,) + template.shape[1:]
+                arrays = [
+                    a if a is not None else mx.zeros(batch_shape, dtype=template.dtype)
+                    for a in arrays
+                ]
+                merged_cache[i] = mx.concatenate(arrays, axis=0)
+            else:
+                merged_cache[i] = mx.concatenate(arrays, axis=0)
+
+        # Create result using the actual subclass type
+        result = cls.__new__(cls)
+        result.cache = merged_cache
+        result.left_padding = mx.array([0] * len(caches))
+        return result
+
+    def extract(self, idx):
+        """
+        Extract a single cache entry from a batched ArraysCache.
+
+        Args:
+            idx: The batch index to extract.
+
+        Returns:
+            A new ArraysCache instance containing only the specified batch entry.
+        """
+        result = self.__class__.__new__(self.__class__)
+        result.cache = [
+            c[idx : idx + 1] if c is not None else None
+            for c in self.cache
+        ]
+        result.left_padding = None
+        return result
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        """
+        Prepare the cache for batch processing with padding information.
+
+        For ArraysCache, this primarily updates the left_padding attribute
+        which is used for mask generation.
+
+        Args:
+            left_padding: List of left padding amounts per batch entry.
+            lengths: Not used for ArraysCache.
+            right_padding: Not used for ArraysCache.
+        """
+        if left_padding is not None:
+            if self.left_padding is not None:
+                self.left_padding = self.left_padding + mx.array(left_padding)
+            else:
+                self.left_padding = mx.array(left_padding)
+
+    def finalize(self):
+        """
+        Finalize the cache after batch processing.
+
+        For ArraysCache, this is a no-op as there's no deferred processing.
+        """
+        pass
+
 
 class MambaCache(ArraysCache):
     def __init__(self, left_padding: Optional[List[int]] = None):
@@ -685,6 +774,61 @@ class CacheList(_BaseCache):
         """
         for c, o in zip(self.caches, other.caches):
             c.extend(o)
+
+    @classmethod
+    def merge(cls, cache_lists):
+        """
+        Merge multiple CacheList instances into a single batched CacheList.
+
+        Each sub-cache is merged using its respective merge method.
+
+        Args:
+            cache_lists: List of CacheList instances to merge.
+
+        Returns:
+            A new CacheList instance containing merged sub-caches.
+        """
+        if not cache_lists:
+            raise ValueError("Cannot merge empty list of CacheLists")
+
+        num_caches = len(cache_lists[0].caches)
+        if not all(len(cl.caches) == num_caches for cl in cache_lists):
+            raise ValueError("All CacheLists must have the same number of sub-caches")
+
+        merged_caches = []
+        for i in range(num_caches):
+            sub_caches = [cl.caches[i] for cl in cache_lists]
+            sub_cache_type = type(sub_caches[0])
+
+            if isinstance(sub_caches[0], KVCache):
+                merged = BatchKVCache.merge(sub_caches)
+            elif isinstance(sub_caches[0], RotatingKVCache):
+                merged = BatchRotatingKVCache.merge(sub_caches)
+            elif isinstance(sub_caches[0], ArraysCache):
+                merged = sub_cache_type.merge(sub_caches)
+            else:
+                raise ValueError(f"{sub_cache_type} does not support merging")
+            merged_caches.append(merged)
+
+        return cls(*merged_caches)
+
+    def extract(self, idx):
+        """
+        Extract a single cache entry from a batched CacheList.
+
+        Args:
+            idx: The batch index to extract.
+
+        Returns:
+            A new CacheList containing extracted sub-caches.
+        """
+        extracted_caches = []
+        for c in self.caches:
+            if hasattr(c, 'extract'):
+                extracted_caches.append(c.extract(idx))
+            else:
+                raise ValueError(f"{type(c)} does not support extraction")
+        return CacheList(*extracted_caches)
 
 
 def dynamic_roll(x, shifts, axis):

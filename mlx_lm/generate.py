@@ -903,6 +903,11 @@ def _merge_caches(caches):
             cache = BatchKVCache.merge([c[i] for c in caches])
         elif isinstance(caches[0][i], RotatingKVCache):
             cache = BatchRotatingKVCache.merge([c[i] for c in caches])
+        elif isinstance(caches[0][i], ArraysCache):
+            # Handles MambaCache and other ArraysCache subclasses
+            cache = type(caches[0][i]).merge([c[i] for c in caches])
+        elif isinstance(caches[0][i], CacheList):
+            cache = CacheList.merge([c[i] for c in caches])
         else:
             raise ValueError(
                 f"{type(caches[0][i])} does not yet support batching with history"
