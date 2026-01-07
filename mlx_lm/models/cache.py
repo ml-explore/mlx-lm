@@ -586,6 +586,14 @@ class ArraysCache(_BaseCache):
         else:
             return None
 
+    def extract(self, idx):
+        """
+        Extract a single item from the batched cache.
+        """
+        cache = ArraysCache(len(self.cache))
+        cache.cache = [c[idx : idx + 1] if c is not None else None for c in self.cache]
+        return cache
+
 
 class MambaCache(ArraysCache):
     def __init__(self, left_padding: Optional[List[int]] = None):
