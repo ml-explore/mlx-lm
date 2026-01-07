@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import random
 import unittest
 from typing import List
 
@@ -10,8 +11,10 @@ from mlx_lm.generate import (
     GenerationResponse,
     batch_generate,
     generate,
+    generate_step,
     stream_generate,
 )
+from mlx_lm.models import mamba2
 from mlx_lm.models.cache import RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
@@ -510,6 +513,83 @@ class TestGenerate(unittest.TestCase):
 
             if rotating:
                 del self.model.make_cache
+
+    def test_batch_continued_generation_ssm(self):
+        # Make a small SSM model
+        args = mamba2.ModelArgs(
+            model_type="mamba2",
+            num_heads=8,
+            head_dim=16,
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=128,
+            state_size=32,
+            num_hidden_layers=4,
+            layer_norm_epsilon=1e-4,
+            conv_kernel=3,
+            n_groups=4,
+            use_bias=False,
+            use_conv_bias=False,
+            tie_word_embeddings=True,
+            time_step_limit=(0.01, 10),
+            time_step_rank="auto",
+        )
+        model = mamba2.Model(args)
+
+        def rand_prompt(n):
+            return [random.randint(0, 1000) for _ in range(n)]
+
+        # Make the prompts
+        prompts_a = [
+            rand_prompt(5),
+            rand_prompt(3),
+            rand_prompt(8),
+            rand_prompt(1),
+        ]
+        prompts_b = [
+            rand_prompt(2),
+            rand_prompt(7),
+            rand_prompt(4),
+            rand_prompt(6),
+        ]
+
+        # Generate once
+        batch_gen = BatchGenerator(
+            model,
+            stop_tokens={},
+            max_tokens=10,
+            prefill_batch_size=4,
+            prefill_step_size=4,
+            completion_batch_size=2,
+        )
+        uids = batch_gen.insert(prompts_a)
+        caches = {uid: None for uid in uids}
+        while responses := batch_gen.next():
+            for r in responses:
+                if r.finish_reason is not None:
+                    caches[r.uid] = r.prompt_cache
+        caches = [caches[uid] for uid in uids]
+
+        # Generate the 2nd time
+        uids = batch_gen.insert(prompts_b, caches=caches)
+        batch_responses = {uid: [] for uid in uids}
+        while responses := batch_gen.next():
+            for r in responses:
+                batch_responses[r.uid].append(r.logprobs)
+
+        for e, uid in enumerate(uids):
+            for i, (_, logprobs) in enumerate(
+                generate_step(
+                    mx.array(prompts_b[e]),
+                    model,
+                    max_tokens=10,
+                    prompt_cache=caches[e],
+                )
+            ):
+                batch_logprobs = batch_responses[uid][i]
+                self.assertTrue(
+                    mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
+                )
 
 
 if __name__ == "__main__":

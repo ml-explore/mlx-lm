@@ -551,7 +551,7 @@ class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         self.left_padding = mx.array(left_padding) if left_padding else None
-        self._lengths = None
+        self.lengths = None
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -572,46 +572,55 @@ class ArraysCache(_BaseCache):
         In-place filter to keep just the given indices in the cache.
         """
         self.cache = [c[batch_indices] for c in self.cache]
-        self.left_padding = None
 
     def extend(self, other):
         """
         In-place extend this cache with the other cache.
         """
         self.cache = [mx.concatenate([c, o]) for c, o in zip(self.cache, other.cache)]
-        self.left_padding = None
 
     def extract(self, idx):
-        cache = copy.copy(self)
-        if self.cache is not None:
-            cache.cache = [
-                c[idx : idx + 1] if c is not None else None for c in self.cache
-            ]
+        cache = ArraysCache(len(self.cache))
+        cache.cache = [c[idx : idx + 1] for c in self.cache]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
-        if lengths is not None:
-            self._lengths = mx.array(lengths)
+        self.lengths = mx.array(lengths)
 
-    def finalize(self, **kwargs):
-        pass
+    def finalize(self):
+        self.lengths = None
+        self.left_padding = None
+
+    def advance(self, N):
+        if self.lengths is not None:
+            self.lengths -= N
+        if self.left_padding is not None:
+            self.left_padding -= N
 
     def make_mask(self, N: int):
-        if self.cache[0] is None and self.left_padding is not None:
-            idx = mx.arange(N)
-            mask = idx >= self.left_padding[:, None]
-            if self._lengths is not None:
-                mask = mx.logical_and(mask, idx < self._lengths[:, None])
-            return mask
+        has_left_pad = self.left_padding is not None
+        has_lengths = self.lengths is not None
+        if has_left_pad or has_lengths:
+            pos = mx.arange(N)
+            if has_left_pad:
+                return pos >= self.left_padding[:, None]
+            elif has_lengths:
+                return pos < self.lengths[:, None]
         else:
             return None
 
-    def extract(self, idx):
-        """
-        Extract a single item from the batched cache.
-        """
-        cache = ArraysCache(len(self.cache))
-        cache.cache = [c[idx : idx + 1] if c is not None else None for c in self.cache]
+    @classmethod
+    def merge(cls, caches):
+        n_state = len(caches[0].cache)
+        B = len(caches)
+        cache = cls(n_state)
+        for e in range(n_state):
+            c0 = caches[0][e]
+            shape = list(c0.shape)
+            shape[0] = B
+            cache[e] = mx.zeros(shape, c0.dtype)
+            for i in range(B):
+                cache[e][i : i + 1] = caches[i][e]
         return cache
 
 

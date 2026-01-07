@@ -105,7 +105,17 @@ class Mamba2Block(nn.Module):
             else:
                 conv_state = cache[0]
             padded_input = mx.concatenate([conv_state, conv_input], axis=1)
-            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :, :]
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                t, d = padded_input.shape[1:]
+                cache[0] = mx.slice(
+                    padded_input,
+                    mx.minimum(cache.lengths, t) - n_keep,
+                    axes=(1,),
+                    slice_size=(b, n_keep, d),
+                )
+            else:
+                cache[0] = padded_input[:, -n_keep:, :]
         else:
             padded_input = mx.pad(
                 conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
@@ -120,7 +130,7 @@ class Mamba2Block(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        state: Optional[mx.array] = None,
+        cache: Optional[MambaCache] = None,
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
@@ -129,6 +139,11 @@ class Mamba2Block(nn.Module):
         )
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        if cache:
+            state = cache[1]
+            lengths = cache.lengths
+        else:
+            state, lengths = None, None
         y, state = ssm_update(
             hidden_states,
             self.A_log,
@@ -140,8 +155,11 @@ class Mamba2Block(nn.Module):
             state,
             self.time_step_limit,
             mask,
+            lengths,
         )
-        return y.reshape(batch_size, seq_len, self.intermediate_size), state
+        if cache:
+            cache[1] = state
+        return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
         self,
@@ -166,10 +184,9 @@ class Mamba2Block(nn.Module):
             ],
             axis=-1,
         )
-        state = cache[1] if cache else None
-        y, state = self._ssm(hidden_states, B, C, dt, state, mask=mask)
+        y = self._ssm(hidden_states, B, C, dt, cache, mask=mask)
         if cache:
-            cache[1] = state
+            cache.advance(y.shape[1])
         y = self.norm(y, gate)
         return self.out_proj(y)
 

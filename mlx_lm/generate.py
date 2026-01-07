@@ -913,6 +913,8 @@ def _merge_caches(caches):
             cache = BatchKVCache.merge([c[i] for c in caches])
         elif isinstance(caches[0][i], RotatingKVCache):
             cache = BatchRotatingKVCache.merge([c[i] for c in caches])
+        elif isinstance(caches[0][i], ArraysCache):
+            cache = ArraysCache.merge([c[i] for c in caches])
         else:
             raise ValueError(
                 f"{type(caches[0][i])} does not yet support batching with history"
@@ -1027,9 +1029,11 @@ class BatchGenerator:
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
+        if hasattr(caches[0], "keys"):
+            cache_is_empty = cache[0].keys is None
+        else:
+            cache_is_empty = caches[0][0][0] is None
 
-        cache_lengths = [cache.cache_length(c) for c in caches]
-        max_cache_length = max(cache_lengths)
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
         padding = [max_length - l for l in lengths]
@@ -1042,7 +1046,7 @@ class BatchGenerator:
         # New prompts so
         #   1. Left-pad the inputs
         #   2. Process
-        if max_cache_length == 0:
+        if cache_is_empty:
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding)
 
@@ -1058,7 +1062,6 @@ class BatchGenerator:
                         for uid, length in zip(uids, lengths)
                     ]
                 )
-                mx.clear_cache()
 
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
@@ -1088,11 +1091,12 @@ class BatchGenerator:
                 )
                 mx.clear_cache()
 
-            for c in prompt_cache:
-                c.finalize()
             mx.eval([c.state for c in prompt_cache])
-            mx.clear_cache()
             inputs = last_inputs
+
+        for c in prompt_cache:
+            c.finalize()
+        mx.clear_cache()
 
         y, logprobs = self._step(
             inputs, prompt_cache, samplers, logits_processors, tokens

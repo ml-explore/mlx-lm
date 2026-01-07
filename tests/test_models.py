@@ -1915,7 +1915,6 @@ class TestModels(unittest.TestCase):
                 "n_groups": 4,
                 "use_bias": False,
                 "use_conv_bias": False,
-                "chunk_size": 32,
                 "tie_word_embeddings": True,
                 "time_step_limit": (0.01, 10),
                 "time_step_rank": "auto",
@@ -2232,6 +2231,50 @@ class TestModels(unittest.TestCase):
             hidden_states, A_log, B, C, D, dt, dt_bias, mask=mask
         )
         out_m = out_m[:, pad:]
+        self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
+        self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
+
+    def test_ssm_right_pad(self):
+        batch_size = 1
+        n_group = 1
+        num_heads = 48
+        head_dim = 64
+        state_dim = 128
+        seq_len = 4
+        pad = 2
+
+        hidden_states = mx.random.normal(
+            shape=(batch_size, seq_len + pad, num_heads, head_dim)
+        )
+        B = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        C = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        dt = mx.random.normal(shape=(batch_size, seq_len + pad, num_heads))
+        dt_bias = mx.random.normal(shape=(num_heads,))
+        A_log = mx.random.normal(shape=(num_heads,))
+        D = mx.random.normal(shape=(num_heads,))
+        out, out_state = ssm_attn(
+            hidden_states[:, :-pad],
+            A_log,
+            B[:, :-pad],
+            C[:, :-pad],
+            D,
+            dt[:, :-pad],
+            dt_bias,
+        )
+        mask = mx.array([[True] * seq_len + [False] * pad])
+        lengths = mx.array([seq_len])
+        out_m, out_state_m = ssm_attn(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            mask=mask,
+            lengths=lengths,
+        )
+        out_m = out_m[:, :-pad]
         self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
 
