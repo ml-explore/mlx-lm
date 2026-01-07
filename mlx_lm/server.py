@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import logging
+import pickle
 import platform
 import select
 import socket
@@ -13,12 +14,13 @@ import uuid
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
 from socketserver import BaseRequestHandler, ThreadingTCPServer
-from threading import Condition, Lock, Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -36,7 +38,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, stream_generate
+from .generate import BatchGenerator, generation_stream, stream_generate
 from .models.cache import (
     can_trim_prompt_cache,
     make_prompt_cache,
@@ -387,6 +389,49 @@ class Response:
     top_tokens: Optional[Tuple[int, float]]
 
 
+class TimeBudget:
+    def __init__(self, budget=0.5, iterations=25, sync_frequency=10):
+        self._is_distributed = mx.distributed.init().size() > 1
+        self._budget = budget
+        self._iterations = iterations
+        self._sync_frequency = sync_frequency
+
+        self._start = None
+        self._current_iterations = None
+        self._loops = 0
+        self._time_spent = 0
+
+    def __iter__(self):
+        self._start = time.time()
+        self._current_iterations = 0
+        return self
+
+    def __next__(self):
+        if not self._is_distributed:
+            if time.time() - self._start > self._budget:
+                raise StopIteration()
+            return None
+
+        self._current_iterations += 1
+        if self._current_iterations > self._iterations:
+            self._loops += 1
+            self._time_spent += time.time() - self._start
+            if self._loops % self._sync_frequency == 0:
+                with mx.stream(generation_stream):
+                    loop_time = mx.distributed.all_sum(self._time_spent)
+                    avg_loop_time = loop_time / (
+                        mx.distributed.init().size() * self._sync_frequency
+                    )
+                    factor = self._budget / avg_loop_time
+                    new_iterations = (
+                        (self._iterations * factor).round().astype(mx.int32).item()
+                    )
+                self._iterations = max(new_iterations, 1)
+                self._loops = 0
+                self._time_spent = 0
+            raise StopIteration()
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -525,6 +570,8 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
 
+        self._time_budget = TimeBudget()
+        self._is_distributed = mx.distributed.init().size() > 1
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
@@ -532,6 +579,11 @@ class ResponseGenerator:
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
+
+    def _barrier(self):
+        if self._is_distributed:
+            with mx.stream(generation_stream):
+                mx.eval(mx.distributed.all_sum(mx.ones(1)))
 
     def _tokenize(self, tokenizer, request):
         if request.request_type == "chat":
@@ -583,6 +635,7 @@ class ResponseGenerator:
             if unprocessed_requests:
                 return unprocessed_requests.pop()
             else:
+                self._barrier()
                 try:
                     if timeout is not None:
                         return self.requests.get(timeout=timeout)
@@ -721,12 +774,7 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
-                time_budget = 0.5
-                start = time.time()
-                while True:
-                    if time.time() - start > time_budget:
-                        break
-
+                for _ in self._time_budget:
                     responses = batch_generator.next()
                     if not responses:
                         break
@@ -903,6 +951,75 @@ class ResponseGenerator:
     @property
     def cli_args(self):
         return self.model_provider.cli_args
+
+
+class ShardedResponseGenerator:
+    def __init__(
+        self, rank, ips, model_provider: ModelProvider, prompt_cache: LRUPromptCache
+    ):
+        self._generator = ResponseGenerator(model_provider, prompt_cache)
+
+        if rank > 0:
+            self._server = socket.create_server(ips[rank])
+            self._peer, _ = self._server.accept()
+            self._buffer = b""
+            self._run()
+
+        else:
+            self._lock = Lock()
+            self._peers = [socket.create_connection(ip) for ip in ips[1:]]
+
+    def stop_and_join(self):
+        for s in self._peers:
+            s.close()
+        self._generator.stop_and_join()
+
+    def __getattr__(self, name):
+        return getattr(self._generator, name)
+
+    def _recv_request(self):
+        request_size = None
+        while len(self._buffer) < 8:
+            data = self._peer.recv(8192)
+            if not data:
+                raise RuntimeError("Connection closed")
+            self._buffer += data
+
+        request_size = int.from_bytes(self._buffer[:8], "big")
+        self._buffer = self._buffer[8:]
+
+        while len(self._buffer) < request_size:
+            data = self._peer.recv(request_size - len(self._buffer))
+            if not data:
+                raise RuntimeError("Connection closed")
+            self._buffer += data
+
+        raw_request = self._buffer[:request_size]
+        self._buffer = self._buffer[request_size:]
+
+        return pickle.loads(raw_request)
+
+    def _run(self):
+        try:
+            while True:
+                request, generation_args = self._recv_request()
+                self._generator.requests.put((Queue(), request, generation_args))
+        except:
+            self._generator.stop_and_join()
+            raise
+
+    def generate(
+        self,
+        request: CompletionRequest,
+        generation_args: GenerationArguments,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ):
+        data = pickle.dumps((request, generation_args))
+        data = len(data).to_bytes(8, "big") + data
+        with self._lock:
+            for p in self._peers:
+                p.sendall(data)
+            return self._generator.generate(request, generation_args, progress_callback)
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1616,12 +1733,11 @@ def get_peer_ips(port):
 def _run_http_server(
     host: str,
     port: int,
-    model_provider: ModelProvider,
+    response_generator,
     server_class=ThreadingHTTPServer,
     handler_class=APIHandler,
 ):
     server_address = (host, port)
-    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
@@ -1655,26 +1771,15 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    if group.size() == 1:
-        _run_http_server(host, port, model_provider, server_class, handler_class)
-        return
 
-    ips = get_peer_ips(port + 1)
-    http_ip, http_port = ips[group.rank()]
-    http_thread = Thread(
-        target=_run_http_server,
-        args=(http_ip, http_port, model_provider, server_class, handler_class),
-    )
-    http_thread.start()
+    response_generator_class = ResponseGenerator
+    if group.size() > 1:
+        ips = get_peer_ips(port)
+        response_generator_class = partial(ShardedResponseGenerator, group.rank(), ips)
+    response_generator = response_generator_class(model_provider, LRUPromptCache())
 
     if group.rank() == 0:
-        server = ThreadingTCPServer(
-            (host, port),
-            lambda *args, **kwargs: ProxyHandler(ips, *args, **kwargs),
-        )
-        server.serve_forever()
-
-    http_thread.join()
+        _run_http_server(host, port, response_generator)
 
 
 def main():
