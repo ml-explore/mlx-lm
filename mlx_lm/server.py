@@ -572,6 +572,7 @@ class ResponseGenerator:
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
+        self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
@@ -580,10 +581,64 @@ class ResponseGenerator:
         self._stop = True
         self._generation_thread.join()
 
-    def _barrier(self):
-        if self._is_distributed:
-            with mx.stream(generation_stream):
-                mx.eval(mx.distributed.all_sum(mx.ones(1)))
+    def join(self):
+        self._generation_thread.join()
+
+    def _next_request(self, timeout=None):
+        request = None
+        if not self._is_distributed or self._rank == 0:
+            try:
+                if timeout is not None:
+                    request = self.requests.get(timeout=timeout)
+                else:
+                    request = self.requests.get_nowait()
+            except QueueEmpty:
+                pass
+
+        return self._share_request(request)
+
+    def _share_request(self, request):
+        if not self._is_distributed:
+            return request
+
+        with mx.stream(generation_stream):
+            if self._rank == 0:
+                if request is None:
+                    mx.eval(mx.distributed.all_sum(0))
+                    return None
+                else:
+                    _, *shareable = request
+                    data = mx.array(pickle.dumps(shareable))
+                    mx.eval(mx.distributed.all_sum(data.size))
+                    mx.eval(mx.distributed.all_sum(data))
+                    return request
+            else:
+                size = mx.distributed.all_sum(0).item()
+                if size == 0:
+                    return None
+                else:
+                    data = mx.zeros(size, dtype=mx.uint8)
+                    data = mx.distributed.all_sum(data)
+                    shareable = pickle.loads(data)
+                    return Queue(), *shareable
+
+    def _share_int_list(self, x):
+        if not self._is_distributed:
+            return x
+
+        with mx.stream(generation_stream):
+            if self._rank == 0:
+                mx.eval(mx.distributed.all_sum(len(x)))
+                if x:
+                    mx.eval(mx.distributed.all_sum(mx.array(x)))
+                return x
+            else:
+                size = mx.distributed.all_sum(0).item()
+                if size == 0:
+                    return []
+                else:
+                    x = mx.zeros(size, dtype=mx.int32)
+                    return mx.distributed.all_sum(x).tolist()
 
     def _tokenize(self, tokenizer, request):
         if request.request_type == "chat":
@@ -635,14 +690,7 @@ class ResponseGenerator:
             if unprocessed_requests:
                 return unprocessed_requests.pop()
             else:
-                self._barrier()
-                try:
-                    if timeout is not None:
-                        return self.requests.get(timeout=timeout)
-                    else:
-                        return self.requests.get_nowait()
-                except QueueEmpty:
-                    return None
+                return self._next_request(timeout)
 
         def progress_callback(info):
             for uid, processed, total in info:
@@ -816,8 +864,9 @@ class ResponseGenerator:
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
-                    if uids_to_remove:
-                        batch_generator.remove(uids_to_remove)
+                uids_to_remove = self._share_int_list(uids_to_remove)
+                if uids_to_remove:
+                    batch_generator.remove(uids_to_remove)
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -908,6 +957,8 @@ class ResponseGenerator:
                 cache_key.append(gen.token)
 
                 if ctx._should_stop:
+                    if self._is_distributed:
+                        raise NotImplementedError()
                     break
 
             rqueue.put(None)
@@ -951,75 +1002,6 @@ class ResponseGenerator:
     @property
     def cli_args(self):
         return self.model_provider.cli_args
-
-
-class ShardedResponseGenerator:
-    def __init__(
-        self, rank, ips, model_provider: ModelProvider, prompt_cache: LRUPromptCache
-    ):
-        self._generator = ResponseGenerator(model_provider, prompt_cache)
-
-        if rank > 0:
-            self._server = socket.create_server(ips[rank])
-            self._peer, _ = self._server.accept()
-            self._buffer = b""
-            self._run()
-
-        else:
-            self._lock = Lock()
-            self._peers = [socket.create_connection(ip) for ip in ips[1:]]
-
-    def stop_and_join(self):
-        for s in self._peers:
-            s.close()
-        self._generator.stop_and_join()
-
-    def __getattr__(self, name):
-        return getattr(self._generator, name)
-
-    def _recv_request(self):
-        request_size = None
-        while len(self._buffer) < 8:
-            data = self._peer.recv(8192)
-            if not data:
-                raise RuntimeError("Connection closed")
-            self._buffer += data
-
-        request_size = int.from_bytes(self._buffer[:8], "big")
-        self._buffer = self._buffer[8:]
-
-        while len(self._buffer) < request_size:
-            data = self._peer.recv(request_size - len(self._buffer))
-            if not data:
-                raise RuntimeError("Connection closed")
-            self._buffer += data
-
-        raw_request = self._buffer[:request_size]
-        self._buffer = self._buffer[request_size:]
-
-        return pickle.loads(raw_request)
-
-    def _run(self):
-        try:
-            while True:
-                request, generation_args = self._recv_request()
-                self._generator.requests.put((Queue(), request, generation_args))
-        except:
-            self._generator.stop_and_join()
-            raise
-
-    def generate(
-        self,
-        request: CompletionRequest,
-        generation_args: GenerationArguments,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
-    ):
-        data = pickle.dumps((request, generation_args))
-        data = len(data).to_bytes(8, "big") + data
-        with self._lock:
-            for p in self._peers:
-                p.sendall(data)
-            return self._generator.generate(request, generation_args, progress_callback)
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1771,15 +1753,20 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-
-    response_generator_class = ResponseGenerator
-    if group.size() > 1:
-        ips = get_peer_ips(port)
-        response_generator_class = partial(ShardedResponseGenerator, group.rank(), ips)
-    response_generator = response_generator_class(model_provider, LRUPromptCache())
-
+    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
+    else:
+        response_generator.join()
+
+    # response_generator_class = ResponseGenerator
+    # if group.size() > 1:
+    #    ips = get_peer_ips(port)
+    #    response_generator_class = partial(ShardedResponseGenerator, group.rank(), ips)
+    # response_generator = response_generator_class(model_provider, LRUPromptCache())
+
+    # if group.rank() == 0:
+    #    _run_http_server(host, port, response_generator)
 
 
 def main():
