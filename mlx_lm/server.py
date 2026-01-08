@@ -35,7 +35,9 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import BatchGenerator, stream_generate
 from .models.cache import (
+    ArraysCache,
     KVCache,
+    MambaCache,
     RotatingKVCache,
     can_trim_prompt_cache,
     make_prompt_cache,
@@ -541,7 +543,7 @@ class ResponseGenerator:
         ):
             return False
         for c in self.model_provider.cache_types:
-            if c not in (KVCache, RotatingKVCache):
+            if c not in (KVCache, RotatingKVCache, ArraysCache, MambaCache):
                 return False
         if args.seed is not None:
             return False
