@@ -908,18 +908,12 @@ def _make_cache(model, left_padding):
 def _merge_caches(caches):
     batch_cache = []
     for i in range(len(caches[0])):
-        cache = None
-        if isinstance(caches[0][i], KVCache):
-            cache = BatchKVCache.merge([c[i] for c in caches])
-        elif isinstance(caches[0][i], RotatingKVCache):
-            cache = BatchRotatingKVCache.merge([c[i] for c in caches])
-        elif isinstance(caches[0][i], ArraysCache):
-            cache = ArraysCache.merge([c[i] for c in caches])
+        if hasattr(caches[0][i], "merge"):
+            batch_cache.append(caches[0][i].merge([c[i] for c in caches]))
         else:
             raise ValueError(
                 f"{type(caches[0][i])} does not yet support batching with history"
             )
-        batch_cache.append(cache)
     return batch_cache
 
 

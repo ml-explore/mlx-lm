@@ -172,6 +172,10 @@ class _BaseCache:
         obj.meta_state = meta_state
         return obj
 
+    @classmethod
+    def merge(_, caches):
+        return BatchKVCache.merge(caches)
+
 
 class ConcatenateKVCache(_BaseCache):
     """ConcatenateKVCache the simplest KV cache implementation.
@@ -546,6 +550,10 @@ class RotatingKVCache(_BaseCache):
                 mask = mx.roll(mask, shift=idx + 1)
                 return mask
 
+    @classmethod
+    def merge(_, caches):
+        return BatchRotatingKVCache.merge(caches)
+
 
 class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -720,6 +728,18 @@ class CacheList(_BaseCache):
         """
         for c, o in zip(self.caches, other.caches):
             c.extend(o)
+
+    @classmethod
+    def merge(cls, caches):
+        cache = cls()
+        cache.caches = tuple(
+            caches[0].caches[i].merge([c.caches[i] for c in caches])
+            for i in range(len(caches[0].caches))
+        )
+        return cache
+
+    def extract(self, idx):
+        return CacheList(*(c.extract(idx) for c in self.caches))
 
 
 def dynamic_roll(x, shifts, axis):
