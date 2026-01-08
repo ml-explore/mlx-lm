@@ -160,11 +160,12 @@ def ssm_attn(
         y = mx.swapaxes(y, 1, 2)
 
         if lengths is not None:
-            decay = mx.slice(
-                decay, mx.minimum(lengths, step) - 1, axes=(2,), slice_size=(b, h, 1, l)
-            )
+            pos = mx.maximum(mx.minimum(lengths, step) - 1, 0)
+            pos = mx.expand_dims(pos, (1, 2, 3))
+            decay = mx.take_along_axis(decay, pos, axis=2)
         else:
             decay = decay[:, :, -1:, :]
+
         decay = decay.transpose(0, 3, 1, 2)
         B = mx.repeat(B, h // g, axis=1).swapaxes(2, 3)
         dtxdecay = dtx * decay
@@ -175,10 +176,16 @@ def ssm_attn(
         if state is not None:
             exp_dtA_cumsum = mx.exp(mx.cumsum(dtA, axis=-2))
             next_state += exp_dtA_cumsum[:, -1, :, None, None] * state
-            state = state.reshape((b, 1, g, repeats, dh, d))
             C = C.reshape(b, s, g, 1, d, 1)
-            y_prev = (state @ C).squeeze(-1).flatten(2, 3)
+            y_prev = (
+                (state.reshape((b, 1, g, repeats, dh, d)) @ C).squeeze(-1).flatten(2, 3)
+            )
             y += exp_dtA_cumsum[..., None] * y_prev
+        if lengths is not None and state is not None:
+            next_state = mx.where(
+                mx.expand_dims(lengths < 0, (1, 2, 3)), state, next_state
+            )
+
         return y, next_state
 
     ys = []

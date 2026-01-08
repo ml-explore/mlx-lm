@@ -107,13 +107,10 @@ class Mamba2Block(nn.Module):
             padded_input = mx.concatenate([conv_state, conv_input], axis=1)
             n_keep = self.conv_kernel_size - 1
             if cache.lengths is not None:
-                t, d = padded_input.shape[1:]
-                cache[0] = mx.slice(
-                    padded_input,
-                    mx.minimum(cache.lengths, t) - n_keep,
-                    axes=(1,),
-                    slice_size=(b, n_keep, d),
-                )
+                t = padded_input.shape[1]
+                ends = mx.maximum(mx.minimum(cache.lengths, t - n_keep), 0)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(padded_input, positions, axis=1)
             else:
                 cache[0] = padded_input[:, -n_keep:, :]
         else:

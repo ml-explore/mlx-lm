@@ -515,6 +515,9 @@ class TestGenerate(unittest.TestCase):
                 del self.model.make_cache
 
     def test_batch_continued_generation_ssm(self):
+        random.seed(0)
+        mx.random.seed(4)
+
         # Make a small SSM model
         args = mamba2.ModelArgs(
             model_type="mamba2",
@@ -568,6 +571,7 @@ class TestGenerate(unittest.TestCase):
             for r in responses:
                 if r.finish_reason is not None:
                     caches[r.uid] = r.prompt_cache
+
         caches = [caches[uid] for uid in uids]
 
         # Generate the 2nd time

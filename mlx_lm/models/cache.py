@@ -598,14 +598,9 @@ class ArraysCache(_BaseCache):
             self.left_padding -= N
 
     def make_mask(self, N: int):
-        has_left_pad = self.left_padding is not None
-        has_lengths = self.lengths is not None
-        if has_left_pad or has_lengths:
+        if self.left_padding is not None:
             pos = mx.arange(N)
-            if has_left_pad:
-                return pos >= self.left_padding[:, None]
-            elif has_lengths:
-                return pos < self.lengths[:, None]
+            return pos >= self.left_padding[:, None]
         else:
             return None
 

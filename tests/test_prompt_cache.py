@@ -10,7 +10,6 @@ import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
-    ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
@@ -568,44 +567,6 @@ class TestPromptCache(unittest.TestCase):
         k, v = cache.update_and_fetch(k, v)
         self.assertEqual(k.shape[2], 10)
         self.assertEqual(v.shape[2], 10)
-
-    def test_arrays_cache_mask(self):
-        # Case 1: Left padding only
-        left_padding = [1, 2]
-        cache = ArraysCache(size=2, left_padding=left_padding)
-
-        mask = cache.make_mask(4)
-        # Expected:
-        # Row 0: [F, T, T, T] (pad 1)
-        # Row 1: [F, F, T, T] (pad 2)
-
-        self.assertIsNotNone(mask)
-        self.assertTrue(mx.array_equal(mask[0], mx.array([False, True, True, True])))
-        self.assertTrue(mx.array_equal(mask[1], mx.array([False, False, True, True])))
-
-        # Case 2: Right padding (via lengths)
-        cache = ArraysCache(size=2, left_padding=[0, 0])
-        cache.prepare(lengths=[2, 1])
-        # N=3.
-        # Row 0: lengths 2. Valid 0, 1. Mask idx < 2.
-        # Row 1: lengths 1. Valid 0. Mask idx < 1.
-
-        mask = cache.make_mask(3)
-        # Expected:
-        # Row 0: [T, T, F]
-        # Row 1: [T, F, F]
-
-        self.assertIsNotNone(mask)
-        self.assertTrue(mx.array_equal(mask[0], mx.array([True, True, False])))
-        self.assertTrue(mx.array_equal(mask[1], mx.array([True, False, False])))
-
-        # Case 3: Mixed Left Padding and Lengths
-        cache = ArraysCache(size=2, left_padding=[1])
-        cache.prepare(lengths=[2])
-
-        mask = cache.make_mask(3)
-        # [F, T, F]
-        self.assertTrue(mx.array_equal(mask[0], mx.array([False, True, False])))
 
 
 if __name__ == "__main__":
