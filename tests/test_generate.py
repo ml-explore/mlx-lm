@@ -473,7 +473,7 @@ class TestGenerate(unittest.TestCase):
                 self.model,
                 stop_tokens=self.tokenizer.eos_token_ids,
                 max_tokens=10,
-                prefill_batch_size=1,
+                prefill_batch_size=4,
                 prefill_step_size=8,
                 completion_batch_size=2,
             )
