@@ -149,13 +149,14 @@ class ShortConv(nn.Module):
                 state = cache[0]
             Bx = mx.concatenate([state, Bx], axis=1)
             n_keep = self.L_cache - 1
+            t = x.shape[1]
             if cache.lengths is not None:
-                t = Bx.shape[1]
-                ends = mx.clip(cache.lengths, 0, t - n_keep)
+                ends = mx.clip(cache.lengths, 0, t)
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
                 cache[0] = mx.take_along_axis(Bx, positions, axis=1)
             else:
                 cache[0] = Bx[:, -n_keep:, :]
+            cache.advance(t)
         else:
             Bx = mx.pad(Bx, [(0, 0), (self.L_cache - 1, 0), (0, 0)])
 
