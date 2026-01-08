@@ -856,7 +856,17 @@ class ResponseGenerator:
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
                     with mx.stream(generation_stream):
-                        batch_generator.remove(uids_to_remove)
+                        caches = batch_generator.remove(
+                            uids_to_remove, return_prompt_caches=True
+                        )
+                        for uid, prompt_cache in caches.items():
+                            if uid not in batch_results:
+                                continue
+                            result = batch_results[uid]
+                            self.prompt_cache.insert_cache(
+                                current_model_key, result["cache_key"], prompt_cache
+                            )
+                            del batch_results[uid]
 
     def _serve_single(self, request):
         rqueue, request, args = request

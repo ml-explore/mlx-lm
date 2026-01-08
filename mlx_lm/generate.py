@@ -1014,10 +1014,16 @@ class BatchGenerator:
         )
         return uids
 
-    def remove(self, uids: List[int]):
+    def remove(self, uids: List[int], return_prompt_caches: bool = False):
+        caches = {}
         uids = set(uids)
         if self.active_batch is not None:
             batch = self.active_batch
+            if return_prompt_caches:
+                for e, uid in enumerate(batch.uids):
+                    if uid not in uids:
+                        continue
+                    caches[uid] = batch.extract_cache(e)
             keep_idx = [e for e, uid in enumerate(batch.uids) if uid not in uids]
             if len(keep_idx) > 0:
                 batch.filter(keep_idx)
@@ -1027,6 +1033,9 @@ class BatchGenerator:
         for i in reversed(range(len(self.unprocessed_prompts))):
             if self.unprocessed_prompts[i][0] in uids:
                 self.unprocessed_prompts.pop(i)
+
+        if return_prompt_caches:
+            return caches
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
