@@ -156,14 +156,8 @@ async def make_request(
 
                         try:
                             data = json.loads(data_str)
-                            if "choices" in data and data["choices"]:
-                                delta = data["choices"][0].get("delta", {})
-                                content = (
-                                    delta["content"]
-                                    if "content" in delta
-                                    else delta.get("reasoning_content", "")
-                                )
-                                if content:
+                            if choices := data.get("choices", False):
+                                if choices[0].get("finish_reason") != "length":
                                     tokens.append(time.perf_counter())
                         except json.JSONDecodeError:
                             continue
