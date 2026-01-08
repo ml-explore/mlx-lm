@@ -418,15 +418,12 @@ class TimeBudget:
             self._time_spent += time.time() - self._start
             if self._loops % self._sync_frequency == 0:
                 with mx.stream(generation_stream):
-                    loop_time = mx.distributed.all_sum(self._time_spent)
-                    avg_loop_time = loop_time / (
-                        mx.distributed.init().size() * self._sync_frequency
-                    )
-                    factor = self._budget / avg_loop_time
-                    new_iterations = (
-                        (self._iterations * factor).round().astype(mx.int32).item()
-                    )
-                self._iterations = max(new_iterations, 1)
+                    loop_time = mx.distributed.all_sum(self._time_spent).item()
+                avg_loop_time = loop_time / (
+                    mx.distributed.init().size() * self._sync_frequency
+                )
+                factor = self._budget / avg_loop_time
+                self._iterations = max(round(self._iterations * factor), 1)
                 self._loops = 0
                 self._time_spent = 0
             raise StopIteration()
@@ -597,21 +594,20 @@ class ResponseGenerator:
 
         return self._share_request(request)
 
-    def _share_request(self, request):
+    def _share_object(self, obj):
         if not self._is_distributed:
-            return request
+            return obj
 
         with mx.stream(generation_stream):
             if self._rank == 0:
-                if request is None:
+                if obj is None:
                     mx.eval(mx.distributed.all_sum(0))
                     return None
                 else:
-                    _, *shareable = request
-                    data = mx.array(pickle.dumps(shareable))
+                    data = mx.array(pickle.dumps(obj))
                     mx.eval(mx.distributed.all_sum(data.size))
                     mx.eval(mx.distributed.all_sum(data))
-                    return request
+                    return obj
             else:
                 size = mx.distributed.all_sum(0).item()
                 if size == 0:
@@ -619,26 +615,19 @@ class ResponseGenerator:
                 else:
                     data = mx.zeros(size, dtype=mx.uint8)
                     data = mx.distributed.all_sum(data)
-                    shareable = pickle.loads(data)
-                    return Queue(), *shareable
+                    return pickle.loads(data)
 
-    def _share_int_list(self, x):
+    def _share_request(self, request):
         if not self._is_distributed:
-            return x
+            return request
 
-        with mx.stream(generation_stream):
-            if self._rank == 0:
-                mx.eval(mx.distributed.all_sum(len(x)))
-                if x:
-                    mx.eval(mx.distributed.all_sum(mx.array(x)))
-                return x
-            else:
-                size = mx.distributed.all_sum(0).item()
-                if size == 0:
-                    return []
-                else:
-                    x = mx.zeros(size, dtype=mx.int32)
-                    return mx.distributed.all_sum(x).tolist()
+        shareable = request[1:] if request is not None else None
+        shareable = self._share_object(shareable)
+        if shareable is None:
+            return None
+
+        rq = request[0] if request is not None else Queue()
+        return rq, *shareable
 
     def _tokenize(self, tokenizer, request):
         if request.request_type == "chat":
@@ -864,9 +853,10 @@ class ResponseGenerator:
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
-                uids_to_remove = self._share_int_list(uids_to_remove)
+                uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
-                    batch_generator.remove(uids_to_remove)
+                    with mx.stream(generation_stream):
+                        batch_generator.remove(uids_to_remove)
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -1652,66 +1642,6 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-class ProxyHandler(BaseRequestHandler):
-    def __init__(self, upstreams, *args, **kwargs):
-        self.upstreams = upstreams
-        super().__init__(*args, **kwargs)
-
-    def handle(self):
-        self.request.setblocking(False)
-        upstreams = [socket.create_connection(u) for u in self.upstreams]
-        for u in upstreams:
-            u.setblocking(False)
-
-        to_read = upstreams + [self.request]
-        to_write = upstreams + [self.request]
-        up_buffers = [b"" for u in upstreams]
-        down_buffer = b""
-        while len(to_read) > 1 or down_buffer or any(up_buffers):
-            rs, ws, _ = select.select(to_read, to_write, [])
-            for r in rs:
-                if r == self.request:
-                    data = self.request.recv(8192)
-                    if data:
-                        for i in range(len(up_buffers)):
-                            up_buffers[i] += data
-                    else:
-                        to_read.remove(self.request)
-                elif r == upstreams[0]:
-                    data = upstreams[0].recv(8192)
-                    if data:
-                        down_buffer += data
-                    else:
-                        to_read.remove(upstreams[0])
-                else:
-                    data = r.recv(8192)
-                    if not data:
-                        to_read.remove(r)
-            for w in ws:
-                if w == self.request:
-                    if len(down_buffer) > 0:
-                        sent = self.request.send(down_buffer)
-                        down_buffer = down_buffer[sent:]
-                else:
-                    idx = to_write.index(w)
-                    if len(up_buffers[idx]) > 0:
-                        sent = w.send(up_buffers[idx])
-                        up_buffers[idx] = up_buffers[idx][sent:]
-
-
-def get_peer_ips(port):
-    our_ip = subprocess.run(
-        ["ipconfig", "getifaddr", "en0"], capture_output=True, text=True
-    ).stdout.strip()
-    our_ip += " " * (15 - len(our_ip))
-    our_ip = our_ip[:15].encode()
-    all_ips = mx.distributed.all_gather(mx.array(our_ip)[None])
-    all_ips = [bytes(ip).decode().strip() for ip in all_ips]
-    all_ips = [(ip, port + i) for i, ip in enumerate(all_ips)]
-
-    return all_ips
-
-
 def _run_http_server(
     host: str,
     port: int,
@@ -1758,15 +1688,6 @@ def run(
         _run_http_server(host, port, response_generator)
     else:
         response_generator.join()
-
-    # response_generator_class = ResponseGenerator
-    # if group.size() > 1:
-    #    ips = get_peer_ips(port)
-    #    response_generator_class = partial(ShardedResponseGenerator, group.rank(), ips)
-    # response_generator = response_generator_class(model_provider, LRUPromptCache())
-
-    # if group.rank() == 0:
-    #    _run_http_server(host, port, response_generator)
 
 
 def main():
