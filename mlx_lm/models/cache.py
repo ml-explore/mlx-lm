@@ -601,6 +601,9 @@ class ArraysCache(_BaseCache):
         if self.left_padding is not None:
             pos = mx.arange(N)
             return pos >= self.left_padding[:, None]
+        elif self.lengths is not None:
+            pos = mx.arange(N)
+            return pos < self.lengths[:, None]
         else:
             return None
 

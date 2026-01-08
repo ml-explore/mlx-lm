@@ -259,18 +259,30 @@ class ShortConv1d(nn.Module):
         )
 
     def __call__(
-        self, x: mx.array, cache: Optional[mx.array]
+        self,
+        x: mx.array,
+        state: Optional[mx.array],
+        mask: Optional[mx.array],
+        lengths: Optional[mx.array],
     ) -> Tuple[mx.array, mx.array]:
-        if cache is None:
-            pad = mx.zeros(
+        if mask is not None:
+            x = mx.where(mask[..., None], x, 0)
+
+        if state is None:
+            state = mx.zeros(
                 (x.shape[0], self.kernel_size - 1, x.shape[-1]), dtype=x.dtype
             )
-        else:
-            pad = cache
-        conv_input = mx.concatenate([pad, x], axis=1)
+        conv_input = mx.concatenate([state, x], axis=1)
         out = nn.silu(self.conv(conv_input))
-        new_cache = conv_input[:, -self.kernel_size + 1 :, :]
-        return out, new_cache
+        n_keep = self.kernel_size - 1
+        if lengths is not None:
+            ends = mx.clip(cache.lengths, 0, x.shape[1])
+            positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+            new_state = mx.take_along_axis(conv_input, positions, axis=1)
+        else:
+            new_state = conv_input[:, -n_keep:, :]
+
+        return out, new_state
 
 
 class KimiDeltaAttention(nn.Module):
@@ -323,9 +335,11 @@ class KimiDeltaAttention(nn.Module):
 
         if cache is not None:
             conv_state, ssm_state = cache
+            lengths = cache.lengths
         else:
             conv_state = None
             ssm_state = None
+            lengths = None
 
         if conv_state is None:
             s = mx.zeros((B, self.conv_kernel - 1, self.projection_dim), dtype=dtype)
@@ -335,9 +349,9 @@ class KimiDeltaAttention(nn.Module):
         else:
             q_state, k_state, v_state = conv_state
 
-        q_conv, q_state = self.q_conv(self.q_proj(x), q_state)
-        k_conv, k_state = self.k_conv(self.k_proj(x), k_state)
-        v_conv, v_state = self.v_conv(self.v_proj(x), v_state)
+        q_conv, q_state = self.q_conv(self.q_proj(x), q_state, mask, lengths)
+        k_conv, k_state = self.k_conv(self.k_proj(x), k_state, mask, lengths)
+        v_conv, v_state = self.v_conv(self.v_proj(x), v_state, mask, lengths)
 
         if cache is not None:
             cache[0] = (q_state, k_state, v_state)
@@ -374,6 +388,7 @@ class KimiDeltaAttention(nn.Module):
 
         if cache is not None:
             cache[1] = ssm_state
+            cache.advance(T)
 
         gate = self.g_b_proj(self.g_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim

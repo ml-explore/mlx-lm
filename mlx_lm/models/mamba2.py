@@ -93,9 +93,15 @@ class Mamba2Block(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.use_bias
         )
 
-    def _apply_conv(
-        self, conv_input: mx.array, cache: Optional[MambaCache] = None
+    def _conv(
+        self,
+        conv_input: mx.array,
+        cache: Optional[MambaCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
+
         if cache is not None:
             if cache[0] is None:
                 conv_state = mx.zeros(
@@ -108,7 +114,7 @@ class Mamba2Block(nn.Module):
             n_keep = self.conv_kernel_size - 1
             if cache.lengths is not None:
                 t = padded_input.shape[1]
-                ends = mx.maximum(mx.minimum(cache.lengths, t - n_keep), 0)
+                ends = mx.clip(cache.lengths, 0, t - n_keep)
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
                 cache[0] = mx.take_along_axis(padded_input, positions, axis=1)
             else:
@@ -127,8 +133,8 @@ class Mamba2Block(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache] = None,
-        mask: Optional[mx.array] = None,
+        cache: Optional[MambaCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
         hidden_states = hidden_states.reshape(
@@ -170,9 +176,7 @@ class Mamba2Block(nn.Module):
             [self.intermediate_size, self.intermediate_size + self.conv_dim],
             axis=-1,
         )
-        if mask is not None:
-            conv_input = mx.where(mask[..., None], conv_input, 0)
-        conv_output = self._apply_conv(conv_input, cache)
+        conv_output = self._conv(conv_input, cache, mask)
         hidden_states, B, C = mx.split(
             conv_output,
             [

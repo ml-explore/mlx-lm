@@ -1998,6 +1998,31 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
             },
             {
+                "model_type": "qwen3_next",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "vocab_size": 1000,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 4,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 3,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "shared_expert_intermediate_size": 128,
+                "mlp_only_layers": [0],
+                "moe_intermediate_size": 128,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 64,
+                "rope_theta": 1000.0,
+                "partial_rotary_factor": 0.5,
+                "max_position_embeddings": 1000,
+            },
+            {
                 "model_type": "kimi_linear",
                 "vocab_size": 1000,
                 "hidden_size": 128,
@@ -2312,23 +2337,26 @@ class TestModels(unittest.TestCase):
         k = mx.random.normal(shape=(B, T, Hk, Dk))
         v = mx.random.normal(shape=(B, T, Hv, Dv))
         g = mx.random.normal(shape=(B, T, Hv))
-        mask = mx.array([[False, True, True]])
         beta = mx.random.normal(shape=(B, T, Hv))
         state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
-        y_gt, st_gt = gated_delta_ops(
-            q[:, 1:],
-            k[:, 1:],
-            v[:, 1:],
-            g[:, 1:],
-            beta[:, 1:],
-            state,
-        )
-        for fn in [gated_delta_ops, gated_delta_kernel]:
-            y, st = fn(q, k, v, g, beta, state, mask)
-            y = y[:, 1:]
-            self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
-            self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+        for s, e, mask in [
+            (1, 3, mx.array([[False, True, True]])),
+            (0, 2, mx.array([[True, True, False]])),
+        ]:
+            y_gt, st_gt = gated_delta_ops(
+                q[:, s:e],
+                k[:, s:e],
+                v[:, s:e],
+                g[:, s:e],
+                beta[:, s:e],
+                state,
+            )
+            for fn in [gated_delta_ops, gated_delta_kernel]:
+                y, st = fn(q, k, v, g, beta, state, mask)
+                y = y[:, s:e]
+                self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":

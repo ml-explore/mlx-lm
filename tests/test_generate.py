@@ -14,7 +14,6 @@ from mlx_lm.generate import (
     generate_step,
     stream_generate,
 )
-from mlx_lm.models import mamba2
 from mlx_lm.models.cache import RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
@@ -514,31 +513,7 @@ class TestGenerate(unittest.TestCase):
             if rotating:
                 del self.model.make_cache
 
-    def test_batch_continued_generation_ssm(self):
-        random.seed(0)
-        mx.random.seed(4)
-
-        # Make a small SSM model
-        args = mamba2.ModelArgs(
-            model_type="mamba2",
-            num_heads=8,
-            head_dim=16,
-            vocab_size=1000,
-            hidden_size=128,
-            intermediate_size=128,
-            state_size=32,
-            num_hidden_layers=4,
-            layer_norm_epsilon=1e-4,
-            conv_kernel=3,
-            n_groups=4,
-            use_bias=False,
-            use_conv_bias=False,
-            tie_word_embeddings=True,
-            time_step_limit=(0.01, 10),
-            time_step_rank="auto",
-        )
-        model = mamba2.Model(args)
-
+    def _continued_generation_test_helper(self, model):
         def rand_prompt(n):
             return [random.randint(0, 1000) for _ in range(n)]
 
@@ -562,9 +537,10 @@ class TestGenerate(unittest.TestCase):
             stop_tokens={},
             max_tokens=10,
             prefill_batch_size=4,
-            prefill_step_size=4,
+            prefill_step_size=32,
             completion_batch_size=2,
         )
+
         uids = batch_gen.insert(prompts_a)
         caches = {uid: None for uid in uids}
         while responses := batch_gen.next():
@@ -594,6 +570,67 @@ class TestGenerate(unittest.TestCase):
                 self.assertTrue(
                     mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
                 )
+
+    def test_batch_continued_generation_ssm(self):
+        from mlx_lm.models import mamba2
+
+        random.seed(0)
+        mx.random.seed(4)
+
+        # Make a small SSM model
+        args = mamba2.ModelArgs(
+            model_type="mamba2",
+            num_heads=8,
+            head_dim=16,
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=128,
+            state_size=32,
+            num_hidden_layers=4,
+            layer_norm_epsilon=1e-4,
+            conv_kernel=3,
+            n_groups=4,
+            use_bias=False,
+            use_conv_bias=False,
+            tie_word_embeddings=True,
+            time_step_limit=(0.01, 10),
+            time_step_rank="auto",
+        )
+        model = mamba2.Model(args)
+        self._continued_generation_test_helper(model)
+
+    def test_batch_continued_generation_gated_delta(self):
+        from mlx_lm.models import qwen3_next
+
+        random.seed(0)
+        mx.random.seed(4)
+        args = qwen3_next.ModelArgs(
+            model_type="qwen3_next",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            vocab_size=1000,
+            linear_num_value_heads=4,
+            linear_num_key_heads=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=3,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            shared_expert_intermediate_size=128,
+            mlp_only_layers=[0],
+            moe_intermediate_size=128,
+            rms_norm_eps=1e-5,
+            head_dim=64,
+            rope_theta=1000.0,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1000,
+        )
+        model = qwen3_next.Model(args)
+        self._continued_generation_test_helper(model)
 
 
 if __name__ == "__main__":

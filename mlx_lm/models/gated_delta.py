@@ -161,11 +161,9 @@ def _gated_delta_step_ops(
     state = state + k[..., None, :] * delta[..., None]
     # Output projection along key dim with q
     y = (state * q[..., None, :]).sum(axis=-1)  # [B, H, Dv]
+
     if mask is not None:
-        if mask.ndim == 2:
-            mask = mx.expand_dims(mask, axes=(2, 3))
-        elif mask.ndim == 3:
-            mask = mx.expand_dims(mask, axis=-1)
+        mask = mx.expand_dims(mask, axis=(1, 2, 3))
         state = mx.where(mask, state, old_state)
     return y, state
 
