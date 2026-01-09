@@ -1,5 +1,6 @@
 import importlib
 import json
+import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
@@ -292,9 +293,9 @@ class TokenizerWrapper:
 
         # Fallback to defaults if no tool call tokens are provided
         if tool_call_start and tool_call_start not in vocab:
-            raise ValueError("Tool call start token not in vocab")
+            warnings.warn("Tool call start token not in vocab")
         if tool_call_end and tool_call_end not in vocab:
-            raise ValueError("Tool call end token not in vocab")
+            warnings.warn("Tool call end token not in vocab")
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
