@@ -526,7 +526,7 @@ class ResponseGenerator:
                 process_message_content(messages)
                 return tokenizer.apply_chat_template(
                     messages,
-                    tools,
+                    tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
                     **self.model_provider.cli_args.chat_template_args,
