@@ -524,6 +524,13 @@ class ResponseGenerator:
 
             if tokenizer.has_chat_template:
                 process_message_content(messages)
+                if tools and not tokenizer.has_tool_calling:
+                    logging.warning(
+                        "Received tools but model does not support tool calling. "
+                        "If you think this is an error, file an issue here: "
+                        "https://github.com/ml-explore/mlx-lm/issues"
+                    )
+
                 return tokenizer.apply_chat_template(
                     messages,
                     tools,
