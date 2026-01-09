@@ -172,10 +172,6 @@ class _BaseCache:
         obj.meta_state = meta_state
         return obj
 
-    @classmethod
-    def merge(_, caches):
-        return BatchKVCache.merge(caches)
-
 
 class ConcatenateKVCache(_BaseCache):
     """ConcatenateKVCache the simplest KV cache implementation.
@@ -378,6 +374,10 @@ class KVCache(_BaseCache):
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    @classmethod
+    def merge(_, caches):
+        return BatchKVCache.merge(caches)
 
 
 class RotatingKVCache(_BaseCache):
@@ -635,9 +635,13 @@ class MambaCache(ArraysCache):
         super().__init__(size=2, left_padding=left_padding)
 
 
-class ChunkedKVCache(KVCache):
+class ChunkedKVCache(_BaseCache):
+    step = 256
+
     def __init__(self, chunk_size):
-        super().__init__()
+        self.keys = None
+        self.values = None
+        self.offset = 0
         self.chunk_size = chunk_size
         self.start_position = 0
 
@@ -672,6 +676,24 @@ class ChunkedKVCache(KVCache):
         self.keys[..., prev:end, :] = keys
         self.values[..., prev:end, :] = values
         return self.keys[..., :end, :], self.values[..., :end, :]
+
+    @property
+    def state(self):
+        if self.offset == self.keys.shape[2]:
+            return self.keys, self.values
+        else:
+            return (
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self.offset = self.keys.shape[2]
+
+    def is_trimmable(self):
+        return True
 
     def trim(self, n):
         n = min(self.offset - self.start_position, n)
