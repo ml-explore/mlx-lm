@@ -362,12 +362,17 @@ def load_model(
             _quantize(quantization)
 
     if config.get("quantize_activations", False):
+
         def _maybe_qq(m):
             if isinstance(m, nn.QuantizedLinear):
                 if m.mode not in ("nvfp4", "mxfp8"):
-                    raise ValueError('Mode ({m.mode}) does not support activation quantization')
+                    raise ValueError(
+                        "Mode ({m.mode}) does not support activation quantization"
+                    )
                 if m.get("bias", False):
-                    raise ValueError('Linear layer with bias does not support activation quantization')
+                    raise ValueError(
+                        "Linear layer with bias does not support activation quantization"
+                    )
                 out_dims, in_dims = m.weight.shape
                 in_dims *= 32 // m.bits
                 return nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
