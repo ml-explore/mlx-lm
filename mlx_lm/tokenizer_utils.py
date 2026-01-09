@@ -1,12 +1,11 @@
 import importlib
 import json
+import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
-
-from .tool_parsers.json_tools import parse_tool_call as default_tool_parser
 
 
 class StreamingDetokenizer:
@@ -276,7 +275,7 @@ class TokenizerWrapper:
         self.has_chat_template = (
             tokenizer.chat_template is not None or chat_template is not None
         )
-        self._tool_parser = tool_parser or default_tool_parser
+        self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
 
@@ -290,11 +289,13 @@ class TokenizerWrapper:
                 self._think_end_id = vocab[think_end]
                 break
 
-        # Fallback to defaults if no tool call tokens are provided
-        if tool_call_start and tool_call_start not in vocab:
-            raise ValueError("Tool call start token not in vocab")
-        if tool_call_end and tool_call_end not in vocab:
-            raise ValueError("Tool call end token not in vocab")
+        # Disable tool calling if tool call tokens aren't in vocab
+        if (tool_call_start and tool_call_start not in vocab) or (
+            tool_call_end and tool_call_end not in vocab
+        ):
+            self._tool_call_start = None
+            self._tool_call_end = None
+            self._tool_parser = None
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
