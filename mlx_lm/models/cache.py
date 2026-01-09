@@ -375,6 +375,10 @@ class KVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
+    @classmethod
+    def merge(_, caches):
+        return BatchKVCache.merge(caches)
+
 
 class RotatingKVCache(_BaseCache):
     step = 256
@@ -546,6 +550,10 @@ class RotatingKVCache(_BaseCache):
                 mask = mx.roll(mask, shift=idx + 1)
                 return mask
 
+    @classmethod
+    def merge(_, caches):
+        return BatchRotatingKVCache.merge(caches)
+
 
 class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -627,9 +635,13 @@ class MambaCache(ArraysCache):
         super().__init__(size=2, left_padding=left_padding)
 
 
-class ChunkedKVCache(KVCache):
+class ChunkedKVCache(_BaseCache):
+    step = 256
+
     def __init__(self, chunk_size):
-        super().__init__()
+        self.keys = None
+        self.values = None
+        self.offset = 0
         self.chunk_size = chunk_size
         self.start_position = 0
 
@@ -664,6 +676,24 @@ class ChunkedKVCache(KVCache):
         self.keys[..., prev:end, :] = keys
         self.values[..., prev:end, :] = values
         return self.keys[..., :end, :], self.values[..., :end, :]
+
+    @property
+    def state(self):
+        if self.offset == self.keys.shape[2]:
+            return self.keys, self.values
+        else:
+            return (
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self.offset = self.keys.shape[2]
+
+    def is_trimmable(self):
+        return True
 
     def trim(self, n):
         n = min(self.offset - self.start_position, n)
@@ -720,6 +750,18 @@ class CacheList(_BaseCache):
         """
         for c, o in zip(self.caches, other.caches):
             c.extend(o)
+
+    @classmethod
+    def merge(cls, caches):
+        cache = cls()
+        cache.caches = tuple(
+            caches[0].caches[i].merge([c.caches[i] for c in caches])
+            for i in range(len(caches[0].caches))
+        )
+        return cache
+
+    def extract(self, idx):
+        return CacheList(*(c.extract(idx) for c in self.caches))
 
 
 def dynamic_roll(x, shifts, axis):

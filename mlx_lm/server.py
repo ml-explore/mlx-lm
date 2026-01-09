@@ -35,10 +35,6 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import BatchGenerator, stream_generate
 from .models.cache import (
-    ArraysCache,
-    KVCache,
-    MambaCache,
-    RotatingKVCache,
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
@@ -396,7 +392,7 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
-        self.cache_types = set()
+        self.is_batchable = False
 
         # Preload the default model if it is provided
         self.default_model_map = {}
@@ -468,13 +464,10 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
-        # Figure out the cache types and save them in a set for anybody that
-        # wants to make a decision based on those.
-        for c in make_prompt_cache(self.model):
-            self.cache_types.add(type(c))
-        if self.draft_model is not None:
-            for c in make_prompt_cache(self.draft_model):
-                self.cache_types.add(type(c))
+        if self.draft_model is None:
+            self.is_batchable = all(
+                hasattr(c, "merge") for c in make_prompt_cache(self.model)
+            )
 
         return self.model, self.tokenizer
 
@@ -544,14 +537,8 @@ class ResponseGenerator:
             return tokenizer.encode(request.prompt)
 
     def _is_batchable(self, args):
-        if (
-            args.model.draft != "default_model"
-            or self.model_provider.cli_args.draft_model is not None
-        ):
+        if not self.model_provider.is_batchable:
             return False
-        for c in self.model_provider.cache_types:
-            if c not in (KVCache, RotatingKVCache, ArraysCache, MambaCache):
-                return False
         if args.seed is not None:
             return False
 
