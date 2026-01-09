@@ -167,7 +167,7 @@ class IQuestLoopCoderModel(nn.Module):
         if cache is None:
             cache = [None] * (2 * len(self.layers))
 
-        offset = cache[0].offset if cache[0] is not None else 0
+        offset = len(cache[0]) if cache[0] is not None else 0
         mask = create_attention_mask(h, cache[0])
         window_mask = create_attention_mask(
             h, cache[len(self.layers)], window_size=self.loop_window_size
