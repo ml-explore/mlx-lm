@@ -844,6 +844,26 @@ class TestModels(unittest.TestCase):
             len(args.ffn_multipliers),
         )
 
+    def test_opt(self):
+        from mlx_lm.models import opt
+
+        args = opt.ModelArgs(
+            model_type="opt",
+            vocab_size=10_000,
+            hidden_size=1024,
+            ffn_dim=4096,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            max_position_embeddings=2048,
+            layer_norm_eps=1e-5,
+            word_embed_proj_dim=512,
+            do_layer_norm_before=False,
+        )
+        model = opt.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_internlm2(self):
         from mlx_lm.models import internlm2
 

@@ -56,7 +56,9 @@ class OPTAttention(nn.Module):
         dim = args.hidden_size
         self.n_heads = args.num_attention_heads
         self.head_dim = dim // self.n_heads
-        assert dim % self.n_heads == 0, "hidden_size must be divisible by num_attention_heads"
+        assert (
+            dim % self.n_heads == 0
+        ), "hidden_size must be divisible by num_attention_heads"
         self.scale = self.head_dim**-0.5
 
         # OPT uses biases in attention projections
@@ -73,15 +75,29 @@ class OPTAttention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(x)
+            .reshape(B, L, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(x)
+            .reshape(B, L, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(x)
+            .reshape(B, L, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         if cache is not None:
             # mlx-lm cache API pattern :contentReference[oaicite:1]{index=1}
             k, v = cache.update_and_fetch(k, v)
 
-        out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask)
+        out = scaled_dot_product_attention(
+            q, k, v, cache=cache, scale=self.scale, mask=mask
+        )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, D)
         return self.out_proj(out)
 
@@ -92,10 +108,11 @@ class OPTMLP(nn.Module):
         dim = args.hidden_size
         self.fc1 = nn.Linear(dim, args.ffn_dim, bias=True)
         self.fc2 = nn.Linear(args.ffn_dim, dim, bias=True)
-        self.act = _act(args.activation_function)
+        # Store activation name for pickling, not function reference
+        self.activation_function = args.activation_function
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(self.act(self.fc1(x)))
+        return self.fc2(_act(self.activation_function)(self.fc1(x)))
 
 
 class OPTDecoderLayer(nn.Module):
@@ -103,7 +120,9 @@ class OPTDecoderLayer(nn.Module):
         super().__init__()
         self.do_layer_norm_before = args.do_layer_norm_before
         self.self_attn = OPTAttention(args)
-        self.self_attn_layer_norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
+        self.self_attn_layer_norm = nn.LayerNorm(
+            args.hidden_size, eps=args.layer_norm_eps
+        )
         self.mlp = OPTMLP(args)
         self.final_layer_norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
 
@@ -142,7 +161,9 @@ class OPTDecoder(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, embed_dim)
 
         # HF OPT learned positional embeddings have +2 offset; weights are (max_pos + 2, hidden_size)
-        self.embed_positions = nn.Embedding(args.max_position_embeddings + 2, args.hidden_size)
+        self.embed_positions = nn.Embedding(
+            args.max_position_embeddings + 2, args.hidden_size
+        )
 
         # Always define these so checkpoints that include them load cleanly
         self.project_in = nn.Linear(embed_dim, args.hidden_size, bias=False)
@@ -153,7 +174,9 @@ class OPTDecoder(nn.Module):
         # HF OPT has decoder.final_layer_norm only when do_layer_norm_before=True
         # When do_layer_norm_before=False, there's no final layer norm
         if args.do_layer_norm_before and not args._remove_final_layer_norm:
-            self.final_layer_norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
+            self.final_layer_norm = nn.LayerNorm(
+                args.hidden_size, eps=args.layer_norm_eps
+            )
         else:
             self.final_layer_norm = None
 
@@ -196,7 +219,9 @@ class OPTDecoder(nn.Module):
             if am.shape[1] != k_len:
                 past = k_len - am.shape[1]
                 if past > 0:
-                    am = mx.concatenate([mx.ones((am.shape[0], past), mx.bool_), am], axis=1)
+                    am = mx.concatenate(
+                        [mx.ones((am.shape[0], past), mx.bool_), am], axis=1
+                    )
             mask = mask & am[:, None, None, :]
 
         if cache is None:
@@ -221,6 +246,7 @@ class Model(nn.Module):
     so HF safetensors with keys like `decoder.layers.0.self_attn.q_proj.weight`
     load without fights.
     """
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -242,7 +268,10 @@ class Model(nn.Module):
     ) -> mx.array:
         h = self.decoder(inputs, mask=mask, cache=cache, attention_mask=attention_mask)
         # Apply project_out if it exists to convert hidden_size -> embed_dim
-        if self.decoder.project_out is not None and self.args.word_embed_proj_dim != self.args.hidden_size:
+        if (
+            self.decoder.project_out is not None
+            and self.args.word_embed_proj_dim != self.args.hidden_size
+        ):
             h = self.decoder.project_out(h)
         return self.lm_head(h)
 
@@ -300,7 +329,7 @@ class Model(nn.Module):
                 # If word_embed_proj_dim != hidden_size, we need to account for project_out
                 # But typically for OPT, the tied weight is directly from embed_tokens
                 embed_weight = out["decoder.embed_tokens.weight"]
-                
+
                 # Check if we need to apply project_out
                 # project_out maps from hidden_size back to embed_dim
                 if "decoder.project_out.weight" in out:
