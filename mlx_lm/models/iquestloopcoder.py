@@ -167,7 +167,6 @@ class IQuestLoopCoderModel(nn.Module):
         if cache is None:
             cache = [None] * (2 * len(self.layers))
 
-        offset = cache[0].offset if cache[0] is not None else 0
         mask = create_attention_mask(h, cache[0])
         window_mask = create_attention_mask(
             h, cache[len(self.layers)], window_size=self.loop_window_size
@@ -176,6 +175,7 @@ class IQuestLoopCoderModel(nn.Module):
         loop1_kv = []
         for layer, c in zip(self.layers, cache):
             h_norm = layer.input_layernorm(h)
+            offset = c.offset if c is not None else 0
             q1, k1, v1 = layer.self_attn.get_qkv(h_norm, offset)
 
             if c is not None:
@@ -192,6 +192,7 @@ class IQuestLoopCoderModel(nn.Module):
             self.layers, self.gate_projections, cache[len(self.layers) :], loop1_kv
         ):
             h_norm = layer.input_layernorm(h)
+            offset = c.offset if c is not None else 0
             q2, k2, v2 = layer.self_attn.get_qkv(h_norm, offset)
             gate = gate_proj(q2)
             attn_global = layer.self_attn.attention(q2, k1, v1, mask, cache=c)
