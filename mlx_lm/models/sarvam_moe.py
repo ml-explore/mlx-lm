@@ -671,6 +671,10 @@ class Model(SarvamMoEForCausalLM):
         for k in keys_to_remove:
             weights.pop(k, None)
 
+        # Add inv_freq if missing (it's often not in checkpoints but is a parameter in MLX RoPE)
+        if "model.rotary_emb.inv_freq" not in weights:
+            weights["model.rotary_emb.inv_freq"] = self.model.rotary_emb.inv_freq
+
         # Remove unused weights
         # Reference uses 'word_embeddings' but we use 'embed_tokens' in MLX standard
         # So we might need to map 'model.word_embeddings.weight' -> 'model.embed_tokens.weight'
