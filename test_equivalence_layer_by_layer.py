@@ -47,6 +47,94 @@ def copy_weights_norm(mlx_layer, pt_layer):
     if hasattr(pt_layer, "weight") and pt_layer.weight is not None:
         mlx_layer.weight = torch_to_mlx(pt_layer.weight)
 
+def test_norm():
+    print("\n--- Testing RMSNorm ---")
+    # PT: SarvamMoERMSNorm
+    # MLX: SarvamMoERMSNorm
+    
+    hidden_size = 64
+    eps = 1e-6
+    
+    pt_norm = nn.Module() # Mock container if needed, or just instantiate class
+    # SarvamMoE Transformers defines SarvamMoERMSNorm
+    from mlx_lm.models.sarvam_moe_transformers import SarvamMoERMSNorm as PTSarvamMoERMSNorm
+    from mlx_lm.models.sarvam_moe import SarvamMoERMSNorm
+    
+    pt_norm = PTSarvamMoERMSNorm(hidden_size, eps=eps).eval()
+    mlx_norm = SarvamMoERMSNorm(hidden_size, eps=eps)
+    
+    copy_weights_norm(mlx_norm, pt_norm)
+    
+    x_pt = torch.randn(1, 10, hidden_size)
+    x_mlx = torch_to_mlx(x_pt)
+    
+    with torch.no_grad():
+        out_pt = pt_norm(x_pt)
+    out_mlx = mlx_norm(x_mlx)
+    
+    check_close(out_mlx, out_pt, name="RMSNorm Output")
+
+    check_close(out_mlx, out_pt, name="RMSNorm Output")
+
+def test_rotary_embedding():
+    print("\n--- Testing Rotary Embedding ---")
+    # PT: SarvamMoERotaryEmbedding
+    # MLX: SarvamMoERotaryEmbedding
+    
+    hidden_size = 64
+    num_heads = 4
+    head_dim = 16
+    partial_rotary_factor = 1.0 # Test full first
+    rope_theta = 10000.0
+    
+    config = SarvamMoEConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
+        head_dim=head_dim,
+        partial_rotary_factor=partial_rotary_factor,
+        rope_theta=rope_theta
+    )
+    
+    args = ModelArgs(
+        model_type="sarvam_moe",
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads, # match
+        head_dim=head_dim,
+        partial_rotary_factor=partial_rotary_factor,
+        rope_theta=rope_theta,
+        vocab_size=1000,
+        intermediate_size=128,
+        num_hidden_layers=1,
+    )
+    
+    # PT
+    from mlx_lm.models.sarvam_moe_transformers import SarvamMoERotaryEmbedding as PTSarvamMoERotaryEmbedding
+    pt_rope_emb = PTSarvamMoERotaryEmbedding(config)
+    
+    # MLX
+    from mlx_lm.models.sarvam_moe import SarvamMoERotaryEmbedding
+    mlx_rope_emb = SarvamMoERotaryEmbedding(args)
+    
+    # Input
+    B, L = 1, 10
+    pos_ids = torch.arange(L).unsqueeze(0) # (1, L)
+    pos_ids_mlx = torch_to_mlx(pos_ids)
+    
+    x_dummy = torch.randn(B, L, hidden_size) # for device inference in PT
+    x_dummy_mlx = torch_to_mlx(x_dummy)
+    
+    # Forward
+    # PT forward(x, position_ids) -> cos, sin
+    with torch.no_grad():
+        cos_pt, sin_pt = pt_rope_emb(x_dummy, pos_ids)
+        
+    cos_mlx, sin_mlx = mlx_rope_emb(x_dummy_mlx, pos_ids_mlx)
+    
+    # Compare
+    check_close(cos_mlx, cos_pt, name="RoPE Cos Output")
+    check_close(sin_mlx, sin_pt, name="RoPE Sin Output")
+
 def test_attention():
     print("\n--- Testing Attention ---")
     config = SarvamMoEConfig(
@@ -124,9 +212,11 @@ def test_attention():
     cos_pt = emb.cos()[None, :, :] # (1, L, D_rope)
     sin_pt = emb.sin()[None, :, :] # (1, L, D_rope)
     
-    # MLX RoPE calculates internally if cache is None? No, self.rope(queries)
-    # MLX RoPE is standard.
-    # We rely on internal calculation. We assume MLX RoPE implementation matches standard.
+    # MLX
+    from mlx_lm.models.sarvam_moe import SarvamMoERotaryEmbedding
+    mlx_rope = SarvamMoERotaryEmbedding(args)
+    pos_ids_mlx = mx.arange(L)[None]
+    cos_mlx, sin_mlx = mlx_rope(x_mlx, pos_ids_mlx)
     
     # Forward PT
     with torch.no_grad():
@@ -134,9 +224,175 @@ def test_attention():
         out_pt, _, _ = pt_attn(x_pt, position_embeddings=(cos_pt, sin_pt))
 
     # Forward MLX
-    out_mlx = mlx_attn(x_mlx, mask=None) # Mask is None for unmasked attention
+    # Now pass position_embeddings
+    out_mlx = mlx_attn(x_mlx, mask=None, position_embeddings=(cos_mlx, sin_mlx))
     
     check_close(out_mlx, out_pt, name="Attention Output")
+
+def test_gate():
+    print("\n--- Testing Gate ---")
+    # PT: SarvamMoEGate
+    # MLX: SarvamMoEGate
+    
+    hidden_size = 64
+    num_experts = 4
+    num_experts_per_tok = 2
+    n_group = 1
+    topk_group = 1
+    routed_scaling_factor = 1.0
+    
+    config = SarvamMoEConfig(
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        moe_router_enable_expert_bias=True
+    )
+    args = ModelArgs(
+        model_type="sarvam_moe",
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        moe_router_enable_expert_bias=True,
+        # dummies
+        vocab_size=1000,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=128
+    )
+    
+    from mlx_lm.models.sarvam_moe_transformers import SarvamMoEGate as PTSarvamMoEGate
+    from mlx_lm.models.sarvam_moe import SarvamMoEGate
+    
+    pt_gate = PTSarvamMoEGate(config).eval()
+    mlx_gate = SarvamMoEGate(args)
+    
+    # Sync weights
+    # PT: weight (NumExperts, Hidden), expert_bias (NumExperts)
+    # MLX: weight (NumExperts, Hidden), expert_bias (NumExperts)
+    mlx_gate.weight = torch_to_mlx(pt_gate.weight)
+    mlx_gate.expert_bias = torch_to_mlx(pt_gate.expert_bias)
+    
+    x_pt = torch.randn(1, 10, hidden_size)
+    x_mlx = torch_to_mlx(x_pt)
+    
+    with torch.no_grad():
+        # returns topk_idx, topk_weight, logits
+        pt_inds, pt_weights, _ = pt_gate(x_pt)
+        
+    # MLX returns inds, topk_weight, logits
+    mlx_inds, mlx_weights, mlx_logits = mlx_gate(x_mlx)
+    
+    check_close(mlx_inds, pt_inds, name="Gate Indices")
+    check_close(mlx_weights, pt_weights, name="Gate Weights")
+    
+    # PT Gate returns logits as well?
+    # pt_gate returns (inds, weights, logits)
+    with torch.no_grad():
+        _, _, pt_logits = pt_gate(x_pt)
+        
+    check_close(mlx_logits, pt_logits, name="Gate Logits")
+
+    check_close(mlx_inds, pt_inds, name="Gate Indices")
+    check_close(mlx_weights, pt_weights, name="Gate Weights")
+
+def test_experts():
+    print("\n--- Testing Experts ---")
+    config = SarvamMoEConfig(
+        hidden_size=64,
+        moe_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    args = ModelArgs(
+        model_type="sarvam_moe",
+        hidden_size=64,
+        moe_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        # dummies
+        vocab_size=1000,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=128
+    )
+    
+    from mlx_lm.models.sarvam_moe_transformers import SarvamMoEExperts as PTSarvamMoEExperts
+    from mlx_lm.models.sarvam_moe import SarvamMoEExperts
+    
+    pt_experts = PTSarvamMoEExperts(config).eval()
+    mlx_experts = SarvamMoEExperts(args)
+    
+    # Sync Weights
+    # PT: experts is list of MLPs (gate, up, down)
+    # MLX: switch_mlp (gate, up, down - stacked)
+    gate_w, up_w, down_w = [], [], []
+    for i in range(config.num_experts):
+        gate_w.append(pt_experts[i].gate_proj.weight)
+        up_w.append(pt_experts[i].up_proj.weight)
+        down_w.append(pt_experts[i].down_proj.weight)
+    
+    mlx_experts.switch_mlp.gate_proj.weight = torch_to_mlx(torch.stack(gate_w))
+    mlx_experts.switch_mlp.up_proj.weight = torch_to_mlx(torch.stack(up_w))
+    mlx_experts.switch_mlp.down_proj.weight = torch_to_mlx(torch.stack(down_w))
+    
+    # Inputs
+    # Experts take (x, inds, weights)
+    # Need dummy inds and weights
+    B, L = 1, 10
+    topk = config.num_experts_per_tok
+    num_ex = config.num_experts
+    
+    x_pt = torch.randn(B, L, 64)
+    x_mlx = torch_to_mlx(x_pt)
+    
+    
+    # Random topk indices (Must be unique per token for Reference Inference Logic)
+    # Generate random logits (B, L, NumExperts)
+    logits = torch.randn(B, L, num_ex)
+    # Get topk indices
+    _, inds_pt = torch.topk(logits, topk, dim=-1)
+    
+    inds_mlx = torch_to_mlx(inds_pt)
+    
+    # Random weights
+    weights_pt = torch.rand(B, L, topk)
+    weights_pt = weights_pt / weights_pt.sum(dim=-1, keepdim=True)
+    weights_mlx = torch_to_mlx(weights_pt)
+    
+    # Forward
+    # PT forward(hidden_states, top_k_index, top_k_weights)
+    # Note: PT forward implementation in reference expects FLATTENED inputs?
+    # No, signature says: hidden_states: (tokens, hidden) or (batch*seq, hidden)
+    # top_k_index: (tokens, top_k)
+    # But SarvamMoESparseMoeBlock line 344 flattens them before calling experts.
+    # So we should pass FLATTENED inputs to test `SarvamMoEExperts` directly, or check if it handles unflattened.
+    # Reference Line 269: tokens, hidden_dim = hidden_states.shape
+    # flat_topk_idx = top_k_index.view(-1)
+    # So it expects 2D hidden_states (Tokens, Dim).
+    
+    # Flatten inputs
+    x_pt_flat = x_pt.view(-1, 64)
+    inds_pt_flat = inds_pt.view(-1, topk)
+    weights_pt_flat = weights_pt.view(-1, topk)
+    
+    x_mlx_flat = x_mlx.reshape(-1, 64)
+    inds_mlx_flat = inds_mlx.reshape(-1, topk)
+    weights_mlx_flat = weights_weights_mlx = weights_mlx.reshape(-1, topk)
+    
+    with torch.no_grad():
+        out_pt = pt_experts(x_pt_flat, inds_pt_flat, weights_pt_flat)
+        
+    out_mlx = mlx_experts(x_mlx_flat, inds_mlx_flat, weights_mlx_flat)
+    
+    check_close(out_mlx, out_pt, name="Experts Output", atol=1e-2)
 
 def test_mlp():
     print("\n--- Testing MLP ---")
@@ -246,11 +502,12 @@ def test_moe_block():
     x_mlx = torch_to_mlx(x_pt)
 
     with torch.no_grad():
-        out_pt, _ = pt_block(x_pt)
-    out_mlx = mlx_block(x_mlx)
+        out_pt, logits_pt = pt_block(x_pt)
+    out_mlx, logits_mlx = mlx_block(x_mlx)
     
     
     check_close(out_mlx, out_pt, name="MoE Block Output", atol=1e-2)
+    check_close(logits_mlx, logits_pt[0], name="MoE Block Logits", atol=1e-2)
 
 def test_decoder_layer():
     print("\n--- Testing Decoder Layer ---")
@@ -344,15 +601,25 @@ def test_decoder_layer():
     cos_pt = emb.cos()[None, :, :]
     sin_pt = emb.sin()[None, :, :]
     
+    # MLX
+    from mlx_lm.models.sarvam_moe import SarvamMoERotaryEmbedding
+    mlx_rope = SarvamMoERotaryEmbedding(args)
+    pos_ids_mlx = mx.arange(10)[None]
+    cos_mlx, sin_mlx = mlx_rope(x_mlx, pos_ids_mlx)
+    
     with torch.no_grad():
-        out_pt = pt_layer(x_pt, position_embeddings=(cos_pt, sin_pt))[0] # returns tuple
+        pt_outputs = pt_layer(x_pt, position_embeddings=(cos_pt, sin_pt), output_router_logits=True)
+        out_pt = pt_outputs[0]
+        logits_pt = pt_outputs[-1] 
     
     # MLX DecoderLayer expects mask=None for test?
     # Actually need a mask for cache even if cache is None? No.
-    out_mlx = mlx_layer(x_mlx, mask=None)
+    # Pass position_embeddings
+    out_mlx, logits_mlx = mlx_layer(x_mlx, mask=None, position_embeddings=(cos_mlx, sin_mlx))
     
     
     check_close(out_mlx, out_pt, name="Decoder Layer Output", atol=1e-2)
+    check_close(logits_mlx, logits_pt[0], name="Decoder Layer Logits", atol=1e-2)
 
 def test_model():
     print("\n--- Testing Full SarvamMoEModel ---")
@@ -463,11 +730,49 @@ def test_model():
     
     out_mlx = mlx_model(x_mlx)
     
-    check_close(out_mlx, out_pt, name="Full Model Output", atol=1e-2)
+    check_close(out_mlx, out_pt, name="Full Model Output")
+
+    # Check output_router_logits flag
+    print("\n--- Checking output_router_logits flag ---")
+    from mlx_lm.models.sarvam_moe import SarvamMoEModelOutputWithPast
+    
+    # PT with output_router_logits=True
+    with torch.no_grad():
+        pt_out_struct = pt_model(x_pt, output_router_logits=True)
+        # pt_out_struct is MoeModelOutputWithPast
+        pt_logits = pt_out_struct.router_logits
+    
+    # MLX with output_router_logits=True
+    mlx_out_struct = mlx_model(x_mlx, output_router_logits=True)
+    
+    if isinstance(mlx_out_struct, SarvamMoEModelOutputWithPast):
+        print("✅ Returned correct class SarvamMoEModelOutputWithPast")
+    else:
+        print(f"❌ Returned wrong type: {type(mlx_out_struct)}")
+    
+    if mlx_out_struct.router_logits is not None:
+        print("✅ router_logits is not None")
+        # Check values
+        # router_logits is a tuple of logits per layer
+        # Check first layer
+        # Note: pt_logits tuple length should match num_layers
+        if len(mlx_out_struct.router_logits) == len(pt_logits):
+             print("✅ router_logits length matches")
+             for i, (ml, pl) in enumerate(zip(mlx_out_struct.router_logits, pt_logits)):
+                 if ml is not None and pl is not None:
+                     check_close(ml, pl[0], name=f"Layer {i} Router Logits", atol=1e-2)
+        else:
+             print(f"❌ router_logits length mismatch: MLX {len(mlx_out_struct.router_logits)} vs PT {len(pt_logits)}")
+    else:
+        print("❌ router_logits is None")
 
 def test_full_equivalence():
     set_seeds()
+    test_norm()
+    test_rotary_embedding()
     test_attention()
+    test_gate()
+    test_experts()
     test_mlp()
     test_moe_block()
     test_decoder_layer()

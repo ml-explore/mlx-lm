@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -10,6 +10,25 @@ from mlx.nn.layers.distributed import shard_linear
 
 from .base import BaseModelArgs, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
+
+
+@dataclass
+class SarvamMoEModelOutputWithPast:
+    last_hidden_state: mx.array = None
+    past_key_values: Optional[List[mx.array]] = None
+    hidden_states: Optional[Tuple[mx.array]] = None
+    attentions: Optional[Tuple[mx.array]] = None
+    router_logits: Optional[Tuple[mx.array]] = None
+
+
+@dataclass
+class SarvamMoECausalLMOutputWithPast:
+    loss: Optional[mx.array] = None
+    logits: Optional[mx.array] = None
+    past_key_values: Optional[List[mx.array]] = None
+    hidden_states: Optional[Tuple[mx.array]] = None
+    attentions: Optional[Tuple[mx.array]] = None
+    router_logits: Optional[Tuple[mx.array]] = None
 
 
 @dataclass
@@ -38,7 +57,52 @@ class ModelArgs(BaseModelArgs):
     pad_token_id: int = 0
     eos_token_id: int = 1
     num_experts: int = 128
-    num_shared_experts: int = 1
+    first_k_dense_replace: int = 1
+    head_dim: int = 256
+    output_router_logits: bool = False
+    use_qk_norm: bool = True
+    moe_router_enable_expert_bias: bool = True
+    routed_scaling_factor: float = 2.5
+    attn_implementation: str = "eager"
+    partial_rotary_factor: float = 0.5
+
+
+class SarvamMoERotaryEmbedding(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.max_position_embeddings = args.max_position_embeddings
+        self.rope_theta = args.rope_theta
+        
+        # Calculate rope dimension
+        # Note: head_dim is usually set in args if not from hidden/heads
+        dim = args.head_dim or (args.hidden_size // args.num_attention_heads)
+        
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+        )
+        self.inv_freq = inv_freq
+        self.attention_scaling = 1.0
+
+    def __call__(self, x: mx.array, position_ids: mx.array) -> Tuple[mx.array, mx.array]:
+        # position_ids: (1, L) or (B, L)
+        
+        inv_freq_expanded = self.inv_freq[None, :, None] # (1, D/2, 1)
+        position_ids_expanded = position_ids[:, None, :].astype(mx.float32) # (B, 1, L)
+        
+        # (1, D/2, 1) * (B, 1, L) -> (B, D/2, L)
+        freqs = inv_freq_expanded * position_ids_expanded
+        
+        # Transpose to (B, L, D/2)
+        freqs = freqs.transpose(0, 2, 1)
+        
+        # emb = cat(freqs, freqs) -> (B, L, D)
+        emb = mx.concatenate((freqs, freqs), axis=-1)
+        
+        cos = mx.cos(emb) * self.attention_scaling
+        sin = mx.sin(emb) * self.attention_scaling
+        
+        return cos, sin
     num_experts_per_tok: int = 6
     n_group: int = 1
     topk_group: int = 1
@@ -63,6 +127,41 @@ class ModelArgs(BaseModelArgs):
 class SarvamMoERMSNorm(nn.RMSNorm):
     def __init__(self, dims: int, eps: float = 1e-6):
         super().__init__(dims, eps)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # q, k: (B, H, L, D)
+    # cos, sin: (B, L, D) -> (B, 1, L, D) for broadcasting
+    
+    # In reference: cos, sin are already prepared or passed as (B, L, D) and then unsqueezed
+    # MLX doesn't auto-broadcast missing dims in the middle if not aligned.
+    # q is (B, H, L, D). cos is (..., L, D).
+    # We want cos to align with L and D.
+    # cos: (B, L, D) -> reshape to (B, 1, L, D)
+    
+    # Using expand_dims or reshape
+    # Assumes cos/sin have shape (B, L, D) or similar.
+    # Let's inspect shape in usage. 
+    # SarvamMoERotaryEmbedding returns (B, L, D).
+    
+    cos = cos[:, None, :, :]
+    sin = sin[:, None, :, :]
+    
+    # rotate_half logic
+    # x: (..., D)
+    # x1 = x[..., :D//2]
+    # x2 = x[..., D//2:]
+    # res = cat(-x2, x1)
+    
+    def rotate_half(x):
+        D = x.shape[-1]
+        x1 = x[..., : D // 2]
+        x2 = x[..., D // 2 :]
+        return mx.concatenate([-x2, x1], axis=-1)
+        
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 class SarvamMoEAttention(nn.Module):
@@ -93,18 +192,12 @@ class SarvamMoEAttention(nn.Module):
 
         self.dense = nn.Linear(self.n_heads * self.head_dim, dim, bias=args.use_bias)
 
-        rope_dim = int(self.head_dim * args.partial_rotary_factor)
-        self.rope = nn.RoPE(
-            rope_dim,
-            traditional=False,
-            base=args.rope_theta,
-        )
-
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_embeddings: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -127,29 +220,23 @@ class SarvamMoEAttention(nn.Module):
             keys = self.key_layernorm(keys)
 
         # Apply Partial RoPE
-        # Input to RoPE is (..., L, D). With queries as (B, H, L, D), this works correctly.
-        if self.partial_rotary_factor < 1.0:
-            query_rot = queries[..., : self.rope.dims]
-            query_pass = queries[..., self.rope.dims :]
-            key_rot = keys[..., : self.rope.dims]
-            key_pass = keys[..., self.rope.dims :]
-            
-            if cache is not None:
-                query_rot = self.rope(query_rot, offset=cache.offset)
-                key_rot = self.rope(key_rot, offset=cache.offset)
-            else:
-                query_rot = self.rope(query_rot)
-                key_rot = self.rope(key_rot)
-                
-            queries = mx.concatenate([query_rot, query_pass], axis=-1)
-            keys = mx.concatenate([key_rot, key_pass], axis=-1)
-        else:
-            if cache is not None:
-                queries = self.rope(queries, offset=cache.offset)
-                keys = self.rope(keys, offset=cache.offset)
-            else:
-                queries = self.rope(queries)
-                keys = self.rope(keys)
+        # Use position_embeddings if provided
+        if position_embeddings is not None:
+             cos, sin = position_embeddings
+             
+             rope_dim = int(self.head_dim * self.partial_rotary_factor)
+             
+             # Split into rotary and pass
+             query_rot = queries[..., :rope_dim]
+             query_pass = queries[..., rope_dim:]
+             key_rot = keys[..., :rope_dim]
+             key_pass = keys[..., rope_dim:]
+             
+             # Apply RoPE
+             query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
+             
+             queries = mx.concatenate([query_rot, query_pass], axis=-1)
+             keys = mx.concatenate([key_rot, key_pass], axis=-1)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -269,7 +356,7 @@ class SarvamMoEGate(nn.Module):
             
         topk_weight = topk_weight * self.routed_scaling_factor
         
-        return inds, topk_weight
+        return inds, topk_weight, logits
 
 
 class SarvamMoEExperts(nn.Module):
@@ -315,14 +402,14 @@ class SarvamMoESparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         identity = x
-        topk_inds, topk_weights = self.gate(x)
+        topk_inds, topk_weights, router_logits = self.gate(x)
         
         y = self.experts(x, topk_inds, topk_weights)
         
         if self.shared_experts is not None:
              y = y + self.shared_experts(identity)
              
-        return y
+        return y, router_logits
 
 
 class SarvamMoEDecoderLayer(nn.Module):
@@ -349,12 +436,19 @@ class SarvamMoEDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_embeddings: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        r = self.attention(self.input_layernorm(x), mask, cache)
+        r = self.attention(self.input_layernorm(x), mask, cache, position_embeddings)
         h = x + r
+        
         r = self.mlp(self.post_attention_layernorm(h))
+        
+        router_logits = None
+        if isinstance(r, tuple):
+            r, router_logits = r
+            
         out = h + r
-        return out
+        return out, router_logits
 
 
 class SarvamMoEModel(nn.Module):
@@ -366,12 +460,14 @@ class SarvamMoEModel(nn.Module):
             SarvamMoEDecoderLayer(args, i) for i in range(args.num_hidden_layers)
         ]
         self.norm = SarvamMoERMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.rotary_emb = SarvamMoERotaryEmbedding(args)
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        output_router_logits: bool = False,
     ):
         if input_embeddings is not None:
             h = input_embeddings
@@ -389,10 +485,33 @@ class SarvamMoEModel(nn.Module):
              from .base import create_attention_mask
              mask = create_attention_mask(h, cache[0], return_array=True)
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+        all_router_logits = [] if output_router_logits else None
 
-        return self.norm(h)
+        # position_ids: (1, L)
+        start = 0
+        if cache and cache[0] is not None:
+             start = cache[0].offset
+        L = h.shape[1]
+        position_ids = mx.arange(start, start + L).reshape(1, -1)
+        
+        cos, sin = self.rotary_emb(h, position_ids)
+        position_embeddings = (cos, sin)
+
+        for layer, c in zip(self.layers, cache):
+            h, router_logits = layer(h, mask, c, position_embeddings)
+            if output_router_logits and router_logits is not None:
+                all_router_logits.append(router_logits)
+
+        out = self.norm(h)
+        
+        if output_router_logits:
+             return SarvamMoEModelOutputWithPast(
+                 last_hidden_state=out,
+                 past_key_values=cache,
+                 router_logits=tuple(all_router_logits) if all_router_logits else None
+             )
+
+        return out
 
 
 class Model(nn.Module):
@@ -409,8 +528,26 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        output_router_logits: bool = False,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        out = self.model(inputs, cache, input_embeddings, output_router_logits=output_router_logits)
+        
+        if output_router_logits and isinstance(out, SarvamMoEModelOutputWithPast):
+             hidden_state = out.last_hidden_state
+             
+             if self.args.tie_word_embeddings:
+                 lm_logits = self.model.embed_tokens.as_linear(hidden_state)
+             else:
+                 lm_logits = self.lm_head(hidden_state)
+            
+             return SarvamMoECausalLMOutputWithPast(
+                 logits=lm_logits,
+                 past_key_values=out.past_key_values,
+                 router_logits=out.router_logits,
+                 hidden_states=out.hidden_states, # if we collected them
+                 attentions=out.attentions,       # if we collected them
+             )
+
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
