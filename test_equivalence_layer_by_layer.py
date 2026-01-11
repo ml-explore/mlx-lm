@@ -137,6 +137,7 @@ def test_rotary_embedding():
 
 def test_attention():
     print("\n--- Testing Attention ---")
+    set_seeds()  # Ensure reproducible results
     config = SarvamMoEConfig(
         hidden_size=64,
         num_attention_heads=4,
@@ -172,45 +173,19 @@ def test_attention():
         copy_weights_norm(mlx_attn.query_layernorm, pt_attn.query_layernorm)
         copy_weights_norm(mlx_attn.key_layernorm, pt_attn.key_layernorm)
 
+    
     # Input
     B, L, D = 1, 10, 64
     x_pt = torch.randn(B, L, D)
     x_mlx = torch_to_mlx(x_pt)
     
-    # Position IDs (transformers uses them for RoPE sometimes, but SarvamMoE uses rotary_emb from model)
-    # The reference Attention .forward() accepts position_embeddings.
-    # In full model, rotary_emb is calculated outside.
-    # Here we need to mock it.
-    
-    # Create cos, sin
-    # PT: (1, 1, L, D_rope)
-    rope_dim = int(config.head_dim * config.partial_rotary_factor)
-    inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
-    t = torch.arange(L).type_as(inv_freq)
-    freqs = torch.outer(t, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    # Create cos, sin matching SarvamMoE Transformers expectation
-    # SarvamMoEAttention in Transformers expects position_embeddings=(cos, sin)
-    # apply_rotary_pos_emb does:
-    # cos = cos.unsqueeze(1) -> (1, 1, L, D_rope) -> unsqueezed becomes (1, 1, 1, L, D_rope)??
-    # Wait, apply_rotary_pos_emb signature: (q, k, cos, sin, unsqueeze_dim=1)
-    # q is (B, H, L, D). 
-    # If cos is (1, L, D), unsqueeze(1) -> (1, 1, L, D). This broadcasts.
-    # 
-    # In my script I did: cos_pt = emb.cos()[None, None, :, :] -> (1, 1, L, D_rope)
-    # inside apply_rotary_pos_emb: cos.unsqueeze(1) -> (1, 1, 1, L, D_rope). Rank 5.
-    # q is (B, H, L, D) -> Rank 4.
-    # q_rot * cos -> Rank 5 * Rank 4 -> Broadcasts to Rank 5. Result Rank 5.
-    # q_pass is Rank 4.
-    # cat([Rank 5, Rank 4]) -> Error.
-    
-    # Correction: The reference code's `apply_rotary_pos_emb` automatically unsqueezes at dim 1.
-    # So we should pass `cos` and `sin` WITHOUT that dimension if we rely on that, OR pass it such that unsqueeze is correct.
-    # The reference `SarvamMoERotaryEmbedding` returns `cos` as `(B, L, D)`.
-    # Let's match correct shape: (1, L, D_rope).
-    
-    cos_pt = emb.cos()[None, :, :] # (1, L, D_rope)
-    sin_pt = emb.sin()[None, :, :] # (1, L, D_rope)
+    # Create position embeddings using the RoPE classes for consistency
+    # PT
+    from mlx_lm.models.sarvam_moe_transformers import SarvamMoERotaryEmbedding as PTRoPE
+    pt_rope = PTRoPE(config)
+    pos_ids_pt = torch.arange(L).unsqueeze(0)
+    with torch.no_grad():
+        cos_pt, sin_pt = pt_rope(x_pt, pos_ids_pt)
     
     # MLX
     from mlx_lm.models.sarvam_moe import SarvamMoERotaryEmbedding
@@ -220,11 +195,9 @@ def test_attention():
     
     # Forward PT
     with torch.no_grad():
-        # PT expects position_embeddings=(cos, sin)
         out_pt, _, _ = pt_attn(x_pt, position_embeddings=(cos_pt, sin_pt))
 
     # Forward MLX
-    # Now pass position_embeddings
     out_mlx = mlx_attn(x_mlx, mask=None, position_embeddings=(cos_mlx, sin_mlx))
     
     check_close(out_mlx, out_pt, name="Attention Output")

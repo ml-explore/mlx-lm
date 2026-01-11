@@ -57,6 +57,11 @@ class ModelArgs(BaseModelArgs):
     pad_token_id: int = 0
     eos_token_id: int = 1
     num_experts: int = 128
+    num_shared_experts: int = 1
+    num_experts_per_tok: int = 6
+    n_group: int = 1
+    topk_group: int = 1
+    moe_intermediate_size: int = 1024
     first_k_dense_replace: int = 1
     head_dim: int = 256
     output_router_logits: bool = False
@@ -130,37 +135,36 @@ class SarvamMoERMSNorm(nn.RMSNorm):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    # q, k: (B, H, L, D)
-    # cos, sin: (B, L, D) -> (B, 1, L, D) for broadcasting
+    # q, k: (B, H, L, D_full) - full head dimension
+    # cos, sin: (B, L, D_full) - full head dimension from SarvamMoERotaryEmbedding
     
-    # In reference: cos, sin are already prepared or passed as (B, L, D) and then unsqueezed
-    # MLX doesn't auto-broadcast missing dims in the middle if not aligned.
-    # q is (B, H, L, D). cos is (..., L, D).
-    # We want cos to align with L and D.
-    # cos: (B, L, D) -> reshape to (B, 1, L, D)
-    
-    # Using expand_dims or reshape
-    # Assumes cos/sin have shape (B, L, D) or similar.
-    # Let's inspect shape in usage. 
-    # SarvamMoERotaryEmbedding returns (B, L, D).
-    
+    # Reshape for broadcasting: (B, L, D) -> (B, 1, L, D)
     cos = cos[:, None, :, :]
     sin = sin[:, None, :, :]
     
-    # rotate_half logic
-    # x: (..., D)
-    # x1 = x[..., :D//2]
-    # x2 = x[..., D//2:]
-    # res = cat(-x2, x1)
+    # Get rotary dimension from cos (matching reference behavior)
+    rotary_dim = cos.shape[-1]
     
+    # Split q and k into rotary and pass-through parts
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+    
+    # rotate_half logic
     def rotate_half(x):
         D = x.shape[-1]
         x1 = x[..., : D // 2]
         x2 = x[..., D // 2 :]
         return mx.concatenate([-x2, x1], axis=-1)
         
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    
+    # Concatenate back
+    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
+    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
+    
     return q_embed, k_embed
 
 
@@ -219,24 +223,10 @@ class SarvamMoEAttention(nn.Module):
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
 
-        # Apply Partial RoPE
-        # Use position_embeddings if provided
+        # Apply RoPE using position_embeddings if provided
         if position_embeddings is not None:
              cos, sin = position_embeddings
-             
-             rope_dim = int(self.head_dim * self.partial_rotary_factor)
-             
-             # Split into rotary and pass
-             query_rot = queries[..., :rope_dim]
-             query_pass = queries[..., rope_dim:]
-             key_rot = keys[..., :rope_dim]
-             key_pass = keys[..., rope_dim:]
-             
-             # Apply RoPE
-             query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
-             
-             queries = mx.concatenate([query_rot, query_pass], axis=-1)
-             keys = mx.concatenate([key_rot, key_pass], axis=-1)
+             queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -514,14 +504,54 @@ class SarvamMoEModel(nn.Module):
         return out
 
 
+class SarvamMoEForCausalLM(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model = SarvamMoEModel(args)
+        self.vocab_size = args.vocab_size
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+    
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+        output_router_logits: bool = False,
+    ):
+        outputs = self.model(inputs, cache, input_embeddings, output_router_logits=output_router_logits)
+        
+        if output_router_logits and isinstance(outputs, SarvamMoEModelOutputWithPast):
+            hidden_state = outputs.last_hidden_state
+            
+            if self.args.tie_word_embeddings:
+                logits = self.model.embed_tokens.as_linear(hidden_state)
+            else:
+                logits = self.lm_head(hidden_state)
+            
+            return SarvamMoECausalLMOutputWithPast(
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                router_logits=outputs.router_logits,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        
+        # Simple tensor output
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(outputs)
+        else:
+            out = self.lm_head(outputs)
+        return out
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = SarvamMoEModel(args)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model = SarvamMoEForCausalLM(args)
 
     def __call__(
         self,
@@ -530,29 +560,19 @@ class Model(nn.Module):
         input_embeddings: Optional[mx.array] = None,
         output_router_logits: bool = False,
     ):
-        out = self.model(inputs, cache, input_embeddings, output_router_logits=output_router_logits)
-        
-        if output_router_logits and isinstance(out, SarvamMoEModelOutputWithPast):
-             hidden_state = out.last_hidden_state
-             
-             if self.args.tie_word_embeddings:
-                 lm_logits = self.model.embed_tokens.as_linear(hidden_state)
-             else:
-                 lm_logits = self.lm_head(hidden_state)
-            
-             return SarvamMoECausalLMOutputWithPast(
-                 logits=lm_logits,
-                 past_key_values=out.past_key_values,
-                 router_logits=out.router_logits,
-                 hidden_states=out.hidden_states, # if we collected them
-                 attentions=out.attentions,       # if we collected them
-             )
+        return self.model(inputs, cache, input_embeddings, output_router_logits)
 
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-        return out
+    @property
+    def layers(self):
+        return self.model.model.layers
+
+    @property
+    def head_dim(self):
+        return self.args.head_dim or (self.args.hidden_size // self.args.num_attention_heads)
+
+    @property
+    def n_kv_heads(self):
+        return self.args.num_key_value_heads
 
     def sanitize(self, weights):
         # Remove unused keys (like FP8 scales) to avoid strict load errors
