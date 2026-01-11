@@ -358,71 +358,35 @@ class SarvamMoEGate(nn.Module):
         
         num_tokens, num_experts = scores.shape
         group_scores = scores.reshape(num_tokens, self.n_group, -1)
-        # Sum of top 2 in each group (as per reference logic which uses topk(2, dim=-1)[0].sum(dim=-1))
-        # We need to compute topk(2) for each group
-        # [num_tokens, n_group, experts_per_group]
-        
-        # Using self._topk for group scoring
-        # But _topk assumes last dim.
-        
-        # topk(2) within group
-        _, top2_vals = self._topk(group_scores, k=2) # [num_tokens, n_group, 2]
-        group_score_sums = top2_vals.sum(axis=-1) # [num_tokens, n_group]
+        # Sum of top 2 in each group
+        # mx.topk returns values directly (unsorted, but sum doesn't care)
+        top2_vals = mx.topk(group_scores, k=2, axis=-1)
+        group_score_sums = top2_vals.sum(axis=-1)
         
         # Select topk groups
-        group_idx, _ = self._topk(group_score_sums, k=self.topk_group) # [num_tokens, topk_group] (indices of groups)
+        # We need indices here, so we use _topk (which wraps argpartition+sort)
+        group_idx, _ = self._topk(group_score_sums, k=self.topk_group)
         
         # Create mask
-        # We need to construct a mask where SELECTED groups are 1 (or allow values), others are -inf.
-        # But constructing index-based masks can be tricky.
-        # Reference does:
-        # group_mask.scatter_(1, group_idx, 1)
-        # score_mask = group_mask.unsqueeze(-1).expand(...).reshape(...)
+        # Reference: group_mask.scatter_(1, group_idx, 1)
+        # MLX supports scatter via advanced indexing
+        group_mask = mx.zeros((num_tokens, self.n_group), dtype=scores.dtype)
+        # [B, Kg] indices
+        batch_col = mx.arange(num_tokens)[:, None]
+        group_mask[batch_col, group_idx] = 1 # Set selected groups to 1
         
-        # In MLX:
-        # We can construct boolean mask from group_idx?
-        
-        # Alternative: Just gather the candidates and maximize among them?
-        # Reference: masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
-        # then global topk.
-        
-        # Let's try to replicate "mask other groups" logic.
-        
-        # Create a full group mask
-        # group_idx: [B, Kg]
-        # We want mask: [B, n_group] with 1s at group_idx
-        
-        # Slow but correct way with current MLX (scatter not fully supported in all contexts or usage might be tricky):
-        # Use one-hot or similar? 
-        # Actually simplest might be:
-        # Construct an array of group indices [0..n_group]
-        # Compare with group_idx
-        
-        groups_range = mx.arange(self.n_group) # [n_group]
-        # [1, 1, n_group] vs [B, Kg, 1] -> broadcast comparison?
-        # group_idx expanded: [B, Kg, 1]
-        # groups_range expanded: [1, 1, n_group]
-        # Equal? [B, Kg, n_group] -> any over Kg dim -> [B, n_group] is Selected
-        
-        is_selected = (groups_range[None, None, :] == group_idx[..., None]).sum(axis=1) > 0 # [B, n_group]
-        
-        # Expand selection to experts
-        # [B, n_group] -> [B, n_group, experts_per_group] -> [B, E]
+        # Expand mask to experts: [B, n_group] -> [B, n_group, 1] -> broadcast
+        # experts_per_group implied by reshape
         experts_per_group = num_experts // self.n_group
-        is_selected = is_selected[:, :, None] # [B, n_group, 1]
         
-        # Broadcast to experts in group
-        # We can just broadcast directly if we reshape scores
+        # We can reshape mask to [B, num_experts] by repeating elements?
+        # group_mask: [B, G]. We want [B, G * E_per_G] where each expert in group G gets mask[g]
+        score_mask = mx.repeat(group_mask[:, :, None], experts_per_group, axis=2)
+        score_mask = score_mask.reshape(num_tokens, num_experts)
         
-        scores_grouped = scores.reshape(num_tokens, self.n_group, experts_per_group)
-        
-        # Mask non-selected with -inf
-        # We need to cast is_selected to match scores type or use where
-        # -inf in float32
-        neg_inf = -1e9 # or float('-inf')
-        
-        masked_scores_grouped = mx.where(is_selected, scores_grouped, neg_inf)
-        masked_scores = masked_scores_grouped.reshape(num_tokens, num_experts)
+        # Apply mask
+        neg_inf = -1e9
+        masked_scores = mx.where(score_mask > 0, scores, neg_inf)
         
         # Final global topk
         return self._topk(masked_scores, self.top_k)
@@ -541,6 +505,9 @@ class SarvamMoEDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_embeddings: Optional[Tuple[mx.array, mx.array]] = None,
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        **kwargs,
     ) -> mx.array:
         r = self.attention(self.input_layernorm(x), mask, cache, position_embeddings)
         h = x + r
@@ -549,7 +516,9 @@ class SarvamMoEDecoderLayer(nn.Module):
         
         router_logits = None
         if isinstance(r, tuple):
-            r, router_logits = r
+            r, rl = r
+            if output_router_logits:
+                router_logits = rl
             
         out = h + r
         return out, router_logits
@@ -610,7 +579,13 @@ class SarvamMoEModel(nn.Module):
         position_embeddings = (cos, sin)
 
         for layer, c in zip(self.layers, cache):
-            h, router_logits = layer(h, mask, c, position_embeddings)
+            h, router_logits = layer(
+                h, 
+                mask, 
+                c, 
+                position_embeddings, 
+                output_router_logits=output_router_logits
+            )
             if output_router_logits and router_logits is not None:
                 all_router_logits.append(router_logits)
 

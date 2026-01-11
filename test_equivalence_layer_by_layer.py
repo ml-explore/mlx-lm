@@ -588,7 +588,7 @@ def test_decoder_layer():
     # MLX DecoderLayer expects mask=None for test?
     # Actually need a mask for cache even if cache is None? No.
     # Pass position_embeddings
-    out_mlx, logits_mlx = mlx_layer(x_mlx, mask=None, position_embeddings=(cos_mlx, sin_mlx))
+    out_mlx, logits_mlx = mlx_layer(x_mlx, mask=None, position_embeddings=(cos_mlx, sin_mlx), output_router_logits=True)
     
     
     check_close(out_mlx, out_pt, name="Decoder Layer Output", atol=1e-2)
