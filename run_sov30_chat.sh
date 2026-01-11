@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default model path
-DEFAULT_MODEL="/Users/rachittibrewal/Documents/mlx/mlx-lm/ckpt-28232"
+DEFAULT_MODEL="/Users/rachittibrewal/Documents/mlx/mlx-lm/sov-30b-fp8"
 
 # Check if model path is provided as argument
 if [ -z "$1" ]; then

@@ -2,7 +2,7 @@
 
 # Check if model path is provided, otherwise use default
 if [ -z "$1" ]; then
-    MODEL_PATH="/Users/rachittibrewal/Documents/mlx/mlx-lm/ckpt-28232"
+    MODEL_PATH="/Users/rachittibrewal/Documents/mlx/mlx-lm/sov-30b-fp8"
     echo "No model path provided. Using default: $MODEL_PATH"
 else
     MODEL_PATH="$1"
