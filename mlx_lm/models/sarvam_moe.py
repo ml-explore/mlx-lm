@@ -751,21 +751,21 @@ class Model(SarvamMoEForCausalLM):
             
             # Check for expert weights
             if f"{mlp_prefix}.experts.0.gate_proj.weight" in weights:
-                 for n in ["gate_proj", "up_proj", "down_proj"]:
-                     # Collect from experts 0..N
-                     w_list = []
-                     for e in range(self.args.num_experts):
-                         key = f"{mlp_prefix}.experts.{e}.{n}.weight"
-                         if key in weights:
-                             w = weights.pop(key)
-                             w_list.append(w)
-                     
-                     if w_list:
-                         stacked = mx.stack(w_list)
-                         # Assign to switch_mlp.{n}.weight
-                         # Warning: SwitchGLU in mlx_lm.models.switch_layers expects specific names?
-                         # Usually SwitchGLU has .gate_proj, .up_proj, .down_proj
-                         weights[f"{mlp_prefix}.experts.switch_mlp.{n}.weight"] = stacked
+                for n in ["gate_proj", "up_proj", "down_proj"]:
+                    # Collect from experts 0..N
+                    w_list = []
+                    for e in range(self.args.num_experts):
+                        key = f"{mlp_prefix}.experts.{e}.{n}.weight"
+                        if key in weights:
+                            w = weights.pop(key)
+                            w_list.append(w)
+                    
+                    if w_list:
+                        stacked = mx.stack(w_list)
+                        # Assign to switch_mlp.{n}.weight
+                        # Warning: SwitchGLU in mlx_lm.models.switch_layers expects specific names?
+                        # Usually SwitchGLU has .gate_proj, .up_proj, .down_proj
+                        weights[f"{mlp_prefix}.experts.switch_mlp.{n}.weight"] = stacked
 
             # Rename 'gate' weights if needed. 
             # Reference: mlp.gate.weight
