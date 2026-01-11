@@ -48,7 +48,7 @@ def run_sarvam_transformers():
     else:
         device = torch.device("cpu")
     print(f"Using device: {device}")
-
+    device = torch.device("cpu")
     model = AutoModelForCausalLM.from_pretrained(
         model_path, 
         config=config, 
