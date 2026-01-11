@@ -168,9 +168,8 @@ class SarvamMoESparseMoeBlock(nn.Module):
         dim = args.hidden_size
         intermediate_size = args.moe_intermediate_size
 
-        self.hidden_size = hidden_size
+        self.hidden_size = dim
         self.intermediate_size = intermediate_size
-        self.hidden_act = hidden_act
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
@@ -183,10 +182,10 @@ class SarvamMoESparseMoeBlock(nn.Module):
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
 
-        if getattr(config, "moe_router_enable_expert_bias", False):
-            self.expert_bias = nn.Parameter(torch.zeros(args.num_experts), requires_grad=True)
+        if getattr(args, "moe_router_enable_expert_bias", False):
+            self.expert_bias = mx.zeros(args.num_experts)
         else:
-            self.
+            self.expert_bias = None
         # Optional shared experts
         n_shared = getattr(args, "num_shared_experts", 0) or 0
         if n_shared > 0:
@@ -197,7 +196,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
-        gates = mx.sigmoid(gates, axis=-1, precise=True)
+        gates = mx.sigmoid(gates)
 
         k = self.top_k
 
@@ -323,7 +322,7 @@ class Model(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return self.lm_head(out)
+        return out
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
