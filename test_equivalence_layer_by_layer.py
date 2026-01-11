@@ -249,13 +249,117 @@ def test_moe_block():
         out_pt, _ = pt_block(x_pt)
     out_mlx = mlx_block(x_mlx)
     
+    
     check_close(out_mlx, out_pt, name="MoE Block Output", atol=1e-2)
+
+def test_decoder_layer():
+    print("\n--- Testing Decoder Layer ---")
+    config = SarvamMoEConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        partial_rotary_factor=0.5,
+        first_k_dense_replace=0, # All layers MoE
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        moe_router_enable_expert_bias=True,
+        attn_implementation="eager",
+    )
+    config._attn_implementation = "eager"
+    args = ModelArgs(
+        model_type="sarvam_moe",
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        partial_rotary_factor=0.5,
+        first_k_dense_replace=0,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        moe_router_enable_expert_bias=True,
+        vocab_size=1000,
+        num_hidden_layers=1,
+    )
+    
+    pt_layer = PTSarvamMoEDecoderLayer(config, layer_idx=0).eval()
+    mlx_layer = SarvamMoEDecoderLayer(args, layer_idx=0)
+    
+    # Sync Norms
+    copy_weights_norm(mlx_layer.input_layernorm, pt_layer.input_layernorm)
+    copy_weights_norm(mlx_layer.post_attention_layernorm, pt_layer.post_attention_layernorm)
+    
+    # Sync Attention
+    copy_weights_linear(mlx_layer.attention.query_key_value, pt_layer.attention.query_key_value)
+    copy_weights_linear(mlx_layer.attention.dense, pt_layer.attention.dense)
+    if config.use_qk_norm:
+        copy_weights_norm(mlx_layer.attention.query_layernorm, pt_layer.attention.query_layernorm)
+        copy_weights_norm(mlx_layer.attention.key_layernorm, pt_layer.attention.key_layernorm)
+        
+    # Sync MLP/MoE
+    # Logic similar to MoE block sync
+    mlx_mlp = mlx_layer.mlp
+    pt_mlp = pt_layer.mlp
+    
+    if isinstance(mlx_mlp, SarvamMoESparseMoeBlock):
+        mlx_mlp.gate.weight = torch_to_mlx(pt_mlp.gate.weight)
+        if config.moe_router_enable_expert_bias:
+            mlx_mlp.gate.expert_bias = torch_to_mlx(pt_mlp.gate.expert_bias)
+            
+        gate_w, up_w, down_w = [], [], []
+        for i in range(config.num_experts):
+            gate_w.append(pt_mlp.experts[i].gate_proj.weight)
+            up_w.append(pt_mlp.experts[i].up_proj.weight)
+            down_w.append(pt_mlp.experts[i].down_proj.weight)
+        
+        mlx_mlp.experts.switch_mlp.gate_proj.weight = torch_to_mlx(torch.stack(gate_w))
+        mlx_mlp.experts.switch_mlp.up_proj.weight = torch_to_mlx(torch.stack(up_w))
+        mlx_mlp.experts.switch_mlp.down_proj.weight = torch_to_mlx(torch.stack(down_w))
+        
+        if pt_mlp.shared_experts:
+            copy_weights_linear(mlx_mlp.shared_experts.gate_proj, pt_mlp.shared_experts.gate_proj)
+            copy_weights_linear(mlx_mlp.shared_experts.up_proj, pt_mlp.shared_experts.up_proj)
+            copy_weights_linear(mlx_mlp.shared_experts.down_proj, pt_mlp.shared_experts.down_proj)
+
+    # Input
+    x_pt = torch.randn(1, 10, 64)
+    x_mlx = torch_to_mlx(x_pt)
+    
+    # RoPE embeddings
+    rope_dim = int(config.head_dim * config.partial_rotary_factor)
+    inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
+    t = torch.arange(10).type_as(inv_freq)
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos_pt = emb.cos()[None, :, :]
+    sin_pt = emb.sin()[None, :, :]
+    
+    with torch.no_grad():
+        out_pt = pt_layer(x_pt, position_embeddings=(cos_pt, sin_pt))[0] # returns tuple
+    
+    # MLX DecoderLayer expects mask=None for test?
+    # Actually need a mask for cache even if cache is None? No.
+    out_mlx = mlx_layer(x_mlx, mask=None)
+    
+    check_close(out_mlx, out_pt, name="Decoder Layer Output", atol=1e-2)
+
 
 def test_full_equivalence():
     set_seeds()
     test_attention()
     test_mlp()
     test_moe_block()
+    test_decoder_layer()
 
 if __name__ == "__main__":
     test_full_equivalence()
