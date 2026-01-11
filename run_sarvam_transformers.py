@@ -41,17 +41,26 @@ def run_sarvam_transformers():
     # If the checkpoint IS fp8, it might need specific handling or just load it.
     # Assuming standard loading for now.
     
+    # Determine device
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
+
     model = SarvamMoEForCausalLM.from_pretrained(
         model_path, 
         config=config, 
         torch_dtype=torch.bfloat16, 
-        device_map="auto"
     )
+    model.to(device)
 
     print("Model loaded. Generating text...")
     
     input_text = "What is the capital of India?"
-    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+    inputs = tokenizer(input_text, return_tensors="pt").to(device)
     
     with torch.no_grad():
         outputs = model.generate(
