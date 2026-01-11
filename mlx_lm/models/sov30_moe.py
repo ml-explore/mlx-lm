@@ -168,6 +168,9 @@ class SarvamMoESparseMoeBlock(nn.Module):
         dim = args.hidden_size
         intermediate_size = args.moe_intermediate_size
 
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
@@ -176,10 +179,14 @@ class SarvamMoESparseMoeBlock(nn.Module):
         self.n_group = getattr(args, "n_group", 1)
         self.topk_group = getattr(args, "topk_group", 1)
         self.routed_scaling_factor = getattr(args, "routed_scaling_factor", 1.0)
-
+        self.score_function = getattr(args, "score_function", "sigmoid")
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
 
+        if getattr(config, "moe_router_enable_expert_bias", False):
+            self.expert_bias = nn.Parameter(torch.zeros(args.num_experts), requires_grad=True)
+        else:
+            self.
         # Optional shared experts
         n_shared = getattr(args, "num_shared_experts", 0) or 0
         if n_shared > 0:
@@ -190,7 +197,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
+        gates = mx.sigmoid(gates, axis=-1, precise=True)
 
         k = self.top_k
 
@@ -316,7 +323,7 @@ class Model(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return out
+        return self.lm_head(out)
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
@@ -369,6 +376,15 @@ class Model(nn.Module):
                     layer.mlp.up_proj, "all-to-sharded", group=group
                 )
 
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+    
+        return predicate
+    
     @property
     def layers(self):
         return self.model.layers
