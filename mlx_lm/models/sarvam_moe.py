@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-from .base import BaseModelArgs, scaled_dot_product_attention
+from .base import BaseModelArgs
 from .switch_layers import SwitchGLU
 
 
@@ -87,6 +87,28 @@ def _expand_mask(mask: mx.array, dtype: mx.Dtype, tgt_len: Optional[int] = None)
     # Check what SarvamMoE expected: It uses _prepare_4d_attention_mask which returns additive mask.
     
     return inverted_mask * -1e9
+
+
+def scaled_dot_product_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    cache: Any = None,
+    scale: float = 1.0,
+    mask: Optional[mx.array] = None,
+):
+    try:
+        return mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=mask 
+        )
+    except ValueError:
+        # Fallback for shape mismatches that mx.fast can't handle
+        scores = (queries * scale) @ keys.transpose(0, 1, 3, 2)
+        if mask is not None:
+            scores = scores + mask
+        scores = mx.softmax(scores, axis=-1)
+        return scores @ values
+
 
 
 
