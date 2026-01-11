@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
@@ -29,6 +31,60 @@ class SarvamMoECausalLMOutputWithPast:
     hidden_states: Optional[Tuple[mx.array]] = None
     attentions: Optional[Tuple[mx.array]] = None
     router_logits: Optional[Tuple[mx.array]] = None
+
+
+def _get_unpad_data(attention_mask):
+    seqlens_in_batch = attention_mask.sum(axis=-1).astype(mx.int32)
+    # create indices from mask
+    # MLX boolean indexing is limited, use numpy/cpu fallback for this helper
+    mask_np = np.array(attention_mask.flatten())
+    indices_np = np.nonzero(mask_np)[0]
+    indices = mx.array(indices_np)
+    
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = mx.cumsum(seqlens_in_batch, axis=0).astype(mx.int32)
+    # Pad with 0
+    cu_seqlens = mx.concatenate([mx.array([0], dtype=mx.int32), cu_seqlens])
+    return indices, cu_seqlens, max_seqlen_in_batch
+
+
+def _make_causal_mask(
+    input_ids_shape: Tuple[int, int],
+    dtype: mx.Dtype,
+    past_key_values_length: int = 0,
+):
+    """
+    Make causal mask used for bi-directional self-attention.
+    """
+    bsz, tgt_len = input_ids_shape
+    mask = mx.full((tgt_len, tgt_len), -1e9, dtype=dtype)
+    mask = mx.triu(mask, k=1)
+    mask = mx.expand_dims(mask, axis=[0, 1])  # (1, 1, tgt_len, tgt_len)
+    return mask
+
+
+def _expand_mask(mask: mx.array, dtype: mx.Dtype, tgt_len: Optional[int] = None):
+    """
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = mask.shape
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_mask = mask[:, None, None, :].astype(dtype)
+    
+    # Inverted mask: 1.0 where we want to attend, 0.0 where we don't.
+    # Usually in transformers: 1 is keep, 0 is mask. 
+    # And then (1.0 - mask) * min_value.
+    # However, create_attention_mask in MLX often expects additive mask (0 for keep, -inf for mask).
+    
+    # If the input mask is 1 for keep, 0 for discard:
+    inverted_mask = 1.0 - expanded_mask
+    
+    # If direct usage of min_dtype
+    # Check what SarvamMoE expected: It uses _prepare_4d_attention_mask which returns additive mask.
+    
+    return inverted_mask * -1e9
+
 
 
 @dataclass
@@ -133,6 +189,12 @@ class SarvamMoERMSNorm(nn.RMSNorm):
     def __init__(self, dims: int, eps: float = 1e-6):
         super().__init__(dims, eps)
 
+# rotate_half logic
+def rotate_half(x):
+    D = x.shape[-1]
+    x1 = x[..., : D // 2]
+    x2 = x[..., D // 2 :]
+    return mx.concatenate([-x2, x1], axis=-1)
 
 def apply_rotary_pos_emb(q, k, cos, sin):
     # q, k: (B, H, L, D_full) - full head dimension
@@ -150,13 +212,6 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     q_pass = q[..., rotary_dim:]
     k_rot = k[..., :rotary_dim]
     k_pass = k[..., rotary_dim:]
-    
-    # rotate_half logic
-    def rotate_half(x):
-        D = x.shape[-1]
-        x1 = x[..., : D // 2]
-        x2 = x[..., D // 2 :]
-        return mx.concatenate([-x2, x1], axis=-1)
         
     q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
     k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
@@ -252,46 +307,11 @@ class SarvamMoEMLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-def _topk_lastdim(x: mx.array, k: int):
-    inds = mx.argpartition(x, kth=-k, axis=-1)[..., -k:]
-    vals = mx.take_along_axis(x, inds, axis=-1)
-    # Sort by score desc
-    order = mx.argsort(vals, axis=-1)[..., ::-1]
-    inds = mx.take_along_axis(inds, order, axis=-1)
-    vals = mx.take_along_axis(vals, order, axis=-1)
-    return inds, vals
-
-
-def _grouped_topk(scores: mx.array, top_k: int, n_group: int, topk_group: int):
-    # scores: [..., E]
-    *prefix, E = scores.shape
-    assert E % n_group == 0
-    gsz = E // n_group
-    
-    s = scores.reshape(*prefix, n_group, gsz)
-    
-    # topk within each group
-    gi, gv = _topk_lastdim(s, topk_group) # [..., G, topk_group]
-    
-    # map to global expert ids
-    group_offsets = mx.arange(n_group).reshape(*([1] * len(prefix)), n_group, 1) * gsz
-    gi_global = gi + group_offsets
-    
-    # flatten candidates
-    cand_inds = gi_global.reshape(*prefix, n_group * topk_group)
-    cand_vals = gv.reshape(*prefix, n_group * topk_group)
-    
-    # pick final top_k
-    ci, cv = _topk_lastdim(cand_vals, top_k)
-    final_inds = mx.take_along_axis(cand_inds, ci, axis=-1)
-    final_vals = cv
-    return final_inds, final_vals
-
-
 class SarvamMoEGate(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.top_k = args.num_experts_per_tok
+        self.num_experts = args.num_experts
         self.n_group = args.n_group
         self.topk_group = args.topk_group
         self.routed_scaling_factor = args.routed_scaling_factor
@@ -309,6 +329,90 @@ class SarvamMoEGate(nn.Module):
         else:
             self.expert_bias = None
 
+    def _topk(self, x: mx.array, k: int):
+        inds = mx.argpartition(x, kth=-k, axis=-1)[..., -k:]
+        vals = mx.take_along_axis(x, inds, axis=-1)
+        # Sort by score desc
+        order = mx.argsort(vals, axis=-1)[..., ::-1]
+        inds = mx.take_along_axis(inds, order, axis=-1)
+        vals = mx.take_along_axis(vals, order, axis=-1)
+        return inds, vals
+
+    def group_limited_topk(self, scores: mx.array):
+        if self.n_group == 1:
+            return self._topk(scores, self.top_k)
+        
+        num_tokens, num_experts = scores.shape
+        group_scores = scores.reshape(num_tokens, self.n_group, -1)
+        # Sum of top 2 in each group (as per reference logic which uses topk(2, dim=-1)[0].sum(dim=-1))
+        # We need to compute topk(2) for each group
+        # [num_tokens, n_group, experts_per_group]
+        
+        # Using self._topk for group scoring
+        # But _topk assumes last dim.
+        
+        # topk(2) within group
+        _, top2_vals = self._topk(group_scores, k=2) # [num_tokens, n_group, 2]
+        group_score_sums = top2_vals.sum(axis=-1) # [num_tokens, n_group]
+        
+        # Select topk groups
+        group_idx, _ = self._topk(group_score_sums, k=self.topk_group) # [num_tokens, topk_group] (indices of groups)
+        
+        # Create mask
+        # We need to construct a mask where SELECTED groups are 1 (or allow values), others are -inf.
+        # But constructing index-based masks can be tricky.
+        # Reference does:
+        # group_mask.scatter_(1, group_idx, 1)
+        # score_mask = group_mask.unsqueeze(-1).expand(...).reshape(...)
+        
+        # In MLX:
+        # We can construct boolean mask from group_idx?
+        
+        # Alternative: Just gather the candidates and maximize among them?
+        # Reference: masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
+        # then global topk.
+        
+        # Let's try to replicate "mask other groups" logic.
+        
+        # Create a full group mask
+        # group_idx: [B, Kg]
+        # We want mask: [B, n_group] with 1s at group_idx
+        
+        # Slow but correct way with current MLX (scatter not fully supported in all contexts or usage might be tricky):
+        # Use one-hot or similar? 
+        # Actually simplest might be:
+        # Construct an array of group indices [0..n_group]
+        # Compare with group_idx
+        
+        groups_range = mx.arange(self.n_group) # [n_group]
+        # [1, 1, n_group] vs [B, Kg, 1] -> broadcast comparison?
+        # group_idx expanded: [B, Kg, 1]
+        # groups_range expanded: [1, 1, n_group]
+        # Equal? [B, Kg, n_group] -> any over Kg dim -> [B, n_group] is Selected
+        
+        is_selected = (groups_range[None, None, :] == group_idx[..., None]).sum(axis=1) > 0 # [B, n_group]
+        
+        # Expand selection to experts
+        # [B, n_group] -> [B, n_group, experts_per_group] -> [B, E]
+        experts_per_group = num_experts // self.n_group
+        is_selected = is_selected[:, :, None] # [B, n_group, 1]
+        
+        # Broadcast to experts in group
+        # We can just broadcast directly if we reshape scores
+        
+        scores_grouped = scores.reshape(num_tokens, self.n_group, experts_per_group)
+        
+        # Mask non-selected with -inf
+        # We need to cast is_selected to match scores type or use where
+        # -inf in float32
+        neg_inf = -1e9 # or float('-inf')
+        
+        masked_scores_grouped = mx.where(is_selected, scores_grouped, neg_inf)
+        masked_scores = masked_scores_grouped.reshape(num_tokens, num_experts)
+        
+        # Final global topk
+        return self._topk(masked_scores, self.top_k)
+
     def __call__(self, x: mx.array):
         # x: [B, L, H], weight: [E, H]
         # logits: [B, L, E] = x @ weight.T
@@ -318,25 +422,21 @@ class SarvamMoEGate(nn.Module):
         scores_for_routing = scores
         if self.expert_bias is not None:
              scores_for_routing = scores_for_routing + self.expert_bias
-
-        if self.n_group > 1:
-            inds, final_scores = _grouped_topk(scores_for_routing, self.top_k, self.n_group, self.topk_group)
-            
-            # Re-gather original scores (without bias? Reference uses gathered scores)
-            # Reference: scores = torch.gather(scores, dim=1, index=topk_idx)
-            # So we use the 'inds' to gather from the RAW 'scores' (sigmoid output)
-            gathered_scores = mx.take_along_axis(scores, inds, axis=-1)
-            
-        else:
-            # Standard top-k
-            inds, gathered_scores = _topk_lastdim(scores_for_routing, self.top_k)
-            # If standard, we also want to gather from original scores if correct?
-            # Reference actually uses scores_for_routing for topk logic, but gathers from 'scores'.
-            gathered_scores = mx.take_along_axis(scores, inds, axis=-1)
-
-        # Normalize logic from reference:
-        # topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.top_k > 1 else scores
-        # topk_weight = topk_weight * self.routed_scaling_factor
+        
+        # Reshape for routing logic which typically expects 2D [Tokens, Experts] 
+        # (though our implementation handles broadcasting, group_limited_topk assumes 2D)
+        
+        B, L, E = scores_for_routing.shape
+        scores_flat = scores_for_routing.reshape(-1, E)
+        
+        # Routing
+        inds_flat, _ = self.group_limited_topk(scores_flat)
+        
+        # Reshape back to [B, L, k]
+        inds = inds_flat.reshape(B, L, self.top_k)
+        
+        # Gather weights from original scores (sigmoid, no bias)
+        gathered_scores = mx.take_along_axis(scores, inds, axis=-1)
         
         if self.top_k > 1:
             denom = gathered_scores.sum(axis=-1, keepdims=True) + 1e-20
@@ -467,13 +567,21 @@ class SarvamMoEModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = None
         if h.shape[1] > 1:
-             # create mask for sequence
-             # We can rely on scaled_dot_product_attention to handle causal masking if mask is None?
-             # mlx.nn.layers.base.create_attention_mask is usually used.
-             from .base import create_attention_mask
-             mask = create_attention_mask(h, cache[0], return_array=True)
+             # create mask for sequence using helpers
+             if cache is not None and cache[0] is not None:
+                 past_key_values_length = cache[0].offset
+             else:
+                 past_key_values_length = 0
+             
+             mask = _make_causal_mask(
+                 h.shape[:2], 
+                 dtype=h.dtype, 
+                 past_key_values_length=past_key_values_length
+             )
+             # Expand to batch size if needed by broadcasting, but _make_causal_mask returns (1, 1, L, L) usually
+             # or we might need to handle specific logic if we want to match exact torch behavior.
+             # _make_causal_mask above creates (1, 1, L, L), so it broadcasts.
 
         all_router_logits = [] if output_router_logits else None
 
