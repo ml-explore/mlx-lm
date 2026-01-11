@@ -59,6 +59,10 @@ def run_sarvam_transformers():
     model.eval()
     print(f"Model loaded in {time.time() - t1:.2f}s")
 
+    for name, param in model.named_parameters():
+        print(name, type(param), param.device)
+        break
+
     print("Model loaded. Generating text...")
     
     input_text = "What is the capital of India?"
