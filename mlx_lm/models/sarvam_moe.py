@@ -30,6 +30,9 @@ class SarvamMoECausalLMOutputWithPast:
     past_key_values: Optional[List[mx.array]] = None
     hidden_states: Optional[Tuple[mx.array]] = None
     attentions: Optional[Tuple[mx.array]] = None
+
+    z_loss: Optional[mx.array] = None
+    aux_loss: Optional[mx.array] = None
     router_logits: Optional[Tuple[mx.array]] = None
 
 
@@ -643,25 +646,14 @@ class SarvamMoEForCausalLM(nn.Module):
         return out
 
 
-class Model(nn.Module):
+class Model(SarvamMoEForCausalLM):
     def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
+        super().__init__(args)
         self.model_type = args.model_type
-        self.model = SarvamMoEForCausalLM(args)
-
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-        input_embeddings: Optional[mx.array] = None,
-        output_router_logits: bool = False,
-    ):
-        return self.model(inputs, cache, input_embeddings, output_router_logits)
 
     @property
     def layers(self):
-        return self.model.model.layers
+        return self.model.layers
 
     @property
     def head_dim(self):
@@ -670,6 +662,8 @@ class Model(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+
 
     def sanitize(self, weights):
         # Remove unused keys (like FP8 scales) to avoid strict load errors
@@ -769,6 +763,4 @@ class Model(nn.Module):
 
         return weights
 
-    @property
-    def layers(self):
-        return self.model.layers
+
