@@ -1,6 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import math
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -8,7 +8,7 @@ import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_linear
+
 
 from .base import BaseModelArgs, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
@@ -712,8 +712,8 @@ class Model(SarvamMoEForCausalLM):
                 val = mx.concatenate([q, k, v], axis=0)
                 weights[f"{prefix}.query_key_value.weight"] = val
 
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
+        for layer_idx in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}"
             
             # Handle Attention
             # Use 'attention' as in reference/checkpoint. (Was 'self_attn')
