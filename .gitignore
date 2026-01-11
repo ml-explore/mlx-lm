@@ -11,6 +11,9 @@ __pycache__/
 
 ckpt-*/*
 
+sov-30b-fp8/*
+sov-30b-bf16/*
+
 # Distribution / packaging
 .Python
 build/
