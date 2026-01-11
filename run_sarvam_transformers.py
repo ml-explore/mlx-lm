@@ -53,10 +53,10 @@ def run_sarvam_transformers():
     model = SarvamMoEForCausalLM.from_pretrained(
         model_path, 
         config=config, 
-        torch_dtype=torch.bfloat16,
-        device=device
+        torch_dtype=torch.float16,
     )
-    # model.eval()
+    model.to(device)
+    model.eval()
     print(f"Model loaded in {time.time() - t1:.2f}s")
 
     print("Model loaded. Generating text...")
