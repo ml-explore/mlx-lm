@@ -49,6 +49,7 @@ class ModelArgs(BaseModelArgs):
     use_qk_norm: bool = True
     moe_router_enable_expert_bias: bool = True
     routed_scaling_factor: float = 2.5
+    partial_rotary_factor: float = 0.5
     attn_implementation: str = "eager"
 
     def __post_init__(self):
@@ -74,6 +75,7 @@ class SarvamMoEAttention(nn.Module):
         self.n_kv_heads = args.num_key_value_heads
         self.head_dim = args.head_dim or (dim // self.n_heads)
         self.scale = self.head_dim**-0.5
+        self.partial_rotary_factor = args.partial_rotary_factor
 
         # Merged QKV projection
         self.query_key_value = nn.Linear(
@@ -91,8 +93,9 @@ class SarvamMoEAttention(nn.Module):
 
         self.dense = nn.Linear(self.n_heads * self.head_dim, dim, bias=args.use_bias)
 
+        rope_dim = int(self.head_dim * args.partial_rotary_factor)
         self.rope = nn.RoPE(
-            self.head_dim,
+            rope_dim,
             traditional=False,
             base=args.rope_theta,
         )
@@ -107,11 +110,6 @@ class SarvamMoEAttention(nn.Module):
 
         qkv = self.query_key_value(x)
         # Split Q, K, V
-        # qkv shape: [B, L, (n_heads + 2*n_kv_heads) * head_dim]
-        # We need to split carefully.
-        # Construct splits for split_einsum-like behavior or manual slice.
-        # Since merged, the layout typically assumes concatenation along the last dim.
-        
         q_size = self.n_heads * self.head_dim
         kv_size = self.n_kv_heads * self.head_dim
         
@@ -119,26 +117,50 @@ class SarvamMoEAttention(nn.Module):
             qkv, [q_size, q_size + kv_size], axis=-1
         )
         
-        queries = queries.reshape(B, L, self.n_heads, self.head_dim)
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim)
-        values = values.reshape(B, L, self.n_kv_heads, self.head_dim)
+        # Transpose immediately to (B, H, L, D) for easier processing with RoPE and SDPA
+        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         if self.query_layernorm is not None:
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
 
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
+        # Apply Partial RoPE
+        # Input to RoPE is (..., L, D). With queries as (B, H, L, D), this works correctly.
+        if self.partial_rotary_factor < 1.0:
+            query_rot = queries[..., : self.rope.dims]
+            query_pass = queries[..., self.rope.dims :]
+            key_rot = keys[..., : self.rope.dims]
+            key_pass = keys[..., self.rope.dims :]
+            
+            if cache is not None:
+                query_rot = self.rope(query_rot, offset=cache.offset)
+                key_rot = self.rope(key_rot, offset=cache.offset)
+            else:
+                query_rot = self.rope(query_rot)
+                key_rot = self.rope(key_rot)
+                
+            queries = mx.concatenate([query_rot, query_pass], axis=-1)
+            keys = mx.concatenate([key_rot, key_pass], axis=-1)
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
 
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        # Output: (B, H, L, D)
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
-        output = output.reshape(B, L, -1)
+        
+        # Transpose back: (B, H, L, D) -> (B, L, H, D) -> (B, L, Hidden)
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.dense(output)
 
 
