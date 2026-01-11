@@ -387,7 +387,7 @@ class SarvamMoEModel(nn.Module):
              # We can rely on scaled_dot_product_attention to handle causal masking if mask is None?
              # mlx.nn.layers.base.create_attention_mask is usually used.
              from .base import create_attention_mask
-             mask = create_attention_mask(h, cache[0])
+             mask = create_attention_mask(h, cache[0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

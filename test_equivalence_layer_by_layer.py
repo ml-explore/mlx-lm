@@ -264,7 +264,7 @@ def test_decoder_layer():
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=16,
-        partial_rotary_factor=0.5,
+        partial_rotary_factor=1.0,
         first_k_dense_replace=0, # All layers MoE
         rope_theta=10000.0,
         rms_norm_eps=1e-6,
@@ -283,7 +283,7 @@ def test_decoder_layer():
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=16,
-        partial_rotary_factor=0.5,
+        partial_rotary_factor=1.0,
         first_k_dense_replace=0,
         rope_theta=10000.0,
         rms_norm_eps=1e-6,
@@ -351,8 +351,119 @@ def test_decoder_layer():
     # Actually need a mask for cache even if cache is None? No.
     out_mlx = mlx_layer(x_mlx, mask=None)
     
+    
     check_close(out_mlx, out_pt, name="Decoder Layer Output", atol=1e-2)
 
+def test_model():
+    print("\n--- Testing Full SarvamMoEModel ---")
+    config = SarvamMoEConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        partial_rotary_factor=1.0,
+        first_k_dense_replace=0,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        moe_router_enable_expert_bias=True,
+        attn_implementation="eager",
+        vocab_size=1000,
+        num_hidden_layers=2, # Test 2 layers
+    )
+    config._attn_implementation = "eager"
+    
+    args = ModelArgs(
+        model_type="sarvam_moe",
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        partial_rotary_factor=1.0,
+        first_k_dense_replace=0,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        moe_router_enable_expert_bias=True,
+        vocab_size=1000,
+        num_hidden_layers=2,
+    )
+    
+    pt_model = PTSarvamMoEModel(config).eval()
+    mlx_model = SarvamMoEModel(args)
+    
+    # Sync Embeddings
+    # PT: word_embeddings (Embedding)
+    # MLX: embed_tokens (Embedding)
+    # Pytorch Embedding weight is (Num, Dim)
+    # MLX Embedding weight is (Num, Dim)
+    mlx_model.embed_tokens.weight = torch_to_mlx(pt_model.word_embeddings.weight)
+    
+    # Sync Layers
+    for i in range(config.num_hidden_layers):
+        pt_layer = pt_model.layers[i]
+        mlx_layer = mlx_model.layers[i]
+        
+        # Sync Norms
+        copy_weights_norm(mlx_layer.input_layernorm, pt_layer.input_layernorm)
+        copy_weights_norm(mlx_layer.post_attention_layernorm, pt_layer.post_attention_layernorm)
+        
+        # Sync Attention
+        copy_weights_linear(mlx_layer.attention.query_key_value, pt_layer.attention.query_key_value)
+        copy_weights_linear(mlx_layer.attention.dense, pt_layer.attention.dense)
+        if config.use_qk_norm:
+            copy_weights_norm(mlx_layer.attention.query_layernorm, pt_layer.attention.query_layernorm)
+            copy_weights_norm(mlx_layer.attention.key_layernorm, pt_layer.attention.key_layernorm)
+            
+        # Sync MLP/MoE
+        mlx_mlp = mlx_layer.mlp
+        pt_mlp = pt_layer.mlp
+        
+        if isinstance(mlx_mlp, SarvamMoESparseMoeBlock):
+            mlx_mlp.gate.weight = torch_to_mlx(pt_mlp.gate.weight)
+            if config.moe_router_enable_expert_bias:
+                mlx_mlp.gate.expert_bias = torch_to_mlx(pt_mlp.gate.expert_bias)
+                
+            gate_w, up_w, down_w = [], [], []
+            for e in range(config.num_experts):
+                gate_w.append(pt_mlp.experts[e].gate_proj.weight)
+                up_w.append(pt_mlp.experts[e].up_proj.weight)
+                down_w.append(pt_mlp.experts[e].down_proj.weight)
+            
+            mlx_mlp.experts.switch_mlp.gate_proj.weight = torch_to_mlx(torch.stack(gate_w))
+            mlx_mlp.experts.switch_mlp.up_proj.weight = torch_to_mlx(torch.stack(up_w))
+            mlx_mlp.experts.switch_mlp.down_proj.weight = torch_to_mlx(torch.stack(down_w))
+            
+            if pt_mlp.shared_experts:
+                copy_weights_linear(mlx_mlp.shared_experts.gate_proj, pt_mlp.shared_experts.gate_proj)
+                copy_weights_linear(mlx_mlp.shared_experts.up_proj, pt_mlp.shared_experts.up_proj)
+                copy_weights_linear(mlx_mlp.shared_experts.down_proj, pt_mlp.shared_experts.down_proj)
+
+    # Sync Final Norm
+    copy_weights_norm(mlx_model.norm, pt_model.norm)
+
+    # Input (Token IDs)
+    B, L = 1, 10
+    x_pt = torch.randint(0, config.vocab_size, (B, L))
+    x_mlx = torch_to_mlx(x_pt)
+    
+    # Forward
+    with torch.no_grad():
+        # PT Model returns (last_hidden_state, ...)
+        # It handles RoPE internally
+        out_pt = pt_model(x_pt).last_hidden_state
+    
+    out_mlx = mlx_model(x_mlx)
+    
+    check_close(out_mlx, out_pt, name="Full Model Output", atol=1e-2)
 
 def test_full_equivalence():
     set_seeds()
@@ -360,6 +471,7 @@ def test_full_equivalence():
     test_mlp()
     test_moe_block()
     test_decoder_layer()
+    test_model()
 
 if __name__ == "__main__":
     test_full_equivalence()
