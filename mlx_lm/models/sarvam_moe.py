@@ -197,7 +197,13 @@ class SarvamMoEGate(nn.Module):
         self.topk_group = args.topk_group
         self.routed_scaling_factor = args.routed_scaling_factor
         
-        self.weight = nn.Linear(args.hidden_size, args.num_experts, bias=False)
+        # Use direct parameter for weight to match checkpoint structure (nn.Parameter in Torch)
+        # Shape: (num_experts, hidden_size)
+        scale = args.hidden_size ** -0.5
+        self.weight = mx.random.uniform(
+            low=-scale, high=scale,
+            shape=(args.num_experts, args.hidden_size)
+        )
         
         if args.moe_router_enable_expert_bias:
             self.expert_bias = mx.zeros((args.num_experts,))
@@ -205,7 +211,9 @@ class SarvamMoEGate(nn.Module):
             self.expert_bias = None
 
     def __call__(self, x: mx.array):
-        logits = self.weight(x)
+        # x: [B, L, H], weight: [E, H]
+        # logits: [B, L, E] = x @ weight.T
+        logits = x @ self.weight.T
         scores = mx.sigmoid(logits)
         
         scores_for_routing = scores
@@ -299,8 +307,8 @@ class SarvamMoEDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.hidden_size = args.hidden_size
-        self.self_attn = SarvamMoEAttention(args) # Renamed from Attention
-        
+        self.attention = SarvamMoEAttention(args) # Renamed to match reference and checkpoint
+
         self.input_layernorm = SarvamMoERMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = SarvamMoERMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -320,7 +328,7 @@ class SarvamMoEDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.attention(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -388,6 +396,11 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
+        # Remove unused keys (like FP8 scales) to avoid strict load errors
+        keys_to_remove = [k for k in weights.keys() if "input_scale" in k or "weight_scale" in k]
+        for k in keys_to_remove:
+            weights.pop(k, None)
+
         # Remove unused weights
         # Reference uses 'word_embeddings' but we use 'embed_tokens' in MLX standard
         # So we might need to map 'model.word_embeddings.weight' -> 'model.embed_tokens.weight'
@@ -428,8 +441,11 @@ class Model(nn.Module):
             prefix = f"model.layers.{l}"
             
             # Handle Attention
-            # Use 'self_attn' as in reference
-            attn_prefix = f"{prefix}.self_attn"
+            # Use 'attention' as in reference/checkpoint. (Was 'self_attn')
+            attn_prefix = f"{prefix}.attention"
+            
+            # If resulting weights use 'self_attn' (e.g. from some other conversion), mapping might be needed.
+            # But error log says checkpoint has 'attention'.
             
             # If weights have q_proj, k_proj, v_proj, merge them into query_key_value
             merge_qkv(attn_prefix)
