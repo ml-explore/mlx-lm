@@ -52,7 +52,7 @@ def run_sarvam_transformers():
     model = AutoModelForCausalLM.from_pretrained(
         model_path, 
         config=config, 
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         trust_remote_code=True,
     )
     model.to(device)
