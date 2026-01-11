@@ -223,6 +223,26 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
+def repeat_kv(x: mx.array, n_rep: int) -> mx.array:
+    if n_rep == 1:
+        return x
+    B, n_kv_heads, L, D = x.shape
+    x = mx.expand_dims(x, axis=2)
+    x = mx.repeat(x, n_rep, axis=2)
+    return x.reshape(B, n_kv_heads * n_rep, L, D)
+
+
+
+class SarvamMoEMLP(nn.Module):
+    def __init__(self, args: ModelArgs, intermediate_size: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
 class SarvamMoEAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -286,6 +306,10 @@ class SarvamMoEAttention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
+        n_rep = self.n_heads // self.n_kv_heads
+        keys = repeat_kv(keys, n_rep)
+        values = repeat_kv(values, n_rep)
+
         # Output: (B, H, L, D)
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -295,16 +319,6 @@ class SarvamMoEAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.dense(output)
 
-
-class SarvamMoEMLP(nn.Module):
-    def __init__(self, args: ModelArgs, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class SarvamMoEGate(nn.Module):
