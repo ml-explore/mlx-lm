@@ -58,14 +58,20 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+
 
         self.rope = nn.RoPE(
             head_dim,
             traditional=False,
             base=args.rope_theta,
         )
+
+        if getattr(args, "use_qk_norm", False):
+            self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+            self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
     def __call__(
         self,
@@ -78,13 +84,17 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, -1)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1)
+        values = values.reshape(B, L, self.n_kv_heads, -1)
+
+        if self.q_norm is not None:
+            queries = self.q_norm(queries)
+            keys = self.k_norm(keys)
+
+        queries = queries.transpose(0, 2, 1, 3)
+        keys = keys.transpose(0, 2, 1, 3)
+        values = values.transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -196,6 +206,8 @@ class SarvamMoESparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
+        if self.expert_bias is not None:
+            gates += self.expert_bias
         gates = mx.sigmoid(gates)
 
         k = self.top_k
@@ -242,10 +254,8 @@ class SarvamMoEDecoderLayer(nn.Module):
         decoder_sparse_step = getattr(args, "decoder_sparse_step", 1)
 
         is_moe_layer = (
-            layer_idx not in mlp_only_layers
-            and args.num_experts > 0
+            args.num_experts > 0
             and layer_idx >= first_k_dense
-            and (layer_idx + 1) % decoder_sparse_step == 0
         )
 
         if is_moe_layer:
@@ -328,12 +338,52 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        # Handle weight conversion from individual experts to switch format
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
-            return weights
+        def split_qkv(qkv, n_heads, n_kv_heads, head_dim):
+            q_dim = n_heads * head_dim
+            k_dim = n_kv_heads * head_dim
+            return mx.split(qkv, [q_dim, q_dim + k_dim], axis=0)
+
+        def split_gate_up(gate_up):
+            return mx.split(gate_up, 2, axis=0)
 
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
+            
+            # QKV projection
+            if f"{prefix}.self_attn.qkv_proj.weight" in weights:
+                qkv = weights.pop(f"{prefix}.self_attn.qkv_proj.weight")
+                q, k, v = split_qkv(
+                    qkv, 
+                    self.args.num_attention_heads, 
+                    self.args.num_key_value_heads, 
+                    self.args.head_dim
+                )
+                weights[f"{prefix}.self_attn.q_proj.weight"] = q
+                weights[f"{prefix}.self_attn.k_proj.weight"] = k
+                weights[f"{prefix}.self_attn.v_proj.weight"] = v
+
+            # Dense/Shared MLP GateUp
+            if f"{prefix}.mlp.gate_up_proj.weight" in weights:
+                gu = weights.pop(f"{prefix}.mlp.gate_up_proj.weight")
+                g, u = split_gate_up(gu)
+                weights[f"{prefix}.mlp.gate_proj.weight"] = g
+                weights[f"{prefix}.mlp.up_proj.weight"] = u
+
+            if f"{prefix}.mlp.shared_experts.gate_up_proj.weight" in weights:
+                gu = weights.pop(f"{prefix}.mlp.shared_experts.gate_up_proj.weight")
+                g, u = split_gate_up(gu)
+                weights[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = g
+                weights[f"{prefix}.mlp.shared_experts.up_proj.weight"] = u
+
+            # Handle expert weights (split GateUp if needed)
+            for e in range(self.args.num_experts):
+                if f"{prefix}.mlp.experts.{e}.gate_up_proj.weight" in weights:
+                     gu = weights.pop(f"{prefix}.mlp.experts.{e}.gate_up_proj.weight")
+                     g, u = split_gate_up(gu)
+                     weights[f"{prefix}.mlp.experts.{e}.gate_proj.weight"] = g
+                     weights[f"{prefix}.mlp.experts.{e}.up_proj.weight"] = u
+
+            # Stack experts for SwitchGLU
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
                     to_join = [
@@ -341,6 +391,7 @@ class Model(nn.Module):
                         for e in range(self.args.num_experts)
                     ]
                     weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
