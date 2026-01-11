@@ -14,7 +14,7 @@ echo "Converting model from: $MODEL_PATH"
 echo "Output path: $QUANTIZED_MODEL_PATH"
 
 # Convert and quantize sarvam_moe from provided path to 4 bits (mxfp4)
-python -m mlx_lm.convert \
+python3 -m mlx_lm.convert \
   --hf-path "$MODEL_PATH" \
   -q \
   --q-bits 4 \
@@ -23,7 +23,7 @@ python -m mlx_lm.convert \
   --mlx-path "$QUANTIZED_MODEL_PATH"
 
 # Generate text using the quantized model
-python -m mlx_lm.generate \
+python3 -m mlx_lm.generate \
   --model "$QUANTIZED_MODEL_PATH" \
   --prompt "What is the capital of France?" \
   --max-tokens 50
