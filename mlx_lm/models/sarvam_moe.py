@@ -553,6 +553,7 @@ class SarvamMoEModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        mask = None
         if h.shape[1] > 1:
              # create mask for sequence using helpers
              if cache is not None and cache[0] is not None:
