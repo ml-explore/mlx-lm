@@ -1,8 +1,7 @@
 
 import sys
 import torch
-from transformers import AutoTokenizer
-from mlx_lm.models.sarvam_moe_transformers import SarvamMoEForCausalLM, SarvamMoEConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 def run_sarvam_transformers():
     if len(sys.argv) < 2:
@@ -34,12 +33,12 @@ def run_sarvam_transformers():
     # 2. Load Model
     t1 = time.time()
     try:
-        config = SarvamMoEConfig.from_pretrained(model_path)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except Exception as e:
-        print(f"Could not load SarvamMoEConfig from {model_path}: {e}")
+        print(f"Could not load AutoConfig from {model_path}: {e}")
         raise e
 
-    print("Initializing SarvamMoEForCausalLM...")
+    print("Initializing AutoModelForCausalLM...")
     
     # Determine device
     if torch.backends.mps.is_available():
@@ -50,10 +49,11 @@ def run_sarvam_transformers():
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    model = SarvamMoEForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_path, 
         config=config, 
         torch_dtype=torch.float16,
+        trust_remote_code=True,
     )
     model.to(device)
     model.eval()
@@ -63,7 +63,15 @@ def run_sarvam_transformers():
         print(name, type(param), param.device)
         break
 
-    print("Model loaded. Generating text...")
+    print("Model loaded. Running single forward pass...")
+    test_input = tokenizer("Hello", return_tensors="pt").to(device)
+    with torch.no_grad():
+        t_test = time.time()
+        out = model(**test_input)
+        print(f"Forward pass successful in {time.time() - t_test:.2f}s")
+        print("Logits (last token, first 5):", out.logits[:, -1, :5])
+
+    print("Generating text...")
     
     input_text = "What is the capital of India?"
     inputs = tokenizer(input_text, return_tensors="pt").to(device)
