@@ -13,20 +13,26 @@ def run_sarvam_transformers():
 
     print(f"Loading model from {model_path}...")
     
+    import time
+    import os
+    
+    # Check for incomplete downloads
+    for root, dirs, files in os.walk(model_path):
+        for file in files:
+            if file.endswith(".gstmp"):
+                print(f"WARNING: Found temporary file {file}. Your download might be incomplete.")
+
+    t0 = time.time()
     # 1. Load Tokenizer
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
     except Exception as e:
-        print(f"Failed to load tokenizer from {model_path}, trying default implementation if applicable or erroring out: {e}")
-        # Fallback to a common tokenizer if appropriate or re-raise
-        # tokenizer = AutoTokenizer.from_pretrained("sarvamai/sarvam-2b-v0.5")
+        print(f"Failed to load tokenizer from {model_path}: {e}")
         raise e
+    print(f"Tokenizer loaded in {time.time() - t0:.2f}s")
 
     # 2. Load Model
-    # We might need to manually register if not using trust_remote_code=True with auto_map
-    # Since we have the class imported, we can load weights directly if the config matches
-    
-    # Check if config exists or load it
+    t1 = time.time()
     try:
         config = SarvamMoEConfig.from_pretrained(model_path)
     except Exception as e:
@@ -34,12 +40,6 @@ def run_sarvam_transformers():
         raise e
 
     print("Initializing SarvamMoEForCausalLM...")
-    # Using from_pretrained with the class directly
-    # Note: If weights are sharded or in safetensors, from_pretrained handles it.
-    # We use torch_dtype=torch.float16 or bfloat16 to avoid OOM if possible, though user said fp8 checkpoint?
-    # Transformers doesn't natively support loading FP8 in generic models easily without bitsandbytes or specific support.
-    # If the checkpoint IS fp8, it might need specific handling or just load it.
-    # Assuming standard loading for now.
     
     # Determine device
     if torch.backends.mps.is_available():
@@ -56,12 +56,15 @@ def run_sarvam_transformers():
         torch_dtype=torch.bfloat16, 
     )
     model.to(device)
+    model.eval()
+    print(f"Model loaded in {time.time() - t1:.2f}s")
 
     print("Model loaded. Generating text...")
     
     input_text = "What is the capital of India?"
     inputs = tokenizer(input_text, return_tensors="pt").to(device)
     
+    t2 = time.time()
     with torch.no_grad():
         outputs = model.generate(
             **inputs, 
@@ -69,6 +72,7 @@ def run_sarvam_transformers():
             do_sample=True, 
             temperature=0.7
         )
+    print(f"Generation took {time.time() - t2:.2f}s")
         
     print("Output:")
     print(tokenizer.decode(outputs[0], skip_special_tokens=True))
