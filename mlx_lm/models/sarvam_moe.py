@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-from .base import BaseModelArgs
+from .base import BaseModelArgs, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
 
 
@@ -62,7 +62,12 @@ def _make_causal_mask(
     bsz, tgt_len = input_ids_shape
     mask = mx.full((tgt_len, tgt_len), -1e9, dtype=dtype)
     mask = mx.triu(mask, k=1)
-    mask = mx.expand_dims(mask, axis=[0, 1])  # (1, 1, tgt_len, tgt_len)
+    
+    if past_key_values_length > 0:
+        past_mask = mx.zeros((tgt_len, past_key_values_length), dtype=dtype)
+        mask = mx.concatenate([past_mask, mask], axis=-1)
+        
+    mask = mx.expand_dims(mask, axis=[0, 1])  # (1, 1, tgt_len, tgt_len + past_len)
     return mask
 
 
@@ -89,25 +94,7 @@ def _expand_mask(mask: mx.array, dtype: mx.Dtype, tgt_len: Optional[int] = None)
     return inverted_mask * -1e9
 
 
-def scaled_dot_product_attention(
-    queries: mx.array,
-    keys: mx.array,
-    values: mx.array,
-    cache: Any = None,
-    scale: float = 1.0,
-    mask: Optional[mx.array] = None,
-):
-    try:
-        return mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=scale, mask=mask 
-        )
-    except ValueError:
-        # Fallback for shape mismatches that mx.fast can't handle
-        scores = (queries * scale) @ keys.transpose(0, 1, 3, 2)
-        if mask is not None:
-            scores = scores + mask
-        scores = mx.softmax(scores, axis=-1)
-        return scores @ values
+
 
 
 
