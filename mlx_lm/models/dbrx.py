@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
@@ -107,7 +108,7 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(ffn_dim, d_model, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        current_hidden_states = nn.silu(self.w1(x)) * self.v1(x)
+        current_hidden_states = swiglu(self.w1(x), self.v1(x))
         current_hidden_states = self.w2(current_hidden_states)
         return current_hidden_states
 

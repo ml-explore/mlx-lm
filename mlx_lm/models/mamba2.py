@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_ssm_mask
 from .cache import MambaCache
 from .ssm import ssm_update
@@ -48,7 +49,7 @@ class MambaRMSNormGated(nn.Module):
 
     def __call__(self, hidden_states: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
+            hidden_states = swiglu(gate, hidden_states)
         return mx.fast.rms_norm(hidden_states, self.weight, self.eps)
 
 
