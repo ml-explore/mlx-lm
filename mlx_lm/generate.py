@@ -1251,7 +1251,7 @@ class BatchGenerator:
 def batch_generate(
     model,
     tokenizer,
-    prompts: List[int],
+    prompts: List[List[int]],
     prompt_caches: Optional[List[List[Any]]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
@@ -1265,7 +1265,7 @@ def batch_generate(
     Args:
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
-       prompt (List[List[int]]): The input prompts.
+       prompts (List[List[int]]): The input prompts.
        prompt_caches (List[List[Any]], optional): Pre-computed prompt-caches
           for each input prompt. Note, unlike ``generate_step``, the caches
           won't be updated in-place.
