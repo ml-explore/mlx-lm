@@ -14,6 +14,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
