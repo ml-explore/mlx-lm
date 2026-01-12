@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -12,7 +13,6 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -187,7 +187,7 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(ff_dim, dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        return self.w2(swiglu(self.w1(x), self.w3(x)))
 
 
 class Lfm2DecoderLayer(nn.Module):
