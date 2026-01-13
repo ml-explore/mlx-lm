@@ -139,6 +139,13 @@ class ModelArgs(BaseModelArgs):
     attn_implementation: str = "eager"
     partial_rotary_factor: float = 0.5
 
+    def __post_init__(self):
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+        if self.rope_scaling:
+            if not isinstance(self.rope_scaling, dict):
+                self.rope_scaling = None
+
 
 class SarvamMoERotaryEmbedding(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -176,25 +183,6 @@ class SarvamMoERotaryEmbedding(nn.Module):
         sin = mx.sin(emb) * self.attention_scaling
         
         return cos, sin
-    num_experts_per_tok: int = 6
-    n_group: int = 1
-    topk_group: int = 1
-    moe_intermediate_size: int = 1024
-    first_k_dense_replace: int = 1
-    head_dim: Optional[int] = None
-    output_router_logits: bool = False
-    use_qk_norm: bool = True
-    moe_router_enable_expert_bias: bool = True
-    routed_scaling_factor: float = 2.5
-    partial_rotary_factor: float = 0.5
-    attn_implementation: str = "eager"
-
-    def __post_init__(self):
-        if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
-        if self.rope_scaling:
-            if not isinstance(self.rope_scaling, dict):
-                self.rope_scaling = None
 
 
 class SarvamMoERMSNorm(nn.RMSNorm):
@@ -694,47 +682,8 @@ class Model(SarvamMoEForCausalLM):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        def split_qkv(qkv, n_heads, n_kv_heads, head_dim):
-            # This logic was used when we had separate projections.
-            # Now we use merged query_key_value, so we might NOT need to split if the weights are already merged.
-            # If the weights come from HF, they are typically 'q_proj', 'k_proj', 'v_proj'.
-            pass
-        
-        # Helper to merge QKV if they are separate in weights
-        def merge_qkv(prefix):
-            q = weights.get(f"{prefix}.q_proj.weight")
-            k = weights.get(f"{prefix}.k_proj.weight")
-            v = weights.get(f"{prefix}.v_proj.weight")
-            if q is not None and k is not None and v is not None:
-                # Remove originals
-                del weights[f"{prefix}.q_proj.weight"]
-                del weights[f"{prefix}.k_proj.weight"]
-                del weights[f"{prefix}.v_proj.weight"]
-                
-                # Stack/Concatenate logic
-                # HF definition: 
-                # q: [n_heads * h, dim]
-                # k: [n_kv * h, dim]
-                # v: [n_kv * h, dim]
-                # merged: split(..., [q, k, v] sizes)
-                # So we just concat them along axis 0
-                val = mx.concatenate([q, k, v], axis=0)
-                weights[f"{prefix}.query_key_value.weight"] = val
-
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
-            
-            # Handle Attention
-            # Use 'attention' as in reference/checkpoint. (Was 'self_attn')
-            attn_prefix = f"{prefix}.attention"
-            
-            # If resulting weights use 'self_attn' (e.g. from some other conversion), mapping might be needed.
-            # But error log says checkpoint has 'attention'.
-            
-            # If weights have q_proj, k_proj, v_proj, merge them into query_key_value
-            merge_qkv(attn_prefix)
-            
-            # Handle MLP
             mlp_prefix = f"{prefix}.mlp"
 
             # Check if it is MoE or Dense
@@ -757,23 +706,11 @@ class Model(SarvamMoEForCausalLM):
                     for e in range(self.args.num_experts):
                         key = f"{mlp_prefix}.experts.{e}.{n}.weight"
                         if key in weights:
-                            w = weights.pop(key)
-                            w_list.append(w)
+                            w_list.append(weights.pop(key))
                     
                     if w_list:
                         stacked = mx.stack(w_list)
-                        # Assign to switch_mlp.{n}.weight
-                        # Warning: SwitchGLU in mlx_lm.models.switch_layers expects specific names?
-                        # Usually SwitchGLU has .gate_proj, .up_proj, .down_proj
                         weights[f"{mlp_prefix}.experts.switch_mlp.{n}.weight"] = stacked
-
-            # Rename 'gate' weights if needed. 
-            # Reference: mlp.gate.weight
-            # Our code: mlp.gate.weight (SarvamMoEGate -> self.weight)
-            # So naming is consistent.
-            
-            # Rename gate_up_proj if it exists (some formats)
-            # But the provided reference sarvam_moe_transformers.py shows separate gate_proj and up_proj.
 
         return weights
 
