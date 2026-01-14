@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, _BaseCache
 from .rope_utils import initialize_rope
 
 
@@ -380,3 +381,12 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def make_cache(self):
+        caches = []
+        for layer in self.layers:
+            if layer.self_attn is not None:
+                caches.append(KVCache())
+            else:
+                caches.append(_BaseCache())
+        return caches
