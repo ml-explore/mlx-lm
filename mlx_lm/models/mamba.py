@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs
 from .cache import MambaCache
 
@@ -139,7 +140,7 @@ class MambaBlock(nn.Module):
             y_t, current_state = self.ssm_step(x[:, t], A, current_state)
             y.append(y_t)
         y = mx.stack(y, axis=1)
-        z = self.out_proj(nn.silu(z) * y)
+        z = self.out_proj(swiglu(z, y))
         return z, (new_conv_cache, current_state)
 
     def __call__(self, x, cache):

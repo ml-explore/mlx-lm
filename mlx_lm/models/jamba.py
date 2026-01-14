@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -65,7 +66,7 @@ class JambaMLP(nn.Module):
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class JambaAttention(nn.Module):
@@ -205,7 +206,7 @@ class JambaMambaMixer(nn.Module):
         x = nn.silu(conv_out)
         A = -mx.exp(self.A_log)
         y, ssm_state = self.ssm_step(x, A, ssm_state)
-        z = self.out_proj(nn.silu(z) * y)
+        z = self.out_proj(swiglu(z, y))
         return z, (conv_state, ssm_state)
 
     def __call__(self, x, cache):

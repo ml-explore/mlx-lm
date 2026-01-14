@@ -9,6 +9,7 @@ import mlx.nn as nn
 
 from mlx_lm.models.base import BaseModelArgs, create_attention_mask, create_ssm_mask
 
+from .activations import swiglu
 from .cache import KVCache, MambaCache
 from .ssm import ssm_update
 
@@ -215,7 +216,7 @@ class Mamba(nn.Module):
         if cache:
             cache.advance(out.shape[1])
 
-        out = out * nn.silu(z.flatten(-2))
+        out = swiglu(z.flatten(-2), out)
         return self.out_proj(out)
 
 
@@ -305,7 +306,7 @@ class MLP(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         h = self.gate_up_proj(x)
         hs = mx.split(h, 2, axis=-1)
-        return self.down_proj(nn.silu(hs[0]) * hs[1])
+        return self.down_proj(swiglu(hs[0], hs[1]))
 
 
 class PlamoDecoderLayer(nn.Module):

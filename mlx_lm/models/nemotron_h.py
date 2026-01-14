@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -62,7 +63,7 @@ class MambaRMSNormGated(nn.Module):
 
     def __call__(self, x: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
-            x = x * nn.silu(gate)
+            x = swiglu(gate, x)
         x = mx.unflatten(x, axis=-1, shape=(-1, self.group_size))
         x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
         return self.weight * x.flatten(-2)

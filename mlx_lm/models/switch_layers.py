@@ -6,6 +6,8 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
+
 
 def _gather_sort(x, indices):
     *_, M = indices.shape
@@ -145,11 +147,6 @@ class SwitchLinear(nn.Module):
         if "bias" in self:
             ql.bias = self.bias
         return ql
-
-
-@partial(mx.compile, shapeless=True)
-def swiglu(x, gate):
-    return nn.silu(gate) * x
 
 
 class SwiGLU(nn.Module):
