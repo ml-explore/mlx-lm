@@ -621,11 +621,13 @@ class ArraysCache(_BaseCache):
         B = len(caches)
         cache = cls(n_state)
         for e in range(n_state):
-            c0 = caches[0][e]
-            shape = list(c0.shape)
+            c_init = next(iter(c[e] for c in caches if c[e] is not None))
+            shape = list(c_init.shape)
             shape[0] = B
-            cache[e] = mx.zeros(shape, c0.dtype)
+            cache[e] = mx.zeros(shape, c_init.dtype)
             for i in range(B):
+                if caches[i][e] is None:
+                    continue
                 cache[e][i : i + 1] = caches[i][e]
         return cache
 
@@ -948,7 +950,7 @@ class BatchKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, c) in enumerate(zip(padding, caches)):
-            if c.keys is None or c.values is None or c.offset == 0:
+            if c.keys is None:
                 continue
             keys[i : i + 1, :, p : p + c.offset] = c.keys[..., : c.offset, :]
             values[i : i + 1, :, p : p + c.offset] = c.values[..., : c.offset, :]
@@ -1262,7 +1264,7 @@ class BatchRotatingKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, c) in enumerate(zip(padding, caches)):
-            if c.keys is None or c.values is None or c._idx == 0:
+            if c.keys is None:
                 continue
             keys[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.keys)
             values[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.values)
