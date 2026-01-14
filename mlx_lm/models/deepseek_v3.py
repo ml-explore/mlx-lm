@@ -368,7 +368,8 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):
-            dtype = weight.dtype
+            dtype = mx.bfloat16
+            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
             bs = 128  # block size
             m, n = weight.shape
             pad_bottom = (-m) % bs
