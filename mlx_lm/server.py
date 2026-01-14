@@ -429,11 +429,12 @@ class ModelProvider:
             model, tokenizer = load(
                 self.cli_args.model,
                 adapter_path=adapter_path,
+                revision=self.cli_args.revision,
                 tokenizer_config=tokenizer_config,
             )
         else:
             model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
+                model_path, adapter_path=adapter_path, revision=self.cli_args.revision, tokenizer_config=tokenizer_config
             )
 
         if self.cli_args.use_default_chat_template:
@@ -457,11 +458,11 @@ class ModelProvider:
             draft_model_path == "default_model"
             and self.cli_args.draft_model is not None
         ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model, revision=self.cli_args.revision)
             validate_draft_tokenizer(draft_tokenizer)
 
         elif draft_model_path is not None and draft_model_path != "default_model":
-            self.draft_model, draft_tokenizer = load(draft_model_path)
+            self.draft_model, draft_tokenizer = load(draft_model_path, revision=self.cli_args.revision)
             validate_draft_tokenizer(draft_tokenizer)
 
         if self.draft_model is None:
@@ -1644,6 +1645,12 @@ def main():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
+    )
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
     )
     args = parser.parse_args()
     if mx.metal.is_available():

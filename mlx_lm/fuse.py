@@ -54,6 +54,12 @@ def parse_arguments() -> argparse.Namespace:
         default="ggml-model-f16.gguf",
         type=str,
     )
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
+    )
     return parser.parse_args()
 
 
@@ -62,7 +68,7 @@ def main() -> None:
     args = parse_arguments()
 
     model, tokenizer, config = load(
-        args.model, adapter_path=args.adapter_path, return_config=True
+        args.model, adapter_path=args.adapter_path, revision=args.revision, return_config=True
     )
 
     fused_linears = [

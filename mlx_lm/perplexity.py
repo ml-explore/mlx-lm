@@ -130,6 +130,12 @@ def main():
     parser.add_argument(
         "--seed", type=int, default=123, help="Random seed for data sampling"
     )
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
+    )
 
     args = parser.parse_args()
 
@@ -139,7 +145,7 @@ def main():
 
     # Load model
     print(f"Loading model from {args.model}...")
-    model, tokenizer = load(args.model)
+    model, tokenizer = load(args.model, revision=args.revision)
 
     # Count parameters
     total_params = get_total_parameters(model)

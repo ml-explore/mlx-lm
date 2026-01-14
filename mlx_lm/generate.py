@@ -209,6 +209,12 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
+    )
     return parser
 
 
@@ -1373,6 +1379,7 @@ def main():
         model_path,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
+        revision=args.revision,
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)

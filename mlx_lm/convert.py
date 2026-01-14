@@ -230,6 +230,14 @@ def configure_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
     )
+
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
+    )
+    
     parser.add_argument(
         "-d",
         "--dequantize",

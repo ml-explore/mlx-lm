@@ -1,17 +1,17 @@
-## MLX LM 
+## MLX LM
 
 MLX LM is a Python package for generating text and fine-tuning large language
 models on Apple silicon with MLX.
 
 Some key features include:
 
-* Integration with the Hugging Face Hub to easily use thousands of LLMs with a
-  single command. 
-* Support for quantizing and uploading models to the Hugging Face Hub.
-* [Low-rank and full model
+- Integration with the Hugging Face Hub to easily use thousands of LLMs with a
+  single command.
+- Support for quantizing and uploading models to the Hugging Face Hub.
+- [Low-rank and full model
   fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
   with support for quantized models.
-* Distributed inference and fine-tuning with `mx.distributed`
+- Distributed inference and fine-tuning with `mx.distributed`
 
 The easiest way to get started is to install the `mlx-lm` package:
 
@@ -53,10 +53,11 @@ mlx_lm.generate -h
 ```
 
 The default model for generation and chat is
-`mlx-community/Llama-3.2-3B-Instruct-4bit`.  You can specify any MLX-compatible
+`mlx-community/Llama-3.2-3B-Instruct-4bit`. You can specify any MLX-compatible
 model with the `--model` flag. Thousands are available in the
 [MLX Community](https://huggingface.co/mlx-community) Hugging Face
-organization.
+organization. You can also load a specific revision (branch, tag, or commit) of
+a model using `--revision`.
 
 ### Python API
 
@@ -142,7 +143,7 @@ print()
 
 The `generate` and `stream_generate` functions accept `sampler` and
 `logits_processors` keyword arguments. A sampler is any callable which accepts
-a possibly batched logits array and returns an array of sampled tokens.  The
+a possibly batched logits array and returns an array of sampled tokens. The
 `logits_processors` must be a list of callables which take the token history
 and current logits as input and return the processed logits. The logits
 processors are applied in order.
@@ -194,7 +195,7 @@ Models can also be converted and quantized directly in the
 [mlx-my-repo](https://huggingface.co/spaces/mlx-community/mlx-my-repo) Hugging
 Face Space.
 
-### Long Prompts and Generations 
+### Long Prompts and Generations
 
 `mlx-lm` has some tools to scale efficiently to long prompts and generations:
 
@@ -214,7 +215,7 @@ cat prompt.txt | mlx_lm.cache_prompt \
   --model mistralai/Mistral-7B-Instruct-v0.3 \
   --prompt - \
   --prompt-cache-file mistral_prompt.safetensors
-``` 
+```
 
 Then use the cached prompt with `mlx_lm.generate`:
 
@@ -246,7 +247,7 @@ Face organization.
 For some models the tokenizer may require you to enable the `trust_remote_code`
 option. You can do this by passing `--trust-remote-code` in the command line.
 If you don't specify the flag explicitly, you will be prompted to trust remote
-code in the terminal when running the model. 
+code in the terminal when running the model.
 
 Tokenizer options can also be set in the Python API. For example:
 
@@ -260,6 +261,7 @@ model, tokenizer = load(
 ### Large Models
 
 > [!NOTE]
+
     This requires macOS 15.0 or higher to work.
 
 Models which are large relative to the total RAM available on the machine can

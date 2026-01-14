@@ -203,6 +203,12 @@ def build_parser():
         help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
+    )
     return parser
 
 
@@ -319,7 +325,7 @@ def run(args, training_callback: TrainingCallback = None):
     )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
+    model, tokenizer = load(args.model, revision=args.revision, tokenizer_config={"trust_remote_code": True})
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)

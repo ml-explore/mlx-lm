@@ -42,6 +42,8 @@ class TestChat(unittest.TestCase):
                 "512",
                 "--system-prompt",
                 "You are a helpful assistant.",
+                "--revision",
+                "abc123",
             ]
         )
 
@@ -55,6 +57,7 @@ class TestChat(unittest.TestCase):
         self.assertEqual(args.max_kv_size, 1024)
         self.assertEqual(args.max_tokens, 512)
         self.assertEqual(args.system_prompt, "You are a helpful assistant.")
+        self.assertEqual(args.revision, "abc123")
 
     @patch("mlx_lm.chat.load")
     @patch("mlx_lm.chat.make_prompt_cache")

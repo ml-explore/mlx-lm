@@ -77,6 +77,12 @@ def setup_arg_parser():
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
     )
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
+    )
     return parser
 
 
@@ -92,6 +98,7 @@ def main():
     model, tokenizer = load(
         args.model,
         adapter_path=args.adapter_path,
+        revision=args.revision,
         tokenizer_config=tokenizer_config,
     )
 

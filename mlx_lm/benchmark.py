@@ -54,6 +54,12 @@ def setup_arg_parser():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--revision",
+        help="Revision to load the model from.",
+        type=str,
+        default=None,
+    )
     return parser
 
 
@@ -79,7 +85,7 @@ def main():
         )
     else:
         model, tokenizer, config = load(
-            args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
+            args.model, revision=args.revision, return_config=True, tokenizer_config={"trust_remote_code": True}
         )
 
     # Empty to avoid early stopping
