@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -142,8 +143,12 @@ class MLPBlock(nn.Module):
             bias=True,
         )
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=True)
+        self.sharding_group = None
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         g = self.router(x)
         experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
         expert_weights = mx.softmax(experts, axis=-1, precise=True)
@@ -152,7 +157,13 @@ class MLPBlock(nn.Module):
         x = self.experts(x, indices)
 
         x = x * mx.expand_dims(expert_weights, axis=-1)
-        return x.sum(axis=-2)
+
+        y = x.sum(axis=-2)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
 
 
 class TransformerBlock(nn.Module):
@@ -267,6 +278,66 @@ class Model(nn.Module):
                 new_weights[k] = v
 
         return new_weights
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        R = group.rank()
+
+        # GPT_OSS bias is a 2d array not a 3d array, so we need to shard it slightly differently
+        segments: int = 1
+
+        def _all_to_sharded(path: str, weight: mx.array):
+            if path.endswith("bias"):
+                return weight.ndim - 1, segments
+            return max(weight.ndim - 2, 0), segments
+
+        def _sharded_to_all(path: str, weight: mx.array):
+            if path.endswith("bias"):
+                weight /= N
+                return None
+            return -1, segments
+
+        for layer in model.layers:
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, sharding="all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, sharding="all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, sharding="all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, sharding="sharded-to-all", group=group
+            )
+
+            layer.self_attn.num_attention_heads //= N
+            layer.self_attn.num_key_value_heads //= N
+            layer.self_attn.num_key_value_groups = (
+                layer.self_attn.num_attention_heads
+                // layer.self_attn.num_key_value_heads
+            )
+
+            layer.self_attn.sinks = layer.self_attn.sinks[
+                layer.self_attn.num_attention_heads
+                * R : layer.self_attn.num_attention_heads
+                * (R + 1)
+            ]
+
+            shard_inplace(
+                layer.mlp.experts.gate_proj, sharding=_all_to_sharded, group=group
+            )
+            shard_inplace(
+                layer.mlp.experts.down_proj, sharding=_sharded_to_all, group=group
+            )
+            shard_inplace(
+                layer.mlp.experts.up_proj, sharding=_all_to_sharded, group=group
+            )
+
+            layer.mlp.sharding_group = self.group
+
+        return model
 
     @property
     def layers(self):
