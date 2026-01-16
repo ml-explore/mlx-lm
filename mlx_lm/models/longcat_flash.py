@@ -8,6 +8,7 @@ import mlx.nn as nn
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -39,6 +40,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     norm_topk_prob: bool = False
     router_bias: bool = False
+    rope_scaling: Optional[Dict] = None
 
 
 class LongcatFlashMLA(nn.Module):
@@ -94,8 +96,20 @@ class LongcatFlashMLA(nn.Module):
         if args.mla_scale_kv_lora:
             self.mla_scale_kv_lora = (args.hidden_size / self.kv_lora_rank) ** 0.5
 
-        self.rope = nn.RoPE(
-            dims=self.qk_rope_head_dim, base=args.rope_theta, traditional=True
+        if args.rope_scaling is not None:
+            mscale_all_dim = args.rope_scaling.get("mscale_all_dim", 0)
+            if mscale_all_dim:
+                scaling_factor = args.rope_scaling["factor"]
+                if scaling_factor > 1:
+                    s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
+                    self.scale = self.scale * s * s
+
+        self.rope = initialize_rope(
+            dims=self.qk_rope_head_dim,
+            base=args.rope_theta,
+            traditional=True,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
