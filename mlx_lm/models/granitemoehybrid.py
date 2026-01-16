@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -75,7 +76,7 @@ class GraniteMoeHybridRMSNormGated(nn.Module):
 
     def __call__(self, hidden_states: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
+            hidden_states = swiglu(gate, hidden_states)
         return mx.fast.rms_norm(hidden_states, self.weight, self.eps)
 
 
@@ -337,7 +338,7 @@ class GraniteMoeHybridSharedMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         gate, up = mx.split(self.input_linear(x), 2, axis=-1)
-        return self.output_linear(nn.silu(gate) * up)
+        return self.output_linear(swiglu(gate, up))
 
 
 class GraniteMoeHybridMLP(nn.Module):
@@ -352,7 +353,7 @@ class GraniteMoeHybridMLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=mlp_bias)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class GraniteMoeHybridLayer(nn.Module):

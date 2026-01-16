@@ -75,11 +75,11 @@ def main():
 
     if group.size() > 1:
         model, tokenizer, config = sharded_load(
-            args.model, pipeline_group, tensor_group, return_config=True
+            model_path, pipeline_group, tensor_group, return_config=True
         )
     else:
         model, tokenizer, config = load(
-            args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
+            model_path, return_config=True, tokenizer_config={"trust_remote_code": True}
         )
 
     # Empty to avoid early stopping

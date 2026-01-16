@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 
@@ -151,7 +152,7 @@ class YoutuLLMMLP(nn.Module):
         )
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class YoutuLLMDecoderLayer(nn.Module):

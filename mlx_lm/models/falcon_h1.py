@@ -6,6 +6,7 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -81,14 +82,14 @@ class FalconH1RMSNormGated(nn.Module):
 
     def __call__(self, hidden_states, gate=None):
         if not self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
+            hidden_states = swiglu(gate, hidden_states)
 
         hidden_states = mx.fast.rms_norm(
             hidden_states, self.weight, self.variance_epsilon
         )
 
         if self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
+            hidden_states = swiglu(gate, hidden_states)
         return hidden_states
 
 
@@ -329,7 +330,7 @@ class FalconH1Mixer(nn.Module):
         if self.mamba_rms_norm:
             y = self.norm(y, gate)
         else:
-            y = y * nn.silu(gate)
+            y = swiglu(gate, y)
 
         return self.out_proj(y)
 
@@ -347,7 +348,7 @@ class FalconH1MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=args.mlp_bias)
 
     def __call__(self, x):
-        y = self.up_proj(x) * nn.silu(self.gate_proj(x))
+        y = swiglu(self.gate_proj(x), self.up_proj(x))
         y = self.down_proj(y)
         return y
 

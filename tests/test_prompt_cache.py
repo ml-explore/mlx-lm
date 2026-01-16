@@ -590,6 +590,29 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(k.shape[2], 10)
         self.assertEqual(v.shape[2], 10)
 
+    def test_merge_with_empty_caches(self):
+        c1 = ArraysCache(2)
+        c2 = ArraysCache(2)
+        c2[0] = mx.zeros((1, 4))
+        c2[1] = mx.zeros((1, 4))
+        c_out = ArraysCache.merge((c1, c2))
+        self.assertEqual(c_out[0].shape, (2, 4))
+        self.assertEqual(c_out[1].shape, (2, 4))
+
+        c1 = KVCache()
+        c2 = KVCache()
+        kv = mx.zeros((1, 4, 4, 4))
+        c2.update_and_fetch(kv, kv)
+        c_out = KVCache.merge((c1, c2))
+        self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
+
+        c1 = RotatingKVCache(max_size=4)
+        c2 = RotatingKVCache(max_size=4)
+        kv = mx.zeros((1, 4, 4, 4))
+        c2.update_and_fetch(kv, kv)
+        c_out = KVCache.merge((c1, c2))
+        self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

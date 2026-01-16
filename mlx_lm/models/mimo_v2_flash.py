@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .switch_layers import SwitchGLU
@@ -139,7 +140,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x):
-        down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
         return down_proj
 
 
@@ -319,7 +320,8 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):
-            dtype = weight.dtype
+            dtype = mx.bfloat16
+            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
             bs = 128  # block size
             m, n = weight.shape
             pad_bottom = bs * scale_inv.shape[0] - m
