@@ -470,8 +470,6 @@ class Model(nn.Module):
             if name.endswith("embed_tokens.weight"):
                 param *= args.embedding_multiplier
             elif name.endswith("lm_head.weight"):
-                if args.tie_word_embeddings:
-                    continue
                 param *= args.lm_head_multiplier
             elif name.endswith("q_proj.weight") or name.endswith("k_proj.weight"):
                 param *= args.attention_in_multiplier
