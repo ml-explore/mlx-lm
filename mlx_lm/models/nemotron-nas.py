@@ -342,11 +342,17 @@ class NemotronNASModel(nn.Module):
         h = self.embed_tokens(inputs)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * self.num_attn_layers
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        cache_idx = 0
+        for layer in self.layers:
+            if layer.self_attn is not None:
+                c = cache[cache_idx]
+                cache_idx += 1
+            else:
+                c = None
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
