@@ -70,6 +70,7 @@ class ModelArgs(BaseModelArgs):
     )
     ssm_out_multiplier: float = 0.23570226039551587
     vocab_size: int = 32784
+    tie_word_embeddings: bool = True
 
 
 class FalconH1RMSNormGated(nn.Module):
@@ -444,11 +445,16 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = FalconH1Model(args=args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs, cache=None):
         hidden_states = self.model(inputs, cache=cache)
-        return self.lm_head(hidden_states)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(hidden_states)
+            return out * (self.args.lm_head_multiplier / self.args.embedding_multiplier)
+        else:
+            return self.lm_head(hidden_states)
 
     def sanitize(self, weights):
         # Check if needs sanitization
