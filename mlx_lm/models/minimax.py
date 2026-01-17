@@ -278,6 +278,7 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        rank = group.rank()
         for layer in self.model.layers:
             # Shard the self attention
             layer.self_attn.q_proj = shard_linear(
@@ -292,18 +293,32 @@ class Model(nn.Module):
             layer.self_attn.o_proj = shard_linear(
                 layer.self_attn.o_proj, "sharded-to-all", group=group
             )
+            if layer.self_attn.use_qk_norm:
+                layer.self_attn.q_norm.weight = layer.self_attn.q_norm.weight.split(
+                    N, axis=-1
+                )[rank]
+                layer.self_attn.k_norm.weight = layer.self_attn.k_norm.weight.split(
+                    N, axis=-1
+                )[rank]
+
             layer.self_attn.num_attention_heads //= N
             layer.self_attn.num_key_value_heads //= N
 
             # Shard the MLP
-            layer.block_sparse_moe.gate_proj = shard_linear(
-                layer.block_sparse_moe.gate_proj, "all-to-sharded", group=group
+            shard_inplace(
+                layer.block_sparse_moe.switch_mlp.gate_proj,
+                "all-to-sharded",
+                group=group,
             )
-            layer.block_sparse_moe.down_proj = shard_linear(
-                layer.block_sparse_moe.down_proj, "sharded-to-all", group=group
+            shard_inplace(
+                layer.block_sparse_moe.switch_mlp.down_proj,
+                "sharded-to-all",
+                group=group,
             )
-            layer.block_sparse_moe.up_proj = shard_linear(
-                layer.block_sparse_moe.up_proj, "all-to-sharded", group=group
+            shard_inplace(
+                layer.block_sparse_moe.switch_mlp.up_proj,
+                "all-to-sharded",
+                group=group,
             )
             layer.block_sparse_moe.sharding_group = group
 
