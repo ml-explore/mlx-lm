@@ -284,21 +284,7 @@ class Model(nn.Module):
         N = group.size()
         R = group.rank()
 
-        # GPT_OSS bias is a 2d array not a 3d array, so we need to shard it slightly differently
-        segments: int = 1
-
-        def _all_to_sharded(path: str, weight: mx.array):
-            if path.endswith("bias"):
-                return weight.ndim - 1, segments
-            return max(weight.ndim - 2, 0), segments
-
-        def _sharded_to_all(path: str, weight: mx.array):
-            if path.endswith("bias"):
-                weight /= N
-                return None
-            return -1, segments
-
-        for layer in model.layers:
+        for layer in self.model.layers:
             layer.self_attn.q_proj = shard_linear(
                 layer.self_attn.q_proj, sharding="all-to-sharded", group=group
             )
@@ -325,19 +311,14 @@ class Model(nn.Module):
                 * (R + 1)
             ]
 
+            shard_inplace(layer.mlp.experts.gate_proj, "all-to-sharded", group=group)
+            shard_inplace(layer.mlp.experts.down_proj, "sharded-to-all", group=group)
+            layer.mlp.experts.down_proj.bias /= N
             shard_inplace(
-                layer.mlp.experts.gate_proj, sharding=_all_to_sharded, group=group
-            )
-            shard_inplace(
-                layer.mlp.experts.down_proj, sharding=_sharded_to_all, group=group
-            )
-            shard_inplace(
-                layer.mlp.experts.up_proj, sharding=_all_to_sharded, group=group
+                layer.mlp.experts.up_proj, sharding="all-to-sharded", group=group
             )
 
-            layer.mlp.sharding_group = self.group
-
-        return model
+            layer.mlp.sharding_group = group
 
     @property
     def layers(self):
