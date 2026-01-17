@@ -146,9 +146,6 @@ class _BaseCache:
     def is_trimmable(self):
         return False
 
-    def is_empty(self):
-        return True
-
     def __len__(self):
         """The length of a cache is meant to represent the number of elements
         that we need to process in the attention. For instance for KVCache it
@@ -341,9 +338,6 @@ class KVCache(_BaseCache):
 
     def __len__(self):
         return self.offset
-
-    def is_empty(self):
-        return self.keys is None
 
     @property
     def state(self):
@@ -573,9 +567,6 @@ class ArraysCache(_BaseCache):
     def __getitem__(self, idx):
         return self.cache[idx]
 
-    def is_empty(self):
-        return all(x is None for x in self.cache)
-
     @property
     def state(self):
         return self.cache
@@ -726,9 +717,6 @@ class CacheList(_BaseCache):
 
     def __getitem__(self, idx):
         return self.caches[idx]
-
-    def is_empty(self):
-        return all(c.is_empty() for c in self.caches)
 
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
