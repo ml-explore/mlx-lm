@@ -1023,10 +1023,7 @@ class BatchGenerator:
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
-        if hasattr(caches[0][0], "keys"):
-            cache_is_empty = all(c[0].keys is None for c in caches)
-        else:
-            cache_is_empty = all(c[0][0] is None for c in caches)
+        cache_is_empty = all(c[0].is_empty() for c in caches)
 
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
