@@ -79,6 +79,7 @@ class MLXLM(LM):
         self,
         path_or_hf_repo: str,
         max_tokens: Optional[int] = None,
+        batch_size: int = 8,
         use_chat_template: Optional[bool] = None,
         trust_remote_code: bool = False,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -89,7 +90,7 @@ class MLXLM(LM):
             path_or_hf_repo, tokenizer_config=tokenizer_config
         )
         self._max_tokens = max_tokens
-        self._batch_size = 8
+        self._batch_size = batch_size
         self.use_chat_template = use_chat_template
         if use_chat_template is None:
             self.use_chat_template = self.tokenizer.chat_template is not None
@@ -476,6 +477,7 @@ def main():
     lm = MLXLM(
         args.model,
         max_tokens=args.max_tokens,
+        batch_size=args.batch_size,
         use_chat_template=args.apply_chat_template,
         trust_remote_code=args.trust_remote_code,
         sampler=sampler,
