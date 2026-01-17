@@ -154,7 +154,7 @@ class SwiGLU(nn.Module):
         super().__init__()
 
     def __call__(self, x, gate):
-        return swiglu(x, gate)
+        return swiglu(gate, x)
 
 
 class SwitchGLU(nn.Module):
