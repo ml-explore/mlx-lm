@@ -72,6 +72,7 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
+    "report_accuracy": False,
     "report_to": None,
     "project_name": None,
 }
@@ -197,6 +198,12 @@ def build_parser():
         help="Services to report logs to ('wandb', 'swanlab', or 'wandb,swanlab').",
     )
     parser.add_argument(
+        "--report-accuracy",
+        action="store_true",
+        help="Display token-level accuracy metrics during training/validation/test reporting",
+        default=None,
+    )
+    parser.add_argument(
         "--project-name",
         type=str,
         default=None,
@@ -262,6 +269,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        report_accuracy=args.report_accuracy,
     )
 
     # Initialize the selected optimizer
@@ -296,17 +304,28 @@ def train_model(
 
 
 def evaluate_model(args, model: nn.Module, test_set):
-    test_loss = evaluate(
+    result = evaluate(
         model=model,
         dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
+        return_accuracy=args.report_accuracy,
     )
+    if args.report_accuracy:
+        test_loss, test_acc = result
+    else:
+        test_loss = result
+        test_acc = None
 
     test_ppl = math.exp(test_loss)
 
-    print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
+    if test_acc is not None:
+        print(
+            f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}, Test acc {(test_acc * 100):.3f}%."
+        )
+    else:
+        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
 
 def run(args, training_callback: TrainingCallback = None):
