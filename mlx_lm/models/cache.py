@@ -109,10 +109,6 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
-def cache_length(cache: List[Any]):
-    return max(len(c) for c in cache)
-
-
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -146,23 +142,20 @@ class _BaseCache:
     def is_trimmable(self):
         return False
 
-    def __len__(self):
-        """The length of a cache is meant to represent the number of elements
-        that we need to process in the attention. For instance for KVCache it
-        is the size of the state, for RotatingKVCache it would be up to
-        max_size etc."""
+    def size(self):
+        """
+        Return the size (i.e. sequence length) of the cache.
+
+        Not every cache is required to implement this, in which case the size
+        will always be 0 (though the cache may not be empty).
+        """
         return 0
 
-    def __bool__(self):
-        """When an object defines __len__ then python defines the bool operator
-        as len(obj) != 0. This, for instance, doesn't allow us to write
-
-            cache = cache or make_cache()
-
-        which is why we are overriding that behaviour with a constant bool
-        operator return True.
+    def empty(self):
         """
-        return True
+        Return if the cache is empty or not.
+        """
+        raise NotImplementedError("Cache sub-class must implement this.")
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -216,6 +209,9 @@ class ConcatenateKVCache(_BaseCache):
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
 
 
 class QuantizedKVCache(_BaseCache):
@@ -303,6 +299,9 @@ class QuantizedKVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
+    def empty(self):
+        return self.keys is None
+
 
 class KVCache(_BaseCache):
     step = 256
@@ -336,7 +335,7 @@ class KVCache(_BaseCache):
         self.values[..., prev : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
-    def __len__(self):
+    def size(self):
         return self.offset
 
     @property
@@ -378,6 +377,9 @@ class KVCache(_BaseCache):
     @classmethod
     def merge(_, caches):
         return BatchKVCache.merge(caches)
+
+    def empty(self):
+        return self.keys is None
 
 
 class RotatingKVCache(_BaseCache):
@@ -487,7 +489,7 @@ class RotatingKVCache(_BaseCache):
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
 
-    def __len__(self):
+    def size(self):
         return min(self.offset, self.max_size)
 
     @property
@@ -553,6 +555,9 @@ class RotatingKVCache(_BaseCache):
     @classmethod
     def merge(_, caches):
         return BatchRotatingKVCache.merge(caches)
+
+    def empty(self):
+        return self.keys is None
 
 
 class ArraysCache(_BaseCache):
@@ -630,6 +635,9 @@ class ArraysCache(_BaseCache):
                     continue
                 cache[e][i : i + 1] = caches[i][e]
         return cache
+
+    def empty(self):
+        return self.cache[0] is None
 
 
 class MambaCache(ArraysCache):
@@ -710,6 +718,9 @@ class ChunkedKVCache(_BaseCache):
     def meta_state(self, v):
         self.chunk_size, self.start_position = map(int, v)
 
+    def empty(self):
+        return self.keys is None
+
 
 class CacheList(_BaseCache):
     def __init__(self, *caches):
@@ -764,6 +775,20 @@ class CacheList(_BaseCache):
 
     def extract(self, idx):
         return CacheList(*(c.extract(idx) for c in self.caches))
+
+    def prepare(self, **kwargs):
+        for c in self.caches:
+            c.prepare(**kwargs)
+
+    def finalize(self):
+        for c in self.caches:
+            c.finalize()
+
+    def size(self):
+        return max(c.size() for c in self.caches)
+
+    def empty(self):
+        return self.caches[0].empty()
 
 
 def dynamic_roll(x, shifts, axis):
@@ -829,9 +854,6 @@ class BatchKVCache(_BaseCache):
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
         return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
-
-    def __len__(self):
-        return self._idx
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
@@ -938,7 +960,7 @@ class BatchKVCache(_BaseCache):
 
     @classmethod
     def merge(cls, caches):
-        lengths = [len(c) for c in caches]
+        lengths = [c.size() for c in caches]
         max_length = max(lengths)
         padding = [max_length - l for l in lengths]
         B = len(caches)
@@ -962,6 +984,9 @@ class BatchKVCache(_BaseCache):
         cache._idx = keys.shape[2]
 
         return cache
+
+    def empty(self):
+        return self.keys is None
 
 
 class BatchRotatingKVCache(_BaseCache):
@@ -1095,9 +1120,6 @@ class BatchRotatingKVCache(_BaseCache):
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
-
-    def __len__(self):
-        return min(self._offset, self.max_size)
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
@@ -1252,7 +1274,7 @@ class BatchRotatingKVCache(_BaseCache):
             )
 
         offsets = [c.offset for c in caches]
-        lengths = [len(c) for c in caches]
+        lengths = [c.size() for c in caches]
         max_length = max(lengths)
         padding = [max_length - l for l in lengths]
         B = len(caches)
@@ -1277,3 +1299,6 @@ class BatchRotatingKVCache(_BaseCache):
         cache._offset = keys.shape[2]
 
         return cache
+
+    def empty(self):
+        return self.keys is None

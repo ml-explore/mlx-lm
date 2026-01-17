@@ -1003,7 +1003,8 @@ class BatchGenerator:
             self.uid_count += 1
         # Sort in ascending order of length
         self.unprocessed_prompts = sorted(
-            self.unprocessed_prompts, key=lambda x: len(x[1]) + cache.cache_length(x[3])
+            self.unprocessed_prompts,
+            key=lambda x: len(x[1]) + max(c.size() for c in x[3]),
         )
         return uids
 
@@ -1023,10 +1024,6 @@ class BatchGenerator:
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
-        if hasattr(caches[0][0], "keys"):
-            cache_is_empty = all(c[0].keys is None for c in caches)
-        else:
-            cache_is_empty = all(c[0][0] is None for c in caches)
 
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
@@ -1040,7 +1037,7 @@ class BatchGenerator:
         # New prompts so
         #   1. Left-pad the inputs
         #   2. Process
-        if cache_is_empty:
+        if all(c[0].empty() for c in caches):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding)
 
