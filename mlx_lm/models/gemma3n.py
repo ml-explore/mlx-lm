@@ -9,9 +9,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
+from .activations import gelu_topk
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
-from .activations import gelu_topk
 
 
 @dataclass

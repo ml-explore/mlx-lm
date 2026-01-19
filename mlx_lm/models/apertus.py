@@ -7,9 +7,9 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import XieLU
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
-from .activations import XieLU
 
 
 @dataclass

@@ -8,10 +8,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
 
+from .activations import _silu_mul
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
-from .activations import _silu_mul
 
 
 @partial(mx.compile, shapeless=True)
