@@ -78,9 +78,7 @@ class Glm4MoeLiteAttention(nn.Module):
             self.q_a_proj = nn.Linear(
                 self.hidden_size, self.q_lora_rank, bias=config.attention_bias
             )
-            self.q_a_layernorm = nn.RMSNorm(
-                self.q_lora_rank, eps=config.rms_norm_eps
-            )
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
@@ -387,6 +385,7 @@ class Model(nn.Module):
 
         num_mpt_layers = getattr(self.args, "num_nextn_predict_layers", 0) or 0
         if num_mpt_layers:
+
             def _is_mpt_layer(key: str) -> bool:
                 for idx in range(num_mpt_layers):
                     if key.startswith(
