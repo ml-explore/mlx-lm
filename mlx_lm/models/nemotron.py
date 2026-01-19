@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .activations import relu_squared
 
 
 @dataclass
@@ -44,11 +45,6 @@ class ModelArgs(BaseModelArgs):
                 )
             if rope_type not in ["linear"]:
                 raise ValueError("rope_scaling 'type' currently only supports 'linear'")
-
-
-@partial(mx.compile, shapeless=True)
-def relu_squared(x):
-    return nn.relu(x).square()
 
 
 class NemotronLayerNorm1P(nn.LayerNorm):

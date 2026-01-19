@@ -13,6 +13,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+from .activations import SwiGLU
 
 
 @dataclass
@@ -43,28 +44,6 @@ def mlx_topk(a, k, axis=-1):
     # Get the corresponding values
     top_k_values = mx.take_along_axis(a, top_k_indices, axis=axis)
     return top_k_values, top_k_indices
-
-
-@partial(mx.compile, shapeless=True)
-def swiglu(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
-    # Clamp the input values
-    x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
-    x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
-
-    glu_scaled = alpha * x_glu
-    sig = mx.sigmoid(glu_scaled)
-
-    out_glu = x_glu * sig
-    # Note we add an extra bias of 1 to the linear layer
-    return out_glu * (x_linear + 1)
-
-
-class SwiGLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def __call__(self, x, gate):
-        return swiglu(x, gate)
 
 
 class AttentionBlock(nn.Module):
