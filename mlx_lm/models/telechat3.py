@@ -14,7 +14,6 @@ from .activations import swiglu
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
-    head_dim: int
     hidden_size: int
     intermediate_size: int
     max_position_embeddings: int
@@ -26,6 +25,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     mlp_bias: bool = False
     attention_bias: bool = False
+    head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
 
