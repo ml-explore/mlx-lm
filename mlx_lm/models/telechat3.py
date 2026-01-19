@@ -10,6 +10,7 @@ from sympy import false
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
+from .activations import swiglu
 
 
 @dataclass
@@ -99,3 +100,41 @@ class Telechat3Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
+
+
+class Telechat3MLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=args.mlp_bias)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
+class Telechat3DecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        self.self_attn = Telechat3Attention(args)
+        self.mlp = Telechat3MLP(args)
+        self.input_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.args = args
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
