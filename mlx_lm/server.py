@@ -1302,7 +1302,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_words,
             )
             if stop_condition.stop_met:
-                finish_reason = "tool_call" if made_tool_call else "stop"
+                finish_reason = "tool_calls" if made_tool_call else "stop"
                 ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
                 text = text[: len(text) - stop_condition.trim_text_length]
