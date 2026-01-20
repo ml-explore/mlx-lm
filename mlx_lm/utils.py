@@ -303,8 +303,6 @@ def load_model(
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:
-        import logging
-        logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
