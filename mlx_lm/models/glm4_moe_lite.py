@@ -54,6 +54,7 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
     mlp_layer_types: Optional[List[str]] = None
+    quantization: Optional[Dict[str, Any]] = None
 
 
 class Glm4MoeLiteAttention(nn.Module):
@@ -108,6 +109,7 @@ class Glm4MoeLiteAttention(nn.Module):
             * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
             bias=False,
         )
+        self._init_presplit_kv_b_proj()
 
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
@@ -131,6 +133,88 @@ class Glm4MoeLiteAttention(nn.Module):
             scaling_config=rope_params,
         )
 
+    def _init_presplit_kv_b_proj(self):
+        quantization = getattr(self.config, "quantization", None)
+        if quantization:
+            bits = int(quantization["bits"])
+            group_size = int(quantization["group_size"])
+            packed_in = (self.kv_lora_rank * bits) // 32
+            group_count = self.kv_lora_rank // group_size
+            self.wk_b_proj_weight = mx.zeros(
+                (self.num_heads, self.qk_nope_head_dim, packed_in), dtype=mx.uint32
+            )
+            self.wv_b_proj_weight = mx.zeros(
+                (self.num_heads, self.v_head_dim, packed_in), dtype=mx.uint32
+            )
+            self.wk_b_proj_scales = mx.zeros(
+                (self.num_heads, self.qk_nope_head_dim, group_count), dtype=mx.float16
+            )
+            self.wv_b_proj_scales = mx.zeros(
+                (self.num_heads, self.v_head_dim, group_count), dtype=mx.float16
+            )
+            if quantization.get("mode", "affine") == "affine":
+                self.wk_b_proj_biases = mx.zeros(
+                    (self.num_heads, self.qk_nope_head_dim, group_count),
+                    dtype=mx.float16,
+                )
+                self.wv_b_proj_biases = mx.zeros(
+                    (self.num_heads, self.v_head_dim, group_count), dtype=mx.float16
+                )
+            else:
+                self.wk_b_proj_biases = None
+                self.wv_b_proj_biases = None
+        else:
+            weight = self.kv_b_proj.weight.reshape(
+                self.num_heads, self.qk_nope_head_dim + self.v_head_dim, -1
+            )
+            self.wk_b_proj_weight = weight[:, : self.qk_nope_head_dim, :]
+            self.wv_b_proj_weight = weight[:, self.qk_nope_head_dim :, :]
+            self.wk_b_proj_scales = None
+            self.wv_b_proj_scales = None
+            self.wk_b_proj_biases = None
+            self.wv_b_proj_biases = None
+
+    def _kv_b_proj_is_quantized(self) -> bool:
+        return hasattr(self.kv_b_proj, "scales") and hasattr(self.kv_b_proj, "bits")
+
+    def _split_kv_b_proj(self):
+        if hasattr(self, "wk_b_proj_weight"):
+            if (
+                self.wk_b_proj_weight.shape[0] == self.num_heads
+                and self.wv_b_proj_weight.shape[0] == self.num_heads
+            ):
+                return (
+                    self.wk_b_proj_weight,
+                    self.wv_b_proj_weight,
+                    getattr(self, "wk_b_proj_scales", None),
+                    getattr(self, "wk_b_proj_biases", None),
+                    getattr(self, "wv_b_proj_scales", None),
+                    getattr(self, "wv_b_proj_biases", None),
+                )
+
+        head_dim = self.qk_nope_head_dim + self.v_head_dim
+        weight = self.kv_b_proj.weight.reshape(self.num_heads, head_dim, -1)
+        wk = weight[:, : self.qk_nope_head_dim, :]
+        wv = weight[:, self.qk_nope_head_dim :, :]
+
+        scales = getattr(self.kv_b_proj, "scales", None)
+        biases = getattr(self.kv_b_proj, "biases", None)
+        if scales is not None:
+            scales = scales.reshape(self.num_heads, head_dim, -1)
+            wk_scales = scales[:, : self.qk_nope_head_dim, :]
+            wv_scales = scales[:, self.qk_nope_head_dim :, :]
+        else:
+            wk_scales = wv_scales = None
+
+        if biases is not None:
+            biases = biases.reshape(self.num_heads, head_dim, -1)
+            wk_biases = biases[:, : self.qk_nope_head_dim, :]
+            wv_biases = biases[:, self.qk_nope_head_dim :, :]
+        else:
+            wk_biases = wv_biases = None
+
+        return wk, wv, wk_scales, wk_biases, wv_scales, wv_biases
+
     def __call__(
         self,
         x: mx.array,
@@ -149,29 +233,60 @@ class Glm4MoeLiteAttention(nn.Module):
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
 
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        wk, wv, wk_scales, wk_biases, wv_scales, wv_biases = self._split_kv_b_proj()
+
+        if self._kv_b_proj_is_quantized():
+            mode = getattr(self.kv_b_proj, "mode", "affine")
+            q_nope_absorbed = mx.quantized_matmul(
+                q_nope,
+                wk,
+                scales=wk_scales,
+                biases=wk_biases,
+                transpose=False,
+                group_size=self.kv_b_proj.group_size,
+                bits=self.kv_b_proj.bits,
+                mode=mode,
+            )
+        else:
+            q_nope_absorbed = mx.matmul(q_nope, wk)
 
         if cache is not None:
             q_pe = self.rope(q_pe, cache.offset)
             k_pe = self.rope(k_pe, cache.offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache.update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), values
-            )
         else:
             q_pe = self.rope(q_pe)
             k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
 
-        queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        keys = mx.concatenate([kv_latent, k_pe], axis=-1)
+        values = kv_latent
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        queries = mx.concatenate([q_nope_absorbed, q_pe], axis=-1)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+
+        if self._kv_b_proj_is_quantized():
+            mode = getattr(self.kv_b_proj, "mode", "affine")
+            output = mx.quantized_matmul(
+                output,
+                wv,
+                scales=wv_scales,
+                biases=wv_biases,
+                transpose=True,
+                group_size=self.kv_b_proj.group_size,
+                bits=self.kv_b_proj.bits,
+                mode=mode,
+            )
+        else:
+            output = mx.matmul(output, wv.transpose(0, 2, 1))
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -409,6 +524,41 @@ class Model(nn.Module):
                 return False
 
             weights = {k: v for k, v in weights.items() if not _is_mpt_layer(k)}
+
+        num_heads = self.args.num_attention_heads
+        head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.self_attn"
+            weight_key = f"{prefix}.kv_b_proj.weight"
+            if weight_key not in weights:
+                continue
+            weight = weights[weight_key].reshape(num_heads, head_dim, -1)
+            weights[f"{prefix}.wk_b_proj_weight"] = weight[
+                :, : self.args.qk_nope_head_dim, :
+            ]
+            weights[f"{prefix}.wv_b_proj_weight"] = weight[
+                :, self.args.qk_nope_head_dim :, :
+            ]
+
+            scales_key = f"{prefix}.kv_b_proj.scales"
+            if scales_key in weights:
+                scales = weights[scales_key].reshape(num_heads, head_dim, -1)
+                weights[f"{prefix}.wk_b_proj_scales"] = scales[
+                    :, : self.args.qk_nope_head_dim, :
+                ]
+                weights[f"{prefix}.wv_b_proj_scales"] = scales[
+                    :, self.args.qk_nope_head_dim :, :
+                ]
+
+            biases_key = f"{prefix}.kv_b_proj.biases"
+            if biases_key in weights:
+                biases = weights[biases_key].reshape(num_heads, head_dim, -1)
+                weights[f"{prefix}.wk_b_proj_biases"] = biases[
+                    :, : self.args.qk_nope_head_dim, :
+                ]
+                weights[f"{prefix}.wv_b_proj_biases"] = biases[
+                    :, self.args.qk_nope_head_dim :, :
+                ]
 
         return weights
 
