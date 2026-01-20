@@ -280,7 +280,10 @@ class TokenizerWrapper:
         self._tool_call_end = tool_call_end
 
         vocab = tokenizer.get_vocab()
-        THINK_TOKENS = [("<think>", "</think>")]
+        THINK_TOKENS = [
+            ("<think>", "</think>"),
+            ("<longcat_think>", "</longcat_think>"),
+        ]
         for think_start, think_end in THINK_TOKENS:
             if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
@@ -461,6 +464,8 @@ def _infer_tool_parser(chat_template):
         return "minimax_m2"
     elif "<start_function_call>" in chat_template:
         return "function_gemma"
+    elif "<longcat_tool_call>" in chat_template:
+        return "longcat"
     elif "<arg_key>" in chat_template:
         return "glm47"
     elif "<tool_call>\n<function=" in chat_template:
