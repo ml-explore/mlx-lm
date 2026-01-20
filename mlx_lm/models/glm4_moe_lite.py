@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -45,15 +45,12 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-5
     rope_theta: float = 1_000_000.0
     rope_scaling: Optional[Dict] = None
-    rope_parameters: Optional[Dict] = None
     rope_traditional: bool = True
-    rope_interleave: Optional[bool] = None
     attention_bias: bool = False
     attention_dropout: float = 0.0
     partial_rotary_factor: float = 1.0
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
-    mlp_layer_types: Optional[List[str]] = None
     quantization: Optional[Dict[str, Any]] = None
 
 
@@ -64,17 +61,13 @@ class Glm4MoeLiteAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
-        rope_params = config.rope_parameters or config.rope_scaling
+        rope_params = config.rope_scaling
         self.rope_theta = (
             rope_params.get("rope_theta", config.rope_theta)
             if rope_params is not None
             else config.rope_theta
         )
-        rope_traditional = (
-            bool(config.rope_interleave)
-            if config.rope_interleave is not None
-            else config.rope_traditional
-        )
+        rope_traditional = config.rope_traditional
         self.q_lora_rank = config.q_lora_rank
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.kv_lora_rank = config.kv_lora_rank
@@ -454,10 +447,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         )
-        if config.mlp_layer_types is not None and layer_idx < len(
-            config.mlp_layer_types
-        ):
-            use_moe = config.mlp_layer_types[layer_idx] == "sparse"
         self.mlp = Glm4MoeLiteMoE(config) if use_moe else Glm4MoeLiteMLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
