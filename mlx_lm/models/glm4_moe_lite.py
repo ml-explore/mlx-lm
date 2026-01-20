@@ -234,6 +234,44 @@ class Glm4MoeLiteAttention(nn.Module):
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         kv_latent = self.kv_a_layernorm(compressed_kv)
+
+        offset_zero = False
+        if cache is not None:
+            offset = cache.offset
+            if isinstance(offset, mx.array):
+                offset_zero = bool(mx.all(offset == 0).item())
+            else:
+                offset_zero = offset == 0
+        use_fast_prefill = L > 1 and (cache is None or offset_zero)
+        if use_fast_prefill:
+            kv = self.kv_b_proj(kv_latent)
+            kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+
+            k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+
+            if cache is not None:
+                q_pe = self.rope(q_pe, cache.offset)
+                k_pe = self.rope(k_pe, cache.offset)
+            else:
+                q_pe = self.rope(q_pe)
+                k_pe = self.rope(k_pe)
+
+            k_pe_full = mx.repeat(k_pe, self.num_heads, axis=1)
+            keys = mx.concatenate([k_nope, k_pe_full], axis=-1)
+            queries = mx.concatenate([q_nope, q_pe], axis=-1)
+
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=None, scale=self.scale, mask=mask
+            )
+
+            if cache is not None:
+                kv_latent_expanded = mx.expand_dims(kv_latent, axis=1)
+                keys_latent = mx.concatenate([kv_latent_expanded, k_pe], axis=-1)
+                cache.update_and_fetch(keys_latent, kv_latent_expanded)
+
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output)
+
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
         wk, wv, wk_scales, wk_biases, wv_scales, wv_biases = self._split_kv_b_proj()
