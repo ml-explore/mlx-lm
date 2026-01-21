@@ -341,7 +341,9 @@ class GenerationArguments:
     max_tokens: int
     num_draft_tokens: int
     logprobs: int
+    logprobs: int
     seed: Optional[int]
+    extra_logits_processors: Optional[List[Callable[[Any, Any], Any]]] = None
 
 
 @dataclass
@@ -623,8 +625,9 @@ class ResponseGenerator:
                         [rest],
                         args.max_tokens,
                         caches=[cache],
+                        caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[_make_logits_processors(args) + (args.extra_logits_processors or [])],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -775,7 +778,7 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _make_logits_processors(args) + (args.extra_logits_processors or [])
 
             # Load the KV cache
             cache, rest = self.prompt_cache.fetch_nearest_cache(

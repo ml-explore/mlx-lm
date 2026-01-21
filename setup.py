@@ -33,6 +33,7 @@ setup(
         "jinja2",
         "fastapi",
         "uvicorn",
+        "outlines",
     ],
     packages=[
         "mlx_lm",

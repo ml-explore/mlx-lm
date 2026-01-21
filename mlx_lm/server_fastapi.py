@@ -24,8 +24,10 @@ from .server import (
     LogitsProcessorArguments,
     ModelDescription,
     CompletionRequest,
+    CompletionRequest,
     get_system_fingerprint
 )
+from .logits_processors import OutlinesLogitsProcessor
 
 # --- Pydantic Models for Input Validation ---
 
@@ -50,6 +52,8 @@ class ChatCompletionRequest(BaseModel):
     repetition_context_size: Optional[int] = 20
     logit_bias: Optional[Dict[int, float]] = None
     seed: Optional[int] = None
+    response_format: Optional[Dict[str, Any]] = None
+    regex: Optional[str] = None
 
 class CompletionRequestModel(BaseModel):
     model: str
@@ -133,6 +137,27 @@ def create_app(cli_args: argparse.Namespace):
             logprobs=0,
             seed=request.seed
         )
+
+        logits_processors = []
+        if request.response_format and request.response_format.get("type") == "json_object":
+             # Basic JSON schema support if provided in schema
+             schema = request.response_format.get("schema")
+             logits_processors.append(OutlinesLogitsProcessor(model_provider.tokenizer, schema_str=schema))
+        elif request.regex:
+             logits_processors.append(OutlinesLogitsProcessor(model_provider.tokenizer, regex_str=request.regex))
+
+        # We need to pass these processors to the generation Logic. 
+        # The current ResponseGenerator/GenerationArguments structure expects LogitsProcessorArguments 
+        # which only supports basic penalties. 
+        # We need to hack or extend.
+        # Since `_make_logits_processors` in server.py is used by ResponseGenerator, it builds lists from args.
+        # We can't easily inject custom object processors via arguments without modifying server.py or sub-classing.
+        
+        # Only feasible way without modifying server.py heavily is ensuring LogitsProcessorArguments 
+        # can carry extra processors or we patch `_make_logits_processors`.
+        
+        # Ideally, we modify `GenerationArguments` to accept a list of `extra_logits_processors`.
+        gen_args.extra_logits_processors = logits_processors
 
         messages = [m.model_dump() for m in request.messages]
         
