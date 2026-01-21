@@ -446,18 +446,6 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        # Stack experts
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-
         def is_mpt_layer(key):
             subkeys = key.split(".")
             if len(subkeys) < 3:
@@ -473,19 +461,59 @@ class Model(nn.Module):
         for k, v in weights.items():
             if is_mpt_layer(k):
                 continue
-            elif "kv_b_proj" in k:
+            else:
+                new_weights[k] = v
+        weights = new_weights
+
+        # Stack experts
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}"
+            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+                for k in ["weight", "scales", "biases"]:
+                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+                        to_join = [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
+                            for e in range(self.args.n_routed_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+            prefix = f"model.layers.{l}.self_attn"
+            if f"{prefix}.kv_b_proj.weight" in weights:
+                layer = self.layers[l].self_attn.embed_q
+                quantized = f"{prefix}.kv_b_proj.scales" in weights
+                v = weights.pop(f"{prefix}.kv_b_proj.weight")
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+                    # Try to infer bits and group size
+                    bits = (v.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    v = mx.dequantize(
+                        v, scales, biases, bits=bits, group_size=group_size
+                    )
                 num_heads = self.args.num_attention_heads
                 v = v.reshape(num_heads, head_dim, -1)
                 wk = mx.contiguous(
                     v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
                 )
                 wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
-                new_weights[k.replace("kv_b_proj", "embed_q")] = wk
-                new_weights[k.replace("kv_b_proj", "unembed_out")] = wv
-            else:
-                new_weights[k] = v
-        return new_weights
+                if quantized:
+                    wk, wk_scales, wk_biases = mx.quantize(
+                        wk, bits=bits, group_size=group_size
+                    )
+                    wv, wv_scales, wv_biases = mx.quantize(
+                        wv, bits=bits, group_size=group_size
+                    )
+                    weights[f"{prefix}.embed_q.scales"] = wk_scales
+                    weights[f"{prefix}.unembed_out.scales"] = wv_scales
+                    weights[f"{prefix}.embed_q.biases"] = wk_biases
+                    weights[f"{prefix}.unembed_out.biases"] = wv_biases
+                weights[f"{prefix}.embed_q.weight"] = wk
+                weights[f"{prefix}.unembed_out.weight"] = wv
+
+        return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
