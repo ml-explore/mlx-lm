@@ -20,7 +20,6 @@ import mlx.nn as nn
 import numpy as np
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from lm_eval.models import huggingface
 from tqdm import tqdm
 
 from .generate import batch_generate
@@ -72,7 +71,6 @@ def chat_template_fn(**extra_kwargs):
 @register_model("mlxlm")
 class MLXLM(LM):
 
-    tokenizer_name = huggingface.HFLM.tokenizer_name
     apply_chat_template = chat_template_fn()
 
     def __init__(
@@ -146,6 +144,10 @@ class MLXLM(LM):
             )
             for t in texts
         ]
+
+    @property
+    def tokenizer_name(self) -> str:
+        return self.tokenizer.name_or_path.replace("/", "__")
 
     def loglikelihood(self, requests) -> list[tuple[float, bool]]:
         """Compute log-likelihood of generating a continuation from a context.
