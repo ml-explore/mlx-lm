@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+from huggingface_hub import logging
 from pathlib import Path
 from textwrap import dedent
 from typing import (
