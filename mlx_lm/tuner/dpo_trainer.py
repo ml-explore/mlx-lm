@@ -11,6 +11,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 from mlx.utils import tree_map
+from mlx.nn.utils import average_gradients
 
 from .trainer import TrainingArgs, evaluate, grad_checkpoint, iterate_batches
 from .utils import print_trainable_parameters, linear_to_lora_layers
@@ -132,6 +133,12 @@ def train_dpo(
 ):
     print(f"Starting DPO training..., iters: {args.iters}")
     
+    world = mx.distributed.init()
+    world_size = world.size()
+    rank = world.rank()
+    if world_size > 1:
+        print(f"Node {rank} of {world_size}")
+
     ref_model.freeze()
     
     def loss_fn(model, batch_c, batch_r, prompt_lens):
@@ -157,31 +164,49 @@ def train_dpo(
     @partial(mx.compile, inputs=state, outputs=state)
     def step(batch_c, batch_r, prompt_lens):
         (loss, rc, rr), grad = loss_value_and_grad(model, batch_c, batch_r, prompt_lens)
+        grad = average_gradients(grad)
         optimizer.update(model, grad)
         return loss, rc, rr
 
     losses = []
+    rewards_c = []
+    rewards_r = []
     
-    iterator = iterate_dpo_batches(train_dataset, args.batch_size, args.max_seq_length, loop=True)
+    iterator = iterate_dpo_batches(train_dataset, args.batch_size, args.max_seq_length, loop=True, comm_group=world)
     
     for it, (batch_c, batch_r, prompt_lens) in zip(range(1, args.iters + 1), iterator):
         loss, rc, rr = step(batch_c, batch_r, prompt_lens)
         mx.eval(state, loss, rc, rr)
         losses.append(loss.item())
+        rewards_c.append(rc.item())
+        rewards_r.append(rr.item())
         
         if it % args.steps_per_report == 0:
-            avg_loss = np.mean(losses)
-            print(f"Iter {it}: Loss {avg_loss:.4f}, Reward Chosen {rc.item():.4f}, Reward Rejected {rr.item():.4f}")
+            train_loss = np.mean(losses)
+            train_rc = np.mean(rewards_c)
+            train_rr = np.mean(rewards_r)
+
+            train_loss = mx.distributed.all_sum(train_loss, stream=mx.cpu).item() / world_size
+            train_rc = mx.distributed.all_sum(train_rc, stream=mx.cpu).item() / world_size
+            train_rr = mx.distributed.all_sum(train_rr, stream=mx.cpu).item() / world_size
+
+            if rank == 0:
+                print(f"Iter {it}: Loss {train_loss:.4f}, Reward Chosen {train_rc:.4f}, Reward Rejected {train_rr:.4f}")
+            
             losses = []
+            rewards_c = []
+            rewards_r = []
             
         if it % args.steps_per_save == 0:
-            adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
-            mx.save_safetensors(str(args.adapter_file), adapter_weights)
-            print(f"Saved adapters to {args.adapter_file}")
+            if rank == 0:
+                adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
+                mx.save_safetensors(str(args.adapter_file), adapter_weights)
+                print(f"Saved adapters to {args.adapter_file}")
 
-    adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
-    mx.save_safetensors(str(args.adapter_file), adapter_weights)
-    print("Training Completed.")
+    if rank == 0:
+        adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
+        mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        print("Training Completed.")
 
 
 def run_dpo(args):

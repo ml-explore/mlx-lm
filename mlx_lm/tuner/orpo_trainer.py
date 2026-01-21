@@ -5,8 +5,10 @@ from typing import List, Dict, Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import numpy as np
 from mlx.utils import tree_map
+from mlx.nn.utils import average_gradients
 
 from .trainer import TrainingArgs, evaluate, iterate_batches
 from .dpo_trainer import DPODataset, iterate_dpo_batches, compute_logprobs
@@ -80,6 +82,12 @@ def train_orpo(
 ):
     print(f"Starting ORPO training..., iters: {args.iters}")
     
+    world = mx.distributed.init()
+    world_size = world.size()
+    rank = world.rank()
+    if world_size > 1:
+        print(f"Node {rank} of {world_size}")
+    
     def loss_fn(model, batch_c, batch_r, prompt_lens):
         logits_c = model(batch_c)
         logits_r = model(batch_r)
@@ -142,31 +150,49 @@ def train_orpo(
     @partial(mx.compile, inputs=state, outputs=state)
     def step(batch_c, batch_r, prompt_lens):
         (loss, sft, or_loss), grad = loss_value_and_grad(model, batch_c, batch_r, prompt_lens)
+        grad = average_gradients(grad)
         optimizer.update(model, grad)
         return loss, sft, or_loss
 
     losses = []
+    losses_sft = []
+    losses_orpo = []
     
-    iterator = iterate_dpo_batches(train_dataset, args.batch_size, args.max_seq_length, loop=True)
+    iterator = iterate_dpo_batches(train_dataset, args.batch_size, args.max_seq_length, loop=True, comm_group=world)
     
     for it, (batch_c, batch_r, prompt_lens) in zip(range(1, args.iters + 1), iterator):
         loss, sft, or_loss = step(batch_c, batch_r, prompt_lens)
         mx.eval(state, loss, sft, or_loss)
         losses.append(loss.item())
+        losses_sft.append(sft.item())
+        losses_orpo.append(or_loss.item())
         
         if it % args.steps_per_report == 0:
-            avg_loss = np.mean(losses)
-            print(f"Iter {it}: Loss {avg_loss:.4f}, SFT {sft.item():.4f}, ORPO {or_loss.item():.4f}")
+            train_loss = np.mean(losses)
+            train_sft = np.mean(losses_sft)
+            train_orpo = np.mean(losses_orpo)
+
+            train_loss = mx.distributed.all_sum(train_loss, stream=mx.cpu).item() / world_size
+            train_sft = mx.distributed.all_sum(train_sft, stream=mx.cpu).item() / world_size
+            train_orpo = mx.distributed.all_sum(train_orpo, stream=mx.cpu).item() / world_size
+
+            if rank == 0:
+                print(f"Iter {it}: Loss {train_loss:.4f}, SFT {train_sft:.4f}, ORPO {train_orpo:.4f}")
+            
             losses = []
+            losses_sft = []
+            losses_orpo = []
             
         if it % args.steps_per_save == 0:
-            adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
-            mx.save_safetensors(str(args.adapter_file), adapter_weights)
-            print(f"Saved adapters to {args.adapter_file}")
+            if rank == 0:
+                 adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
+                 mx.save_safetensors(str(args.adapter_file), adapter_weights)
+                 print(f"Saved adapters to {args.adapter_file}")
 
-    adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
-    mx.save_safetensors(str(args.adapter_file), adapter_weights)
-    print("Training Completed.")
+    if rank == 0:
+        adapter_weights = dict(tree_map(lambda x: x, model.trainable_parameters()))
+        mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        print("Training Completed.")
 
 def run_orpo(args):
     # Same as run_dpo but calling train_orpo and no ref_model
