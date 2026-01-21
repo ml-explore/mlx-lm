@@ -31,6 +31,8 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "fastapi",
+        "uvicorn",
     ],
     packages=[
         "mlx_lm",
