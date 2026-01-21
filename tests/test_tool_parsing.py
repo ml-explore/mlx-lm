@@ -82,6 +82,53 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_glm47_fallback_json(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "multiply",
+                    "description": "Multiply two numbers.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["a", "b"],
+                        "properties": {
+                            "a": {"type": "number", "description": "a is a number"},
+                            "b": {"type": "number", "description": "b is a number"},
+                        },
+                    },
+                },
+            }
+        ]
+        tool_call = glm47.parse_tool_call(
+            '{"name": "multiply", "arguments": {"a": 2, "b": 3}}',
+            tools,
+        )
+        expected = {"name": "multiply", "arguments": {"a": 2, "b": 3}}
+        self.assertEqual(tool_call, expected)
+
+    def test_glm47_fallback_plain_text(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "multiply",
+                    "description": "Multiply two numbers.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["a", "b"],
+                        "properties": {
+                            "a": {"type": "number", "description": "a is a number"},
+                            "b": {"type": "number", "description": "b is a number"},
+                        },
+                    },
+                },
+            }
+        ]
+        tool_call = glm47.parse_tool_call("multiply a=2 b=3", tools)
+        expected = {"name": "multiply", "arguments": {"a": 2, "b": 3}}
+        self.assertEqual(tool_call, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
