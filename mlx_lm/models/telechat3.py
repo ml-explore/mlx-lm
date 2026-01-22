@@ -148,7 +148,6 @@ class Telechat3Model(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
-        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             Telechat3DecoderLayer(args=args) for _ in range(args.num_hidden_layers)
