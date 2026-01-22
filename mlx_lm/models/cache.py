@@ -908,6 +908,28 @@ class BatchKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        if self.keys is None or self.values is None:
+            return
+
+        if self.keys.size == 0 or self.values.size == 0:
+            self.offset = self.offset[batch_indices]
+            self.left_padding = self.left_padding[batch_indices]
+            if hasattr(batch_indices, "shape"):
+                batch_size = int(batch_indices.shape[0])
+            else:
+                batch_size = len(batch_indices)
+            head_dim = self.keys.shape[1]
+            key_dim = self.keys.shape[3]
+            val_dim = self.values.shape[3]
+            self.keys = mx.zeros(
+                (batch_size, head_dim, 0, key_dim), dtype=self.keys.dtype
+            )
+            self.values = mx.zeros(
+                (batch_size, head_dim, 0, val_dim), dtype=self.values.dtype
+            )
+            self._idx = 0
+            return
+
         self.keys = self.keys[batch_indices]
         self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
@@ -1212,6 +1234,29 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        if self.keys is None or self.values is None:
+            return
+
+        if self.keys.size == 0 or self.values.size == 0:
+            self.offset = self.offset[batch_indices]
+            self.left_padding = self.left_padding[batch_indices]
+            if hasattr(batch_indices, "shape"):
+                batch_size = int(batch_indices.shape[0])
+            else:
+                batch_size = len(batch_indices)
+            head_dim = self.keys.shape[1]
+            key_dim = self.keys.shape[3]
+            val_dim = self.values.shape[3]
+            self.keys = mx.zeros(
+                (batch_size, head_dim, 0, key_dim), dtype=self.keys.dtype
+            )
+            self.values = mx.zeros(
+                (batch_size, head_dim, 0, val_dim), dtype=self.values.dtype
+            )
+            self._idx = 0
+            self._offset = 0
+            return
+
         self.keys = self.keys[batch_indices]
         self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
