@@ -30,6 +30,8 @@ To see a full list of options run:
 mlx_lm.server --help
 ```
 
+## Chat completions API
+
 You can make a request to the model by running:
 
 ```shell
@@ -128,7 +130,34 @@ curl localhost:8080/v1/chat/completions \
     - `completion_tokens`: The number of tokens generated.
     - `total_tokens`: The total number of tokens, i.e. the sum of the above two fields.
 
-### List Models
+## Responses API
+
+The responses API follows the [OpenAI responses API
+spec](https://platform.openai.com/docs/quickstart?api-mode=responses)
+
+To make a request, use the `/responses` endpoint. For example:
+
+```shell
+curl localhost:8080/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+     "input": [{"role": "user", "content": "Say this is a test!"}],
+     "temperature": 0.7
+   }'
+```
+
+The server also supports retrieving and deleting stored responses:
+
+```shell
+curl localhost:8080/v1/responses/resp_123
+curl -X DELETE localhost:8080/v1/responses/resp_123
+```
+
+Note: image inputs can be routed through `mlx-vlm` when it is installed; audio
+and video inputs are accepted but treated as text placeholders in the local
+text-only server.
+
+## Models API
 
 Use the `v1/models` endpoint to list available models:
 

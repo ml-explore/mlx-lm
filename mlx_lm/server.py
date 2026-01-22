@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Condition, Lock, Thread
+from threading import Condition, Thread
 from typing import (
     Any,
     Callable,
@@ -34,11 +34,27 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import BatchGenerator, stream_generate
+from .harmony_parser import (
+    HarmonyStreamingParser,
+    is_harmony_model,
+    parse_harmony_output,
+)
 from .models.cache import (
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
 )
+from .responses_server import (
+    build_context_from_previous_response,
+    build_response_output_items,
+    delete_stored_response,
+    get_stored_response,
+    has_media_content,
+    normalize_responses_payload,
+    responses_to_chat_messages,
+    store_response,
+)
+from .responses_server import vision as responses_vision
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import load
 
@@ -881,6 +897,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self.created = int(time.time())
         self.response_generator = response_generator
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
+        self.responses_request = None
+        self.responses_store = False
+        self.responses_normalized = None
         super().__init__(*args, **kwargs)
 
     def _set_cors_headers(self):
@@ -907,13 +926,23 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/v1/responses/") and path.endswith("/cancel"):
+            parts = path.strip("/").split("/")
+            if len(parts) >= 3:
+                response_id = parts[2]
+                self.handle_response_cancel(response_id)
+                return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
+            "/responses": self.handle_responses,
+            "/v1/responses": self.handle_responses,
             "/chat/completions": self.handle_chat_completions,
         }
 
-        if self.path not in request_factories:
+        if path not in request_factories:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -952,6 +981,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self.max_tokens = self.body.get(
                 "max_tokens", self.response_generator.cli_args.max_tokens
             )
+
         self.temperature = self.body.get(
             "temperature", self.response_generator.cli_args.temp
         )
@@ -973,7 +1003,7 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        request = request_factories[path]()
         self.handle_completion(request, stop_words)
 
     def validate_model_parameters(self):
@@ -1082,6 +1112,10 @@ class APIHandler(BaseHTTPRequestHandler):
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
 
+        if self.stream and self.object_type == "response":
+            raise RuntimeError(
+                "Responses streaming uses SSE events; generate_response should not be called."
+            )
         # Static response
         response = {
             "id": self.request_id,
@@ -1089,13 +1123,40 @@ class APIHandler(BaseHTTPRequestHandler):
             "object": self.object_type,
             "model": self.requested_model,
             "created": self.created,
-            "choices": [
-                {
-                    "index": 0,
-                    "finish_reason": finish_reason,
-                },
-            ],
         }
+
+        if self.object_type == "response":
+            response = {
+                "id": self.request_id,
+                "object": "response",
+                "created_at": self.created,
+                "model": self.requested_model,
+                "status": "completed",
+                "output": build_response_output_items(
+                    text, reasoning_text=reasoning_text, tool_calls=tool_calls
+                ),
+            }
+            if not self.stream:
+                if not (
+                    isinstance(prompt_token_count, int)
+                    and isinstance(completion_token_count, int)
+                ):
+                    raise ValueError(
+                        "Response type is complete, but token counts not provided"
+                    )
+                response["usage"] = {
+                    "input_tokens": prompt_token_count,
+                    "output_tokens": completion_token_count,
+                    "total_tokens": prompt_token_count + completion_token_count,
+                }
+            return response
+
+        response["choices"] = [
+            {
+                "index": 0,
+                "finish_reason": finish_reason,
+            },
+        ]
 
         if token_logprobs or top_logprobs or tokens:
             response["choices"][0]["logprobs"] = {
@@ -1146,6 +1207,13 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words (List[str]): A list of stop words passed to the
                 stopping_criteria function
         """
+        if (
+            self.object_type == "response"
+            and self.responses_normalized is not None
+            and responses_vision.has_image_content(self.responses_normalized)
+        ):
+            self.handle_responses_vision(self.responses_normalized)
+            return
         args = GenerationArguments(
             model=ModelDescription(
                 model=self.requested_model,
@@ -1210,6 +1278,43 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
+        is_response = self.object_type == "response"
+        is_harmony = is_response and is_harmony_model(self.requested_model)
+        harmony_parser = HarmonyStreamingParser() if is_harmony else None
+        harmony_output_parts: List[str] = []
+        harmony_reasoning_parts: List[str] = []
+        response_sequence = 0
+        message_item_id = None
+        reasoning_item_id = None
+        message_output_index = 0
+        message_item_emitted = False
+        reasoning_item_emitted = False
+        reasoning_done = False
+
+        def send_response_event(event_type: str, data: dict):
+            nonlocal response_sequence
+            event = {"type": event_type, "sequence_number": response_sequence, **data}
+            response_sequence += 1
+            self.wfile.write(f"event: {event_type}\n".encode())
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            self.wfile.flush()
+
+        if self.stream and is_response:
+            message_item_id = f"msg_{uuid.uuid4().hex}"
+            reasoning_item_id = f"rs_{uuid.uuid4().hex}"
+            response_obj = {
+                "id": self.request_id,
+                "object": "response",
+                "status": "in_progress",
+                "model": self.requested_model,
+                "created_at": self.created,
+                "output": [],
+            }
+            send_response_event("response.created", {"response": response_obj.copy()})
+            send_response_event(
+                "response.in_progress", {"response": response_obj.copy()}
+            )
+
         # Variables to save the tool calls in as they are being generated by
         # the model.
         in_tool_call = False
@@ -1267,11 +1372,160 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.debug(gen.text)
 
             # Gather the text in tool calling or text variables
-            if in_reasoning:
+            if is_harmony and harmony_parser is not None:
+                event_type, clean_text = harmony_parser.process_delta(gen.text)
+
+                if event_type == "reasoning" and clean_text:
+                    harmony_reasoning_parts.append(clean_text)
+                    if self.stream and is_response:
+                        if not reasoning_item_emitted:
+                            send_response_event(
+                                "response.output_item.added",
+                                {
+                                    "output_index": 0,
+                                    "item": {
+                                        "id": reasoning_item_id,
+                                        "type": "reasoning",
+                                        "summary": [],
+                                    },
+                                },
+                            )
+                            reasoning_item_emitted = True
+
+                        send_response_event(
+                            "response.reasoning_summary_text.delta",
+                            {
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "delta": clean_text,
+                            },
+                        )
+
+                elif event_type == "output" and clean_text:
+                    harmony_output_parts.append(clean_text)
+                    if self.stream and is_response:
+                        if reasoning_item_emitted and not reasoning_done:
+                            send_response_event(
+                                "response.reasoning_summary_text.done",
+                                {
+                                    "item_id": reasoning_item_id,
+                                    "output_index": 0,
+                                    "text": "".join(harmony_reasoning_parts),
+                                },
+                            )
+                            send_response_event(
+                                "response.output_item.done",
+                                {
+                                    "output_index": 0,
+                                    "item": {
+                                        "id": reasoning_item_id,
+                                        "type": "reasoning",
+                                        "summary": [
+                                            {
+                                                "type": "summary_text",
+                                                "text": "".join(
+                                                    harmony_reasoning_parts
+                                                ),
+                                            }
+                                        ],
+                                    },
+                                },
+                            )
+                            reasoning_done = True
+
+                        if not message_item_emitted:
+                            message_output_index = 1 if reasoning_item_emitted else 0
+                            send_response_event(
+                                "response.output_item.added",
+                                {
+                                    "output_index": message_output_index,
+                                    "item": {
+                                        "id": message_item_id,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "status": "in_progress",
+                                        "content": [],
+                                    },
+                                },
+                            )
+                            send_response_event(
+                                "response.content_part.added",
+                                {
+                                    "output_index": message_output_index,
+                                    "content_index": 0,
+                                    "part": {"type": "output_text", "text": ""},
+                                },
+                            )
+                            message_item_emitted = True
+
+                        send_response_event(
+                            "response.output_text.delta",
+                            {
+                                "output_index": message_output_index,
+                                "content_index": 0,
+                                "delta": clean_text,
+                            },
+                        )
+
+            # Non-Harmony models
+            elif in_reasoning:
                 if gen.text == ctx.think_end:
                     in_reasoning = False
+                    if (
+                        self.stream
+                        and is_response
+                        and reasoning_item_emitted
+                        and not reasoning_done
+                    ):
+                        send_response_event(
+                            "response.reasoning_summary_text.done",
+                            {
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "text": reasoning_text,
+                            },
+                        )
+                        send_response_event(
+                            "response.output_item.done",
+                            {
+                                "output_index": 0,
+                                "item": {
+                                    "id": reasoning_item_id,
+                                    "type": "reasoning",
+                                    "summary": [
+                                        {
+                                            "type": "summary_text",
+                                            "text": reasoning_text,
+                                        }
+                                    ],
+                                },
+                            },
+                        )
+                        reasoning_done = True
                 else:
                     reasoning_text += gen.text
+                    if self.stream and is_response:
+                        if not reasoning_item_emitted:
+                            send_response_event(
+                                "response.output_item.added",
+                                {
+                                    "output_index": 0,
+                                    "item": {
+                                        "id": reasoning_item_id,
+                                        "type": "reasoning",
+                                        "summary": [],
+                                    },
+                                },
+                            )
+                            reasoning_item_emitted = True
+                        send_response_event(
+                            "response.reasoning_summary_text.delta",
+                            {
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "delta": gen.text,
+                            },
+                        )
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 made_tool_call = True
                 in_tool_call = True
@@ -1310,6 +1564,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 break
 
             if self.stream and not in_tool_call:
+                if is_response and is_harmony:
+                    continue
                 # If the end of tokens overlaps with a stop sequence, generate new
                 # tokens until we know if the stop sequence is hit or not
                 if any(
@@ -1319,6 +1575,69 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
+                elif is_response:
+                    if segment:
+                        if reasoning_item_emitted and not reasoning_done:
+                            send_response_event(
+                                "response.reasoning_summary_text.done",
+                                {
+                                    "item_id": reasoning_item_id,
+                                    "output_index": 0,
+                                    "text": reasoning_text,
+                                },
+                            )
+                            send_response_event(
+                                "response.output_item.done",
+                                {
+                                    "output_index": 0,
+                                    "item": {
+                                        "id": reasoning_item_id,
+                                        "type": "reasoning",
+                                        "summary": [
+                                            {
+                                                "type": "summary_text",
+                                                "text": reasoning_text,
+                                            }
+                                        ],
+                                    },
+                                },
+                            )
+                            reasoning_done = True
+
+                        if not message_item_emitted:
+                            message_output_index = 1 if reasoning_item_emitted else 0
+                            send_response_event(
+                                "response.output_item.added",
+                                {
+                                    "output_index": message_output_index,
+                                    "item": {
+                                        "id": message_item_id,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "status": "in_progress",
+                                        "content": [],
+                                    },
+                                },
+                            )
+                            send_response_event(
+                                "response.content_part.added",
+                                {
+                                    "output_index": message_output_index,
+                                    "content_index": 0,
+                                    "part": {"type": "output_text", "text": ""},
+                                },
+                            )
+                            message_item_emitted = True
+
+                        send_response_event(
+                            "response.output_text.delta",
+                            {
+                                "output_index": message_output_index,
+                                "content_index": 0,
+                                "delta": segment,
+                            },
+                        )
+                        segment = ""
                 elif segment or tool_calls or reasoning_text:
                     response = self.generate_response(
                         segment,
@@ -1334,6 +1653,147 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
+
+        harmony_tool_calls = None
+        if is_harmony and harmony_parser is not None:
+            parsed = parse_harmony_output(harmony_parser.full_text)
+            fallback_text = "".join(harmony_output_parts)
+            if parsed["final_text"]:
+                text = parsed["final_text"]
+            elif fallback_text:
+                text = fallback_text
+            else:
+                text = harmony_parser.full_text
+
+            if parsed["reasoning"]:
+                reasoning_text = parsed["reasoning"]
+            elif harmony_reasoning_parts:
+                reasoning_text = "".join(harmony_reasoning_parts)
+
+            if parsed["tool_calls"]:
+                harmony_tool_calls = [
+                    {
+                        "id": tool_call["id"],
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
+                    }
+                    for tool_call in parsed["tool_calls"]
+                ]
+
+        if self.stream and is_response:
+            final_tool_calls = (
+                harmony_tool_calls
+                if harmony_tool_calls is not None
+                else parse_tools(tool_calls)
+            )
+            if reasoning_item_emitted and not reasoning_done:
+                send_response_event(
+                    "response.reasoning_summary_text.done",
+                    {
+                        "item_id": reasoning_item_id,
+                        "output_index": 0,
+                        "text": reasoning_text,
+                    },
+                )
+                send_response_event(
+                    "response.output_item.done",
+                    {
+                        "output_index": 0,
+                        "item": {
+                            "id": reasoning_item_id,
+                            "type": "reasoning",
+                            "summary": [
+                                {"type": "summary_text", "text": reasoning_text}
+                            ],
+                        },
+                    },
+                )
+                reasoning_done = True
+
+            if not message_item_emitted:
+                message_output_index = 1 if reasoning_item_emitted else 0
+                send_response_event(
+                    "response.output_item.added",
+                    {
+                        "output_index": message_output_index,
+                        "item": {
+                            "id": message_item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    },
+                )
+                send_response_event(
+                    "response.content_part.added",
+                    {
+                        "output_index": message_output_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    },
+                )
+                message_item_emitted = True
+
+            send_response_event(
+                "response.output_text.done",
+                {
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "text": text,
+                },
+            )
+            send_response_event(
+                "response.content_part.done",
+                {
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": text},
+                },
+            )
+            send_response_event(
+                "response.output_item.done",
+                {
+                    "output_index": message_output_index,
+                    "item": {
+                        "id": message_item_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": text}],
+                    },
+                },
+            )
+
+            response_payload = {
+                "id": self.request_id,
+                "object": "response",
+                "created_at": self.created,
+                "model": self.requested_model,
+                "status": "completed",
+                "output": build_response_output_items(
+                    text,
+                    reasoning_text=reasoning_text,
+                    tool_calls=final_tool_calls,
+                ),
+                "usage": {
+                    "input_tokens": len(ctx.prompt),
+                    "output_tokens": len(tokens),
+                    "total_tokens": len(ctx.prompt) + len(tokens),
+                },
+            }
+            send_response_event("response.completed", {"response": response_payload})
+
+            if self.responses_store and self.responses_request is not None:
+                store_response(
+                    self.request_id, self.responses_request, response_payload
+                )
+
+            self.wfile.write("data: [DONE]\n\n".encode())
+            self.wfile.flush()
+            return
 
         if self.stream:
             response = self.generate_response(
@@ -1351,6 +1811,11 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write("data: [DONE]\n\n".encode())
             self.wfile.flush()
         else:
+            final_tool_calls = (
+                harmony_tool_calls
+                if harmony_tool_calls is not None
+                else parse_tools(tool_calls)
+            )
             response = self.generate_response(
                 text,
                 finish_reason,
@@ -1360,8 +1825,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 top_tokens=top_tokens,
                 tokens=tokens,
                 reasoning_text=reasoning_text,
-                tool_calls=parse_tools(tool_calls),
+                tool_calls=final_tool_calls,
             )
+            if (
+                is_response
+                and self.responses_store
+                and self.responses_request is not None
+            ):
+                store_response(self.request_id, self.responses_request, response)
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
             logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
@@ -1371,6 +1842,202 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response_json)
             self.wfile.flush()
+
+    def handle_responses_vision(self, normalized: dict[str, Any]) -> None:
+        response_id = self.request_id or f"resp_{uuid.uuid4().hex}"
+        message_item_id = f"msg_{uuid.uuid4().hex}"
+
+        if self.stream:
+            self._set_stream_headers(200)
+            self.end_headers()
+
+            response_sequence = 0
+
+            def send_response_event(event_type: str, data: dict):
+                nonlocal response_sequence
+                event = {
+                    "type": event_type,
+                    "sequence_number": response_sequence,
+                    **data,
+                }
+                response_sequence += 1
+                self.wfile.write(f"event: {event_type}\n".encode())
+                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                self.wfile.flush()
+
+            response_obj = {
+                "id": response_id,
+                "object": "response",
+                "status": "in_progress",
+                "model": self.requested_model,
+                "created_at": self.created,
+                "output": [],
+            }
+            send_response_event("response.created", {"response": response_obj.copy()})
+            send_response_event(
+                "response.in_progress", {"response": response_obj.copy()}
+            )
+
+            output_text_parts: list[str] = []
+            message_item_emitted = False
+
+            try:
+                for delta in responses_vision.stream_generate(
+                    self.requested_model, normalized
+                ):
+                    if not delta:
+                        continue
+
+                    if not message_item_emitted:
+                        send_response_event(
+                            "response.output_item.added",
+                            {
+                                "output_index": 0,
+                                "item": {
+                                    "id": message_item_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "in_progress",
+                                    "content": [],
+                                },
+                            },
+                        )
+                        send_response_event(
+                            "response.content_part.added",
+                            {
+                                "output_index": 0,
+                                "content_index": 0,
+                                "part": {"type": "output_text", "text": ""},
+                            },
+                        )
+                        message_item_emitted = True
+
+                    output_text_parts.append(delta)
+                    send_response_event(
+                        "response.output_text.delta",
+                        {
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": delta,
+                        },
+                    )
+
+                final_text = "".join(output_text_parts)
+
+                if not message_item_emitted:
+                    send_response_event(
+                        "response.output_item.added",
+                        {
+                            "output_index": 0,
+                            "item": {
+                                "id": message_item_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": [],
+                            },
+                        },
+                    )
+                    send_response_event(
+                        "response.content_part.added",
+                        {
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": ""},
+                        },
+                    )
+
+                send_response_event(
+                    "response.output_text.done",
+                    {
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": final_text,
+                    },
+                )
+                send_response_event(
+                    "response.content_part.done",
+                    {
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": final_text},
+                    },
+                )
+                send_response_event(
+                    "response.output_item.done",
+                    {
+                        "output_index": 0,
+                        "item": {
+                            "id": message_item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": final_text}],
+                        },
+                    },
+                )
+
+                response_payload = {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": self.created,
+                    "model": self.requested_model,
+                    "status": "completed",
+                    "output": build_response_output_items(final_text),
+                }
+                send_response_event(
+                    "response.completed", {"response": response_payload}
+                )
+
+                if self.responses_store and self.responses_request is not None:
+                    store_response(
+                        self.request_id, self.responses_request, response_payload
+                    )
+
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+                return
+
+            except Exception as exc:
+                send_response_event(
+                    "error",
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "error",
+                            "code": "internal_error",
+                        }
+                    },
+                )
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+                return
+
+        try:
+            text, usage = responses_vision.generate(self.requested_model, normalized)
+        except Exception as exc:
+            self._responses_error(500, str(exc), "internal_error", error_type="error")
+            return
+
+        response_payload = {
+            "id": response_id,
+            "object": "response",
+            "created_at": self.created,
+            "model": self.requested_model,
+            "status": "completed",
+            "output": build_response_output_items(text),
+            "usage": usage,
+        }
+
+        if self.responses_store and self.responses_request is not None:
+            store_response(self.request_id, self.responses_request, response_payload)
+
+        response_json = json.dumps(response_payload).encode()
+        self._set_completion_headers(200)
+        self.send_header("Content-Length", str(len(response_json)))
+        self.end_headers()
+        self.wfile.write(response_json)
+        self.wfile.flush()
 
     def completion_usage_response(
         self,
@@ -1414,6 +2081,48 @@ class APIHandler(BaseHTTPRequestHandler):
             body.get("role_mapping"),
         )
 
+    def handle_responses(self) -> CompletionRequest:
+        body = self.body
+        normalized = normalize_responses_payload(body)
+
+        previous_id = body.get("previous_response_id")
+        if previous_id:
+            stored = get_stored_response(previous_id)
+            if stored is not None:
+                normalized["input"] = build_context_from_previous_response(
+                    stored, normalized["input"]
+                )
+            else:
+                logging.warning(
+                    f"previous_response_id '{previous_id}' not found; continuing without context"
+                )
+
+        if has_media_content(normalized) and not responses_vision.has_image_content(
+            normalized
+        ):
+            logging.warning(
+                "Responses request includes media content without images; "
+                "mlx-lm server will treat media as text placeholders"
+            )
+
+        self.responses_request = normalized
+        self.responses_store = body.get("store", True)
+        self.responses_normalized = normalized
+
+        messages = responses_to_chat_messages(normalized)
+        tools = body.get("tools")
+
+        # Determine response type
+        self.request_id = f"resp_{uuid.uuid4().hex}"
+        self.object_type = "response"
+        return CompletionRequest(
+            "chat",
+            "",
+            messages,
+            tools or None,
+            None,
+        )
+
     def handle_text_completions(self) -> CompletionRequest:
         """
         Handle a text completion request.
@@ -1437,14 +2146,153 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/v1/responses/"):
+            parts = path.strip("/").split("/")
+            if len(parts) >= 4 and parts[3] == "input_items":
+                self.handle_response_input_items(parts[2])
+                return
+            if len(parts) >= 3:
+                self.handle_response_get(parts[2])
+                return
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+            return
+
+        if path.startswith("/v1/models"):
             self.handle_models_request()
-        elif self.path == "/health":
+        elif path == "/health":
             self.handle_health_check()
         else:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def do_DELETE(self):
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/v1/responses/"):
+            parts = path.strip("/").split("/")
+            if len(parts) >= 3:
+                self.handle_response_delete(parts[2])
+                return
+        self._set_completion_headers(404)
+        self.end_headers()
+        self.wfile.write(b"Not Found")
+
+    def _responses_error(
+        self,
+        status_code: int,
+        message: str,
+        code: str,
+        error_type: str = "invalid_request_error",
+    ):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        payload = {"error": {"message": message, "type": error_type, "code": code}}
+        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.flush()
+
+    def handle_response_get(self, response_id: str):
+        stored = get_stored_response(response_id)
+        if stored is None:
+            self._responses_error(
+                404,
+                f"Response '{response_id}' not found",
+                "response_not_found",
+            )
+            return
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(stored.response).encode())
+        self.wfile.flush()
+
+    def handle_response_delete(self, response_id: str):
+        deleted = delete_stored_response(response_id)
+        if not deleted:
+            self._responses_error(
+                404,
+                f"Response '{response_id}' not found",
+                "response_not_found",
+            )
+            return
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(
+            json.dumps(
+                {"id": response_id, "object": "response.deleted", "deleted": True}
+            ).encode()
+        )
+        self.wfile.flush()
+
+    def handle_response_cancel(self, response_id: str):
+        stored = get_stored_response(response_id)
+        if stored is None:
+            self._responses_error(
+                404,
+                f"Response '{response_id}' not found",
+                "response_not_found",
+            )
+            return
+
+        if stored.status != "in_progress":
+            self._responses_error(
+                400,
+                f"Response '{response_id}' is not in progress (status: {stored.status})",
+                "response_not_cancellable",
+            )
+            return
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(stored.response).encode())
+        self.wfile.flush()
+
+    def handle_response_input_items(self, response_id: str):
+        stored = get_stored_response(response_id)
+        if stored is None:
+            self._responses_error(
+                404,
+                f"Response '{response_id}' not found",
+                "response_not_found",
+            )
+            return
+
+        input_items = stored.request.get("input", [])
+        items = []
+        for idx, item in enumerate(input_items):
+            if isinstance(item, dict):
+                items.append(
+                    {
+                        "id": f"input_{idx}",
+                        "type": "message",
+                        "role": item.get("role", "user"),
+                        "content": item.get("content", []),
+                    }
+                )
+            elif isinstance(item, str):
+                items.append(
+                    {
+                        "id": f"input_{idx}",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": item}],
+                    }
+                )
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        payload = {
+            "object": "list",
+            "data": items,
+            "first_id": items[0]["id"] if items else None,
+            "last_id": items[-1]["id"] if items else None,
+            "has_more": False,
+        }
+        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.flush()
 
     def handle_health_check(self):
         """

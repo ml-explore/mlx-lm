@@ -165,6 +165,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             self.tokenmap[tokenid] = value
 
         self.reset()
+        self._trim_space_before_punct = self._infer_trim_space_before_punct(tokenizer)
 
         # Make the BPE byte decoder from
         # https://github.com/openai/gpt-2/blob/master/src/encoder.py
@@ -175,6 +176,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         self._unflushed = ""
         self.text = ""
         self.tokens = []
+        self._pending_space = ""
 
     def _decode_bytes(self, seq):
         barr = bytearray()
@@ -193,7 +195,23 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             return current_text
         elif not self.text:
             return current_text[1:]
+        if self._trim_space_before_punct:
+            for match in self._space_matches:
+                if current_text[1:].startswith(match):
+                    return current_text[1:]
         return current_text
+
+    @staticmethod
+    def _infer_trim_space_before_punct(tokenizer):
+        try:
+            tokens = tokenizer.encode("a ,b")
+            decoded = tokenizer.decode(tokens)
+            bos_token = getattr(tokenizer, "bos_token", None)
+            if bos_token and decoded.startswith(bos_token):
+                decoded = decoded[len(bos_token) :]
+            return decoded == "a,b"
+        except Exception:
+            return False
 
     def add_token(self, token):
         self.tokens.append(token)
@@ -203,7 +221,19 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
         # For multi-byte utf-8 wait until they are complete
         if not text.endswith("\ufffd"):
-            self.text += self._maybe_trim_space(text)
+            text = self._maybe_trim_space(text)
+            if self._trim_space_before_punct:
+                if self._pending_space:
+                    if any(text.startswith(match) for match in self._space_matches):
+                        self._pending_space = ""
+                    else:
+                        self.text += self._pending_space
+                        self._pending_space = ""
+                if text == " ":
+                    self._pending_space = " "
+                    self._unflushed = ""
+                    return
+            self.text += text
             self._unflushed = ""
 
     def finalize(self):
@@ -211,7 +241,16 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             "utf-8",
             "replace",
         )
-        self.text += self._maybe_trim_space(current_text)
+        current_text = self._maybe_trim_space(current_text)
+        if self._trim_space_before_punct and self._pending_space:
+            if current_text and any(
+                current_text.startswith(match) for match in self._space_matches
+            ):
+                self._pending_space = ""
+            else:
+                self.text += self._pending_space
+                self._pending_space = ""
+        self.text += current_text
         self._unflushed = ""
 
     @classmethod

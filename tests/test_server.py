@@ -178,6 +178,43 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_handle_responses(self):
+        url = f"http://localhost:{self.port}/v1/responses"
+        post_data = {
+            "model": "chat_model",
+            "input": "Say hello",
+            "max_output_tokens": 10,
+            "store": True,
+        }
+
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["object"], "response")
+        self.assertIn("id", response_body)
+        self.assertIn("output", response_body)
+
+        response_id = response_body["id"]
+
+        get_response = requests.get(f"{url}/{response_id}")
+        self.assertEqual(get_response.status_code, 200)
+        get_body = json.loads(get_response.text)
+        self.assertEqual(get_body["id"], response_id)
+
+        input_items = requests.get(f"{url}/{response_id}/input_items")
+        self.assertEqual(input_items.status_code, 200)
+        input_body = json.loads(input_items.text)
+        self.assertEqual(input_body["object"], "list")
+        self.assertIsInstance(input_body["data"], list)
+
+        delete_response = requests.delete(f"{url}/{response_id}")
+        self.assertEqual(delete_response.status_code, 200)
+        delete_body = json.loads(delete_response.text)
+        self.assertTrue(delete_body["deleted"])
+
+        missing = requests.get(f"{url}/{response_id}")
+        self.assertEqual(missing.status_code, 404)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)

@@ -36,6 +36,7 @@ setup(
         "mlx_lm",
         "mlx_lm.models",
         "mlx_lm.quant",
+        "mlx_lm.responses_server",
         "mlx_lm.tuner",
         "mlx_lm.tool_parsers",
         "mlx_lm.chat_templates",
