@@ -5,6 +5,7 @@ from mlx_lm.tool_parsers import (
     function_gemma,
     glm47,
     json_tools,
+    kimi_k2,
     minimax_m2,
     qwen3_coder,
 )
@@ -13,12 +14,13 @@ from mlx_lm.tool_parsers import (
 class TestToolParsing(unittest.TestCase):
 
     def test_parsers(self):
-        parsers = [function_gemma, glm47, json_tools, minimax_m2, qwen3_coder]
+        parsers = [function_gemma, glm47, json_tools, kimi_k2, minimax_m2, qwen3_coder]
 
         test_cases = [
             "call:multiply{a:12234585,b:48838483920}",
             "multiply<arg_key>a</arg_key><arg_value>12234585</arg_value><arg_key>b</arg_key><arg_value>48838483920</arg_value>",
             '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
+            '<|tool_call_begin|>functions.multiply:0<|tool_call_argument_begin|>{"a": 12234585, "b": 48838483920}<|tool_call_end|>',
             '<invoke name="multiply">\n<parameter name="a">12234585</parameter>\n<parameter name="b">48838483920</parameter>\n</invoke>',
             "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
         ]
@@ -53,6 +55,7 @@ class TestToolParsing(unittest.TestCase):
             "call:get_current_temperature{location:<escape>London<escape>}",
             'get_current_temperature<arg_key>location</arg_key><arg_value>"London"</arg_value>',
             '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
+            '<|tool_call_begin|>functions.get_current_temperature:0<|tool_call_argument_begin|>{"location": "London"}<|tool_call_end|>',
             '<invoke name="get_current_temperature">\n<parameter name="location">London</parameter>\n</invoke>',
             "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
         ]
