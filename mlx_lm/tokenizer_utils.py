@@ -465,6 +465,8 @@ def _infer_tool_parser(chat_template):
         return "glm47"
     elif "<tool_call>\n<function=" in chat_template:
         return "qwen3_coder"
+    elif "<|tool_calls_section_begin|>" in chat_template:
+        return "kimi_k2"
     elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
         return "json_tools"
     return None
