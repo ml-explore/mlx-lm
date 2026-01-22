@@ -2213,6 +2213,18 @@ class TestModels(unittest.TestCase):
                 "kv_lora_rank": 128,
                 "q_lora_rank": 256,
             },
+            {
+                "model_type": "telechat3",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 128,
+                "rope_theta": 10000.0,
+                "max_position_embeddings": 1000,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
