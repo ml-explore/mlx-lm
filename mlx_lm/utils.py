@@ -361,12 +361,34 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
 
+    if config.get("quantize_activations", False):
+
+        def _maybe_qq(m):
+            if isinstance(m, nn.QuantizedLinear):
+                if m.mode not in ("nvfp4", "mxfp8"):
+                    raise ValueError(
+                        "Mode ({m.mode}) does not support activation quantization"
+                    )
+                if m.get("bias", False):
+                    raise ValueError(
+                        "Linear layer with bias does not support activation quantization"
+                    )
+                out_dims, in_dims = m.weight.shape
+                in_dims *= 32 // m.bits
+                return nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
+            else:
+                return m
+
+        leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
+
+        model.update_modules(leaves)
+
+    model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
         mx.eval(model.parameters())
 
-    model.eval()
     return model, config
 
 

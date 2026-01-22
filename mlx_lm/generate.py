@@ -179,6 +179,12 @@ def setup_arg_parser():
         help="A file containing saved KV caches to avoid recomputing them",
     )
     parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Quantize activations using the same quantization config as the corresponding layer.",
+    )
+    parser.add_argument(
         "--kv-bits",
         type=int,
         help="Number of bits for KV cache quantization. Defaults to no quantization.",
@@ -1370,6 +1376,7 @@ def main():
         model_path,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
+        model_config={"quantize_activations": args.quantize_activations},
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
