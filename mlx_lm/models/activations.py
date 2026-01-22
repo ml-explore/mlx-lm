@@ -43,9 +43,8 @@ class XieLU(nn.Module):
         return xielu(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
 
 
-# TODO rename
 @partial(mx.compile, shapeless=True)
-def swiglu(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
+def swiglu_clamped(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
     # Clamp the input values
     x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
     x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
@@ -63,7 +62,7 @@ class SwiGLU(nn.Module):
         super().__init__()
 
     def __call__(self, x, gate):
-        return swiglu(x, gate)
+        return swiglu_clamped(x, gate)
 
 
 @partial(mx.compile, shapeless=True)
