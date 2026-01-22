@@ -481,6 +481,16 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
 
+    def test_batch_kv_cache_filter_zero_length(self):
+        cache = BatchKVCache(left_padding=[0, 0])
+        cache.keys = mx.zeros((2, 1, 0, 8))
+        cache.values = mx.zeros((2, 1, 0, 8))
+        cache.filter([0])
+        self.assertEqual(cache.keys.shape, (1, 1, 0, 8))
+        self.assertEqual(cache.values.shape, (1, 1, 0, 8))
+        self.assertEqual(cache.offset.shape[0], 1)
+        self.assertEqual(cache.left_padding.shape[0], 1)
+
     def test_batch_rotating_kv_cache(self):
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
         mask = cache.make_mask(4)
@@ -520,6 +530,16 @@ class TestPromptCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
         cache.filter(mx.array([1]))
         self.assertEqual(cache.keys.shape, (1, 1, 3, 8))
+
+    def test_batch_rotating_kv_cache_filter_zero_length(self):
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[0, 0])
+        cache.keys = mx.zeros((2, 1, 0, 8))
+        cache.values = mx.zeros((2, 1, 0, 8))
+        cache.filter([0])
+        self.assertEqual(cache.keys.shape, (1, 1, 0, 8))
+        self.assertEqual(cache.values.shape, (1, 1, 0, 8))
+        self.assertEqual(cache.offset.shape[0], 1)
+        self.assertEqual(cache.left_padding.shape[0], 1)
 
         # Check extend
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 1])
