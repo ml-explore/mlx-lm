@@ -702,10 +702,10 @@ class ResponseGenerator:
                         top_tokens = None
                         if args.logprobs > 0:
                             sorted_indices = mx.argpartition(
-                                -gen.logprobs, kth=args.logprobs - 1
+                                -r.logprobs, kth=args.logprobs - 1
                             )
                             top_indices = sorted_indices[: args.logprobs]
-                            top_logprobs = gen.logprobs[top_indices]
+                            top_logprobs = r.logprobs[top_indices]
                             top_token_info = zip(
                                 top_indices.tolist(), top_logprobs.tolist()
                             )
