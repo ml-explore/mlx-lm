@@ -686,6 +686,10 @@ class ResponseGenerator:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
 
+        if self._is_distributed:
+            seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+            mx.random.seed(seed)
+
         while not self._stop:
             request = None
             if not drain_batch:
