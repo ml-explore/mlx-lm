@@ -104,6 +104,8 @@ def main():
         mx.random.seed(args.seed)
 
     if group.size() > 1:
+        seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+        mx.random.seed(seed)
         if args.adapter_path:
             parser.error("Adapters not supported in distributed mode")
         model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
