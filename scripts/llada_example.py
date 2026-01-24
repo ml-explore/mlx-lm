@@ -16,7 +16,7 @@ import time
 
 import mlx.core as mx
 from mlx_lm import load
-from mlx_lm.models.llada_generate import generate, stream_generate
+from mlx_lm.llada_generate import generate, stream_generate
 
 
 def main():

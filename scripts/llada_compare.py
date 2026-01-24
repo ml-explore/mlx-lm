@@ -176,7 +176,7 @@ def main():
     # Load MLX model
     print("\n[2] Loading MLX model (mlx-community/LLaDA-8B-Instruct-mlx-fp16)...")
     from mlx_lm import load
-    from mlx_lm.models.llada_generate import generate as mlx_generate
+    from mlx_lm.llada_generate import generate as mlx_generate
 
     mlx_model, mlx_tokenizer = load("mlx-community/LLaDA-8B-Instruct-mlx-fp16")
     print("MLX model loaded!")

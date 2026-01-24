@@ -6,7 +6,7 @@ import unittest
 
 import mlx.core as mx
 from mlx_lm.models import llada
-from mlx_lm.models.llada_generate import (
+from mlx_lm.llada_generate import (
     add_gumbel_noise,
     get_num_transfer_tokens,
     generate,
