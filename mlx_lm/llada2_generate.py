@@ -10,26 +10,6 @@ Reference: https://huggingface.co/inclusionAI/LLaDA2.0-mini
 import mlx.core as mx
 
 
-def add_gumbel_noise(logits: mx.array, temperature: float) -> mx.array:
-    """
-    Add Gumbel noise for sampling from categorical distributions.
-
-    Args:
-        logits: Model output logits of shape (batch, seq_len, vocab_size)
-        temperature: Sampling temperature. 0 means deterministic (no noise).
-
-    Returns:
-        Noisy logits for sampling
-    """
-    if temperature == 0:
-        return logits
-
-    noise = mx.random.uniform(shape=logits.shape)
-    noise = mx.clip(noise, 1e-10, 1.0)
-    gumbel_noise = -mx.log(-mx.log(noise))
-    return logits + temperature * gumbel_noise
-
-
 def get_num_transfer_tokens(block_length: int, steps: int) -> mx.array:
     """
     Compute the number of tokens to unmask at each step.
