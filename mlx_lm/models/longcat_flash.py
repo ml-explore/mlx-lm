@@ -35,33 +35,78 @@ def gather_sparse_kv(
     )
 
 
-def create_sparse_causal_mask(
-    N: int,
-    kv_len: int,
+def chunked_sparse_prefill(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
     sink_size: int,
     recent_size: int,
-) -> Optional[mx.array]:
-    if N == 1:
-        return None
-
-    gathered_len = min(kv_len, sink_size + recent_size)
-
-    if kv_len <= sink_size + recent_size:
-        rinds = mx.arange(gathered_len)
-        linds = mx.arange(kv_len - N, kv_len)[:, None]
-        return rinds <= linds
-
-    rinds = mx.arange(gathered_len)
+    scale: float,
+    chunk_size: int = 256,
+) -> mx.array:
+    B, n_heads, N, head_dim = queries.shape
+    kv_len = keys.shape[2]
     q_start = kv_len - N
-    linds = mx.arange(q_start, kv_len)[:, None]
 
-    sink_mask = rinds < sink_size
+    outputs = []
 
-    recent_start_original = kv_len - recent_size
-    recent_original_pos = recent_start_original + (rinds - sink_size)
-    recent_mask = (rinds >= sink_size) & (recent_original_pos <= linds)
+    for chunk_start in range(0, N, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, N)
+        q_chunk = queries[:, :, chunk_start:chunk_end, :]
 
-    return sink_mask | recent_mask
+        abs_q_start = q_start + chunk_start
+        abs_q_end = q_start + chunk_end
+
+        recent_union_start = max(0, abs_q_start - recent_size + 1)
+
+        if recent_union_start <= sink_size:
+            k_gathered = keys[:, :, :abs_q_end, :]
+            v_gathered = values[:, :, :abs_q_end, :]
+
+            q_pos = mx.arange(abs_q_start, abs_q_end)[:, None]
+            kv_pos = mx.arange(abs_q_end)[None, :]
+            causal = kv_pos <= q_pos
+            in_sink = kv_pos < sink_size
+            in_recent = kv_pos > q_pos - recent_size
+            mask = causal & (in_sink | in_recent)
+        else:
+            k_gathered = mx.concatenate(
+                [
+                    keys[:, :, :sink_size, :],
+                    keys[:, :, recent_union_start:abs_q_end, :],
+                ],
+                axis=2,
+            )
+            v_gathered = mx.concatenate(
+                [
+                    values[:, :, :sink_size, :],
+                    values[:, :, recent_union_start:abs_q_end, :],
+                ],
+                axis=2,
+            )
+
+            gathered_len = sink_size + (abs_q_end - recent_union_start)
+
+            q_pos = mx.arange(abs_q_start, abs_q_end)[:, None]
+            gathered_idx = mx.arange(gathered_len)[None, :]
+
+            original_pos = mx.where(
+                gathered_idx < sink_size,
+                gathered_idx,
+                recent_union_start + (gathered_idx - sink_size),
+            )
+
+            causal = original_pos <= q_pos
+            in_sink = original_pos < sink_size
+            in_recent = original_pos > q_pos - recent_size
+            mask = causal & (in_sink | in_recent)
+
+        out = mx.fast.scaled_dot_product_attention(
+            q_chunk, k_gathered, v_gathered, scale=scale, mask=mask
+        )
+        outputs.append(out)
+
+    return mx.concatenate(outputs, axis=2)
 
 
 @dataclass
@@ -223,22 +268,36 @@ class LongcatFlashMLA(nn.Module):
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
 
         if self.is_sparse:
-            kv_len = key_states.shape[2]
-            key_states, value_states = gather_sparse_kv(
-                key_states, value_states, self.sink_size, self.recent_size
+            if L > 1:
+                attn_output = chunked_sparse_prefill(
+                    query_states,
+                    key_states,
+                    value_states,
+                    self.sink_size,
+                    self.recent_size,
+                    self.scale,
+                )
+            else:
+                key_states, value_states = gather_sparse_kv(
+                    key_states, value_states, self.sink_size, self.recent_size
+                )
+                attn_output = scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=None,
+                )
+        else:
+            attn_output = scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
             )
-            mask = create_sparse_causal_mask(
-                L, kv_len, self.sink_size, self.recent_size
-            )
-
-        attn_output = scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-        )
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(attn_output)
