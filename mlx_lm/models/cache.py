@@ -561,10 +561,16 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        instance.left_padding = None
+        instance.lengths = None
+        return instance
+
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
-        self.left_padding = mx.array(left_padding) if left_padding else None
-        self.lengths = None
+        if left_padding:
+            self.left_padding = mx.array(left_padding)
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -638,17 +644,6 @@ class ArraysCache(_BaseCache):
 
     def empty(self):
         return self.cache[0] is None
-
-    @classmethod
-    def from_state(cls, state, meta_state):
-        # Create instance without calling __init__
-        obj = cls.__new__(cls)
-        # Initialize attributes that __init__ sets but state.setter doesn't
-        obj.left_padding = None
-        obj.lengths = None
-        obj.state = state
-        obj.meta_state = meta_state
-        return obj
 
 
 class MambaCache(ArraysCache):
