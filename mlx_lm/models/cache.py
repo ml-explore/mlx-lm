@@ -561,10 +561,16 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        instance.left_padding = None
+        instance.lengths = None
+        return instance
+
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
-        self.left_padding = mx.array(left_padding) if left_padding else None
-        self.lengths = None
+        if left_padding:
+            self.left_padding = mx.array(left_padding)
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value

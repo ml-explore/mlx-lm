@@ -133,6 +133,19 @@ class TestPromptCache(unittest.TestCase):
                 self.assertTrue(mx.array_equal(k, lk))
                 self.assertTrue(mx.array_equal(v, lv))
 
+    def test_save_load_mamba_cache(self):
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+
+        cache = [MambaCache()]
+        cache[0][0] = mx.zeros((1, 4, 4))
+        cache[0][1] = mx.zeros((1, 4, 4))
+
+        save_prompt_cache(cache_file, cache)
+        loaded = load_prompt_cache(cache_file)
+
+        # Try to make a mask
+        mask = loaded[0].make_mask(4)
+
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
