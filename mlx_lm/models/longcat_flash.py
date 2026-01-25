@@ -8,34 +8,60 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache, RotatingKVCache
+from .cache import CacheList, KVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
-def is_sparse_sublayer(layer_idx: int, sub_idx: int, layer_type: str) -> bool:
-    if not layer_type:
-        return False
-    idx = layer_idx * 2 + sub_idx
-    return idx < len(layer_type) and layer_type[idx] == "1"
+def gather_sparse_kv(
+    keys: mx.array,
+    values: mx.array,
+    sink_size: int,
+    recent_size: int,
+) -> Tuple[mx.array, mx.array]:
+    seq_len = keys.shape[2]
+
+    if seq_len <= sink_size + recent_size:
+        return keys, values
+
+    sink_keys = keys[:, :, :sink_size, :]
+    sink_values = values[:, :, :sink_size, :]
+    recent_keys = keys[:, :, -recent_size:, :]
+    recent_values = values[:, :, -recent_size:, :]
+
+    return (
+        mx.concatenate([sink_keys, recent_keys], axis=2),
+        mx.concatenate([sink_values, recent_values], axis=2),
+    )
 
 
-def create_streaming_sparse_mask(
+def create_sparse_causal_mask(
     N: int,
-    offset: int,
+    kv_len: int,
     sink_size: int,
     recent_size: int,
 ) -> Optional[mx.array]:
     if N == 1:
         return None
 
-    total_len = offset + N
-    rinds = mx.arange(total_len)
-    linds = mx.arange(offset, total_len)[:, None]
+    gathered_len = min(kv_len, sink_size + recent_size)
+
+    if kv_len <= sink_size + recent_size:
+        rinds = mx.arange(gathered_len)
+        linds = mx.arange(kv_len - N, kv_len)[:, None]
+        return rinds <= linds
+
+    rinds = mx.arange(gathered_len)
+    q_start = kv_len - N
+    linds = mx.arange(q_start, kv_len)[:, None]
 
     sink_mask = rinds < sink_size
-    local_mask = (rinds <= linds) & (rinds > linds - recent_size)
-    return sink_mask | local_mask
+
+    recent_start_original = kv_len - recent_size
+    recent_original_pos = recent_start_original + (rinds - sink_size)
+    recent_mask = (rinds >= sink_size) & (recent_original_pos <= linds)
+
+    return sink_mask | recent_mask
 
 
 @dataclass
@@ -71,9 +97,18 @@ class ModelArgs(BaseModelArgs):
 
 
 class LongcatFlashMLA(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
+
+        self.is_sparse = False
+        ssa = args.streaming_sparse_attention
+        if ssa:
+            layer_type = ssa["layer_type"]
+            if layer_idx < len(layer_type) and layer_type[layer_idx] == "1":
+                self.is_sparse = True
+                self.sink_size = ssa["sink_size"]
+                self.recent_size = ssa["recent_size"]
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.kv_lora_rank = args.kv_lora_rank
@@ -186,6 +221,15 @@ class LongcatFlashMLA(nn.Module):
 
         if cache is not None:
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
+
+        if self.is_sparse:
+            kv_len = key_states.shape[2]
+            key_states, value_states = gather_sparse_kv(
+                key_states, value_states, self.sink_size, self.recent_size
+            )
+            mask = create_sparse_causal_mask(
+                L, kv_len, self.sink_size, self.recent_size
+            )
 
         attn_output = scaled_dot_product_attention(
             query_states,
@@ -304,7 +348,9 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.hidden_size = args.hidden_size
         self.mlp = LongcatFlashMoE(args)
 
-        self.self_attn = [LongcatFlashMLA(args) for _ in range(2)]
+        self.self_attn = [
+            LongcatFlashMLA(args, layer_idx=layer_idx * 2 + i) for i in range(2)
+        ]
         self.mlps = [LongcatFlashMLP(args, False) for _ in range(2)]
         self.input_layernorm = [
             nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps) for _ in range(2)
@@ -313,19 +359,10 @@ class LongcatFlashDecoderLayer(nn.Module):
             nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps) for _ in range(2)
         ]
 
-        ssa = args.streaming_sparse_attention
-        if ssa:
-            self.is_sparse = [
-                is_sparse_sublayer(layer_idx, i, ssa["layer_type"]) for i in range(2)
-            ]
-        else:
-            self.is_sparse = [False, False]
-
     def __call__(
         self,
         x: mx.array,
-        full_mask: Optional[mx.array] = None,
-        sparse_mask: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
         hidden_states = x
@@ -338,7 +375,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             residual = hidden_states
 
             hidden_states = self.input_layernorm[i](hidden_states)
-            mask = sparse_mask if self.is_sparse[i] else full_mask
             hidden_states = self.self_attn[i](hidden_states, mask=mask, cache=cache[i])
             hidden_states = residual + hidden_states
 
@@ -361,13 +397,6 @@ class LongcatFlashModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.num_layers = args.num_layers
-        ssa = args.streaming_sparse_attention
-        if ssa:
-            self.sink_size = ssa["sink_size"]
-            self.recent_size = ssa["recent_size"]
-        else:
-            self.sink_size = None
-            self.recent_size = None
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             LongcatFlashDecoderLayer(args, layer_idx=idx)
@@ -385,22 +414,10 @@ class LongcatFlashModel(nn.Module):
         if cache is None:
             cache = [(None, None)] * self.num_layers
 
-        full_mask = create_attention_mask(h, cache[0][0])
-
-        sparse_mask = None
-        if self.sink_size is not None:
-            N = h.shape[1]
-            if N > 1:
-                offset = cache[0][0].offset if cache[0][0] is not None else 0
-                sparse_mask = create_streaming_sparse_mask(
-                    N=N,
-                    offset=offset,
-                    sink_size=self.sink_size,
-                    recent_size=self.recent_size,
-                )
+        mask = create_attention_mask(h, cache[0][0])
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, full_mask=full_mask, sparse_mask=sparse_mask, cache=c)
+            h = layer(h, mask=mask, cache=c)
 
         return self.norm(h)
 
@@ -461,18 +478,7 @@ class Model(nn.Module):
         return new_weights
 
     def make_cache(self):
-        def _cache(is_sparse):
-            if is_sparse:
-                return RotatingKVCache(
-                    max_size=self.model.sink_size + self.model.recent_size,
-                    keep=self.model.sink_size,
-                )
-            return KVCache()
-
-        return [
-            CacheList(*(_cache(s) for s in layer.is_sparse))
-            for layer in self.model.layers
-        ]
+        return [CacheList(KVCache(), KVCache()) for _ in self.model.layers]
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
