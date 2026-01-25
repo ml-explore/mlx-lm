@@ -639,6 +639,17 @@ class ArraysCache(_BaseCache):
     def empty(self):
         return self.cache[0] is None
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # Create instance without calling __init__
+        obj = cls.__new__(cls)
+        # Initialize attributes that __init__ sets but state.setter doesn't
+        obj.left_padding = None
+        obj.lengths = None
+        obj.state = state
+        obj.meta_state = meta_state
+        return obj
+
 
 class MambaCache(ArraysCache):
     def __init__(self, left_padding: Optional[List[int]] = None):
