@@ -26,7 +26,7 @@ setup(
     install_requires=[
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
         "numpy",
-        "transformers==5.0.0rc3",
+        "transformers>=5.0.0",
         "sentencepiece",
         "protobuf",
         "pyyaml",
