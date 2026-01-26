@@ -45,12 +45,88 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-5
     rope_theta: float = 1_000_000.0
     rope_scaling: Optional[Dict] = None
-    rope_traditional: bool = True
     attention_bias: bool = False
     attention_dropout: float = 0.0
     partial_rotary_factor: float = 1.0
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
+    quantization: Optional[Dict[str, Any]] = None
+
+
+class MultiLinear(nn.Module):
+    def __init__(self, input_dims: int, output_dims: int, num_heads: int) -> None:
+        super().__init__()
+        scale = math.sqrt(1.0 / input_dims)
+        self.weight = mx.random.uniform(
+            low=-scale,
+            high=scale,
+            shape=(num_heads, output_dims, input_dims),
+        )
+
+    def __call__(self, x):
+        return x @ self.weight.swapaxes(-1, -2)
+
+    def to_quantized(
+        self,
+        group_size: int,
+        bits: int,
+        mode: str,
+    ):
+        num_heads, output_dims, input_dims = self.weight.shape
+        ql = QuantizedMultiLinear(
+            input_dims, output_dims, num_heads, group_size, bits, mode
+        )
+        ql.weight, ql.scales, *biases = mx.quantize(
+            self.weight,
+            group_size,
+            bits,
+            mode=mode,
+        )
+        ql.biases = biases[0] if biases else None
+        return ql
+
+
+class QuantizedMultiLinear(nn.Module):
+    def __init__(
+        self,
+        input_dims: int,
+        output_dims: int,
+        num_heads: int,
+        group_size: int,
+        bits: int,
+        mode: str,
+    ):
+        super().__init__()
+
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+
+        # Initialize the quantized weight
+        scale = math.sqrt(1 / input_dims)
+        weight = mx.random.uniform(
+            low=-scale,
+            high=scale,
+            shape=(num_heads, output_dims, input_dims),
+        )
+        self.weight, self.scales, *biases = mx.quantize(
+            weight, group_size, bits, mode=mode
+        )
+        self.biases = biases[0] if biases else None
+
+        self.freeze()
+
+    def __call__(self, x):
+        return mx.quantized_matmul(
+            x,
+            self["weight"],
+            scales=self["scales"],
+            biases=self.get("biases"),
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
 
 
 class Glm4MoeLiteAttention(nn.Module):
@@ -60,6 +136,7 @@ class Glm4MoeLiteAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
+        rope_params = config.rope_scaling
         self.rope_theta = config.rope_theta
         self.q_lora_rank = config.q_lora_rank
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -89,11 +166,12 @@ class Glm4MoeLiteAttention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
+        head_dim = self.qk_nope_head_dim + self.v_head_dim
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
 
         self.o_proj = nn.Linear(
@@ -102,10 +180,10 @@ class Glm4MoeLiteAttention(nn.Module):
             bias=config.attention_bias,
         )
 
-        if self.config.rope_scaling is not None:
-            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+        if rope_params is not None:
+            mscale_all_dim = rope_params.get("mscale_all_dim", 0)
             if mscale_all_dim:
-                scaling_factor = self.config.rope_scaling["factor"]
+                scaling_factor = rope_params["factor"]
                 if scaling_factor > 1:
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
@@ -113,9 +191,9 @@ class Glm4MoeLiteAttention(nn.Module):
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
-            traditional=self.config.rope_traditional,
+            traditional=True,
             max_position_embeddings=self.max_position_embeddings,
-            scaling_config=self.config.rope_scaling,
+            scaling_config=rope_params,
         )
 
     def __call__(
@@ -136,29 +214,29 @@ class Glm4MoeLiteAttention(nn.Module):
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
 
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        offset = cache.offset if cache is not None else 0
+        q_pe = self.rope(q_pe, offset)
+        k_pe = self.rope(k_pe, offset)
+
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
+
+        q_nope = self.embed_q(q_nope)
+        keys = mx.concatenate([kv_latent, k_pe], axis=-1)
 
         if cache is not None:
-            q_pe = self.rope(q_pe, cache.offset)
-            k_pe = self.rope(k_pe, cache.offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache.update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), values
-            )
-        else:
-            q_pe = self.rope(q_pe)
-            k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
+            keys, _ = cache.update_and_fetch(keys, mx.zeros((B, 1, L, 0)))
+        values = keys[..., : -self.qk_rope_head_dim]
 
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+
+        output = self.unembed_out(output)
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -211,7 +289,7 @@ def group_expert_select(
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / denominator
+        scores = scores / (denominator + 1e-20)
     scores = scores * routed_scaling_factor
 
     return inds, scores
@@ -283,15 +361,12 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
         self.self_attn = Glm4MoeLiteAttention(config)
-        self.mlp = (
-            Glm4MoeLiteMoE(config)
-            if (
-                config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0
-            )
-            else Glm4MoeLiteMLP(config)
+        use_moe = (
+            config.n_routed_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
         )
+        self.mlp = Glm4MoeLiteMoE(config) if use_moe else Glm4MoeLiteMLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -371,6 +446,25 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
+        def is_mpt_layer(key):
+            subkeys = key.split(".")
+            if len(subkeys) < 3:
+                return False
+            if (
+                subkeys[1] == "layers"
+                and int(subkeys[2]) >= self.args.num_hidden_layers
+            ):
+                return True
+            return False
+
+        new_weights = {}
+        for k, v in weights.items():
+            if is_mpt_layer(k):
+                continue
+            else:
+                new_weights[k] = v
+        weights = new_weights
+
         # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
@@ -382,24 +476,48 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+            prefix = f"model.layers.{l}.self_attn"
+            if f"{prefix}.kv_b_proj.weight" in weights:
+                layer = self.layers[l].self_attn.embed_q
+                quantized = f"{prefix}.kv_b_proj.scales" in weights
+                v = weights.pop(f"{prefix}.kv_b_proj.weight")
+                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
 
-        num_mpt_layers = getattr(self.args, "num_nextn_predict_layers", 0) or 0
-        if num_mpt_layers:
-
-            def _is_mpt_layer(key: str) -> bool:
-                for idx in range(num_mpt_layers):
-                    if key.startswith(
-                        f"model.layers.{self.args.num_hidden_layers + idx}"
-                    ):
-                        return True
-                return False
-
-            weights = {k: v for k, v in weights.items() if not _is_mpt_layer(k)}
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+                    # Try to infer bits and group size
+                    bits = (v.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    v = mx.dequantize(
+                        v, scales, biases, bits=bits, group_size=group_size
+                    )
+                num_heads = self.args.num_attention_heads
+                v = v.reshape(num_heads, head_dim, -1)
+                wk = mx.contiguous(
+                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
+                if quantized:
+                    wk, wk_scales, wk_biases = mx.quantize(
+                        wk, bits=bits, group_size=group_size
+                    )
+                    wv, wv_scales, wv_biases = mx.quantize(
+                        wv, bits=bits, group_size=group_size
+                    )
+                    weights[f"{prefix}.embed_q.scales"] = wk_scales
+                    weights[f"{prefix}.unembed_out.scales"] = wv_scales
+                    weights[f"{prefix}.embed_q.biases"] = wk_biases
+                    weights[f"{prefix}.unembed_out.biases"] = wv_biases
+                weights[f"{prefix}.embed_q.weight"] = wk
+                weights[f"{prefix}.unembed_out.weight"] = wv
 
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
+        rank = group.rank()
         N = group.size()
         for layer in self.model.layers:
             # Shard the self attention
@@ -411,13 +529,20 @@ class Model(nn.Module):
                 layer.self_attn.q_b_proj = shard_linear(
                     layer.self_attn.q_b_proj, "all-to-sharded", group=group
                 )
-            layer.self_attn.kv_b_proj = shard_linear(
-                layer.self_attn.kv_b_proj, "all-to-sharded", group=group
-            )
+            layer.self_attn.num_heads //= N
+            num_heads = layer.self_attn.num_heads
+            sh = rank * num_heads
+            eh = sh + num_heads
+
+            def shard_heads(w):
+                return w[sh:eh]
+
+            layer.self_attn.embed_q.apply(shard_heads)
+            layer.self_attn.unembed_out.apply(shard_heads)
+
             layer.self_attn.o_proj = shard_linear(
                 layer.self_attn.o_proj, "sharded-to-all", group=group
             )
-            layer.self_attn.num_heads //= N
 
             # Shard the MLP
             if isinstance(layer.mlp, Glm4MoeLiteMLP):

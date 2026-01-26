@@ -221,7 +221,7 @@ def initialize_rope(
             base=base,
             scaling_config=scaling_config,
         )
-    elif rope_type in ("yarn", "deepseek_yarn"):
+    elif rope_type in ("yarn", "deepseek_yarn", "telechat3-yarn"):
         scaling_factor = scaling_config["factor"]
         rope_kwargs = {
             key: scaling_config[key]

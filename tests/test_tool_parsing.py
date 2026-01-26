@@ -5,6 +5,7 @@ from mlx_lm.tool_parsers import (
     function_gemma,
     glm47,
     json_tools,
+    kimi_k2,
     longcat,
     minimax_m2,
     qwen3_coder,
@@ -20,6 +21,7 @@ class TestToolParsing(unittest.TestCase):
             json_tools,
             longcat,
             longcat,
+            kimi_k2,
             minimax_m2,
             qwen3_coder,
         ]
@@ -30,6 +32,7 @@ class TestToolParsing(unittest.TestCase):
             '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
             "multiply<longcat_arg_key>a</longcat_arg_key>\n<longcat_arg_value>12234585</longcat_arg_value>\n<longcat_arg_key>b</longcat_arg_key>\n<longcat_arg_value>48838483920</longcat_arg_value>",
             '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
+            '<|tool_call_begin|>functions.multiply:0<|tool_call_argument_begin|>{"a": 12234585, "b": 48838483920}<|tool_call_end|>',
             '<invoke name="multiply">\n<parameter name="a">12234585</parameter>\n<parameter name="b">48838483920</parameter>\n</invoke>',
             "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
         ]
@@ -66,6 +69,7 @@ class TestToolParsing(unittest.TestCase):
             '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
             "get_current_temperature<longcat_arg_key>location</longcat_arg_key>\n<longcat_arg_value>London</longcat_arg_value>",
             '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
+            '<|tool_call_begin|>functions.get_current_temperature:0<|tool_call_argument_begin|>{"location": "London"}<|tool_call_end|>',
             '<invoke name="get_current_temperature">\n<parameter name="location">London</parameter>\n</invoke>',
             "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
         ]

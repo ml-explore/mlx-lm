@@ -13,7 +13,7 @@ DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.0
-DEFAULT_SEED = None
+DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 
@@ -100,8 +100,7 @@ def main():
         if rank == 0:
             print(*args, **kwargs)
 
-    if args.seed is not None:
-        mx.random.seed(args.seed)
+    mx.random.seed(args.seed)
 
     if group.size() > 1:
         if args.adapter_path:
