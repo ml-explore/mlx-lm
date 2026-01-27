@@ -8,6 +8,7 @@ import unittest
 
 import mlx.core as mx
 from mlx_lm.models import llada2_moe
+from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm import llada2_generate
 
 
@@ -323,6 +324,245 @@ class TestLLaDA2Generate(unittest.TestCase):
 
         # Check that no mask tokens appear in the output
         has_mask = mx.any(output == mask_id).item()
+        self.assertFalse(has_mask)
+
+
+class TestLLaDA2CachedLogits(unittest.TestCase):
+    """Logit-level tests: verify cached forward pass produces identical logits."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.args = llada2_moe.ModelArgs(
+            model_type="llada2_moe",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            first_k_dense_replace=0,
+            n_group=2,
+            topk_group=1,
+        )
+        cls.model = llada2_moe.Model(cls.args)
+        cls.mask_id = 999
+        cls.block_length = 4
+
+    def test_logits_single_block_no_prefill(self):
+        """Logits match when there are no prefill blocks (prompt < block_length)."""
+        bl = self.block_length
+        tokens = mx.array([[1, 2, 3, self.mask_id]])  # 1 block, 4 tokens
+
+        # Uncached: full forward with block-diagonal mask
+        full_mask = llada2_generate.create_block_diagonal_mask(1, bl)
+        logits_uncached = self.model(tokens, mask=full_mask)
+        mx.eval(logits_uncached)
+
+        # Cached: no prefill, forward entire block
+        cache = make_prompt_cache(self.model)
+        block_mask = mx.zeros((1, 1, bl, bl), dtype=mx.bfloat16)
+        logits_cached = self.model(tokens, cache=cache, mask=block_mask)
+        mx.eval(logits_cached)
+
+        diff = mx.abs(logits_cached - logits_uncached)
+        max_diff = mx.max(diff).item()
+        self.assertLess(max_diff, 1e-4, f"Max logit diff {max_diff}")
+
+    def test_logits_with_prefill(self):
+        """Logits match for the second block after prefilling the first."""
+        bl = self.block_length
+        # 2 blocks: first is prompt, second has mask tokens
+        tokens = mx.array([[1, 2, 3, 4, 5, 6, self.mask_id, self.mask_id]])
+
+        # Uncached: full forward with block-diagonal mask
+        full_mask = llada2_generate.create_block_diagonal_mask(2, bl)
+        logits_uncached = self.model(tokens, mask=full_mask)
+        block2_logits_uncached = logits_uncached[:, bl:, :]
+        mx.eval(block2_logits_uncached)
+
+        # Cached: prefill block 1, then forward block 2
+        cache = make_prompt_cache(self.model)
+        prefill_mask = llada2_generate.create_block_diagonal_mask(1, bl)
+        prefill_logits = self.model(tokens[:, :bl], cache=cache, mask=prefill_mask)
+        mx.eval(prefill_logits)
+
+        block_mask = mx.zeros((1, 1, bl, bl + bl), dtype=mx.bfloat16)
+        logits_cached = self.model(tokens[:, bl:], cache=cache, mask=block_mask)
+        mx.eval(logits_cached)
+
+        diff = mx.abs(logits_cached - block2_logits_uncached)
+        max_diff = mx.max(diff).item()
+        self.assertLess(max_diff, 1e-4, f"Max logit diff {max_diff}")
+
+    def test_logits_three_blocks(self):
+        """Logits match across three blocks with incremental prefill + commit."""
+        bl = self.block_length
+        tokens = mx.array([[1, 2, 3, 4,   5, 6, 7, 8,
+                            self.mask_id, self.mask_id, self.mask_id, self.mask_id]])
+
+        # Uncached: full forward
+        full_mask = llada2_generate.create_block_diagonal_mask(3, bl)
+        logits_uncached = self.model(tokens, mask=full_mask)
+        block3_logits_uncached = logits_uncached[:, 2 * bl:, :]
+        mx.eval(block3_logits_uncached)
+
+        # Cached: prefill blocks 1-2, then forward block 3
+        cache = make_prompt_cache(self.model)
+        prefill_mask = llada2_generate.create_block_diagonal_mask(2, bl)
+        prefill_logits = self.model(tokens[:, : 2 * bl], cache=cache, mask=prefill_mask)
+        mx.eval(prefill_logits)
+
+        block_mask = mx.zeros((1, 1, bl, 2 * bl + bl), dtype=mx.bfloat16)
+        logits_cached = self.model(tokens[:, 2 * bl:], cache=cache, mask=block_mask)
+        mx.eval(logits_cached)
+
+        diff = mx.abs(logits_cached - block3_logits_uncached)
+        max_diff = mx.max(diff).item()
+        self.assertLess(max_diff, 1e-4, f"Max logit diff {max_diff}")
+
+    def test_logits_after_commit(self):
+        """Logits match when block 2 is committed then block 3 is forwarded."""
+        bl = self.block_length
+        tokens = mx.array([[1, 2, 3, 4,   10, 20, 30, 40,
+                            self.mask_id, self.mask_id, self.mask_id, self.mask_id]])
+
+        # Uncached reference
+        full_mask = llada2_generate.create_block_diagonal_mask(3, bl)
+        logits_uncached = self.model(tokens, mask=full_mask)
+        block3_logits_uncached = logits_uncached[:, 2 * bl:, :]
+        mx.eval(block3_logits_uncached)
+
+        # Cached: prefill block 1, commit block 2, then forward block 3
+        cache = make_prompt_cache(self.model)
+
+        # Prefill block 1
+        mask1 = llada2_generate.create_block_diagonal_mask(1, bl)
+        self.model(tokens[:, :bl], cache=cache, mask=mask1)
+        mx.eval(*[c.keys for c in cache if c.keys is not None])
+
+        # Commit block 2 (simulate a completed denoising block)
+        mask2 = mx.zeros((1, 1, bl, bl + bl), dtype=mx.bfloat16)
+        self.model(tokens[:, bl : 2 * bl], cache=cache, mask=mask2)
+        mx.eval(*[c.keys for c in cache if c.keys is not None])
+
+        # Forward block 3
+        mask3 = mx.zeros((1, 1, bl, 2 * bl + bl), dtype=mx.bfloat16)
+        logits_cached = self.model(tokens[:, 2 * bl:], cache=cache, mask=mask3)
+        mx.eval(logits_cached)
+
+        diff = mx.abs(logits_cached - block3_logits_uncached)
+        max_diff = mx.max(diff).item()
+        self.assertLess(max_diff, 1e-4, f"Max logit diff {max_diff}")
+
+
+class TestLLaDA2CachedGenerate(unittest.TestCase):
+    """Tests for LLaDA2 cached (KV-cache) generation."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Create a small model for testing."""
+        cls.args = llada2_moe.ModelArgs(
+            model_type="llada2_moe",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            first_k_dense_replace=0,
+            n_group=2,
+            topk_group=1,
+        )
+        cls.model = llada2_moe.Model(cls.args)
+        cls.mask_id = 999
+        cls.eos_id = 998
+
+    def test_cached_matches_uncached(self):
+        """Test that cached generation matches uncached with temp=0."""
+        prompt = mx.array([[1, 2, 3]])
+
+        output_no_cache = llada2_generate.generate(
+            self.model,
+            prompt,
+            max_new_tokens=8,
+            block_length=4,
+            steps=4,
+            temperature=0.0,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            use_cache=False,
+        )
+
+        output_cached = llada2_generate.generate(
+            self.model,
+            prompt,
+            max_new_tokens=8,
+            block_length=4,
+            steps=4,
+            temperature=0.0,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            use_cache=True,
+        )
+
+        self.assertEqual(output_no_cache.shape, output_cached.shape)
+        self.assertTrue(mx.array_equal(output_no_cache, output_cached).item())
+
+    def test_cached_with_full_prefill_blocks(self):
+        """Test cached generation when prompt fills exact block boundaries."""
+        # prompt_length=8, block_length=4 → prefill_blocks=2
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+
+        output_no_cache = llada2_generate.generate(
+            self.model,
+            prompt,
+            max_new_tokens=8,
+            block_length=4,
+            steps=4,
+            temperature=0.0,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            use_cache=False,
+        )
+
+        output_cached = llada2_generate.generate(
+            self.model,
+            prompt,
+            max_new_tokens=8,
+            block_length=4,
+            steps=4,
+            temperature=0.0,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            use_cache=True,
+        )
+
+        self.assertEqual(output_no_cache.shape, output_cached.shape)
+        self.assertTrue(mx.array_equal(output_no_cache, output_cached).item())
+
+    def test_cached_no_mask_tokens(self):
+        """Test that cached output contains no mask tokens."""
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+
+        output = llada2_generate.generate(
+            self.model,
+            prompt,
+            max_new_tokens=16,
+            block_length=8,
+            steps=8,
+            temperature=0.0,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            use_cache=True,
+        )
+
+        has_mask = mx.any(output == self.mask_id).item()
         self.assertFalse(has_mask)
 
 
