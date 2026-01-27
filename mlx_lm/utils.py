@@ -554,16 +554,6 @@ def sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
-
-    # Evaluate parameters layer-by-layer for large models to avoid hangs
-    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-        mx.eval(model.model.embed_tokens.parameters())
-    if hasattr(model, "layers"):
-        for layer in model.layers:
-            mx.eval(layer.parameters())
-    if hasattr(model, "model") and hasattr(model.model, "norm"):
-        mx.eval(model.model.norm.parameters())
-    # Final eval for any remaining parameters (lm_head, etc.)
     mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
