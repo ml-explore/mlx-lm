@@ -317,6 +317,15 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    # Handle nested quantization_config (e.g., in VL models where it's inside text_config)
+    if "quantization_config" not in config:
+        for nested_key in ["text_config", "language_config", "llm_config"]:
+            if nested_key in config and "quantization_config" in config[nested_key]:
+                config["quantization_config"] = config[nested_key][
+                    "quantization_config"
+                ]
+                break
+
     def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
@@ -551,6 +560,16 @@ def sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
+
+    # Evaluate parameters layer-by-layer for large models to avoid hangs
+    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+        mx.eval(model.model.embed_tokens.parameters())
+    if hasattr(model, "layers"):
+        for layer in model.layers:
+            mx.eval(layer.parameters())
+    if hasattr(model, "model") and hasattr(model.model, "norm"):
+        mx.eval(model.model.norm.parameters())
+    # Final eval for any remaining parameters (lm_head, etc.)
     mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
