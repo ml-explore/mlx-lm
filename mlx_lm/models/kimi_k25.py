@@ -76,6 +76,15 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.language_model = LanguageModel(config.text_config)
 
+    @staticmethod
+    def sanitize_config(config):
+        if "quantization_config" not in config:
+            if "quantization_config" in config.get("text_config", {}):
+                config["quantization_config"] = config["text_config"][
+                    "quantization_config"
+                ]
+        return config
+
     def __call__(
         self,
         inputs: mx.array,

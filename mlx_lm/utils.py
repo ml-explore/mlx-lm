@@ -311,20 +311,14 @@ def load_model(
 
     model_class, model_args_class = get_model_classes(config=config)
 
+    if hasattr(model_class, "sanitize_config"):
+        config = model_class.sanitize_config(config)
+
     model_args = model_args_class.from_dict(config)
     model = model_class(model_args)
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
-
-    # Handle nested quantization_config (e.g., in VL models where it's inside text_config)
-    if "quantization_config" not in config:
-        for nested_key in ["text_config", "language_config", "llm_config"]:
-            if nested_key in config and "quantization_config" in config[nested_key]:
-                config["quantization_config"] = config[nested_key][
-                    "quantization_config"
-                ]
-                break
 
     def _quantize(quantization):
         def class_predicate(p, m):
