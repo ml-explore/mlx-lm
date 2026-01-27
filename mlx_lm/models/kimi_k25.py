@@ -185,7 +185,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.language_model.model.pipeline_layers
 
     @property
     def cast_predicate(self):
