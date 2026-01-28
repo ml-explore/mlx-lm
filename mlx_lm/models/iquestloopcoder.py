@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
 
+from .activations import _silu_mul
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -18,11 +19,6 @@ def _compute_gate(query: mx.array, weight: mx.array, bias: mx.array) -> mx.array
     gate_logits = query @ weight[:, None, :].swapaxes(-1, -2)
     gate_logits = gate_logits + bias[..., None, None]
     return mx.sigmoid(gate_logits)
-
-
-@partial(mx.compile, shapeless=True)
-def _silu_mul(gate: mx.array, up: mx.array) -> mx.array:
-    return nn.silu(gate) * up
 
 
 @partial(mx.compile, shapeless=True)
