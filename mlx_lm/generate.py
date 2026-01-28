@@ -292,6 +292,10 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
+class GenerationCancelled(Exception):
+    """Raised when generation is cooperatively cancelled."""
+
+
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
@@ -314,6 +318,7 @@ def generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -371,6 +376,7 @@ def generate_step(
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+    should_cancel = should_cancel or (lambda: False)
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -422,8 +428,12 @@ def generate_step(
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
+        if should_cancel():
+            raise GenerationCancelled()
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
+            if should_cancel():
+                raise GenerationCancelled()
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
             _model_call(
@@ -438,6 +448,8 @@ def generate_step(
             mx.eval([c.state for c in prompt_cache])
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+            if should_cancel():
+                raise GenerationCancelled()
             prompt = prompt[n_to_process:]
             input_embeddings = (
                 input_embeddings[n_to_process:]
@@ -446,11 +458,15 @@ def generate_step(
             )
             mx.clear_cache()
 
+        if should_cancel():
+            raise GenerationCancelled()
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
     mx.async_eval(y, logprobs)
     n = 0
     while True:
+        if should_cancel():
+            raise GenerationCancelled()
         if n != max_tokens:
             next_y, next_logprobs = _step(y)
             mx.async_eval(next_y, next_logprobs)
@@ -480,6 +496,8 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -531,6 +549,9 @@ def speculative_generate_step(
         kv_bits=kv_bits,
     )
 
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+    should_cancel = should_cancel or (lambda: False)
+
     def _process_and_sample(tokens, logits):
         if logits_processors:
             for processor in logits_processors:
@@ -566,15 +587,6 @@ def speculative_generate_step(
             else:
                 return _process_and_sample(None, logits.squeeze(0))
 
-    def _prefill(model, cache, y):
-        while y.size > prefill_step_size:
-            model(y[:prefill_step_size][None], cache=cache)
-            quantize_cache_fn(cache)
-            mx.eval([c.state for c in cache])
-            y = y[prefill_step_size:]
-            mx.clear_cache()
-        return y
-
     def _rewind_cache(num_draft, num_accept):
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
@@ -590,15 +602,44 @@ def speculative_generate_step(
         return mx.concatenate(ys)
 
     with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
-        y = _prefill(model, model_cache, y)
+        total_prompt_tokens = y.size
+        prompt_processed_tokens = 0
+        if should_cancel():
+            raise GenerationCancelled()
+        prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+
+        while total_prompt_tokens - prompt_processed_tokens > 1:
+            if should_cancel():
+                raise GenerationCancelled()
+            remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+            n_to_process = min(prefill_step_size, remaining)
+            if n_to_process <= 0:
+                break
+
+            chunk = y[:n_to_process]
+            draft_model(chunk[None], cache=draft_cache)
+            quantize_cache_fn(draft_cache)
+            model(chunk[None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in draft_cache] + [c.state for c in model_cache])
+            prompt_processed_tokens += n_to_process
+            prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+            y = y[n_to_process:]
+            mx.clear_cache()
+            if should_cancel():
+                raise GenerationCancelled()
+
+        draft_y = y
 
     ntoks = 0
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    prompt_fully_processed = False
     try:
         while True:
+            if should_cancel():
+                raise GenerationCancelled()
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
@@ -606,6 +647,11 @@ def speculative_generate_step(
             y = mx.concatenate([y, draft_tokens])
             tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
             mx.eval(tokens, draft_tokens)
+            if not prompt_fully_processed:
+                prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+                prompt_fully_processed = True
+            if should_cancel():
+                raise GenerationCancelled()
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
             n = 0
@@ -696,7 +742,6 @@ def stream_generate(
         )
     else:
         kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
