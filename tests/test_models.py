@@ -509,6 +509,103 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_sov30_moe(self):
+        from mlx_lm.models import sov30_moe
+
+        args = sov30_moe.ModelArgs(
+            model_type="sov30_moe",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=1000,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            num_experts_per_tok=2,
+            num_experts=4,
+            moe_intermediate_size=128,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            first_k_dense_replace=1,
+            n_group=2,
+            topk_group=2,
+            routed_scaling_factor=1.0,
+            num_shared_experts=1,
+        )
+        model = sov30_moe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_sov30_moe_sanitize(self):
+        from mlx_lm.models import sov30_moe
+        import mlx.core as mx
+
+        args = sov30_moe.ModelArgs(
+            model_type="sov30_moe",
+            hidden_size=64,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=16,
+            vocab_size=100,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            num_experts_per_tok=2,
+            num_experts=4,
+            moe_intermediate_size=64,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            first_k_dense_replace=0, # All MoE
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            num_shared_experts=1,
+        )
+        model = sov30_moe.Model(args)
+        
+        # Simulate merged weights
+        # QKV: heads=4, kv=2, dim=16. hidden=64.
+        # q: 4*16=64. k: 2*16=32. v: 32. Total out=128. In=64.
+        weights = {
+            "model.layers.0.self_attn.qkv_proj.weight": mx.zeros((128, 64)),
+            "model.layers.0.mlp.experts.0.gate_up_proj.weight": mx.zeros((128, 64)), # 64 gate + 64 up. In=64
+            "model.layers.0.mlp.shared_experts.gate_up_proj.weight": mx.zeros((128, 64)),
+        }
+        
+        # Add basic weights to pass the check in sanitize
+        for i in range(4):
+            # We only testing simple sanitize, but need to ensure it processes experts
+            if i > 0:
+                 weights[f"model.layers.0.mlp.experts.{i}.gate_up_proj.weight"] = mx.zeros((128, 64))
+
+        sanitized = model.sanitize(weights)
+        
+        # Check QKV split
+        assert "model.layers.0.self_attn.q_proj.weight" in sanitized
+        assert "model.layers.0.self_attn.k_proj.weight" in sanitized
+        assert "model.layers.0.self_attn.v_proj.weight" in sanitized
+        assert sanitized["model.layers.0.self_attn.q_proj.weight"].shape == (64, 64)
+        assert sanitized["model.layers.0.self_attn.k_proj.weight"].shape == (32, 64)
+        
+        # Check Expert GateUp split and stack
+        assert "model.layers.0.mlp.switch_mlp.gate_proj.weight" in sanitized
+        assert "model.layers.0.mlp.switch_mlp.up_proj.weight" in sanitized
+        # Shape should be (num_experts, out, in) = (4, 64, 64)
+        assert sanitized["model.layers.0.mlp.switch_mlp.gate_proj.weight"].shape == (4, 64, 64)
+        
+        # Check Shared GateUp split
+        assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in sanitized
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
