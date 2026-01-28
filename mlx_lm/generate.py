@@ -240,7 +240,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         model_bytes = tree_reduce(
             lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
         )
-        max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
         if model_bytes > 0.9 * max_rec_size:
             model_mb = model_bytes // 2**20
             max_rec_mb = max_rec_size // 2**20
@@ -965,7 +965,7 @@ class BatchGenerator:
 
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
-                mx.metal.device_info()["max_recommended_working_set_size"]
+                mx.device_info()["max_recommended_working_set_size"]
             )
         else:
             self._old_wired_limit = None

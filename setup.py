@@ -10,7 +10,7 @@ sys.path.append(str(package_dir))
 
 from _version import __version__
 
-MIN_MLX_VERSION = "0.30.3"
+MIN_MLX_VERSION = "0.30.4"
 
 setup(
     name="mlx-lm",
