@@ -51,6 +51,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
+            "mlx_lm = mlx_lm.cli:main",
             "mlx_lm.awq = mlx_lm.quant.awq:main",
             "mlx_lm.dwq = mlx_lm.quant.dwq:main",
             "mlx_lm.dynamic_quant = mlx_lm.quant.dynamic_quant:main",
