@@ -41,6 +41,8 @@ class DummyModelProvider:
                 "max_tokens": 512,
                 "chat_template_args": {},
                 "model": None,
+                "decode_concurrency": 32,
+                "prompt_concurrency": 8,
             },
         )
 
