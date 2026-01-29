@@ -44,7 +44,7 @@ from .utils import load
 
 
 def get_system_fingerprint():
-    gpu_arch = mx.metal.device_info()["architecture"] if mx.metal.is_available() else ""
+    gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
@@ -1647,7 +1647,7 @@ def main():
     )
     args = parser.parse_args()
     if mx.metal.is_available():
-        wired_limit = mx.metal.device_info()["max_recommended_working_set_size"]
+        wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
 
     logging.basicConfig(
