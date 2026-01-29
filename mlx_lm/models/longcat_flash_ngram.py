@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask
-from .cache import CacheList, KVCache
+from .cache import CacheList, KVCache, NgramCache
 from .longcat_flash import LongcatFlashDecoderLayer
 from .longcat_flash import Model as LongcatFlashLM
 
@@ -45,22 +45,6 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Optional[Dict] = None
 
 
-class NgramCache:
-    def __init__(self, max_context_len: int):
-        self.ngram_context = None
-        self.max_context_len = max_context_len
-
-    def update(self, new_tokens: mx.array) -> None:
-        if self.ngram_context is None:
-            self.ngram_context = new_tokens
-        else:
-            self.ngram_context = mx.concatenate(
-                [self.ngram_context, new_tokens], axis=-1
-            )
-        if self.ngram_context.shape[-1] > self.max_context_len:
-            self.ngram_context = self.ngram_context[..., -self.max_context_len :]
-
-
 class NgramEmbedding(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -81,13 +65,9 @@ class NgramEmbedding(nn.Module):
             emb_vocab_size = int(self.m + i * 2 + 1)
             self.embedders.append(nn.Embedding(emb_vocab_size, emb_dim))
             self.post_projs.append(nn.Linear(emb_dim, args.hidden_size, bias=False))
+        self._compute_vocab_mods()
 
-        self._vocab_mods_cache: Optional[Dict[Tuple[int, int], List[int]]] = None
-
-    def _precompute_vocab_mods(self) -> Dict[Tuple[int, int], List[int]]:
-        if self._vocab_mods_cache is not None:
-            return self._vocab_mods_cache
-
+    def _compute_vocab_mods(self):
         vocab_mods = {}
         for i in range(2, self.n + 1):
             for j in range(self.k):
@@ -99,18 +79,16 @@ class NgramEmbedding(nn.Module):
                     power_mod = (power_mod * self.vocab_size) % emb_vocab_dim
                     mods.append(power_mod)
                 vocab_mods[(i, j)] = mods
+        self._vocab_mods = vocab_mods
 
-        self._vocab_mods_cache = vocab_mods
-        return vocab_mods
-
-    def _shift_right(self, tensor: mx.array, n: int) -> mx.array:
+    def _shift_right(self, x: mx.array, n: int) -> mx.array:
         if n <= 0:
-            return tensor
-        batch_size, seq_len = tensor.shape
+            return x
+        batch_size, seq_len = x.shape
         if seq_len <= n:
-            return mx.zeros_like(tensor)
+            return mx.zeros_like(x)
         return mx.concatenate(
-            [mx.zeros((batch_size, n), dtype=tensor.dtype), tensor[..., :-n]], axis=-1
+            [mx.zeros((batch_size, n), dtype=x.dtype), x[..., :-n]], axis=-1
         )
 
     def _get_ngram_ids(
@@ -128,21 +106,16 @@ class NgramEmbedding(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        ngram_context: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         seq_len = input_ids.shape[-1]
 
-        if ngram_context is not None:
-            context = mx.concatenate(
-                [ngram_context[..., -(self.n - 1) :], input_ids], axis=-1
-            )
-        else:
-            context = input_ids
-
-        context = context.astype(mx.int64)
+        context = input_ids.astype(mx.int64)
+        if cache is not None:
+            context = cache.update_and_fetch(context)
 
         x = self.word_embeddings(input_ids)
-        vocab_mods = self._precompute_vocab_mods()
+        vocab_mods = self._vocab_mods
 
         shifted_ids = {}
         for i in range(2, self.n + 1):
@@ -175,23 +148,15 @@ class LongcatFlashNgramModel(nn.Module):
         self,
         input_ids: mx.array,
         cache: Optional[Any] = None,
-        ngram_cache: Optional[NgramCache] = None,
     ) -> mx.array:
-        ngram_context = None
-        if ngram_cache is not None and ngram_cache.ngram_context is not None:
-            ngram_context = ngram_cache.ngram_context
-
-        h = self.ngram_embeddings(input_ids, ngram_context=ngram_context)
-
-        if ngram_cache is not None:
-            ngram_cache.update(input_ids)
-
         if cache is None:
-            cache = [(None, None)] * self.num_layers
+            cache = [None] + [(None, None)] * self.num_layers
 
-        mask = create_attention_mask(h, cache[0][0])
+        h = self.ngram_embeddings(input_ids, cache=cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        mask = create_attention_mask(h, cache[1][0])
+
+        for layer, c in zip(self.layers, cache[1:]):
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
@@ -204,14 +169,13 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = LongcatFlashNgramModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self._ngram_cache: Optional[NgramCache] = None
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
     ):
-        out = self.model(inputs, cache, ngram_cache=self._ngram_cache)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     @property
@@ -235,11 +199,9 @@ class Model(nn.Module):
         return weights
 
     def make_cache(self):
-        self._ngram_cache = NgramCache(max_context_len=self.args.emb_neighbor_num - 1)
-        return [CacheList(KVCache(), KVCache()) for _ in self.model.layers]
-
-    def reset_cache(self):
-        self._ngram_cache = NgramCache(max_context_len=self.args.emb_neighbor_num - 1)
+        return [NgramCache(max_len=self.args.emb_neighbor_num - 1)] + [
+            CacheList(KVCache(), KVCache()) for _ in self.model.layers
+        ]
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         LongcatFlashLM.shard(self, group)
