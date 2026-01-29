@@ -18,8 +18,9 @@ from .utils import (
 
 
 def mixed_quant_predicate_builder(
-    recipe: str, model: nn.Module, group_size: int = 64, mode: str = "affine"
+    recipe: str, model: nn.Module, group_size: int = 64
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
+    mode = "affine"
     high_bits = 6
 
     if recipe == "mixed_2_6":
@@ -117,6 +118,8 @@ def convert(
     )
 
     if isinstance(quant_predicate, str):
+        if q_mode != "affine":
+            raise ValueError(f"Quant predicates only support 'affine' quantization.")
         quant_predicate = mixed_quant_predicate_builder(
             quant_predicate, model, q_group_size, q_mode
         )
