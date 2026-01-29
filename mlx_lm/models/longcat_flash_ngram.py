@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask
-from .cache import CacheList, KVCache, NgramCache
+from .cache import ArraysCache, CacheList, KVCache
 from .longcat_flash import LongcatFlashDecoderLayer
 from .longcat_flash import Model as LongcatFlashLM
 
@@ -110,9 +110,16 @@ class NgramEmbedding(nn.Module):
     ) -> mx.array:
         seq_len = input_ids.shape[-1]
 
-        context = input_ids.astype(mx.int64)
+        input_ids = input_ids.astype(mx.int64)
         if cache is not None:
-            context = cache.update_and_fetch(context)
+            context = cache[0]
+            if context is None:
+                context = input_ids
+            else:
+                context = mx.concatenate([context, input_ids], axis=-1)
+            cache[0] = context[..., max(0, context.shape[-1] - self.n + 1) :]
+        else:
+            context = input_ids
 
         x = self.word_embeddings(input_ids)
         vocab_mods = self._vocab_mods
@@ -199,7 +206,7 @@ class Model(nn.Module):
         return weights
 
     def make_cache(self):
-        return [NgramCache(max_len=self.args.emb_neighbor_num - 1)] + [
+        return [ArraysCache(size=1)] + [
             CacheList(KVCache(), KVCache()) for _ in self.model.layers
         ]
 

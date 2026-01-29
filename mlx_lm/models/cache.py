@@ -1308,19 +1308,3 @@ class BatchRotatingKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
-
-
-class NgramCache(_BaseCache):
-    def __init__(self, max_len: int):
-        self.tokens = None
-        self.max_len = max_len
-
-    def update_and_fetch(self, tokens: mx.array) -> None:
-        if self.tokens is None:
-            self.tokens = tokens
-        else:
-            self.tokens = mx.concatenate([self.tokens, tokens], axis=-1)
-        out_tokens = self.tokens
-        if self.tokens.shape[-1] > self.max_len:
-            self.tokens = self.tokens[..., -self.max_len :]
-        return out_tokens
