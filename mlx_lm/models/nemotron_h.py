@@ -36,7 +36,6 @@ class ModelArgs(BaseModelArgs):
     ssm_state_size: int
     conv_kernel: int
     n_groups: int
-    time_step_limit: Tuple[float, float]
     mlp_bias: bool
     layer_norm_epsilon: float
     use_bias: bool
@@ -52,6 +51,17 @@ class ModelArgs(BaseModelArgs):
     num_experts_per_tok: Optional[int] = None
     norm_topk_prob: Optional[bool] = None
     routed_scaling_factor: Optional[float] = None
+    time_step_limit: Optional[Tuple[float, float]] = None
+    time_step_min: Optional[float] = None
+    time_step_max: Optional[float] = None
+
+    def __post_init__(self):
+        if (
+            self.time_step_limit is None
+            and self.time_step_min is not None
+            and self.time_step_max is not None
+        ):
+            self.time_step_limit = (self.time_step_min, self.time_step_max)
 
 
 class MambaRMSNormGated(nn.Module):
