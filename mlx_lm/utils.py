@@ -300,6 +300,16 @@ def load_model(
     if model_config is not None:
         config.update(model_config)
 
+    # Some non-generative tasks (e.g. sequence classification/regression) add new
+    # head parameters that are not present in the base checkpoint. For such cases,
+    # enforce non-strict weight loading so that the backbone loads while the new
+    # head initializes randomly.
+    #
+    # This is currently needed for ModernBERT when selecting a sequence task head
+    # at load time via model_config={"task": "..."}.
+    if config.get("model_type") == "modernbert":
+        strict = False
+
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:

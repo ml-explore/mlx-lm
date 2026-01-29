@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Any, Dict, Generator, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -86,6 +87,294 @@ def default_loss(model, batch, lengths):
     ce = ce.astype(mx.float32).sum() / ntoks
 
     return ce, ntoks
+
+
+# -----------------------------------------------------------------------------
+# Sequence classification / regression helpers
+#
+# These helpers are designed to reuse the existing training loop (`train` /
+# `evaluate`) by passing:
+#   - iterate_batches=iterate_sequence_batches
+#   - loss=sequence_loss (or a thin wrapper choosing classification/regression)
+#
+# Expected dataset item formats:
+#   1) (input_ids, label)
+#   2) (input_ids, attention_mask, label)
+#   3) {"input_ids": ..., "attention_mask": ..., "label": ...}
+#   4) {"text": ..., "label": ...}   (requires providing a tokenizer)
+# -----------------------------------------------------------------------------
+
+ArrayLike1D = Union[Sequence[int], np.ndarray, mx.array]
+
+
+def _as_1d_int_tokens(x: Any) -> Sequence[int]:
+    if isinstance(x, mx.array):
+        x = np.array(x)
+    if isinstance(x, np.ndarray):
+        x = x.tolist()
+    if not isinstance(x, (list, tuple)):
+        raise TypeError(f"Unsupported token container type: {type(x)}")
+    return [int(t) for t in x]
+
+
+def _get_sequence_item_fields(
+    item: Any,
+    *,
+    tokenizer=None,
+    text_key: str = "text",
+    label_key: str = "label",
+    input_ids_key: str = "input_ids",
+    attention_mask_key: str = "attention_mask",
+) -> Tuple[Sequence[int], Optional[Sequence[int]], Any]:
+    """
+    Normalize dataset item into (input_ids, attention_mask, label).
+    """
+    if isinstance(item, dict):
+        if input_ids_key in item:
+            input_ids = _as_1d_int_tokens(item[input_ids_key])
+            attention_mask = (
+                _as_1d_int_tokens(item[attention_mask_key])
+                if attention_mask_key in item and item[attention_mask_key] is not None
+                else None
+            )
+            label = item[label_key]
+            return input_ids, attention_mask, label
+
+        if text_key in item and label_key in item:
+            if tokenizer is None:
+                raise ValueError(
+                    "Dataset item provides text but no tokenizer was provided."
+                )
+            enc = tokenizer(item[text_key], return_tensors="np")
+            input_ids = _as_1d_int_tokens(enc[input_ids_key][0])
+            attention_mask = (
+                _as_1d_int_tokens(enc.get(attention_mask_key, None)[0])
+                if attention_mask_key in enc
+                else None
+            )
+            label = item[label_key]
+            return input_ids, attention_mask, label
+
+        raise ValueError(
+            f"Unsupported dict item format. Expected keys: "
+            f"('{input_ids_key}', '{label_key}') or ('{text_key}', '{label_key}')."
+        )
+
+    if isinstance(item, (tuple, list)):
+        if len(item) == 2:
+            input_ids, label = item
+            return _as_1d_int_tokens(input_ids), None, label
+        if len(item) == 3:
+            input_ids, attention_mask, label = item
+            return (
+                _as_1d_int_tokens(input_ids),
+                _as_1d_int_tokens(attention_mask) if attention_mask is not None else None,
+                label,
+            )
+        raise ValueError(
+            "Tuple/list item must be (input_ids, label) or (input_ids, attention_mask, label)."
+        )
+
+    raise TypeError(f"Unsupported dataset item type: {type(item)}")
+
+
+def iterate_sequence_batches(
+    dataset: Any,
+    batch_size: int,
+    max_seq_length: int,
+    loop: bool = False,
+    seed: Optional[int] = None,
+    comm_group=None,
+    *,
+    pad_to: int = 32,
+    pad_token_id: int = 0,
+    tokenizer=None,
+    text_key: str = "text",
+    label_key: str = "label",
+    input_ids_key: str = "input_ids",
+    attention_mask_key: str = "attention_mask",
+) -> Generator[Tuple[mx.array, mx.array, mx.array], None, None]:
+    """
+    Batch iterator for sequence classification/regression.
+    Yields (input_ids, attention_mask, labels).
+    """
+    if len(dataset) < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size} examples but only has {len(dataset)}."
+        )
+
+    # Distributed behavior matches iterate_batches
+    if comm_group is not None:
+        offset = comm_group.rank()
+        step = comm_group.size()
+    else:
+        offset = 0
+        step = 1
+    if batch_size % step != 0:
+        raise ValueError("The batch size must be divisible by the number of workers")
+
+    # Sort indices by length to reduce padding waste
+    def item_len(idx: int) -> int:
+        item = dataset[idx]
+        input_ids, _, _ = _get_sequence_item_fields(
+            item,
+            tokenizer=tokenizer,
+            text_key=text_key,
+            label_key=label_key,
+            input_ids_key=input_ids_key,
+            attention_mask_key=attention_mask_key,
+        )
+        return len(input_ids)
+
+    idx = sorted(range(len(dataset)), key=item_len)
+
+    batch_idx = [
+        idx[i + offset : i + offset + batch_size : step]
+        for i in range(0, len(idx) - batch_size + 1, batch_size)
+    ]
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    local_bsz = batch_size // step
+
+    while True:
+        order = np.random.permutation(len(batch_idx))
+        for bi in order:
+            items = [dataset[j] for j in batch_idx[bi]]
+
+            input_seqs: list[list[int]] = []
+            masks: list[Optional[list[int]]] = []
+            labels: list[Any] = []
+            max_len = 0
+
+            for it in items:
+                ids, am, lab = _get_sequence_item_fields(
+                    it,
+                    tokenizer=tokenizer,
+                    text_key=text_key,
+                    label_key=label_key,
+                    input_ids_key=input_ids_key,
+                    attention_mask_key=attention_mask_key,
+                )
+                if len(ids) > max_seq_length:
+                    ids = ids[:max_seq_length]
+                    if am is not None:
+                        am = am[:max_seq_length]
+                input_seqs.append(list(ids))
+                masks.append(list(am) if am is not None else None)
+                labels.append(lab)
+                max_len = max(max_len, len(ids))
+
+            max_len = max(1, max_len)
+            padded_len = pad_to * ((max_len + pad_to - 1) // pad_to)
+            padded_len = min(padded_len, max_seq_length)
+
+            input_arr = np.full((local_bsz, padded_len), pad_token_id, dtype=np.int32)
+            attn_arr = np.zeros((local_bsz, padded_len), dtype=np.int32)
+
+            for i in range(local_bsz):
+                ids = input_seqs[i]
+                L = min(len(ids), padded_len)
+                input_arr[i, :L] = np.asarray(ids[:L], dtype=np.int32)
+                if masks[i] is None:
+                    attn_arr[i, :L] = 1
+                else:
+                    m = masks[i]
+                    mL = min(len(m), padded_len)
+                    attn_arr[i, :mL] = np.asarray(m[:mL], dtype=np.int32)
+
+            labels_arr = np.asarray(labels[:local_bsz])
+            yield mx.array(input_arr), mx.array(attn_arr), mx.array(labels_arr)
+
+        if not loop:
+            break
+
+
+def sequence_loss(
+    model: nn.Module,
+    input_ids: mx.array,
+    attention_mask: mx.array,
+    labels: mx.array,
+    *,
+    task: str = "auto",
+    num_labels: Optional[int] = None,
+    label_smoothing: float = 0.0,
+    regression_loss: str = "mse",
+) -> Tuple[mx.array, mx.array]:
+    """
+    Compute loss for sequence classification/regression.
+    Returns (loss, n_examples).
+
+    task:
+      - "auto": infer regression if labels are float or num_labels==1
+      - "classification"
+      - "regression"
+    """
+    logits = model(input_ids, attention_mask=attention_mask)
+
+    if labels.ndim > 1:
+        labels = labels.reshape((-1,))
+
+    t = (task or "auto").lower()
+    if t == "auto":
+        if num_labels == 1:
+            t = "regression"
+        elif mx.issubdtype(labels.dtype, mx.floating):
+            t = "regression"
+        else:
+            t = "classification"
+
+    n = mx.array(input_ids.shape[0])
+
+    if t == "classification":
+        if logits.ndim != 2:
+            raise ValueError(
+                f"Classification expects logits of shape (B, C), got {logits.shape}"
+            )
+        labels = labels.astype(mx.int32)
+
+        if label_smoothing and label_smoothing > 0.0:
+            c = logits.shape[-1]
+            logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            nll = -mx.take_along_axis(logp, labels[:, None], axis=-1).squeeze(-1)
+            u = -mx.mean(logp, axis=-1)
+            loss_vec = (1.0 - label_smoothing) * nll + label_smoothing * u
+            loss = loss_vec.astype(mx.float32).mean()
+        else:
+            loss_vec = nn.losses.cross_entropy(logits, labels)
+            loss = loss_vec.astype(mx.float32).mean()
+
+        return loss, n
+
+    if t == "regression":
+        if logits.ndim == 2 and logits.shape[-1] == 1:
+            preds = logits.squeeze(-1)
+        elif logits.ndim == 1:
+            preds = logits
+        else:
+            raise ValueError(
+                f"Regression expects logits of shape (B,) or (B,1), got {logits.shape}"
+            )
+
+        y = labels.astype(mx.float32)
+        p = preds.astype(mx.float32)
+
+        if regression_loss.lower() == "huber":
+            d = p - y
+            abs_d = mx.abs(d)
+            quad = mx.minimum(abs_d, mx.array(1.0, dtype=abs_d.dtype))
+            lin = abs_d - quad
+            loss_vec = 0.5 * quad * quad + lin
+            loss = loss_vec.mean()
+        else:
+            loss = mx.mean(mx.square(p - y))
+
+        return loss, n
+
+    raise ValueError(
+        f"Unknown task '{task}'. Use 'classification', 'regression', or 'auto'."
+    )
 
 
 def iterate_batches(
