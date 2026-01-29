@@ -148,6 +148,8 @@ class NgramEmbedding(nn.Module):
         else:
             context = input_ids
 
+        context = context.astype(mx.int64)
+
         x = self.word_embeddings(input_ids)
         vocab_mods = self._precompute_vocab_mods()
 
@@ -524,7 +526,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         for l in range(self.args.num_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
