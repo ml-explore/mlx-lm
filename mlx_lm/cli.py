@@ -24,7 +24,7 @@ def main():
         "upload",
     )
     subpackages = {
-        "awq": "qaunt",
+        "awq": "quant",
         "dwq": "quant",
         "dynamic_quant": "quant",
         "gptq": "quant",
