@@ -121,7 +121,9 @@ def convert(
         if q_mode != "affine":
             raise ValueError(f"Quant predicates only support 'affine' quantization.")
         quant_predicate = mixed_quant_predicate_builder(
-            quant_predicate, model, q_group_size, q_mode
+            quant_predicate,
+            model,
+            q_group_size,
         )
 
     if dtype is None:
