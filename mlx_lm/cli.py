@@ -23,14 +23,19 @@ def main():
         "server",
         "upload",
     )
+    subpackages = {
+        "awq": "qaunt",
+        "dwq": "quant",
+        "dynamic_quant": "quant",
+        "gptq": "quant",
+    }
     if len(sys.argv) < 2:
         raise ValueError(f"CLI requires a subcommand in {subcommands}")
     subcommand = sys.argv.pop(1)
     if subcommand in subcommands:
-        try:
-            submodule = importlib.import_module(f"mlx_lm.{subcommand}")
-        except ImportError:
-            submodule = importlib.import_module(f"mlx_lm.quant.{subcommand}")
+        if subpackage := subpackages.get(subcommand):
+            subcommand = f"{subpackage}.{subcommand}"
+        submodule = importlib.import_module(f"mlx_lm.{subcommand}")
         submodule.main()
     elif subcommand == "--version":
         from mlx_lm import __version__
