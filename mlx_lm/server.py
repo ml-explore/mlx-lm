@@ -6,21 +6,17 @@ import json
 import logging
 import pickle
 import platform
-import select
 import socket
-import subprocess
 import time
 import uuid
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
-from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from socketserver import BaseRequestHandler, ThreadingTCPServer
-from threading import Lock, Thread
+from threading import Thread
 from typing import (
     Any,
     Callable,
