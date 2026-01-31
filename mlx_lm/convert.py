@@ -20,6 +20,7 @@ from .utils import (
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module, group_size: int = 64
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
+    mode = "affine"
     high_bits = 6
 
     if recipe == "mixed_2_6":
@@ -65,11 +66,11 @@ def mixed_quant_predicate_builder(
         if (
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "lm_head" in path:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
 
         return {"group_size": group_size, "bits": low_bits}
 
@@ -117,8 +118,12 @@ def convert(
     )
 
     if isinstance(quant_predicate, str):
+        if q_mode != "affine":
+            raise ValueError(f"Quant predicates only support 'affine' quantization.")
         quant_predicate = mixed_quant_predicate_builder(
-            quant_predicate, model, q_group_size
+            quant_predicate,
+            model,
+            q_group_size,
         )
 
     if dtype is None:

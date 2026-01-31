@@ -179,6 +179,12 @@ def setup_arg_parser():
         help="A file containing saved KV caches to avoid recomputing them",
     )
     parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Quantize activations using the same quantization config as the corresponding layer.",
+    )
+    parser.add_argument(
         "--kv-bits",
         type=int,
         help="Number of bits for KV cache quantization. Defaults to no quantization.",
@@ -234,7 +240,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         model_bytes = tree_reduce(
             lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
         )
-        max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
         if model_bytes > 0.9 * max_rec_size:
             model_mb = model_bytes // 2**20
             max_rec_mb = max_rec_size // 2**20
@@ -959,7 +965,7 @@ class BatchGenerator:
 
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
-                mx.metal.device_info()["max_recommended_working_set_size"]
+                mx.device_info()["max_recommended_working_set_size"]
             )
         else:
             self._old_wired_limit = None
@@ -1008,10 +1014,16 @@ class BatchGenerator:
         )
         return uids
 
-    def remove(self, uids: List[int]):
+    def remove(self, uids: List[int], return_prompt_caches: bool = False):
+        caches = {}
         uids = set(uids)
         if self.active_batch is not None:
             batch = self.active_batch
+            if return_prompt_caches:
+                for e, uid in enumerate(batch.uids):
+                    if uid not in uids:
+                        continue
+                    caches[uid] = batch.extract_cache(e)
             keep_idx = [e for e, uid in enumerate(batch.uids) if uid not in uids]
             if len(keep_idx) > 0:
                 batch.filter(keep_idx)
@@ -1021,6 +1033,9 @@ class BatchGenerator:
         for i in reversed(range(len(self.unprocessed_prompts))):
             if self.unprocessed_prompts[i][0] in uids:
                 self.unprocessed_prompts.pop(i)
+
+        if return_prompt_caches:
+            return caches
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
@@ -1370,6 +1385,7 @@ def main():
         model_path,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
+        model_config={"quantize_activations": args.quantize_activations},
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)

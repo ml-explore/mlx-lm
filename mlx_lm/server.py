@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import logging
+import pickle
 import platform
 import socket
 import time
@@ -15,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Condition, Lock, Thread
+from threading import Thread
 from typing import (
     Any,
     Callable,
@@ -33,18 +34,18 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, stream_generate
+from .generate import BatchGenerator, generation_stream, stream_generate
 from .models.cache import (
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load
+from .utils import load, sharded_load
 
 
 def get_system_fingerprint():
-    gpu_arch = mx.metal.device_info()["architecture"] if mx.metal.is_available() else ""
+    gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
@@ -384,6 +385,46 @@ class Response:
     top_tokens: Optional[Tuple[int, float]]
 
 
+class TimeBudget:
+    def __init__(self, budget=0.5, iterations=25, sync_frequency=10):
+        self._is_distributed = mx.distributed.init().size() > 1
+        self._budget = budget
+        self._iterations = iterations
+        self._sync_frequency = sync_frequency
+
+        self._start = None
+        self._current_iterations = None
+        self._loops = 0
+        self._time_spent = 0
+
+    def __iter__(self):
+        self._start = time.time()
+        self._current_iterations = 0
+        return self
+
+    def __next__(self):
+        if not self._is_distributed:
+            if time.time() - self._start > self._budget:
+                raise StopIteration()
+            return None
+
+        self._current_iterations += 1
+        if self._current_iterations > self._iterations:
+            self._loops += 1
+            self._time_spent += time.time() - self._start
+            if self._loops % self._sync_frequency == 0:
+                with mx.stream(generation_stream):
+                    loop_time = mx.distributed.all_sum(self._time_spent).item()
+                avg_loop_time = loop_time / (
+                    mx.distributed.init().size() * self._sync_frequency
+                )
+                factor = self._budget / avg_loop_time
+                self._iterations = max(round(self._iterations * factor), 1)
+                self._loops = 0
+                self._time_spent = 0
+            raise StopIteration()
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -393,6 +434,13 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+
+        group = mx.distributed.init()
+        self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
+        self.tensor_group = (
+            group if group.size() > 1 and not cli_args.pipeline else None
+        )
+        self.is_distributed = group.size() > 1
 
         # Preload the default model if it is provided
         self.default_model_map = {}
@@ -426,15 +474,29 @@ class ModelProvider:
                     "argument or in the HTTP request"
                 )
             adapter_path = adapter_path or self.cli_args.adapter_path
-            model, tokenizer = load(
-                self.cli_args.model,
-                adapter_path=adapter_path,
-                tokenizer_config=tokenizer_config,
-            )
+            # TODO: Generalize distributed load
+            if self.is_distributed:
+                model, tokenizer = sharded_load(
+                    self.cli_args.model, self.pipeline_group, self.tensor_group
+                )
+            else:
+                model, tokenizer = load(
+                    self.cli_args.model,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
         else:
-            model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
-            )
+            # TODO: Generalize distributed load
+            if self.is_distributed:
+                model, tokenizer = sharded_load(
+                    model_path, self.pipeline_group, self.tensor_group
+                )
+            else:
+                model, tokenizer = load(
+                    model_path,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
@@ -501,6 +563,9 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
 
+        self._time_budget = TimeBudget()
+        self._is_distributed = mx.distributed.init().size() > 1
+        self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
@@ -508,6 +573,57 @@ class ResponseGenerator:
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
+
+    def join(self):
+        self._generation_thread.join()
+
+    def _next_request(self, timeout=None):
+        request = None
+        if not self._is_distributed or self._rank == 0:
+            try:
+                if timeout is not None:
+                    request = self.requests.get(timeout=timeout)
+                else:
+                    request = self.requests.get_nowait()
+            except QueueEmpty:
+                pass
+
+        return self._share_request(request)
+
+    def _share_object(self, obj):
+        if not self._is_distributed:
+            return obj
+
+        with mx.stream(generation_stream):
+            if self._rank == 0:
+                if obj is None:
+                    mx.eval(mx.distributed.all_sum(0))
+                    return None
+                else:
+                    data = mx.array(pickle.dumps(obj))
+                    mx.eval(mx.distributed.all_sum(data.size))
+                    mx.eval(mx.distributed.all_sum(data))
+                    return obj
+            else:
+                size = mx.distributed.all_sum(0).item()
+                if size == 0:
+                    return None
+                else:
+                    data = mx.zeros(size, dtype=mx.uint8)
+                    data = mx.distributed.all_sum(data)
+                    return pickle.loads(data)
+
+    def _share_request(self, request):
+        if not self._is_distributed:
+            return request
+
+        shareable = request[1:] if request is not None else None
+        shareable = self._share_object(shareable)
+        if shareable is None:
+            return None
+
+        rq = request[0] if request is not None else Queue()
+        return rq, *shareable
 
     def _tokenize(self, tokenizer, request):
         if request.request_type == "chat":
@@ -559,18 +675,16 @@ class ResponseGenerator:
             if unprocessed_requests:
                 return unprocessed_requests.pop()
             else:
-                try:
-                    if timeout is not None:
-                        return self.requests.get(timeout=timeout)
-                    else:
-                        return self.requests.get_nowait()
-                except QueueEmpty:
-                    return None
+                return self._next_request(timeout)
 
         def progress_callback(info):
             for uid, processed, total in info:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
+
+        if self._is_distributed:
+            seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+            mx.random.seed(seed)
 
         while not self._stop:
             request = None
@@ -657,6 +771,8 @@ class ResponseGenerator:
                     batch_generator = BatchGenerator(
                         model,
                         stop_tokens=tokenizer.eos_token_ids,
+                        completion_batch_size=self.cli_args.decode_concurrency,
+                        prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -683,12 +799,7 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
-                time_budget = 0.5
-                start = time.time()
-                while True:
-                    if time.time() - start > time_budget:
-                        break
-
+                for _ in self._time_budget:
                     responses = batch_generator.next()
                     if not responses:
                         break
@@ -702,10 +813,10 @@ class ResponseGenerator:
                         top_tokens = None
                         if args.logprobs > 0:
                             sorted_indices = mx.argpartition(
-                                -gen.logprobs, kth=args.logprobs - 1
+                                -r.logprobs, kth=args.logprobs - 1
                             )
                             top_indices = sorted_indices[: args.logprobs]
-                            top_logprobs = gen.logprobs[top_indices]
+                            top_logprobs = r.logprobs[top_indices]
                             top_token_info = zip(
                                 top_indices.tolist(), top_logprobs.tolist()
                             )
@@ -730,8 +841,20 @@ class ResponseGenerator:
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
-                    if uids_to_remove:
-                        batch_generator.remove(uids_to_remove)
+                uids_to_remove = self._share_object(uids_to_remove)
+                if uids_to_remove:
+                    with mx.stream(generation_stream):
+                        caches = batch_generator.remove(
+                            uids_to_remove, return_prompt_caches=True
+                        )
+                        for uid, prompt_cache in caches.items():
+                            if uid not in batch_results:
+                                continue
+                            result = batch_results[uid]
+                            self.prompt_cache.insert_cache(
+                                current_model_key, result["cache_key"], prompt_cache
+                            )
+                            del batch_results[uid]
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -822,6 +945,8 @@ class ResponseGenerator:
                 cache_key.append(gen.token)
 
                 if ctx._should_stop:
+                    if self._is_distributed:
+                        raise NotImplementedError()
                     break
 
             rqueue.put(None)
@@ -1218,16 +1343,16 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         tool_idx = 0
 
-        def parse_single_tool(tool_text):
+        def format_tool_call(tool_call):
             nonlocal tool_idx
-            tool_call = ctx.tool_parser(tool_text, request.tools)
+            tool_call_id = tool_call.pop("id", None) or str(uuid.uuid4())
             tool_call["arguments"] = json.dumps(
                 tool_call["arguments"], ensure_ascii=False
             )
             out = {
                 "function": tool_call,
                 "type": "function",
-                "id": str(uuid.uuid4()),
+                "id": tool_call_id,
             }
             if self.stream:
                 out["index"] = tool_idx
@@ -1237,7 +1362,14 @@ class APIHandler(BaseHTTPRequestHandler):
         def parse_tools(tool_calls):
             if not tool_calls:
                 return []
-            return [parse_single_tool(tool_text) for tool_text in tool_calls]
+            result = []
+            for tool_text in tool_calls:
+                parsed = ctx.tool_parser(tool_text, request.tools)
+                if isinstance(parsed, list):
+                    result.extend(format_tool_call(tc) for tc in parsed)
+                else:
+                    result.append(format_tool_call(parsed))
+            return result
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token
@@ -1515,15 +1647,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def run(
+def _run_http_server(
     host: str,
     port: int,
-    model_provider: ModelProvider,
+    response_generator,
     server_class=ThreadingHTTPServer,
     handler_class=APIHandler,
 ):
     server_address = (host, port)
-    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
@@ -1547,6 +1678,21 @@ def run(
     except KeyboardInterrupt:
         httpd.shutdown()
         response_generator.stop_and_join()
+
+
+def run(
+    host: str,
+    port: int,
+    model_provider: ModelProvider,
+    server_class=ThreadingHTTPServer,
+    handler_class=APIHandler,
+):
+    group = mx.distributed.init()
+    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
+    if group.rank() == 0:
+        _run_http_server(host, port, response_generator)
+    else:
+        response_generator.join()
 
 
 def main():
@@ -1645,9 +1791,26 @@ def main():
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
+    parser.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=32,
+        help="When a request is batchable then decode that many requests in parallel",
+    )
+    parser.add_argument(
+        "--prompt-concurrency",
+        type=int,
+        default=8,
+        help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
+    )
     args = parser.parse_args()
     if mx.metal.is_available():
-        wired_limit = mx.metal.device_info()["max_recommended_working_set_size"]
+        wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
 
     logging.basicConfig(
