@@ -66,11 +66,6 @@ class SwiGLU(nn.Module):
 
 
 @partial(mx.compile, shapeless=True)
-def _silu_mul(gate: mx.array, up: mx.array) -> mx.array:
-    return nn.silu(gate) * up
-
-
-@partial(mx.compile, shapeless=True)
 def relu_squared(x):
     return nn.relu(x).square()
 
