@@ -1,11 +1,14 @@
 import importlib
 import json
+import logging
 import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+logger = logging.getLogger(__name__)
 
 
 class StreamingDetokenizer:
@@ -91,7 +94,11 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if self._current_text.endswith("\ufffd"):
+            if self._current_text.endswith("\ufffd") or (
+                self._tokenizer.clean_up_tokenization_spaces
+                and len(self._current_text) > 0
+                and self._current_text[-1] == " "
+            ):
                 self._current_text = self._current_text[:-1]
         if self._current_text and self._current_text[-1] == "\n":
             self._text += self._current_text
@@ -159,6 +166,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _space_matches = (".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re")
 
     def __init__(self, tokenizer):
+        self.clean_spaces = tokenizer.clean_up_tokenization_spaces
+
         # Extract the tokens in a list from id to text
         self.tokenmap = [None] * len(tokenizer.vocab)
         for value, tokenid in tokenizer.vocab.items():
@@ -199,6 +208,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             for match in self._space_matches:
                 if current_text[1:].startswith(match):
                     return current_text[1:]
+        elif self.clean_spaces and current_text[1:].startswith(self._space_matches):
+            return current_text[1:]
         return current_text
 
     @staticmethod
@@ -210,7 +221,11 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             if bos_token and decoded.startswith(bos_token):
                 decoded = decoded[len(bos_token) :]
             return decoded == "a,b"
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "BPE trim inference failed; falling back to default spacing.",
+                exc_info=exc,
+            )
             return False
 
     def add_token(self, token):
@@ -220,21 +235,30 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         text = self._decode_bytes(self._unflushed)
 
         # For multi-byte utf-8 wait until they are complete
-        if not text.endswith("\ufffd"):
-            text = self._maybe_trim_space(text)
-            if self._trim_space_before_punct:
-                if self._pending_space:
-                    if any(text.startswith(match) for match in self._space_matches):
-                        self._pending_space = ""
-                    else:
-                        self.text += self._pending_space
-                        self._pending_space = ""
-                if text == " ":
-                    self._pending_space = " "
-                    self._unflushed = ""
-                    return
+        if text.endswith("\ufffd"):
+            return
+
+        text = self._maybe_trim_space(text)
+        if self._trim_space_before_punct:
+            if self._pending_space:
+                if any(text.startswith(match) for match in self._space_matches):
+                    self._pending_space = ""
+                else:
+                    self.text += self._pending_space
+                    self._pending_space = ""
+            if text == " ":
+                self._pending_space = " "
+                self._unflushed = ""
+                return
             self.text += text
             self._unflushed = ""
+            return
+
+        if self.clean_spaces and len(v) == 1 and self._byte_decoder.get(v[0]) == 32:
+            return
+
+        self.text += text
+        self._unflushed = ""
 
     def finalize(self):
         current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
@@ -319,7 +343,10 @@ class TokenizerWrapper:
         self._tool_call_end = tool_call_end
 
         vocab = tokenizer.get_vocab()
-        THINK_TOKENS = [("<think>", "</think>")]
+        THINK_TOKENS = [
+            ("<think>", "</think>"),
+            ("<longcat_think>", "</longcat_think>"),
+        ]
         for think_start, think_end in THINK_TOKENS:
             if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
@@ -500,6 +527,8 @@ def _infer_tool_parser(chat_template):
         return "minimax_m2"
     elif "<start_function_call>" in chat_template:
         return "function_gemma"
+    elif "<longcat_tool_call>" in chat_template:
+        return "longcat"
     elif "<arg_key>" in chat_template:
         return "glm47"
     elif "<tool_call>\n<function=" in chat_template:
