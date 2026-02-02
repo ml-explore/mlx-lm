@@ -66,11 +66,11 @@ class ModelArgs(BaseModelArgs):
 class ZeroCenteredRMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1e-5):
         super().__init__()
-        self.weight = mx.zeros((dims,))
+        self.weight = mx.ones((dims,))
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight + 1, self.eps)
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class Step3p5MLP(nn.Module):
@@ -97,7 +97,7 @@ class Step3p5MLP(nn.Module):
 
 @mx.compile
 def moe_gate_select(gates, router_bias, top_k, routed_scaling_factor, norm_topk_prob):
-    scores = mx.sigmoid(gates)
+    scores = mx.sigmoid(gates.astype(mx.float32))
     corrected_scores = scores + router_bias
 
     topk_indices = mx.argpartition(-corrected_scores, kth=top_k - 1, axis=-1)[
@@ -125,15 +125,13 @@ class Step3p5MoEGate(nn.Module):
         self.router_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, x: mx.array):
-        gates = self.gate(x.astype(mx.float32))
-        inds, weights = moe_gate_select(
-            gates,
+        return moe_gate_select(
+            self.gate(x),
             self.router_bias,
             self.top_k,
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
-        return inds, weights.astype(x.dtype)
 
 
 class Step3p5MoE(nn.Module):
@@ -172,7 +170,11 @@ class Step3p5MoE(nn.Module):
 
         topk_indices, topk_weights = self.gate(x)
         routed_output = self.switch_mlp(x, topk_indices)
-        routed_output = (routed_output * topk_weights[..., None]).sum(axis=-2)
+        routed_output = (
+            (routed_output * topk_weights[..., None])
+            .sum(axis=-2)
+            .astype(routed_output.dtype)
+        )
         y = routed_output + self.share_expert(x)
 
         if self.sharding_group is not None:
@@ -418,6 +420,9 @@ class Model(nn.Module):
                 if src in k and dst not in k:
                     k = k.replace(src, dst)
                     break
+
+            if k.endswith(".weight") and ("layernorm" in k or "norm" in k):
+                v = v + 1
 
             new_weights[k] = v
 
