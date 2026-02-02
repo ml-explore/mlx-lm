@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
@@ -163,11 +164,21 @@ class Step3p5MoE(nn.Module):
             swiglu_limit=swiglu_limit_shared,
         )
 
+        self.sharding_group = None
+
     def __call__(self, x: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         topk_indices, topk_weights = self.gate(x)
         routed_output = self.switch_mlp(x, topk_indices)
         routed_output = (routed_output * topk_weights[..., None]).sum(axis=-2)
-        return routed_output + self.share_expert(x)
+        y = routed_output + self.share_expert(x)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
 
 
 class Step3p5Attention(nn.Module):
@@ -427,3 +438,59 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+
+        for layer in self.model.layers:
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.num_heads //= N
+            layer.self_attn.num_kv_heads //= N
+
+            if layer.self_attn.use_head_wise_attn_gate:
+                layer.self_attn.g_proj = shard_linear(
+                    layer.self_attn.g_proj, "all-to-sharded", group=group
+                )
+
+            if isinstance(layer.mlp, Step3p5MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.share_expert.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.share_expert.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.share_expert.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
