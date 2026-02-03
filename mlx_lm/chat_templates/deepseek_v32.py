@@ -4,6 +4,8 @@ import copy
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
+from transformers.utils.chat_template_utils import get_json_schema
+from inspect import isfunction
 
 TOOLS_SYSTEM_TEMPLATE = """## Tools
 
@@ -70,7 +72,11 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    return [tool["function"] for tool in tools]
+    def normalize_tool(tool):
+        if isfunction(tool):
+            return get_json_schema(tool)
+        return tool["function"]
+    return [normalize_tool(tool) for tool in tools]
 
 
 def tool_calls_from_openai_format(tool_calls):
@@ -141,7 +147,7 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 
 
 def render_message(
-    index: int, messages: List[Dict[str, Any]], thinking_mode: str
+        index: int, messages: List[Dict[str, Any]], thinking_mode: str, tools: Any = None,
 ) -> str:
     assert 0 <= index < len(messages)
     assert thinking_mode in [
@@ -155,20 +161,18 @@ def render_message(
 
     role = msg.get("role")
     content = msg.get("content")
-    tools = msg.get("tools")
+    tools = tools or msg.get("tools")
     response_format = msg.get("response_format")
     tool_calls = msg.get("tool_calls")
     reasoning_content = msg.get("reasoning_content")
 
-    if tools:
-        tools = tools_from_openai_format(tools)
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
     if role == "system":
         prompt += system_msg_template.format(content=content or "")
         if tools:
-            prompt += "\n\n" + render_tools(tools)
+            prompt += "\n\n" + render_tools(tools_from_openai_format(tools))
 
         if response_format:
             prompt += "\n\n" + response_format_template.format(
@@ -179,7 +183,7 @@ def render_message(
         assert content, f"Invalid message for role `{role}`: {msg}"
         content_developer = ""
         if tools:
-            content_developer += "\n\n" + render_tools(tools)
+            content_developer += "\n\n" + render_tools(tools_from_openai_format(tools))
 
         if response_format:
             content_developer += "\n\n" + response_format_template.format(
@@ -301,6 +305,7 @@ def encode_messages(
     context: Optional[List[Dict[str, Any]]] = None,
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
+    tools: Any = None
 ) -> str:
     context = context if context else []
     full_messages = context + messages
@@ -311,7 +316,7 @@ def encode_messages(
 
     for idx in range(len(messages)):
         prompt += render_message(
-            idx + len(context), full_messages, thinking_mode=thinking_mode
+            idx + len(context), full_messages, thinking_mode=thinking_mode, tools=tools,
         )
 
     return prompt
