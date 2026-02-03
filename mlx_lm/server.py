@@ -728,7 +728,11 @@ class ResponseGenerator:
                     and current_model == args.model
                     and is_batchable
                 ):
-                    prompt = self._tokenize(current_tokenizer, request, args)
+                    try:
+                        prompt = self._tokenize(current_tokenizer, request, args)
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
 
                     ctx = GenerationContext(
                         has_tool_calling=tokenizer.has_tool_calling,
