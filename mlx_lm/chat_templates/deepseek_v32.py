@@ -3,9 +3,10 @@
 import copy
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
-from transformers.utils.chat_template_utils import get_json_schema
 from inspect import isfunction
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from transformers.utils.chat_template_utils import get_json_schema
 
 TOOLS_SYSTEM_TEMPLATE = """## Tools
 
@@ -76,6 +77,7 @@ def tools_from_openai_format(tools):
         if isfunction(tool):
             return get_json_schema(tool)
         return tool["function"]
+
     return [normalize_tool(tool) for tool in tools]
 
 
@@ -147,7 +149,10 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 
 
 def render_message(
-        index: int, messages: List[Dict[str, Any]], thinking_mode: str, tools: Any = None,
+    index: int,
+    messages: List[Dict[str, Any]],
+    thinking_mode: str,
+    tools: Any = None,
 ) -> str:
     assert 0 <= index < len(messages)
     assert thinking_mode in [
@@ -305,7 +310,7 @@ def encode_messages(
     context: Optional[List[Dict[str, Any]]] = None,
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
-    tools: Any = None
+    tools: Any = None,
 ) -> str:
     context = context if context else []
     full_messages = context + messages
@@ -316,7 +321,10 @@ def encode_messages(
 
     for idx in range(len(messages)):
         prompt += render_message(
-            idx + len(context), full_messages, thinking_mode=thinking_mode, tools=tools,
+            idx + len(context),
+            full_messages,
+            thinking_mode=thinking_mode,
+            tools=tools,
         )
 
     return prompt
