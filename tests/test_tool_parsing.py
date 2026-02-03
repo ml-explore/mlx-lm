@@ -15,14 +15,6 @@ from mlx_lm.tool_parsers import (
 class TestToolParsing(unittest.TestCase):
 
     def test_parsers(self):
-<<<<<<< HEAD
-        test_cases = [
-            "call:multiply{a:12234585,b:48838483920}",
-            "multiply<arg_key>a</arg_key><arg_value>12234585</arg_value><arg_key>b</arg_key><arg_value>48838483920</arg_value>",
-            '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
-            '<invoke name="multiply">\n<parameter name="a">12234585</parameter>\n<parameter name="b">48838483920</parameter>\n</invoke>',
-            "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
-
         test_cases = [
             ("call:multiply{a:12234585,b:48838483920}", function_gemma),
             (
@@ -46,9 +38,14 @@ class TestToolParsing(unittest.TestCase):
                 "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
                 qwen3_coder,
             ),
-            ("multiply<longcat_arg_key>a</longcat_arg_key>\n<longcat_arg_value>12234585</longcat_arg_value>\n<longcat_arg_key>b</longcat_arg_key>\n<longcat_arg_value>48838483920</longcat_arg_value>", longcat),
-            ('{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}', longcat),
-
+            (
+                "multiply<longcat_arg_key>a</longcat_arg_key>\n<longcat_arg_value>12234585</longcat_arg_value>\n<longcat_arg_key>b</longcat_arg_key>\n<longcat_arg_value>48838483920</longcat_arg_value>",
+                longcat,
+            ),
+            (
+                '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
+                longcat,
+            ),
         ]
 
         tools = [
@@ -79,11 +76,6 @@ class TestToolParsing(unittest.TestCase):
                 self.assertEqual(tool_call, expected)
 
         test_cases = [
-            "call:get_current_temperature{location:<escape>London<escape>}",
-            'get_current_temperature<arg_key>location</arg_key><arg_value>"London"</arg_value>',
-            '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
-            '<invoke name="get_current_temperature">\n<parameter name="location">London</parameter>\n</invoke>',
-            "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
             (
                 "call:get_current_temperature{location:<escape>London<escape>}",
                 function_gemma,
@@ -104,8 +96,14 @@ class TestToolParsing(unittest.TestCase):
                 "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
                 qwen3_coder,
             ),
-            ("get_current_temperature<longcat_arg_key>location</longcat_arg_key>\n<longcat_arg_value>London</longcat_arg_value>", longcat),
-            ('{"name": "get_current_temperature", "arguments": {"location": "London"}}', longcat),
+            (
+                "get_current_temperature<longcat_arg_key>location</longcat_arg_key>\n<longcat_arg_value>London</longcat_arg_value>",
+                longcat,
+            ),
+            (
+                '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
+                longcat,
+            ),
         ]
         tools = [
             {
@@ -133,7 +131,6 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
-<<<<<<< HEAD
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
@@ -172,8 +169,6 @@ class TestToolParsing(unittest.TestCase):
         ]
         self.assertEqual(tool_calls, expected)
 
-=======
->>>>>>> 4cdbb3f (simplify test)
 
 if __name__ == "__main__":
     unittest.main()
