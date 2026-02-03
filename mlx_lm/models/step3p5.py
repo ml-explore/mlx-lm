@@ -406,6 +406,10 @@ class Model(nn.Module):
             (".share_expert.", ".mlp.share_expert."),
         ]
 
+        is_vanilla = any(
+            src in k and dst not in k for k in weights for src, dst in remappings
+        )
+
         new_weights = {}
         for k, v in weights.items():
             if ".mtp" in k:
@@ -421,9 +425,8 @@ class Model(nn.Module):
                     k = k.replace(src, dst)
                     break
 
-            if k.endswith(".weight") and "norm" in k:
-                if mx.mean(v).item() < 0.5:
-                    v = v + 1
+            if is_vanilla and k.endswith(".weight") and "norm" in k:
+                v = v + 1
 
             new_weights[k] = v
 
