@@ -573,58 +573,6 @@ def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, A
     )
 
 
-_chat_template_arg_default_whitelist = """\
-enable_thinking:bool;thinking:bool;thinking_mode:str;reasoning_effort:str;thinking_budget:int;\
-model_identity:str;date_string:str;\
-think_render_option:str;truncate_history_thinking:bool;tools_in_user_message:bool;\
-"""
-_chat_template_arg_whitelist_types = {
-    "str": str,
-    "num": (int, float),
-    "int": int,
-    "float": float,
-    "bool": bool,
-    "dict": dict,
-    "list": (list, tuple),
-    "*": (str, int, float, bool, dict, list, tuple, type(None)),
-}
-
-
-def _apply_chat_template_arg_whitelist(
-    kws: Dict[str, Any], whitelist: str
-) -> Dict[str, Any]:
-    whitelist = whitelist.strip()
-    if whitelist == "" or not kws:
-        return {}
-    if whitelist == "*":
-        return kws
-
-    ret = {}
-    for i in whitelist.split(";"):
-        key, typ = i.rsplit(":", 1) if ":" in i else (i, "*")
-        key, typ = key.strip(), typ.strip()
-        if not key or key not in kws:
-            continue
-
-        val = kws[key]
-        if typ == "int":
-            if isinstance(val, float):
-                val = int(val)
-        elif typ == "float":
-            if isinstance(val, int):
-                val = float(val)
-
-        if isinstance(val, _chat_template_arg_whitelist_types.get(typ, ())):
-            ret[key] = val
-
-    if len(ret) != len(kws):
-        rejected = set(kws.keys())
-        rejected -= ret.keys()
-        logging.info(f"Rejecting chat_template_kwargs keys {rejected!r}")
-
-    return ret
-
-
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
@@ -710,13 +658,8 @@ class ResponseGenerator:
 
                 chat_template_args = self.model_provider.cli_args.chat_template_args
                 if args.chat_template_kwargs:
-                    kwargs = _apply_chat_template_arg_whitelist(
-                        args.chat_template_kwargs,
-                        self.model_provider.cli_args.client_chat_template_args,
-                    )
-                    if kwargs:
-                        chat_template_args = chat_template_args.copy()
-                        chat_template_args.update(kwargs)
+                    chat_template_args = chat_template_args.copy()
+                    chat_template_args.update(args.chat_template_kwargs)
                 return tokenizer.apply_chat_template(
                     messages,
                     tools=tools,
@@ -785,11 +728,7 @@ class ResponseGenerator:
                     and current_model == args.model
                     and is_batchable
                 ):
-                    try:
-                        prompt = self._tokenize(current_tokenizer, request, args)
-                    except Exception as e:
-                        rqueue.put(e)
-                        continue
+                    prompt = self._tokenize(current_tokenizer, request, args)
 
                     ctx = GenerationContext(
                         has_tool_calling=tokenizer.has_tool_calling,
@@ -1870,13 +1809,6 @@ def main():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
-    )
-    parser.add_argument(
-        "--client-chat-template-args",
-        type=str,
-        default=_chat_template_arg_default_whitelist,
-        help='Whitelist of apply_chat_template arguments a client can set with "chat_template_kwargs".'
-        " '*' to allow any argument. (default: thinking:bool;enable_thinking:bool;... )",
     )
     parser.add_argument(
         "--decode-concurrency",
