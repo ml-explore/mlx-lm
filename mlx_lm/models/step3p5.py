@@ -66,11 +66,11 @@ class ModelArgs(BaseModelArgs):
 class ZeroCenteredRMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1e-5):
         super().__init__()
-        self.weight = mx.zeros((dims,))
+        self.weight = mx.ones((dims,))
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight + 1, self.eps)
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class Step3p5MLP(nn.Module):
@@ -420,6 +420,10 @@ class Model(nn.Module):
                 if src in k and dst not in k:
                     k = k.replace(src, dst)
                     break
+
+            if k.endswith(".weight") and "norm" in k:
+                if mx.mean(v).item() < 0.5:
+                    v = v + 1
 
             new_weights[k] = v
 
