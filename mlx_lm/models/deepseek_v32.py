@@ -108,7 +108,7 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
-        scores = scores.sum(axis=1)
+        scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
@@ -215,12 +215,12 @@ class DeepseekV32Attention(nn.Module):
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
-            k_seq = keys.shape[2]
-            sparse_mask = mx.zeros((B, L, k_seq), dtype=mx.bool_)
+            shape = list(topk_indices.shape)
+            shape[-1] = keys.shape[2]
+            sparse_mask = mx.zeros(shape, dtype=mx.bool_)
             sparse_mask = mx.put_along_axis(
                 sparse_mask, topk_indices, mx.array(True), axis=-1
             )
-            sparse_mask = sparse_mask[:, None, :, :]
             if mask is not None:
                 sparse_mask = sparse_mask & mask
             mask = sparse_mask
