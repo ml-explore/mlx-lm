@@ -1056,6 +1056,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
             self._set_completion_headers(400)
+            self.end_headers()
             self.wfile.write(
                 json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
             )
@@ -1340,7 +1341,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write((f"{e}").encode())
+            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
 
         # Prepare the headers
