@@ -341,8 +341,10 @@ class GenerationArguments:
 
     max_tokens: int
     num_draft_tokens: int
-    logprobs: int
+    logprobs: bool
+    top_logprobs: int
     seed: Optional[int]
+    chat_template_kwargs: Optional[Dict[str, Any]]
 
 
 @dataclass
@@ -382,7 +384,7 @@ class Response:
     token: int
     logprob: float
     finish_reason: Optional[str]
-    top_tokens: Optional[Tuple[int, float]]
+    top_tokens: Tuple[Dict[str, Any]]
 
 
 class TimeBudget:
@@ -557,6 +559,20 @@ def _make_logits_processors(args):
     )
 
 
+def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, Any]]:
+    """Returns info dicts for the top `top_logprobs` tokens from `logprobs`"""
+    if top_logprobs <= 0:
+        return ()
+    sorted_indices = mx.argpartition(-logprobs, kth=top_logprobs - 1)
+    top_indices = sorted_indices[:top_logprobs].tolist()
+    top_logprobs = logprobs[top_indices].tolist()
+    txts = tokenizer.convert_ids_to_tokens(top_indices)
+    return tuple(
+        {"id": i, "token": s, "logprob": g}
+        for i, s, g in zip(top_indices, txts, top_logprobs)
+    )
+
+
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
@@ -625,7 +641,7 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
-    def _tokenize(self, tokenizer, request):
+    def _tokenize(self, tokenizer, request, args):
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
@@ -640,12 +656,16 @@ class ResponseGenerator:
                         "https://github.com/ml-explore/mlx-lm/issues"
                     )
 
+                chat_template_args = self.model_provider.cli_args.chat_template_args
+                if args.chat_template_kwargs:
+                    chat_template_args = chat_template_args.copy()
+                    chat_template_args.update(args.chat_template_kwargs)
                 return tokenizer.apply_chat_template(
                     messages,
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
-                    **self.model_provider.cli_args.chat_template_args,
+                    **chat_template_args,
                 )
             else:
                 return tokenizer.encode(convert_chat(messages, role_mapping))
@@ -708,7 +728,12 @@ class ResponseGenerator:
                     and current_model == args.model
                     and is_batchable
                 ):
-                    prompt = self._tokenize(current_tokenizer, request)
+                    try:
+                        prompt = self._tokenize(current_tokenizer, request, args)
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+
                     ctx = GenerationContext(
                         has_tool_calling=tokenizer.has_tool_calling,
                         tool_call_start=tokenizer.tool_call_start,
@@ -810,24 +835,15 @@ class ResponseGenerator:
                         if r.finish_reason != "stop":
                             result["detokenizer"].add_token(r.token)
 
-                        top_tokens = None
-                        if args.logprobs > 0:
-                            sorted_indices = mx.argpartition(
-                                -r.logprobs, kth=args.logprobs - 1
-                            )
-                            top_indices = sorted_indices[: args.logprobs]
-                            top_logprobs = r.logprobs[top_indices]
-                            top_token_info = zip(
-                                top_indices.tolist(), top_logprobs.tolist()
-                            )
-                            top_tokens = tuple(top_token_info)
                         result["rqueue"].put(
                             Response(
                                 result["detokenizer"].last_segment,
                                 r.token,
                                 r.logprobs[r.token].item(),
                                 r.finish_reason,
-                                top_tokens,
+                                _format_top_logprobs(
+                                    r.logprobs, args.top_logprobs, current_tokenizer
+                                ),
                             )
                         )
 
@@ -871,7 +887,7 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt
-            prompt = self._tokenize(tokenizer, request)
+            prompt = self._tokenize(tokenizer, request, args)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -923,23 +939,15 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
             ):
-                top_tokens = None
-                if args.logprobs > 0:
-                    sorted_indices = mx.argpartition(
-                        -gen.logprobs, kth=args.logprobs - 1
-                    )
-                    top_indices = sorted_indices[: args.logprobs]
-                    top_logprobs = gen.logprobs[top_indices]
-                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                    top_tokens = tuple(top_token_info)
-
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
                         gen.logprobs[gen.token].item(),
                         gen.finish_reason,
-                        top_tokens,
+                        _format_top_logprobs(
+                            gen.logprobs, args.top_logprobs, tokenizer
+                        ),
                     )
                 )
                 cache_key.append(gen.token)
@@ -1052,6 +1060,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
             self._set_completion_headers(400)
+            self.end_headers()
             self.wfile.write(
                 json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
             )
@@ -1088,8 +1097,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", -1)
+        self.logprobs = self.body.get("logprobs", False)
+        self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
+        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1132,9 +1143,12 @@ class APIHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError("repetition_penalty must be a non-negative float")
 
-        if self.logprobs != -1 and not (0 < self.logprobs <= 10):
+        if not isinstance(self.logprobs, bool):
+            raise ValueError("logprobs must be a boolean")
+
+        if self.top_logprobs != -1 and not (0 < self.top_logprobs <= 10):
             raise ValueError(
-                f"logprobs must be between 1 and 10 but got {self.logprobs:,}"
+                f"top_logprobs must be between 1 and 10 but got {self.top_logprobs:,}"
             )
 
         if (
@@ -1174,7 +1188,7 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
         token_logprobs: Optional[List[float]] = None,
-        top_tokens: Optional[List[Dict[int, float]]] = None,
+        top_tokens: Optional[List[Tuple[Dict[str, Any]]]] = None,
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
         reasoning_text: Optional[str] = None,
@@ -1193,8 +1207,8 @@ class APIHandler(BaseHTTPRequestHandler):
               response, used to populate the "usage" field (not used when stream).
             token_logprobs (Optional[List[float]]): The log probabilities per token,
               in token order.
-            top_tokens (Optional[List[Dict[int, float]]]): List of dictionaries mapping
-              tokens to logprobs for the top N tokens at each token position.
+            top_tokens (Optional[List[Tuple[Dict[str, Any]]]]): List of outputs from
+              _format_top_logprobs, giving info on the top N tokens at each token position.
             tokens (Optional[List[int]]): List of tokens to return with logprobs structure
             tool_calls (Optional[List[str]]): List of tool calls.
             reasoning_text (Optional[str]): The reasoning text generated by the model.
@@ -1222,11 +1236,17 @@ class APIHandler(BaseHTTPRequestHandler):
             ],
         }
 
-        if token_logprobs or top_logprobs or tokens:
+        if top_logprobs:
             response["choices"][0]["logprobs"] = {
-                "token_logprobs": token_logprobs,
-                "top_logprobs": top_logprobs,
-                "tokens": tokens,
+                "content": [
+                    dict(i[0], top_logprobs=i) if i else {} for i in top_logprobs
+                ]
+            }
+        elif token_logprobs:
+            response["choices"][0]["logprobs"] = {
+                "content": [
+                    dict(id=i, logprob=g) for i, g in zip(tokens, token_logprobs)
+                ]
             }
 
         if not self.stream:
@@ -1294,7 +1314,9 @@ class APIHandler(BaseHTTPRequestHandler):
             max_tokens=self.max_tokens,
             num_draft_tokens=self.num_draft_tokens,
             logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
             seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
         )
 
         # Create keepalive callback to send SSE comments during long prompt processing
@@ -1323,7 +1345,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write((f"{e}").encode())
+            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
 
         # Prepare the headers
@@ -1420,10 +1442,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # Save the token and its logprob
             tokens.append(gen.token)
-            token_logprobs.append(gen.logprob)
+            if args.logprobs:
+                token_logprobs.append(gen.logprob)
 
             # If requested save the k top logprobs
-            if gen.top_tokens is not None:
+            if args.top_logprobs > 0:
                 top_tokens.append(gen.top_tokens)
 
             # Check if we should stop early
