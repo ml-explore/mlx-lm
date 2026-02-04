@@ -10,7 +10,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs, create_attention_mask, create_ssm_mask
 
 from .activations import swiglu
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .ssm import ssm_update
 
 
@@ -101,7 +101,7 @@ class Mamba(nn.Module):
     def _conv(
         self,
         conv_input: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         if mask is not None:
@@ -459,7 +459,7 @@ class Model(nn.Module):
     def make_cache(self):
         # TODO use RotatingKVCache is not full_attn
         # full_attn = self.layer_idx in self.config.full_attention_idx
-        return [MambaCache() if l.is_mamba else KVCache() for l in self.layers]
+        return [ArraysCache(size=2) if l.is_mamba else KVCache() for l in self.layers]
 
     def __call__(self, inputs: mx.array, cache=None) -> mx.array:
         outputs = self.model(

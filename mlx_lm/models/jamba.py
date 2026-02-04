@@ -14,7 +14,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .switch_layers import SwitchGLU
 
 
@@ -341,7 +341,7 @@ class Model(nn.Module):
             if layer.is_attn:
                 caches.append(KVCache())
             else:
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=2))
         return caches
 
     def sanitize(self, weights):

@@ -13,7 +13,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import CacheList, KVCache, MambaCache
+from .cache import ArraysCache, CacheList, KVCache
 from .rope_utils import initialize_rope
 from .ssm import ssm_update
 
@@ -236,7 +236,7 @@ class FalconH1Mixer(nn.Module):
     def _conv(
         self,
         conv_input: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         if mask is not None:
@@ -273,7 +273,7 @@ class FalconH1Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
@@ -495,7 +495,7 @@ class Model(nn.Module):
 
     def make_cache(self):
         return [
-            CacheList(MambaCache(), KVCache())
+            CacheList(ArraysCache(size=2), KVCache())
             for _ in range(self.args.num_hidden_layers)
         ]
 
