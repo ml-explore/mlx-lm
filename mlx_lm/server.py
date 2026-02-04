@@ -720,13 +720,11 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
-                is_batchable = self._is_batchable(args)
-
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and is_batchable
+                    and self._is_batchable(args)
                 ):
                     try:
                         prompt = self._tokenize(current_tokenizer, request, args)
@@ -773,13 +771,9 @@ class ResponseGenerator:
                     }
                     continue
 
-                # We have no batch and it actually is not a batchable request
-                # so serve single sequence at a time.
-                elif batch_generator is None and not is_batchable:
-                    self._serve_single((rqueue, request, args))
-                    continue
-
-                # No batch so make one and serve this batched
+                # No batch generator. Load the model and if it's not
+                # batchable serve sequential, o/w make a batch generaotr and
+                # serve batched
                 elif batch_generator is None:
                     try:
                         model, tokenizer = self.model_provider.load(
@@ -787,6 +781,10 @@ class ResponseGenerator:
                         )
                     except Exception as e:
                         rqueue.put(e)
+                        continue
+
+                    if not self._is_batchable(args):
+                        self._serve_single((rqueue, request, args))
                         continue
 
                     current_model = args.model
@@ -881,9 +879,8 @@ class ResponseGenerator:
 
         try:
             # Load the model and tokenizer
-            model, tokenizer = self.model_provider.load(
-                args.model.model, args.model.adapter, args.model.draft
-            )
+            model = self.model_provider.model
+            tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt

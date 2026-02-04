@@ -646,11 +646,6 @@ class ArraysCache(_BaseCache):
         return self.cache[0] is None
 
 
-class MambaCache(ArraysCache):
-    def __init__(self, left_padding: Optional[List[int]] = None):
-        super().__init__(size=2, left_padding=left_padding)
-
-
 class ChunkedKVCache(_BaseCache):
     step = 256
 
