@@ -16,8 +16,11 @@ class MultiLinear(nn.Module):
             shape=(num_heads, output_dims, input_dims),
         )
 
-    def __call__(self, x):
-        return x @ self.weight.swapaxes(-1, -2)
+    def __call__(self, x, transpose=True):
+        if transpose:
+            return x @ self.weight.swapaxes(-1, -2)
+        else:
+            return x @ self.weight
 
     def to_quantized(
         self,
@@ -69,13 +72,13 @@ class QuantizedMultiLinear(nn.Module):
 
         self.freeze()
 
-    def __call__(self, x):
+    def __call__(self, x, transpose=True):
         return mx.quantized_matmul(
             x,
             self["weight"],
             scales=self["scales"],
             biases=self.get("biases"),
-            transpose=True,
+            transpose=transpose,
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
