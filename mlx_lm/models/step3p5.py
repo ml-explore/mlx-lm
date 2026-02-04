@@ -362,9 +362,19 @@ class Step3p5Model(nn.Module):
             full_mask = create_attention_mask(h, cache[self._full_idx])
 
         if self._swa_idx is not None:
-            swa_mask = create_attention_mask(
-                h, cache[self._swa_idx], window_size=self.args.sliding_window
-            )
+            swa_cache = cache[self._swa_idx]
+            if (
+                h.shape[1] == 1
+                and swa_cache is not None
+                and swa_cache.offset >= self.args.sliding_window
+            ):
+                kv_len = swa_cache.offset + 1
+                swa_mask = mx.arange(kv_len) >= (kv_len - self.args.sliding_window)
+                swa_mask = swa_mask.reshape(1, 1, 1, -1)
+            else:
+                swa_mask = create_attention_mask(
+                    h, swa_cache, window_size=self.args.sliding_window
+                )
 
         for layer, c in zip(self.layers, cache):
             mask = swa_mask if layer.is_sliding else full_mask
