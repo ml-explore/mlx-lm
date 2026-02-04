@@ -14,7 +14,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .ssm import ssm_update
 from .switch_layers import SwitchMLP
 
@@ -125,7 +125,7 @@ class NemotronHMamba2Mixer(nn.Module):
     def _conv(
         self,
         conv_input: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         if mask is not None:
@@ -162,7 +162,7 @@ class NemotronHMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
@@ -199,7 +199,7 @@ class NemotronHMamba2Mixer(nn.Module):
         self,
         hidden_states: mx.array,
         mask: Optional[mx.array],
-        cache: Optional[MambaCache] = None,
+        cache: Optional[ArraysCache] = None,
     ) -> mx.array:
 
         projected = self.in_proj(hidden_states)
@@ -495,7 +495,7 @@ class Model(nn.Module):
         caches = []
         for l in self.layers:
             if l.block_type == "M":
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=2))
             elif l.block_type == "*":
                 caches.append(KVCache())
         return caches

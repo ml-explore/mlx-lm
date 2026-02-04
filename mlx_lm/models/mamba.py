@@ -8,7 +8,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs
-from .cache import MambaCache
+from .cache import ArraysCache
 
 
 @dataclass
@@ -153,7 +153,7 @@ class MambaBlock(nn.Module):
             x, conv_cache, state_cache
         )
 
-        if isinstance(cache, MambaCache):
+        if isinstance(cache, ArraysCache):
             cache[0] = new_conv_cache
             cache[1] = new_state_cache
 
@@ -208,7 +208,7 @@ class Model(nn.Module):
         return logits
 
     def make_cache(self):
-        return [MambaCache() for _ in range(len(self.layers))]
+        return [ArraysCache(size=2) for _ in range(len(self.layers))]
 
     @property
     def layers(self):

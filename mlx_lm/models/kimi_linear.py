@@ -13,7 +13,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -500,7 +500,7 @@ class Model(nn.Module):
         caches: List[Any] = []
         for layer in self.layers:
             if layer.is_linear:
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=2))
             else:
                 caches.append(KVCache())
         return caches
