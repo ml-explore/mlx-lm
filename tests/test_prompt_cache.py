@@ -627,6 +627,16 @@ class TestPromptCache(unittest.TestCase):
         c_out = KVCache.merge((c1, c2))
         self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
 
+    def test_window_mask_with_full_kv_cache(self):
+        c = KVCache()
+        kv = mx.zeros((1, 1, 32, 128))
+        c.update_and_fetch(kv, kv)
+
+        h = mx.zeros((1, 1, 1, 128))
+        mask = create_attention_mask(h, c, window_size=4)
+        expected = create_causal_mask(1, offset=32, window_size=4)
+        self.assertTrue(mx.array_equal(mask, expected))
+
 
 if __name__ == "__main__":
     unittest.main()

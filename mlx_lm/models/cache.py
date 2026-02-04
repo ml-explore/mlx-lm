@@ -112,9 +112,11 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
-    if N == 1:
+    if window_size is not None:
+        return create_causal_mask(N, offset, window_size=window_size)
+    elif N == 1:
         return None
-    if return_array:
+    elif return_array:
         return create_causal_mask(N, offset, window_size=window_size)
     else:
         return "causal"
