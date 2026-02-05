@@ -1294,7 +1294,7 @@ def batch_generate(
     if verbose:
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
-    uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
+    uids = gen.insert(prompts, max_tokens, caches=prompt_caches, logits_processors=logits_processors)
     results = {uid: [] for uid in uids}
     prompt_caches = {}
     while responses := gen.next():
