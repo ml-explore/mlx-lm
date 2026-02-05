@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, Type
 
-from outlines.backends.outlines_core import OutlinesCoreBackend, OutlinesCoreLogitsProcessor
+from outlines.backends.outlines_core import (
+    OutlinesCoreBackend,
+    OutlinesCoreLogitsProcessor,
+)
 from outlines_core import Index, outlines_core
 from pydantic import BaseModel
 
@@ -38,7 +41,9 @@ class StructuredProcessorCache:
         ] = {}
         self._tensor_library_name = "mlx"
 
-    def _ensure_entry(self, tokenizer) -> "StructuredProcessorCache.TokenizerCacheEntry":
+    def _ensure_entry(
+        self, tokenizer
+    ) -> "StructuredProcessorCache.TokenizerCacheEntry":
         """Create or fetch per-tokenizer cache state; used by get_processor."""
         fp = StructuredProcessorCache.TokenizerFingerprint(
             id(tokenizer), tokenizer.eos_token_id, tokenizer.vocab_size
@@ -96,7 +101,6 @@ class StructuredProcessorCache:
         schema = model_cls.model_json_schema()
         return self.get_processor(schema, tokenizer)
 
-    # I'm going to add this here, because it feels like it belongs here more than at the module level
     def _make_structured_processor(self, schema, tokenizer):
         """Build a per-request Outlines processor; used by LocalResponseGenerator."""
         processor = self.get_processor(schema, tokenizer)
