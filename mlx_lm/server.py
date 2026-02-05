@@ -42,6 +42,8 @@ from .models.cache import (
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import load
 
+from .structured import StructuredProcessorCache
+
 
 def get_system_fingerprint():
     gpu_arch = mx.metal.device_info()["architecture"] if mx.metal.is_available() else ""
@@ -353,6 +355,7 @@ class CompletionRequest:
     messages: List[Any]
     tools: Optional[List[Any]]
     role_mapping: Optional[Dict[str, Any]]
+    json_schema: Optional[Any]
 
 
 @dataclass
@@ -501,6 +504,8 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
 
+        self.processor_cache = StructuredProcessorCache()
+
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
@@ -619,12 +624,19 @@ class ResponseGenerator:
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
+                    proc = self.processor_cache._make_structured_processor(
+                        request.json_schema, current_tokenizer
+                    )
+                    logits_processors = [
+                        *_make_logits_processors(args),
+                        *([proc] if proc is not None else []),
+                    ]
                     (uid,) = batch_generator.insert(
                         [rest],
                         args.max_tokens,
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[logits_processors],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -776,6 +788,10 @@ class ResponseGenerator:
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
+            # make a structrued one if there is a schema
+            proc = self.processor_cache._make_structured_processor(request.json_schema, tokenizer)
+            if proc is not None:
+                logits_processors = [*logits_processors, proc]
 
             # Load the KV cache
             cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -866,6 +882,17 @@ class ResponseGenerator:
     def cli_args(self):
         return self.model_provider.cli_args
 
+def _extract_json_schema(body: Dict[str, Any]) -> Optional[Any]:
+    # This is quite permissive about the different ways
+    # that different packages embed json_schema in requests.
+    schema = body.get("json_schema")
+    if schema is None:
+        response_format = body.get("response_format")
+        if isinstance(response_format, dict):
+            schema = response_format.get("json_schema") or response_format.get("schema")
+            if isinstance(schema, dict) and "schema" in schema:
+                schema = schema.get("schema")
+    return schema
 
 class APIHandler(BaseHTTPRequestHandler):
     def __init__(
@@ -1412,6 +1439,7 @@ class APIHandler(BaseHTTPRequestHandler):
             body["messages"],
             body.get("tools") or None,
             body.get("role_mapping"),
+            _extract_json_schema(body)
         )
 
     def handle_text_completions(self) -> CompletionRequest:
@@ -1431,6 +1459,7 @@ class APIHandler(BaseHTTPRequestHandler):
             [],
             None,
             None,
+            _extract_json_schema(self.body)
         )
 
     def do_GET(self):
