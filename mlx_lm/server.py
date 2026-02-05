@@ -40,9 +40,8 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load
-
 from .structured import StructuredProcessorCache
+from .utils import load
 
 
 def get_system_fingerprint():
@@ -789,7 +788,9 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
             # make a structrued one if there is a schema
-            proc = self.processor_cache._make_structured_processor(request.json_schema, tokenizer)
+            proc = self.processor_cache._make_structured_processor(
+                request.json_schema, tokenizer
+            )
             if proc is not None:
                 logits_processors = [*logits_processors, proc]
 
@@ -882,6 +883,7 @@ class ResponseGenerator:
     def cli_args(self):
         return self.model_provider.cli_args
 
+
 def _extract_json_schema(body: Dict[str, Any]) -> Optional[Any]:
     # This is quite permissive about the different ways
     # that different packages embed json_schema in requests.
@@ -893,6 +895,7 @@ def _extract_json_schema(body: Dict[str, Any]) -> Optional[Any]:
             if isinstance(schema, dict) and "schema" in schema:
                 schema = schema.get("schema")
     return schema
+
 
 class APIHandler(BaseHTTPRequestHandler):
     def __init__(
@@ -1439,7 +1442,7 @@ class APIHandler(BaseHTTPRequestHandler):
             body["messages"],
             body.get("tools") or None,
             body.get("role_mapping"),
-            _extract_json_schema(body)
+            _extract_json_schema(body),
         )
 
     def handle_text_completions(self) -> CompletionRequest:
@@ -1454,12 +1457,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.object_type = "text_completion"
         assert "prompt" in self.body, "Request did not contain a prompt"
         return CompletionRequest(
-            "text",
-            self.body["prompt"],
-            [],
-            None,
-            None,
-            _extract_json_schema(self.body)
+            "text", self.body["prompt"], [], None, None, _extract_json_schema(self.body)
         )
 
     def do_GET(self):
