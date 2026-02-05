@@ -31,6 +31,8 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "outlines==1.2.9",
+        "outlines_core==0.2.14",
     ],
     packages=[
         "mlx_lm",
