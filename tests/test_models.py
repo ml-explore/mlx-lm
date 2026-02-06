@@ -2141,6 +2141,9 @@ class TestModels(unittest.TestCase):
                 "num_experts": 2,
                 "moe_intermediate_size": 128,
                 "kv_lora_rank": 8,
+                "qk_nope_head_dim": 16,
+                "qk_rope_head_dim": 16,
+                "v_head_dim": 16,
             },
             {
                 "model_type": "afmoe",
