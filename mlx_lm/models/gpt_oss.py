@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
-from .activations import SwiGLU
+from .activations import SwiGLUClamped
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -118,7 +118,7 @@ class MLPBlock(nn.Module):
             input_dims=config.hidden_size,
             hidden_dims=config.intermediate_size,
             num_experts=config.num_local_experts,
-            activation=SwiGLU(),
+            activation=SwiGLUClamped(),
             bias=True,
         )
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=True)

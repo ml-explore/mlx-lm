@@ -11,6 +11,14 @@ def swiglu(gate, x):
     return nn.silu(gate) * x
 
 
+class SwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, x, gate):
+        return swiglu(gate, x)
+
+
 @partial(mx.compile, shapeless=True)
 def xielu(x, alpha_p, alpha_n, beta, eps):
     alpha_p = nn.softplus(alpha_p)
@@ -57,7 +65,7 @@ def swiglu_clamped(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
     return out_glu * (x_linear + 1)
 
 
-class SwiGLU(nn.Module):
+class SwiGLUClamped(nn.Module):
     def __init__(self):
         super().__init__()
 
