@@ -123,7 +123,7 @@ def share_file(path, file, src, group=None):
     group = group or mx.distributed.init()
     all_sum = partial(mx.distributed.all_sum, group=group)
     total_size = 0
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     if group.rank() == src:
         with open(path / file, "rb") as f:
@@ -168,7 +168,7 @@ def share_file(path, file, src, group=None):
                 f.write(bytes(data))
                 data = next_data
 
-    return total_size, time.time() - start_time
+    return total_size, time.perf_counter() - start_time
 
 
 def share_files(path, files, src, group=None):
