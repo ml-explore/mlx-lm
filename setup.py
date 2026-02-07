@@ -31,6 +31,7 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "rich",
     ],
     packages=[
         "mlx_lm",
