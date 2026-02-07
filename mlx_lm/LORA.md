@@ -66,9 +66,10 @@ mlx_lm.lora \
 To fine-tune the full model weights, add the `--fine-tune-type full` flag.
 Currently supported fine-tuning types are `lora` (default), `dora`, and `full`.
 
-The `--data` argument must specify a path to a `train.jsonl`, `valid.jsonl`
-when using `--train` and a path to a `test.jsonl` when using `--test`. For more
-details on the data format see the section on [Data](#Data).
+The `--data` argument must specify a path to a `train.jsonl` when using
+`--train` and a path to a `test.jsonl` when using `--test`. A `valid.jsonl` is
+optional; if provided, validation loss will be reported during training. For
+more details on the data format see the section on [Data](#Data).
 
 For example, to fine-tune a Mistral 7B you can use `--model
 mistralai/Mistral-7B-v0.1`.
@@ -184,9 +185,10 @@ Face.
 
 ### Local Datasets
 
-For fine-tuning (`--train`), the data loader expects a `train.jsonl` and a
-`valid.jsonl` to be in the data directory. For evaluation (`--test`), the data
-loader expects a `test.jsonl` in the data directory. 
+For fine-tuning (`--train`), the data loader expects a `train.jsonl` to be in
+the data directory. A `valid.jsonl` is optional; if present, validation loss
+will be reported periodically during training. For evaluation (`--test`), the
+data loader expects a `test.jsonl` in the data directory. 
 
 Currently, `*.jsonl` files support `chat`, `tools`, `completions`, and `text`
 data formats. Here are examples of these formats:
