@@ -349,13 +349,9 @@ class KimiDeltaAttention(nn.Module):
         k = k_conv.reshape(B, T, self.num_heads, self.head_dim)
         v = v_conv.reshape(B, T, self.num_heads, self.head_dim)
 
-        def _l2norm(x, eps=1e-6):
-            norm = mx.linalg.norm(x, axis=-1, keepdims=True)
-            return x / (norm + eps)
-
-        q = _l2norm(q)
-        k = _l2norm(k)
-        q = q * self.scale
+        inv_scale = self.scale
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim
