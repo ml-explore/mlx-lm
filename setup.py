@@ -25,6 +25,7 @@ setup(
     license="MIT",
     install_requires=[
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
+        "huggingface_hub",
         "numpy",
         "transformers>=5.0.0",
         "sentencepiece",
