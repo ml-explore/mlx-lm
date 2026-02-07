@@ -159,7 +159,7 @@ def dwq_quantize(
     total_tokens = 0
     tokens = 0
 
-    tic = time.time()
+    tic = time.perf_counter()
 
     # Compute initial validation loss
     initial_valid_loss = valid_loss = validate(params, it=0)
@@ -184,7 +184,7 @@ def dwq_quantize(
         if rank == 0:
             pbar.set_description(desc=f"{loss=:.4f}")
             if (it + 1) % 20 == 0:
-                toks_per_sec = tokens / (time.time() - tic)
+                toks_per_sec = tokens / (time.perf_counter() - tic)
                 peak_memory_gb = mx.get_peak_memory() / 1e9
                 avg_loss = total_loss / tokens
                 total_tokens += tokens
@@ -192,7 +192,7 @@ def dwq_quantize(
                     f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
                     f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
                 )
-                tic = time.time()
+                tic = time.perf_counter()
                 tokens = 0
                 total_loss = 0
         if (it + 1) % 200 == 0:

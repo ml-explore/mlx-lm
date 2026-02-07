@@ -400,20 +400,20 @@ class TimeBudget:
         self._time_spent = 0
 
     def __iter__(self):
-        self._start = time.time()
+        self._start = time.perf_counter()
         self._current_iterations = 0
         return self
 
     def __next__(self):
         if not self._is_distributed:
-            if time.time() - self._start > self._budget:
+            if time.perf_counter() - self._start > self._budget:
                 raise StopIteration()
             return None
 
         self._current_iterations += 1
         if self._current_iterations > self._iterations:
             self._loops += 1
-            self._time_spent += time.time() - self._start
+            self._time_spent += time.perf_counter() - self._start
             if self._loops % self._sync_frequency == 0:
                 with mx.stream(generation_stream):
                     loop_time = mx.distributed.all_sum(self._time_spent).item()
