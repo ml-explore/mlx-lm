@@ -20,6 +20,7 @@ from .utils import (
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module, group_size: int = 64
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
+    mode = "affine"
     high_bits = 6
 
     if recipe == "mixed_2_6":
@@ -65,11 +66,11 @@ def mixed_quant_predicate_builder(
         if (
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "lm_head" in path:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
 
         return {"group_size": group_size, "bits": low_bits}
 
@@ -117,8 +118,12 @@ def convert(
     )
 
     if isinstance(quant_predicate, str):
+        if q_mode != "affine":
+            raise ValueError(f"Quant predicates only support 'affine' quantization.")
         quant_predicate = mixed_quant_predicate_builder(
-            quant_predicate, model, q_group_size
+            quant_predicate,
+            model,
+            q_group_size,
         )
 
     if dtype is None:
@@ -179,7 +184,12 @@ def configure_parser() -> argparse.ArgumentParser:
         description="Convert Hugging Face model to MLX format"
     )
 
-    parser.add_argument("--hf-path", type=str, help="Path to the Hugging Face model.")
+    parser.add_argument(
+        "--hf-path",
+        "--model",
+        type=str,
+        help="Path to the model. This can be a local path or a Hugging Face Hub model identifier.",
+    )
     parser.add_argument(
         "--mlx-path", type=str, default="mlx_model", help="Path to save the MLX model."
     )
@@ -187,17 +197,23 @@ def configure_parser() -> argparse.ArgumentParser:
         "-q", "--quantize", help="Generate a quantized model.", action="store_true"
     )
     parser.add_argument(
-        "--q-group-size", help="Group size for quantization.", type=int, default=64
+        "--q-group-size",
+        help="Group size for quantization.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
-        "--q-bits", help="Bits per weight for quantization.", type=int, default=4
+        "--q-bits",
+        help="Bits per weight for quantization.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--q-mode",
         help="The quantization mode.",
         type=str,
         default="affine",
-        choices=["affine", "mxfp4"],
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
     )
     parser.add_argument(
         "--quant-predicate",

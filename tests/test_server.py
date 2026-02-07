@@ -10,7 +10,7 @@ import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache
+from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
 from mlx_lm.utils import load
 
 
@@ -19,6 +19,7 @@ class DummyModelProvider:
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
+        self.is_batchable = True
 
         # Add draft model support
         self.draft_model = None
@@ -31,6 +32,7 @@ class DummyModelProvider:
                 "chat_template": None,
                 "use_default_chat_template": False,
                 "trust_remote_code": False,
+                "draft_model": None,
                 "num_draft_tokens": 3,
                 "temp": 0.0,
                 "top_p": 1.0,
@@ -38,6 +40,9 @@ class DummyModelProvider:
                 "min_p": 0.0,
                 "max_tokens": 512,
                 "chat_template_args": {},
+                "model": None,
+                "decode_concurrency": 32,
+                "prompt_concurrency": 8,
             },
         )
 
@@ -45,6 +50,7 @@ class DummyModelProvider:
             # Use the same model as the draft model for testing
             self.draft_model, _ = load(HF_MODEL_PATH)
             self.draft_model_key = HF_MODEL_PATH
+            self.cli_args.draft_model = HF_MODEL_PATH
 
     def load(self, model, adapter=None, draft_model=None):
         assert model in ["default_model", "chat_model"]
@@ -54,11 +60,13 @@ class DummyModelProvider:
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model_provider = DummyModelProvider()
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
         cls.server_address = ("localhost", 0)
         cls.httpd = http.server.HTTPServer(
             cls.server_address,
-            lambda *args, **kwargs: APIHandler(cls.model_provider, *args, **kwargs),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
         )
         cls.port = cls.httpd.server_port
         cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
@@ -70,6 +78,7 @@ class TestServer(unittest.TestCase):
         cls.httpd.shutdown()
         cls.httpd.server_close()
         cls.server_thread.join()
+        cls.response_generator.stop_and_join()
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -200,11 +209,13 @@ class TestServer(unittest.TestCase):
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model_provider = DummyModelProvider(with_draft=True)
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(with_draft=True), LRUPromptCache()
+        )
         cls.server_address = ("localhost", 0)
         cls.httpd = http.server.HTTPServer(
             cls.server_address,
-            lambda *args, **kwargs: APIHandler(cls.model_provider, *args, **kwargs),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
         )
         cls.port = cls.httpd.server_port
         cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
@@ -216,6 +227,7 @@ class TestServerWithDraftModel(unittest.TestCase):
         cls.httpd.shutdown()
         cls.httpd.server_close()
         cls.server_thread.join()
+        cls.response_generator.stop_and_join()
 
     def test_handle_completions_with_draft_model(self):
         url = f"http://localhost:{self.port}/v1/completions"

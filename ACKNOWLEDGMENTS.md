@@ -14,7 +14,7 @@ OpenBMB's `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's `Mamba v1` 
 inclusionAI's `Bailing MoE e.g. Ling-family`, `Bailing MoE Linear e.g. Ling-Linear-family`, 
 Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba` IBM's `Granite MoE`, 
 Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's `Apertus`, Nikity's `Lille130m`, 
-Alibaba Qwen's `Qwen3Next`, and Allenai's `OLMoE` and `Olmo 3`; 
+Alibaba Qwen's `Qwen3Next`, Tele-AI's `TeleChat3`, and Allenai's `OLMoE` and `Olmo 3`; 
 Helped add support for the following model architectures: 
 Alibaba Qwen's `Qwen3 & Qwen3MoE)`; Added support for the following training algorithms: 
 `Full Weight Fine-Tuning`, and the `Muon` optimizer; 

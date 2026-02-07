@@ -1,19 +1,20 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 """
 Run with:
 
 ```
 mlx.launch \
- --hostfile /path/to/hosts.json \
- /path/to/pipeline_generate.py \
- --prompt "hello world"
+    --backend jaccl \
+    --env MLX_METAL_FAST_SYNCH=1 \
+    --hostfile /path/to/hosts.json \
+    /path/to/sharded_generate.py \
+    --prompt 'Hello world'
 ```
 
-Make sure you can run MLX over MPI on two hosts. For more information see the
-documentation:
+For more information on running distributed programs with MLX see the documentation:
 
-https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
+https://ml-explore.github.io/mlx/build/html/usage/distributed.html .
 """
 
 import argparse
@@ -21,13 +22,13 @@ import argparse
 import mlx.core as mx
 
 from mlx_lm import stream_generate
-from mlx_lm.utils import pipeline_load
+from mlx_lm.utils import sharded_load
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LLM pipelined inference example")
+    parser = argparse.ArgumentParser(description="LLM distributed inference example")
     parser.add_argument(
         "--model",
-        default="mlx-community/DeepSeek-R1-3bit",
+        default="mlx-community/Llama-3.3-70B-Instruct-4bit",
         help="HF repo or path to local model.",
     )
     parser.add_argument(
@@ -43,19 +44,29 @@ if __name__ == "__main__":
         default=256,
         help="Maximum number of tokens to generate",
     )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
     rank = group.rank()
+    pipeline_group = group if args.pipeline else None
+    tensor_group = group if not args.pipeline else None
 
     def rprint(*args, **kwargs):
         if rank == 0:
             print(*args, **kwargs)
 
-    model, tokenizer = pipeline_load(args.model)
+    model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
 
     messages = [{"role": "user", "content": args.prompt}]
-    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+    )
 
     for response in stream_generate(
         model, tokenizer, prompt, max_tokens=args.max_tokens

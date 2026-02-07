@@ -12,7 +12,7 @@ permissions:
 jobs:
 
   build_release:
-    if: github.repository == 'ml-explore/mlx'
+    if: github.repository == 'ml-explore/mlx-lm'
     runs-on: ubuntu-22.04
     permissions:
       id-token: write

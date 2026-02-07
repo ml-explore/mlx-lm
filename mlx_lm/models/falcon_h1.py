@@ -6,13 +6,14 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import CacheList, KVCache, MambaCache
+from .cache import ArraysCache, CacheList, KVCache
 from .rope_utils import initialize_rope
 from .ssm import ssm_update
 
@@ -69,6 +70,7 @@ class ModelArgs(BaseModelArgs):
     )
     ssm_out_multiplier: float = 0.23570226039551587
     vocab_size: int = 32784
+    tie_word_embeddings: bool = True
 
 
 class FalconH1RMSNormGated(nn.Module):
@@ -81,14 +83,14 @@ class FalconH1RMSNormGated(nn.Module):
 
     def __call__(self, hidden_states, gate=None):
         if not self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
+            hidden_states = swiglu(gate, hidden_states)
 
         hidden_states = mx.fast.rms_norm(
             hidden_states, self.weight, self.variance_epsilon
         )
 
         if self.norm_before_gate and gate is not None:
-            hidden_states = hidden_states * nn.silu(gate)
+            hidden_states = swiglu(gate, hidden_states)
         return hidden_states
 
 
@@ -231,21 +233,36 @@ class FalconH1Mixer(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.projectors_bias
         )
 
-    def _apply_conv(
-        self, conv_input: mx.array, cache: Optional[MambaCache] = None
+    def _conv(
+        self,
+        conv_input: mx.array,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
-        if cache is None or cache[0] is None:
-            conv_state = mx.zeros(
-                (conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim),
-                dtype=conv_input.dtype,
-            )
-        else:
-            conv_state = cache[0]
-
-        padded_input = mx.concatenate([conv_state, conv_input], axis=1)
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
 
         if cache is not None:
-            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :]
+            if cache[0] is None:
+                conv_state = mx.zeros(
+                    (conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim),
+                    dtype=conv_input.dtype,
+                )
+            else:
+                conv_state = cache[0]
+            padded_input = mx.concatenate([conv_state, conv_input], axis=1)
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                t = padded_input.shape[1]
+                ends = mx.clip(cache.lengths, 0, t - n_keep)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(padded_input, positions, axis=1)
+            else:
+                cache[0] = padded_input[:, -n_keep:, :]
+        else:
+            padded_input = mx.pad(
+                conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+            )
 
         conv_output = self.conv1d(padded_input)
         return nn.silu(conv_output)
@@ -256,17 +273,20 @@ class FalconH1Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        state: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
-
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
-
+        if cache:
+            state = cache[1]
+            lengths = cache.lengths
+        else:
+            state, lengths = None, None
         y, state = ssm_update(
             hidden_states,
             self.A_log,
@@ -278,9 +298,11 @@ class FalconH1Mixer(nn.Module):
             state,
             self.time_step_limit,
             mask,
+            lengths,
         )
-
-        return y.reshape(batch_size, seq_len, self.intermediate_size), state
+        if cache:
+            cache[1] = state
+        return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(self, input_states, cache=None, mask: Optional[mx.array] = None):
         projected_states = self.in_proj(input_states)
@@ -291,11 +313,9 @@ class FalconH1Mixer(nn.Module):
             axis=-1,
         )
 
-        if mask is not None:
-            conv_input = mx.where(mask[..., None], conv_input, 0)
-        conv_output = self._apply_conv(conv_input, cache)
+        conv_output = self._conv(conv_input, cache, mask)
 
-        hidden_states_ssm, B, C = mx.split(
+        hidden_states, B, C = mx.split(
             conv_output,
             [
                 self.intermediate_size,
@@ -303,15 +323,15 @@ class FalconH1Mixer(nn.Module):
             ],
             axis=-1,
         )
-        state = cache[1] if cache else None
-        y, state = self._ssm(hidden_states_ssm, B, C, dt, state, mask)
+
+        y = self._ssm(hidden_states, B, C, dt, cache, mask=mask)
         if cache:
-            cache[1] = state
+            cache.advance(y.shape[1])
 
         if self.mamba_rms_norm:
             y = self.norm(y, gate)
         else:
-            y = y * nn.silu(gate)
+            y = swiglu(gate, y)
 
         return self.out_proj(y)
 
@@ -329,7 +349,7 @@ class FalconH1MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=args.mlp_bias)
 
     def __call__(self, x):
-        y = self.up_proj(x) * nn.silu(self.gate_proj(x))
+        y = swiglu(self.gate_proj(x), self.up_proj(x))
         y = self.down_proj(y)
         return y
 
@@ -425,11 +445,16 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = FalconH1Model(args=args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs, cache=None):
         hidden_states = self.model(inputs, cache=cache)
-        return self.lm_head(hidden_states)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(hidden_states)
+            return out * (self.args.lm_head_multiplier / self.args.embedding_multiplier)
+        else:
+            return self.lm_head(hidden_states)
 
     def sanitize(self, weights):
         # Check if needs sanitization
@@ -470,7 +495,7 @@ class Model(nn.Module):
 
     def make_cache(self):
         return [
-            CacheList(MambaCache(), KVCache())
+            CacheList(ArraysCache(size=2), KVCache())
             for _ in range(self.args.num_hidden_layers)
         ]
 

@@ -7,9 +7,13 @@ from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .mla import MultiLinear
 from .pipeline import PipelineMixin
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -44,85 +48,6 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
-
-
-def yarn_find_correction_dim(
-    num_rotations, dim, base=10000, max_position_embeddings=2048
-):
-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
-        2 * math.log(base)
-    )
-
-
-def yarn_find_correction_range(
-    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
-):
-    low = math.floor(
-        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
-    )
-    high = math.ceil(
-        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
-    )
-    return max(low, 0), min(high, dim - 1)
-
-
-def yarn_get_mscale(scale=1, mscale=1):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def yarn_linear_ramp_mask(min_val, max_val, dim):
-    if min_val == max_val:
-        max_val += 0.001  # Prevent singularity
-
-    linear_func = (mx.arange(dim, dtype=mx.float32) - min_val) / (max_val - min_val)
-    return mx.clip(linear_func, 0, 1)
-
-
-class DeepseekV3YarnRotaryEmbedding(nn.Module):
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        scaling_factor=1.0,
-        original_max_position_embeddings=4096,
-        beta_fast=32,
-        beta_slow=1,
-        mscale=1,
-        mscale_all_dim=0,
-    ):
-        super().__init__()
-        self.mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
-            scaling_factor, mscale_all_dim
-        )
-        freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-        freq_inter = scaling_factor * freq_extra
-        low, high = yarn_find_correction_range(
-            beta_fast,
-            beta_slow,
-            dim,
-            base,
-            original_max_position_embeddings,
-        )
-        freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2)
-        self._freqs = (freq_inter * freq_extra) / (
-            freq_inter * freq_mask + freq_extra * (1 - freq_mask)
-        )
-
-    def __call__(self, x, offset=0):
-        if self.mscale != 1.0:
-            x = self.mscale * x
-        return mx.fast.rope(
-            x,
-            x.shape[-1],
-            traditional=True,
-            base=None,
-            scale=1.0,
-            offset=offset,
-            freqs=self._freqs,
-        )
 
 
 class DeepseekV3Attention(nn.Module):
@@ -161,11 +86,11 @@ class DeepseekV3Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
 
         self.o_proj = nn.Linear(
@@ -176,35 +101,19 @@ class DeepseekV3Attention(nn.Module):
 
         if self.config.rope_scaling is not None:
             mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = self.config.rope_scaling["factor"]
             if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.scale = self.scale * mscale * mscale
+                scaling_factor = self.config.rope_scaling["factor"]
+                if scaling_factor > 1:
+                    s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
+                    self.scale = self.scale * s * s
 
-            rope_kwargs = {
-                key: self.config.rope_scaling[key]
-                for key in [
-                    "original_max_position_embeddings",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                ]
-                if key in self.config.rope_scaling
-            }
-            self.rope = DeepseekV3YarnRotaryEmbedding(
-                dim=self.qk_rope_head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                scaling_factor=scaling_factor,
-                base=self.rope_theta,
-                **rope_kwargs,
-            )
-        else:
-            self.rope = nn.RoPE(
-                dims=self.qk_rope_head_dim,
-                base=self.rope_theta,
-                traditional=True,
-            )
+        self.rope = initialize_rope(
+            dims=self.qk_rope_head_dim,
+            base=self.rope_theta,
+            traditional=True,
+            max_position_embeddings=self.max_position_embeddings,
+            scaling_config=self.config.rope_scaling,
+        )
 
     def __call__(
         self,
@@ -224,29 +133,38 @@ class DeepseekV3Attention(nn.Module):
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
 
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        offset = cache.offset if cache is not None else 0
+        q_pe = self.rope(q_pe, offset)
+        k_pe = self.rope(k_pe, offset)
+
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
 
         if cache is not None:
-            q_pe = self.rope(q_pe, cache.offset)
-            k_pe = self.rope(k_pe, cache.offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache.update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), values
-            )
-        else:
-            q_pe = self.rope(q_pe)
-            k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
+            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+
+        if L == 1:
+            q_nope = self.embed_q(q_nope)
+            k = v = kv_latent
+        else:
+            k = self.embed_q(kv_latent, transpose=False)
+            v = self.unembed_out(kv_latent)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
+        if L == 1:
+            output = self.unembed_out(output)
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -267,7 +185,7 @@ class DeepseekV3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x):
-        down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
         return down_proj
 
 
@@ -350,12 +268,20 @@ class DeepseekV3MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size
             )
 
+        self.sharding_group = None
+
     def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(x)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
 
@@ -413,7 +339,7 @@ class DeepseekV3Model(PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(h, cache[0], return_array=True)
 
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
@@ -429,7 +355,8 @@ class DeepseekV3Model(PipelineMixin, nn.Module):
                 cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         # Broadcast h while keeping it in the graph
-        h = mx.distributed.all_gather(h)[: h.shape[0]]
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -452,7 +379,8 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):
-            dtype = weight.dtype
+            dtype = mx.bfloat16
+            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
             bs = 128  # block size
             m, n = weight.shape
             pad_bottom = (-m) % bs
@@ -505,6 +433,42 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+            prefix = f"model.layers.{l}.self_attn"
+            if f"{prefix}.kv_b_proj.weight" in weights:
+                layer = self.model.layers[l].self_attn.embed_q
+                quantized = f"{prefix}.kv_b_proj.scales" in weights
+                v = weights.pop(f"{prefix}.kv_b_proj.weight")
+                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+                    # Try to infer bits and group size
+                    bits = (v.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    v = mx.dequantize(
+                        v, scales, biases, bits=bits, group_size=group_size
+                    )
+                num_heads = self.args.num_attention_heads
+                v = v.reshape(num_heads, head_dim, -1)
+                wk = mx.contiguous(
+                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
+                if quantized:
+                    wk, wk_scales, wk_biases = mx.quantize(
+                        wk, bits=bits, group_size=group_size
+                    )
+                    wv, wv_scales, wv_biases = mx.quantize(
+                        wv, bits=bits, group_size=group_size
+                    )
+                    weights[f"{prefix}.embed_q.scales"] = wk_scales
+                    weights[f"{prefix}.unembed_out.scales"] = wv_scales
+                    weights[f"{prefix}.embed_q.biases"] = wk_biases
+                    weights[f"{prefix}.unembed_out.biases"] = wv_biases
+                weights[f"{prefix}.embed_q.weight"] = wk
+                weights[f"{prefix}.unembed_out.weight"] = wv
 
         # Remove multi-token prediction layer and any unused precomputed rotary freqs
         return {
@@ -512,6 +476,70 @@ class Model(nn.Module):
             for k, v in weights.items()
             if not k.startswith("model.layers.61") and "rotary_emb.inv_freq" not in k
         }
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        rank = group.rank()
+        for layer in self.model.layers:
+            # Shard the self attention
+            if layer.self_attn.q_lora_rank is None:
+                layer.self_attn.q_proj = shard_linear(
+                    layer.self_attn.q_proj, "all-to-sharded", group=group
+                )
+            else:
+                layer.self_attn.q_b_proj = shard_linear(
+                    layer.self_attn.q_b_proj, "all-to-sharded", group=group
+                )
+            layer.self_attn.num_heads //= N
+            num_heads = layer.self_attn.num_heads
+            sh = rank * num_heads
+            eh = sh + num_heads
+
+            def shard_heads(w):
+                return w[sh:eh]
+
+            layer.self_attn.embed_q.apply(shard_heads)
+            layer.self_attn.unembed_out.apply(shard_heads)
+
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+
+            # Shard the MLP
+            if isinstance(layer.mlp, DeepseekV3MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+
+            # Shard the MoE. Shard in place since the MoE should be responsible
+            # for aggregating the results.
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.shared_experts.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.shared_experts.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
 
     @property
     def layers(self):

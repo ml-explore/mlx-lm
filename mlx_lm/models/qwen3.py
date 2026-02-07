@@ -5,7 +5,9 @@ from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_linear
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 
@@ -95,7 +97,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):
@@ -184,6 +186,37 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         return weights
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        for layer in self.model.layers:
+            # Shard the self attention
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            # Shard the MLP
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
 
     @property
     def layers(self):

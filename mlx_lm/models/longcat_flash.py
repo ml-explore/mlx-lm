@@ -4,9 +4,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -38,6 +41,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     norm_topk_prob: bool = False
     router_bias: bool = False
+    rope_scaling: Optional[Dict] = None
 
 
 class LongcatFlashMLA(nn.Module):
@@ -93,8 +97,20 @@ class LongcatFlashMLA(nn.Module):
         if args.mla_scale_kv_lora:
             self.mla_scale_kv_lora = (args.hidden_size / self.kv_lora_rank) ** 0.5
 
-        self.rope = nn.RoPE(
-            dims=self.qk_rope_head_dim, base=args.rope_theta, traditional=True
+        if args.rope_scaling is not None:
+            mscale_all_dim = args.rope_scaling.get("mscale_all_dim", 0)
+            if mscale_all_dim:
+                scaling_factor = args.rope_scaling["factor"]
+                if scaling_factor > 1:
+                    s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
+                    self.scale = self.scale * s * s
+
+        self.rope = initialize_rope(
+            dims=self.qk_rope_head_dim,
+            base=args.rope_theta,
+            traditional=True,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -168,7 +184,7 @@ class LongcatFlashMLP(nn.Module):
         self.down_proj = nn.Linear(hidden_size, args.hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class LongcatFlashTopkRouter(nn.Module):
@@ -223,8 +239,11 @@ class LongcatFlashMoE(nn.Module):
         )
 
         self.router = LongcatFlashTopkRouter(args)
+        self.sharding_group = None
 
     def __call__(self, hidden_states):
+        if self.sharding_group is not None:
+            hidden_states = sum_gradients(self.sharding_group)(hidden_states)
 
         topk_indices, topk_weights = self.router(hidden_states)
 
@@ -236,14 +255,20 @@ class LongcatFlashMoE(nn.Module):
         regular_outputs = self.switch_mlp(hidden_states, topk_indices)
 
         weighted_outputs = regular_outputs * regular_weights[..., None]
-
-        # Add identity expert contribution if needed
-        assert self.zero_expert_type == "identity"
-        identity_weights = mx.where(mask, topk_weights, 0.0)
-        identity_outputs = hidden_states[..., None, :] * identity_weights[..., None]
-        weighted_outputs = weighted_outputs + identity_outputs
-
         final_output = mx.sum(weighted_outputs, axis=-2)
+
+        if self.sharding_group is not None:
+            final_output = mx.distributed.all_sum(
+                final_output, group=self.sharding_group
+            )
+
+        # Add identity expert contribution after all_sum to avoid summing it N times
+        assert self.zero_expert_type == "identity"
+        identity_weights_sum = mx.sum(
+            mx.where(mask, topk_weights, 0.0), axis=-1, keepdims=True
+        )
+        final_output = final_output + hidden_states * identity_weights_sum
+
         return final_output
 
 
@@ -379,3 +404,37 @@ class Model(nn.Module):
 
     def make_cache(self):
         return [CacheList(KVCache(), KVCache()) for _ in self.model.layers]
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+
+        for layer in self.model.layers:
+            for attn in layer.self_attn:
+                if attn.q_lora_rank is None:
+                    attn.q_proj = shard_linear(
+                        attn.q_proj, "all-to-sharded", group=group
+                    )
+                else:
+                    attn.q_b_proj = shard_linear(
+                        attn.q_b_proj, "all-to-sharded", group=group
+                    )
+                attn.kv_b_proj = shard_linear(
+                    attn.kv_b_proj, "all-to-sharded", group=group
+                )
+                attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+                attn.num_attention_heads //= N
+
+            for mlp in layer.mlps:
+                mlp.gate_proj = shard_linear(
+                    mlp.gate_proj, "all-to-sharded", group=group
+                )
+                mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
+                mlp.down_proj = shard_linear(
+                    mlp.down_proj, "sharded-to-all", group=group
+                )
+
+            layer.mlp.sharding_group = group
+            shard_inplace(layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+            shard_inplace(layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+            shard_inplace(layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group)

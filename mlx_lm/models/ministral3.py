@@ -5,9 +5,12 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_linear
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 
 
@@ -36,13 +39,17 @@ class ModelArgs(BaseModelArgs):
             self.layer_types = ["full_attention"] * self.num_hidden_layers
 
 
-def _get_llama_4_attn_scale(
-    start: int, stop: int, beta: float, max_position_embeddings: int
-):
+def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        offset = offset[:, None]
+
     scaling = 1 + beta * mx.log(
-        1 + mx.floor(mx.arange(start, stop) / max_position_embeddings)
+        1 + mx.floor((mx.arange(size) + offset) / max_position_embeddings)
     )
-    return scaling[:, None]
+    if scaling.ndim == 2:
+        return scaling[:, None, :, None]
+    else:
+        return scaling[:, None]
 
 
 class Attention(nn.Module):
@@ -115,7 +122,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):
@@ -146,7 +153,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class LanguageModel(nn.Module):
+class LanguageModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -167,6 +174,18 @@ class LanguageModel(nn.Module):
                 self.swa_idx = e
                 break
 
+    def pipeline(self, group):
+        super().pipeline(group)
+        self.fa_idx = None
+        self.swa_idx = None
+        for e, l in enumerate(self.pipeline_layers):
+            if self.swa_idx is None and l.use_sliding:
+                self.swa_idx = e
+            elif self.fa_idx is None and not l.use_sliding:
+                self.fa_idx = e
+            if self.fa_idx is not None and self.swa_idx is not None:
+                break
+
     def __call__(
         self,
         inputs: mx.array,
@@ -178,28 +197,47 @@ class LanguageModel(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
             offset = 0
         else:
             offset = cache[0].offset
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        swa_mask = fa_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(h, cache[self.fa_idx])
         if self.swa_idx is not None:
             swa_mask = create_attention_mask(
                 h, cache[self.swa_idx], window_size=self.sliding_window
             )
 
         attn_scale = _get_llama_4_attn_scale(
+            inputs.shape[1],
             offset,
-            offset + inputs.shape[1],
             self.args.rope_parameters["llama_4_scaling_beta"],
             self.args.rope_parameters["original_max_position_embeddings"],
         ).astype(h.dtype)
 
-        for layer, cache in zip(self.layers, cache):
-            mask = swa_mask if layer.use_sliding else fa_mask
-            h = layer(h, attn_scale, mask, cache=cache)
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for l, c in zip(self.pipeline_layers, cache):
+            mask = swa_mask if l.use_sliding else fa_mask
+            h = l(h, attn_scale, mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -249,9 +287,40 @@ class Model(nn.Module):
 
         return weights
 
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        for layer in self.model.layers:
+            # Shard the self attention
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            # Shard the MLP
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
+
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [

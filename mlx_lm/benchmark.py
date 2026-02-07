@@ -6,7 +6,7 @@ import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.utils import pipeline_load
+from mlx_lm.utils import pipeline_load, sharded_load
 
 
 def setup_arg_parser():
@@ -49,6 +49,17 @@ def setup_arg_parser():
         help="Number of timing trials",
         type=int,
     )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Quantize activations using the same quantization config as the corresponding layer.",
+    )
     return parser
 
 
@@ -59,6 +70,8 @@ def main():
 
     group = mx.distributed.init()
     rank = group.rank()
+    pipeline_group = group if args.pipeline else None
+    tensor_group = group if not args.pipeline else None
 
     def rprint(*args, **kwargs):
         if rank == 0:
@@ -67,10 +80,15 @@ def main():
     model_path = args.model or DEFAULT_MODEL
 
     if group.size() > 1:
-        model, tokenizer, config = pipeline_load(args.model, return_config=True)
+        model, tokenizer, config = sharded_load(
+            model_path, pipeline_group, tensor_group, return_config=True
+        )
     else:
         model, tokenizer, config = load(
-            args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
+            model_path,
+            return_config=True,
+            tokenizer_config={"trust_remote_code": True},
+            model_config={"quantize_activations": args.quantize_activations},
         )
 
     # Empty to avoid early stopping

@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import ConcatenateKVCache, KVCache
 from .rope_utils import initialize_rope
@@ -262,11 +263,6 @@ class KVReuseAttention(nn.Module):
         return self.out_proj(output)
 
 
-@partial(mx.compile, shapeless=True)
-def _swiglu(g, x):
-    return nn.silu(g) * x
-
-
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -281,7 +277,7 @@ class MLP(nn.Module):
     def __call__(self, x) -> mx.array:
         g = self.gate_proj(x)
         x = self.up_proj(x)
-        return self.down_proj(_swiglu(g, x))
+        return self.down_proj(swiglu(g, x))
 
 
 class TransformerBlock(nn.Module):

@@ -671,6 +671,44 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_step3p5(self):
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 10000.0, 10000.0, 10000.0],
+            sliding_window=64,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            partial_rotary_factors=[0.5, 1.0, 1.0, 0.5],
+            attention_other_setting={
+                "num_attention_heads": 8,
+                "num_attention_groups": 2,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        model = step3p5.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_cohere(self):
         from mlx_lm.models import cohere
 
@@ -1327,6 +1365,29 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_iquestloopcoder(self):
+        from mlx_lm.models import iquestloopcoder
+
+        args = iquestloopcoder.ModelArgs(
+            model_type="iquestloopcoder",
+            hidden_size=256,
+            num_hidden_layers=2,
+            intermediate_size=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=1000,
+            rope_theta=500000.0,
+            tie_word_embeddings=False,
+            loop_num=2,
+            loop_window_size=32,
+        )
+        model = iquestloopcoder.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_smollm3(self):
         from mlx_lm.models import smollm3
 
@@ -1577,6 +1638,40 @@ class TestModels(unittest.TestCase):
                 "partial_rotary_factor": 0.0,
             },
             {
+                "model_type": "glm4_moe_lite",
+                "vocab_size": 1000,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "routed_scaling_factor": 1.0,
+                "kv_lora_rank": 8,
+                "q_lora_rank": 8,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 16,
+                "v_head_dim": 8,
+                "topk_method": "noaux_tc",
+                "scoring_func": "sigmoid",
+                "norm_topk_prob": True,
+                "n_group": 1,
+                "topk_group": 1,
+                "num_experts_per_tok": 2,
+                "moe_layer_freq": 1,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 256,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "rope_scaling": None,
+                "attention_bias": False,
+                "partial_rotary_factor": 1.0,
+                "tie_word_embeddings": False,
+                "num_nextn_predict_layers": 1,
+            },
+            {
                 "model_type": "granite",
                 "hidden_size": 128,
                 "num_hidden_layers": 4,
@@ -1699,6 +1794,33 @@ class TestModels(unittest.TestCase):
                 },
                 "num_hidden_layers": 4,
                 "vocab_size": 1000,
+            },
+            {
+                "model_type": "longcat_flash_ngram",
+                "attention_method": "MLA",
+                "zero_expert_type": "identity",
+                "hidden_size": 128,
+                "ffn_hidden_size": 128,
+                "moe_topk": 2,
+                "expert_ffn_hidden_size": 128,
+                "n_routed_experts": 2,
+                "zero_expert_num": 2,
+                "num_layers": 4,
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 4,
+                "kv_lora_rank": 16,
+                "q_lora_rank": 16,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "routed_scaling_factor": 1.0,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "mla_scale_q_lora": True,
+                "mla_scale_kv_lora": True,
+                "attention_bias": False,
             },
             {
                 "model_type": "longcat_flash",
@@ -1967,7 +2089,6 @@ class TestModels(unittest.TestCase):
                 "n_groups": 4,
                 "use_bias": False,
                 "use_conv_bias": False,
-                "chunk_size": 32,
                 "tie_word_embeddings": True,
                 "time_step_limit": (0.01, 10),
                 "time_step_rank": "auto",
@@ -2051,6 +2172,31 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
             },
             {
+                "model_type": "qwen3_next",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "vocab_size": 1000,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 4,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 3,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "shared_expert_intermediate_size": 128,
+                "mlp_only_layers": [0],
+                "moe_intermediate_size": 128,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 64,
+                "rope_theta": 1000.0,
+                "partial_rotary_factor": 0.5,
+                "max_position_embeddings": 1000,
+            },
+            {
                 "model_type": "kimi_linear",
                 "vocab_size": 1000,
                 "hidden_size": 128,
@@ -2070,6 +2216,9 @@ class TestModels(unittest.TestCase):
                 "num_experts": 2,
                 "moe_intermediate_size": 128,
                 "kv_lora_rank": 8,
+                "qk_nope_head_dim": 16,
+                "qk_rope_head_dim": 16,
+                "v_head_dim": 16,
             },
             {
                 "model_type": "afmoe",
@@ -2090,6 +2239,134 @@ class TestModels(unittest.TestCase):
                 "num_experts": 4,
                 "num_experts_per_tok": 2,
                 "moe_intermediate_size": 128,
+            },
+            {
+                "model_type": "deepseek_v32",
+                "vocab_size": 1024,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "moe_intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "n_routed_experts": 4,
+                "n_group": 2,
+                "topk_group": 1,
+                "num_experts_per_tok": 2,
+                "n_shared_experts": 1,
+                "kv_lora_rank": 4,
+                "q_lora_rank": 4,
+                "qk_rope_head_dim": 32,
+                "v_head_dim": 16,
+                "qk_nope_head_dim": 32,
+                "rope_scaling": {
+                    "beta_fast": 32,
+                    "beta_slow": 1,
+                    "factor": 40,
+                    "mscale": 1.0,
+                    "mscale_all_dim": 1.0,
+                    "original_max_position_embeddings": 4096,
+                    "type": "yarn",
+                },
+            },
+            {
+                "model_type": "mimo_v2_flash",
+                "num_experts_per_tok": 2,
+                "hybrid_layer_pattern": [0, 1, 0, 1],
+                "moe_layer_freq": [0, 1, 0, 1],
+                "add_swa_attention_sink_bias": True,
+                "add_full_attention_sink_bias": False,
+                "sliding_window_size": 32,
+                "vocab_size": 1000,
+                "hidden_size": 512,
+                "intermediate_size": 512,
+                "moe_intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "n_shared_experts": 1,
+                "n_routed_experts": 8,
+                "routed_scaling_factor": None,
+                "topk_method": "noaux_tc",
+                "scoring_func": "sigmoid",
+                "norm_topk_prob": True,
+                "n_group": 2,
+                "topk_group": 1,
+                "max_position_embeddings": 1000,
+                "layernorm_epsilon": 1e-5,
+                "rope_theta": 1000.0,
+                "swa_rope_theta": 1000.0,
+                "swa_num_attention_heads": 4,
+                "swa_num_key_value_heads": 2,
+                "head_dim": 128,
+                "v_head_dim": 64,
+                "swa_head_dim": 128,
+                "swa_v_head_dim": 64,
+                "partial_rotary_factor": 0.5,
+            },
+            {
+                "model_type": "rwkv7",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "norm_eps": 1e-5,
+                "head_dim": 32,
+                "num_hidden_layers": 4,
+                "a_low_rank_dim": 16,
+                "v_low_rank_dim": 16,
+                "gate_low_rank_dim": 16,
+                "decay_low_rank_dim": 16,
+            },
+            {
+                "model_type": "exaone_moe",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "moe_intermediate_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "num_shared_experts": 1,
+                "n_group": 1,
+                "topk_group": 1,
+                "routed_scaling_factor": 2.5,
+                "norm_topk_prob": True,
+                "sliding_window": 32,
+                "max_position_embeddings": 1000,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "is_moe_layer": [False, True, True, True],
+                "tie_word_embeddings": False,
+            },
+            {
+                "model_type": "youtu_llm",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "kv_lora_rank": 128,
+                "q_lora_rank": 256,
+            },
+            {
+                "model_type": "telechat3",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 128,
+                "rope_theta": 10000.0,
+                "max_position_embeddings": 1000,
             },
         ]
         for config in test_configs:
@@ -2171,6 +2448,50 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
 
+    def test_ssm_right_pad(self):
+        batch_size = 1
+        n_group = 1
+        num_heads = 48
+        head_dim = 64
+        state_dim = 128
+        seq_len = 4
+        pad = 2
+
+        hidden_states = mx.random.normal(
+            shape=(batch_size, seq_len + pad, num_heads, head_dim)
+        )
+        B = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        C = mx.random.normal(shape=(batch_size, seq_len + pad, n_group, state_dim))
+        dt = mx.random.normal(shape=(batch_size, seq_len + pad, num_heads))
+        dt_bias = mx.random.normal(shape=(num_heads,))
+        A_log = mx.random.normal(shape=(num_heads,))
+        D = mx.random.normal(shape=(num_heads,))
+        out, out_state = ssm_attn(
+            hidden_states[:, :-pad],
+            A_log,
+            B[:, :-pad],
+            C[:, :-pad],
+            D,
+            dt[:, :-pad],
+            dt_bias,
+        )
+        mask = mx.array([[True] * seq_len + [False] * pad])
+        lengths = mx.array([seq_len])
+        out_m, out_state_m = ssm_attn(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            mask=mask,
+            lengths=lengths,
+        )
+        out_m = out_m[:, :-pad]
+        self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
+        self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
+
     def test_gated_delta(self):
         mx.random.seed(0)
         for B in [1, 2]:
@@ -2205,23 +2526,26 @@ class TestModels(unittest.TestCase):
         k = mx.random.normal(shape=(B, T, Hk, Dk))
         v = mx.random.normal(shape=(B, T, Hv, Dv))
         g = mx.random.normal(shape=(B, T, Hv))
-        mask = mx.array([[False, True, True]])
         beta = mx.random.normal(shape=(B, T, Hv))
         state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
-        y_gt, st_gt = gated_delta_ops(
-            q[:, 1:],
-            k[:, 1:],
-            v[:, 1:],
-            g[:, 1:],
-            beta[:, 1:],
-            state,
-        )
-        for fn in [gated_delta_ops, gated_delta_kernel]:
-            y, st = fn(q, k, v, g, beta, state, mask)
-            y = y[:, 1:]
-            self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
-            self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+        for s, e, mask in [
+            (1, 3, mx.array([[False, True, True]])),
+            (0, 2, mx.array([[True, True, False]])),
+        ]:
+            y_gt, st_gt = gated_delta_ops(
+                q[:, s:e],
+                k[:, s:e],
+                v[:, s:e],
+                g[:, s:e],
+                beta[:, s:e],
+                state,
+            )
+            for fn in [gated_delta_ops, gated_delta_kernel]:
+                y, st = fn(q, k, v, g, beta, state, mask)
+                y = y[:, s:e]
+                self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":

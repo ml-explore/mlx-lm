@@ -34,15 +34,12 @@ class DoRALinear(nn.Module):
         bias = "bias" in linear
         weight = self._dequantized_weight()
 
-        # Use the same type as the linear weight
-        dtype = weight.dtype
-
         output_dims, input_dims = weight.shape
         fused_linear = nn.Linear(input_dims, output_dims, bias=False)
 
-        lora_b = (self.scale * self.lora_b.T).astype(dtype)
-        lora_a = self.lora_a.T.astype(dtype)
-        weight = weight + lora_b @ lora_a
+        lora_b = self.scale * self.lora_b.T
+        lora_a = self.lora_a.T
+        weight = weight + (lora_b @ lora_a).astype(weight.dtype)
         norm_scale = self.m / mx.linalg.norm(weight, axis=1)
         fused_linear.weight = norm_scale[:, None] * weight
 
@@ -52,8 +49,9 @@ class DoRALinear(nn.Module):
         if self._is_quantized() and not dequantize:
             fused_linear = nn.QuantizedLinear.from_linear(
                 fused_linear,
-                linear.group_size,
-                linear.bits,
+                group_size=linear.group_size,
+                bits=linear.bits,
+                mode=linear.mode,
             )
         return fused_linear
 
@@ -101,8 +99,9 @@ class DoRALinear(nn.Module):
                 weight,
                 self.linear.scales,
                 self.linear.biases,
-                self.linear.group_size,
-                self.linear.bits,
+                group_size=self.linear.group_size,
+                bits=self.linear.bits,
+                mode=self.linear.mode,
             )
         return weight
 
@@ -155,15 +154,12 @@ class DoRAEmbedding(nn.Module):
         embedding = self.embedding
         weight = embedding.weight
 
-        # Use the same type as the linear weight if not quantized
-        dtype = weight.dtype
-
         num_embeddings, dims = weight.shape
         fused_embedding = nn.Embedding(num_embeddings, dims)
 
-        lora_a = (self.scale * self.lora_a).astype(dtype)
-        lora_b = self.lora_b.astype(dtype)
-        weight = weight + lora_a @ lora_b
+        lora_a = self.scale * self.lora_a
+        lora_b = self.lora_b
+        weight = weight + (lora_a @ lora_b).astype(weight.dtype)
         norm_scale = self.m / mx.linalg.norm(weight, axis=1)
         fused_embedding.weight = norm_scale[:, None] * weight
 

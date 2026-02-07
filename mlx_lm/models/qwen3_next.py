@@ -8,13 +8,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -44,10 +45,10 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     partial_rotary_factor: float
     max_position_embeddings: int
+    head_dim: int
     norm_topk_prob: bool = False
     tie_word_embeddings: bool = False
     attention_bias: bool = False
-    head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
 
@@ -63,7 +64,7 @@ class Qwen3NextRMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            x = x * nn.silu(gate)
+            x = swiglu(gate, x)
         return x
 
 
@@ -155,7 +156,7 @@ class Qwen3NextMLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -247,8 +248,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+
         if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = conv_input[:, -n_keep:, :]
+
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -280,6 +289,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         if cache is not None:
             cache[1] = state
+            cache.advance(S)
 
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
@@ -417,7 +427,7 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [MambaCache() if l.is_linear else KVCache() for l in self.layers]
+        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
