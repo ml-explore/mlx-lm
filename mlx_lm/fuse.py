@@ -5,6 +5,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from .gguf import convert_to_gguf
 from .utils import (
+    MODEL_REMAPPING,
     dequantize_model,
     load,
     save,
@@ -91,7 +92,9 @@ def main() -> None:
 
     if args.export_gguf:
         model_type = config["model_type"]
-        if model_type not in ["llama", "mixtral", "mistral", "ministral3", "mistral3"]:
+        # Apply MODEL_REMAPPING to match load() behavior
+        remapped_type = MODEL_REMAPPING.get(model_type, model_type)
+        if remapped_type not in ["llama", "mixtral", "mistral", "ministral3"]:
             raise ValueError(
                 f"Model type {model_type} not supported for GGUF conversion."
             )

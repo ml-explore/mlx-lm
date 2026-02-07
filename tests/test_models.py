@@ -907,7 +907,12 @@ class TestModels(unittest.TestCase):
                 "original_max_position_embeddings": 4096,
             },
             tie_word_embeddings=True,
-            layer_types=["full_attention", "full_attention", "sliding_attention", "sliding_attention"],
+            layer_types=[
+                "full_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+            ],
             sliding_window=512,
         )
         model = ministral3.Model(args)
@@ -917,6 +922,7 @@ class TestModels(unittest.TestCase):
 
     def test_mistral3(self):
         from mlx_lm.models import mistral3
+        from mlx_lm.models.cache import make_prompt_cache
 
         text_config = {
             "model_type": "ministral3",
@@ -934,7 +940,13 @@ class TestModels(unittest.TestCase):
                 "original_max_position_embeddings": 4096,
             },
             "tie_word_embeddings": True,
-            "layer_types": ["full_attention"] * 4,
+            "layer_types": [
+                "full_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+            ],
+            "sliding_window": 512,
         }
 
         args = mistral3.ModelArgs(
@@ -945,6 +957,11 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, text_config["vocab_size"], text_config["num_hidden_layers"]
         )
+
+        # Test that cache construction works with sliding attention
+        cache = make_prompt_cache(model)
+        self.assertEqual(len(cache), text_config["num_hidden_layers"])
+
 
     def test_deepseek(self):
         from mlx_lm.models import deepseek

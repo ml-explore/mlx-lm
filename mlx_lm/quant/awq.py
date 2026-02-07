@@ -145,6 +145,7 @@ AWQ_MODEL_CONFIGS = {
     "mistral": llama_awq,
     "ministral3": llama_awq,
     "mistral3": update(llama_awq, lm_key="language_model"),
+    "llava": update(llama_awq, lm_key="language_model"),
     "qwen2": llama_awq,
     "qwen3": llama_awq,
     "gemma3_text": gemma3_text_awq,
