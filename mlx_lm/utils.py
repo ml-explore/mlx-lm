@@ -797,13 +797,14 @@ def quantize_model(
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
     group_size, bits = defaults_for_mode(mode, group_size, bits)
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
+    base_quant_params = dict(quant_params)
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
         # the config is set on a per-layer basis
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
@@ -814,12 +815,19 @@ def quantize_model(
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
         if isinstance(bool_or_params, dict):
-            # Ensure all required quant params are set for modules that require
-            # explicit mode/group_size/bits (e.g., MultiLinear).
-            bool_or_params = {**quant_params, **bool_or_params}
-            quantized_config["quantization"][path] = bool_or_params
+            # Only allow known quantization keys; ignore any unexpected keys
+            # (e.g., accidental per-layer config dicts) and fall back to defaults.
+            allowed_keys = {"group_size", "bits", "mode"}
+            filtered = {k: bool_or_params[k] for k in allowed_keys if k in bool_or_params}
+            if not filtered:
+                bool_or_params = True
+            else:
+                # Ensure all required quant params are set for modules that require
+                # explicit mode/group_size/bits (e.g., MultiLinear).
+                bool_or_params = {**base_quant_params, **filtered}
+                quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
-            quantized_config["quantization"][path] = quant_params
+            quantized_config["quantization"][path] = base_quant_params
         return bool_or_params
 
     nn.quantize(
