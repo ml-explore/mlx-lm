@@ -10,6 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -51,82 +52,6 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
     quantization: Optional[Dict[str, Any]] = None
-
-
-class MultiLinear(nn.Module):
-    def __init__(self, input_dims: int, output_dims: int, num_heads: int) -> None:
-        super().__init__()
-        scale = math.sqrt(1.0 / input_dims)
-        self.weight = mx.random.uniform(
-            low=-scale,
-            high=scale,
-            shape=(num_heads, output_dims, input_dims),
-        )
-
-    def __call__(self, x):
-        return x @ self.weight.swapaxes(-1, -2)
-
-    def to_quantized(
-        self,
-        group_size: int,
-        bits: int,
-        mode: str,
-    ):
-        num_heads, output_dims, input_dims = self.weight.shape
-        ql = QuantizedMultiLinear(
-            input_dims, output_dims, num_heads, group_size, bits, mode
-        )
-        ql.weight, ql.scales, *biases = mx.quantize(
-            self.weight,
-            group_size,
-            bits,
-            mode=mode,
-        )
-        ql.biases = biases[0] if biases else None
-        return ql
-
-
-class QuantizedMultiLinear(nn.Module):
-    def __init__(
-        self,
-        input_dims: int,
-        output_dims: int,
-        num_heads: int,
-        group_size: int,
-        bits: int,
-        mode: str,
-    ):
-        super().__init__()
-
-        self.group_size = group_size
-        self.bits = bits
-        self.mode = mode
-
-        # Initialize the quantized weight
-        scale = math.sqrt(1 / input_dims)
-        weight = mx.random.uniform(
-            low=-scale,
-            high=scale,
-            shape=(num_heads, output_dims, input_dims),
-        )
-        self.weight, self.scales, *biases = mx.quantize(
-            weight, group_size, bits, mode=mode
-        )
-        self.biases = biases[0] if biases else None
-
-        self.freeze()
-
-    def __call__(self, x):
-        return mx.quantized_matmul(
-            x,
-            self["weight"],
-            scales=self["scales"],
-            biases=self.get("biases"),
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-        )
 
 
 class Glm4MoeLiteAttention(nn.Module):
@@ -222,20 +147,28 @@ class Glm4MoeLiteAttention(nn.Module):
 
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
-        q_nope = self.embed_q(q_nope)
-        keys = mx.concatenate([kv_latent, k_pe], axis=-1)
-
         if cache is not None:
-            keys, _ = cache.update_and_fetch(keys, mx.zeros((B, 1, L, 0)))
-        values = keys[..., : -self.qk_rope_head_dim]
+            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
 
+        if L == 1:
+            q_nope = self.embed_q(q_nope)
+            k = v = kv_latent
+        else:
+            k = self.embed_q(kv_latent, transpose=False)
+            v = self.unembed_out(kv_latent)
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-
-        output = self.unembed_out(output)
+        if L == 1:
+            output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -407,7 +340,7 @@ class Glm4MoeLiteModel(PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(h, cache[0], return_array=True)
 
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:

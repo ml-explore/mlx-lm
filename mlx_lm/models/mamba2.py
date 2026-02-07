@@ -9,7 +9,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_ssm_mask
-from .cache import MambaCache
+from .cache import ArraysCache
 from .ssm import ssm_update
 
 
@@ -97,7 +97,7 @@ class Mamba2Block(nn.Module):
     def _conv(
         self,
         conv_input: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         if mask is not None:
@@ -134,7 +134,7 @@ class Mamba2Block(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
@@ -169,7 +169,7 @@ class Mamba2Block(nn.Module):
         self,
         hidden_states: mx.array,
         mask: Optional[mx.array],
-        cache: Optional[MambaCache] = None,
+        cache: Optional[ArraysCache] = None,
     ) -> mx.array:
         projected = self.in_proj(hidden_states)
         gate, conv_input, dt = mx.split(
@@ -200,7 +200,7 @@ class ResidualBlock(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size)
 
     def __call__(
-        self, x: mx.array, mask: Optional[mx.array], cache: Optional[MambaCache] = None
+        self, x: mx.array, mask: Optional[mx.array], cache: Optional[ArraysCache] = None
     ) -> mx.array:
         output = self.mixer(self.norm(x), mask, cache)
         return output + x
@@ -215,7 +215,7 @@ class Mamba2(nn.Module):
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
 
     def __call__(
-        self, x: mx.array, cache: Optional[list[MambaCache]] = None
+        self, x: mx.array, cache: Optional[list[ArraysCache]] = None
     ) -> mx.array:
         hidden = self.embeddings(x)
 
@@ -240,7 +240,7 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
-        self, inputs: mx.array, cache: Optional[list[MambaCache]] = None
+        self, inputs: mx.array, cache: Optional[list[ArraysCache]] = None
     ) -> mx.array:
         hidden = self.backbone(inputs, cache)
 
@@ -250,8 +250,8 @@ class Model(nn.Module):
             logits = self.lm_head(hidden)
         return logits
 
-    def make_cache(self, batch_size: int = 1) -> list[MambaCache]:
-        return [MambaCache() for _ in range(self.args.num_hidden_layers)]
+    def make_cache(self, batch_size: int = 1) -> list[ArraysCache]:
+        return [ArraysCache(size=2) for _ in range(self.args.num_hidden_layers)]
 
     @property
     def layers(self):

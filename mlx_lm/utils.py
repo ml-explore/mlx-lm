@@ -309,7 +309,16 @@ def load_model(
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_args_class = get_model_classes(config=config)
+    if (model_file := config.get("model_file")) is not None:
+        spec = importlib.util.spec_from_file_location(
+            "custom_model",
+            model_path / model_file,
+        )
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        model_class, model_args_class = arch.Model, arch.ModelArgs
+    else:
+        model_class, model_args_class = get_model_classes(config=config)
 
     if "quantization_config" not in config:
         text_config = config.get("text_config", {})
@@ -317,6 +326,7 @@ def load_model(
             config["quantization_config"] = text_config["quantization_config"]
 
     model_args = model_args_class.from_dict(config)
+
     model = model_class(model_args)
 
     if hasattr(model, "sanitize"):

@@ -112,9 +112,11 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
-    if N == 1:
+    if window_size is not None:
+        return create_causal_mask(N, offset, window_size=window_size)
+    elif N == 1:
         return None
-    if return_array:
+    elif return_array:
         return create_causal_mask(N, offset, window_size=window_size)
     else:
         return "causal"
@@ -644,11 +646,6 @@ class ArraysCache(_BaseCache):
 
     def empty(self):
         return self.cache[0] is None
-
-
-class MambaCache(ArraysCache):
-    def __init__(self, left_padding: Optional[List[int]] = None):
-        super().__init__(size=2, left_padding=left_padding)
 
 
 class ChunkedKVCache(_BaseCache):
