@@ -13,6 +13,95 @@ from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
+def _chunked_sparse_prefill(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    sink_size: int,
+    recent_size: int,
+    scale: float,
+    chunk_size: int = 256,
+) -> mx.array:
+    B, n_heads, N, head_dim = queries.shape
+    kv_len = keys.shape[2]
+    q_start = kv_len - N
+
+    outputs = []
+    for chunk_start in range(0, N, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, N)
+        q_chunk = queries[:, :, chunk_start:chunk_end, :]
+
+        abs_q_start = q_start + chunk_start
+        abs_q_end = q_start + chunk_end
+        recent_union_start = max(0, abs_q_start - recent_size + 1)
+
+        if recent_union_start <= sink_size:
+            k_gathered = keys[:, :, :abs_q_end, :]
+            v_gathered = values[:, :, :abs_q_end, :]
+            kv_pos = mx.arange(abs_q_end)
+        else:
+            k_gathered = mx.concatenate(
+                [
+                    keys[:, :, :sink_size, :],
+                    keys[:, :, recent_union_start:abs_q_end, :],
+                ],
+                axis=2,
+            )
+            v_gathered = mx.concatenate(
+                [
+                    values[:, :, :sink_size, :],
+                    values[:, :, recent_union_start:abs_q_end, :],
+                ],
+                axis=2,
+            )
+            gathered_idx = mx.arange(sink_size + (abs_q_end - recent_union_start))
+            kv_pos = mx.where(
+                gathered_idx < sink_size,
+                gathered_idx,
+                recent_union_start + (gathered_idx - sink_size),
+            )
+
+        q_pos = mx.arange(abs_q_start, abs_q_end)[:, None]
+        kv_pos = kv_pos[None, :]
+        mask = (kv_pos <= q_pos) & (
+            (kv_pos < sink_size) | (kv_pos > q_pos - recent_size)
+        )
+
+        out = mx.fast.scaled_dot_product_attention(
+            q_chunk, k_gathered, v_gathered, scale=scale, mask=mask
+        )
+        outputs.append(out)
+
+    return mx.concatenate(outputs, axis=2)
+
+
+def sparse_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    sink_size: int,
+    recent_size: int,
+    scale: float,
+) -> mx.array:
+    L = queries.shape[2]
+
+    if L > 1:
+        return _chunked_sparse_prefill(
+            queries, keys, values, sink_size, recent_size, scale
+        )
+
+    seq_len = keys.shape[2]
+    if seq_len > sink_size + recent_size:
+        keys = mx.concatenate(
+            [keys[:, :, :sink_size, :], keys[:, :, -recent_size:, :]], axis=2
+        )
+        values = mx.concatenate(
+            [values[:, :, :sink_size, :], values[:, :, -recent_size:, :]], axis=2
+        )
+
+    return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale)
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -42,12 +131,22 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool = False
     router_bias: bool = False
     rope_scaling: Optional[Dict] = None
+    streaming_sparse_attention: Optional[Dict] = None
 
 
 class LongcatFlashMLA(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
+
+        self.is_sparse = False
+        ssa = args.streaming_sparse_attention
+        if ssa:
+            layer_type = ssa["layer_type"]
+            if layer_idx < len(layer_type) and layer_type[layer_idx] == "1":
+                self.is_sparse = True
+                self.sink_size = ssa["sink_size"]
+                self.recent_size = ssa["recent_size"]
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.kv_lora_rank = args.kv_lora_rank
@@ -161,14 +260,24 @@ class LongcatFlashMLA(nn.Module):
         if cache is not None:
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
 
-        attn_output = scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-        )
+        if self.is_sparse:
+            attn_output = sparse_attention(
+                query_states,
+                key_states,
+                value_states,
+                self.sink_size,
+                self.recent_size,
+                self.scale,
+            )
+        else:
+            attn_output = scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+            )
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(attn_output)
@@ -273,12 +382,14 @@ class LongcatFlashMoE(nn.Module):
 
 
 class LongcatFlashDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.mlp = LongcatFlashMoE(args)
 
-        self.self_attn = [LongcatFlashMLA(args) for _ in range(2)]
+        self.self_attn = [
+            LongcatFlashMLA(args, layer_idx=layer_idx * 2 + i) for i in range(2)
+        ]
         self.mlps = [LongcatFlashMLP(args, False) for _ in range(2)]
         self.input_layernorm = [
             nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps) for _ in range(2)
@@ -326,7 +437,10 @@ class LongcatFlashModel(nn.Module):
         super().__init__()
         self.num_layers = args.num_layers
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [LongcatFlashDecoderLayer(args) for idx in range(args.num_layers)]
+        self.layers = [
+            LongcatFlashDecoderLayer(args, layer_idx=idx)
+            for idx in range(args.num_layers)
+        ]
         self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
 
     def __call__(
@@ -342,7 +456,7 @@ class LongcatFlashModel(nn.Module):
         mask = create_attention_mask(h, cache[0][0])
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, cache=c)
+            h = layer(h, mask=mask, cache=c)
 
         return self.norm(h)
 
