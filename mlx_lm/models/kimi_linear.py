@@ -321,27 +321,29 @@ class KimiDeltaAttention(nn.Module):
         dtype = x.dtype
 
         if cache is not None:
-            conv_state, ssm_state = cache
+            q_state, k_state, v_state, ssm_state = cache
             lengths = cache.lengths
         else:
-            conv_state = None
+            q_state = None
+            k_state = None
+            v_state = None
             ssm_state = None
             lengths = None
 
-        if conv_state is None:
+        if q_state is None:
             s = mx.zeros((B, self.conv_kernel - 1, self.projection_dim), dtype=dtype)
             q_state = s
             k_state = s
             v_state = s
-        else:
-            q_state, k_state, v_state = mx.split(conv_state, 3, axis=-1)
 
         q_conv, q_state = self.q_conv(self.q_proj(x), q_state, mask, lengths)
         k_conv, k_state = self.k_conv(self.k_proj(x), k_state, mask, lengths)
         v_conv, v_state = self.v_conv(self.v_proj(x), v_state, mask, lengths)
 
         if cache is not None:
-            cache[0] = mx.concatenate([q_state, k_state, v_state], axis=-1)
+            cache[0] = q_state
+            cache[1] = k_state
+            cache[2] = v_state
 
         q = q_conv.reshape(B, T, self.num_heads, self.head_dim)
         k = k_conv.reshape(B, T, self.num_heads, self.head_dim)
@@ -374,7 +376,7 @@ class KimiDeltaAttention(nn.Module):
         )
 
         if cache is not None:
-            cache[1] = ssm_state
+            cache[3] = ssm_state
             cache.advance(T)
 
         gate = self.g_b_proj(self.g_a_proj(x)).reshape(
@@ -486,7 +488,7 @@ class Model(nn.Module):
         caches: List[Any] = []
         for layer in self.layers:
             if layer.is_linear:
-                caches.append(ArraysCache(size=2))
+                caches.append(ArraysCache(size=4))
             else:
                 caches.append(KVCache())
         return caches
