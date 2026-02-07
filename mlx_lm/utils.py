@@ -814,6 +814,9 @@ def quantize_model(
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
         if isinstance(bool_or_params, dict):
+            # Ensure all required quant params are set for modules that require
+            # explicit mode/group_size/bits (e.g., MultiLinear).
+            bool_or_params = {**quant_params, **bool_or_params}
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
             quantized_config["quantization"][path] = quant_params
