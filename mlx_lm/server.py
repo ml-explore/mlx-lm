@@ -153,7 +153,7 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message["content"]
+        content = message.get("content", None)
         if isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
