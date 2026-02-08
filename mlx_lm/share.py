@@ -161,9 +161,17 @@ def main():
     path = None
     files = []
     try:
-        path = hf_repo_to_path(args.path)
-        files = get_files(path)
-    except LocalEntryNotFoundError:
+        path = Path(args.path)
+        if path.exists():
+            if path.is_file():
+                files = [path.name]
+                path = path.parent
+            else:
+                files = get_files(path)
+        else:
+            path = hf_repo_to_path(args.path)
+            files = get_files(path)
+    except:
         pass
     has_file = mx.distributed.all_gather(len(files) > 0)
     src = has_file.argmax().item()
