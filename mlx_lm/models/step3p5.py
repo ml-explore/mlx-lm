@@ -110,7 +110,7 @@ def moe_gate_select(gates, router_bias, top_k, routed_scaling_factor, norm_topk_
             mx.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
         )
 
-    return topk_indices, topk_weights * routed_scaling_factor
+    return mx.stop_gradient(topk_indices), topk_weights * routed_scaling_factor
 
 
 class Step3p5MoEGate(nn.Module):
