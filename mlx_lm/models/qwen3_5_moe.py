@@ -37,7 +37,7 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
-    ):
+    ) -> mx.array:
         return self.language_model(
             inputs, cache=cache, input_embeddings=input_embeddings
         )
