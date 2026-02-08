@@ -15,7 +15,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -427,7 +427,7 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [MambaCache() if l.is_linear else KVCache() for l in self.layers]
+        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:

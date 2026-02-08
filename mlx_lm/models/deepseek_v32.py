@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
+from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -108,7 +109,7 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
-        scores = scores.sum(axis=1)
+        scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
@@ -147,11 +148,11 @@ class DeepseekV32Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
 
         self.o_proj = nn.Linear(
@@ -193,34 +194,27 @@ class DeepseekV32Attention(nn.Module):
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
 
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        offset = cache[0].offset if cache is not None else 0
+        q_pe = self.rope(q_pe, offset)
+        k_pe = self.rope(k_pe, offset)
+
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
 
         if cache is not None:
-            q_pe = self.rope(q_pe, cache[0].offset)
-            k_pe = self.rope(k_pe, cache[0].offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache[0].update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), values
-            )
+            kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
         else:
             cache = [None] * 2
-            q_pe = self.rope(q_pe)
-            k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
 
-        queries = mx.concatenate([q_nope, q_pe], axis=-1)
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
-            k_seq = keys.shape[2]
-            sparse_mask = mx.zeros((B, L, k_seq), dtype=mx.bool_)
+            shape = list(topk_indices.shape)
+            shape[-1] = keys.shape[2]
+            sparse_mask = mx.zeros(shape, dtype=mx.bool_)
             sparse_mask = mx.put_along_axis(
                 sparse_mask, topk_indices, mx.array(True), axis=-1
             )
-            sparse_mask = sparse_mask[:, None, :, :]
             if mask is not None:
                 sparse_mask = sparse_mask & mask
             mask = sparse_mask
@@ -229,9 +223,27 @@ class DeepseekV32Attention(nn.Module):
         if cache is not None and cache[0] is not None:
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+
+        if L == 1:
+            q_nope = self.embed_q(q_nope)
+            k = v = kv_latent
+        else:
+            k = self.embed_q(kv_latent, transpose=False)
+            v = self.unembed_out(kv_latent)
+
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache[0], scale=self.scale, mask=mask
+            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
+        if L == 1:
+            output = self.unembed_out(output)
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -509,6 +521,41 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+            if f"{prefix}.kv_b_proj.weight" in weights:
+                layer = self.model.layers[l].self_attn.embed_q
+                quantized = f"{prefix}.kv_b_proj.scales" in weights
+                v = weights.pop(f"{prefix}.kv_b_proj.weight")
+                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+                    # Try to infer bits and group size
+                    bits = (v.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    v = mx.dequantize(
+                        v, scales, biases, bits=bits, group_size=group_size
+                    )
+                num_heads = self.args.num_attention_heads
+                v = v.reshape(num_heads, head_dim, -1)
+                wk = mx.contiguous(
+                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
+                if quantized:
+                    wk, wk_scales, wk_biases = mx.quantize(
+                        wk, bits=bits, group_size=group_size
+                    )
+                    wv, wv_scales, wv_biases = mx.quantize(
+                        wv, bits=bits, group_size=group_size
+                    )
+                    weights[f"{prefix}.embed_q.scales"] = wk_scales
+                    weights[f"{prefix}.unembed_out.scales"] = wv_scales
+                    weights[f"{prefix}.embed_q.biases"] = wk_biases
+                    weights[f"{prefix}.unembed_out.biases"] = wv_biases
+                weights[f"{prefix}.embed_q.weight"] = wk
+                weights[f"{prefix}.unembed_out.weight"] = wv
 
         # Remove multi-token prediction layer and any unused precomputed rotary freqs
         return {
@@ -520,17 +567,25 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        rank = group.rank()
         for layer in self.model.layers:
             layer.self_attn.q_b_proj = shard_linear(
                 layer.self_attn.q_b_proj, "all-to-sharded", group=group
             )
-            layer.self_attn.kv_b_proj = shard_linear(
-                layer.self_attn.kv_b_proj, "all-to-sharded", group=group
-            )
+
             layer.self_attn.o_proj = shard_linear(
                 layer.self_attn.o_proj, "sharded-to-all", group=group
             )
             layer.self_attn.num_heads //= N
+            num_heads = layer.self_attn.num_heads
+            sh = rank * num_heads
+            eh = sh + num_heads
+
+            def shard_heads(w):
+                return w[sh:eh]
+
+            layer.self_attn.embed_q.apply(shard_heads)
+            layer.self_attn.unembed_out.apply(shard_heads)
 
             # Shard the MLP
             if isinstance(layer.mlp, DeepseekV32MLP):
