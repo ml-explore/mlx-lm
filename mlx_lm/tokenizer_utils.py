@@ -479,6 +479,8 @@ def _infer_tool_parser(chat_template):
         return "longcat"
     elif "<arg_key>" in chat_template:
         return "glm47"
+    elif "<|tool_list_start|>" in chat_template:
+        return "pythonic"
     elif (
         "<tool_call>\\n<function=" in chat_template
         or "<tool_call>\n<function=" in chat_template
