@@ -41,9 +41,11 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.layer_types is None:
             self.layer_types = [
-                "linear_attention"
-                if (i + 1) % self.full_attention_interval != 0
-                else "full_attention"
+                (
+                    "linear_attention"
+                    if (i + 1) % self.full_attention_interval != 0
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
 

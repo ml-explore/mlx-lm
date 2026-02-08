@@ -5,10 +5,10 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten, tree_unflatten
 
 from . import qwen3_5_text
 from .base import BaseModelArgs
-from mlx.utils import tree_flatten, tree_unflatten
 
 
 @dataclass
