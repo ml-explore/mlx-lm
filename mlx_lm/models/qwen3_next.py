@@ -45,7 +45,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     partial_rotary_factor: float
     max_position_embeddings: int
-    head_dim: int
+    head_dim: Optional[int] = None
     norm_topk_prob: bool = False
     tie_word_embeddings: bool = False
     attention_bias: bool = False
@@ -73,7 +73,7 @@ class Qwen3NextAttention(nn.Module):
         super().__init__()
         self.num_key_value_heads = args.num_key_value_heads
         self.num_attention_heads = args.num_attention_heads
-        self.head_dim = args.head_dim
+        self.head_dim = args.head_dim or (args.hidden_size // args.num_attention_heads)
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
