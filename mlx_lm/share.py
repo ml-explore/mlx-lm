@@ -151,6 +151,7 @@ def main():
 
     args = parser.parse_args()
 
+    mx.set_default_device(mx.cpu)
     world = mx.distributed.init()
 
     if world.size() == 1:
