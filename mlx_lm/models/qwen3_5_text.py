@@ -1,6 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -15,42 +15,49 @@ from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP, Qwen3NextRMSNormGated
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
-    hidden_size: int = 4096
-    num_hidden_layers: int = 32
-    intermediate_size: int = 12288
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 4
-    head_dim: Optional[int] = None
-    linear_num_value_heads: int = 32
-    linear_num_key_heads: int = 16
-    linear_key_head_dim: int = 128
-    linear_value_head_dim: int = 128
-    linear_conv_kernel_dim: int = 4
-    rms_norm_eps: float = 1e-6
-    vocab_size: int = 248320
-    rope_theta: float = 10000.0
-    partial_rotary_factor: float = 0.25
-    max_position_embeddings: int = 32768
+    hidden_size: int
+    intermediate_size: int
+    linear_num_value_heads: int
+    linear_num_key_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    rms_norm_eps: float
+    vocab_size: int
+    num_key_value_heads: int
+    max_position_embeddings: int
     tie_word_embeddings: bool = False
     attention_bias: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    rope_parameters: Optional[Dict] = None
-    layer_types: Optional[List[str]] = None
+    head_dim: Optional[int] = None
+    rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
+        default_factory=lambda: {
+            "type": "default",
+            "mrope_section": [11, 11, 10],
+            "rope_theta": 100000,
+            "partial_rotary_factor": 0.25,
+        }
+    )
     full_attention_interval: int = 4
 
     def __post_init__(self):
-        if self.layer_types is None:
-            self.layer_types = [
-                (
-                    "linear_attention"
-                    if (i + 1) % self.full_attention_interval != 0
-                    else "full_attention"
-                )
-                for i in range(self.num_hidden_layers)
-            ]
+        if self.rope_parameters:
+            # Normalize rope_parameters keys (accept both 'rope_type' and 'type')
+            if (
+                "type" not in self.rope_parameters
+                and "rope_type" in self.rope_parameters
+            ):
+                self.rope_parameters["type"] = self.rope_parameters.pop("rope_type")
 
-        if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
+            required_keys = {
+                "mrope_section",
+                "type",
+                "rope_theta",
+                "partial_rotary_factor",
+            }
+            if not all(key in self.rope_parameters for key in required_keys):
+                raise ValueError(f"rope_parameters must contain keys {required_keys}")
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -162,7 +169,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.is_linear = args.layer_types[layer_idx] == "linear_attention"
+        self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
         if self.is_linear:
             self.linear_attn = Qwen3_5GatedDeltaNet(args)
         else:
@@ -198,12 +205,8 @@ class Qwen3_5TextModel(nn.Module):
             for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.ssm_idx = next(
-            i for i, t in enumerate(args.layer_types) if t == "linear_attention"
-        )
-        self.fa_idx = next(
-            i for i, t in enumerate(args.layer_types) if t == "full_attention"
-        )
+        self.ssm_idx = 0
+        self.fa_idx = args.full_attention_interval - 1
 
     def __call__(
         self,
@@ -259,6 +262,22 @@ class Model(nn.Module):
         return [MambaCache() if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
+        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+
+        norm_keys = (
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            "model.norm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
+        )
+        for k, v in weights.items():
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+            if any(k.endswith(sfx) for sfx in norm_keys):
+                if v.ndim == 1:
+                    weights[k] = v + 1.0
         return weights
