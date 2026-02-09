@@ -5,6 +5,11 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from qwen3_next import (
+    Qwen3NextAttention,
+    Qwen3NextMLP,
+    Qwen3NextRMSNormGated,
+)
 
 from .base import (
     BaseModelArgs,
@@ -14,12 +19,6 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
-
-from qwen3_next import (
-    Qwen3NextAttention,
-    Qwen3NextMLP,
-    Qwen3NextRMSNormGated,
-)
 
 
 @dataclass
