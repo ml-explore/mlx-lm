@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
-from . import qwen3_next
+from . import qwen3_5_moe_text
 from .base import BaseModelArgs
 
 
@@ -28,8 +28,8 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.language_model = qwen3_next.Model(
-            qwen3_next.ModelArgs.from_dict(args.text_config)
+        self.language_model = qwen3_5_moe_text.Model(
+            qwen3_5_moe_text.ModelArgs.from_dict(args.text_config)
         )
 
     def __call__(
