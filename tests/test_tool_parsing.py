@@ -8,6 +8,7 @@ from mlx_lm.tool_parsers import (
     kimi_k2,
     longcat,
     minimax_m2,
+    mistral,
     pythonic,
     qwen3_coder,
 )
@@ -50,6 +51,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 "[multiply(a=12234585, b=48838483920)]",
                 pythonic,
+            ),
+            (
+                'multiply[ARGS]{"a": 12234585, "b": 48838483920}',
+                mistral,
             ),
         ]
 
@@ -112,6 +117,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '[get_current_temperature(location="London")]',
                 pythonic,
+            ),
+            (
+                'get_current_temperature[ARGS]{"location": "London"}',
+                mistral,
             ),
         ]
         tools = [
