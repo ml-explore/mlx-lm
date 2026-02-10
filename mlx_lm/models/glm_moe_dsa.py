@@ -8,10 +8,9 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from .base import BaseModelArgs, create_attention_mask
-from .pipeline import PipelineMixin
-
 from .deepseek_v32 import DeepseekV32Attention
-from .glm4_moe_lite import Glm4MoeLiteMoE, Glm4MoeLiteMLP
+from .glm4_moe_lite import Glm4MoeLiteMLP, Glm4MoeLiteMoE
+from .pipeline import PipelineMixin
 
 
 @dataclass
@@ -85,7 +84,8 @@ class Glm4MoeDSAModel(PipelineMixin, nn.Module):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            Glm4MoeDSADecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
+            Glm4MoeDSADecoderLayer(config, idx)
+            for idx in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
