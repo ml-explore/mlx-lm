@@ -13,7 +13,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .rope_utils import initialize_rope
 from .ssm import ssm_update
 from .switch_layers import SwitchGLU
@@ -123,7 +123,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
     def _conv(
         self,
         conv_input: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         if mask is not None:
@@ -160,7 +160,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache],
+        cache: Optional[ArraysCache],
         mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
@@ -197,7 +197,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         self,
         hidden_states: mx.array,
         mask: Optional[mx.array],
-        cache: Optional[MambaCache] = None,
+        cache: Optional[ArraysCache] = None,
     ) -> mx.array:
 
         projected = self.in_proj(hidden_states)
@@ -496,7 +496,7 @@ class Model(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.layer_type == "mamba":
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=2))
             elif layer.layer_type == "attention":
                 caches.append(KVCache())
         return caches

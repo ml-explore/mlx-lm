@@ -16,7 +16,6 @@ from mlx_lm.models.cache import (
     CacheList,
     ChunkedKVCache,
     KVCache,
-    MambaCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -103,14 +102,14 @@ class TestPromptCache(unittest.TestCase):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
         cache = [
-            MambaCache(),
+            ArraysCache(size=2),
             KVCache(),
             RotatingKVCache(8),
-            MambaCache(),
+            ArraysCache(size=2),
             ChunkedKVCache(256),
         ]
         for c in cache:
-            if isinstance(c, MambaCache):
+            if isinstance(c, ArraysCache):
                 c[0] = mx.random.uniform(shape=(4, 4, 4))
                 c[1] = mx.random.uniform(shape=(4, 4, 4))
             else:
@@ -121,7 +120,7 @@ class TestPromptCache(unittest.TestCase):
         save_prompt_cache(cache_file, cache)
         loaded_cache = load_prompt_cache(cache_file)
         for c, lc in zip(cache, loaded_cache):
-            if isinstance(c, MambaCache):
+            if isinstance(c, ArraysCache):
                 self.assertTrue(mx.array_equal(c[0], lc[0]))
                 self.assertTrue(mx.array_equal(c[1], lc[1]))
             else:
@@ -133,10 +132,10 @@ class TestPromptCache(unittest.TestCase):
                 self.assertTrue(mx.array_equal(k, lk))
                 self.assertTrue(mx.array_equal(v, lv))
 
-    def test_save_load_mamba_cache(self):
+    def test_save_load_arrays_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
-        cache = [MambaCache()]
+        cache = [ArraysCache(size=2)]
         cache[0][0] = mx.zeros((1, 4, 4))
         cache[0][1] = mx.zeros((1, 4, 4))
 
@@ -182,16 +181,18 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
 
-        # Can't trim mamba cache
-        cache = [MambaCache() for _ in range(2)]
+        # Can't trim arrays cache
+        cache = [ArraysCache(size=2) for _ in range(2)]
         for c in cache:
-            c.state = mx.zeros((5, 5))
+            c[0] = mx.zeros((5, 5))
+            c[1] = mx.zeros((5, 5))
         num_trimmed = trim_prompt_cache(cache, 7)
         self.assertEqual(num_trimmed, 0)
 
         # All cache's have to be trimmable
-        cache = [MambaCache(), KVCache()]
-        cache[0].state = mx.zeros((5, 5))
+        cache = [ArraysCache(size=2), KVCache()]
+        cache[0][0] = mx.zeros((5, 5))
+        cache[0][1] = mx.zeros((5, 5))
         x = mx.random.uniform(shape=(1, 8, 10, 4))
         cache[1].update_and_fetch(x, x)
         num_trimmed = trim_prompt_cache(cache, 1)
@@ -338,7 +339,7 @@ class TestPromptCache(unittest.TestCase):
         m = c.trim(5)
         self.assertEqual(m, 5)
 
-        c = CacheList(MambaCache(), KVCache())
+        c = CacheList(ArraysCache(size=2), KVCache())
         self.assertFalse(c.is_trimmable())
 
         c1 = CacheList(ArraysCache(size=1), KVCache())
@@ -570,12 +571,12 @@ class TestPromptCache(unittest.TestCase):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
         cache = [
-            MambaCache(left_padding=[1, 2]),
+            ArraysCache(size=2, left_padding=[1, 2]),
             BatchKVCache(left_padding=[1, 2]),
             BatchRotatingKVCache(max_size=10, left_padding=[1, 2]),
         ]
         for c in cache:
-            if isinstance(c, MambaCache):
+            if isinstance(c, ArraysCache):
                 c[0] = mx.random.uniform(shape=(4, 4, 4))
                 c[1] = mx.random.uniform(shape=(4, 4, 4))
             else:
@@ -625,6 +626,16 @@ class TestPromptCache(unittest.TestCase):
         c2.update_and_fetch(kv, kv)
         c_out = KVCache.merge((c1, c2))
         self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
+
+    def test_window_mask_with_full_kv_cache(self):
+        c = KVCache()
+        kv = mx.zeros((1, 1, 32, 128))
+        c.update_and_fetch(kv, kv)
+
+        h = mx.zeros((1, 1, 1, 128))
+        mask = create_attention_mask(h, c, window_size=4)
+        expected = create_causal_mask(1, offset=32, window_size=4)
+        self.assertTrue(mx.array_equal(mask, expected))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import MambaCache, RotatingKVCache
+from .cache import ArraysCache, RotatingKVCache
 
 
 @dataclass
@@ -446,7 +446,7 @@ class Model(nn.Module):
         cache = []
         for layer in self.layers:
             if layer.temporal_block_type == "recurrent":
-                cache.append(MambaCache())
+                cache.append(ArraysCache(size=2))
             else:
                 cache.append(RotatingKVCache(max_size=self.args.attention_window_size))
         return cache
