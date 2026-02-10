@@ -170,10 +170,11 @@ class LongcatFlashMLA(nn.Module):
             )
             output = self.unembed_out(output)
         else:
+            # Pre-scale Q: the absorbed nope/pe split routes scale
+            # through different precisions in the Steel SDPA kernel,
+            # causing drift on long sequences. Pre-scaling avoids this.
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-            # Pre-scale Q so SDPA doesn't rescale in f32 (scale=1.0);
-            # with mscale-amplified pe_scores the f32/bf16 gap shifts attention.
             q_nope = q_nope * self.scale
             output = scaled_dot_product_attention(
                 q_nope, k, v, cache=cache, scale=1.0, mask=pe_scores
