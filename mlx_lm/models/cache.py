@@ -856,7 +856,9 @@ class BatchKVCache(_BaseCache):
         self._idx += keys.shape[2]
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
-        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+        end = int(mx.max(self.left_padding + self.offset).item())
+        end = max(self._idx, end)
+        return self.keys[..., :end, :], self.values[..., :end, :]
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
@@ -902,9 +904,29 @@ class BatchKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def trim_per_sequence(self, n: mx.array):
+        """
+        Trim each sequence by a different amount.
+
+        This is useful for speculative decoding where different sequences
+        in a batch may accept different numbers of draft tokens.
+
+        Args:
+            n: An array of shape ``(B,)`` with the number of tokens to
+                trim from each sequence.
+        """
+        n = mx.minimum(n, self.left_padding + self.offset)
+        self.offset -= n
+        self._idx = int(mx.max(self.left_padding + self.offset).item())
+
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        end = int(mx.max(self.left_padding + self.offset).item())
+        end = max(self._idx, end)
+        right_pad = end - (self.left_padding + self.offset)
+        if mx.max(right_pad).item() > 0:
+            kwargs["right_padding"] = right_pad
         return create_causal_mask(
-            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+            N, offset=end, left_padding=self.left_padding, **kwargs
         )
 
     def filter(self, batch_indices):
