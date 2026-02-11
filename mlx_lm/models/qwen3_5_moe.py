@@ -32,6 +32,8 @@ class Model(Qwen3_5Model):
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
+            elif key.startswith("language_model."):
+                pass
             else:
                 key = "language_model." + key
             new_weights[key] = value

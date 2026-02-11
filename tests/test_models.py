@@ -530,6 +530,59 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+    
+    def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
+        text_config = {
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 32,
+            "linear_num_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 1,
+            "full_attention_interval": 1,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 64,
+        }
+        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+
+        for model_type, hf_mtp_key in (
+            ("qwen3_5", "mtp.fc.weights"),
+            ("qwen3_5_moe", "mtp.fc.weight"),
+        ):
+            module = importlib.import_module(f"mlx_lm.models.{model_type}")
+            args = module.ModelArgs.from_dict(
+                {
+                    "model_type": model_type,
+                    "text_config": {"model_type": model_type, **text_config},
+                }
+            )
+            model = module.Model(args)
+
+            base = mx.arange(8, dtype=mx.float32)
+
+            # Simulate convert sanitize on HF-style keys.
+            converted = model.sanitize(
+                {
+                    hf_norm_key: base,
+                    hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
+                }
+            )
+            self.assertIn(mlx_norm_key, converted)
+            self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
+            self.assertFalse(any("mtp." in k for k in converted))
+
+            # Simulate load sanitize on already-converted keys.
+            loaded = model.sanitize(converted)
+            self.assertTrue(
+                mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
+            )
 
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe

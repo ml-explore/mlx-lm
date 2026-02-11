@@ -287,6 +287,9 @@ class TextModel(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
+        should_shift_norm_weights = any("mtp." in k for k in weights) or any(
+            "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
+        )
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
@@ -302,7 +305,7 @@ class TextModel(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if any(k.endswith(sfx) for sfx in norm_keys):
+            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights
@@ -359,6 +362,8 @@ class Model(nn.Module):
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
+            elif key.startswith("language_model."):
+                pass
             else:
                 key = "language_model." + key
             sanitized[key] = value
