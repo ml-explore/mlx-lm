@@ -530,7 +530,7 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
-    
+
     def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
         text_config = {
             "hidden_size": 8,
