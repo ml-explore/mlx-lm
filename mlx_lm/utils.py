@@ -569,7 +569,7 @@ def sharded_load(
     mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
-    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+    mx.distributed.all_sum(0).item()
     if return_config:
         return model, tokenizer, config
     else:
