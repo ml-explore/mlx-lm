@@ -1,9 +1,11 @@
 # Copyright © 2026 Apple Inc.
 
 import argparse
+import os
 import sys
 from functools import partial
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import mlx.core as mx
 from huggingface_hub.errors import LocalEntryNotFoundError
@@ -48,6 +50,8 @@ def launch(args):
         "--path",
         args.path,
     ]
+    if args.tmpdir is not None:
+        cmd += ["--tmpdir", args.tmpdir]
     if args.dst is not None:
         cmd += ["--dst", args.dst]
 
@@ -148,6 +152,11 @@ def main():
         type=str,
         help="The destination path in other nodes (defaults to --path)",
     )
+    parser.add_argument(
+        "--tmpdir",
+        type=str,
+        help="Intermediate temporary directory to ensure successfull transfer",
+    )
 
     args = parser.parse_args()
 
@@ -193,7 +202,12 @@ def main():
             data_size = mx.distributed.all_sum(0).item()
             data = mx.distributed.all_sum(mx.zeros(data_size, dtype=mx.uint8))
             path = Path(bytes(data).decode("utf-8"))
-    else:
+    elif world.rank() != src:
         path = Path(args.dst)
 
-    share_files(path, files, src, world)
+    with TemporaryDirectory(dir=args.tmpdir) as tmp:
+        if world.rank() == src:
+            share_files(path, files, src, world)
+        else:
+            share_files(Path(tmp), files, src, world)
+            os.rename(tmp, path)
