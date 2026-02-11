@@ -210,4 +210,5 @@ def main():
             share_files(path, files, src, world)
         else:
             share_files(Path(tmp), files, src, world)
+            path.mkdir(parents=True, exist_ok=True)
             os.rename(tmp, path)
