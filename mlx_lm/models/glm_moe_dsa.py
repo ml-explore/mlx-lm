@@ -8,6 +8,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from .base import BaseModelArgs, create_attention_mask
+from .cache import CacheList, KVCache
 from .deepseek_v32 import DeepseekV32Attention
 from .glm4_moe_lite import Glm4MoeLiteMLP, Glm4MoeLiteMoE
 from .pipeline import PipelineMixin
@@ -48,6 +49,9 @@ class ModelArgs(BaseModelArgs):
     partial_rotary_factor: float = 1.0
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
+    index_head_dim: int = 128
+    index_n_heads: int = 32
+    index_topk: int = 2048
     quantization: Optional[Dict[str, Any]] = None
 
 
@@ -101,7 +105,9 @@ class Glm4MoeDSAModel(PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(
+            h, cache[0][0] if cache[0] else None, return_array=True
+        )
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
@@ -112,7 +118,7 @@ class Glm4MoeDSAModel(PipelineMixin, nn.Module):
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
             if cache[-1] is not None:
-                cache[-1].keys = mx.depends(cache[-1].keys, h)
+                cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
 
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
@@ -137,9 +143,17 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
+        # Remove multi-token prediction layers
         mpt_layer = self.args.num_hidden_layers
+        new_weights = {}
+        for k, v in weights.items():
+            parts = k.split(".")
+            if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
+                continue
+            new_weights[k] = v
+        weights = new_weights
 
-        # Stack experts
+        # Stack experts and absorb MLA weights
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
@@ -151,32 +165,66 @@ class Model(nn.Module):
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
-        # Remove multi-token prediction layer
-        return {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith(f"model.layers.{mpt_layer}")
-        }
+            # MLA absorption: split kv_b_proj into embed_q and unembed_out
+            attn_prefix = f"{prefix}.self_attn"
+            if f"{attn_prefix}.kv_b_proj.weight" in weights:
+                quantized = f"{attn_prefix}.kv_b_proj.scales" in weights
+                v = weights.pop(f"{attn_prefix}.kv_b_proj.weight")
+                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{attn_prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{attn_prefix}.kv_b_proj.biases")
+                    bits = (v.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    v = mx.dequantize(
+                        v, scales, biases, bits=bits, group_size=group_size
+                    )
+                num_heads = self.args.num_attention_heads
+                v = v.reshape(num_heads, head_dim, -1)
+                wk = mx.contiguous(
+                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
+                if quantized:
+                    wk, wk_scales, wk_biases = mx.quantize(
+                        wk, bits=bits, group_size=group_size
+                    )
+                    wv, wv_scales, wv_biases = mx.quantize(
+                        wv, bits=bits, group_size=group_size
+                    )
+                    weights[f"{attn_prefix}.embed_q.scales"] = wk_scales
+                    weights[f"{attn_prefix}.unembed_out.scales"] = wv_scales
+                    weights[f"{attn_prefix}.embed_q.biases"] = wk_biases
+                    weights[f"{attn_prefix}.unembed_out.biases"] = wv_biases
+                weights[f"{attn_prefix}.embed_q.weight"] = wk
+                weights[f"{attn_prefix}.unembed_out.weight"] = wv
+
+        return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        rank = group.rank()
         for layer in self.model.layers:
             # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
+            layer.self_attn.q_b_proj = shard_linear(
+                layer.self_attn.q_b_proj, "all-to-sharded", group=group
             )
             layer.self_attn.o_proj = shard_linear(
                 layer.self_attn.o_proj, "sharded-to-all", group=group
             )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
+            layer.self_attn.num_heads //= N
+            num_heads = layer.self_attn.num_heads
+            sh = rank * num_heads
+            eh = sh + num_heads
+
+            def shard_heads(w):
+                return w[sh:eh]
+
+            layer.self_attn.embed_q.apply(shard_heads)
+            layer.self_attn.unembed_out.apply(shard_heads)
 
             # Shard the MLP
             if isinstance(layer.mlp, Glm4MoeLiteMLP):
@@ -223,3 +271,6 @@ class Model(nn.Module):
             return "e_score_correction_bias" not in k
 
         return predicate
+
+    def make_cache(self):
+        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
