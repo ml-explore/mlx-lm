@@ -165,20 +165,15 @@ class LongcatFlashMLA(nn.Module):
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
-            output = scaled_dot_product_attention(
-                q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-            )
-            output = self.unembed_out(output)
         else:
-            # Pre-scale Q: the absorbed nope/pe split routes scale
-            # through different precisions in the Steel SDPA kernel,
-            # causing drift on long sequences. Pre-scaling avoids this.
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-            q_nope = q_nope * self.scale
-            output = scaled_dot_product_attention(
-                q_nope, k, v, cache=cache, scale=1.0, mask=pe_scores
-            )
+
+        output = scaled_dot_product_attention(
+            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+        )
+        if L == 1:
+            output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
