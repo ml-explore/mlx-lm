@@ -72,7 +72,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=self.indexer_rope_interleave,
+            traditional=args.indexer_rope_interleave,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
