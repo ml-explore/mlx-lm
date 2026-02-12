@@ -71,7 +71,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=False,
+            traditional=True,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
@@ -495,6 +495,16 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
+        # Remove multi-token prediction layers
+        mpt_layer = self.args.num_hidden_layers
+        new_weights = {}
+        for k, v in weights.items():
+            parts = k.split(".")
+            if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
+                continue
+            new_weights[k] = v
+        weights = new_weights
+
         def dequant(weight, scale_inv):
             dtype = mx.bfloat16
             weight = mx.from_fp8(weight, dtype=mx.bfloat16)
@@ -572,12 +582,7 @@ class Model(nn.Module):
                 weights[f"{prefix}.embed_q.weight"] = wk
                 weights[f"{prefix}.unembed_out.weight"] = wv
 
-        # Remove multi-token prediction layer and any unused precomputed rotary freqs
-        return {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith("model.layers.61") and "rotary_emb.inv_freq" not in k
-        }
+        return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
