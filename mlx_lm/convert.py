@@ -97,7 +97,27 @@ def convert(
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
     trust_remote_code: bool = False,
+    chunked: bool = False,
 ):
+    if chunked:
+        from .chunked_convert import convert_chunked
+
+        if dequantize:
+            raise ValueError("--chunked is not compatible with --dequantize")
+        return convert_chunked(
+            hf_path,
+            mlx_path,
+            quantize,
+            q_group_size,
+            q_bits,
+            q_mode,
+            dtype,
+            quant_predicate,
+            upload_repo,
+            revision,
+            trust_remote_code,
+        )
+
     # Check the save path is empty
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)
@@ -245,6 +265,14 @@ def configure_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trust-remote-code",
         help="Trust remote code when loading tokenizer.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--chunked",
+        help="Use memory-efficient chunked conversion. Required for models "
+        "larger than available RAM. Not compatible with --dequantize "
+        "or advanced quantization methods (AWQ, GPTQ, DWQ).",
         action="store_true",
         default=False,
     )
