@@ -51,6 +51,7 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "glm_moe_dsa": "deepseek_v32",
 }
 
 MAX_FILE_SIZE_GB = 5
