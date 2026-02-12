@@ -209,15 +209,29 @@ class DeepseekV32Attention(nn.Module):
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
-            shape = list(topk_indices.shape)
-            shape[-1] = kv_latent.shape[2]
-            sparse_mask = mx.zeros(shape, dtype=mx.bool_)
-            sparse_mask = mx.put_along_axis(
-                sparse_mask, topk_indices, mx.array(True), axis=-1
-            )
-            if mask is not None:
-                sparse_mask = sparse_mask & mask
-            mask = sparse_mask
+            if L == 1:
+                idx = topk_indices[:, :, 0, :, None]
+                kv_latent = mx.take_along_axis(
+                    kv_latent,
+                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
+                    axis=2,
+                )
+                k_pe = mx.take_along_axis(
+                    k_pe,
+                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
+                    axis=2,
+                )
+                mask = None
+            else:
+                shape = list(topk_indices.shape)
+                shape[-1] = kv_latent.shape[2]
+                sparse_mask = mx.zeros(shape, dtype=mx.bool_)
+                sparse_mask = mx.put_along_axis(
+                    sparse_mask, topk_indices, mx.array(True), axis=-1
+                )
+                if mask is not None:
+                    sparse_mask = sparse_mask & mask
+                mask = sparse_mask
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
         if cache is not None and cache[0] is not None:
