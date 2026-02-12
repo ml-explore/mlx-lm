@@ -50,7 +50,6 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
-    indexer_rope_interleave: bool = False
 
 
 class Indexer(nn.Module):
@@ -72,7 +71,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=args.indexer_rope_interleave,
+            traditional=True,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
