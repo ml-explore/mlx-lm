@@ -530,7 +530,10 @@ class ModelProvider:
 
         if self.draft_model is None:
             self.is_batchable = all(
-                hasattr(c, "merge") for c in make_prompt_cache(self.model)
+                hasattr(c, "merge")
+                for c in make_prompt_cache(
+                    self.model, max_kv_size=self.cli_args.max_kv_size
+                )
             )
 
         return self.model, self.tokenizer
@@ -754,7 +757,10 @@ class ResponseGenerator:
                         current_model_key, prompt
                     )
                     if cache is None:
-                        cache = make_prompt_cache(self.model_provider.model)
+                        cache = make_prompt_cache(
+                            self.model_provider.model,
+                            max_kv_size=self.model_provider.cli_args.max_kv_size,
+                        )
 
                     (uid,) = batch_generator.insert(
                         [rest],
@@ -797,6 +803,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
+                        max_kv_size=self.model_provider.cli_args.max_kv_size,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -919,9 +926,15 @@ class ResponseGenerator:
             )
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
+                cache = make_prompt_cache(
+                    self.model_provider.model,
+                    max_kv_size=self.model_provider.cli_args.max_kv_size,
+                )
                 if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+                    cache += make_prompt_cache(
+                        self.model_provider.draft_model,
+                        max_kv_size=self.model_provider.cli_args.max_kv_size,
+                    )
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1808,6 +1821,12 @@ def main():
         type=int,
         default=512,
         help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Set the maximum key-value cache size",
     )
     parser.add_argument(
         "--chat-template-args",
