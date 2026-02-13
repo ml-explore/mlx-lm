@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
@@ -163,8 +163,12 @@ class MixtralModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-    ):
-        h = self.embed_tokens(inputs)
+        input_embeddings: Optional[mx.array] = None,
+    ) -> mx.array:
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -190,8 +194,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-    ):
-        out = self.model(inputs, cache)
+        input_embeddings: Optional[mx.array] = None,
+    ) -> mx.array:
+        out = self.model(inputs, cache, input_embeddings)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
         else:
