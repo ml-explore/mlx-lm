@@ -132,6 +132,41 @@ class TestPromptCache(unittest.TestCase):
                 self.assertTrue(mx.array_equal(k, lk))
                 self.assertTrue(mx.array_equal(v, lv))
 
+    def test_save_load_cache_list(self):
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+
+        cache = [
+            ArraysCache(size=2),
+            KVCache(),
+            RotatingKVCache(8),
+            ArraysCache(size=2),
+            ChunkedKVCache(256),
+        ]
+        for c in cache:
+            if isinstance(c, ArraysCache):
+                c[0] = mx.random.uniform(shape=(4, 4, 4))
+                c[1] = mx.random.uniform(shape=(4, 4, 4))
+            else:
+                x = mx.random.uniform(shape=(4, 4, 7, 4))
+                y = mx.random.uniform(shape=(4, 4, 7, 4))
+                c.update_and_fetch(x, y)
+        cache = [CacheList(*cache)]
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        for c, lc in zip(cache[0].caches, loaded_cache[0].caches):
+            if isinstance(c, ArraysCache):
+                self.assertTrue(mx.array_equal(c[0], lc[0]))
+                self.assertTrue(mx.array_equal(c[1], lc[1]))
+            else:
+                x = mx.random.uniform(shape=(4, 4, 1, 4))
+                y = mx.random.uniform(shape=(4, 4, 1, 4))
+                k, v = c.update_and_fetch(x, y)
+                lk, lv = lc.update_and_fetch(x, y)
+                self.assertEqual(c.offset, lc.offset)
+                self.assertTrue(mx.array_equal(k, lk))
+                self.assertTrue(mx.array_equal(v, lv))
+
     def test_save_load_arrays_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
