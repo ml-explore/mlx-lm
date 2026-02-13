@@ -1,4 +1,4 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
@@ -123,7 +123,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
-    ):
+    ) -> mx.array:
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
@@ -190,7 +190,7 @@ class Qwen3MoeModel(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
-    ):
+    ) -> mx.array:
         if input_embeddings is not None:
             h = input_embeddings
         else:
@@ -213,15 +213,25 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = Qwen3MoeModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
-        self, inputs: mx.array, cache=None, input_embeddings: Optional[mx.array] = None
-    ):
+        self,
+        inputs: mx.array,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+    ) -> mx.array:
         out = self.model(inputs, cache, input_embeddings)
-        return self.lm_head(out)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
 
     def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
             return weights
         for l in range(self.args.num_hidden_layers):
