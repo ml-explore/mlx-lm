@@ -25,6 +25,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 1e6
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    tie_word_embeddings: bool = False
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -179,10 +180,11 @@ class MixtralModel(nn.Module):
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.args = args
         self.model_type = args.model_type
         self.model = MixtralModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self.args = args
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -190,9 +192,14 @@ class Model(nn.Module):
         cache=None,
     ):
         out = self.model(inputs, cache)
-        return self.lm_head(out)
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(out)
+        else:
+            return self.lm_head(out)
 
     def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
         if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:
             return weights
         for l in range(self.args.num_hidden_layers):
