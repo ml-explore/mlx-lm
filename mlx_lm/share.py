@@ -2,10 +2,14 @@
 
 import argparse
 import os
+import pickle
 import sys
-from functools import partial
+import time
+from dataclasses import dataclass
+from functools import partial, total_ordering
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Literal, Optional
 
 import mlx.core as mx
 from huggingface_hub.errors import LocalEntryNotFoundError
@@ -16,6 +20,38 @@ from tqdm import tqdm
 from .utils import hf_repo_to_path
 
 CHUNK_SIZE = 100 * 1024 * 1024
+
+
+@total_ordering
+@dataclass
+class DirectoryEntry:
+    entry_type: Literal["directory", "symlink", "file"]
+    path: str
+    dst: Optional[str]
+
+    def __lt__(self, other):
+        order_type = dict(directory=0, symlink=1, file=2)
+        o1 = order_type[self.entry_type]
+        o2 = order_type[other.entry_type]
+        return o1 < o2 or (o1 == o2 and self.path < other.path)
+
+    def __eq__(self, other):
+        return (
+            self.entry_type == other.entry_type
+            and self.path == other.path
+            and self.dst == other.dst
+        )
+
+    @classmethod
+    def from_path(cls, root, path):
+        entry_type = {
+            (True, False): "directory",
+            (False, True): "symlink",
+            (False, False): "file",
+        }[path.is_dir(), path.is_symlink()]
+        dst = path.readlink() if path.is_symlink() else None
+
+        return cls(entry_type, str(path.relative_to(root)), str(dst))
 
 
 def error(*args, **kwargs):
@@ -47,9 +83,11 @@ def launch(args):
         "-m",
         "mlx_lm",
         "share",
-        "--path",
-        args.path,
     ]
+    if args.path is not None:
+        cmd += ["--path", args.path]
+    if args.model is not None:
+        cmd += ["--model", args.model]
     if args.tmpdir is not None:
         cmd += ["--tmpdir", args.tmpdir]
     if args.dst is not None:
@@ -64,13 +102,28 @@ def launch(args):
 
 
 def get_files(path):
-    files = [str(f.relative_to(path)) for f in path.rglob("*") if f.is_file()]
-    return sorted(files)
+    if not path.is_dir():
+        return path.parent, [DirectoryEntry.from_path(path.parent, path)]
+
+    files = [DirectoryEntry.from_path(path, f) for f in path.rglob("*")]
+    return path, sorted(files)
+
+
+def format_bw(x):
+    if x >= 1e9:
+        return f"{x / 1e9:.2} GB/s"
+    if x >= 1e6:
+        return f"{x / 1e6:.2} MB/s"
+    if x >= 1e3:
+        return f"{x / 1e3:.2} KB/s"
+    return f"{x:.2} B/s"
 
 
 def share_file(path, file, src, group=None):
     group = group or mx.distributed.init()
     all_sum = partial(mx.distributed.all_sum, group=group)
+    total_size = 0
+    start_time = time.time()
 
     if group.rank() == src:
         with open(path / file, "rb") as f:
@@ -83,6 +136,8 @@ def share_file(path, file, src, group=None):
                 unit="B",
                 unit_scale=True,
                 desc=file,
+                position=1,
+                leave=False,
             )
             while True:
                 data = f.read(CHUNK_SIZE)
@@ -113,6 +168,8 @@ def share_file(path, file, src, group=None):
                 f.write(bytes(data))
                 data = next_data
 
+    return total_size, time.time() - start_time
+
 
 def share_files(path, files, src, group=None):
     group = group or mx.distributed.init()
@@ -120,7 +177,7 @@ def share_files(path, files, src, group=None):
 
     if group.rank() == src:
         # Share the list first
-        file_list = "|".join(files).encode("utf-8")
+        file_list = pickle.dumps(files)
         mx.eval(all_sum(len(file_list)))
         mx.eval(all_sum(file_list))
 
@@ -128,19 +185,36 @@ def share_files(path, files, src, group=None):
         # Get the list first
         file_list_size = all_sum(0).item()
         data = all_sum(mx.zeros(file_list_size, dtype=mx.uint8))
-        files = bytes(data).decode("utf-8").split("|")
+        files = pickle.loads(bytes(data))
 
+        # Make the directories and symlinks
+        for file in files:
+            if file.entry_type == "directory":
+                (path / file.path).mkdir()
+            elif file.entry_type == "symlink":
+                (path / file.path).symlink_to(file.dst)
+
+    # Everybody shares the files
+    total_size = 0
+    total_time = 1e-6
+    pbar = tqdm(total=len(files), desc="Files", position=0, disable=group.rank() != src)
     for file in files:
-        (path / file).parent.mkdir(parents=True, exist_ok=True)
-        share_file(path, file, src, group)
+        if file.entry_type == "file":
+            s, t = share_file(path, file.path, src, group)
+            total_size += s
+            total_time += t
+        pbar.update(1)
+        pbar.set_postfix(speed=format_bw(total_size / total_time))
+    pbar.close()
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Distribute a model to other nodes using MLX distributed."
     )
+    parser.add_argument("--path", type=str, help="Path to a file or folder to share.")
     parser.add_argument(
-        "--path", type=str, required=True, help="Path to the MLX model."
+        "--model", type=str, help="The path to a local model or Hugging Face repo"
     )
     parser.add_argument(
         "--hostfile",
@@ -150,7 +224,7 @@ def main():
     parser.add_argument(
         "--dst",
         type=str,
-        help="The destination path in other nodes (defaults to --path)",
+        help="The destination path in other nodes (defaults to --path or --model)",
     )
     parser.add_argument(
         "--tmpdir",
@@ -160,6 +234,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.path is args.model is None:
+        parser.error("One of --path or --model must be provided")
+
     mx.set_default_device(mx.cpu)
     world = mx.distributed.init()
 
@@ -167,22 +244,21 @@ def main():
         launch(args)
         return
 
-    # Check if any node has the file
+    # Check if any node has the data
     path = None
     files = []
-    try:
-        path = Path(args.path)
-        if path.exists():
-            if path.is_file():
-                files = [path.name]
-                path = path.parent
-            else:
-                files = get_files(path)
-        else:
-            path = hf_repo_to_path(args.path)
-            files = get_files(path)
-    except:
-        pass
+    if args.path is not None and (path := Path(args.path)).exists():
+        path, files = get_files(path)
+    elif args.model is not None:
+        try:
+            path = hf_repo_to_path(args.model)
+            if path.parent.name != "snapshots":
+                raise ValueError(
+                    f"The model repository appears to be corrupted, it resolved to {str(path)}"
+                )
+            path, files = get_files(path.parent.parent)
+        except Exception as e:
+            pass
     has_file = mx.distributed.all_gather(len(files) > 0)
     src = has_file.argmax().item()
     has_file = has_file.any().item()
