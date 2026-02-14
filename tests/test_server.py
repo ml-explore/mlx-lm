@@ -39,6 +39,7 @@ class DummyModelProvider:
                 "top_k": 0,
                 "min_p": 0.0,
                 "max_tokens": 512,
+                "max_kv_size": None,
                 "chat_template_args": {},
                 "model": None,
                 "decode_concurrency": 32,
