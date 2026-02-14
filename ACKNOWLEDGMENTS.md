@@ -31,3 +31,4 @@ Added support for the following other features:
 MoonshotAI's `Kimi K2.5`, Upstage's `Solar Open`, LG AI Research's `K-Exaone MoE`, 
 Meituan's `LongCat Flash Lite` Helped add support for the following model architectures: 
 Z.ai & THUKEG's `GLM5 (GLM MoE DSA)`
+- Willem Adnet: Revamped the CLI chat interface with `rich` for a full terminal UI, improved distributed mode support, and added `readline` history navigation.
