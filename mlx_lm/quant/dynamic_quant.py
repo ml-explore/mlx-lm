@@ -54,13 +54,18 @@ def estimate_sensitivities(
     layers = {k: l for k, l in layers if hasattr(l, "to_quantized")}
     q_model = copy.deepcopy(model)
     q_layers = copy.deepcopy(layers)
-    for l in q_layers.values():
+    # Skip layers whose weight dimensions are incompatible with quantization
+    for k, l in list(q_layers.items()):
+        if l.weight.shape[-1] % low_group_size != 0:
+            del q_layers[k]
+            continue
         l.weight = qdq(l.weight, low_bits, low_group_size)
         # Freeze everything but the quantizable weight
         l.freeze()
         l.unfreeze(keys=["weight"])
     q_model.freeze()
     q_model.update_modules(tree_unflatten(list(q_layers.items())))
+    q_model.train()
 
     def loss_fn(batch, targets):
         return kl_div_loss(q_model(batch), targets).mean()
@@ -117,6 +122,8 @@ def estimate_threshold(
 ):
     def predicate(p, m, high_threshold):
         if not hasattr(m, "to_quantized"):
+            return False
+        if m.weight.shape[-1] % low_group_size != 0:
             return False
         if sensitivities[p] > high_threshold:
             return {"bits": high_bits, "group_size": high_group_size}
@@ -228,6 +235,8 @@ def main():
 
     def quant_predicate(p, m):
         if not hasattr(m, "to_quantized"):
+            return False
+        if m.weight.shape[-1] % args.low_group_size != 0:
             return False
         if sensitivities[p] > threshold:
             return {"bits": args.high_bits, "group_size": args.high_group_size}
