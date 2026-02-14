@@ -371,6 +371,7 @@ class GenerationContext:
     eos_token_ids: set
     stop_token_sequences: List[List[int]]
     prompt: List[int]
+    prompt_cache_count: int = -1
 
     _should_stop: bool = False
 
@@ -753,6 +754,7 @@ class ResponseGenerator:
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
+                    ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
@@ -917,6 +919,7 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
+            ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -1184,6 +1187,7 @@ class APIHandler(BaseHTTPRequestHandler):
         finish_reason: Union[Literal["length", "stop"], None],
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
+        prompt_cache_count: Optional[int] = None,
         token_logprobs: Optional[List[float]] = None,
         top_tokens: Optional[List[Tuple[Dict[str, Any]]]] = None,
         tokens: Optional[List[int]] = None,
@@ -1202,6 +1206,8 @@ class APIHandler(BaseHTTPRequestHandler):
               used to populate the "usage" field (not used when stream).
             completion_token_count (Optional[int]): The number of tokens in the
               response, used to populate the "usage" field (not used when stream).
+            prompt_cache_count (Optional[int]): The portion of prompt_token_count
+              that was found in the cache when servicing the request.
             token_logprobs (Optional[List[float]]): The log probabilities per token,
               in token order.
             top_tokens (Optional[List[Tuple[Dict[str, Any]]]]): List of outputs from
@@ -1260,6 +1266,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "completion_tokens": completion_token_count,
                 "total_tokens": prompt_token_count + completion_token_count,
             }
+            if prompt_cache_count is not None and prompt_cache_count >= 0:
+                response["usage"]["prompt_tokens_details"] = {
+                    "cached_tokens": prompt_cache_count,
+                }
 
         choice = response["choices"][0]
 
@@ -1501,7 +1511,11 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(ctx.prompt), len(tokens))
+                response = self.completion_usage_response(
+                    len(ctx.prompt),
+                    len(tokens),
+                    ctx.prompt_cache_count,
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
@@ -1512,6 +1526,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason,
                 len(ctx.prompt),
                 len(tokens),
+                ctx.prompt_cache_count,
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
@@ -1532,6 +1547,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self,
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
+        prompt_cache_count: Optional[int] = None,
     ):
         response = {
             "id": self.request_id,
@@ -1546,6 +1562,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt_token_count + completion_token_count,
             },
         }
+        if prompt_cache_count is not None and prompt_cache_count >= 0:
+            response["usage"]["prompt_tokens_details"] = {
+                "cached_tokens": prompt_cache_count,
+            }
         return response
 
     def handle_chat_completions(self) -> CompletionRequest:
