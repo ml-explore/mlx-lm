@@ -72,7 +72,7 @@ def mixed_quant_predicate_builder(
         if "lm_head" in path:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
 
-        return {"group_size": group_size, "bits": low_bits}
+        return {"group_size": group_size, "bits": low_bits, "mode": mode}
 
     return mixed_quant_predicate
 
