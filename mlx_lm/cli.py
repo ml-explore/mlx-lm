@@ -22,6 +22,7 @@ def main():
         "gptq",
         "server",
         "upload",
+        "share",
     )
     subpackages = {
         "awq": "quant",

@@ -71,7 +71,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=False,
+            traditional=True,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
@@ -209,15 +209,29 @@ class DeepseekV32Attention(nn.Module):
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
-            shape = list(topk_indices.shape)
-            shape[-1] = kv_latent.shape[2]
-            sparse_mask = mx.zeros(shape, dtype=mx.bool_)
-            sparse_mask = mx.put_along_axis(
-                sparse_mask, topk_indices, mx.array(True), axis=-1
-            )
-            if mask is not None:
-                sparse_mask = sparse_mask & mask
-            mask = sparse_mask
+            if L == 1:
+                idx = topk_indices[:, :, 0, :, None]
+                kv_latent = mx.take_along_axis(
+                    kv_latent,
+                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
+                    axis=2,
+                )
+                k_pe = mx.take_along_axis(
+                    k_pe,
+                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
+                    axis=2,
+                )
+                mask = None
+            else:
+                shape = list(topk_indices.shape)
+                shape[-1] = kv_latent.shape[2]
+                sparse_mask = mx.zeros(shape, dtype=mx.bool_)
+                sparse_mask = mx.put_along_axis(
+                    sparse_mask, topk_indices, mx.array(True), axis=-1
+                )
+                if mask is not None:
+                    sparse_mask = sparse_mask & mask
+                mask = sparse_mask
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
         if cache is not None and cache[0] is not None:
@@ -481,6 +495,16 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
+        # Remove multi-token prediction layers
+        mpt_layer = self.args.num_hidden_layers
+        new_weights = {}
+        for k, v in weights.items():
+            parts = k.split(".")
+            if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
+                continue
+            new_weights[k] = v
+        weights = new_weights
+
         def dequant(weight, scale_inv):
             dtype = mx.bfloat16
             weight = mx.from_fp8(weight, dtype=mx.bfloat16)
@@ -558,12 +582,7 @@ class Model(nn.Module):
                 weights[f"{prefix}.embed_q.weight"] = wk
                 weights[f"{prefix}.unembed_out.weight"] = wv
 
-        # Remove multi-token prediction layer and any unused precomputed rotary freqs
-        return {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith("model.layers.61") and "rotary_emb.inv_freq" not in k
-        }
+        return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()

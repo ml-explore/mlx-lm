@@ -47,6 +47,7 @@ MODEL_REMAPPING = {
     "llava": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "joyai_llm_flash": "deepseek_v3",
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
