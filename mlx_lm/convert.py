@@ -23,7 +23,13 @@ def mixed_quant_predicate_builder(
     mode = "affine"
     high_bits = 6
 
-    if recipe == "mixed_2_6":
+    if recipe == "mixed_2_3":
+        low_bits = 2
+        high_bits = 3
+    elif recipe == "mixed_2_4":
+        low_bits = 2
+        high_bits = 4
+    elif recipe == "mixed_2_6":
         low_bits = 2
     elif recipe == "mixed_3_4":
         low_bits = 3
@@ -77,7 +83,7 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
+QUANT_RECIPES = ["mixed_2_3", "mixed_2_4", "mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
