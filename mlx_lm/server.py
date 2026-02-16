@@ -1383,7 +1383,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 return []
             result = []
             for tool_text in tool_calls:
-                parsed = ctx.tool_parser(tool_text, request.tools)
+                try:
+                    parsed = ctx.tool_parser(tool_text, request.tools)
+                except (json.JSONDecodeError, ValueError, KeyError) as e:
+                    logging.warning(f"Failed to parse tool call: {e}")
+                    continue
                 if isinstance(parsed, list):
                     result.extend(format_tool_call(tc) for tc in parsed)
                 else:
