@@ -784,7 +784,7 @@ def main():
     if (awq_config := AWQ_MODEL_CONFIGS.get(model_type, None)) is None:
         raise NotImplementedError(f"AWQ support for {model_type} models NYI.")
 
-    calibration_data = load_data(tokenizer, args.num_samples, args.sequence_length)
+    calibration_data = load_data(tokenizer, num_samples, args.sequence_length)
 
     calibration_data = dist_split(calibration_data, group)
 
@@ -829,12 +829,13 @@ def main():
             n_grid=args.n_grid,
         )
 
-        config = update_config(model, config)
-        save(
-            args.mlx_path,
-            args.model,
-            model,
-            tokenizer,
-            config,
-            max_file_size_gb=args.max_file_size_gb,
-        )
+        if group is None or group.rank() == 0:
+            config = update_config(model, config)
+            save(
+                args.mlx_path,
+                args.model,
+                model,
+                tokenizer,
+                config,
+                max_file_size_gb=args.max_file_size_gb,
+            )
