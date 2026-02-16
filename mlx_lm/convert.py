@@ -128,6 +128,8 @@ def convert(
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
+    if dtype is None and (text_config := config.get("text_config", None)):
+        dtype = text_config.get("dtype", None)
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
         dtype = getattr(mx, dtype)
