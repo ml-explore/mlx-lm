@@ -2,10 +2,12 @@
 
 import argparse
 import copy
+import glob
+import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict
-from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,8 +18,13 @@ from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
+    MAX_FILE_SIZE_GB,
+    create_model_card,
+    get_total_parameters,
+    hf_repo_to_path,
     load,
     save,
+    save_config,
 )
 
 
@@ -396,6 +403,35 @@ def clip_block(
     tree_map_with_path(apply_clip, block.leaf_modules(), is_leaf=nn.Module.is_module)
 
 
+def _save_shard(weights: dict, shard_path: Path):
+    mx.save_safetensors(str(shard_path), weights, metadata={"format": "mlx"})
+
+
+def _capture_module_inputs(module):
+    if not isinstance(module, (nn.Linear, SwitchLinear)):
+        return module
+
+    class Catcher(nn.Module):
+        def __call__(self, x: mx.array, *args, **kwargs):
+            # Store the input features on the original modules.
+            if hasattr(module, "input_feat"):
+                module.input_feat = mx.concatenate([module.input_feat, x], axis=0)
+            else:
+                module.input_feat = x
+
+            # Also store the MOE indices if applicable.
+            if isinstance(module, SwitchLinear):
+                indices = args[0]
+                if hasattr(module, "indices"):
+                    module.indices = mx.concatenate([module.indices, indices], axis=0)
+                else:
+                    module.indices = indices
+
+            return module(x, *args, **kwargs)
+
+    return Catcher()
+
+
 def awq_quantize(
     model,
     inputs: mx.array,
@@ -423,40 +459,15 @@ def awq_quantize(
     )
     inputs = model.model[embed_key](inputs)
 
-    def capture(module):
-        if not isinstance(module, (nn.Linear, SwitchLinear)):
-            return module
-
-        class Catcher(nn.Module):
-            def __call__(self, x: mx.array, *args, **kwargs):
-                # Store the input features on the original modules.
-                if hasattr(module, "input_feat"):
-                    module.input_feat = mx.concatenate([module.input_feat, x], axis=0)
-                else:
-                    module.input_feat = x
-
-                # Also store the MOE indices if applicabale
-                if isinstance(module, SwitchLinear):
-                    indices = args[0]
-                    if hasattr(module, "indices"):
-                        module.indices = mx.concatenate(
-                            [module.indices, indices], axis=0
-                        )
-                    else:
-                        module.indices = indices
-
-                return module(x, *args, **kwargs)
-
-        return Catcher()
-
     for e, block in enumerate(tqdm(model.layers)):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
-        capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)
+        capture_leaves = tree_map(
+            _capture_module_inputs, orig_leaves, is_leaf=nn.Module.is_module
+        )
         block.update_modules(capture_leaves)
         outputs = run_layer(block, inputs, mask=mask)
         block.update_modules(orig_leaves)
-        del capture_leaves
 
         # Quantize the block without AWQ to obtain a reference loss
         nn.quantize(block, group_size=group_size, bits=bits)
@@ -510,6 +521,224 @@ def awq_quantize(
         )
 
 
+def awq_quantize_streaming(
+    model,
+    inputs: mx.array,
+    awq_config: AWQConfig,
+    output_path: Path,
+    config: dict,
+    group_size: int = 64,
+    bits: int = 3,
+    embed_group_size: int = 32,
+    embed_bits: int = 4,
+    n_grid: int = 20,
+    max_file_size_gb: float = MAX_FILE_SIZE_GB,
+):
+    max_file_size_bytes = int(max_file_size_gb * (1 << 30))
+    if max_file_size_bytes <= 0:
+        raise ValueError(
+            f"max_file_size_gb must be positive, got {max_file_size_gb}."
+        )
+
+    output_path = Path(output_path)
+
+    root_model = model
+    lm_prefix = ""
+    if awq_config.lm_key is not None:
+        lm_prefix = f"{awq_config.lm_key}."
+        model = model[awq_config.lm_key]
+    work_model = model
+
+    group = mx.distributed.init()
+    should_write = group is None or group.rank() == 0
+    if should_write:
+        output_path.mkdir(parents=True, exist_ok=True)
+
+    total_parameters = get_total_parameters(root_model)
+    total_size = 0
+    # Streaming keeps only this in-memory shard buffer plus one active block.
+    # The buffer is bounded by max_file_size_gb.
+    pending_shard = {}
+    pending_shard_keys = []
+    pending_shard_size = 0
+    temp_shards = []
+
+    def flush_pending_shard():
+        nonlocal pending_shard_size, pending_shard_keys, pending_shard
+        if not should_write or len(pending_shard) == 0:
+            return
+
+        temp_name = f"model-tmp-{len(temp_shards) + 1:05d}.safetensors"
+        temp_path = output_path / temp_name
+        _save_shard(pending_shard, temp_path)
+        temp_shards.append((temp_path, pending_shard_keys))
+        pending_shard = {}
+        pending_shard_keys = []
+        pending_shard_size = 0
+
+    def register_shard(weights: dict):
+        nonlocal total_size, pending_shard_size, pending_shard_keys
+        if len(weights) == 0:
+            return
+        total_size += sum(v.nbytes for v in weights.values())
+        if not should_write:
+            return
+
+        for key, value in weights.items():
+            if (
+                len(pending_shard) > 0
+                and pending_shard_size + value.nbytes > max_file_size_bytes
+            ):
+                flush_pending_shard()
+            pending_shard[key] = value
+            pending_shard_keys.append(key)
+            pending_shard_size += value.nbytes
+
+    def quantize_func(w):
+        wq = mx.quantize(w, bits=bits, group_size=group_size)
+        return mx.dequantize(*wq, bits=bits, group_size=group_size)
+
+    mask = create_attention_mask(inputs)
+
+    embed_key = awq_config.embed
+    work_model.model[embed_key] = work_model.model[embed_key].to_quantized(
+        group_size=embed_group_size, bits=embed_bits
+    )
+    inputs = work_model.model[embed_key](inputs)
+    mx.eval(inputs)
+
+    embed_prefix = f"{lm_prefix}model.{embed_key}."
+    embed_shard = {
+        embed_prefix + k: v
+        for k, v in tree_flatten(work_model.model[embed_key].parameters())
+    }
+    register_shard(embed_shard)
+    work_model.model[embed_key].update(
+        tree_map(lambda _: mx.array([]), work_model.model[embed_key].parameters())
+    )
+    mx.clear_cache()
+
+    for e, block in enumerate(tqdm(work_model.layers)):
+        # Capture the input features for each of the layers in the transformer block
+        orig_leaves = block.leaf_modules()
+        capture_leaves = tree_map(
+            _capture_module_inputs, orig_leaves, is_leaf=nn.Module.is_module
+        )
+        block.update_modules(capture_leaves)
+        outputs = run_layer(block, inputs, mask=mask)
+        block.update_modules(orig_leaves)
+
+        # Quantize the block without AWQ to obtain a reference loss
+        nn.quantize(block, group_size=group_size, bits=bits)
+        outputs_q = run_layer(block, inputs, mask=mask)
+        before_loss = mse(outputs, outputs_q).sum()
+        if group is not None:
+            before_loss = mx.distributed.all_sum(before_loss) / group.size()
+        before_loss /= outputs.size
+        block.update_modules(orig_leaves)
+        orig_params = block.parameters()
+        del outputs_q
+
+        scale_block(
+            block=block,
+            configs=awq_config.scale_configs,
+            quantize_func=quantize_func,
+            n_grid=n_grid,
+            layer_kwargs={"mask": mask},
+        )
+
+        clip_block(
+            block=block,
+            no_clip_keys=awq_config.no_clip,
+            quantize_func=quantize_func,
+            group_size=group_size,
+            n_grid=n_grid,
+        )
+
+        for _, module in tree_flatten(
+            block.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+        ):
+            if hasattr(module, "input_feat"):
+                # Free activation memory while keeping attribute presence stable
+                # for downstream hasattr checks.
+                module.input_feat = mx.array([])
+            if hasattr(module, "indices"):
+                module.indices = mx.array([], dtype=module.indices.dtype)
+
+        # Quantize the scaled and clipped block
+        nn.quantize(block, group_size=group_size, bits=bits)
+        outputs_q = run_layer(block, inputs, mask=mask)
+        after_loss = mse(outputs, outputs_q).sum()
+        if group is not None:
+            after_loss = mx.distributed.all_sum(after_loss) / group.size()
+        after_loss /= outputs.size
+        tqdm.write(f"Loss reduction: {after_loss / before_loss}")
+        if after_loss > before_loss:
+            # Reload original weights and quantize
+            block.update_modules(orig_leaves)
+            block.update(orig_params)
+            nn.quantize(block, group_size=group_size, bits=bits)
+            tqdm.write("Loss is not reduced, falling back to original weights.")
+        del outputs_q
+
+        inputs = outputs
+        del orig_params
+
+        mx.eval(block)
+        mx.eval(inputs)
+
+        block_prefix = f"{lm_prefix}model.layers.{e}."
+        block_shard = {
+            block_prefix + k: v for k, v in tree_flatten(block.parameters())
+        }
+        register_shard(block_shard)
+        block.update(tree_map(lambda _: mx.array([]), block.parameters()))
+
+        mx.clear_cache()
+
+    if (lm_head := awq_config.lm_head) in work_model:
+        work_model[lm_head] = work_model[lm_head].to_quantized(
+            group_size=embed_group_size, bits=embed_bits
+        )
+
+    orphan_shard = {
+        k: v for k, v in tree_flatten(work_model.parameters()) if v.size > 0
+    }
+    if awq_config.lm_key is not None:
+        orphan_shard = {f"{lm_prefix}{k}": v for k, v in orphan_shard.items()}
+    register_shard(orphan_shard)
+
+    update_config(root_model, config)
+
+    if should_write:
+        flush_pending_shard()
+        shard_count = len(temp_shards)
+        weight_map = {}
+        for i in range(shard_count):
+            temp_path, shard_keys = temp_shards[i]
+            if shard_count == 1:
+                shard_name = "model.safetensors"
+            else:
+                shard_name = f"model-{i + 1:05d}-of-{shard_count:05d}.safetensors"
+            final_path = output_path / shard_name
+            temp_path.replace(final_path)
+            for weight_name in shard_keys:
+                weight_map[weight_name] = shard_name
+
+        weight_map = {k: weight_map[k] for k in sorted(weight_map)}
+        index_data = {
+            "metadata": {
+                "total_size": total_size,
+                "total_parameters": total_parameters,
+            },
+            "weight_map": weight_map,
+        }
+        with open(output_path / "model.safetensors.index.json", "w") as f:
+            json.dump(index_data, f, indent=4)
+
+        save_config(config, config_path=output_path / "config.json")
+
+
 def update_config(
     model: nn.Module,
     config: Dict[str, Any],
@@ -544,6 +773,10 @@ def main():
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--streaming", action="store_true")
+    parser.add_argument(
+        "--streaming-max-file-size-gb", type=float, default=MAX_FILE_SIZE_GB
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -564,22 +797,52 @@ def main():
 
     calibration_data = dist_split(calibration_data, group)
 
-    awq_quantize(
-        model,
-        calibration_data,
-        awq_config,
-        bits=args.bits,
-        group_size=args.group_size,
-        embed_bits=args.embed_bits,
-        embed_group_size=args.embed_group_size,
-        n_grid=args.n_grid,
-    )
+    if args.streaming:
+        output_path = Path(args.mlx_path)
+        awq_quantize_streaming(
+            model,
+            calibration_data,
+            awq_config,
+            output_path=output_path,
+            config=config,
+            max_file_size_gb=args.streaming_max_file_size_gb,
+            bits=args.bits,
+            group_size=args.group_size,
+            embed_bits=args.embed_bits,
+            embed_group_size=args.embed_group_size,
+            n_grid=args.n_grid,
+        )
 
-    config = update_config(model, config)
-    save(
-        args.mlx_path,
-        args.model,
-        model,
-        tokenizer,
-        config,
-    )
+        if group is None or group.rank() == 0:
+            src_path = Path(args.model)
+            if not src_path.exists():
+                hf_repo = args.model
+                src_path = hf_repo_to_path(hf_repo)
+            else:
+                hf_repo = None
+
+            tokenizer.save_pretrained(output_path)
+            for p in ["*.py", "generation_config.json"]:
+                for file in glob.glob(str(src_path / p)):
+                    shutil.copy(file, output_path)
+            create_model_card(output_path, hf_repo)
+    else:
+        awq_quantize(
+            model,
+            calibration_data,
+            awq_config,
+            bits=args.bits,
+            group_size=args.group_size,
+            embed_bits=args.embed_bits,
+            embed_group_size=args.embed_group_size,
+            n_grid=args.n_grid,
+        )
+
+        config = update_config(model, config)
+        save(
+            args.mlx_path,
+            args.model,
+            model,
+            tokenizer,
+            config,
+        )
