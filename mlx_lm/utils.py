@@ -56,6 +56,15 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 
+def max_file_size_gb_to_bytes(max_file_size_gb: float) -> int:
+    max_file_size_bytes = int(max_file_size_gb * (1 << 30))
+    if max_file_size_bytes <= 0:
+        raise ValueError(
+            f"max_file_size_gb must be positive, got {max_file_size_gb}."
+        )
+    return max_file_size_bytes
+
+
 def _unpack_awq_weights(qweight: mx.array) -> mx.array:
     bits = 4
     pack_factor = 32 // bits
@@ -580,18 +589,18 @@ def pipeline_load(repo, return_config=False):
     return sharded_load(repo, mx.distributed.init(), None, return_config)
 
 
-def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
+def make_shards(weights: dict, max_file_size_gb: float = MAX_FILE_SIZE_GB) -> list:
     """
     Splits the weights into smaller shards.
 
     Args:
         weights (dict): Model weights.
-        max_file_size_gb (int): Maximum size of each shard in gigabytes.
+        max_file_size_gb (float): Maximum size of each shard in gigabytes.
 
     Returns:
         list: List of weight shards.
     """
-    max_file_size_bytes = max_file_size_gb << 30
+    max_file_size_bytes = max_file_size_gb_to_bytes(max_file_size_gb)
     shards = []
     shard, shard_size = {}, 0
     for k, v in weights.items():
@@ -701,6 +710,7 @@ def save_model(
     model: nn.Module,
     *,
     donate_model: bool = False,
+    max_file_size_gb: float = MAX_FILE_SIZE_GB,
 ) -> None:
     """Save model weights and metadata index into specified directory."""
     if isinstance(save_path, str):
@@ -708,7 +718,7 @@ def save_model(
     save_path.mkdir(parents=True, exist_ok=True)
 
     weights = dict(tree_flatten(model.parameters()))
-    shards = make_shards(weights)
+    shards = make_shards(weights, max_file_size_gb=max_file_size_gb)
     shards_count = len(shards)
     shard_file_format = (
         "model-{:05d}-of-{:05d}.safetensors"
@@ -914,6 +924,7 @@ def save(
     tokenizer: TokenizerWrapper,
     config: Dict[str, Any],
     donate_model: bool = True,
+    max_file_size_gb: float = MAX_FILE_SIZE_GB,
 ):
 
     src_path = Path(src_path_or_repo)
@@ -924,7 +935,12 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
-    save_model(dst_path, model, donate_model=True)
+    save_model(
+        dst_path,
+        model,
+        donate_model=True,
+        max_file_size_gb=max_file_size_gb,
+    )
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 

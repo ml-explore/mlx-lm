@@ -23,6 +23,7 @@ from mlx_lm.utils import (
     get_total_parameters,
     hf_repo_to_path,
     load,
+    max_file_size_gb_to_bytes,
     save,
     save_config,
 )
@@ -530,11 +531,7 @@ def awq_quantize_streaming(
     n_grid: int = 20,
     max_file_size_gb: float = MAX_FILE_SIZE_GB,
 ):
-    max_file_size_bytes = int(max_file_size_gb * (1 << 30))
-    if max_file_size_bytes <= 0:
-        raise ValueError(
-            f"max_file_size_gb must be positive, got {max_file_size_gb}."
-        )
+    max_file_size_bytes = max_file_size_gb_to_bytes(max_file_size_gb)
 
     output_path = Path(output_path)
 
@@ -770,9 +767,7 @@ def main():
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--streaming", action="store_true")
-    parser.add_argument(
-        "--streaming-max-file-size-gb", type=float, default=MAX_FILE_SIZE_GB
-    )
+    parser.add_argument("--max-file-size-gb", type=float, default=MAX_FILE_SIZE_GB)
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -801,7 +796,7 @@ def main():
             awq_config,
             output_path=output_path,
             config=config,
-            max_file_size_gb=args.streaming_max_file_size_gb,
+            max_file_size_gb=args.max_file_size_gb,
             bits=args.bits,
             group_size=args.group_size,
             embed_bits=args.embed_bits,
@@ -841,4 +836,5 @@ def main():
             model,
             tokenizer,
             config,
+            max_file_size_gb=args.max_file_size_gb,
         )
