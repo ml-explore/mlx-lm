@@ -34,6 +34,7 @@ class ModelArgs(BaseModelArgs):
     use_qk_norm: bool = True
 
 
+@lru_cache
 def sharded_rms_norm(group):
     @mx.compile
     def _inner_sharded_rms_norm(x, w, eps):
