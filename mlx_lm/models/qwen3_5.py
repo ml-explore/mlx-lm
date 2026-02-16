@@ -324,6 +324,15 @@ class TextModel(nn.Module):
 
         return predicate
 
+    @property
+    def cast_predicate(self):
+        def predicate(path: str):
+            if path.endswith("A_log"):
+                return False
+            return True
+
+        return predicate
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -381,3 +390,7 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         return self.language_model.quant_predicate
+
+    @property
+    def cast_predicate(self):
+        return self.language_model.cast_predicate
