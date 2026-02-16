@@ -403,10 +403,6 @@ def clip_block(
     tree_map_with_path(apply_clip, block.leaf_modules(), is_leaf=nn.Module.is_module)
 
 
-def _save_shard(weights: dict, shard_path: Path):
-    mx.save_safetensors(str(shard_path), weights, metadata={"format": "mlx"})
-
-
 def _capture_module_inputs(module):
     if not isinstance(module, (nn.Linear, SwitchLinear)):
         return module
@@ -570,7 +566,7 @@ def awq_quantize_streaming(
 
         temp_name = f"model-tmp-{len(temp_shards) + 1:05d}.safetensors"
         temp_path = output_path / temp_name
-        _save_shard(pending_shard, temp_path)
+        mx.save_safetensors(str(temp_path), pending_shard, metadata={"format": "mlx"})
         temp_shards.append((temp_path, pending_shard_keys))
         pending_shard = {}
         pending_shard_keys = []
