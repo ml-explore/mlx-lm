@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -31,6 +32,45 @@ class ModelArgs(BaseModelArgs):
     scoring_func: str = "sigmoid"
     head_dim: Optional[int] = None
     use_qk_norm: bool = True
+
+
+def sharded_rms_norm(group):
+    @mx.compile
+    def _inner_sharded_rms_norm(x, w, eps):
+        norm2 = x.square().sum(-1, keepdims=True)
+        norm2 = mx.distributed.all_sum(norm2, group=group)
+        norm = mx.rsqrt(norm2 / (x.shape[-1] * group.size()) + eps)
+        return x * norm * w
+
+    return _inner_sharded_rms_norm
+
+
+class ShardedRMSNorm(nn.Module):
+    def __init__(
+        self, dims: int, eps: float = 1e-5, group: Optional[mx.distributed.Group] = None
+    ):
+        super().__init__()
+        group = group or mx.distributed.init()
+        self.weight = mx.ones((dims // group.size(),))
+        self.group = group
+        self.eps = eps
+
+    def _extra_repr(self):
+        return f"{self.weight.shape[0] * self.group.size()}, eps={self.eps}"
+
+    def __call__(self, x):
+        return sharded_rms_norm(self.group)(x, self["weight"], self.eps)
+
+    @classmethod
+    def from_rms_norm(
+        cls, norm_module, *, group: Optional[mx.distributed.Group] = None
+    ):
+        sn = cls(norm_module.weight.shape[0], norm_module.eps, group=group)
+        sn.weight = mx.contiguous(
+            mx.split(norm_module.weight, group.size(), axis=-1)[group.rank()]
+        )
+
+        return sn
 
 
 class MiniMaxAttention(nn.Module):
@@ -295,12 +335,12 @@ class Model(nn.Module):
                 layer.self_attn.o_proj, "sharded-to-all", group=group
             )
             if layer.self_attn.use_qk_norm:
-                layer.self_attn.q_norm.weight = layer.self_attn.q_norm.weight.split(
-                    N, axis=-1
-                )[rank]
-                layer.self_attn.k_norm.weight = layer.self_attn.k_norm.weight.split(
-                    N, axis=-1
-                )[rank]
+                layer.self_attn.q_norm = ShardedRMSNorm.from_rms_norm(
+                    layer.self_attn.q_norm, group=group
+                )
+                layer.self_attn.k_norm = ShardedRMSNorm.from_rms_norm(
+                    layer.self_attn.k_norm, group=group
+                )
 
             layer.self_attn.num_attention_heads //= N
             layer.self_attn.num_key_value_heads //= N
