@@ -1052,6 +1052,71 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_step3p5_mtp_cache_follows_the_main_model_policy(self):
+        """An MTP layer borrows a real layer's attention config.
+
+        When that layer slides, the MTP cache has to be windowed too, or it
+        grows without bound across a generation while the main model's
+        equivalent layers stay capped at sliding_window.
+        """
+        from mlx_lm.models import step3p5
+
+        def build(layer_types):
+            args = step3p5.ModelArgs(
+                model_type="step3p5",
+                hidden_size=256,
+                num_hidden_layers=4,
+                vocab_size=1024,
+                num_attention_heads=4,
+                num_attention_groups=2,
+                head_dim=64,
+                intermediate_size=512,
+                rms_norm_eps=1e-5,
+                rope_theta=[10000.0, 10000.0, 10000.0, 10000.0],
+                sliding_window=4,
+                layer_types=layer_types,
+                partial_rotary_factors=[0.5, 1.0, 1.0, 0.5],
+                attention_other_setting={
+                    "num_attention_heads": 8,
+                    "num_attention_groups": 2,
+                },
+                use_head_wise_attn_gate=True,
+                moe_num_experts=4,
+                moe_top_k=2,
+                moe_intermediate_size=256,
+                share_expert_dim=256,
+                moe_layers_enum="1,2,3",
+                num_nextn_predict_layers=1,
+            )
+            return step3p5.Model(args), args
+
+        sliding_model, args = build(
+            [
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ]
+        )
+        self.assertTrue(sliding_model.mtp.layers[0].self_attn.is_sliding)
+        mtp_cache = sliding_model.make_mtp_cache()
+        self.assertIsInstance(mtp_cache[0], RotatingKVCache)
+        self.assertEqual(mtp_cache[0].max_size, args.sliding_window)
+
+        # It must actually stay bounded, not merely be the right class.
+        cache = mtp_cache[0]
+        for _ in range(4 * args.sliding_window):
+            cache.update_and_fetch(
+                mx.zeros((1, 2, 1, args.head_dim)), mx.zeros((1, 2, 1, args.head_dim))
+            )
+        self.assertLessEqual(cache.size(), args.sliding_window)
+
+        full_model, _ = build(["full_attention"] * 4)
+        self.assertFalse(full_model.mtp.layers[0].self_attn.is_sliding)
+        full_mtp_cache = full_model.make_mtp_cache()
+        self.assertIsInstance(full_mtp_cache[0], KVCache)
+        self.assertNotIsInstance(full_mtp_cache[0], RotatingKVCache)
+
     def test_step3p5_make_cache_uses_rotating_for_sliding_layers(self):
         from mlx_lm.models import step3p5
 
