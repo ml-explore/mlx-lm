@@ -176,6 +176,7 @@ class LRUPromptCache:
     class CacheEntry:
         prompt_cache: List[Any]
         count: int
+        nbytes: int
 
     @dataclass
     class SearchResult:
@@ -185,10 +186,19 @@ class LRUPromptCache:
         longer: List[int]
         common_prefix: int
 
-    def __init__(self, max_size: int = 10):
+    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
         self.max_size = max_size
+        self.max_bytes = max_bytes
         self._cache = {}
         self._lru = deque()
+        self._n_bytes = 0
+
+    def __len__(self):
+        return len(self._lru)
+
+    @property
+    def nbytes(self):
+        return self._n_bytes
 
     def _search(self, model, tokens):
         """Search the cache for a prompt cache. Return exact or close match."""
@@ -241,12 +251,16 @@ class LRUPromptCache:
         path = [self._cache[model]]
         for tok in tokens:
             path.append(path[-1][tok])
+        cache_bytes = path[-1]["cache"].nbytes
+        self._n_bytes -= cache_bytes
         del path[-1]["cache"]
         for i in reversed(range(len(tokens))):
             d_prev, d, t = path[i], path[i + 1], tokens[i]
             if len(d) > 0:
                 break
             del d_prev[t]
+
+        logging.debug(f"[LRUPromptCache] Removed {cache_bytes} bytes from the cache")
 
     def _extract(self, model, tokens):
         cache_entry = self._get(model, tokens)
@@ -257,8 +271,7 @@ class LRUPromptCache:
 
         cache_entry.count -= 1
         return self.CacheEntry(
-            copy.deepcopy(cache_entry.prompt_cache),
-            1,
+            copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
         )
 
     def fetch_nearest_cache(self, model, tokens):
@@ -275,14 +288,11 @@ class LRUPromptCache:
         if result.longer is not None:
             cache_entry = self._get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache_entry = self.CacheEntry(
-                    copy.deepcopy(cache_entry.prompt_cache),
-                    1,
-                )
+                cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache_entry.prompt_cache, num_to_trim)
-                return cache_entry.prompt_cache, tokens[prefix:]
+                trim_prompt_cache(cache, num_to_trim)
+                return cache, tokens[prefix:]
 
         return None, tokens
 
@@ -299,10 +309,29 @@ class LRUPromptCache:
             current["cache"].count += 1
             self._lru.remove((model, tokens))
         else:
-            current["cache"] = self.CacheEntry(prompt_cache, 1)
+            cache_bytes = sum(c.nbytes for c in prompt_cache)
+            current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes)
+            self._n_bytes += cache_bytes
+            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} to the cache")
 
         self._lru.append((model, tokens))
         if len(self._lru) > self.max_size:
+            model, tokens = self._lru.popleft()
+            self._delete(model, tokens)
+        while self._n_bytes > self.max_bytes and len(self._lru) > 1:
+            model, tokens = self._lru.popleft()
+            self._delete(model, tokens)
+
+    def trim_to(
+        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
+    ):
+        n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
+        n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
+
+        while len(self._lru) > n_sequences:
+            model, tokens = self._lru.popleft()
+            self._delete(model, tokens)
+        while self._n_bytes > n_bytes:
             model, tokens = self._lru.popleft()
             self._delete(model, tokens)
 
@@ -771,6 +800,14 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                     }
+
+                    if self.model_provider.cli_args.prompt_cache_total_size is not None:
+                        total_size = (
+                            self.model_provider.cli_args.prompt_cache_total_size
+                        )
+                        active_size = batch_generator.kv_cache_nbytes
+                        cache_size = self.prompt_cache.nbytes
+                        self.prompt_cache.trim_to(n_bytes=total_size - active_size)
                     continue
 
                 # No batch generator. Load the model and if it's not
@@ -1732,7 +1769,11 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
+    prompt_cache = LRUPromptCache(
+        model_provider.cli_args.prompt_cache_size,
+        model_provider.cli_args.prompt_cache_bytes,
+    )
+    response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
     else:
@@ -1846,6 +1887,23 @@ def main():
         type=int,
         default=8,
         help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--prompt-cache-size",
+        type=int,
+        default=10,
+        help="Maximum number of distinct KV caches to hold in the prompt cache",
+    )
+    parser.add_argument(
+        "--prompt-cache-bytes",
+        type=int,
+        default=1 << 63,
+        help="Maximum size in bytes of the KV caches held in the prompt cache",
+    )
+    parser.add_argument(
+        "--prompt-cache-total-size",
+        type=int,
+        help="If provided make a best effort to keep the prompt cache and active KV caches lower than this number",
     )
     parser.add_argument(
         "--pipeline",
