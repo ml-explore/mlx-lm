@@ -37,11 +37,20 @@ class ModelArgs(BaseModelArgs):
 @lru_cache
 def sharded_rms_norm(group):
     @mx.compile
-    def _inner_sharded_rms_norm(x, w, eps):
-        norm2 = x.square().sum(-1, keepdims=True)
+    def _cast_square_sum(x):
+        return x.astype(mx.float32).square().sum(-1, keepdims=True)
+
+    @mx.compile
+    def _normalize(x, norm2, w, eps):
         norm2 = mx.distributed.all_sum(norm2, group=group)
         norm = mx.rsqrt(norm2 / (x.shape[-1] * group.size()) + eps)
-        return x * norm * w
+        return (x.astype(mx.float32) * norm * w).astype(x.dtype)
+
+    # Split the compile so that x upcasting doesn't break the compile and we
+    # have 2 kernels generated 1 for f(x) = square(upcast(x)) and another
+    # g(x) = downcast(upcast(x) * norm * w)
+    def _inner_sharded_rms_norm(x, w, eps):
+        return _normalize(x, _cast_square_sum(x), w, eps)
 
     return _inner_sharded_rms_norm
 
