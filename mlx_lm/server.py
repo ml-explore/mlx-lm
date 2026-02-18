@@ -744,6 +744,14 @@ class ResponseGenerator:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
 
+        def prompt_finished_callback(prompts):
+            if tokenizer.has_thinking:
+                for uid, prompt_end, lazy_cache in prompts:
+                    cache_key = batch_results[uid]["cache_key"][:-prompt_end]
+                    self.prompt_cache.insert_cache(
+                        current_model_key, cache_key, list(lazy_cache)
+                    )
+
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
             mx.random.seed(seed)
@@ -792,6 +800,16 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
+                    # If the model has thinking it may have the <think> token
+                    # in the prompt so we adjust so that the prompt ends before
+                    # the <think> token. We only search in the last 5 tokens
+                    # for speed.
+                    prompt_end = 1
+                    if tokenizer.has_thinking:
+                        for i in range(-1, -6, -1):
+                            if prompt[i] == tokenizer.think_start_id:
+                                prompt_end = -i
+
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
@@ -810,6 +828,7 @@ class ResponseGenerator:
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
+                        prompt_end=[prompt_end],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -852,6 +871,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
+                        prompt_finished_callback=prompt_finished_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -902,9 +922,12 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
-                            )
+                            if not tokenizer.has_thinking:
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    result["cache_key"],
+                                    r.prompt_cache,
+                                )
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
@@ -920,9 +943,10 @@ class ResponseGenerator:
                             if uid not in batch_results:
                                 continue
                             result = batch_results[uid]
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], prompt_cache
-                            )
+                            if not tokenizer.has_thinking:
+                                self.prompt_cache.insert_cache(
+                                    current_model_key, result["cache_key"], prompt_cache
+                                )
                             del batch_results[uid]
 
     def _serve_single(self, request):
