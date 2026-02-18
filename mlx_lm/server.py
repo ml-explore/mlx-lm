@@ -800,14 +800,16 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                     }
+                    # just making sure we don't leave a reference around
+                    del cache
 
-                    if self.model_provider.cli_args.prompt_cache_total_size is not None:
-                        total_size = (
-                            self.model_provider.cli_args.prompt_cache_total_size
-                        )
-                        active_size = batch_generator.kv_cache_nbytes
-                        cache_size = self.prompt_cache.nbytes
-                        self.prompt_cache.trim_to(n_bytes=total_size - active_size)
+                    if (
+                        self.model_provider.cli_args.prompt_cache_total_bytes
+                        is not None
+                    ):
+                        total = self.model_provider.cli_args.prompt_cache_total_bytes
+                        active = batch_generator.kv_cache_nbytes
+                        self.prompt_cache.trim_to(n_bytes=total - active)
                     continue
 
                 # No batch generator. Load the model and if it's not
@@ -1901,7 +1903,7 @@ def main():
         help="Maximum size in bytes of the KV caches held in the prompt cache",
     )
     parser.add_argument(
-        "--prompt-cache-total-size",
+        "--prompt-cache-total-bytes",
         type=int,
         help="If provided make a best effort to keep the prompt cache and active KV caches lower than this number",
     )
