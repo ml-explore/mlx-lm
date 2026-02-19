@@ -466,6 +466,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.is_trimmable = False
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -558,10 +559,14 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
-        if self.draft_model is None:
-            self.is_batchable = all(
-                hasattr(c, "merge") for c in make_prompt_cache(self.model)
-            )
+        self.is_batchable = self.draft_model is None
+        self.is_trimmable = True
+        for c in make_prompt_cache(self.model):
+            self.is_batchable &= hasattr(c, "merge")
+            self.is_trimmable &= c.is_trimmable(always=True)
+        if self.draft_model is not None:
+            for c in make_prompt_cache(self.draft_model):
+                self.is_trimmable &= c.is_trimmable(always=True)
 
         return self.model, self.tokenizer
 
@@ -732,6 +737,14 @@ class ResponseGenerator:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
 
+        def prompt_finished_callback(prompts):
+            if not self.model_provider.is_trimmable:
+                for uid, prompt_end, lazy_cache in prompts:
+                    cache_key = batch_results[uid]["cache_key"][:-prompt_end]
+                    self.prompt_cache.insert_cache(
+                        current_model_key, cache_key, list(lazy_cache)
+                    )
+
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
             mx.random.seed(seed)
@@ -780,12 +793,26 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
+                    # If the cache is not trimmable then save the cache at the
+                    # end of each prompt processing step to increase reuse.
+                    # Because <think> tokens as well as extra system prompts
+                    # etc can appear after the user message, we actually save
+                    # the cache at the last eos_token.
+                    prompt_end = 1
+                    if not self.model_provider.is_trimmable:
+                        for i in range(-1, -10, -1):
+                            if prompt[i] == tokenizer.eos_token_id:
+                                prompt_end = -i
+
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
+                    logging.info(
+                        f"[LRUPromptCache] We have {len(self.prompt_cache)} kv caches that take {self.prompt_cache.nbytes/1e9:.2f} GB"
+                    )
 
                     (uid,) = batch_generator.insert(
                         [rest],
@@ -793,6 +820,7 @@ class ResponseGenerator:
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
+                        prompt_end=[prompt_end],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -835,6 +863,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
+                        prompt_finished_callback=prompt_finished_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -886,7 +915,9 @@ class ResponseGenerator:
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
                             self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
+                                current_model_key,
+                                result["cache_key"],
+                                r.prompt_cache,
                             )
                             del batch_results[r.uid]
 
