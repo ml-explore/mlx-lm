@@ -49,6 +49,18 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
+def parse_size(x):
+    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    split = 0
+    for xi in x:
+        if not (xi.isdigit() or xi == "."):
+            break
+        split += 1
+    digits = float(x[:split])
+    size = (x[split:]).strip().upper()
+    return int(digits * sizes[size])
+
+
 class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
@@ -787,6 +799,11 @@ class ResponseGenerator:
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
+                    ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
+                    logging.info(
+                        f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB"
+                    )
+
                     (uid,) = batch_generator.insert(
                         [rest],
                         args.max_tokens,
@@ -961,6 +978,9 @@ class ResponseGenerator:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
+            logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1892,7 +1912,7 @@ def main():
     )
     parser.add_argument(
         "--prompt-cache-bytes",
-        type=int,
+        type=parse_size,
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
