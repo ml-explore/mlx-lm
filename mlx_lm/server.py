@@ -1897,10 +1897,10 @@ def main():
         help="Maximum number of distinct KV caches to hold in the prompt cache",
     )
     parser.add_argument(
-        "--prompt-cache-bytes",
+        "--prompt-cache-inactive-bytes",
         type=int,
         default=1 << 63,
-        help="Maximum size in bytes of the KV caches held in the prompt cache",
+        help="Maximum size in bytes of the KV caches held in the prompt cache ie not being actively used",
     )
     parser.add_argument(
         "--prompt-cache-total-bytes",

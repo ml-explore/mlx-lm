@@ -1044,7 +1044,7 @@ class BatchGenerator:
             return caches
 
     @property
-    def kv_cache_nbytes(self):
+    def prompt_cache_nbytes(self):
         total = sum(c.nbytes for p in self.unprocessed_prompts for c in p[3])
         if self.active_batch is not None:
             total += sum(c.nbytes for c in self.active_batch.cache)
