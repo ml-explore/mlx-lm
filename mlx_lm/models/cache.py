@@ -742,16 +742,24 @@ class CacheList(_BaseCache):
 
     @property
     def state(self):
-        return [s for c in self.caches for s in c.state]
+        return [c.state for c in self.caches]
 
     @state.setter
     def state(self, v):
-        state_lens = [len(c.state) for c in self.caches]
-        start = 0
-        for c in self.caches:
-            l = len(c.state)
-            c.state = v[start : start + l]
-            start += l
+        for c, s in zip(self.caches, v):
+            c.state = s
+
+    @property
+    def meta_state(self):
+        return (
+            [type(c).__name__ for c in self.caches],
+            [c.meta_state for c in self.caches],
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        for c, m in zip(self.caches, v[1]):
+            c.meta_state = m
 
     def filter(self, batch_indices):
         """
@@ -792,6 +800,14 @@ class CacheList(_BaseCache):
 
     def empty(self):
         return self.caches[0].empty()
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        obj.caches = [
+            globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
+        ]
+        return obj
 
 
 def dynamic_roll(x, shifts, axis):

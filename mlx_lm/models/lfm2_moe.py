@@ -35,11 +35,14 @@ class ModelArgs(BaseModelArgs):
     norm_eps: float
     conv_bias: bool
     conv_L_cache: int
-    rope_theta: float
+    rope_theta: float = 1000000.0
+    rope_parameters: Optional[dict] = None
     full_attn_idxs: Optional[List[int]] = None
     layer_types: Optional[List[str]] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
+            self.rope_theta = self.rope_parameters["rope_theta"]
         if self.full_attn_idxs is None:
             self.full_attn_idxs = [
                 i

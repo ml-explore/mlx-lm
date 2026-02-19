@@ -161,7 +161,7 @@ class LongcatFlashNgramModel(nn.Module):
 
         h = self.ngram_embeddings(input_ids, cache=cache[0])
 
-        mask = create_attention_mask(h, cache[1][0])
+        mask = create_attention_mask(h, cache[1][0], return_array=True)
 
         for layer, c in zip(self.layers, cache[1:]):
             h = layer(h, mask, cache=c)
