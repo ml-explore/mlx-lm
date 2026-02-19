@@ -803,12 +803,9 @@ class ResponseGenerator:
                     # just making sure we don't leave a reference around
                     del cache
 
-                    if (
-                        self.model_provider.cli_args.prompt_cache_total_bytes
-                        is not None
-                    ):
-                        total = self.model_provider.cli_args.prompt_cache_total_bytes
-                        active = batch_generator.kv_cache_nbytes
+                    if self.model_provider.cli_args.prompt_cache_bytes is not None:
+                        total = self.model_provider.cli_args.prompt_cache_bytes
+                        active = batch_generator.prompt_cache_nbytes
                         self.prompt_cache.trim_to(n_bytes=total - active)
                     continue
 
@@ -1771,10 +1768,7 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(
-        model_provider.cli_args.prompt_cache_size,
-        model_provider.cli_args.prompt_cache_bytes,
-    )
+    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1897,15 +1891,9 @@ def main():
         help="Maximum number of distinct KV caches to hold in the prompt cache",
     )
     parser.add_argument(
-        "--prompt-cache-inactive-bytes",
+        "--prompt-cache-bytes",
         type=int,
-        default=1 << 63,
-        help="Maximum size in bytes of the KV caches held in the prompt cache ie not being actively used",
-    )
-    parser.add_argument(
-        "--prompt-cache-total-bytes",
-        type=int,
-        help="If provided make a best effort to keep the prompt cache and active KV caches lower than this number",
+        help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
         "--pipeline",
