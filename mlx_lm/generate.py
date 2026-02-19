@@ -1043,6 +1043,13 @@ class BatchGenerator:
         if return_prompt_caches:
             return caches
 
+    @property
+    def prompt_cache_nbytes(self):
+        total = sum(c.nbytes for p in self.unprocessed_prompts for c in p[3])
+        if self.active_batch is not None:
+            total += sum(c.nbytes for c in self.active_batch.cache)
+        return total
+
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
 
