@@ -141,7 +141,9 @@ class _BaseCache:
         if v is not None and v:
             raise ValueError("This cache has no meta_state but a meta_state was set.")
 
-    def is_trimmable(self):
+    def is_trimmable(self, always=False):
+        """Return True if the cache can be trimmed. When always is True then
+        only return True if the cache will always be trimmable."""
         return False
 
     def size(self):
@@ -206,7 +208,7 @@ class ConcatenateKVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[-2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, always=False):
         return True
 
     def trim(self, n):
@@ -301,7 +303,7 @@ class QuantizedKVCache(_BaseCache):
     def meta_state(self, v):
         self.offset, self.group_size, self.bits = map(int, v)
 
-    def is_trimmable(self):
+    def is_trimmable(self, always=False):
         return True
 
     def trim(self, n):
@@ -370,7 +372,7 @@ class KVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, always=False):
         return True
 
     def trim(self, n):
@@ -537,8 +539,8 @@ class RotatingKVCache(_BaseCache):
             v,
         )
 
-    def is_trimmable(self):
-        return self.offset < self.max_size
+    def is_trimmable(self, always=False):
+        return not always and self.offset < self.max_size
 
     def trim(self, n):
         n = min(self.offset, n)
@@ -736,7 +738,7 @@ class ChunkedKVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, always=False):
         return True
 
     def trim(self, n):
@@ -769,8 +771,8 @@ class CacheList(_BaseCache):
     def __getitem__(self, idx):
         return self.caches[idx]
 
-    def is_trimmable(self):
-        return all(c.is_trimmable() for c in self.caches)
+    def is_trimmable(self, always=False):
+        return all(c.is_trimmable(always) for c in self.caches)
 
     def trim(self, n):
         for c in self.caches:
@@ -950,7 +952,7 @@ class BatchKVCache(_BaseCache):
         self.keys, self.values, self.offset, self.left_padding = v
         self._idx = self.keys.shape[2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, always=False):
         return True
 
     def trim(self, n):
@@ -1232,8 +1234,8 @@ class BatchRotatingKVCache(_BaseCache):
         )
         self.rotated = bool(v[3])
 
-    def is_trimmable(self):
-        return self._offset < self.max_size
+    def is_trimmable(self, always=False):
+        return not always and self._offset < self.max_size
 
     def trim(self, n):
         n = min(self._offset, n)

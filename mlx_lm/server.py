@@ -478,6 +478,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.is_trimmable = False
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -570,10 +571,14 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
-        if self.draft_model is None:
-            self.is_batchable = all(
-                hasattr(c, "merge") for c in make_prompt_cache(self.model)
-            )
+        self.is_batchable = self.draft_model is None
+        self.is_trimmable = True
+        for c in make_prompt_cache(self.model):
+            self.is_batchable &= hasattr(c, "merge")
+            self.is_trimmable &= c.is_trimmable(always=True)
+        if self.draft_model is not None:
+            for c in make_prompt_cache(self.draft_model):
+                self.is_trimmable &= c.is_trimmable(always=True)
 
         return self.model, self.tokenizer
 
@@ -745,7 +750,7 @@ class ResponseGenerator:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
 
         def prompt_finished_callback(prompts):
-            if tokenizer.has_thinking:
+            if not self.model_provider.is_trimmable:
                 for uid, prompt_end, lazy_cache in prompts:
                     cache_key = batch_results[uid]["cache_key"][:-prompt_end]
                     self.prompt_cache.insert_cache(
@@ -800,14 +805,15 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
-                    # If the model has thinking it may have the <think> token
-                    # in the prompt so we adjust so that the prompt ends before
-                    # the <think> token. We only search in the last 5 tokens
-                    # for speed.
+                    # If the cache is not trimmable then save the cache at the
+                    # end of each prompt processing step to increase reuse.
+                    # Because <think> tokens as well as extra system prompts
+                    # etc can appear after the user message, we actually save
+                    # the cache at the last eos_token.
                     prompt_end = 1
-                    if tokenizer.has_thinking:
-                        for i in range(-1, -6, -1):
-                            if prompt[i] == tokenizer.think_start_id:
+                    if not self.model_provider.is_trimmable:
+                        for i in range(-1, -10, -1):
+                            if prompt[i] == tokenizer.eos_token_id:
                                 prompt_end = -i
 
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -816,6 +822,9 @@ class ResponseGenerator:
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
+                    logging.info(
+                        f"[LRUPromptCache] We have {len(self.prompt_cache)} kv caches that take {self.prompt_cache.nbytes/1e9:.2f} GB"
+                    )
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
@@ -922,12 +931,11 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            if not tokenizer.has_thinking:
-                                self.prompt_cache.insert_cache(
-                                    current_model_key,
-                                    result["cache_key"],
-                                    r.prompt_cache,
-                                )
+                            self.prompt_cache.insert_cache(
+                                current_model_key,
+                                result["cache_key"],
+                                r.prompt_cache,
+                            )
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
@@ -943,10 +951,9 @@ class ResponseGenerator:
                             if uid not in batch_results:
                                 continue
                             result = batch_results[uid]
-                            if not tokenizer.has_thinking:
-                                self.prompt_cache.insert_cache(
-                                    current_model_key, result["cache_key"], prompt_cache
-                                )
+                            self.prompt_cache.insert_cache(
+                                current_model_key, result["cache_key"], prompt_cache
+                            )
                             del batch_results[uid]
 
     def _serve_single(self, request):
