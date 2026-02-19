@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 
@@ -186,6 +187,19 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_invalid_json_raises(self):
+        """Verify parsers raise on invalid JSON so server can catch it."""
+        invalid_inputs = [
+            # Raw regex with invalid escape (model produces literal \d)
+            r'{"name": "grep", "arguments": {"pattern": "\d+"}}',
+            # Completely malformed
+            "not json at all",
+        ]
+        for text in invalid_inputs:
+            with self.subTest(text=text[:40]):
+                with self.assertRaises((json.JSONDecodeError, ValueError)):
+                    json_tools.parse_tool_call(text)
 
 
 if __name__ == "__main__":
