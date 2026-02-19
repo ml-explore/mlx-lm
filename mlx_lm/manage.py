@@ -1,7 +1,8 @@
 import argparse
+import fnmatch
 from typing import List, Union
 
-from huggingface_hub import scan_cache_dir
+from huggingface_hub import list_repo_files, scan_cache_dir
 
 
 def tabulate(rows: List[List[Union[str, int]]], headers: List[str]) -> str:
@@ -46,6 +47,11 @@ def main():
         "--delete",
         action="store_true",
         help="Delete models matching the given pattern.",
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Keep only the latest snapshot per repo, delete older ones.",
     )
     parser.add_argument(
         "--pattern",
@@ -133,6 +139,112 @@ def main():
                 print("\nDeletion cancelled - no changes made.")
         else:
             print(f'No models found matching pattern "{args.pattern}"')
+
+    if args.prune:
+        print(f'Pruning old snapshots for models matching pattern "{args.pattern}"')
+        hf_cache_info = scan_cache_dir()
+
+        all_repos = [
+            repo
+            for repo in sorted(hf_cache_info.repos, key=lambda repo: repo.repo_path)
+            if args.pattern in repo.repo_id
+        ]
+
+        # Find repos with missing files compared to what mlx-lm would download
+        allow_patterns = [
+            "*.json",
+            "model*.safetensors",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ]
+        incomplete_repos = []
+        for repo in all_repos:
+            rev = max(repo.revisions, key=lambda r: r.last_modified)
+            local_files = {
+                str(f.file_path.relative_to(rev.snapshot_path)) for f in rev.files
+            }
+            try:
+                remote_files = list_repo_files(repo.repo_id, revision=rev.commit_hash)
+            except Exception:
+                continue
+            expected = {
+                f
+                for f in remote_files
+                if any(fnmatch.fnmatch(f, p) for p in allow_patterns)
+            }
+            missing = expected - local_files
+            if missing:
+                incomplete_repos.append((repo, missing))
+
+        if incomplete_repos:
+            print("\nFound repos with missing files:")
+            for repo, missing in incomplete_repos:
+                print(f"\n  {repo.repo_id} ({len(missing)} missing):")
+                for f in sorted(missing):
+                    print(f"    - {f}")
+            if ask_for_confirmation("\nDelete these incomplete repos?"):
+                for repo, _ in incomplete_repos:
+                    for revision in repo.revisions:
+                        strategy = hf_cache_info.delete_revisions(revision.commit_hash)
+                        strategy.execute()
+                    print(f"  Deleted {repo.repo_id}")
+                print("\nIncomplete repos deleted.")
+            else:
+                print("\nSkipping incomplete repos.")
+
+        incomplete_repo_ids = {repo.repo_id for repo, _ in incomplete_repos}
+        repos = [
+            repo
+            for repo in all_repos
+            if repo.repo_id not in incomplete_repo_ids and len(repo.revisions) > 1
+        ]
+        if repos:
+            rows = []
+            old_revisions = {}
+            for repo in repos:
+                revisions = sorted(
+                    repo.revisions, key=lambda r: r.last_modified, reverse=True
+                )
+                keep = revisions[0]
+                old = revisions[1:]
+                old_revisions[repo.repo_id] = old
+                rows.append(
+                    [
+                        repo.repo_id,
+                        f"{len(old)}",
+                        keep.commit_hash[:8],
+                    ]
+                )
+            print("\nRepos with old snapshots to prune:")
+            print(
+                tabulate(
+                    rows=rows,
+                    headers=["REPO ID", "OLD SNAPSHOTS", "KEEPING"],
+                )
+            )
+
+            confirmed = ask_for_confirmation(
+                "\nAre you sure you want to delete old snapshots?"
+            )
+            if confirmed:
+                for repo in repos:
+                    for revision in old_revisions[repo.repo_id]:
+                        strategy = hf_cache_info.delete_revisions(revision.commit_hash)
+                        strategy.execute()
+                    print(
+                        f"  Pruned {len(old_revisions[repo.repo_id])} old snapshot(s)"
+                        f" from {repo.repo_id}"
+                    )
+                print("\nPrune complete.")
+            else:
+                print("\nPrune cancelled - no changes made.")
+        if not repos and not incomplete_repos:
+            print(f'Nothing to prune for repos matching "{args.pattern}"')
 
 
 if __name__ == "__main__":
