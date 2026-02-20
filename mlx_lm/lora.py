@@ -69,7 +69,10 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
-    "lr_schedule": None,
+    # name options: "cosine_decay", "linear_schedule", "exponential_decay", or "step_decay"
+    # arguments match positional values for the corresponding mlx scheduler:
+    # See: https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
+    "lr_schedule": {"name": None, "arguments": [], "warmup": 0, "warmup_init": 0.0},
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
     "report_to": None,
@@ -111,7 +114,7 @@ def build_parser():
         type=str,
         choices=["adam", "adamw", "muon", "sgd", "adafactor"],
         default=None,
-        help="Optimizer to use for training: adam, adamw, sgd, or adafactor.",
+        help="Optimizer to use for training: adam, adamw, muon, sgd, or adafactor.",
     )
     parser.add_argument(
         "--mask-prompt",
@@ -131,7 +134,7 @@ def build_parser():
         type=int,
         help="Number of validation batches, -1 uses the entire validation set.",
     )
-    parser.add_argument("--learning-rate", type=float, help="Adam learning rate.")
+    parser.add_argument("--learning-rate", type=float, help="Optimizer learning rate.")
     parser.add_argument(
         "--steps-per-report",
         type=int,
@@ -265,7 +268,17 @@ def train_model(
     )
 
     # Initialize the selected optimizer
-    lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
+    lr = args.learning_rate
+    if args.lr_schedule.get("name", None) or args.lr_schedule.get("warmup", 0) > 0:
+        # See CONFIG_DEFAULTS["lr_schedule"] for the format
+        # and https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
+        # for the available schedulers
+        lr = build_schedule(
+            args.lr_schedule,
+            args.learning_rate,
+            args.iters,
+            args.grad_accumulation_steps,
+        )
 
     optimizer_name = args.optimizer.lower()
     optimizer_config = args.optimizer_config.get(optimizer_name, {})
