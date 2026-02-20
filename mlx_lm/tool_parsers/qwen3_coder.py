@@ -65,14 +65,10 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
     elif param_type in _bool_types:
         return param_value.lower() == "true"
     else:
-        if (
-            param_type in _obj_types
-            or param_type.startswith("dict")
-            or param_type.startswith("list")
-        ):
+        try:
             return json.loads(param_value)
-
-        return ast.literal_eval(param_value)
+        except (json.JSONDecodeError, ValueError):
+            return ast.literal_eval(param_value)
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
