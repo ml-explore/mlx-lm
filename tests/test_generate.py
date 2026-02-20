@@ -8,6 +8,7 @@ import mlx.core as mx
 
 from mlx_lm.generate import (
     BatchGenerator,
+    GenerationCancelled,
     GenerationResponse,
     batch_generate,
     generate,
@@ -27,6 +28,13 @@ class TestGenerate(unittest.TestCase):
         cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
         cls.model.set_dtype(mx.float32)
 
+    def _chat_prompt_tokens(self, content: str) -> List[int]:
+        return self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+
     def test_generate(self):
         # Simple test that generation runs
         text = generate(
@@ -45,6 +53,20 @@ class TestGenerate(unittest.TestCase):
         )
         self.assertEqual(text, "!!!!!")
 
+    def test_generate_propagates_generationcancelled(self):
+        def should_cancel() -> bool:
+            return True
+
+        with self.assertRaises(GenerationCancelled):
+            generate(
+                self.model,
+                self.tokenizer,
+                "hello",
+                max_tokens=5,
+                verbose=False,
+                should_cancel=should_cancel,
+            )
+
     def test_stream_generate_max_tokens(self):
         prompt = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": "Write a story about Einstein"}],
@@ -61,6 +83,87 @@ class TestGenerate(unittest.TestCase):
         ):
             tokens.append(response.token)
         self.assertEqual(len(tokens), 4)
+
+    def test_stream_generate_cancel_immediate(self):
+        prompt = self._chat_prompt_tokens("hello")
+
+        def should_cancel() -> bool:
+            return True
+
+        gen = stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=5,
+            should_cancel=should_cancel,
+        )
+        with self.assertRaises(GenerationCancelled):
+            next(gen)
+
+    def test_stream_generate_cancel_during_prefill(self):
+        prompt = self._chat_prompt_tokens("Please cancel during prefill. " * 16)
+
+        progress: List[tuple[int, int]] = []
+        cancelled = False
+
+        def progress_callback(processed: int, total: int) -> None:
+            nonlocal cancelled
+            progress.append((processed, total))
+            if processed > 0:
+                cancelled = True
+
+        def should_cancel() -> bool:
+            return cancelled
+
+        gen = stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=5,
+            prefill_step_size=4,
+            prompt_progress_callback=progress_callback,
+            should_cancel=should_cancel,
+        )
+        with self.assertRaises(GenerationCancelled):
+            next(gen)
+
+        self.assertGreaterEqual(len(progress), 2)
+        self.assertEqual(progress[0][0], 0)
+        self.assertGreater(progress[0][1], 0)
+        self.assertTrue(any(p > 0 for p, _ in progress))
+
+    def test_stream_generate_cancel_before_first_step(self):
+        prompt = self._chat_prompt_tokens("Please cancel before first-step. " * 16)
+
+        ready = False
+        calls_after_ready = 0
+
+        def progress_callback(processed: int, total: int) -> None:
+            nonlocal ready
+            if processed == total - 1:
+                ready = True
+
+        def should_cancel() -> bool:
+            nonlocal calls_after_ready
+            if not ready:
+                return False
+            calls_after_ready += 1
+            return calls_after_ready >= 2
+
+        gen = stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=5,
+            prefill_step_size=2048,
+            prompt_progress_callback=progress_callback,
+            should_cancel=should_cancel,
+        )
+        with self.assertRaises(GenerationCancelled):
+            next(gen)
+
+        self.assertTrue(ready)
+        self.assertEqual(calls_after_ready, 2)
 
     def test_generate_with_processor(self):
         init_toks = self.tokenizer.encode("hello")
@@ -114,6 +217,142 @@ class TestGenerate(unittest.TestCase):
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
+
+    def test_stream_generate_speculative_cancel_immediate(self):
+        # Use same model as draft model to exercise the speculative path
+        draft_model = self.model
+        sampler = make_sampler(temp=0.0)
+        prompt = self._chat_prompt_tokens("hello")
+
+        def should_cancel() -> bool:
+            return True
+
+        gen = stream_generate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            max_tokens=5,
+            draft_model=draft_model,
+            num_draft_tokens=2,
+            sampler=sampler,
+            should_cancel=should_cancel,
+        )
+        with self.assertRaises(GenerationCancelled):
+            next(gen)
+
+    def test_stream_generate_speculative_cancel_during_prefill(self):
+        draft_model = self.model
+        sampler = make_sampler(temp=0.0)
+        prompt = self._chat_prompt_tokens(
+            "Please cancel during speculative prefill. " * 16
+        )
+
+        progress: List[tuple[int, int]] = []
+        cancelled = False
+
+        def progress_callback(processed: int, total: int) -> None:
+            nonlocal cancelled
+            progress.append((processed, total))
+            if processed > 0:
+                cancelled = True
+
+        def should_cancel() -> bool:
+            return cancelled
+
+        gen = stream_generate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            max_tokens=5,
+            draft_model=draft_model,
+            num_draft_tokens=2,
+            sampler=sampler,
+            prefill_step_size=4,
+            prompt_progress_callback=progress_callback,
+            should_cancel=should_cancel,
+        )
+        with self.assertRaises(GenerationCancelled):
+            next(gen)
+
+        self.assertGreaterEqual(len(progress), 2)
+        self.assertEqual(progress[0][0], 0)
+        self.assertGreater(progress[0][1], 0)
+        self.assertTrue(any(p > 0 for p, _ in progress))
+
+    def test_stream_generate_speculative_cancel_before_first_step(self):
+        draft_model = self.model
+        sampler = make_sampler(temp=0.0)
+        prompt = self._chat_prompt_tokens(
+            "Please cancel before speculative first-step. " * 16
+        )
+
+        ready = False
+        calls_after_ready = 0
+
+        def progress_callback(processed: int, total: int) -> None:
+            nonlocal ready
+            if processed == total - 1:
+                ready = True
+
+        def should_cancel() -> bool:
+            nonlocal calls_after_ready
+            if not ready:
+                return False
+            calls_after_ready += 1
+            return calls_after_ready >= 2
+
+        gen = stream_generate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            max_tokens=5,
+            draft_model=draft_model,
+            num_draft_tokens=2,
+            sampler=sampler,
+            prefill_step_size=2048,
+            prompt_progress_callback=progress_callback,
+            should_cancel=should_cancel,
+        )
+        with self.assertRaises(GenerationCancelled):
+            next(gen)
+
+        self.assertTrue(ready)
+        self.assertEqual(calls_after_ready, 2)
+
+    def test_stream_generate_speculative_prompt_progress_callback(self):
+        draft_model = self.model
+        sampler = make_sampler(temp=0.0)
+        prompt = self._chat_prompt_tokens("Track speculative prompt progress. " * 16)
+
+        progress: List[tuple[int, int]] = []
+
+        def progress_callback(processed: int, total: int) -> None:
+            progress.append((processed, total))
+
+        for _ in stream_generate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            max_tokens=4,
+            draft_model=draft_model,
+            num_draft_tokens=2,
+            sampler=sampler,
+            prefill_step_size=4,
+            prompt_progress_callback=progress_callback,
+        ):
+            pass
+
+        self.assertGreaterEqual(len(progress), 2)
+        first_processed, first_total = progress[0]
+        self.assertEqual(first_processed, 0)
+        self.assertGreater(first_total, 0)
+        self.assertTrue(any(p == t and t > 0 for p, t in progress))
+
+        prev = -1
+        for processed, total in progress:
+            self.assertGreaterEqual(processed, prev)
+            self.assertLessEqual(processed, total)
+            prev = processed
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
