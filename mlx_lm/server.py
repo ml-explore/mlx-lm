@@ -714,6 +714,33 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
+    def _tokenize_for_cache_key(self, tokenizer, request, args):
+        """Tokenize without generation prompt for cache key computation.
+
+        This ensures prompt chaining works correctly by using the message
+        content only (without generation suffix) as the cache key.
+        """
+        if request.request_type == "chat":
+            messages = request.messages
+            tools = request.tools
+
+            if tokenizer.has_chat_template:
+                chat_template_args = self.model_provider.cli_args.chat_template_args
+                if args.chat_template_kwargs:
+                    chat_template_args = chat_template_args.copy()
+                    chat_template_args.update(args.chat_template_kwargs)
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    **chat_template_args,
+                )
+            else:
+                return tokenizer.encode(convert_chat(messages, request.role_mapping))
+        else:
+            return tokenizer.encode(request.prompt)
+
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
             return False
@@ -770,6 +797,9 @@ class ResponseGenerator:
                 ):
                     try:
                         prompt = self._tokenize(current_tokenizer, request, args)
+                        cache_key_prompt = self._tokenize_for_cache_key(
+                            current_tokenizer, request, args
+                        )
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -793,9 +823,15 @@ class ResponseGenerator:
                     rqueue.put(ctx)
 
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
+                        current_model_key, cache_key_prompt
                     )
-                    ctx.prompt_cache_count = len(prompt) - len(rest)
+                    ctx.prompt_cache_count = len(cache_key_prompt) - len(rest)
+
+                    # Include generation suffix in rest for batch processing
+                    gen_suffix_len = len(prompt) - len(cache_key_prompt)
+                    if gen_suffix_len > 0:
+                        rest = list(rest) + list(prompt[-gen_suffix_len:])
+
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
@@ -813,7 +849,7 @@ class ResponseGenerator:
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
-                        "cache_key": prompt[:],
+                        "cache_key": list(cache_key_prompt),
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                     }
@@ -884,7 +920,6 @@ class ResponseGenerator:
 
                     for r in responses:
                         result = batch_results[r.uid]
-                        result["cache_key"].append(r.token)
                         if r.finish_reason != "stop":
                             result["detokenizer"].add_token(r.token)
 
@@ -938,8 +973,11 @@ class ResponseGenerator:
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
 
-            # Prepare the prompt
+            # Prepare the prompt for generation (with generation suffix)
             prompt = self._tokenize(tokenizer, request, args)
+
+            # Prepare the cache key prompt (without generation suffix for prompt chaining)
+            cache_key_prompt = self._tokenize_for_cache_key(tokenizer, request, args)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -968,12 +1006,21 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
-            # Load the KV cache
+            # Load the KV cache using cache_key_prompt (without gen suffix)
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                self.model_provider.model_key, cache_key_prompt
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
-            cache_key = prompt[:]
+            ctx.prompt_cache_count = len(cache_key_prompt) - len(rest)
+
+            # Store cache at cache_key_prompt position for prompt chaining support
+            cache_key = list(cache_key_prompt)
+
+            # Compute the generation suffix (prompt - cache_key_prompt)
+            gen_suffix_len = len(prompt) - len(cache_key_prompt)
+            if gen_suffix_len > 0:
+                # If we have a cache hit, we need to include the gen suffix in the rest
+                rest = list(rest) + list(prompt[-gen_suffix_len:])
+
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
@@ -1006,7 +1053,6 @@ class ResponseGenerator:
                         ),
                     )
                 )
-                cache_key.append(gen.token)
 
                 if ctx._should_stop:
                     if self._is_distributed:
