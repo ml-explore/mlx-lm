@@ -278,30 +278,38 @@ class LRUPromptCache:
         cache_entry = self._get(model, tokens)
         if cache_entry.count == 1:
             if keep_original:
-                # For hybrid models, keep the original cache for prompt chaining
+                # Return the SAME cache object (not a copy) for hybrid models
+                # This allows the cache to be updated in place and shared across positions
                 return self.CacheEntry(
-                    copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
+                    cache_entry.prompt_cache, 1, cache_entry.nbytes
                 )
             self._delete(model, tokens)
             self._lru.remove((model, tokens))
             return cache_entry
 
         cache_entry.count -= 1
+        # Return the SAME cache object (not a copy)
         return self.CacheEntry(
-            copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
+            cache_entry.prompt_cache, 1, cache_entry.nbytes
         )
 
     def fetch_nearest_cache(self, model, tokens):
         result = self._search(model, tokens)
+        requested_len = len(tokens)
+
         if result.exact is not None:
             cache_entry = self._extract(result.model, result.exact)
-            return cache_entry.prompt_cache, []
+            logging.debug(f"[LRUPromptCache] EXACT match: {requested_len} tokens")
+            return cache_entry.prompt_cache, [], result.exact
 
         if result.shorter is not None:
-            # Keep original cache for prompt chaining support
+            # Return the SAME cache object (not a copy) for efficient reuse
+            # Also return the old position so we can move the cache later
             cache_entry = self._extract(result.model, result.shorter, keep_original=True)
             prefix_len = len(result.shorter)
-            return cache_entry.prompt_cache, tokens[prefix_len:]
+            remaining = len(tokens) - prefix_len
+            logging.debug(f"[LRUPromptCache] SHORTER match: {prefix_len} cached, {remaining} to process (requested {requested_len})")
+            return cache_entry.prompt_cache, tokens[prefix_len:], result.shorter
 
         if result.longer is not None:
             cache_entry = self._get(result.model, result.longer)
@@ -310,20 +318,31 @@ class LRUPromptCache:
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                logging.debug(f"[LRUPromptCache] LONGER match: trimmed {num_to_trim} tokens")
+                return cache, tokens[prefix:], None
 
-        return None, tokens
+        logging.debug(f"[LRUPromptCache] NO match for {requested_len} tokens")
+        return None, tokens, None
 
-    def insert_cache(self, model, tokens, prompt_cache, boundary_positions=None):
-        """Insert cache at the full token position and optionally at message boundaries.
+    def insert_cache(self, model, tokens, prompt_cache, boundary_positions=None, old_position=None):
+        """Insert cache at the full token position.
 
         Args:
             model: The model identifier
             tokens: The full token sequence
             prompt_cache: The cache to store
             boundary_positions: Optional list of positions where message boundaries occur
-                               (e.g., after system message, after each user/assistant message)
+            old_position: If provided, delete the cache at this old position (for cache moves)
         """
+        # If we're extending a cache, delete the old position first
+        if old_position is not None and old_position != tokens:
+            self._delete(model, old_position)
+            try:
+                self._lru.remove((model, old_position))
+            except ValueError:
+                pass  # Already not in LRU
+            logging.debug(f"[LRUPromptCache] Moved cache from {len(old_position)} to {len(tokens)}")
+
         if model not in self._cache:
             self._cache[model] = {}
         current = self._cache[model]
@@ -333,13 +352,18 @@ class LRUPromptCache:
             current = current[tok]
 
         if "cache" in current:
-            current["cache"].count += 1
+            # Update existing cache with new state
+            old_bytes = current["cache"].nbytes
+            new_bytes = sum(c.nbytes for c in prompt_cache)
+            current["cache"] = self.CacheEntry(prompt_cache, current["cache"].count + 1, new_bytes)
+            self._n_bytes += (new_bytes - old_bytes)
             self._lru.remove((model, tokens))
+            logging.debug(f"[LRUPromptCache] Updating cache at position {len(tokens)}, bytes: {old_bytes} -> {new_bytes}")
         else:
             cache_bytes = sum(c.nbytes for c in prompt_cache)
             current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes)
             self._n_bytes += cache_bytes
-            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} to the cache")
+            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} bytes at position {len(tokens)}")
 
         self._lru.append((model, tokens))
 
@@ -359,7 +383,12 @@ class LRUPromptCache:
             self._delete(model, tokens)
 
     def _insert_boundary_cache(self, model, tokens, prompt_cache):
-        """Insert a cache at a boundary position (shares the same cache object)."""
+        """Insert a reference to a cache at a boundary position.
+
+        Note: This stores a reference to the SAME cache object. This is intentional
+        for memory efficiency but means all boundary caches share the same state.
+        The boundary cache should only be used as a hint for where to start processing.
+        """
         if model not in self._cache:
             self._cache[model] = {}
         current = self._cache[model]
@@ -368,17 +397,12 @@ class LRUPromptCache:
                 current[tok] = {}
             current = current[tok]
 
-        if "cache" in current:
-            current["cache"].count += 1
-            self._lru.remove((model, tokens))
-        else:
-            # Share the same cache bytes count (the cache object is shared)
-            cache_bytes = sum(c.nbytes for c in prompt_cache)
-            current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes)
-            self._n_bytes += cache_bytes
-            logging.debug(f"[LRUPromptCache] Adding boundary cache at position {len(tokens)}")
-
-        self._lru.append((model, tokens))
+        if "cache" not in current:
+            # Only add if not already present (don't double-count bytes)
+            # Boundary caches share the same object, so we don't add to _n_bytes
+            current["cache"] = self.CacheEntry(prompt_cache, 1, 0)  # 0 bytes to avoid double-counting
+            logging.debug(f"[LRUPromptCache] Adding boundary cache reference at position {len(tokens)}")
+            self._lru.append((model, tokens))
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -933,7 +957,7 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    cache, rest, old_position = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, cache_key_prompt
                     )
                     ctx.prompt_cache_count = len(cache_key_prompt) - len(rest)
@@ -945,6 +969,7 @@ class ResponseGenerator:
 
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
+                        old_position = None
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
@@ -961,6 +986,7 @@ class ResponseGenerator:
                     batch_results[uid] = {
                         "ctx": ctx,
                         "cache_key": list(cache_key_prompt),
+                        "old_position": old_position,
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                     }
@@ -1048,12 +1074,9 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            boundaries = self._find_cache_boundaries(
-                                result["cache_key"], current_tokenizer
-                            )
                             self.prompt_cache.insert_cache(
                                 current_model_key, result["cache_key"], r.prompt_cache,
-                                boundary_positions=boundaries
+                                old_position=result.get("old_position")
                             )
                             del batch_results[r.uid]
 
@@ -1070,12 +1093,9 @@ class ResponseGenerator:
                             if uid not in batch_results:
                                 continue
                             result = batch_results[uid]
-                            boundaries = self._find_cache_boundaries(
-                                result["cache_key"], current_tokenizer
-                            )
                             self.prompt_cache.insert_cache(
                                 current_model_key, result["cache_key"], prompt_cache,
-                                boundary_positions=boundaries
+                                old_position=result.get("old_position")
                             )
                             del batch_results[uid]
 
@@ -1126,7 +1146,8 @@ class ResponseGenerator:
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache using cache_key_prompt (without gen suffix)
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
+            # Returns: cache, remaining tokens, old_position (for cache move)
+            cache, rest, old_position = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, cache_key_prompt
             )
             ctx.prompt_cache_count = len(cache_key_prompt) - len(rest)
@@ -1144,6 +1165,7 @@ class ResponseGenerator:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+                old_position = None  # New cache, no old position to delete
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
             logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
@@ -1180,13 +1202,11 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Find message boundaries for better prompt chaining
-            boundaries = self._find_cache_boundaries(cache_key, tokenizer)
-
-            # Save the KV cache with boundary positions for prompt chaining
+            # Save the KV cache, moving from old position if we had a cache hit
+            # This ensures we only have ONE cache entry per conversation path
             self.prompt_cache.insert_cache(
                 self.model_provider.model_key, cache_key, cache,
-                boundary_positions=boundaries
+                old_position=old_position
             )
 
         except Exception as e:
