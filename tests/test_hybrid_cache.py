@@ -168,9 +168,13 @@ def test_extended_prompt_chaining():
     """Test extended prompt chaining with multiple turns."""
     print("\n=== Test: Extended Prompt Chaining ===")
 
+    # Use unique system prompt to avoid interference from other tests
+    import time
+    unique_id = str(int(time.time() * 1000))
+
     # Build up a conversation
     messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "system", "content": f"You are a helpful assistant. [{unique_id}]"},
     ]
 
     cached_tokens_history = []
@@ -222,9 +226,13 @@ def test_cache_persistence():
     """Test that cache persists across multiple requests (not deleted after use)."""
     print("\n=== Test: Cache Persistence ===")
 
+    # Use unique system prompt to avoid interference from other tests
+    import time
+    unique_id = str(int(time.time() * 1000))
+
     # First request
     messages1 = [
-        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "system", "content": f"You are a helpful assistant. [{unique_id}]"},
         {"role": "user", "content": "My favorite color is blue."}
     ]
     response1 = make_request(messages1, enable_thinking=False)
@@ -271,9 +279,13 @@ def test_cache_invalidation():
     """Test that different conversations don't share cache."""
     print("\n=== Test: Cache Invalidation ===")
 
+    # Use unique system prompts to avoid interference
+    import time
+    unique_id = str(int(time.time() * 1000))
+
     # Conversation A
     messages_a = [
-        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "system", "content": f"You are a helpful assistant. [{unique_id}A]"},
         {"role": "user", "content": "Remember the number 42."}
     ]
     response_a1 = make_request(messages_a, enable_thinking=False)
@@ -283,7 +295,7 @@ def test_cache_invalidation():
 
     # Conversation B (different system prompt)
     messages_b = [
-        {"role": "system", "content": "You are a pirate assistant. Arr!"},
+        {"role": "system", "content": f"You are a pirate assistant. Arr! [{unique_id}B]"},
         {"role": "user", "content": "Remember the number 42."}
     ]
     response_b = make_request(messages_b, enable_thinking=False)
@@ -295,6 +307,129 @@ def test_cache_invalidation():
 
     # Conversation B should not use cache from conversation A (different system prompt)
     assert cached_b == 0, f"Different conversations should not share cache, but cached_tokens={cached_b}"
+
+    print("PASSED")
+    return True
+
+
+def test_conversation_branching():
+    """Test that branching conversations share system prompt cache."""
+    print("\n=== Test: Conversation Branching ===")
+
+    # Use unique system prompt to avoid interference
+    import time
+    unique_id = str(int(time.time() * 1000))
+    system_prompt = f"You are a math bot. Answer briefly. [{unique_id}]"
+
+    # Request 1: Establish first conversation branch
+    messages1 = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "1+1=?"}
+    ]
+    response1 = make_request(messages1, enable_thinking=False)
+    if "error" in response1:
+        print(f"FAILED (request 1): {response1['error']}")
+        return False
+
+    content1 = response1.get("choices", [{}])[0].get("message", {}).get("content", "")
+    cached1 = response1.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    print(f"Request 1 (first): {cached1} cached")
+
+    # Request 2: Different user message, same system (should use system cache)
+    messages2 = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "2+2=?"}
+    ]
+    response2 = make_request(messages2, enable_thinking=False)
+    if "error" in response2:
+        print(f"FAILED (request 2): {response2['error']}")
+        return False
+
+    content2 = response2.get("choices", [{}])[0].get("message", {}).get("content", "")
+    cached2 = response2.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    print(f"Request 2 (branch from system): {cached2} cached")
+
+    # Request 3: Extend first conversation branch
+    messages3 = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "1+1=?"},
+        {"role": "assistant", "content": content1.strip()},
+        {"role": "user", "content": "3+3=?"}
+    ]
+    response3 = make_request(messages3, enable_thinking=False)
+    if "error" in response3:
+        print(f"FAILED (request 3): {response3['error']}")
+        return False
+
+    cached3 = response3.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    print(f"Request 3 (extend branch 1): {cached3} cached")
+
+    # Request 4: Extend second conversation branch
+    messages4 = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "2+2=?"},
+        {"role": "assistant", "content": content2.strip()},
+        {"role": "user", "content": "4+4=?"}
+    ]
+    response4 = make_request(messages4, enable_thinking=False)
+    if "error" in response4:
+        print(f"FAILED (request 4): {response4['error']}")
+        return False
+
+    cached4 = response4.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    print(f"Request 4 (extend branch 2): {cached4} cached")
+
+    # Verify caching behavior
+    assert cached1 == 0, "First request should have 0 cached tokens"
+    assert cached2 > 0, f"Request 2 should use system cache, but cached_tokens={cached2}"
+    assert cached3 > 0, f"Request 3 should use cache, but cached_tokens={cached3}"
+    assert cached4 > 0, f"Request 4 should use cache, but cached_tokens={cached4}"
+
+    print("PASSED")
+    return True
+
+
+def test_cache_survives_multiple_branches():
+    """Test that the system prompt cache survives multiple different branches."""
+    print("\n=== Test: Cache Survives Multiple Branches ===")
+
+    # Use unique system prompt to avoid interference
+    import time
+    unique_id = str(int(time.time() * 1000))
+    system_prompt = f"You are a helpful assistant. Be very brief. [{unique_id}]"
+
+    # Establish system cache
+    messages1 = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "First message"}
+    ]
+    response1 = make_request(messages1, enable_thinking=False)
+    if "error" in response1:
+        print(f"FAILED (request 1): {response1['error']}")
+        return False
+
+    cached1 = response1.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    print(f"Request 1: {cached1} cached")
+
+    # Multiple different branches should all use system cache
+    cached_tokens_list = []
+    for i in range(5):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Different message {i}"}
+        ]
+        response = make_request(messages, enable_thinking=False)
+        if "error" in response:
+            print(f"FAILED (branch {i}): {response['error']}")
+            return False
+
+        cached = response.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        cached_tokens_list.append(cached)
+        print(f"Branch {i}: {cached} cached")
+
+    # All branches should use system cache
+    for i, cached in enumerate(cached_tokens_list):
+        assert cached > 0, f"Branch {i} should use system cache, but cached_tokens={cached}"
 
     print("PASSED")
     return True
@@ -320,6 +455,8 @@ def run_tests():
         results["extended_prompt_chaining"] = test_extended_prompt_chaining()
         results["cache_persistence"] = test_cache_persistence()
         results["cache_invalidation"] = test_cache_invalidation()
+        results["conversation_branching"] = test_conversation_branching()
+        results["cache_survives_multiple_branches"] = test_cache_survives_multiple_branches()
 
         # Summary
         print("\n" + "=" * 60)
