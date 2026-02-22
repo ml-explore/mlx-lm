@@ -218,6 +218,55 @@ def test_extended_prompt_chaining():
     return True
 
 
+def test_cache_persistence():
+    """Test that cache persists across multiple requests (not deleted after use)."""
+    print("\n=== Test: Cache Persistence ===")
+
+    # First request
+    messages1 = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "My favorite color is blue."}
+    ]
+    response1 = make_request(messages1, enable_thinking=False)
+    if "error" in response1:
+        print(f"FAILED (request 1): {response1['error']}")
+        return False
+    content1 = response1.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    # Second request (should use cache from first)
+    messages2 = messages1 + [
+        {"role": "assistant", "content": content1.split('.')[0] + "."},
+        {"role": "user", "content": "What is my favorite color?"}
+    ]
+    response2 = make_request(messages2, enable_thinking=False)
+    if "error" in response2:
+        print(f"FAILED (request 2): {response2['error']}")
+        return False
+    cached2 = response2.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+
+    # Third request (should STILL use cache from first - this is the key test)
+    messages3 = messages1 + [
+        {"role": "assistant", "content": content1.split('.')[0] + "."},
+        {"role": "user", "content": "Do you remember my favorite color?"}
+    ]
+    response3 = make_request(messages3, enable_thinking=False)
+    if "error" in response3:
+        print(f"FAILED (request 3): {response3['error']}")
+        return False
+    cached3 = response3.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+
+    print(f"Request 2 cached: {cached2}")
+    print(f"Request 3 cached: {cached3}")
+
+    # Both request 2 and 3 should use cache (cache should not be deleted after use)
+    assert cached2 > 0, f"Request 2 should use cache, but cached_tokens={cached2}"
+    assert cached3 > 0, f"Request 3 should use cache (cache persistence), but cached_tokens={cached3}"
+    assert cached3 == cached2, f"Request 3 should use same cache as request 2 (same prefix)"
+
+    print("PASSED")
+    return True
+
+
 def test_cache_invalidation():
     """Test that different conversations don't share cache."""
     print("\n=== Test: Cache Invalidation ===")
@@ -269,6 +318,7 @@ def run_tests():
         results["basic_generation"] = test_basic_generation()
         results["prompt_chaining"] = test_prompt_chaining()
         results["extended_prompt_chaining"] = test_extended_prompt_chaining()
+        results["cache_persistence"] = test_cache_persistence()
         results["cache_invalidation"] = test_cache_invalidation()
 
         # Summary

@@ -274,9 +274,14 @@ class LRUPromptCache:
 
         logging.debug(f"[LRUPromptCache] Removed {cache_bytes} bytes from the cache")
 
-    def _extract(self, model, tokens):
+    def _extract(self, model, tokens, keep_original=False):
         cache_entry = self._get(model, tokens)
         if cache_entry.count == 1:
+            if keep_original:
+                # For hybrid models, keep the original cache for prompt chaining
+                return self.CacheEntry(
+                    copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
+                )
             self._delete(model, tokens)
             self._lru.remove((model, tokens))
             return cache_entry
@@ -293,7 +298,8 @@ class LRUPromptCache:
             return cache_entry.prompt_cache, []
 
         if result.shorter is not None:
-            cache_entry = self._extract(result.model, result.shorter)
+            # Keep original cache for prompt chaining support
+            cache_entry = self._extract(result.model, result.shorter, keep_original=True)
             prefix_len = len(result.shorter)
             return cache_entry.prompt_cache, tokens[prefix_len:]
 
