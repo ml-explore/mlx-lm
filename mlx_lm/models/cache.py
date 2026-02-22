@@ -676,7 +676,7 @@ class ArraysCache(_BaseCache):
 
     @property
     def nbytes(self):
-        return sum(c.nbytes for c in self.cache)
+        return sum(c.nbytes for c in self.cache if c is not None)
 
 
 class ChunkedKVCache(_BaseCache):
