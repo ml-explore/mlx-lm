@@ -8,7 +8,6 @@ import json
 import os
 import resource
 import shutil
-import sys
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -21,10 +20,8 @@ from typing import (
     Tuple,
     Type,
     Union,
+    overload,
 )
-
-if sys.version_info >= (3, 11):
-    from typing import overload
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -443,52 +440,52 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
     )
 
 
-if sys.version_info >= (3, 11):
+@overload
+def load(
+    path_or_hf_repo: str,
+    return_config: Literal[False] = False,
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    revision: Optional[str] = ...,
+) -> Tuple[nn.Module, TokenizerWrapper]: ...
 
-    @overload
-    def load(
-        path_or_hf_repo: str,
-        tokenizer_config: Optional[Dict[str, Any]],
-        model_config: Optional[Dict[str, Any]],
-        adapter_path: Optional[str],
-        lazy: bool,
-        revision: Optional[str],
-        return_config: Literal[False] = False,
-    ) -> Tuple[nn.Module, TokenizerWrapper]: ...
 
-    @overload
-    def load(
-        path_or_hf_repo: str,
-        tokenizer_config: Optional[Dict[str, Any]],
-        model_config: Optional[Dict[str, Any]],
-        adapter_path: Optional[str],
-        lazy: bool,
-        revision: Optional[str],
-        return_config: Literal[True],
-    ) -> Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]: ...
+@overload
+def load(
+    path_or_hf_repo: str,
+    return_config: Literal[True],
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    revision: Optional[str] = ...,
+) -> Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]: ...
 
-    @overload
-    def load(
-        path_or_hf_repo: str,
-        tokenizer_config: Optional[Dict[str, Any]],
-        model_config: Optional[Dict[str, Any]],
-        adapter_path: Optional[str],
-        lazy: bool,
-        revision: Optional[str],
-        return_config: bool,
-    ) -> Union[
-        Tuple[nn.Module, TokenizerWrapper],
-        Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
-    ]: ...
+
+@overload
+def load(
+    path_or_hf_repo: str,
+    return_config: bool = ...,
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    revision: Optional[str] = ...,
+) -> Union[
+    Tuple[nn.Module, TokenizerWrapper],
+    Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
+]: ...
 
 
 def load(
     path_or_hf_repo: str,
+    return_config: bool = False,
     tokenizer_config: Optional[Dict[str, Any]] = None,
     model_config: Optional[Dict[str, Any]] = None,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
-    return_config: bool = False,
     revision: Optional[str] = None,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
