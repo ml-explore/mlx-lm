@@ -451,7 +451,7 @@ def generate_step(
     mx.async_eval(y, logprobs)
     n = 0
     while True:
-        if n != max_tokens:
+        if n + 1 < max_tokens:
             next_y, next_logprobs = _step(y)
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
