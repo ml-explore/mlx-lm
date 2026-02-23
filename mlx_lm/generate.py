@@ -1228,7 +1228,7 @@ class BatchGenerator:
             batch.tokens,
         )
 
-        mx.async_eval(batch.y, batch.logprobs)
+        mx.async_eval(batch.y, batch.logprobs, batch.tokens)
 
         y = y.tolist()
         toc = time.perf_counter()
