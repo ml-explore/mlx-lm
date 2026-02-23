@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import re
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -81,13 +82,86 @@ QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
+FLOAT_DTYPES = {
+    "float16": mx.float16,
+    "bfloat16": mx.bfloat16,
+    "float32": mx.float32,
+}
+
+QUANT_MODES = {
+    "mxfp4": {"group_size": 32, "bits": 4, "mode": "mxfp4"},
+    "nvfp4": {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+    "mxfp8": {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+}
+
+
+def parse_overrides(overrides: list[str]) -> list[tuple[re.Pattern, Union[int, str]]]:
+    parsed = []
+    for entry in overrides:
+        if "=" not in entry:
+            raise ValueError(
+                f"Invalid override '{entry}'. Expected PATTERN=VALUE"
+            )
+        pattern, value = entry.split("=", 1)
+        try:
+            compiled = re.compile(pattern)
+        except re.error as e:
+            raise ValueError(f"Invalid regex in override '{pattern}': {e}")
+        if value in FLOAT_DTYPES or value in QUANT_MODES:
+            parsed.append((compiled, value))
+        else:
+            try:
+                parsed.append((compiled, int(value)))
+            except ValueError:
+                valid = list(FLOAT_DTYPES) + list(QUANT_MODES)
+                raise ValueError(
+                    f"Invalid override value '{value}'. "
+                    f"Expected an integer (bit width) or one of {valid}"
+                )
+    return parsed
+
+
+def build_override_predicate(overrides, base_predicate, group_size):
+    def predicate(path, module):
+        for regex, value in overrides:
+            if regex.search(path):
+                if value in QUANT_MODES:
+                    return dict(QUANT_MODES[value])
+                if isinstance(value, str):
+                    return False
+                return {"group_size": group_size, "bits": value, "mode": "affine"}
+        if base_predicate is not None:
+            return base_predicate(path, module)
+        return True
+
+    return predicate
+
+
+def apply_float_overrides(model, overrides):
+    float_overrides = [(r, FLOAT_DTYPES[v]) for r, v in overrides if v in FLOAT_DTYPES]
+    if not float_overrides:
+        return
+
+    def maybe_cast(path, value):
+        # Only cast weights; biases are small and typically not quantized
+        if not path.endswith(".weight"):
+            return value
+        if not mx.issubdtype(value.dtype, mx.floating):
+            return value
+        for regex, target_dtype in float_overrides:
+            if regex.search(path):
+                return value.astype(target_dtype)
+        return value
+
+    model.update(tree_map_with_path(maybe_cast, model.parameters()))
+
 
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
     quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
+    q_group_size: Optional[int] = None,
+    q_bits: Optional[int] = None,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
@@ -97,6 +171,7 @@ def convert(
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
     trust_remote_code: bool = False,
+    q_overrides: Optional[list[str]] = None,
 ):
     # Check the save path is empty
     if isinstance(mlx_path, str):
@@ -107,6 +182,17 @@ def convert(
             f"Cannot save to the path {mlx_path} as it already exists."
             " Please delete the file/directory or specify a new path to save to."
         )
+
+    # Resolve mode-aware defaults before building predicates
+    mode_defaults = {
+        "affine": (64, 4),
+        "mxfp4": (32, 4),
+        "nvfp4": (16, 4),
+        "mxfp8": (32, 8),
+    }
+    default_gs, default_bits = mode_defaults[q_mode]
+    q_group_size = q_group_size or default_gs
+    q_bits = q_bits or default_bits
 
     print("[INFO] Loading")
     model, tokenizer, config = load(
@@ -124,6 +210,14 @@ def convert(
             quant_predicate,
             model,
             q_group_size,
+        )
+
+    parsed_overrides = None
+    if q_overrides:
+        parsed_overrides = parse_overrides(q_overrides)
+        apply_float_overrides(model, parsed_overrides)
+        quant_predicate = build_override_predicate(
+            parsed_overrides, quant_predicate, q_group_size
         )
 
     if dtype is None:
@@ -223,6 +317,19 @@ def configure_parser() -> argparse.ArgumentParser:
         choices=QUANT_RECIPES,
         type=str,
         required=False,
+    )
+    parser.add_argument(
+        "--q-override",
+        help=(
+            "Per-layer quantization override as PATTERN=VALUE (repeatable). "
+            "PATTERN is a regex matched against the module path. "
+            "VALUE is a bit width (int), dtype (float16, bfloat16, float32), "
+            "or quant mode (mxfp4, nvfp4, mxfp8)."
+        ),
+        action="append",
+        default=None,
+        dest="q_overrides",
+        metavar="PATTERN=VALUE",
     )
     parser.add_argument(
         "--dtype",
