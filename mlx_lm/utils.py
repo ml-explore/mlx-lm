@@ -443,11 +443,11 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
 @overload
 def load(
     path_or_hf_repo: str,
-    return_config: Literal[False] = False,
     tokenizer_config: Optional[Dict[str, Any]] = ...,
     model_config: Optional[Dict[str, Any]] = ...,
     adapter_path: Optional[str] = ...,
     lazy: bool = ...,
+    return_config: Literal[False] = False,
     revision: Optional[str] = ...,
 ) -> Tuple[nn.Module, TokenizerWrapper]: ...
 
@@ -455,11 +455,11 @@ def load(
 @overload
 def load(
     path_or_hf_repo: str,
-    return_config: Literal[True],
     tokenizer_config: Optional[Dict[str, Any]] = ...,
     model_config: Optional[Dict[str, Any]] = ...,
     adapter_path: Optional[str] = ...,
     lazy: bool = ...,
+    return_config: Literal[True] = True,
     revision: Optional[str] = ...,
 ) -> Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]: ...
 
@@ -467,11 +467,11 @@ def load(
 @overload
 def load(
     path_or_hf_repo: str,
-    return_config: bool = ...,
     tokenizer_config: Optional[Dict[str, Any]] = ...,
     model_config: Optional[Dict[str, Any]] = ...,
     adapter_path: Optional[str] = ...,
     lazy: bool = ...,
+    return_config: bool = ...,
     revision: Optional[str] = ...,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
@@ -481,11 +481,11 @@ def load(
 
 def load(
     path_or_hf_repo: str,
-    return_config: bool = False,
     tokenizer_config: Optional[Dict[str, Any]] = None,
     model_config: Optional[Dict[str, Any]] = None,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
+    return_config: bool = False,
     revision: Optional[str] = None,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
