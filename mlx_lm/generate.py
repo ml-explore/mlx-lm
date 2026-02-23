@@ -1081,6 +1081,7 @@ class BatchGenerator:
                         for uid, length in zip(uids, lengths)
                     ]
                 )
+                mx.clear_cache()
 
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
