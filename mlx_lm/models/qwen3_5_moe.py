@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-from mlx.utils import tree_flatten, tree_unflatten
-
 from .base import BaseModelArgs
 from .qwen3_5 import Model as Qwen3_5Model
 
@@ -23,12 +21,9 @@ class ModelArgs(BaseModelArgs):
 class Model(Qwen3_5Model):
 
     def sanitize(self, weights):
-        weights = tree_unflatten(list(weights.items()))
-        weights = dict(tree_flatten(weights))
-
         new_weights = {}
         for key, value in weights.items():
-            if key.startswith("model.visual"):
+            if key.startswith("vision_tower") or key.startswith("model.visual"):
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")

@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
 
 from .base import (
     BaseModelArgs,
@@ -364,11 +363,10 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
-        weights = tree_unflatten(list(weights.items()))
-        weights = dict(tree_flatten(weights))
-
         sanitized = {}
         for key, value in weights.items():
+            if key.startswith("vision_tower") or key.startswith("model.visual"):
+                continue
             if key.startswith("model.visual"):
                 continue
             if key.startswith("model.language_model"):
