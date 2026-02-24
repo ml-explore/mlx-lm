@@ -965,6 +965,7 @@ class BatchGenerator:
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
+        self._next_count = 0
         self.max_kv_size = max_kv_size
 
         self.active_batch = None
@@ -1266,6 +1267,9 @@ class BatchGenerator:
             else:
                 self.active_batch = None
 
+        self._next_count += 1
+        if self._next_count % 512 == 0:
+            mx.clear_cache()
         self._stats.generation_tokens += len(responses)
         return responses
 
