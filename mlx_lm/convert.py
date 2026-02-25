@@ -4,16 +4,16 @@ import argparse
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map_with_path
 
 from .utils import (
+    cast_model_dtype,
     dequantize_model,
     load,
     quantize_model,
     save,
     upload_to_hub,
+    MODEL_CONVERSION_DTYPES,
 )
 
 
@@ -79,8 +79,6 @@ def mixed_quant_predicate_builder(
 
 QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
 
-MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
-
 
 def convert(
     hf_path: str,
@@ -126,22 +124,7 @@ def convert(
             q_group_size,
         )
 
-    if dtype is None:
-        dtype = config.get("torch_dtype", None)
-    if dtype is None and (text_config := config.get("text_config", None)):
-        dtype = text_config.get("dtype", None)
-    if dtype in MODEL_CONVERSION_DTYPES:
-        print("[INFO] Using dtype:", dtype)
-        dtype = getattr(mx, dtype)
-        cast_predicate = getattr(model, "cast_predicate", lambda _: True)
-
-        def set_dtype(k, v):
-            if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
-                return v.astype(dtype)
-            else:
-                return v
-
-        model.update(tree_map_with_path(set_dtype, model.parameters()))
+    cast_model_dtype(model, config)
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
