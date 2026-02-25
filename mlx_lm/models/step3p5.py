@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -60,6 +60,7 @@ class ModelArgs(BaseModelArgs):
     norm_expert_weight: bool = True
     swiglu_limits: Optional[List[float]] = None
     swiglu_limits_shared: Optional[List[float]] = None
+    num_nextn_predict_layers: int = 0
     tie_word_embeddings: bool = False
 
 
@@ -339,16 +340,17 @@ class Step3p5Model(nn.Module):
         self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
         self._swa_idx = next(
-            (i for i, l in enumerate(self.layers) if l.is_sliding), None
+            (i for i, layer in enumerate(self.layers) if layer.is_sliding), None
         )
         self._full_idx = next(
-            (i for i, l in enumerate(self.layers) if not l.is_sliding), None
+            (i for i, layer in enumerate(self.layers) if not layer.is_sliding), None
         )
 
     def __call__(
         self,
         x: mx.array,
         cache: Optional[List[Any]] = None,
+        return_prenorm: bool = False,
     ) -> mx.array:
         h = self.embed_tokens(x)
 
@@ -370,7 +372,90 @@ class Step3p5Model(nn.Module):
             mask = swa_mask if layer.is_sliding else full_mask
             h = layer(h, mask=mask, cache=c)
 
+        if return_prenorm:
+            return self.norm(h), h
         return self.norm(h)
+
+
+class Step3p5SharedHead(nn.Module):
+    """Per-MTP-layer prediction head with norm and output projection."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.output = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.output(self.norm(x))
+
+
+class Step3p5MTPLayer(nn.Module):
+    """Single MTP prediction layer.
+
+    Architecture:
+      1. Normalize hidden_states (hnorm) and token embedding (enorm)
+      2. Concatenate and project: [B, L, 2H] -> [B, L, H] via eh_proj
+      3. Decoder block: sliding attention + dense MLP
+      4. Per-layer shared_head for logit prediction
+    """
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.hnorm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.enorm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.eh_proj = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+
+        # MTP uses sliding_attention — pick first sliding layer_idx for RoPE config
+        mtp_layer_idx = 1
+        layer_types = args.layer_types or []
+        for idx, lt in enumerate(layer_types):
+            if lt == "sliding_attention":
+                mtp_layer_idx = idx
+                break
+
+        self.self_attn = Step3p5Attention(args, layer_idx=mtp_layer_idx)
+        self.mlp = Step3p5MLP(
+            args, intermediate_size=args.intermediate_size, swiglu_limit=0
+        )
+        self.input_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_attention_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.shared_head = Step3p5SharedHead(args)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        input_embeds: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> Tuple[mx.array, mx.array]:
+        h = self.hnorm(hidden_states)
+        e = self.enorm(input_embeds)
+        x = self.eh_proj(mx.concatenate([e, h], axis=-1))
+
+        residual = x
+        x = self.input_layernorm(x)
+        x = self.self_attn(x, mask=mask, cache=cache) + residual
+
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x) + residual
+
+        logits = self.shared_head(x)
+        return x, logits
+
+
+class Step3p5MTP(nn.Module):
+    """MTP module with multiple prediction layers."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.layers = [
+            Step3p5MTPLayer(args) for _ in range(args.num_nextn_predict_layers)
+        ]
 
 
 class Model(nn.Module):
@@ -381,13 +466,30 @@ class Model(nn.Module):
         self.model = Step3p5Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+        self._mtp_num_layers = args.num_nextn_predict_layers
+        if self._mtp_num_layers > 0:
+            self.mtp = Step3p5MTP(args)
+        else:
+            self.mtp = None
+
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[List[Any]] = None,
+        return_hidden: bool = False,
     ):
-        out = self.model(inputs, cache)
-        return self.lm_head(out)
+        if return_hidden:
+            hidden_states, prenorm_hidden = self.model(
+                inputs, cache, return_prenorm=True
+            )
+        else:
+            hidden_states = self.model(inputs, cache)
+
+        out = self.lm_head(hidden_states)
+
+        if return_hidden:
+            return out, prenorm_hidden
+        return out
 
     @property
     def layers(self):
@@ -396,7 +498,41 @@ class Model(nn.Module):
     def make_cache(self):
         return [KVCache() for _ in self.layers]
 
+    def mtp_forward(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        mtp_cache: Optional[Any] = None,
+    ) -> mx.array:
+        """Run MTP head to predict token n+2 given hidden states and token n+1.
+
+        Args:
+            hidden_states: [B, 1, H] prenorm hidden states from main model
+            next_token_ids: [B, 1] token IDs for position n+1
+            mtp_cache: list of KVCache for MTP layers
+
+        Returns:
+            logits: [B, 1, V] logits for token n+2
+        """
+        if self.mtp is None:
+            raise RuntimeError("MTP head not loaded (num_nextn_predict_layers=0)")
+
+        input_embeds = self.model.embed_tokens(next_token_ids)
+
+        layer = self.mtp.layers[0]
+        cache_entry = mtp_cache[0] if mtp_cache else None
+        mask = create_attention_mask(input_embeds, cache_entry)
+        _, logits = layer(hidden_states, input_embeds, mask=mask, cache=cache_entry)
+        return logits
+
+    def make_mtp_cache(self):
+        if self.mtp is None:
+            return None
+        return [KVCache() for _ in self.mtp.layers]
+
     def sanitize(self, weights):
+        has_mtp_weights = any(k.startswith("mtp.") for k in weights)
+
         remappings = [
             (".moe.gate_proj.", ".mlp.switch_mlp.gate_proj."),
             (".moe.up_proj.", ".mlp.switch_mlp.up_proj."),
@@ -412,7 +548,8 @@ class Model(nn.Module):
 
         new_weights = {}
         for k, v in weights.items():
-            if ".mtp" in k:
+            # Filter MTP weights if no MTP head or no MTP weights
+            if "mtp" in k and (not has_mtp_weights or self._mtp_num_layers == 0):
                 continue
             if "model.layers." in k:
                 parts = k.split(".")
@@ -444,6 +581,20 @@ class Model(nn.Module):
         def predicate(path, _):
             if "mlp.gate.gate" in path:
                 return {"group_size": 64, "bits": 8}
+            if "mtp." in path and any(
+                x in path
+                for x in [
+                    ".eh_proj.",
+                    ".enorm.",
+                    ".hnorm.",
+                    ".shared_head.norm.",
+                    ".input_layernorm.",
+                    ".post_attention_layernorm.",
+                    ".q_norm.",
+                    ".k_norm.",
+                ]
+            ):
+                return False
             return True
 
         return predicate
