@@ -35,7 +35,13 @@ else:
 # For large models with lots of files
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
-from mlx.utils import tree_flatten, tree_map, tree_map_with_path, tree_reduce, tree_unflatten
+from mlx.utils import (
+    tree_flatten,
+    tree_map,
+    tree_map_with_path,
+    tree_reduce,
+    tree_unflatten,
+)
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper
@@ -779,6 +785,7 @@ def cast_model_dtype(
                 return v
 
         model.update(tree_map_with_path(set_dtype, model.parameters()))
+
 
 def quantize_model(
     model: nn.Module,

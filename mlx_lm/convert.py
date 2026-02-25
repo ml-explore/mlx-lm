@@ -7,13 +7,13 @@ from typing import Callable, Optional, Union
 import mlx.nn as nn
 
 from .utils import (
+    MODEL_CONVERSION_DTYPES,
     cast_model_dtype,
     dequantize_model,
     load,
     quantize_model,
     save,
     upload_to_hub,
-    MODEL_CONVERSION_DTYPES,
 )
 
 
