@@ -217,31 +217,37 @@ class LRUPromptCache:
     def _find_checkpoint_positions(self, tokens_len, boundary_positions=None):
         """Find positions where we should create checkpoint snapshots.
 
-        Creates checkpoints at message boundaries that fall near checkpoint_interval
-        boundaries (e.g., around 8k tokens). This ensures we snapshot at natural
-        conversation break points without creating too many snapshots.
+        Always creates a checkpoint at the last message boundary so the next
+        turn can resume from it.  For long contexts, also creates periodic
+        checkpoints at ~checkpoint_interval spacing aligned to message
+        boundaries.
 
         Returns list of positions (not including 0 or tokens_len).
         """
-        positions = set()
-
         if not boundary_positions:
             return []
 
-        # Find message boundaries near checkpoint intervals
-        # For each 8k interval, find the closest message boundary
-        last_checkpoint = 0
-        for interval_start in range(self.checkpoint_interval, tokens_len, self.checkpoint_interval):
-            # Find message boundaries within this interval
-            candidates = [p for p in boundary_positions
-                         if last_checkpoint < p < tokens_len and p <= interval_start + self.checkpoint_interval // 2]
+        valid = [p for p in boundary_positions if 0 < p < tokens_len]
+        if not valid:
+            return []
 
-            if candidates:
-                # Pick the last boundary in this range (most complete message)
-                best = max(candidates)
-                if best > last_checkpoint:
-                    positions.add(best)
-                    last_checkpoint = best
+        positions = set()
+
+        # Always checkpoint at the last message boundary — this is the state
+        # the next turn will need to resume from.
+        positions.add(valid[-1])
+
+        # For long contexts, add periodic checkpoints for branching reuse.
+        if tokens_len > self.checkpoint_interval:
+            last_checkpoint = 0
+            for interval_start in range(self.checkpoint_interval, tokens_len, self.checkpoint_interval):
+                candidates = [p for p in valid
+                             if last_checkpoint < p < tokens_len and p <= interval_start + self.checkpoint_interval // 2]
+                if candidates:
+                    best = max(candidates)
+                    if best > last_checkpoint:
+                        positions.add(best)
+                        last_checkpoint = best
 
         return sorted(positions)
 
@@ -453,11 +459,18 @@ class LRUPromptCache:
         # Deep copy the cache
         snapshot = copy.deepcopy(prompt_cache)
 
-        # Trim KVCache layers to the checkpoint position
-        # This works for trimmable caches (KVCache), non-trimmable caches (ArraysCache) stay as-is
+        # Trim trimmable layers to the checkpoint position.
+        # For hybrid models, can_trim_prompt_cache() returns False because
+        # ArraysCache isn't trimmable — but KVCache layers still should be
+        # trimmed so the snapshot has clean KV state at the boundary.
         tokens_to_trim = len(tokens) - position
-        if tokens_to_trim > 0 and can_trim_prompt_cache(snapshot):
-            trim_prompt_cache(snapshot, tokens_to_trim)
+        if tokens_to_trim > 0:
+            if can_trim_prompt_cache(snapshot):
+                trim_prompt_cache(snapshot, tokens_to_trim)
+            else:
+                for c in snapshot:
+                    if c.is_trimmable():
+                        c.trim(tokens_to_trim)
 
         snapshot_bytes = sum(c.nbytes for c in snapshot)
         current["cache"] = self.CacheEntry(snapshot, 1, snapshot_bytes, is_snapshot=True)
@@ -901,8 +914,10 @@ class ResponseGenerator:
 
         boundaries = []
 
-        # Tokenize progressively to find message boundary positions
-        for i in range(1, len(messages)):
+        # Tokenize progressively to find message boundary positions.
+        # Include all messages (range through len) so single-message
+        # conversations get a boundary that the next turn can resume from.
+        for i in range(1, len(messages) + 1):
             try:
                 partial_tokens = tokenizer.apply_chat_template(
                     messages[:i],
