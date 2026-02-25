@@ -35,7 +35,13 @@ else:
 # For large models with lots of files
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
-from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+from mlx.utils import (
+    tree_flatten,
+    tree_map,
+    tree_map_with_path,
+    tree_reduce,
+    tree_unflatten,
+)
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper
@@ -55,6 +61,8 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
+
+MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 
 def _unpack_awq_weights(qweight: mx.array) -> mx.array:
@@ -401,6 +409,7 @@ def load_model(
 
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
+    cast_model_dtype(model, config)
 
     if not lazy:
         mx.eval(model.parameters())
@@ -755,6 +764,27 @@ def save_model(
             f,
             indent=4,
         )
+
+
+def cast_model_dtype(
+    model: nn.Module,
+    config: dict,
+):
+    dtype = config.get("torch_dtype", None)
+    if dtype is None and (text_config := config.get("text_config", None)):
+        dtype = text_config.get("dtype", None)
+    if dtype in MODEL_CONVERSION_DTYPES:
+        print("[INFO] Using dtype:", dtype)
+        dtype = getattr(mx, dtype)
+        cast_predicate = getattr(model, "cast_predicate", lambda _: True)
+
+        def set_dtype(k, v):
+            if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
+                return v.astype(dtype)
+            else:
+                return v
+
+        model.update(tree_map_with_path(set_dtype, model.parameters()))
 
 
 def quantize_model(
