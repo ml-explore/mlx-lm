@@ -189,6 +189,7 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         count: int
         nbytes: int
+        is_snapshot: bool = False  # True if this is a snapshot copy
 
     @dataclass
     class SearchResult:
@@ -198,9 +199,10 @@ class LRUPromptCache:
         longer: List[int]
         common_prefix: int
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63, checkpoint_interval: int = 8192):
         self.max_size = max_size
         self.max_bytes = max_bytes
+        self.checkpoint_interval = checkpoint_interval
         self._cache = {}
         self._lru = deque()
         self._n_bytes = 0
@@ -211,6 +213,37 @@ class LRUPromptCache:
     @property
     def nbytes(self):
         return self._n_bytes
+
+    def _find_checkpoint_positions(self, tokens_len, boundary_positions=None):
+        """Find positions where we should create checkpoint snapshots.
+
+        Creates checkpoints at message boundaries that fall near checkpoint_interval
+        boundaries (e.g., around 8k tokens). This ensures we snapshot at natural
+        conversation break points without creating too many snapshots.
+
+        Returns list of positions (not including 0 or tokens_len).
+        """
+        positions = set()
+
+        if not boundary_positions:
+            return []
+
+        # Find message boundaries near checkpoint intervals
+        # For each 8k interval, find the closest message boundary
+        last_checkpoint = 0
+        for interval_start in range(self.checkpoint_interval, tokens_len, self.checkpoint_interval):
+            # Find message boundaries within this interval
+            candidates = [p for p in boundary_positions
+                         if last_checkpoint < p < tokens_len and p <= interval_start + self.checkpoint_interval // 2]
+
+            if candidates:
+                # Pick the last boundary in this range (most complete message)
+                best = max(candidates)
+                if best > last_checkpoint:
+                    positions.add(best)
+                    last_checkpoint = best
+
+        return sorted(positions)
 
     def _search(self, model, tokens):
         """Search the cache for a prompt cache. Return exact or close match."""
@@ -274,28 +307,56 @@ class LRUPromptCache:
 
         logging.debug(f"[LRUPromptCache] Removed {cache_bytes} bytes from the cache")
 
-    def _extract(self, model, tokens):
+    def _extract(self, model, tokens, keep_original=False):
         cache_entry = self._get(model, tokens)
+        is_snapshot = cache_entry.is_snapshot
+
+        # For snapshots, always extract (they are already copies)
+        # For non-snapshots with count=1, extract or keep based on keep_original
         if cache_entry.count == 1:
+            if keep_original and not is_snapshot:
+                # Return the SAME cache object (not a copy) for hybrid models
+                # This allows the cache to be updated in place and shared across positions
+                return self.CacheEntry(
+                    cache_entry.prompt_cache, 1, cache_entry.nbytes
+                )
             self._delete(model, tokens)
             self._lru.remove((model, tokens))
             return cache_entry
 
         cache_entry.count -= 1
+        # Return the SAME cache object (not a copy)
         return self.CacheEntry(
-            copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
+            cache_entry.prompt_cache, 1, cache_entry.nbytes
         )
 
     def fetch_nearest_cache(self, model, tokens):
         result = self._search(model, tokens)
+        requested_len = len(tokens)
+
         if result.exact is not None:
             cache_entry = self._extract(result.model, result.exact)
-            return cache_entry.prompt_cache, []
+            logging.debug(f"[LRUPromptCache] EXACT match: {requested_len} tokens")
+            return cache_entry.prompt_cache, [], result.exact
 
         if result.shorter is not None:
-            cache_entry = self._extract(result.model, result.shorter)
+            cache_entry = self._get(model, result.shorter)
+            is_snapshot = cache_entry.is_snapshot
             prefix_len = len(result.shorter)
-            return cache_entry.prompt_cache, tokens[prefix_len:]
+            remaining = len(tokens) - prefix_len
+
+            if is_snapshot:
+                # Snapshots are already copies - extract them (don't keep original)
+                # Don't return old_position since we're branching from a snapshot
+                cache_entry = self._extract(result.model, result.shorter, keep_original=False)
+                logging.debug(f"[LRUPromptCache] CHECKPOINT match: {prefix_len} cached (snapshot), {remaining} to process (requested {requested_len})")
+                return cache_entry.prompt_cache, tokens[prefix_len:], None
+            else:
+                # Non-snapshot: return the SAME cache object for efficient reuse
+                # Also return the old position so we can move the cache later
+                cache_entry = self._extract(result.model, result.shorter, keep_original=True)
+                logging.debug(f"[LRUPromptCache] SHORTER match: {prefix_len} cached, {remaining} to process (requested {requested_len})")
+                return cache_entry.prompt_cache, tokens[prefix_len:], result.shorter
 
         if result.longer is not None:
             cache_entry = self._get(result.model, result.longer)
@@ -304,11 +365,31 @@ class LRUPromptCache:
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                logging.debug(f"[LRUPromptCache] LONGER match: trimmed {num_to_trim} tokens")
+                return cache, tokens[prefix:], None
 
-        return None, tokens
+        logging.debug(f"[LRUPromptCache] NO match for {requested_len} tokens")
+        return None, tokens, None
 
-    def insert_cache(self, model, tokens, prompt_cache):
+    def insert_cache(self, model, tokens, prompt_cache, boundary_positions=None, old_position=None):
+        """Insert cache at the full token position with checkpoint snapshots.
+
+        Args:
+            model: The model identifier
+            tokens: The full token sequence
+            prompt_cache: The cache to store
+            boundary_positions: Optional list of positions where message boundaries occur
+            old_position: If provided, delete the cache at this old position (for cache moves)
+        """
+        # If we're extending a cache, delete the old position first
+        if old_position is not None and old_position != tokens:
+            self._delete(model, old_position)
+            try:
+                self._lru.remove((model, old_position))
+            except ValueError:
+                pass  # Already not in LRU
+            logging.debug(f"[LRUPromptCache] Moved cache from {len(old_position)} to {len(tokens)}")
+
         if model not in self._cache:
             self._cache[model] = {}
         current = self._cache[model]
@@ -318,21 +399,71 @@ class LRUPromptCache:
             current = current[tok]
 
         if "cache" in current:
-            current["cache"].count += 1
+            # Update existing cache with new state
+            old_bytes = current["cache"].nbytes
+            new_bytes = sum(c.nbytes for c in prompt_cache)
+            current["cache"] = self.CacheEntry(prompt_cache, current["cache"].count + 1, new_bytes)
+            self._n_bytes += (new_bytes - old_bytes)
             self._lru.remove((model, tokens))
+            logging.debug(f"[LRUPromptCache] Updating cache at position {len(tokens)}, bytes: {old_bytes} -> {new_bytes}")
         else:
             cache_bytes = sum(c.nbytes for c in prompt_cache)
             current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes)
             self._n_bytes += cache_bytes
-            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} to the cache")
+            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} bytes at position {len(tokens)}")
 
         self._lru.append((model, tokens))
-        if len(self._lru) > self.max_size:
-            model, tokens = self._lru.popleft()
+
+        # Create checkpoint snapshots at interval and message boundaries
+        checkpoint_positions = self._find_checkpoint_positions(len(tokens), boundary_positions)
+        for pos in checkpoint_positions:
+            self._create_checkpoint_snapshot(model, tokens, prompt_cache, pos)
+
+        # Evict oldest entries first when limits exceeded (LRU eviction)
+        # This removes caches that haven't been used recently
+        while len(self._lru) > self.max_size:
+            model, tokens = self._lru.popleft()  # Remove oldest (first in)
             self._delete(model, tokens)
         while self._n_bytes > self.max_bytes and len(self._lru) > 1:
-            model, tokens = self._lru.popleft()
+            model, tokens = self._lru.popleft()  # Remove oldest (first in)
             self._delete(model, tokens)
+
+    def _create_checkpoint_snapshot(self, model, tokens, prompt_cache, position):
+        """Create a deep copy snapshot of the cache at a checkpoint position.
+
+        For hybrid models (KVCache + ArraysCache), we:
+        - Deep copy the entire cache state
+        - Trim KVCache layers to the checkpoint position
+        - ArraysCache layers are copied as-is (they maintain full state)
+        """
+        if model not in self._cache:
+            self._cache[model] = {}
+
+        checkpoint_tokens = tokens[:position]
+        current = self._cache[model]
+        for tok in checkpoint_tokens:
+            if tok not in current:
+                current[tok] = {}
+            current = current[tok]
+
+        # Only create snapshot if one doesn't already exist at this position
+        if "cache" in current:
+            return
+
+        # Deep copy the cache
+        snapshot = copy.deepcopy(prompt_cache)
+
+        # Trim KVCache layers to the checkpoint position
+        # This works for trimmable caches (KVCache), non-trimmable caches (ArraysCache) stay as-is
+        tokens_to_trim = len(tokens) - position
+        if tokens_to_trim > 0 and can_trim_prompt_cache(snapshot):
+            trim_prompt_cache(snapshot, tokens_to_trim)
+
+        snapshot_bytes = sum(c.nbytes for c in snapshot)
+        current["cache"] = self.CacheEntry(snapshot, 1, snapshot_bytes, is_snapshot=True)
+        self._n_bytes += snapshot_bytes
+        self._lru.append((model, checkpoint_tokens))
+        logging.debug(f"[LRUPromptCache] Created checkpoint snapshot at position {position} ({snapshot_bytes} bytes)")
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -714,6 +845,80 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
+    def _tokenize_for_cache_key(self, tokenizer, request, args):
+        """Tokenize without generation prompt for cache key computation.
+
+        This ensures prompt chaining works correctly by using the message
+        content only (without generation suffix) as the cache key.
+        """
+        if request.request_type == "chat":
+            messages = request.messages
+            tools = request.tools
+
+            if tokenizer.has_chat_template:
+                chat_template_args = self.model_provider.cli_args.chat_template_args
+                if args.chat_template_kwargs:
+                    chat_template_args = chat_template_args.copy()
+                    chat_template_args.update(args.chat_template_kwargs)
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    **chat_template_args,
+                )
+            else:
+                return tokenizer.encode(convert_chat(messages, request.role_mapping))
+        else:
+            return tokenizer.encode(request.prompt)
+
+    def _compute_message_boundaries(self, tokenizer, request, args):
+        """Compute token positions where each message ends in the cache key.
+
+        This is used to create checkpoint snapshots at message boundaries,
+        allowing cache reuse when conversations branch in different directions.
+
+        Args:
+            tokenizer: The tokenizer to use
+            request: The request containing messages
+            args: Generation arguments (for chat_template_kwargs)
+
+        Returns:
+            List of token positions where messages end
+        """
+        if request.request_type != "chat":
+            return []
+
+        messages = request.messages
+        tools = request.tools
+        if not messages or not tokenizer.has_chat_template:
+            return []
+
+        chat_template_args = self.model_provider.cli_args.chat_template_args
+        if args.chat_template_kwargs:
+            chat_template_args = chat_template_args.copy()
+            chat_template_args.update(args.chat_template_kwargs)
+
+        boundaries = []
+
+        # Tokenize progressively to find message boundary positions
+        for i in range(1, len(messages)):
+            try:
+                partial_tokens = tokenizer.apply_chat_template(
+                    messages[:i],
+                    tools=tools,
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    **chat_template_args,
+                )
+                if partial_tokens:
+                    boundaries.append(len(partial_tokens))
+            except Exception:
+                # If tokenization fails for partial messages, skip this boundary
+                continue
+
+        return boundaries
+
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
             return False
@@ -721,6 +926,71 @@ class ResponseGenerator:
             return False
 
         return True
+
+    def _find_cache_boundaries(self, tokens, tokenizer, min_chunk_size=10):
+        """Find positions in tokens where we should create cache boundaries.
+
+        This identifies key positions (like after the system message) where
+        storing a separate cache enables better prompt chaining when
+        conversations branch in different directions.
+
+        Args:
+            tokens: The tokenized prompt
+            tokenizer: The tokenizer to use
+            min_chunk_size: Minimum tokens before a boundary is considered
+
+        Returns:
+            List of positions where cache boundaries should be created
+        """
+        boundaries = []
+
+        # Find the end-of-message token (typically <|im_end|> or similar)
+        end_token = None
+        try:
+            im_end_tokens = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+            if len(im_end_tokens) == 1:
+                end_token = im_end_tokens[0]
+        except:
+            pass
+
+        if end_token is None:
+            # Try alternative end tokens
+            for end_str in ["</s>", "<|end|>", "[/INST]"]:
+                try:
+                    end_tokens = tokenizer.encode(end_str, add_special_tokens=False)
+                    if len(end_tokens) == 1:
+                        end_token = end_tokens[0]
+                        break
+                except:
+                    pass
+
+        if end_token is None:
+            return boundaries
+
+        # Find positions after each complete message
+        # We only store at the FIRST message boundary (after system message)
+        # and at the last position (full prompt)
+        for i, tok in enumerate(tokens):
+            if tok == end_token:
+                # Position after this token and any following newline
+                pos = i + 1
+                # Skip following newline if present
+                if pos < len(tokens):
+                    try:
+                        next_decoded = tokenizer.decode([tokens[pos]])
+                        if next_decoded in ['\n', '']:
+                            pos += 1
+                    except:
+                        pass
+
+                # Only add if it's a significant chunk
+                if pos >= min_chunk_size and pos < len(tokens):
+                    boundaries.append(pos)
+                    # Only store at the first message boundary (usually after system message)
+                    # This is the most common branching point
+                    break
+
+        return boundaries
 
     def _generate(self):
         current_model = None
@@ -770,6 +1040,13 @@ class ResponseGenerator:
                 ):
                     try:
                         prompt = self._tokenize(current_tokenizer, request, args)
+                        cache_key_prompt = self._tokenize_for_cache_key(
+                            current_tokenizer, request, args
+                        )
+                        # Compute message boundary positions for checkpoint snapshots
+                        boundary_positions = self._compute_message_boundaries(
+                            current_tokenizer, request, args
+                        )
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -792,12 +1069,19 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
+                    cache, rest, old_position = self.prompt_cache.fetch_nearest_cache(
+                        current_model_key, cache_key_prompt
                     )
-                    ctx.prompt_cache_count = len(prompt) - len(rest)
+                    ctx.prompt_cache_count = len(cache_key_prompt) - len(rest)
+
+                    # Include generation suffix in rest for batch processing
+                    gen_suffix_len = len(prompt) - len(cache_key_prompt)
+                    if gen_suffix_len > 0:
+                        rest = list(rest) + list(prompt[-gen_suffix_len:])
+
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
+                        old_position = None
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
@@ -813,7 +1097,9 @@ class ResponseGenerator:
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
-                        "cache_key": prompt[:],
+                        "cache_key": list(cache_key_prompt),
+                        "boundary_positions": boundary_positions,
+                        "old_position": old_position,
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                     }
@@ -884,7 +1170,6 @@ class ResponseGenerator:
 
                     for r in responses:
                         result = batch_results[r.uid]
-                        result["cache_key"].append(r.token)
                         if r.finish_reason != "stop":
                             result["detokenizer"].add_token(r.token)
 
@@ -903,7 +1188,9 @@ class ResponseGenerator:
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
                             self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
+                                current_model_key, result["cache_key"], r.prompt_cache,
+                                boundary_positions=result.get("boundary_positions"),
+                                old_position=result.get("old_position")
                             )
                             del batch_results[r.uid]
 
@@ -921,7 +1208,9 @@ class ResponseGenerator:
                                 continue
                             result = batch_results[uid]
                             self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], prompt_cache
+                                current_model_key, result["cache_key"], prompt_cache,
+                                boundary_positions=result.get("boundary_positions"),
+                                old_position=result.get("old_position")
                             )
                             del batch_results[uid]
 
@@ -938,8 +1227,14 @@ class ResponseGenerator:
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
 
-            # Prepare the prompt
+            # Prepare the prompt for generation (with generation suffix)
             prompt = self._tokenize(tokenizer, request, args)
+
+            # Prepare the cache key prompt (without generation suffix for prompt chaining)
+            cache_key_prompt = self._tokenize_for_cache_key(tokenizer, request, args)
+
+            # Compute message boundary positions for checkpoint snapshots
+            boundary_positions = self._compute_message_boundaries(tokenizer, request, args)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -968,16 +1263,27 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
-            # Load the KV cache
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+            # Load the KV cache using cache_key_prompt (without gen suffix)
+            # Returns: cache, remaining tokens, old_position (for cache move)
+            cache, rest, old_position = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key, cache_key_prompt
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
-            cache_key = prompt[:]
+            ctx.prompt_cache_count = len(cache_key_prompt) - len(rest)
+
+            # Store cache at cache_key_prompt position for prompt chaining support
+            cache_key = list(cache_key_prompt)
+
+            # Compute the generation suffix (prompt - cache_key_prompt)
+            gen_suffix_len = len(prompt) - len(cache_key_prompt)
+            if gen_suffix_len > 0:
+                # If we have a cache hit, we need to include the gen suffix in the rest
+                rest = list(rest) + list(prompt[-gen_suffix_len:])
+
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+                old_position = None  # New cache, no old position to delete
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
             logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
@@ -1006,7 +1312,6 @@ class ResponseGenerator:
                         ),
                     )
                 )
-                cache_key.append(gen.token)
 
                 if ctx._should_stop:
                     if self._is_distributed:
@@ -1015,9 +1320,12 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
+            # Save the KV cache with checkpoint snapshots at message boundaries
+            # This enables cache reuse when conversations branch in different directions
             self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
+                self.model_provider.model_key, cache_key, cache,
+                boundary_positions=boundary_positions,
+                old_position=old_position
             )
 
         except Exception as e:
