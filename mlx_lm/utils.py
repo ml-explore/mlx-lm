@@ -15,10 +15,12 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Tuple,
     Type,
     Union,
+    overload,
 )
 
 import mlx.core as mx
@@ -436,6 +438,45 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
     )
+
+
+@overload
+def load(
+    path_or_hf_repo: str,
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    return_config: Literal[False] = False,
+    revision: Optional[str] = ...,
+) -> Tuple[nn.Module, TokenizerWrapper]: ...
+
+
+@overload
+def load(
+    path_or_hf_repo: str,
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    return_config: Literal[True] = True,
+    revision: Optional[str] = ...,
+) -> Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]: ...
+
+
+@overload
+def load(
+    path_or_hf_repo: str,
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    return_config: bool = ...,
+    revision: Optional[str] = ...,
+) -> Union[
+    Tuple[nn.Module, TokenizerWrapper],
+    Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
+]: ...
 
 
 def load(
