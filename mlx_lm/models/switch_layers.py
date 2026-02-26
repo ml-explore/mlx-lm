@@ -1,12 +1,11 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import math
-from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .activations import swiglu
+from .activations import SwiGLU
 
 
 def _gather_sort(x, indices):
@@ -147,14 +146,6 @@ class SwitchLinear(nn.Module):
         if "bias" in self:
             ql.bias = self.bias
         return ql
-
-
-class SwiGLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def __call__(self, x, gate):
-        return swiglu(gate, x)
 
 
 class SwitchGLU(nn.Module):

@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -18,11 +19,6 @@ def _compute_gate(query: mx.array, weight: mx.array, bias: mx.array) -> mx.array
     gate_logits = query @ weight[:, None, :].swapaxes(-1, -2)
     gate_logits = gate_logits + bias[..., None, None]
     return mx.sigmoid(gate_logits)
-
-
-@partial(mx.compile, shapeless=True)
-def _silu_mul(gate: mx.array, up: mx.array) -> mx.array:
-    return nn.silu(gate) * up
 
 
 @partial(mx.compile, shapeless=True)
@@ -124,7 +120,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=args.mlp_bias)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(_silu_mul(self.gate_proj(x), self.up_proj(x)))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):

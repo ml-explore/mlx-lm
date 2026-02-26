@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
+from .activations import gelu_topk
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 
@@ -158,14 +159,6 @@ class Gemma3nAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output)
-
-
-@partial(mx.compile, shapeless=True)
-def gelu_topk(inputs, std_multiplier):
-    inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
-    inputs_std = mx.std(inputs, axis=-1, keepdims=True)
-    cutoff_x = inputs_mean + inputs_std * std_multiplier.astype(inputs_std.dtype)
-    return nn.gelu_approx(mx.maximum(0, inputs - cutoff_x))
 
 
 class MLP(nn.Module):

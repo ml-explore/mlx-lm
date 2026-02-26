@@ -8,6 +8,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import gegelu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
@@ -32,27 +33,6 @@ class ModelArgs(BaseModelArgs):
     blocksparse_block_size: int = 64
     blocksparse_num_local_blocks: int = 16
     blocksparse_vert_stride: int = 8
-
-
-@partial(mx.compile, shapeless=True)
-def gegelu_impl(a_gelu, a_linear, limit):
-    a_gelu = mx.where(
-        mx.isinf(a_gelu),
-        a_gelu,
-        mx.clip(a_gelu, a_min=None, a_max=limit),
-    )
-    a_linear = mx.where(
-        mx.isinf(a_linear),
-        a_linear,
-        mx.clip(a_linear, a_min=-limit, a_max=limit),
-    )
-    out_gelu = a_gelu * mx.sigmoid(1.702 * a_gelu)
-    return out_gelu * (a_linear + 1.0)
-
-
-def gegelu(x, limit):
-    a_gelu, a_linear = x[..., ::2], x[..., 1::2]
-    return gegelu_impl(a_gelu, a_linear, limit)
 
 
 class Attention(nn.Module):
