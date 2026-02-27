@@ -21,6 +21,13 @@ class _QuantGateModel(nn.Module):
         self.linear = nn.Linear(96, 96)
 
 
+class _TwoLinearQuantModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_a = nn.Linear(64, 64)
+        self.linear_b = nn.Linear(64, 64)
+
+
 class TestUtils(unittest.TestCase):
 
     @classmethod
@@ -138,6 +145,34 @@ class TestUtils(unittest.TestCase):
         self.assertNotIn("linear.scales", weights)
         self.assertNotIn("Skipping quantization for linear", log_output)
         self.assertNotIn("incompatible group size", log_output)
+
+    def test_quantize_dict_predicate_multiple_layers(self):
+        model = _TwoLinearQuantModel()
+
+        def pred(path, _module):
+            if path == "linear_a":
+                return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            if path == "linear_b":
+                return {"group_size": 64, "bits": 6, "mode": "affine"}
+            return False
+
+        model, config = utils.quantize_model(
+            model,
+            {},
+            64,
+            4,
+            mode="affine",
+            quant_predicate=pred,
+        )
+
+        weights = dict(tree_flatten(model.parameters()))
+        self.assertIn("linear_a.scales", weights)
+        self.assertIn("linear_b.scales", weights)
+        self.assertEqual(config["quantization"]["group_size"], 64)
+        self.assertEqual(config["quantization"]["bits"], 4)
+        self.assertEqual(config["quantization"]["mode"], "affine")
+        self.assertEqual(config["quantization"]["linear_a"]["mode"], "mxfp4")
+        self.assertEqual(config["quantization"]["linear_b"]["bits"], 6)
 
     def test_convert(self):
         mlx_path = os.path.join(self.test_dir, "mlx_model")

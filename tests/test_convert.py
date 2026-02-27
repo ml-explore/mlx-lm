@@ -1,7 +1,9 @@
 import re
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -9,7 +11,9 @@ import mlx.nn as nn
 from mlx_lm.convert import (
     apply_float_overrides,
     build_override_predicate,
+    convert,
     parse_overrides,
+    warn_mixed_mode_overrides,
     warn_mode_override_conflicts,
 )
 
@@ -154,6 +158,54 @@ class TestModeConflictWarnings(unittest.TestCase):
         with redirect_stdout(out):
             warn_mode_override_conflicts("affine", 32, 4, 64, 4)
         self.assertEqual(out.getvalue(), "")
+
+    def test_non_affine_int_override_warns_mixed_mode(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            warn_mixed_mode_overrides("mxfp4", [(re.compile("lm_head"), 8)])
+        self.assertIn(
+            "Integer --q-override values force affine quantization",
+            out.getvalue(),
+        )
+        self.assertIn("mixed quantization modes", out.getvalue())
+
+    def test_non_affine_no_int_override_no_warning(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            warn_mixed_mode_overrides("mxfp4", [(re.compile("lm_head"), "mxfp8")])
+        self.assertEqual(out.getvalue(), "")
+
+    def test_affine_int_override_no_warning(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            warn_mixed_mode_overrides("affine", [(re.compile("lm_head"), 8)])
+        self.assertEqual(out.getvalue(), "")
+
+
+class TestConvertOverridePrecedence(unittest.TestCase):
+
+    def test_float_override_applies_after_dtype_cast(self):
+        model = _Wrapper()
+        model.linear.weight = model.linear.weight.astype(mx.float16)
+        captured = {}
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        def fake_save(_mlx_path, _hf_path, saved_model, *_args):
+            captured["weight_dtype"] = saved_model.linear.weight.dtype
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch("mlx_lm.convert.save", side_effect=fake_save):
+                    convert(
+                        "stub/repo",
+                        mlx_path=mlx_path,
+                        q_overrides=["linear=float32"],
+                    )
+
+        self.assertEqual(captured["weight_dtype"], mx.float32)
 
 
 if __name__ == "__main__":

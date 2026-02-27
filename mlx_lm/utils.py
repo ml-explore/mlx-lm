@@ -804,7 +804,7 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     skipped_layers = []
 
@@ -833,10 +833,10 @@ def quantize_model(
             return False
 
         if isinstance(bool_or_params, dict):
-            quantized_config["quantization"][path] = effective_params
+            quantized_config["quantization"][path] = dict(effective_params)
             return effective_params
         elif fine_grained_config and bool_or_params:
-            quantized_config["quantization"][path] = quant_params
+            quantized_config["quantization"][path] = dict(quant_params)
         return bool_or_params
 
     nn.quantize(

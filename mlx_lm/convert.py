@@ -120,6 +120,20 @@ def warn_mode_override_conflicts(
         )
 
 
+def warn_mixed_mode_overrides(
+    q_mode: str, overrides: list[tuple[re.Pattern, Union[int, str]]]
+) -> None:
+    if q_mode == "affine":
+        return
+    if not any(isinstance(value, int) for _, value in overrides):
+        return
+    print(
+        f"[WARN] Integer --q-override values force affine quantization on "
+        f"matching layers. With --q-mode {q_mode}, this produces mixed "
+        f"quantization modes."
+    )
+
+
 def parse_overrides(overrides: list[str]) -> list[tuple[re.Pattern, Union[int, str]]]:
     parsed = []
     for entry in overrides:
@@ -243,7 +257,7 @@ def convert(
     parsed_overrides = None
     if q_overrides:
         parsed_overrides = parse_overrides(q_overrides)
-        apply_float_overrides(model, parsed_overrides)
+        warn_mixed_mode_overrides(q_mode, parsed_overrides)
         quant_predicate = build_override_predicate(
             parsed_overrides, quant_predicate, q_group_size
         )
@@ -264,6 +278,9 @@ def convert(
                 return v
 
         model.update(tree_map_with_path(set_dtype, model.parameters()))
+
+    if parsed_overrides:
+        apply_float_overrides(model, parsed_overrides)
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -352,7 +369,8 @@ def configure_parser() -> argparse.ArgumentParser:
             "Per-layer quantization override as PATTERN=VALUE (repeatable). "
             "PATTERN is a regex matched against the module path. "
             "VALUE is a bit width (int), dtype (float16, bfloat16, float32), "
-            "or quant mode (mxfp4, nvfp4, mxfp8)."
+            "or quant mode (mxfp4, nvfp4, mxfp8). Integer bit overrides are "
+            "affine for matching layers."
         ),
         action="append",
         default=None,
