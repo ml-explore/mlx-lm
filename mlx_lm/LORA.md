@@ -60,8 +60,12 @@ mlx_lm.lora \
     --model <path_to_model> \
     --train \
     --data <path_to_data> \
-    --iters 600
+    --epochs 3
 ```
+
+You can use either `--epochs` or `--iters` to control training length. They
+are mutually exclusive. If neither is specified, `mlx_lm.lora` defaults to
+`--iters 1000` for backward compatibility.
 
 To fine-tune the full model weights, add the `--fine-tune-type full` flag.
 Currently supported fine-tuning types are `lora` (default), `dora`, and `full`.

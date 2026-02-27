@@ -28,6 +28,10 @@ num_layers: 16
 # Minibatch size.
 batch_size: 4
 
+# Use either epochs or iters (mutually exclusive).
+# Epochs to train for.
+# epochs: 3
+
 # Iterations to train for.
 iters: 1000
 
