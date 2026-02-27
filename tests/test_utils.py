@@ -3,6 +3,8 @@
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,6 +13,19 @@ from mlx.utils import tree_flatten
 from mlx_lm import convert, utils
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+
+
+class _QuantGateModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(96, 96)
+
+
+class _TwoLinearQuantModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_a = nn.Linear(64, 64)
+        self.linear_b = nn.Linear(64, 64)
 
 
 class TestUtils(unittest.TestCase):
@@ -77,6 +92,87 @@ class TestUtils(unittest.TestCase):
         self.assertTrue("model.layers.2.mlp.up_proj.biases" in weights)
         self.assertEqual(config["quantization"]["group_size"], 64)
         self.assertEqual(config["quantization"]["bits"], 4)
+
+    def test_quantize_override_group_size_applies_before_gate(self):
+        model = _QuantGateModel()
+        out = StringIO()
+
+        with redirect_stdout(out):
+            model, _ = utils.quantize_model(
+                model,
+                {},
+                64,
+                4,
+                quant_predicate=lambda _path, _module: {
+                    "group_size": 32,
+                    "bits": 4,
+                    "mode": "mxfp4",
+                },
+            )
+
+        weights = dict(tree_flatten(model.parameters()))
+        self.assertIn("linear.scales", weights)
+        self.assertNotIn("Skipping quantization for linear", out.getvalue())
+
+    def test_quantize_logs_incompatible_group_size_skip(self):
+        model = _QuantGateModel()
+        out = StringIO()
+
+        with redirect_stdout(out):
+            model, _ = utils.quantize_model(model, {}, 64, 4)
+
+        weights = dict(tree_flatten(model.parameters()))
+        log_output = out.getvalue()
+        self.assertNotIn("linear.scales", weights)
+        self.assertIn("Skipping quantization for linear", log_output)
+        self.assertIn("Skipped 1 layer(s) due to incompatible group size", log_output)
+
+    def test_quantize_does_not_log_group_size_skip_for_predicate_false(self):
+        model = _QuantGateModel()
+        out = StringIO()
+
+        with redirect_stdout(out):
+            model, _ = utils.quantize_model(
+                model,
+                {},
+                64,
+                4,
+                quant_predicate=lambda _path, _module: False,
+            )
+
+        weights = dict(tree_flatten(model.parameters()))
+        log_output = out.getvalue()
+        self.assertNotIn("linear.scales", weights)
+        self.assertNotIn("Skipping quantization for linear", log_output)
+        self.assertNotIn("incompatible group size", log_output)
+
+    def test_quantize_dict_predicate_multiple_layers(self):
+        model = _TwoLinearQuantModel()
+
+        def pred(path, _module):
+            if path == "linear_a":
+                return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            if path == "linear_b":
+                return {"group_size": 64, "bits": 6, "mode": "affine"}
+            return False
+
+        model, config = utils.quantize_model(
+            model,
+            {},
+            64,
+            4,
+            mode="affine",
+            quant_predicate=pred,
+        )
+
+        weights = dict(tree_flatten(model.parameters()))
+        self.assertIn("linear_a.scales", weights)
+        self.assertIn("linear_b.scales", weights)
+        self.assertEqual(config["quantization"]["group_size"], 64)
+        self.assertEqual(config["quantization"]["bits"], 4)
+        self.assertEqual(config["quantization"]["mode"], "affine")
+        self.assertEqual(config["quantization"]["linear_a"]["mode"], "mxfp4")
+        self.assertEqual(config["quantization"]["linear_b"]["bits"], 6)
 
     def test_convert(self):
         mlx_path = os.path.join(self.test_dir, "mlx_model")
