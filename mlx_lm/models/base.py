@@ -135,3 +135,12 @@ def scaled_dot_product_attention(
             mask=mask,
             sinks=sinks,
         )
+
+
+def deserialize_float(x):
+    if isinstance(x, dict) and "__float__" in x:
+        if x["__float__"] == "Infinity":
+            return float("inf")
+        if x["__float__"] == "-Infinity":
+            return float("-inf")
+    return x

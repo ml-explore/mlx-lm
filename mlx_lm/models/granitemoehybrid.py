@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
-from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,6 +11,7 @@ from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
+    deserialize_float,
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
@@ -37,7 +38,10 @@ class ModelArgs(BaseModelArgs):
     residual_multiplier: float
     layer_types: List[str]
     rms_norm_eps: float
-    rope_theta: float
+    rope_parameters: Dict[str, Any] = field(default_factory=dict)
+    rope_theta: Optional[float] = (
+        None  # For backward compatibility; can also be in rope_parameters
+    )
 
     # Optional fields (with defaults)
     # MoE parameters (optional for dense mode)
@@ -90,7 +94,10 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         self.intermediate_size = args.mamba_n_heads * args.mamba_d_head
         self.n_groups = args.mamba_n_groups
         self.head_dim = args.mamba_d_head
-        self.time_step_limit = args.time_step_limit
+        self.time_step_limit = [
+            deserialize_float(args.time_step_limit[0]),
+            deserialize_float(args.time_step_limit[1]),
+        ]
         self.heads_per_group = self.num_heads // self.n_groups
 
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
@@ -235,6 +242,7 @@ class GraniteMoeHybridAttention(nn.Module):
 
         self.scale = args.attention_multiplier
         attention_bias = args.attention_bias
+        rope_theta = args.rope_parameters.get("rope_theta") or args.rope_theta
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
@@ -246,7 +254,7 @@ class GraniteMoeHybridAttention(nn.Module):
         if use_rope:
             self.rope = initialize_rope(
                 self.head_dim,
-                args.rope_theta,
+                rope_theta,
                 False,
                 None,  # rope_scaling
                 args.max_position_embeddings,
