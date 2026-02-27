@@ -983,6 +983,11 @@ class ResponseGenerator:
             logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
 
             # Process the prompt and generate tokens
+            kv_kwargs = {}
+            if self.cli_args.kv_bits is not None:
+                kv_kwargs["kv_bits"] = self.cli_args.kv_bits
+                kv_kwargs["kv_group_size"] = self.cli_args.kv_group_size
+                kv_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -994,6 +999,7 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                **kv_kwargs,
             ):
                 rqueue.put(
                     Response(
@@ -1919,6 +1925,25 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Number of bits for KV cache quantization (4 or 8). Default: None (no quantization)",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Step to begin using a quantized KV cache (default: 0)",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
