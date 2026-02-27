@@ -108,6 +108,12 @@ class TestBuildOverridePredicate(unittest.TestCase):
         result = pred("model.lm_head", None)
         self.assertEqual(result["group_size"], 32)
 
+    def test_int_override_uses_explicit_int_group_size(self):
+        overrides = [(re.compile("lm_head"), 8)]
+        pred = build_override_predicate(overrides, None, 32, int_group_size=64)
+        result = pred("model.lm_head", None)
+        self.assertEqual(result["group_size"], 64)
+
 
 class _Wrapper(nn.Module):
     def __init__(self):
@@ -356,6 +362,43 @@ class TestConvertOverridePrecedence(unittest.TestCase):
             )
             self.assertIn("received q-group-size=64", out.getvalue())
             self.assertNotIn("received q-bits=", out.getvalue())
+
+    def test_non_affine_mode_int_override_uses_affine_group_size(self):
+        model = _Wrapper()
+        captured = {}
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        def fake_quantize_model(
+            model,
+            config,
+            group_size,
+            bits,
+            mode="affine",
+            quant_predicate=None,
+        ):
+            captured["override"] = quant_predicate("model.lm_head", None)
+            return model, config
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch(
+                    "mlx_lm.convert.quantize_model", side_effect=fake_quantize_model
+                ):
+                    with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            quantize=True,
+                            q_mode="mxfp4",
+                            q_overrides=["lm_head=8"],
+                        )
+
+        self.assertEqual(captured["override"]["mode"], "affine")
+        self.assertEqual(captured["override"]["bits"], 8)
+        self.assertEqual(captured["override"]["group_size"], 64)
 
 
 if __name__ == "__main__":

@@ -167,6 +167,7 @@ def build_override_predicate(
     overrides: list[ParsedOverride],
     base_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]],
     group_size: int,
+    int_group_size: Optional[int] = None,
 ) -> Callable[[str, nn.Module], Union[bool, dict]]:
     def predicate(path, module):
         for regex, value in overrides:
@@ -175,7 +176,14 @@ def build_override_predicate(
                     return dict(QUANT_MODES[value])
                 if isinstance(value, str):
                     return False
-                return {"group_size": group_size, "bits": value, "mode": "affine"}
+                resolved_group_size = (
+                    group_size if int_group_size is None else int_group_size
+                )
+                return {
+                    "group_size": resolved_group_size,
+                    "bits": value,
+                    "mode": "affine",
+                }
         if base_predicate is not None:
             return base_predicate(path, module)
         return True
@@ -256,8 +264,15 @@ def convert(
     if q_overrides:
         parsed_overrides = parse_overrides(q_overrides)
         warn_mixed_mode_overrides(q_mode, parsed_overrides)
+        affine_group_size, _ = QUANT_MODE_DEFAULTS["affine"]
+        int_override_group_size = (
+            q_group_size if q_mode == "affine" else affine_group_size
+        )
         quant_predicate = build_override_predicate(
-            parsed_overrides, quant_predicate, q_group_size
+            parsed_overrides,
+            quant_predicate,
+            q_group_size,
+            int_group_size=int_override_group_size,
         )
 
     if dtype is None:
