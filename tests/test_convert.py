@@ -1,5 +1,7 @@
 import re
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,6 +10,7 @@ from mlx_lm.convert import (
     apply_float_overrides,
     build_override_predicate,
     parse_overrides,
+    warn_mode_override_conflicts,
 )
 
 
@@ -129,6 +132,28 @@ class TestApplyFloatOverrides(unittest.TestCase):
         overrides = [(re.compile("linear"), 8)]
         apply_float_overrides(model, overrides)
         self.assertEqual(model.linear.weight.dtype, original_dtype)
+
+
+class TestModeConflictWarnings(unittest.TestCase):
+
+    def test_non_affine_bits_conflict_warns(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            warn_mode_override_conflicts("mxfp4", None, 8, 32, 4)
+        self.assertIn("--q-mode mxfp4 default is q-group-size=32, q-bits=4", out.getvalue())
+        self.assertIn("q-bits=8", out.getvalue())
+
+    def test_non_affine_matching_values_no_warning(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            warn_mode_override_conflicts("mxfp4", 32, 4, 32, 4)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_affine_no_warning(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            warn_mode_override_conflicts("affine", 32, 4, 64, 4)
+        self.assertEqual(out.getvalue(), "")
 
 
 if __name__ == "__main__":

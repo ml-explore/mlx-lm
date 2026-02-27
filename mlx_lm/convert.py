@@ -95,6 +95,31 @@ QUANT_MODES = {
 }
 
 
+def warn_mode_override_conflicts(
+    q_mode: str,
+    q_group_size: Optional[int],
+    q_bits: Optional[int],
+    default_group_size: int,
+    default_bits: int,
+) -> None:
+    if q_mode == "affine":
+        return
+
+    conflicts = []
+    if q_group_size is not None and q_group_size != default_group_size:
+        conflicts.append(f"q-group-size={q_group_size}")
+    if q_bits is not None and q_bits != default_bits:
+        conflicts.append(f"q-bits={q_bits}")
+
+    if conflicts:
+        details = ", ".join(conflicts)
+        print(
+            f"[WARN] --q-mode {q_mode} default is "
+            f"q-group-size={default_group_size}, q-bits={default_bits}; "
+            f"received {details}. This may produce unexpected results."
+        )
+
+
 def parse_overrides(overrides: list[str]) -> list[tuple[re.Pattern, Union[int, str]]]:
     parsed = []
     for entry in overrides:
@@ -191,6 +216,9 @@ def convert(
         "mxfp8": (32, 8),
     }
     default_gs, default_bits = mode_defaults[q_mode]
+    warn_mode_override_conflicts(
+        q_mode, q_group_size, q_bits, default_gs, default_bits
+    )
     q_group_size = q_group_size or default_gs
     q_bits = q_bits or default_bits
 
