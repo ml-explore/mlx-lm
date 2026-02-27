@@ -55,7 +55,8 @@ CONFIG_DEFAULTS = {
     "seed": 0,
     "num_layers": 16,
     "batch_size": 4,
-    "iters": 1000,
+    "iters": None,
+    "epochs": None,
     "val_batches": 25,
     "learning_rate": 1e-5,
     "steps_per_report": 10,
@@ -75,6 +76,7 @@ CONFIG_DEFAULTS = {
     "report_to": None,
     "project_name": None,
 }
+DEFAULT_ITERS = 1000
 
 
 def build_parser():
@@ -125,7 +127,16 @@ def build_parser():
         help="Number of layers to fine-tune. Default is 16, use -1 for all.",
     )
     parser.add_argument("--batch-size", type=int, help="Minibatch size.")
-    parser.add_argument("--iters", type=int, help="Iterations to train for.")
+    parser.add_argument(
+        "--iters",
+        type=int,
+        help="Iterations to train for. Mutually exclusive with --epochs.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=float,
+        help="Epochs to train for. Mutually exclusive with --iters.",
+    )
     parser.add_argument(
         "--val-batches",
         type=int,
@@ -206,6 +217,29 @@ def build_parser():
     return parser
 
 
+def resolve_train_iterations(args, train_set_len: int):
+    if args.batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if args.iters is not None and args.epochs is not None:
+        raise ValueError("Please provide only one of --iters or --epochs.")
+    if args.epochs is not None:
+        if args.epochs <= 0:
+            raise ValueError("epochs must be greater than 0.")
+        steps_per_epoch = train_set_len // args.batch_size
+        if steps_per_epoch < 1:
+            raise ValueError(
+                f"Dataset must have at least batch_size={args.batch_size} "
+                f"examples but only has {train_set_len}."
+            )
+        iters = max(1, math.ceil(args.epochs * steps_per_epoch))
+        return iters, steps_per_epoch
+    if args.iters is None:
+        raise ValueError("Please provide --iters or --epochs.")
+    if args.iters < 1:
+        raise ValueError("iters must be at least 1.")
+    return args.iters, None
+
+
 def train_model(
     args,
     model: nn.Module,
@@ -246,6 +280,14 @@ def train_model(
 
     adapter_path = Path(args.adapter_path)
     adapter_path.mkdir(parents=True, exist_ok=True)
+
+    resolved_iters, steps_per_epoch = resolve_train_iterations(args, len(train_set))
+    args.iters = resolved_iters
+    if steps_per_epoch is not None:
+        print(
+            f"Using epochs={args.epochs} with steps_per_epoch={steps_per_epoch}; "
+            f"resolved to iters={args.iters}."
+        )
 
     adapter_file = adapter_path / "adapters.safetensors"
     save_config(vars(args), adapter_path / "adapter_config.json")
@@ -359,6 +401,8 @@ def main():
     for k, v in CONFIG_DEFAULTS.items():
         if args.get(k, None) is None:
             args[k] = v
+    if args["iters"] is None and args["epochs"] is None:
+        args["iters"] = DEFAULT_ITERS
     run(types.SimpleNamespace(**args))
 
 

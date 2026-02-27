@@ -5,6 +5,7 @@ import sys
 import unittest
 from contextlib import contextmanager
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock
 
 import mlx.core as mx
@@ -445,6 +446,49 @@ class TestScheduleConfig(unittest.TestCase):
             comm_group=ANY,
         )
         self.assertEqual(mock_default_loss.call_count, 3)
+
+
+class TestLoraEpochs(unittest.TestCase):
+    def test_resolve_train_iterations_with_epochs(self):
+        args = SimpleNamespace(batch_size=4, iters=None, epochs=2)
+        iters, steps_per_epoch = lora.resolve_train_iterations(args, train_set_len=10)
+        self.assertEqual(iters, 4)
+        self.assertEqual(steps_per_epoch, 2)
+
+    def test_resolve_train_iterations_with_fractional_epochs(self):
+        args = SimpleNamespace(batch_size=4, iters=None, epochs=1.5)
+        iters, steps_per_epoch = lora.resolve_train_iterations(args, train_set_len=10)
+        self.assertEqual(iters, 3)
+        self.assertEqual(steps_per_epoch, 2)
+
+    def test_resolve_train_iterations_with_iters(self):
+        args = SimpleNamespace(batch_size=4, iters=17, epochs=None)
+        iters, steps_per_epoch = lora.resolve_train_iterations(args, train_set_len=10)
+        self.assertEqual(iters, 17)
+        self.assertIsNone(steps_per_epoch)
+
+    def test_resolve_train_iterations_rejects_both(self):
+        args = SimpleNamespace(batch_size=4, iters=100, epochs=2)
+        with self.assertRaisesRegex(ValueError, "only one of --iters or --epochs"):
+            lora.resolve_train_iterations(args, train_set_len=100)
+
+    def test_resolve_train_iterations_rejects_invalid_epochs(self):
+        args = SimpleNamespace(batch_size=4, iters=None, epochs=0)
+        with self.assertRaisesRegex(ValueError, "epochs must be greater than 0"):
+            lora.resolve_train_iterations(args, train_set_len=100)
+
+    def test_resolve_train_iterations_rejects_invalid_iters(self):
+        args = SimpleNamespace(batch_size=4, iters=0, epochs=None)
+        with self.assertRaisesRegex(ValueError, "iters must be at least 1"):
+            lora.resolve_train_iterations(args, train_set_len=100)
+
+    def test_resolve_train_iterations_rejects_too_small_dataset(self):
+        args = SimpleNamespace(batch_size=4, iters=None, epochs=1)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Dataset must have at least batch_size=4 examples but only has 3",
+        ):
+            lora.resolve_train_iterations(args, train_set_len=3)
 
 
 if __name__ == "__main__":
