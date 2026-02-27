@@ -105,7 +105,7 @@ class MOE(nn.Module):
         scores = mx.softmax(scores, axis=-1, precise=True)
 
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
 
         return y
 

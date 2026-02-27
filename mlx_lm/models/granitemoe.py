@@ -125,7 +125,7 @@ class GraniteMoeMoE(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         token_ids, gates = self.router(x)
         y = self.switch_mlp(x, token_ids)
-        return (y * gates[..., None]).sum(axis=-2).astype(y.dtype)
+        return (y * gates[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
 
 
 class GraniteMoeDecoderLayer(nn.Module):

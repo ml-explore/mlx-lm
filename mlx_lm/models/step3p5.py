@@ -171,7 +171,7 @@ class Step3p5MoE(nn.Module):
         topk_indices, topk_weights = self.gate(x)
         routed_output = self.switch_mlp(x, topk_indices)
         routed_output = (
-            (routed_output * topk_weights[..., None])
+            (routed_output * topk_weights[..., None].astype(mx.float32))
             .sum(axis=-2)
             .astype(routed_output.dtype)
         )

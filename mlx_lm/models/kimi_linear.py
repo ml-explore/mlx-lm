@@ -149,7 +149,7 @@ class KimiSparseMoE(nn.Module):
             self.args.moe_router_activation_func,
         )
         out = self.switch_mlp(x, inds)
-        out = (out * weights[..., None]).sum(axis=-2)
+        out = (out * weights[..., None].astype(mx.float32)).sum(axis=-2).astype(out.dtype)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
         return out

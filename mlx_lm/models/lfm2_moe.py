@@ -221,7 +221,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         scores = scores.astype(x.dtype)
 
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
 
         return y
 

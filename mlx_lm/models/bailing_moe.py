@@ -53,7 +53,7 @@ class ModelArgs(BaseModelArgs):
 @partial(mx.compile, shapeless=True)
 def aggregate_expert_outputs(expert_outputs, scores):
     return (
-        (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
+        (expert_outputs * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(expert_outputs.dtype)
     )
 
 

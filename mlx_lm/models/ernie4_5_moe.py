@@ -152,7 +152,7 @@ class Ernie4_5_MoeMLP(nn.Module):
         scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-12)
 
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = (y * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
 
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)

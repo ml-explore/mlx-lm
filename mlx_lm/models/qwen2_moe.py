@@ -135,7 +135,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         scores = mx.take_along_axis(gates, inds, axis=-1)
 
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
 
         shared_expert_output = self.shared_expert(x)
         shared_expert_output = (

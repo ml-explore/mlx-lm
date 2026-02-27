@@ -121,7 +121,7 @@ class OlmoeSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
         y = self.switch_mlp(x_flat, indices)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
         return y.reshape(B, L, D)
 
 
