@@ -89,9 +89,6 @@ FLOAT_DTYPES = {
     "float32": mx.float32,
 }
 
-LEGACY_Q_GROUP_SIZE_DEFAULT = 64
-LEGACY_Q_BITS_DEFAULT = 4
-
 QUANT_MODES = {
     mode: {"group_size": group_size, "bits": bits, "mode": mode}
     for mode, (group_size, bits) in QUANT_MODE_DEFAULTS.items()
@@ -99,10 +96,6 @@ QUANT_MODES = {
 }
 
 ParsedOverride = tuple[re.Pattern, Union[int, str]]
-
-
-def _is_non_default_override(value: Optional[int], legacy_default: int) -> bool:
-    return value is not None and value != legacy_default
 
 
 def warn_mode_override_conflicts(
@@ -213,8 +206,8 @@ def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
     quantize: bool = False,
-    q_group_size: int = LEGACY_Q_GROUP_SIZE_DEFAULT,
-    q_bits: int = LEGACY_Q_BITS_DEFAULT,
+    q_group_size: int = 64,
+    q_bits: int = 4,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
@@ -236,16 +229,12 @@ def convert(
             " Please delete the file/directory or specify a new path to save to."
         )
 
-    # Keep legacy convert() defaults for non-CLI callers, but allow
-    # mode-aware defaults when CLI passes None for unset values.
     default_gs, default_bits = QUANT_MODE_DEFAULTS[q_mode]
     q_group_size_override = (
-        q_group_size
-        if _is_non_default_override(q_group_size, LEGACY_Q_GROUP_SIZE_DEFAULT)
-        else None
+        None if q_group_size in (None, 64) else q_group_size
     )
     q_bits_override = (
-        q_bits if _is_non_default_override(q_bits, LEGACY_Q_BITS_DEFAULT) else None
+        None if q_bits in (None, 4) else q_bits
     )
     warn_mode_override_conflicts(
         q_mode, q_group_size_override, q_bits_override, default_gs, default_bits

@@ -207,7 +207,7 @@ class TestConvertOverridePrecedence(unittest.TestCase):
 
         self.assertEqual(captured["weight_dtype"], mx.float32)
 
-    def test_legacy_defaults_do_not_warn_on_non_affine_mode(self):
+    def test_default_q_args_do_not_warn_on_non_affine_mode(self):
         model = _Wrapper()
 
         def fake_load(*_args, **_kwargs):
