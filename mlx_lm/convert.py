@@ -206,8 +206,8 @@ def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
     quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
+    q_group_size: Optional[int] = None,
+    q_bits: Optional[int] = None,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
@@ -230,15 +230,7 @@ def convert(
         )
 
     default_gs, default_bits = QUANT_MODE_DEFAULTS[q_mode]
-    q_group_size_override = (
-        None if q_group_size in (None, 64) else q_group_size
-    )
-    q_bits_override = (
-        None if q_bits in (None, 4) else q_bits
-    )
-    warn_mode_override_conflicts(
-        q_mode, q_group_size_override, q_bits_override, default_gs, default_bits
-    )
+    warn_mode_override_conflicts(q_mode, q_group_size, q_bits, default_gs, default_bits)
     q_group_size = default_gs if q_group_size is None else q_group_size
     q_bits = default_bits if q_bits is None else q_bits
 

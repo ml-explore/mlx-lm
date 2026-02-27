@@ -147,6 +147,15 @@ class TestModeConflictWarnings(unittest.TestCase):
         self.assertIn("--q-mode mxfp4 default is q-group-size=32, q-bits=4", out.getvalue())
         self.assertIn("q-bits=8", out.getvalue())
 
+    def test_non_affine_group_size_conflict_warns(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            warn_mode_override_conflicts("mxfp4", 64, None, 32, 4)
+        self.assertIn(
+            "--q-mode mxfp4 default is q-group-size=32, q-bits=4", out.getvalue()
+        )
+        self.assertIn("q-group-size=64", out.getvalue())
+
     def test_non_affine_matching_values_no_warning(self):
         out = StringIO()
         with redirect_stdout(out):
@@ -222,7 +231,7 @@ class TestConvertOverridePrecedence(unittest.TestCase):
                         convert("stub/repo", mlx_path=mlx_path, q_mode="mxfp4")
             self.assertNotIn("--q-mode mxfp4 default is", out.getvalue())
 
-    def test_none_q_args_use_mode_defaults(self):
+    def test_default_q_args_use_mode_defaults(self):
         model = _Wrapper()
         captured = {}
 
@@ -254,13 +263,99 @@ class TestConvertOverridePrecedence(unittest.TestCase):
                             mlx_path=mlx_path,
                             quantize=True,
                             q_mode="mxfp4",
-                            q_group_size=None,
-                            q_bits=None,
                         )
 
         self.assertEqual(captured["group_size"], 32)
         self.assertEqual(captured["bits"], 4)
         self.assertEqual(captured["mode"], "mxfp4")
+
+    def test_default_q_args_use_mxfp8_mode_defaults(self):
+        model = _Wrapper()
+        captured = {}
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        def fake_quantize_model(
+            model,
+            config,
+            group_size,
+            bits,
+            mode="affine",
+            quant_predicate=None,
+        ):
+            captured["group_size"] = group_size
+            captured["bits"] = bits
+            captured["mode"] = mode
+            return model, config
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch(
+                    "mlx_lm.convert.quantize_model", side_effect=fake_quantize_model
+                ):
+                    with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            quantize=True,
+                            q_mode="mxfp8",
+                        )
+
+        self.assertEqual(captured["group_size"], 32)
+        self.assertEqual(captured["bits"], 8)
+        self.assertEqual(captured["mode"], "mxfp8")
+
+    def test_explicit_q_bits_warn_on_non_affine_mode(self):
+        model = _Wrapper()
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            out = StringIO()
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                    with redirect_stdout(out):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            q_mode="mxfp8",
+                            q_bits=4,
+                        )
+            self.assertIn(
+                "--q-mode mxfp8 default is q-group-size=32, q-bits=8",
+                out.getvalue(),
+            )
+            self.assertIn("received q-bits=4", out.getvalue())
+            self.assertNotIn("received q-group-size=", out.getvalue())
+
+    def test_explicit_q_group_size_warn_on_non_affine_mode(self):
+        model = _Wrapper()
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            out = StringIO()
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                    with redirect_stdout(out):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            q_mode="mxfp4",
+                            q_group_size=64,
+                        )
+            self.assertIn(
+                "--q-mode mxfp4 default is q-group-size=32, q-bits=4",
+                out.getvalue(),
+            )
+            self.assertIn("received q-group-size=64", out.getvalue())
+            self.assertNotIn("received q-bits=", out.getvalue())
 
 
 if __name__ == "__main__":
