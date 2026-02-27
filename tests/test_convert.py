@@ -207,6 +207,61 @@ class TestConvertOverridePrecedence(unittest.TestCase):
 
         self.assertEqual(captured["weight_dtype"], mx.float32)
 
+    def test_legacy_defaults_do_not_warn_on_non_affine_mode(self):
+        model = _Wrapper()
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            out = StringIO()
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                    with redirect_stdout(out):
+                        convert("stub/repo", mlx_path=mlx_path, q_mode="mxfp4")
+            self.assertNotIn("--q-mode mxfp4 default is", out.getvalue())
+
+    def test_none_q_args_use_mode_defaults(self):
+        model = _Wrapper()
+        captured = {}
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        def fake_quantize_model(
+            model,
+            config,
+            group_size,
+            bits,
+            mode="affine",
+            quant_predicate=None,
+        ):
+            captured["group_size"] = group_size
+            captured["bits"] = bits
+            captured["mode"] = mode
+            return model, config
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch(
+                    "mlx_lm.convert.quantize_model", side_effect=fake_quantize_model
+                ):
+                    with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            quantize=True,
+                            q_mode="mxfp4",
+                            q_group_size=None,
+                            q_bits=None,
+                        )
+
+        self.assertEqual(captured["group_size"], 32)
+        self.assertEqual(captured["bits"], 4)
+        self.assertEqual(captured["mode"], "mxfp4")
+
 
 if __name__ == "__main__":
     unittest.main()

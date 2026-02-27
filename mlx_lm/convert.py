@@ -10,6 +10,7 @@ import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
 from .utils import (
+    QUANT_MODE_DEFAULTS,
     dequantize_model,
     load,
     quantize_model,
@@ -88,11 +89,20 @@ FLOAT_DTYPES = {
     "float32": mx.float32,
 }
 
+LEGACY_Q_GROUP_SIZE_DEFAULT = 64
+LEGACY_Q_BITS_DEFAULT = 4
+
 QUANT_MODES = {
-    "mxfp4": {"group_size": 32, "bits": 4, "mode": "mxfp4"},
-    "nvfp4": {"group_size": 16, "bits": 4, "mode": "nvfp4"},
-    "mxfp8": {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+    mode: {"group_size": group_size, "bits": bits, "mode": mode}
+    for mode, (group_size, bits) in QUANT_MODE_DEFAULTS.items()
+    if mode != "affine"
 }
+
+ParsedOverride = tuple[re.Pattern, Union[int, str]]
+
+
+def _is_non_default_override(value: Optional[int], legacy_default: int) -> bool:
+    return value is not None and value != legacy_default
 
 
 def warn_mode_override_conflicts(
@@ -121,7 +131,7 @@ def warn_mode_override_conflicts(
 
 
 def warn_mixed_mode_overrides(
-    q_mode: str, overrides: list[tuple[re.Pattern, Union[int, str]]]
+    q_mode: str, overrides: list[ParsedOverride]
 ) -> None:
     if q_mode == "affine":
         return
@@ -134,7 +144,7 @@ def warn_mixed_mode_overrides(
     )
 
 
-def parse_overrides(overrides: list[str]) -> list[tuple[re.Pattern, Union[int, str]]]:
+def parse_overrides(overrides: list[str]) -> list[ParsedOverride]:
     parsed = []
     for entry in overrides:
         if "=" not in entry:
@@ -160,7 +170,11 @@ def parse_overrides(overrides: list[str]) -> list[tuple[re.Pattern, Union[int, s
     return parsed
 
 
-def build_override_predicate(overrides, base_predicate, group_size):
+def build_override_predicate(
+    overrides: list[ParsedOverride],
+    base_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]],
+    group_size: int,
+) -> Callable[[str, nn.Module], Union[bool, dict]]:
     def predicate(path, module):
         for regex, value in overrides:
             if regex.search(path):
@@ -176,7 +190,7 @@ def build_override_predicate(overrides, base_predicate, group_size):
     return predicate
 
 
-def apply_float_overrides(model, overrides):
+def apply_float_overrides(model: nn.Module, overrides: list[ParsedOverride]) -> None:
     float_overrides = [(r, FLOAT_DTYPES[v]) for r, v in overrides if v in FLOAT_DTYPES]
     if not float_overrides:
         return
@@ -199,8 +213,8 @@ def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
     quantize: bool = False,
-    q_group_size: Optional[int] = None,
-    q_bits: Optional[int] = None,
+    q_group_size: int = LEGACY_Q_GROUP_SIZE_DEFAULT,
+    q_bits: int = LEGACY_Q_BITS_DEFAULT,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
@@ -222,19 +236,22 @@ def convert(
             " Please delete the file/directory or specify a new path to save to."
         )
 
-    # Resolve mode-aware defaults before building predicates
-    mode_defaults = {
-        "affine": (64, 4),
-        "mxfp4": (32, 4),
-        "nvfp4": (16, 4),
-        "mxfp8": (32, 8),
-    }
-    default_gs, default_bits = mode_defaults[q_mode]
-    warn_mode_override_conflicts(
-        q_mode, q_group_size, q_bits, default_gs, default_bits
+    # Keep legacy convert() defaults for non-CLI callers, but allow
+    # mode-aware defaults when CLI passes None for unset values.
+    default_gs, default_bits = QUANT_MODE_DEFAULTS[q_mode]
+    q_group_size_override = (
+        q_group_size
+        if _is_non_default_override(q_group_size, LEGACY_Q_GROUP_SIZE_DEFAULT)
+        else None
     )
-    q_group_size = q_group_size or default_gs
-    q_bits = q_bits or default_bits
+    q_bits_override = (
+        q_bits if _is_non_default_override(q_bits, LEGACY_Q_BITS_DEFAULT) else None
+    )
+    warn_mode_override_conflicts(
+        q_mode, q_group_size_override, q_bits_override, default_gs, default_bits
+    )
+    q_group_size = default_gs if q_group_size is None else q_group_size
+    q_bits = default_bits if q_bits is None else q_bits
 
     print("[INFO] Loading")
     model, tokenizer, config = load(
@@ -279,6 +296,7 @@ def convert(
 
         model.update(tree_map_with_path(set_dtype, model.parameters()))
 
+    # Apply float overrides last so per-layer dtype rules win over global --dtype.
     if parsed_overrides:
         apply_float_overrides(model, parsed_overrides)
 
@@ -354,7 +372,7 @@ def configure_parser() -> argparse.ArgumentParser:
         help="The quantization mode.",
         type=str,
         default="affine",
-        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        choices=list(QUANT_MODE_DEFAULTS),
     )
     parser.add_argument(
         "--quant-predicate",

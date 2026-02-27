@@ -56,6 +56,13 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+QUANT_MODE_DEFAULTS = {
+    "affine": (64, 4),
+    "mxfp4": (32, 4),
+    "nvfp4": (16, 4),
+    "mxfp8": (32, 8),
+}
+
 
 def _unpack_awq_weights(qweight: mx.array) -> mx.array:
     bits = 4
@@ -784,14 +791,12 @@ def quantize_model(
     """
 
     def defaults_for_mode(mode, group_size, bits):
-        mode_defaults = {
-            "affine": (64, 4),
-            "mxfp4": (32, 4),
-            "nvfp4": (16, 4),
-            "mxfp8": (32, 8),
-        }
-        default_group_size, default_bits = mode_defaults[mode]
-        return group_size or default_group_size, bits or default_bits
+        default_group_size, default_bits = QUANT_MODE_DEFAULTS[mode]
+        resolved_group_size = (
+            default_group_size if group_size is None else group_size
+        )
+        resolved_bits = default_bits if bits is None else bits
+        return resolved_group_size, resolved_bits
 
     quantized_config = copy.deepcopy(config)
 
