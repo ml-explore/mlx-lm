@@ -1712,6 +1712,22 @@ class APIHandler(BaseHTTPRequestHandler):
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)
 
+        def get_context_length(repo):
+            """Read max_position_embeddings from model config.json."""
+            try:
+                for f in repo.refs["main"].files:
+                    if f.file_path.name == "config.json":
+                        with open(f.file_path) as fh:
+                            config = json.load(fh)
+                        for key in ("max_position_embeddings",):
+                            if key in config:
+                                return config[key]
+                            if "text_config" in config and key in config["text_config"]:
+                                return config["text_config"][key]
+            except Exception:
+                pass
+            return None
+
         # Scan the cache directory for downloaded mlx models
         hf_cache_info = scan_cache_dir()
         downloaded_models = [
@@ -1719,26 +1735,40 @@ class APIHandler(BaseHTTPRequestHandler):
         ]
 
         # Create a list of available models
-        models = [
-            {
+        models = []
+        for repo in downloaded_models:
+            model_info = {
                 "id": repo.repo_id,
                 "object": "model",
                 "created": self.created,
             }
-            for repo in downloaded_models
-        ]
+            ctx_len = get_context_length(repo)
+            if ctx_len is not None:
+                model_info["context_length"] = ctx_len
+            models.append(model_info)
 
         if self.response_generator.cli_args.model:
             model_path = Path(self.response_generator.cli_args.model)
             if model_path.exists():
                 model_id = str(model_path.resolve())
-                models.append(
-                    {
-                        "id": model_id,
-                        "object": "model",
-                        "created": self.created,
-                    }
-                )
+                model_info = {
+                    "id": model_id,
+                    "object": "model",
+                    "created": self.created,
+                }
+                try:
+                    with open(model_path / "config.json") as fh:
+                        config = json.load(fh)
+                    for key in ("max_position_embeddings",):
+                        if key in config:
+                            model_info["context_length"] = config[key]
+                            break
+                        if "text_config" in config and key in config["text_config"]:
+                            model_info["context_length"] = config["text_config"][key]
+                            break
+                except Exception:
+                    pass
+                models.append(model_info)
 
         response = {"object": "list", "data": models}
 
