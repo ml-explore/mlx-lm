@@ -3,8 +3,10 @@
 import http
 import io
 import json
+import sys
 import threading
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -15,6 +17,7 @@ from mlx_lm.server import (
     LRUPromptCache,
     ResponseGenerator,
     is_metal_oom_error,
+    projected_kv_bytes,
 )
 from mlx_lm.utils import load
 
@@ -51,6 +54,11 @@ class DummyModelProvider:
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
+                "max_active_kv_bytes": None,
+                "max_kv_size": None,
+                "kv_bits": None,
+                "kv_group_size": 64,
+                "quantized_kv_start": 0,
             },
         )
 
@@ -66,12 +74,16 @@ class DummyModelProvider:
 
 
 class MockCache:
-    def __init__(self, value):
+    def __init__(self, value, size=None):
         self.value = value
+        self._size = len(value) if size is None else size
 
     @property
     def nbytes(self):
         return len(self.value)
+
+    def size(self):
+        return self._size
 
     def __eq__(self, other):
         return other.value == self.value
@@ -584,6 +596,55 @@ class TestErrorStatusCodes(unittest.TestCase):
             )
         )
         self.assertFalse(is_metal_oom_error(RuntimeError("other runtime failure")))
+
+
+class TestKVBudgeting(unittest.TestCase):
+    def test_projected_kv_bytes_without_growth(self):
+        cache = [MockCache("abcd", size=0)]
+        self.assertEqual(projected_kv_bytes(cache, 10), 4)
+
+    def test_projected_kv_bytes_with_growth(self):
+        cache = [MockCache("abcdef", size=3)]
+        # 6 bytes over 3 tokens => 2 bytes/token
+        self.assertEqual(projected_kv_bytes(cache, 5), 16)
+
+
+class TestBatchability(unittest.TestCase):
+    def _make_response_generator(self, is_batchable=True, kv_bits=None):
+        rg = ResponseGenerator.__new__(ResponseGenerator)
+        rg.model_provider = type(
+            "obj",
+            (),
+            {
+                "is_batchable": is_batchable,
+                "cli_args": type("obj", (), {"kv_bits": kv_bits}),
+            },
+        )()
+        return rg
+
+    def test_kv_quantization_disables_batching(self):
+        rg = self._make_response_generator(is_batchable=True, kv_bits=4)
+        self.assertFalse(rg._is_batchable(type("obj", (), {"seed": None})()))
+
+    def test_batching_enabled_without_kv_quantization(self):
+        rg = self._make_response_generator(is_batchable=True, kv_bits=None)
+        self.assertTrue(rg._is_batchable(type("obj", (), {"seed": None})()))
+
+
+class TestCLIValidation(unittest.TestCase):
+    def test_reject_max_kv_size_with_kv_bits(self):
+        from mlx_lm import server as server_module
+
+        argv = [
+            "mlx_lm.server",
+            "--max-kv-size",
+            "1024",
+            "--kv-bits",
+            "4",
+        ]
+        with patch.object(sys, "argv", argv):
+            with self.assertRaisesRegex(ValueError, "cannot be used with --kv-bits"):
+                server_module.main()
 
 
 if __name__ == "__main__":

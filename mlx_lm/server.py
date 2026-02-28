@@ -34,7 +34,12 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, generation_stream, stream_generate
+from .generate import (
+    BatchGenerator,
+    generation_stream,
+    maybe_quantize_kv_cache,
+    stream_generate,
+)
 from .models.cache import (
     can_trim_prompt_cache,
     make_prompt_cache,
@@ -70,6 +75,21 @@ def is_metal_oom_error(error: Exception) -> bool:
         "mps backend out of memory",
     )
     return any(pattern in text for pattern in patterns)
+
+
+def projected_kv_bytes(prompt_cache: List[Any], extra_tokens: int) -> int:
+    cache_bytes = sum(c.nbytes for c in prompt_cache)
+    if cache_bytes <= 0 or extra_tokens <= 0:
+        return cache_bytes
+
+    cache_tokens = max(
+        (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
+    )
+    if cache_tokens <= 0:
+        return cache_bytes
+
+    bytes_per_token = cache_bytes / cache_tokens
+    return cache_bytes + int(bytes_per_token * extra_tokens)
 
 
 class StopCondition(NamedTuple):
@@ -730,8 +750,43 @@ class ResponseGenerator:
             return False
         if args.seed is not None:
             return False
+        if self.model_provider.cli_args.kv_bits is not None:
+            return False
 
         return True
+
+    def _make_prompt_cache(self, model, draft_model=None):
+        cache = make_prompt_cache(
+            model,
+            max_kv_size=self.model_provider.cli_args.max_kv_size,
+        )
+        if draft_model is not None:
+            cache += make_prompt_cache(
+                draft_model,
+                max_kv_size=self.model_provider.cli_args.max_kv_size,
+            )
+        if self.model_provider.cli_args.kv_bits is not None:
+            maybe_quantize_kv_cache(
+                cache,
+                quantized_kv_start=self.model_provider.cli_args.quantized_kv_start,
+                kv_group_size=self.model_provider.cli_args.kv_group_size,
+                kv_bits=self.model_provider.cli_args.kv_bits,
+            )
+        return cache
+
+    def _memory_admission_error(
+        self, prompt_cache: List[Any], extra_tokens: int, active_bytes: int = 0
+    ) -> Optional[str]:
+        limit = self.model_provider.cli_args.max_active_kv_bytes
+        if limit is None:
+            return None
+        projected = active_bytes + projected_kv_bytes(prompt_cache, extra_tokens)
+        if projected <= limit:
+            return None
+        return (
+            "Projected KV memory usage exceeds configured active KV limit. "
+            f"projected={projected} bytes, limit={limit} bytes"
+        )
 
     def _generate(self):
         current_model = None
@@ -808,7 +863,16 @@ class ResponseGenerator:
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
-                        cache = make_prompt_cache(self.model_provider.model)
+                        cache = self._make_prompt_cache(self.model_provider.model)
+
+                    admission_error = self._memory_admission_error(
+                        cache,
+                        len(rest) + args.max_tokens,
+                        batch_generator.prompt_cache_nbytes,
+                    )
+                    if admission_error is not None:
+                        rqueue.put(MemoryError(admission_error))
+                        continue
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
@@ -863,6 +927,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
+                        max_kv_size=self.cli_args.max_kv_size,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -1004,9 +1069,16 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+                cache = self._make_prompt_cache(
+                    self.model_provider.model, self.model_provider.draft_model
+                )
+
+            admission_error = self._memory_admission_error(
+                cache,
+                len(rest) + args.max_tokens,
+            )
+            if admission_error is not None:
+                raise MemoryError(admission_error)
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
             logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
@@ -1023,6 +1095,10 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                max_kv_size=self.cli_args.max_kv_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 rqueue.put(
                     Response(
@@ -1951,11 +2027,49 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--max-active-kv-bytes",
+        type=parse_size,
+        help=(
+            "Reject requests when projected active KV memory would exceed this limit "
+            "(bytes or shorthand like 20G)"
+        ),
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum size of the active KV cache per sequence",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Number of bits for KV cache quantization (4 or 8)",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Step to begin using quantized KV cache",
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    if args.max_kv_size is not None and args.kv_bits is not None:
+        raise ValueError(
+            "--max-kv-size cannot be used with --kv-bits yet "
+            "(rotating+quantized cache support is not implemented)."
+        )
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
