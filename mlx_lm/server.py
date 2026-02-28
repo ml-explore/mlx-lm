@@ -61,6 +61,17 @@ def parse_size(x):
     return int(digits * sizes[size])
 
 
+def is_metal_oom_error(error: Exception) -> bool:
+    text = str(error).lower()
+    patterns = (
+        "out of memory",
+        "insufficient memory",
+        "kiogpucommandbuffercallbackerroroutofmemory",
+        "mps backend out of memory",
+    )
+    return any(pattern in text for pattern in patterns)
+
+
 class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
@@ -877,53 +888,71 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
-                for _ in self._time_budget:
-                    responses = batch_generator.next()
-                    if not responses:
-                        break
+                try:
+                    for _ in self._time_budget:
+                        responses = batch_generator.next()
+                        if not responses:
+                            break
 
-                    for r in responses:
-                        result = batch_results[r.uid]
-                        result["cache_key"].append(r.token)
-                        if r.finish_reason != "stop":
-                            result["detokenizer"].add_token(r.token)
+                        for r in responses:
+                            result = batch_results[r.uid]
+                            result["cache_key"].append(r.token)
+                            if r.finish_reason != "stop":
+                                result["detokenizer"].add_token(r.token)
 
-                        result["rqueue"].put(
-                            Response(
-                                result["detokenizer"].last_segment,
-                                r.token,
-                                r.logprobs[r.token].item(),
-                                r.finish_reason,
-                                _format_top_logprobs(
-                                    r.logprobs, args.top_logprobs, current_tokenizer
-                                ),
+                            result["rqueue"].put(
+                                Response(
+                                    result["detokenizer"].last_segment,
+                                    r.token,
+                                    r.logprobs[r.token].item(),
+                                    r.finish_reason,
+                                    _format_top_logprobs(
+                                        r.logprobs, args.top_logprobs, current_tokenizer
+                                    ),
+                                )
                             )
-                        )
 
-                        if r.finish_reason is not None:
-                            result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
+                            if r.finish_reason is not None:
+                                result["rqueue"].put(None)
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    result["cache_key"],
+                                    r.prompt_cache,
+                                )
+                                del batch_results[r.uid]
+
+                            if result["ctx"]._should_stop:
+                                uids_to_remove.append(r.uid)
+
+                    uids_to_remove = self._share_object(uids_to_remove)
+                    if uids_to_remove:
+                        with mx.stream(generation_stream):
+                            caches = batch_generator.remove(
+                                uids_to_remove, return_prompt_caches=True
                             )
-                            del batch_results[r.uid]
-
-                        if result["ctx"]._should_stop:
-                            uids_to_remove.append(r.uid)
-
-                uids_to_remove = self._share_object(uids_to_remove)
-                if uids_to_remove:
-                    with mx.stream(generation_stream):
-                        caches = batch_generator.remove(
-                            uids_to_remove, return_prompt_caches=True
-                        )
-                        for uid, prompt_cache in caches.items():
-                            if uid not in batch_results:
-                                continue
-                            result = batch_results[uid]
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], prompt_cache
-                            )
-                            del batch_results[uid]
+                            for uid, prompt_cache in caches.items():
+                                if uid not in batch_results:
+                                    continue
+                                result = batch_results[uid]
+                                self.prompt_cache.insert_cache(
+                                    current_model_key, result["cache_key"], prompt_cache
+                                )
+                                del batch_results[uid]
+                except Exception as e:
+                    logging.exception("Batched generation failed")
+                    if is_metal_oom_error(e):
+                        mx.clear_cache()
+                    for result in batch_results.values():
+                        result["rqueue"].put(e)
+                        result["rqueue"].put(None)
+                    batch_results = {}
+                    current_model = None
+                    current_sampling = None
+                    current_tokenizer = None
+                    current_model_key = None
+                    batch_generator.close()
+                    batch_generator = None
+                    drain_batch = False
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -1021,6 +1050,8 @@ class ResponseGenerator:
             )
 
         except Exception as e:
+            if is_metal_oom_error(e):
+                mx.clear_cache()
             rqueue.put(e)
 
     def generate(
@@ -1406,7 +1437,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
+            status_code = 503 if is_metal_oom_error(e) else 500
+            self._set_completion_headers(status_code)
             self.end_headers()
             self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
@@ -1788,7 +1820,10 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache = LRUPromptCache(
+        model_provider.cli_args.prompt_cache_size,
+        model_provider.cli_args.prompt_cache_bytes or (1 << 63),
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)

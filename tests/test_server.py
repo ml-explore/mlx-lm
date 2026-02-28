@@ -10,7 +10,12 @@ import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    ResponseGenerator,
+    is_metal_oom_error,
+)
 from mlx_lm.utils import load
 
 
@@ -510,6 +515,75 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class FailingResponseGenerator:
+    def __init__(self, exc):
+        self.exc = exc
+        self.cli_args = type(
+            "obj",
+            (object,),
+            {
+                "num_draft_tokens": 3,
+                "max_tokens": 32,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "model": None,
+            },
+        )
+
+    def generate(self, *args, **kwargs):
+        raise self.exc
+
+
+class TestErrorStatusCodes(unittest.TestCase):
+    def _run_request(self, exc):
+        response_generator = FailingResponseGenerator(exc)
+        httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(response_generator, *args, **kwargs),
+        )
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        try:
+            url = f"http://localhost:{httpd.server_port}/v1/completions"
+            return requests.post(
+                url,
+                json={
+                    "model": "default_model",
+                    "prompt": "test",
+                    "max_tokens": 2,
+                },
+            )
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server_thread.join()
+
+    def test_oom_maps_to_service_unavailable(self):
+        response = self._run_request(
+            RuntimeError(
+                "[METAL] Command buffer execution failed: Insufficient Memory "
+                "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+            )
+        )
+        self.assertEqual(response.status_code, 503)
+
+    def test_non_oom_maps_to_internal_server_error(self):
+        response = self._run_request(RuntimeError("arbitrary failure"))
+        self.assertEqual(response.status_code, 500)
+
+    def test_is_metal_oom_error(self):
+        self.assertTrue(is_metal_oom_error(RuntimeError("out of memory")))
+        self.assertTrue(
+            is_metal_oom_error(
+                RuntimeError("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+            )
+        )
+        self.assertFalse(is_metal_oom_error(RuntimeError("other runtime failure")))
 
 
 if __name__ == "__main__":
