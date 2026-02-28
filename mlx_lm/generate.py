@@ -951,6 +951,9 @@ class BatchGenerator:
         prompt_progress_callback: Optional[
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
+        prompt_checkpoint_callback: Optional[
+            Callable[[int, List[int], List[Any]], None]
+        ] = None,
         max_kv_size: Optional[int] = None,
     ):
         self.model = model
@@ -964,6 +967,7 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+        self.prompt_checkpoint_callback = prompt_checkpoint_callback
         self._stats = BatchStats()
         self._next_count = 0
         self.max_kv_size = max_kv_size
@@ -993,11 +997,15 @@ class BatchGenerator:
         caches=None,
         samplers: list | None = None,
         logits_processors: list | None = None,
+        prompt_checkpoints: list | int = -1,
     ):
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
+
+        if isinstance(prompt_checkpoints, int):
+            prompt_checkpoints = [prompt_checkpoints] * len(prompts)
 
         if caches is None:
             caches = [None] * len(prompts)
@@ -1008,10 +1016,10 @@ class BatchGenerator:
         samplers = samplers or [None] * len(prompts)
         logits_processors = logits_processors or [self.logits_processors] * len(prompts)
 
-        for p, m, c, s, lp in zip(
-            prompts, max_tokens, caches, samplers, logits_processors
+        for p, m, c, s, lp, pc in zip(
+            prompts, max_tokens, caches, samplers, logits_processors, prompt_checkpoints
         ):
-            self.unprocessed_prompts.append((self.uid_count, p, m, c, s, lp))
+            self.unprocessed_prompts.append((self.uid_count, p, m, c, s, lp, pc))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -1052,11 +1060,26 @@ class BatchGenerator:
         return total
 
     def _process_prompts(self, prompts):
-        uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
+        (
+            uids,
+            inputs,
+            max_tokens,
+            caches,
+            samplers,
+            logits_processors,
+            prompt_checkpoints,
+        ) = zip(*prompts)
 
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
         padding = [max_length - l for l in lengths]
+
+        # We will stop to call the checkpoint callback at least
+        # 'prompt_checkpoint' tokens before the end of the prompt
+        prompt_checkpoints = [
+            (l - pc if pc > 0 else -pc) for l, pc in zip(lengths, prompt_checkpoints)
+        ]
+        prompt_checkpoint = max(1, max(prompt_checkpoints))
 
         self._stats.prompt_tokens += sum(lengths)
 
@@ -1070,8 +1093,10 @@ class BatchGenerator:
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
 
-            while inputs.shape[1] > 1:
-                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+            while inputs.shape[1] > prompt_checkpoint:
+                n_to_process = min(
+                    self.prefill_step_size, inputs.shape[1] - prompt_checkpoint
+                )
                 self.model(inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
@@ -1090,16 +1115,23 @@ class BatchGenerator:
         #   2. Process
         #   3. Finalize the KV caches so they are left padded again
         else:
-            last_inputs = mx.array([p[-1:] for p in inputs])
+            last_inputs = mx.array([p[-prompt_checkpoint:] for p in inputs])
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
+            del prompts, caches
 
             for c in prompt_cache:
-                # subtract one from lengths since we don't process the last token during prefill
-                c.prepare(lengths=[l - 1 for l in lengths], right_padding=padding)
+                # subtract from lengths since we don't process the last
+                # prompt_checkpoint tokens during prefill
+                c.prepare(
+                    lengths=[l - prompt_checkpoint for l in lengths],
+                    right_padding=padding,
+                )
 
-            while inputs.shape[1] > 1:
-                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+            while inputs.shape[1] > prompt_checkpoint:
+                n_to_process = min(
+                    self.prefill_step_size, inputs.shape[1] - prompt_checkpoint
+                )
                 self.model(inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
@@ -1117,7 +1149,19 @@ class BatchGenerator:
 
         for c in prompt_cache:
             c.finalize()
+        if self.prompt_checkpoint_callback is not None:
+            self.prompt_checkpoint_callback(
+                [
+                    (uid, -prompt_checkpoint, (c.extract(i) for c in prompt_cache))
+                    for i, uid in enumerate(uids)
+                ]
+            )
         mx.clear_cache()
+
+        # Process the remaining prompt_checkpoint - 1 tokens
+        if prompt_checkpoint > 1:
+            self.model(inputs[:, : prompt_checkpoint - 1], cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
 
         y, logprobs = self._step(
             inputs, prompt_cache, samplers, logits_processors, tokens
@@ -1203,10 +1247,10 @@ class BatchGenerator:
                 self._stats.generation_time += time.perf_counter() - tic
                 tic = time.perf_counter()
 
-            batch = self._process_prompts(prompts)
             self.unprocessed_prompts = self.unprocessed_prompts[
                 self.prefill_batch_size :
             ]
+            batch = self._process_prompts(prompts)
             prompt_processing = True
             # If there was no active batch, set it
             if self.active_batch is None:
