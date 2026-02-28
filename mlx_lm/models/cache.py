@@ -1124,10 +1124,6 @@ class BatchRotatingKVCache(_BaseCache):
         self.offset += keys.shape[2]
         self._offset += keys.shape[2]
         self._idx = self.keys.shape[2]
-
-        # Make sure left_padding and offset are evaluated
-        self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
-
         return self.keys, self.values
 
     def _update_in_place(self, keys, values):
@@ -1177,9 +1173,6 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset += S
         self.offset += S
         self._idx += S
-
-        # Make sure left_padding and offset are evaluated
-        self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
 
         # If the buffer is not full, slice off the end
         if self._offset < self.max_size:
