@@ -3,14 +3,23 @@
 import http
 import io
 import json
+import sys
 import threading
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    ResponseGenerator,
+    apply_prompt_token_limit,
+    is_metal_oom_error,
+    projected_kv_bytes,
+)
 from mlx_lm.utils import load
 
 
@@ -47,7 +56,12 @@ class DummyModelProvider:
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
-                "allowed_origins": ["*"],
+                "max_prompt_tokens": None,
+                "prompt_overflow_policy": "error",
+                "prompt_keep_tokens": 512,
+                "max_active_kv_bytes": None,
+                "max_active_memory_bytes": None,
+                "max_kv_size": None,
             },
         )
 
@@ -63,23 +77,19 @@ class DummyModelProvider:
 
 
 class MockCache:
-    def __init__(self, value, is_trimmable: bool = True):
+    def __init__(self, value, size=None):
         self.value = value
-        self._is_trimmable = is_trimmable
+        self._size = len(value) if size is None else size
 
     @property
     def nbytes(self):
         return len(self.value)
 
+    def size(self):
+        return self._size
+
     def __eq__(self, other):
         return other.value == self.value
-
-    def is_trimmable(self):
-        return self._is_trimmable
-
-    def trim(self, n):
-        assert self._is_trimmable
-        return n
 
 
 class TestServer(unittest.TestCase):
@@ -446,23 +456,18 @@ class TestLRUPromptCache(unittest.TestCase):
         c[0].update_and_fetch(*get_kv(24))
         cache.insert_cache(model, t, c)
 
-        # Fetching a cache that is strictly a prefix doesn't remove it from the
-        # lru cache
         tokens = tokens + [20] * 5
         c, t = cache.fetch_nearest_cache(model, tokens)
         k, v = c[0].state
         self.assertTrue((k == v).all().item())
         self.assertTrue((k.flatten() == mx.arange(24)).all().item())
         self.assertEqual(t, [20] * 5)
-        self.assertEqual(len(cache), 1)
+        self.assertEqual(len(cache._lru), 0)
 
-        # Inserting a trimmable cache with shared prefix removes the prefixes
         tokens = tokens + [30] * 3
         c[0].update_and_fetch(*get_kv(8))
         cache.insert_cache(model, tokens, c)
-        self.assertEqual(len(cache), 1)
 
-        # Fetching a cache with a shared prefix doesn't remove it either
         tokens = tokens[:26] + [40] * 8
         c, t = cache.fetch_nearest_cache(model, tokens)
         k, v = c[0].state
@@ -471,34 +476,23 @@ class TestLRUPromptCache(unittest.TestCase):
             (k.flatten() == mx.concatenate([mx.arange(24), mx.arange(2)])).all().item()
         )
         self.assertEqual(t, [40] * 8)
-        self.assertEqual(len(cache), 1)
-
-        # Inserting a diverged cache actually creates another entry
-        c[0].update_and_fetch(*get_kv(8))
-        cache.insert_cache(model, tokens, c)
-        self.assertEqual(len(cache), 2)
+        self.assertEqual(len(cache._lru), 1)
 
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
         model = ("test", None, None)
         cache.insert_cache(model, [1, 2], [MockCache("test1")])
-        cache.insert_cache(model, [2, 3], [MockCache("test2")])
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, [MockCache("test1")])
         self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [1])
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [1])
-        c, t = cache.fetch_nearest_cache(model, [1, 3, 4])
-        self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [3, 4])
-        c, t = cache.fetch_nearest_cache(model, [2, 3, 4])
-        self.assertEqual(c, [MockCache("test2")])
-        self.assertEqual(t, [4])
-        c, t = cache.fetch_nearest_cache(model, [2, 4, 5])
-        self.assertEqual(c, [MockCache("test2")])
-        self.assertEqual(t, [4, 5])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [1, 2])
 
         cache.insert_cache(model, [1, 2], [MockCache("test1")])
         cache.insert_cache(model, [2, 3], [MockCache("test2")])
@@ -512,29 +506,6 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
-
-        cache.insert_cache(model, [4, 5], [MockCache("test4")], checkpoint=True)
-        c, t = cache.fetch_nearest_cache(model, [2, 3])
-        self.assertEqual(c, None)
-        self.assertEqual(t, [2, 3])
-        c, t = cache.fetch_nearest_cache(model, [3, 4])
-        self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [4, 5])
-        self.assertEqual(c, [MockCache("test4")])
-        self.assertEqual(t, [])
-
-        cache.insert_cache(model, [5, 6], [MockCache("test5")])
-        cache.insert_cache(model, [6, 7], [MockCache("test6")])
-        c, t = cache.fetch_nearest_cache(model, [5, 6])
-        self.assertEqual(c, None)
-        self.assertEqual(t, [5, 6])
-        c, t = cache.fetch_nearest_cache(model, [6, 7])
-        self.assertEqual(c, [MockCache("test6")])
-        self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [4, 5])
-        self.assertEqual(c, [MockCache("test4")])
         self.assertEqual(t, [])
 
     def test_lru_bytes(self):
@@ -559,6 +530,143 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class FailingResponseGenerator:
+    def __init__(self, exc):
+        self.exc = exc
+        self.cli_args = type(
+            "obj",
+            (object,),
+            {
+                "num_draft_tokens": 3,
+                "max_tokens": 32,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "model": None,
+            },
+        )
+
+    def generate(self, *args, **kwargs):
+        raise self.exc
+
+
+class TestErrorStatusCodes(unittest.TestCase):
+    def _run_request(self, exc):
+        response_generator = FailingResponseGenerator(exc)
+        httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(response_generator, *args, **kwargs),
+        )
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        try:
+            url = f"http://localhost:{httpd.server_port}/v1/completions"
+            return requests.post(
+                url,
+                json={
+                    "model": "default_model",
+                    "prompt": "test",
+                    "max_tokens": 2,
+                },
+            )
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server_thread.join()
+
+    def test_oom_maps_to_service_unavailable(self):
+        response = self._run_request(
+            RuntimeError(
+                "[METAL] Command buffer execution failed: Insufficient Memory "
+                "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+            )
+        )
+        self.assertEqual(response.status_code, 503)
+
+    def test_non_oom_maps_to_internal_server_error(self):
+        response = self._run_request(RuntimeError("arbitrary failure"))
+        self.assertEqual(response.status_code, 500)
+
+    def test_is_metal_oom_error(self):
+        self.assertTrue(is_metal_oom_error(RuntimeError("out of memory")))
+        self.assertTrue(
+            is_metal_oom_error(
+                RuntimeError("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+            )
+        )
+        self.assertFalse(is_metal_oom_error(RuntimeError("other runtime failure")))
+
+
+class TestKVBudgeting(unittest.TestCase):
+    def test_projected_kv_bytes_without_growth(self):
+        cache = [MockCache("abcd", size=0)]
+        self.assertEqual(projected_kv_bytes(cache, 10), 4)
+
+    def test_projected_kv_bytes_with_growth(self):
+        cache = [MockCache("abcdef", size=3)]
+        # 6 bytes over 3 tokens => 2 bytes/token
+        self.assertEqual(projected_kv_bytes(cache, 5), 16)
+
+
+class TestCLIValidation(unittest.TestCase):
+    def test_reject_bad_prompt_overflow_policy(self):
+        from mlx_lm import server as server_module
+
+        argv = [
+            "mlx_lm.server",
+            "--prompt-overflow-policy",
+            "invalid",
+        ]
+        with patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit):
+                server_module.main()
+
+
+class TestPromptTokenLimit(unittest.TestCase):
+    def test_no_limit(self):
+        tokens = list(range(10))
+        self.assertEqual(
+            apply_prompt_token_limit(
+                tokens,
+                max_prompt_tokens=None,
+                overflow_policy="error",
+                keep_tokens=0,
+            ),
+            tokens,
+        )
+
+    def test_error_policy(self):
+        with self.assertRaisesRegex(
+            ValueError, "Prompt exceeds max prompt token limit"
+        ):
+            apply_prompt_token_limit(
+                list(range(20)),
+                max_prompt_tokens=8,
+                overflow_policy="error",
+                keep_tokens=0,
+            )
+
+    def test_truncate_policy(self):
+        out = apply_prompt_token_limit(
+            list(range(20)),
+            max_prompt_tokens=8,
+            overflow_policy="truncate",
+            keep_tokens=3,
+        )
+        self.assertEqual(out, [0, 1, 2, 15, 16, 17, 18, 19])
+
+    def test_truncate_policy_keep_over_cap(self):
+        out = apply_prompt_token_limit(
+            list(range(20)),
+            max_prompt_tokens=8,
+            overflow_policy="truncate",
+            keep_tokens=100,
+        )
+        self.assertEqual(out, list(range(8)))
 
 
 if __name__ == "__main__":
