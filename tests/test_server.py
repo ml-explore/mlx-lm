@@ -8,6 +8,7 @@ import unittest
 
 import mlx.core as mx
 import requests
+import time
 
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
@@ -94,6 +95,55 @@ class TestServer(unittest.TestCase):
         cls.httpd.server_close()
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
+
+    def test_handle_chunked_request(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+
+        post_data = {
+            "model": "default_model",
+            "prompt": "Once upon a time",
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "stream": False,
+            "top_p": 1.0,
+        }
+
+        # chunked request
+        data_parts = [
+            b'{"model": "default_model", "messages": [{"role": "user", "content": "Once',
+            b' upon a times, Once upon ',
+            b'a time"}], "temperature": 0.8, "max_tokens": 1024, "stream": false}',
+        ]
+
+        max_length = 0
+        for part in data_parts:
+            max_length += len(part)
+
+        def data_generator():
+            for part in data_parts:
+                yield part
+                time.sleep(0.1)
+
+        try:
+            response = requests.post(
+                url,
+                data=data_generator(),
+                headers={
+                    "Transfer-Encoding": "chunked",
+                    "Content-Type": "application/json",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+        except requests.exceptions.RequestException:
+            self.assertTrue(False, "Chunked request failed")
+
+        response_body = json.loads(response.text)
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+        self.assertIn("usage", response_body) 
+
+        # Check that tokens were generated
+        self.assertTrue(response_body["usage"]["completion_tokens"] > 0)
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
