@@ -400,6 +400,43 @@ class TestConvertOverridePrecedence(unittest.TestCase):
         self.assertEqual(captured["override"]["bits"], 8)
         self.assertEqual(captured["override"]["group_size"], 64)
 
+    def test_affine_mode_quant_mode_override_uses_mode_defaults(self):
+        model = _Wrapper()
+        captured = {}
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        def fake_quantize_model(
+            model,
+            config,
+            group_size,
+            bits,
+            mode="affine",
+            quant_predicate=None,
+        ):
+            captured["override"] = quant_predicate("model.layers.0.mlp.down_proj", None)
+            return model, config
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch(
+                    "mlx_lm.convert.quantize_model", side_effect=fake_quantize_model
+                ):
+                    with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            quantize=True,
+                            q_mode="affine",
+                            q_overrides=["down_proj=mxfp4"],
+                        )
+
+        self.assertEqual(captured["override"]["mode"], "mxfp4")
+        self.assertEqual(captured["override"]["bits"], 4)
+        self.assertEqual(captured["override"]["group_size"], 32)
+
 
 if __name__ == "__main__":
     unittest.main()
