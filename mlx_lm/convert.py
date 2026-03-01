@@ -9,6 +9,7 @@ import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
 from .utils import (
+    QUANT_MODE_DEFAULTS,
     dequantize_model,
     load,
     quantize_model,
@@ -86,8 +87,8 @@ def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
     quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
+    q_group_size: Optional[int] = None,
+    q_bits: Optional[int] = None,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
@@ -107,6 +108,10 @@ def convert(
             f"Cannot save to the path {mlx_path} as it already exists."
             " Please delete the file/directory or specify a new path to save to."
         )
+
+    default_gs, default_bits = QUANT_MODE_DEFAULTS[q_mode]
+    q_group_size = default_gs if q_group_size is None else q_group_size
+    q_bits = default_bits if q_bits is None else q_bits
 
     print("[INFO] Loading")
     model, tokenizer, config = load(
@@ -215,7 +220,7 @@ def configure_parser() -> argparse.ArgumentParser:
         help="The quantization mode.",
         type=str,
         default="affine",
-        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        choices=list(QUANT_MODE_DEFAULTS),
     )
     parser.add_argument(
         "--quant-predicate",
