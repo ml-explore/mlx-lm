@@ -56,6 +56,13 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+QUANT_MODE_DEFAULTS = {
+    "affine": (64, 4),
+    "mxfp4": (32, 4),
+    "nvfp4": (16, 4),
+    "mxfp8": (32, 8),
+}
+
 
 def _unpack_awq_weights(qweight: mx.array) -> mx.array:
     bits = 4
@@ -783,20 +790,12 @@ def quantize_model(
         Tuple: Tuple containing quantized model and config.
     """
 
-    def defaults_for_mode(mode, group_size, bits):
-        mode_defaults = {
-            "affine": (64, 4),
-            "mxfp4": (32, 4),
-            "nvfp4": (16, 4),
-            "mxfp8": (32, 8),
-        }
-        default_group_size, default_bits = mode_defaults[mode]
-        return group_size or default_group_size, bits or default_bits
-
     quantized_config = copy.deepcopy(config)
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
-    group_size, bits = defaults_for_mode(mode, group_size, bits)
+    default_group_size, default_bits = QUANT_MODE_DEFAULTS[mode]
+    group_size = default_group_size if group_size is None else group_size
+    bits = default_bits if bits is None else bits
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
@@ -804,20 +803,30 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
-        if module.weight.shape[-1] % group_size != 0:
-            return False
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+
+        if bool_or_params is False:
+            return False
+
+        effective_params = dict(quant_params)
         if isinstance(bool_or_params, dict):
-            quantized_config["quantization"][path] = bool_or_params
+            effective_params.update(bool_or_params)
+
+        if module.weight.shape[-1] % effective_params["group_size"] != 0:
+            return False
+
+        if isinstance(bool_or_params, dict):
+            quantized_config["quantization"][path] = dict(effective_params)
+            return effective_params
         elif fine_grained_config and bool_or_params:
-            quantized_config["quantization"][path] = quant_params
+            quantized_config["quantization"][path] = dict(quant_params)
         return bool_or_params
 
     nn.quantize(
@@ -827,6 +836,7 @@ def quantize_model(
         mode=mode,
         class_predicate=wrapped_predicate,
     )
+
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
 
