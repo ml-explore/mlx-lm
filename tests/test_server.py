@@ -11,7 +11,7 @@ from unittest.mock import patch
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
@@ -607,6 +607,10 @@ class TestKVBudgeting(unittest.TestCase):
         cache = [MockCache("abcdef", size=3)]
         # 6 bytes over 3 tokens => 2 bytes/token
         self.assertEqual(projected_kv_bytes(cache, 5), 16)
+
+    def test_quantized_cache_nbytes_empty(self):
+        cache = QuantizedKVCache()
+        self.assertEqual(cache.nbytes, 0)
 
 
 class TestBatchability(unittest.TestCase):
