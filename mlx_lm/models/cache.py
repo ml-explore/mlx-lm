@@ -317,7 +317,13 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def nbytes(self):
-        return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+        if self.keys is None:
+            return 0
+        return tree_reduce(
+            lambda a, x: a + (x.nbytes if x is not None else 0),
+            (self.keys, self.values),
+            0,
+        )
 
 
 class KVCache(_BaseCache):
