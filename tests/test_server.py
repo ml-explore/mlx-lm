@@ -17,6 +17,7 @@ from mlx_lm.server import (
     LRUPromptCache,
     ResponseGenerator,
     is_metal_oom_error,
+    model_supports_kv_quantization,
     projected_kv_bytes,
 )
 from mlx_lm.utils import load
@@ -649,6 +650,16 @@ class TestCLIValidation(unittest.TestCase):
         with patch.object(sys, "argv", argv):
             with self.assertRaisesRegex(ValueError, "cannot be used with --kv-bits"):
                 server_module.main()
+
+
+class TestKVQuantModelCompatibility(unittest.TestCase):
+    def test_mla_models_report_unsupported(self):
+        model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
+        self.assertFalse(model_supports_kv_quantization(model))
+
+    def test_non_mla_models_report_supported(self):
+        model = type("obj", (), {"args": type("obj", (), {"hidden_size": 1024})()})()
+        self.assertTrue(model_supports_kv_quantization(model))
 
 
 if __name__ == "__main__":

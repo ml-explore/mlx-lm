@@ -92,6 +92,15 @@ def projected_kv_bytes(prompt_cache: List[Any], extra_tokens: int) -> int:
     return cache_bytes + int(bytes_per_token * extra_tokens)
 
 
+def model_supports_kv_quantization(model: Any) -> bool:
+    # MLA-style models store extra latent structures in the KV cache and are
+    # currently incompatible with QuantizedKVCache update/fetch semantics.
+    args = getattr(model, "args", None)
+    if args is not None and hasattr(args, "kv_lora_rank"):
+        return False
+    return True
+
+
 class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
@@ -766,6 +775,11 @@ class ResponseGenerator:
                 max_kv_size=self.model_provider.cli_args.max_kv_size,
             )
         if self.model_provider.cli_args.kv_bits is not None:
+            if not model_supports_kv_quantization(model):
+                raise ValueError(
+                    "KV quantization is not currently supported for this model "
+                    "architecture. Disable --kv-bits for this model."
+                )
             maybe_quantize_kv_cache(
                 cache,
                 quantized_kv_start=self.model_provider.cli_args.quantized_kv_start,
