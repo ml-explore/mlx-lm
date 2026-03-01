@@ -16,6 +16,7 @@ from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
     ResponseGenerator,
+    apply_prompt_token_limit,
     is_metal_oom_error,
     model_supports_kv_quantization,
     projected_kv_bytes,
@@ -56,6 +57,9 @@ class DummyModelProvider:
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
+                "max_prompt_tokens": None,
+                "prompt_overflow_policy": "error",
+                "prompt_keep_tokens": 512,
                 "max_active_kv_bytes": None,
                 "max_active_memory_bytes": None,
                 "max_kv_size": None,
@@ -662,6 +666,49 @@ class TestKVQuantModelCompatibility(unittest.TestCase):
     def test_non_mla_models_report_supported(self):
         model = type("obj", (), {"args": type("obj", (), {"hidden_size": 1024})()})()
         self.assertTrue(model_supports_kv_quantization(model))
+
+
+class TestPromptTokenLimit(unittest.TestCase):
+    def test_no_limit(self):
+        tokens = list(range(10))
+        self.assertEqual(
+            apply_prompt_token_limit(
+                tokens,
+                max_prompt_tokens=None,
+                overflow_policy="error",
+                keep_tokens=0,
+            ),
+            tokens,
+        )
+
+    def test_error_policy(self):
+        with self.assertRaisesRegex(
+            ValueError, "Prompt exceeds max prompt token limit"
+        ):
+            apply_prompt_token_limit(
+                list(range(20)),
+                max_prompt_tokens=8,
+                overflow_policy="error",
+                keep_tokens=0,
+            )
+
+    def test_truncate_policy(self):
+        out = apply_prompt_token_limit(
+            list(range(20)),
+            max_prompt_tokens=8,
+            overflow_policy="truncate",
+            keep_tokens=3,
+        )
+        self.assertEqual(out, [0, 1, 2, 15, 16, 17, 18, 19])
+
+    def test_truncate_policy_keep_over_cap(self):
+        out = apply_prompt_token_limit(
+            list(range(20)),
+            max_prompt_tokens=8,
+            overflow_policy="truncate",
+            keep_tokens=100,
+        )
+        self.assertEqual(out, list(range(8)))
 
 
 if __name__ == "__main__":

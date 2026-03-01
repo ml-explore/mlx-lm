@@ -101,6 +101,32 @@ def model_supports_kv_quantization(model: Any) -> bool:
     return True
 
 
+def apply_prompt_token_limit(
+    tokens: List[int],
+    *,
+    max_prompt_tokens: Optional[int],
+    overflow_policy: str,
+    keep_tokens: int,
+) -> List[int]:
+    if max_prompt_tokens is None or len(tokens) <= max_prompt_tokens:
+        return tokens
+
+    if overflow_policy == "error":
+        raise ValueError(
+            "Prompt exceeds max prompt token limit: "
+            f"prompt_tokens={len(tokens)}, max_prompt_tokens={max_prompt_tokens}"
+        )
+
+    if overflow_policy != "truncate":
+        raise ValueError(f"Invalid prompt overflow policy: {overflow_policy}")
+
+    keep_tokens = max(0, min(keep_tokens, max_prompt_tokens))
+    tail_tokens = max_prompt_tokens - keep_tokens
+    if tail_tokens <= 0:
+        return tokens[:max_prompt_tokens]
+    return tokens[:keep_tokens] + tokens[-tail_tokens:]
+
+
 class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
@@ -742,17 +768,35 @@ class ResponseGenerator:
                 if args.chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
                     chat_template_args.update(args.chat_template_kwargs)
-                return tokenizer.apply_chat_template(
+                tokens = tokenizer.apply_chat_template(
                     messages,
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
                     **chat_template_args,
                 )
+                return apply_prompt_token_limit(
+                    tokens,
+                    max_prompt_tokens=self.cli_args.max_prompt_tokens,
+                    overflow_policy=self.cli_args.prompt_overflow_policy,
+                    keep_tokens=self.cli_args.prompt_keep_tokens,
+                )
             else:
-                return tokenizer.encode(convert_chat(messages, role_mapping))
+                tokens = tokenizer.encode(convert_chat(messages, role_mapping))
+                return apply_prompt_token_limit(
+                    tokens,
+                    max_prompt_tokens=self.cli_args.max_prompt_tokens,
+                    overflow_policy=self.cli_args.prompt_overflow_policy,
+                    keep_tokens=self.cli_args.prompt_keep_tokens,
+                )
         else:
-            return tokenizer.encode(request.prompt)
+            tokens = tokenizer.encode(request.prompt)
+            return apply_prompt_token_limit(
+                tokens,
+                max_prompt_tokens=self.cli_args.max_prompt_tokens,
+                overflow_policy=self.cli_args.prompt_overflow_policy,
+                keep_tokens=self.cli_args.prompt_keep_tokens,
+            )
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -2061,6 +2105,28 @@ def main():
         "--prompt-cache-bytes",
         type=parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        help="Maximum prompt token count accepted by the server",
+    )
+    parser.add_argument(
+        "--prompt-overflow-policy",
+        type=str,
+        default="error",
+        choices=["error", "truncate"],
+        help="Behavior when prompt exceeds --max-prompt-tokens",
+    )
+    parser.add_argument(
+        "--prompt-keep-tokens",
+        type=int,
+        default=512,
+        help=(
+            "When truncating prompts, keep this many tokens from the start and fill "
+            "the remainder from the end"
+        ),
     )
     parser.add_argument(
         "--max-active-kv-bytes",
