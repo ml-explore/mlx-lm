@@ -11,14 +11,13 @@ from unittest.mock import patch
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
     ResponseGenerator,
     apply_prompt_token_limit,
     is_metal_oom_error,
-    model_supports_kv_quantization,
     projected_kv_bytes,
 )
 from mlx_lm.utils import load
@@ -63,9 +62,6 @@ class DummyModelProvider:
                 "max_active_kv_bytes": None,
                 "max_active_memory_bytes": None,
                 "max_kv_size": None,
-                "kv_bits": None,
-                "kv_group_size": 64,
-                "quantized_kv_start": 0,
             },
         )
 
@@ -615,57 +611,37 @@ class TestKVBudgeting(unittest.TestCase):
         # 6 bytes over 3 tokens => 2 bytes/token
         self.assertEqual(projected_kv_bytes(cache, 5), 16)
 
-    def test_quantized_cache_nbytes_empty(self):
-        cache = QuantizedKVCache()
-        self.assertEqual(cache.nbytes, 0)
-
 
 class TestBatchability(unittest.TestCase):
-    def _make_response_generator(self, is_batchable=True, kv_bits=None):
+    def _make_response_generator(self, is_batchable=True):
         rg = ResponseGenerator.__new__(ResponseGenerator)
         rg.model_provider = type(
             "obj",
             (),
             {
                 "is_batchable": is_batchable,
-                "cli_args": type("obj", (), {"kv_bits": kv_bits}),
+                "cli_args": type("obj", (), {}),
             },
         )()
         return rg
 
-    def test_kv_quantization_disables_batching(self):
-        rg = self._make_response_generator(is_batchable=True, kv_bits=4)
-        self.assertFalse(rg._is_batchable(type("obj", (), {"seed": None})()))
-
-    def test_batching_enabled_without_kv_quantization(self):
-        rg = self._make_response_generator(is_batchable=True, kv_bits=None)
+    def test_batching_enabled(self):
+        rg = self._make_response_generator(is_batchable=True)
         self.assertTrue(rg._is_batchable(type("obj", (), {"seed": None})()))
 
 
 class TestCLIValidation(unittest.TestCase):
-    def test_reject_max_kv_size_with_kv_bits(self):
+    def test_reject_bad_prompt_overflow_policy(self):
         from mlx_lm import server as server_module
 
         argv = [
             "mlx_lm.server",
-            "--max-kv-size",
-            "1024",
-            "--kv-bits",
-            "4",
+            "--prompt-overflow-policy",
+            "invalid",
         ]
         with patch.object(sys, "argv", argv):
-            with self.assertRaisesRegex(ValueError, "cannot be used with --kv-bits"):
+            with self.assertRaises(SystemExit):
                 server_module.main()
-
-
-class TestKVQuantModelCompatibility(unittest.TestCase):
-    def test_mla_models_report_unsupported(self):
-        model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
-        self.assertFalse(model_supports_kv_quantization(model))
-
-    def test_non_mla_models_report_supported(self):
-        model = type("obj", (), {"args": type("obj", (), {"hidden_size": 1024})()})()
-        self.assertTrue(model_supports_kv_quantization(model))
 
 
 class TestPromptTokenLimit(unittest.TestCase):

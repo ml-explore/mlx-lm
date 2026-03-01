@@ -246,8 +246,6 @@ multi-turn sessions:
 - `--max-active-kv-bytes`: reject requests if projected active KV usage would
   exceed this limit.
 - `--max-kv-size`: fixed active KV window (rotating cache), llama.cpp-style.
-- `--kv-bits`, `--kv-group-size`, `--quantized-kv-start`: KV cache
-  quantization controls.
 
 Examples:
 
@@ -262,23 +260,8 @@ mlx_lm.server \
   --max-active-kv-bytes 8G
 ```
 
-```bash
-# KV quantization mode (batching disabled while kv-bits is enabled)
-mlx_lm.server \
-  --model <model> \
-  --max-prompt-tokens 8192 \
-  --prompt-overflow-policy truncate \
-  --prompt-keep-tokens 512 \
-  --kv-bits 4 \
-  --kv-group-size 64 \
-  --quantized-kv-start 0 \
-  --prompt-cache-bytes 3G \
-  --max-active-kv-bytes 8G
-```
-
 Notes:
 
-- `--max-kv-size` and `--kv-bits` are currently mutually exclusive.
 - `--max-prompt-tokens` is the primary control to stop memory creep across long chats.
 - OOM-style failures now return HTTP `503` instead of crashing the server
   process.

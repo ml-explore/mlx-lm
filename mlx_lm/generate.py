@@ -297,10 +297,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
         return
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            try:
-                prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
-            except NotImplementedError:
-                continue
+            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
 def generate_step(

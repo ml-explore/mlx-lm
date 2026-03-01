@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from .base import create_causal_mask
 
@@ -317,13 +317,7 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def nbytes(self):
-        if self.keys is None:
-            return 0
-        return tree_reduce(
-            lambda a, x: a + (x.nbytes if x is not None else 0),
-            (self.keys, self.values),
-            0,
-        )
+        return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
 class KVCache(_BaseCache):
