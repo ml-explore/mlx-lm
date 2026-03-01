@@ -790,18 +790,12 @@ def quantize_model(
         Tuple: Tuple containing quantized model and config.
     """
 
-    def defaults_for_mode(mode, group_size, bits):
-        default_group_size, default_bits = QUANT_MODE_DEFAULTS[mode]
-        resolved_group_size = (
-            default_group_size if group_size is None else group_size
-        )
-        resolved_bits = default_bits if bits is None else bits
-        return resolved_group_size, resolved_bits
-
     quantized_config = copy.deepcopy(config)
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
-    group_size, bits = defaults_for_mode(mode, group_size, bits)
+    default_group_size, default_bits = QUANT_MODE_DEFAULTS[mode]
+    group_size = default_group_size if group_size is None else group_size
+    bits = default_bits if bits is None else bits
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
