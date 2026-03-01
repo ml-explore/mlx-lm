@@ -234,46 +234,6 @@ requests that use the same context. See the
 [example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
 for more usage details.
 
-### Server Memory Controls
-
-When using `mlx_lm.server`, these options help prevent OOM during long
-multi-turn sessions:
-
-- `--prompt-cache-bytes`: upper bound for the LRU prompt cache memory.
-- `--max-active-kv-bytes`: reject requests if projected active KV usage would
-  exceed this limit.
-- `--max-kv-size`: fixed active KV window (rotating cache), llama.cpp-style.
-- `--kv-bits`, `--kv-group-size`, `--quantized-kv-start`: KV cache
-  quantization controls.
-
-Examples:
-
-```bash
-# Fixed active-KV window (stable bounded memory, no KV quantization)
-mlx_lm.server \
-  --model <model> \
-  --max-kv-size 8192 \
-  --prompt-cache-bytes 2G \
-  --max-active-kv-bytes 8G
-```
-
-```bash
-# KV quantization mode (batching disabled while kv-bits is enabled)
-mlx_lm.server \
-  --model <model> \
-  --kv-bits 4 \
-  --kv-group-size 64 \
-  --quantized-kv-start 0 \
-  --prompt-cache-bytes 3G \
-  --max-active-kv-bytes 8G
-```
-
-Notes:
-
-- `--max-kv-size` and `--kv-bits` are currently mutually exclusive.
-- OOM-style failures now return HTTP `503` instead of crashing the server
-  process.
-
 ### Supported Models
 
 `mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
