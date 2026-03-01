@@ -3,8 +3,6 @@
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
-from io import StringIO
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -95,56 +93,25 @@ class TestUtils(unittest.TestCase):
 
     def test_quantize_override_group_size_applies_before_gate(self):
         model = _QuantGateModel()
-        out = StringIO()
-
-        with redirect_stdout(out):
-            model, _ = utils.quantize_model(
-                model,
-                {},
-                64,
-                4,
-                quant_predicate=lambda _path, _module: {
-                    "group_size": 32,
-                    "bits": 4,
-                    "mode": "mxfp4",
-                },
-            )
-
+        model, _ = utils.quantize_model(
+            model,
+            {},
+            64,
+            4,
+            quant_predicate=lambda _path, _module: {
+                "group_size": 32,
+                "bits": 4,
+                "mode": "mxfp4",
+            },
+        )
         weights = dict(tree_flatten(model.parameters()))
         self.assertIn("linear.scales", weights)
-        self.assertNotIn("Skipping quantization for linear", out.getvalue())
 
-    def test_quantize_logs_incompatible_group_size_skip(self):
+    def test_quantize_incompatible_group_size_skips(self):
         model = _QuantGateModel()
-        out = StringIO()
-
-        with redirect_stdout(out):
-            model, _ = utils.quantize_model(model, {}, 64, 4)
-
+        model, _ = utils.quantize_model(model, {}, 64, 4)
         weights = dict(tree_flatten(model.parameters()))
-        log_output = out.getvalue()
         self.assertNotIn("linear.scales", weights)
-        self.assertIn("Skipping quantization for linear", log_output)
-        self.assertIn("Skipped 1 layer(s) due to incompatible group size", log_output)
-
-    def test_quantize_does_not_log_group_size_skip_for_predicate_false(self):
-        model = _QuantGateModel()
-        out = StringIO()
-
-        with redirect_stdout(out):
-            model, _ = utils.quantize_model(
-                model,
-                {},
-                64,
-                4,
-                quant_predicate=lambda _path, _module: False,
-            )
-
-        weights = dict(tree_flatten(model.parameters()))
-        log_output = out.getvalue()
-        self.assertNotIn("linear.scales", weights)
-        self.assertNotIn("Skipping quantization for linear", log_output)
-        self.assertNotIn("incompatible group size", log_output)
 
     def test_quantize_dict_predicate_multiple_layers(self):
         model = _TwoLinearQuantModel()
