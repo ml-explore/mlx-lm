@@ -805,8 +805,6 @@ def quantize_model(
         fine_grained_config = False
         quantized_config["quantization"] = dict(quant_params)
 
-    skipped_layers = []
-
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
@@ -820,15 +818,8 @@ def quantize_model(
         effective_params = dict(quant_params)
         if isinstance(bool_or_params, dict):
             effective_params.update(bool_or_params)
-        effective_group_size = effective_params["group_size"]
 
-        if module.weight.shape[-1] % effective_group_size != 0:
-            skipped_layers.append(path)
-            print(
-                f"[WARN] Skipping quantization for {path}: "
-                f"weight dim {module.weight.shape[-1]} is not divisible by "
-                f"group_size {effective_group_size}."
-            )
+        if module.weight.shape[-1] % effective_params["group_size"] != 0:
             return False
 
         if isinstance(bool_or_params, dict):
@@ -845,12 +836,6 @@ def quantize_model(
         mode=mode,
         class_predicate=wrapped_predicate,
     )
-
-    if skipped_layers:
-        print(
-            "[WARN] "
-            f"Skipped {len(skipped_layers)} layer(s) due to incompatible group size."
-        )
 
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
