@@ -802,6 +802,18 @@ class ResponseGenerator:
             f"projected={projected} bytes, limit={limit} bytes"
         )
 
+    def _check_active_memory_limit(self):
+        limit = self.model_provider.cli_args.max_active_memory_bytes
+        if limit is None:
+            return
+        active = mx.get_active_memory()
+        if active > limit:
+            raise MemoryError(
+                "Active MLX memory exceeded configured limit: "
+                f"active={active} bytes, limit={limit} bytes. "
+                "Consider lowering prompt length or max_tokens."
+            )
+
     def _generate(self):
         current_model = None
         current_sampling = None
@@ -820,6 +832,7 @@ class ResponseGenerator:
                 return self._next_request(timeout)
 
         def progress_callback(info):
+            self._check_active_memory_limit()
             for uid, processed, total in info:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
@@ -940,6 +953,7 @@ class ResponseGenerator:
                         stop_tokens=tokenizer.eos_token_ids,
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
+                        prefill_step_size=self.cli_args.prefill_step_size,
                         prompt_progress_callback=progress_callback,
                         max_kv_size=self.cli_args.max_kv_size,
                     )
@@ -1038,6 +1052,7 @@ class ResponseGenerator:
 
         # Define the progress callback
         def progress(tokens_processed, tokens_total):
+            self._check_active_memory_limit()
             rqueue.put((tokens_processed, tokens_total))
 
         try:
@@ -1113,6 +1128,7 @@ class ResponseGenerator:
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
+                prefill_step_size=self.cli_args.prefill_step_size,
             ):
                 rqueue.put(
                     Response(
@@ -2030,6 +2046,12 @@ def main():
         help="When a request is batchable then process that many prompts in parallel",
     )
     parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Prompt processing chunk size; lower values reduce memory spikes",
+    )
+    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=10,
@@ -2046,6 +2068,14 @@ def main():
         help=(
             "Reject requests when projected active KV memory would exceed this limit "
             "(bytes or shorthand like 20G)"
+        ),
+    )
+    parser.add_argument(
+        "--max-active-memory-bytes",
+        type=parse_size,
+        help=(
+            "Abort requests when current active MLX memory exceeds this limit "
+            "(bytes or shorthand like 30G)"
         ),
     )
     parser.add_argument(
