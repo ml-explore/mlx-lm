@@ -187,7 +187,6 @@ class LRUPromptCache:
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
-        count: int
         nbytes: int
 
     @dataclass
@@ -239,7 +238,7 @@ class LRUPromptCache:
         # Check for caches that are longer
         longer = None
         common_prefix = index
-        if index > 0 and last_cache_index <= 0:
+        if index > 0:
             best = None
             stack = [(current, [])]
             while stack:
@@ -272,32 +271,14 @@ class LRUPromptCache:
                 break
             del d_prev[t]
 
-        logging.debug(f"[LRUPromptCache] Removed {cache_bytes} bytes from the cache")
-
-    def _extract(self, model, tokens):
-        cache_entry = self._get(model, tokens)
-        if cache_entry.count == 1:
-            self._delete(model, tokens)
-            self._lru.remove((model, tokens))
-            return cache_entry
-
-        cache_entry.count -= 1
-        return self.CacheEntry(
-            copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
-        )
-
     def fetch_nearest_cache(self, model, tokens):
         result = self._search(model, tokens)
         if result.exact is not None:
-            cache_entry = self._extract(result.model, result.exact)
-            return cache_entry.prompt_cache, []
+            cache_entry = self._get(result.model, result.exact)
+            return copy.deepcopy(cache_entry.prompt_cache), []
 
-        if result.shorter is not None:
-            cache_entry = self._extract(result.model, result.shorter)
-            prefix_len = len(result.shorter)
-            return cache_entry.prompt_cache, tokens[prefix_len:]
-
-        if result.longer is not None:
+        short_length = len(result.shorter) if result.shorter is not None else 0
+        if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
@@ -306,25 +287,33 @@ class LRUPromptCache:
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
+        if short_length > 0:
+            cache_entry = self._get(result.model, result.shorter)
+            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+
         return None, tokens
 
     def insert_cache(self, model, tokens, prompt_cache):
+        is_trimmable = can_trim_prompt_cache(prompt_cache)
+
         if model not in self._cache:
             self._cache[model] = {}
         current = self._cache[model]
-        for tok in tokens:
+        for i, tok in enumerate(tokens):
             if tok not in current:
                 current[tok] = {}
+            if is_trimmable and "cache" in current:
+                self._n_bytes -= current["cache"].nbytes
+                del current["cache"]
+                self._lru.remove((model, tokens[:i]))
             current = current[tok]
 
         if "cache" in current:
-            current["cache"].count += 1
             self._lru.remove((model, tokens))
         else:
             cache_bytes = sum(c.nbytes for c in prompt_cache)
-            current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes)
+            current["cache"] = self.CacheEntry(prompt_cache, cache_bytes)
             self._n_bytes += cache_bytes
-            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} to the cache")
 
         self._lru.append((model, tokens))
         if len(self._lru) > self.max_size:
@@ -333,6 +322,10 @@ class LRUPromptCache:
         while self._n_bytes > self.max_bytes and len(self._lru) > 1:
             model, tokens = self._lru.popleft()
             self._delete(model, tokens)
+
+        logging.info(
+            f"[LRUPromptCache::insert_cache] {len(self)} sequences totalling {self.nbytes/1e9:.2f} GB"
+        )
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -346,6 +339,10 @@ class LRUPromptCache:
         while self._n_bytes > n_bytes:
             model, tokens = self._lru.popleft()
             self._delete(model, tokens)
+
+        logging.info(
+            f"[LRUPromptCache::trim_to] {len(self)} sequences totalling {self.nbytes/1e9:.2f} GB"
+        )
 
 
 @dataclass
