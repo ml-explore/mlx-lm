@@ -1939,9 +1939,10 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
+    prompt_cache_bytes = model_provider.cli_args.prompt_cache_bytes
     prompt_cache = LRUPromptCache(
         model_provider.cli_args.prompt_cache_size,
-        model_provider.cli_args.prompt_cache_bytes or (1 << 63),
+        prompt_cache_bytes if prompt_cache_bytes is not None else (1 << 63),
     )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
