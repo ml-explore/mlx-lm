@@ -60,6 +60,12 @@ def setup_arg_parser():
         action="store_true",
         help="Quantize activations using the same quantization config as the corresponding layer.",
     )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prefill processing (default: 2048)",
+    )
     return parser
 
 
@@ -103,14 +109,22 @@ def main():
 
     def single_bench():
         for response in stream_generate(
-            model, tokenizer, prompt, max_tokens=generation_tokens
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
         ):
             pass
         return response
 
     def batch_bench():
         return batch_generate(
-            model, tokenizer, prompts, max_tokens=generation_tokens
+            model,
+            tokenizer,
+            prompts,
+            max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
         ).stats
 
     if batch_size == 1:
