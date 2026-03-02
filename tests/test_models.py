@@ -2387,6 +2387,30 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 10000.0,
                 "max_position_embeddings": 1000,
             },
+            {
+                "model_type": "olmo_hybrid",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 1000,
+                "max_position_embeddings": 1000,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention",
+                ],
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 4,
+                "linear_allow_neg_eigval": True,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
