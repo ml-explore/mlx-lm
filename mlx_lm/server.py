@@ -103,9 +103,6 @@ def apply_prompt_token_limit(
             f"prompt_tokens={len(tokens)}, max_prompt_tokens={max_prompt_tokens}"
         )
 
-    if overflow_policy != "truncate":
-        raise ValueError(f"Invalid prompt overflow policy: {overflow_policy}")
-
     keep_tokens = max(0, min(keep_tokens, max_prompt_tokens))
     tail_tokens = max_prompt_tokens - keep_tokens
     if tail_tokens <= 0:
