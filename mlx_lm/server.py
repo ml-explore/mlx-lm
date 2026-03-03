@@ -766,6 +766,15 @@ class ResponseGenerator:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
 
+        def checkpoint_callback(prompts):
+            for uid, prompt_end, cache in prompts:
+                self.prompt_cache.insert_cache(
+                    current_model_key,
+                    batch_results[uid]["cache_key"][:prompt_end],
+                    list(cache),
+                    checkpoint=True,
+                )
+
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
             mx.random.seed(seed)
@@ -826,12 +835,21 @@ class ResponseGenerator:
                         f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB"
                     )
 
+                    # Save the KV cache at the end of the prompt or if an EOS
+                    # token is found in the last 10 tokens then at EOS.
+                    prompt_checkpoint = -1
+                    for i in range(-1, -11, -1):
+                        if rest[i] == tokenizer.eos_token_id:
+                            prompt_checkpoint = i
+                            break
+
                     (uid,) = batch_generator.insert(
                         [rest],
                         args.max_tokens,
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
+                        prompt_checkpoints=[prompt_checkpoint],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -874,6 +892,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
+                        prompt_checkpoint_callback=checkpoint_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
