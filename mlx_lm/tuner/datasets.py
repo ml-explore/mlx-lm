@@ -322,8 +322,8 @@ def load_dataset(args, tokenizer: PreTrainedTokenizer):
             "Training set not found or empty. Must provide training set for fine-tuning."
         )
     if args.train and len(valid) == 0:
-        raise ValueError(
-            "Validation set not found or empty. Must provide validation set for fine-tuning."
+        print(
+            "Warning: Validation set not found or empty. Training will proceed without validation."
         )
     if args.test and len(test) == 0:
         raise ValueError(

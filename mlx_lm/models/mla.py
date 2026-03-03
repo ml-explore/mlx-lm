@@ -26,7 +26,7 @@ class MultiLinear(nn.Module):
         self,
         group_size: int,
         bits: int,
-        mode: str,
+        mode: str = "affine",
     ):
         num_heads, output_dims, input_dims = self.weight.shape
         ql = QuantizedMultiLinear(

@@ -32,11 +32,14 @@ class ModelArgs(BaseModelArgs):
     block_multiple_of: int
     block_ffn_dim_multiplier: float
     block_auto_adjust_ff_dim: bool
-    rope_theta: float
+    rope_theta: float = 1000000.0
+    rope_parameters: Optional[dict] = None
     full_attn_idxs: Optional[List[int]] = None
     layer_types: Optional[List[str]] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
+            self.rope_theta = self.rope_parameters["rope_theta"]
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         if self.full_attn_idxs is None:

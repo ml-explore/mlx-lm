@@ -43,6 +43,9 @@ class DummyModelProvider:
                 "model": None,
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
+                "prompt_cache_size": 10,
+                "prompt_cache_bytes": 1 << 63,
+                "prompt_cache_total_bytes": None,
             },
         )
 
@@ -55,6 +58,18 @@ class DummyModelProvider:
     def load(self, model, adapter=None, draft_model=None):
         assert model in ["default_model", "chat_model"]
         return self.model, self.tokenizer
+
+
+class MockCache:
+    def __init__(self, value):
+        self.value = value
+
+    @property
+    def nbytes(self):
+        return len(self.value)
+
+    def __eq__(self, other):
+        return other.value == self.value
 
 
 class TestServer(unittest.TestCase):
@@ -354,7 +369,6 @@ class TestServerWithDraftModel(unittest.TestCase):
 
 
 class TestKeepalive(unittest.TestCase):
-
     def test_keepalive_callback(self):
         """Test keepalive callback sends SSE comments and handles errors"""
         from unittest.mock import Mock
@@ -404,7 +418,6 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
-
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 
@@ -448,32 +461,55 @@ class TestLRUPromptCache(unittest.TestCase):
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
         model = ("test", None, None)
-        cache.insert_cache(model, [1, 2], ["test1"])
-        cache.insert_cache(model, [1, 2], ["test1"])
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, ["test1"])
+        self.assertEqual(c, [MockCache("test1")])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, ["test1"])
+        self.assertEqual(c, [MockCache("test1")])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, None)
         self.assertEqual(t, [1, 2])
 
-        cache.insert_cache(model, [1, 2], ["test1"])
-        cache.insert_cache(model, [2, 3], ["test2"])
-        cache.insert_cache(model, [3, 4], ["test3"])
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
+        cache.insert_cache(model, [2, 3], [MockCache("test2")])
+        cache.insert_cache(model, [3, 4], [MockCache("test3")])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, None)
         self.assertEqual(t, [1, 2])
         c, t = cache.fetch_nearest_cache(model, [2, 3])
-        self.assertEqual(c, ["test2"])
+        self.assertEqual(c, [MockCache("test2")])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
-        self.assertEqual(c, ["test3"])
+        self.assertEqual(c, [MockCache("test3")])
         self.assertEqual(t, [])
+
+    def test_lru_bytes(self):
+        cache = LRUPromptCache(max_size=100, max_bytes=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("aaa")])
+        cache.insert_cache(model, [3, 4], [MockCache("bbb")])
+        cache.insert_cache(model, [4, 5], [MockCache("ccc")])
+        cache.insert_cache(model, [6, 7], [MockCache("ddd")])
+
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(cache.nbytes, 9)
+
+        cache.trim_to(n_bytes=7)
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(cache.nbytes, 6)
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [1, 2])
+        c, t = cache.fetch_nearest_cache(model, [3, 4])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [3, 4])
 
 
 if __name__ == "__main__":

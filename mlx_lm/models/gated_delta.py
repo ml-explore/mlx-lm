@@ -8,7 +8,7 @@ import mlx.nn as nn
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias)).astype(
-        A_log.dtype
+        a.dtype
     )
 
 

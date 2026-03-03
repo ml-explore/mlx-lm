@@ -205,7 +205,7 @@ def train(
     model,
     optimizer,
     train_dataset,
-    val_dataset,
+    val_dataset=None,
     args: TrainingArgs = TrainingArgs(),
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
@@ -269,7 +269,9 @@ def train(
         tic = time.perf_counter()
         # Report validation loss if needed, the first validation loss
         # is always measured before any training.
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+        if val_dataset and (
+            it == 1 or it % args.steps_per_eval == 0 or it == args.iters
+        ):
             tic = time.perf_counter()
             val_loss = evaluate(
                 model=model,

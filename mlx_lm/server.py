@@ -49,6 +49,18 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
+def parse_size(x):
+    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    split = 0
+    for xi in x:
+        if not (xi.isdigit() or xi == "."):
+            break
+        split += 1
+    digits = float(x[:split])
+    size = (x[split:]).strip().upper()
+    return int(digits * sizes[size])
+
+
 class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
@@ -153,7 +165,7 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message["content"]
+        content = message.get("content", None)
         if isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
@@ -176,6 +188,7 @@ class LRUPromptCache:
     class CacheEntry:
         prompt_cache: List[Any]
         count: int
+        nbytes: int
 
     @dataclass
     class SearchResult:
@@ -185,10 +198,19 @@ class LRUPromptCache:
         longer: List[int]
         common_prefix: int
 
-    def __init__(self, max_size: int = 10):
+    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
         self.max_size = max_size
+        self.max_bytes = max_bytes
         self._cache = {}
         self._lru = deque()
+        self._n_bytes = 0
+
+    def __len__(self):
+        return len(self._lru)
+
+    @property
+    def nbytes(self):
+        return self._n_bytes
 
     def _search(self, model, tokens):
         """Search the cache for a prompt cache. Return exact or close match."""
@@ -241,12 +263,16 @@ class LRUPromptCache:
         path = [self._cache[model]]
         for tok in tokens:
             path.append(path[-1][tok])
+        cache_bytes = path[-1]["cache"].nbytes
+        self._n_bytes -= cache_bytes
         del path[-1]["cache"]
         for i in reversed(range(len(tokens))):
             d_prev, d, t = path[i], path[i + 1], tokens[i]
             if len(d) > 0:
                 break
             del d_prev[t]
+
+        logging.debug(f"[LRUPromptCache] Removed {cache_bytes} bytes from the cache")
 
     def _extract(self, model, tokens):
         cache_entry = self._get(model, tokens)
@@ -257,8 +283,7 @@ class LRUPromptCache:
 
         cache_entry.count -= 1
         return self.CacheEntry(
-            copy.deepcopy(cache_entry.prompt_cache),
-            1,
+            copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
         )
 
     def fetch_nearest_cache(self, model, tokens):
@@ -275,14 +300,11 @@ class LRUPromptCache:
         if result.longer is not None:
             cache_entry = self._get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache_entry = self.CacheEntry(
-                    copy.deepcopy(cache_entry.prompt_cache),
-                    1,
-                )
+                cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache_entry.prompt_cache, num_to_trim)
-                return cache_entry.prompt_cache, tokens[prefix:]
+                trim_prompt_cache(cache, num_to_trim)
+                return cache, tokens[prefix:]
 
         return None, tokens
 
@@ -299,10 +321,29 @@ class LRUPromptCache:
             current["cache"].count += 1
             self._lru.remove((model, tokens))
         else:
-            current["cache"] = self.CacheEntry(prompt_cache, 1)
+            cache_bytes = sum(c.nbytes for c in prompt_cache)
+            current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes)
+            self._n_bytes += cache_bytes
+            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} to the cache")
 
         self._lru.append((model, tokens))
         if len(self._lru) > self.max_size:
+            model, tokens = self._lru.popleft()
+            self._delete(model, tokens)
+        while self._n_bytes > self.max_bytes and len(self._lru) > 1:
+            model, tokens = self._lru.popleft()
+            self._delete(model, tokens)
+
+    def trim_to(
+        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
+    ):
+        n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
+        n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
+
+        while len(self._lru) > n_sequences:
+            model, tokens = self._lru.popleft()
+            self._delete(model, tokens)
+        while self._n_bytes > n_bytes:
             model, tokens = self._lru.popleft()
             self._delete(model, tokens)
 
@@ -371,6 +412,7 @@ class GenerationContext:
     eos_token_ids: set
     stop_token_sequences: List[List[int]]
     prompt: List[int]
+    prompt_cache_count: int = -1
 
     _should_stop: bool = False
 
@@ -753,8 +795,14 @@ class ResponseGenerator:
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
+                    ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
+
+                    ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
+                    logging.info(
+                        f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB"
+                    )
 
                     (uid,) = batch_generator.insert(
                         [rest],
@@ -769,6 +817,13 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                     }
+                    # just making sure we don't leave a reference around
+                    del cache
+
+                    if self.model_provider.cli_args.prompt_cache_bytes is not None:
+                        total = self.model_provider.cli_args.prompt_cache_bytes
+                        active = batch_generator.prompt_cache_nbytes
+                        self.prompt_cache.trim_to(n_bytes=total - active)
                     continue
 
                 # No batch generator. Load the model and if it's not
@@ -917,11 +972,15 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
+            ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
+            logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1184,6 +1243,7 @@ class APIHandler(BaseHTTPRequestHandler):
         finish_reason: Union[Literal["length", "stop"], None],
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
+        prompt_cache_count: Optional[int] = None,
         token_logprobs: Optional[List[float]] = None,
         top_tokens: Optional[List[Tuple[Dict[str, Any]]]] = None,
         tokens: Optional[List[int]] = None,
@@ -1202,6 +1262,8 @@ class APIHandler(BaseHTTPRequestHandler):
               used to populate the "usage" field (not used when stream).
             completion_token_count (Optional[int]): The number of tokens in the
               response, used to populate the "usage" field (not used when stream).
+            prompt_cache_count (Optional[int]): The portion of prompt_token_count
+              that was found in the cache when servicing the request.
             token_logprobs (Optional[List[float]]): The log probabilities per token,
               in token order.
             top_tokens (Optional[List[Tuple[Dict[str, Any]]]]): List of outputs from
@@ -1260,6 +1322,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "completion_tokens": completion_token_count,
                 "total_tokens": prompt_token_count + completion_token_count,
             }
+            if prompt_cache_count is not None and prompt_cache_count >= 0:
+                response["usage"]["prompt_tokens_details"] = {
+                    "cached_tokens": prompt_cache_count,
+                }
 
         choice = response["choices"][0]
 
@@ -1487,6 +1553,10 @@ class APIHandler(BaseHTTPRequestHandler):
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
+        # Flush any remaining tool text (e.g. when tool_call_end is empty)
+        if in_tool_call and tool_text:
+            tool_calls.append(tool_text)
+
         if self.stream:
             response = self.generate_response(
                 segment,
@@ -1497,7 +1567,11 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(ctx.prompt), len(tokens))
+                response = self.completion_usage_response(
+                    len(ctx.prompt),
+                    len(tokens),
+                    ctx.prompt_cache_count,
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
@@ -1508,6 +1582,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason,
                 len(ctx.prompt),
                 len(tokens),
+                ctx.prompt_cache_count,
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
@@ -1528,6 +1603,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self,
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
+        prompt_cache_count: Optional[int] = None,
     ):
         response = {
             "id": self.request_id,
@@ -1542,6 +1618,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt_token_count + completion_token_count,
             },
         }
+        if prompt_cache_count is not None and prompt_cache_count >= 0:
+            response["usage"]["prompt_tokens_details"] = {
+                "cached_tokens": prompt_cache_count,
+            }
         return response
 
     def handle_chat_completions(self) -> CompletionRequest:
@@ -1708,7 +1788,8 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
+    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
     else:
@@ -1822,6 +1903,17 @@ def main():
         type=int,
         default=8,
         help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--prompt-cache-size",
+        type=int,
+        default=10,
+        help="Maximum number of distinct KV caches to hold in the prompt cache",
+    )
+    parser.add_argument(
+        "--prompt-cache-bytes",
+        type=parse_size,
+        help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
         "--pipeline",
