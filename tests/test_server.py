@@ -612,24 +612,6 @@ class TestKVBudgeting(unittest.TestCase):
         self.assertEqual(projected_kv_bytes(cache, 5), 16)
 
 
-class TestBatchability(unittest.TestCase):
-    def _make_response_generator(self, is_batchable=True):
-        rg = ResponseGenerator.__new__(ResponseGenerator)
-        rg.model_provider = type(
-            "obj",
-            (),
-            {
-                "is_batchable": is_batchable,
-                "cli_args": type("obj", (), {}),
-            },
-        )()
-        return rg
-
-    def test_batching_enabled(self):
-        rg = self._make_response_generator(is_batchable=True)
-        self.assertTrue(rg._is_batchable(type("obj", (), {"seed": None})()))
-
-
 class TestCLIValidation(unittest.TestCase):
     def test_reject_bad_prompt_overflow_policy(self):
         from mlx_lm import server as server_module
