@@ -190,26 +190,29 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
 
-    class CacheKey:
-        entry_count = 0
+    class CacheOrder:
+        def __init__(self):
+            self._lru_checkpoints = deque()
+            self._lru = deque()
 
-        def __init__(self, model, tokens, checkpoint: bool = False):
-            self.model = model
-            self.tokens = tokens
+        def __len__(self):
+            return len(self._lru) + len(self._lru_checkpoints)
 
-            self.entry_count += 1
-            self._id = self.entry_count
-            self._checkpoint = int(checkpoint)
+        def push(self, model, tokens, checkpoint: bool = False):
+            c = self._lru_checkpoints if checkpoint else self._lru
+            c.append((model, tokens))
 
-        def __lt__(self, other):
-            return (self._checkpoint, self._id) < (other._checkpoint, other._id)
+        def remove(self, model, tokens):
+            try:
+                self._lru.remove((model, tokens))
+            except ValueError:
+                self._lru_checkpoints.remove((model, tokens))
 
-        def __eq__(self, other):
-            return self.model == other.model and self.tokens == other.tokens
-
-        def __iter__(self):
-            yield self.model
-            yield self.tokens
+        def pop(self):
+            if len(self._lru) >= len(self._lru_checkpoints):
+                return self._lru.popleft()
+            else:
+                return self._lru_checkpoints.popleft()
 
     @dataclass
     class SearchResult:
@@ -223,11 +226,11 @@ class LRUPromptCache:
         self.max_size = max_size
         self.max_bytes = max_bytes
         self._cache = {}
-        self._cache_order = []
+        self._lru = self.CacheOrder()
         self._n_bytes = 0
 
     def __len__(self):
-        return len(self._cache_order)
+        return len(self._lru)
 
     @property
     def nbytes(self):
@@ -327,30 +330,23 @@ class LRUPromptCache:
             if is_trimmable and "cache" in current:
                 self._n_bytes -= current["cache"].nbytes
                 del current["cache"]
-                self._cache_order.remove(self.CacheKey(model, tokens[:i]))
+                self._lru.remove(model, tokens[:i])
             current = current[tok]
 
         if "cache" in current:
-            self._cache_order.remove(self.CacheKey(model, tokens))
+            self._lru.remove(model, tokens)
         else:
             cache_bytes = sum(c.nbytes for c in prompt_cache)
             current["cache"] = self.CacheEntry(prompt_cache, cache_bytes)
             self._n_bytes += cache_bytes
 
-        heapq.heapify(self._cache_order)
-        heapq.heappush(
-            self._cache_order, self.CacheKey(model, tokens, checkpoint=checkpoint)
-        )
-        if len(self._cache_order) > self.max_size:
-            model, tokens = heapq.heappop(self._cache_order)
+        self._lru.push(model, tokens, checkpoint=checkpoint)
+        if len(self._lru) > self.max_size:
+            model, tokens = self._lru.pop()
             self._delete(model, tokens)
-        while self._n_bytes > self.max_bytes and len(self._cache_order) > 1:
-            model, tokens = heapq.heappop(self._cache_order)
+        while self._n_bytes > self.max_bytes and len(self._lru) > 1:
+            model, tokens = self._lru.pop()
             self._delete(model, tokens)
-
-        logging.info(
-            f"[LRUPromptCache::insert_cache] {len(self)} sequences totalling {self.nbytes/1e9:.2f} GB"
-        )
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -358,15 +354,22 @@ class LRUPromptCache:
         n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
         n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
 
-        while len(self._cache_order) > n_sequences:
-            model, tokens = heapq.heappop(self._cache_order)
+        while len(self._lru) > n_sequences:
+            model, tokens = self._lru.pop()
             self._delete(model, tokens)
         while self._n_bytes > n_bytes:
-            model, tokens = heapq.heappop(self._cache_order)
+            model, tokens = self._lru.pop()
             self._delete(model, tokens)
 
+    def log_cache_stats(self):
+        ncaches, nbytes = len(self), self.nbytes
+        ntok = (
+            len(self._lru._lru_checkpoints[-1][1])
+            if len(self._lru._lru_checkpoints) > 0
+            else 0
+        )
         logging.info(
-            f"[LRUPromptCache::trim_to] {len(self)} sequences totalling {self.nbytes/1e9:.2f} GB"
+            f"KV Caches: {ncaches} seq, {nbytes/1e9:.2f} GB, latest user cache {ntok} tokens"
         )
 
 
@@ -768,9 +771,12 @@ class ResponseGenerator:
 
         def checkpoint_callback(prompts):
             for uid, prompt_end, cache in prompts:
+                rs = batch_results[uid]
+                if not rs["checkpoint"]:
+                    continue
                 self.prompt_cache.insert_cache(
                     current_model_key,
-                    batch_results[uid]["cache_key"][:prompt_end],
+                    rs["cache_key"][:-prompt_end],
                     list(cache),
                     checkpoint=True,
                 )
@@ -801,6 +807,7 @@ class ResponseGenerator:
                 ):
                     try:
                         prompt = self._tokenize(current_tokenizer, request, args)
+                        do_checkpoint = request.messages[-1]["role"] == "user"
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -823,6 +830,7 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
+                    self.prompt_cache.log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
@@ -830,17 +838,16 @@ class ResponseGenerator:
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
-                    ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
-                    logging.info(
-                        f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB"
-                    )
-
-                    # Save the KV cache at the end of the prompt or if an EOS
-                    # token is found in the last 10 tokens then at EOS.
+                    # Save the KV cache at the end of the prompt just before
+                    # the think start token which will likely be removed in the
+                    # next turn.
                     prompt_checkpoint = -1
-                    for i in range(-1, -11, -1):
-                        if rest[i] == tokenizer.eos_token_id:
-                            prompt_checkpoint = i
+                    for i in range(1, min(11, len(rest)) - 1, 1):
+                        if (
+                            tokenizer.has_thinking
+                            and rest[-i] == tokenizer.think_start_id
+                        ):
+                            prompt_checkpoint = -i - 1
                             break
 
                     (uid,) = batch_generator.insert(
@@ -856,6 +863,7 @@ class ResponseGenerator:
                         "cache_key": prompt[:],
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
+                        "checkpoint": do_checkpoint,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -1010,6 +1018,7 @@ class ResponseGenerator:
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
+            self.prompt_cache.log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
@@ -1019,9 +1028,6 @@ class ResponseGenerator:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
-
-            ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
-            logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
