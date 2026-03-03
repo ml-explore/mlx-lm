@@ -70,7 +70,10 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             or param_type.startswith("dict")
             or param_type.startswith("list")
         ):
-            return json.loads(param_value)
+            try:
+                return json.loads(param_value)
+            except json.JSONDecodeError:
+                return ast.literal_eval(param_value)
 
         return ast.literal_eval(param_value)
 

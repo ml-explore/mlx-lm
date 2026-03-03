@@ -187,6 +187,88 @@ class TestToolParsing(unittest.TestCase):
         ]
         self.assertEqual(tool_calls, expected)
 
+    def test_qwen3_coder_object_params(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_message",
+                    "description": "Send a message.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["recipient", "tags"],
+                        "properties": {
+                            "recipient": {
+                                "type": "object",
+                                "description": "The recipient.",
+                            },
+                            "tags": {
+                                "type": "array",
+                                "description": "Tags.",
+                            },
+                            "metadata": {
+                                "type": "dict",
+                                "description": "Metadata.",
+                            },
+                        },
+                    },
+                },
+            }
+        ]
+
+        test_cases = [
+            # Case 1: Single-quoted dict and array (the bug — json.loads fails,
+            # ast.literal_eval succeeds)
+            (
+                "object",
+                "recipient",
+                "{'name': 'Alice', 'email': 'a@b.com'}",
+                {"name": "Alice", "email": "a@b.com"},
+            ),
+            (
+                "array",
+                "tags",
+                "['meeting', 'daily']",
+                ["meeting", "daily"],
+            ),
+            # Case 2: Valid JSON dict and array (regression guard —
+            # json.loads succeeds, no fallback)
+            (
+                "object",
+                "recipient",
+                '{"name": "Alice", "email": "a@b.com"}',
+                {"name": "Alice", "email": "a@b.com"},
+            ),
+            (
+                "array",
+                "tags",
+                '["meeting", "daily"]',
+                ["meeting", "daily"],
+            ),
+            # Case 3: Dict type prefix with mixed types (covers
+            # startswith("dict") branch)
+            (
+                "dict",
+                "metadata",
+                "{'key': 123}",
+                {"key": 123},
+            ),
+        ]
+
+        for param_type, param_name, param_value, expected in test_cases:
+            with self.subTest(
+                param_type=param_type,
+                param_name=param_name,
+                param_value=param_value,
+            ):
+                param_config = {
+                    param_name: {"type": param_type},
+                }
+                result = qwen3_coder._convert_param_value(
+                    param_value, param_name, param_config
+                )
+                self.assertEqual(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
