@@ -234,59 +234,6 @@ requests that use the same context. See the
 [example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
 for more usage details.
 
-### Server Memory Controls
-
-When using `mlx_lm.server`, these options help prevent OOM during long
-multi-turn sessions:
-
-- `--prompt-cache-bytes`: upper bound for the LRU prompt cache memory.
-- `--max-prompt-tokens`: hard prompt token cap to avoid unbounded context growth.
-- `--prompt-overflow-policy`: `error` (reject) or `truncate` (keep head+tail).
-- `--prompt-keep-tokens`: with `truncate`, keep this many tokens from the start.
-- `--max-active-kv-bytes`: reject requests if projected active KV usage would
-  exceed this limit.
-- `--max-active-memory-bytes`: abort requests when current MLX active memory is
-  above this limit.
-- `--max-kv-size`: fixed active KV window (rotating cache). This bounds per-request
-  KV growth but can reduce quality if set too low.
-
-Examples:
-
-```bash
-# Fixed active-KV window (stable bounded memory, no KV quantization)
-mlx_lm.server \
-  --model <model> \
-  --max-prompt-tokens 8192 \
-  --prompt-overflow-policy error \
-  --max-kv-size 8192 \
-  --prompt-cache-bytes 2G \
-  --max-active-kv-bytes 8G \
-  --max-active-memory-bytes 28G
-```
-
-Notes:
-
-- `--max-prompt-tokens` is the primary control to stop memory creep across long chats.
-- `--max-active-kv-bytes`, `--max-active-memory-bytes`, and `--max-kv-size`
-  work at different levels:
-  - `--max-active-kv-bytes`: projected KV-only admission control.
-  - `--max-active-memory-bytes`: runtime ceiling for all active MLX memory.
-  - `--max-kv-size`: hard cap on attention window in KV cache (quality tradeoff).
-- Practical tuning order:
-  1. Set `--max-prompt-tokens` first (for example `8192`).
-  2. Set `--max-active-memory-bytes` below total RAM by 15-25% to leave headroom for
-     OS and other apps.
-  3. Set `--max-active-kv-bytes` as a subset of that budget (commonly ~20-40% of
-     `--max-active-memory-bytes`).
-  4. Only add `--max-kv-size` if memory still creeps; start high (for example `8192`
-     or `16384`) and lower only if required.
-- Example for a 36 GB machine:
-  - `--max-active-memory-bytes 27G`
-  - `--max-active-kv-bytes 6G`
-  - `--max-prompt-tokens 8192`
-- OOM-style failures now return HTTP `503` instead of crashing the server
-  process.
-
 ### Supported Models
 
 `mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
