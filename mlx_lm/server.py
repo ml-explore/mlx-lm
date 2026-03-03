@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import heapq
 import json
 import logging
 import pickle
@@ -189,6 +190,27 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
 
+    class CacheKey:
+        entry_count = 0
+
+        def __init__(self, model, tokens, checkpoint: bool = False):
+            self.model = model
+            self.tokens = tokens
+
+            self.entry_count += 1
+            self._id = self.entry_count
+            self._checkpoint = int(checkpoint)
+
+        def __lt__(self, other):
+            return (self._checkpoint, self._id) < (other._checkpoint, other._id)
+
+        def __eq__(self, other):
+            return self.model == other.model and self.tokens == other.tokens
+
+        def __iter__(self):
+            yield self.model
+            yield self.tokens
+
     @dataclass
     class SearchResult:
         model: Any
@@ -201,11 +223,11 @@ class LRUPromptCache:
         self.max_size = max_size
         self.max_bytes = max_bytes
         self._cache = {}
-        self._lru = deque()
+        self._cache_order = []
         self._n_bytes = 0
 
     def __len__(self):
-        return len(self._lru)
+        return len(self._cache_order)
 
     @property
     def nbytes(self):
@@ -293,7 +315,7 @@ class LRUPromptCache:
 
         return None, tokens
 
-    def insert_cache(self, model, tokens, prompt_cache):
+    def insert_cache(self, model, tokens, prompt_cache, checkpoint: bool = False):
         is_trimmable = can_trim_prompt_cache(prompt_cache)
 
         if model not in self._cache:
@@ -305,22 +327,25 @@ class LRUPromptCache:
             if is_trimmable and "cache" in current:
                 self._n_bytes -= current["cache"].nbytes
                 del current["cache"]
-                self._lru.remove((model, tokens[:i]))
+                self._cache_order.remove(self.CacheKey(model, tokens[:i]))
             current = current[tok]
 
         if "cache" in current:
-            self._lru.remove((model, tokens))
+            self._cache_order.remove(self.CacheKey(model, tokens))
         else:
             cache_bytes = sum(c.nbytes for c in prompt_cache)
             current["cache"] = self.CacheEntry(prompt_cache, cache_bytes)
             self._n_bytes += cache_bytes
 
-        self._lru.append((model, tokens))
-        if len(self._lru) > self.max_size:
-            model, tokens = self._lru.popleft()
+        heapq.heapify(self._cache_order)
+        heapq.heappush(
+            self._cache_order, self.CacheKey(model, tokens, checkpoint=checkpoint)
+        )
+        if len(self._cache_order) > self.max_size:
+            model, tokens = heapq.heappop(self._cache_order)
             self._delete(model, tokens)
-        while self._n_bytes > self.max_bytes and len(self._lru) > 1:
-            model, tokens = self._lru.popleft()
+        while self._n_bytes > self.max_bytes and len(self._cache_order) > 1:
+            model, tokens = heapq.heappop(self._cache_order)
             self._delete(model, tokens)
 
         logging.info(
@@ -333,11 +358,11 @@ class LRUPromptCache:
         n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
         n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
 
-        while len(self._lru) > n_sequences:
-            model, tokens = self._lru.popleft()
+        while len(self._cache_order) > n_sequences:
+            model, tokens = heapq.heappop(self._cache_order)
             self._delete(model, tokens)
         while self._n_bytes > n_bytes:
-            model, tokens = self._lru.popleft()
+            model, tokens = heapq.heappop(self._cache_order)
             self._delete(model, tokens)
 
         logging.info(
