@@ -739,6 +739,24 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
+    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
+        if request.request_type != "chat":
+            return False, -1
+        if request.messages[-1]["role"] != "user":
+            return False, -1
+
+        # Save the KV cache at the end of the prompt just before
+        # the think start token which will likely be removed in the
+        # next turn.
+        prompt_checkpoint = -1
+        if tokenizer.has_thinking:
+            for i in range(1, min(11, len(prompt)) - 1, 1):
+                if prompt[-i] == tokenizer.think_start_id:
+                    prompt_checkpoint = -i - 1
+                    break
+
+        return True, prompt_checkpoint
+
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
             return False
@@ -807,7 +825,6 @@ class ResponseGenerator:
                 ):
                     try:
                         prompt = self._tokenize(current_tokenizer, request, args)
-                        do_checkpoint = request.messages[-1]["role"] == "user"
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -838,17 +855,9 @@ class ResponseGenerator:
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
-                    # Save the KV cache at the end of the prompt just before
-                    # the think start token which will likely be removed in the
-                    # next turn.
-                    prompt_checkpoint = -1
-                    for i in range(1, min(11, len(rest)) - 1, 1):
-                        if (
-                            tokenizer.has_thinking
-                            and rest[-i] == tokenizer.think_start_id
-                        ):
-                            prompt_checkpoint = -i - 1
-                            break
+                    do_checkpoint, checkpoint_position = (
+                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
+                    )
 
                     (uid,) = batch_generator.insert(
                         [rest],
@@ -856,7 +865,7 @@ class ResponseGenerator:
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        prompt_checkpoints=[prompt_checkpoint],
+                        prompt_checkpoints=[checkpoint_position],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
