@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
@@ -136,7 +137,7 @@ class MLP(nn.Module):
     def __call__(self, x) -> mx.array:
         x = self.proj_1(x)
         gate, x = mx.split(x, 2, axis=-1)
-        return self.proj_2(nn.silu(gate) * x)
+        return self.proj_2(swiglu(gate, x))
 
 
 class TransformerBlock(nn.Module):

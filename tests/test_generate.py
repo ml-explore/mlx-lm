@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import random
 import unittest
 from typing import List
 
@@ -8,7 +9,9 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
+    batch_generate,
     generate,
+    generate_step,
     stream_generate,
 )
 from mlx_lm.models.cache import RotatingKVCache
@@ -81,7 +84,7 @@ class TestGenerate(unittest.TestCase):
 
     def test_stream_generate_speculative(self):
         # Use same model as draft model, this is not a speed test
-        draft_model, _ = load(self.HF_MODEL_PATH)
+        draft_model = self.model
 
         results: List[GenerationResponse] = []
         drafted: List[bool] = []
@@ -90,7 +93,8 @@ class TestGenerate(unittest.TestCase):
         sampler = make_sampler(temp=0.0)
         messages = [{"role": "user", "content": "hello"}]
         prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages,
+            add_generation_prompt=True,
         )
 
         for generation_result in stream_generate(
@@ -117,7 +121,8 @@ class TestGenerate(unittest.TestCase):
         # get prompt embeddings
         messages = [{"role": "user", "content": "Say 'TEST' and nothing else"}]
         prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages,
+            add_generation_prompt=True,
         )
         prompt_embeddings = self.model.model.embed_tokens(prompt)
 
@@ -140,7 +145,8 @@ class TestGenerate(unittest.TestCase):
         # get prompt embeddings
         messages = [{"role": "user", "content": "Say 'TEST' and nothing else"}]
         prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages,
+            add_generation_prompt=True,
         )
         prompt_embeddings = self.model.model.embed_tokens(prompt)
 
@@ -352,6 +358,81 @@ class TestGenerate(unittest.TestCase):
 
         del self.model.make_cache
 
+    def test_batch_generate_with_logits_processors(self):
+        """Test that batch_generate with logits_processors produces correct results."""
+        logit_bias = {0: 2000.0, 1: -2000.0}
+        processors = make_logits_processors(logit_bias)
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+        prompt = self.tokenizer.encode("hello")
+        uids = batch_gen.insert([prompt])
+        response = batch_gen.next()[0]
+        logprobs = response.logprobs
+        self.assertEqual(logprobs[0].item(), 0.0)
+        self.assertEqual(logprobs.argmin().item(), 1)
+
+        del batch_gen
+
+        logit_bias = {0: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+
+        (uid0,) = batch_gen.insert([prompt])
+
+        logit_bias = {1: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        (uid1,) = batch_gen.insert([prompt], logits_processors=[processors])
+
+        logit_bias = {2: 2000.0}
+        processors = make_logits_processors(logit_bias)
+        (uid2,) = batch_gen.insert([prompt], logits_processors=[processors])
+
+        responses = batch_gen.next()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid0].logprobs[0].item(), 0.0)
+        self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
+        self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
+
+    def test_batch_generate_with_samplers(self):
+        """Test that batch_generate with logits_processors produces correct results."""
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            sampler=lambda _: mx.array([1]),
+        )
+        prompt = self.tokenizer.encode("hello")
+        uids = batch_gen.insert([prompt])
+        response = batch_gen.next()[0]
+        self.assertEqual(response.token, 1)
+
+        del batch_gen
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            sampler=lambda _: mx.array([1]),
+        )
+
+        (uid0,) = batch_gen.insert([prompt])
+        uid1, uid2 = batch_gen.insert(
+            [prompt, prompt],
+            samplers=[lambda _: mx.array([2]), lambda _: mx.array([3])],
+        )
+
+        responses = batch_gen.next()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid0].token, 1)
+        self.assertEqual(responses[uid1].token, 2)
+        self.assertEqual(responses[uid2].token, 3)
+
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
             if rotating:
@@ -394,7 +475,7 @@ class TestGenerate(unittest.TestCase):
                 self.model,
                 stop_tokens=self.tokenizer.eos_token_ids,
                 max_tokens=10,
-                prefill_batch_size=1,
+                prefill_batch_size=4,
                 prefill_step_size=8,
                 completion_batch_size=2,
             )
@@ -431,6 +512,125 @@ class TestGenerate(unittest.TestCase):
 
             if rotating:
                 del self.model.make_cache
+
+    def _continued_generation_test_helper(self, model):
+        def rand_prompt(n):
+            return [random.randint(0, 1000) for _ in range(n)]
+
+        # Make the prompts
+        prompts_a = [
+            rand_prompt(5),
+            rand_prompt(3),
+            rand_prompt(8),
+            rand_prompt(1),
+        ]
+        prompts_b = [
+            rand_prompt(2),
+            rand_prompt(7),
+            rand_prompt(4),
+            rand_prompt(6),
+        ]
+
+        # Generate once
+        batch_gen = BatchGenerator(
+            model,
+            stop_tokens={},
+            max_tokens=10,
+            prefill_batch_size=4,
+            prefill_step_size=32,
+            completion_batch_size=2,
+        )
+
+        uids = batch_gen.insert(prompts_a)
+        caches = {uid: None for uid in uids}
+        while responses := batch_gen.next():
+            for r in responses:
+                if r.finish_reason is not None:
+                    caches[r.uid] = r.prompt_cache
+
+        caches = [caches[uid] for uid in uids]
+
+        # Generate the 2nd time
+        uids = batch_gen.insert(prompts_b, caches=caches)
+        batch_responses = {uid: [] for uid in uids}
+        while responses := batch_gen.next():
+            for r in responses:
+                batch_responses[r.uid].append(r.logprobs)
+
+        for e, uid in enumerate(uids):
+            for i, (_, logprobs) in enumerate(
+                generate_step(
+                    mx.array(prompts_b[e]),
+                    model,
+                    max_tokens=10,
+                    prompt_cache=caches[e],
+                )
+            ):
+                batch_logprobs = batch_responses[uid][i]
+                self.assertTrue(
+                    mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
+                )
+
+    def test_batch_continued_generation_ssm(self):
+        from mlx_lm.models import mamba2
+
+        random.seed(0)
+        mx.random.seed(4)
+
+        # Make a small SSM model
+        args = mamba2.ModelArgs(
+            model_type="mamba2",
+            num_heads=8,
+            head_dim=16,
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=128,
+            state_size=32,
+            num_hidden_layers=4,
+            layer_norm_epsilon=1e-4,
+            conv_kernel=3,
+            n_groups=4,
+            use_bias=False,
+            use_conv_bias=False,
+            tie_word_embeddings=True,
+            time_step_limit=(0.01, 10),
+            time_step_rank="auto",
+        )
+        model = mamba2.Model(args)
+        self._continued_generation_test_helper(model)
+
+    def test_batch_continued_generation_gated_delta(self):
+        from mlx_lm.models import qwen3_next
+
+        random.seed(0)
+        mx.random.seed(4)
+        args = qwen3_next.ModelArgs(
+            model_type="qwen3_next",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            vocab_size=1000,
+            linear_num_value_heads=4,
+            linear_num_key_heads=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=3,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            shared_expert_intermediate_size=128,
+            mlp_only_layers=[0],
+            moe_intermediate_size=128,
+            rms_norm_eps=1e-5,
+            head_dim=64,
+            rope_theta=1000.0,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1000,
+        )
+        model = qwen3_next.Model(args)
+        self._continued_generation_test_helper(model)
 
 
 if __name__ == "__main__":

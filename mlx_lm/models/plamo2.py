@@ -9,7 +9,8 @@ import mlx.nn as nn
 
 from mlx_lm.models.base import BaseModelArgs, create_attention_mask, create_ssm_mask
 
-from .cache import KVCache, MambaCache
+from .activations import swiglu
+from .cache import ArraysCache, KVCache
 from .ssm import ssm_update
 
 
@@ -54,27 +55,13 @@ class RMSNorm(nn.Module):
         )
 
 
-def causal_conv1d_update(conv_state, x, weight) -> tuple[mx.array, mx.array]:
-    dim = x.shape[-1]
-    state_len = conv_state.shape[-2]
-    x = mx.concatenate([conv_state, x], axis=-2)
-    conv_state = x[:, -state_len:]
-    out = mx.conv1d(
-        x,
-        weight,
-        padding=0,
-        groups=dim,
-    )
-    return nn.silu(out), conv_state
-
-
 class Mamba(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.d_state = config.mamba_d_state
-        self.d_conv = config.mamba_d_conv
+        self.conv_kernel_size = config.mamba_d_conv
         self.chunk_size = config.mamba_chunk_size
         self.num_heads = config.mamba_num_heads
         self.hidden_size_per_head = config.hidden_size_per_head
@@ -88,7 +75,7 @@ class Mamba(nn.Module):
             in_channels=self.intermediate_size,
             out_channels=self.intermediate_size,
             bias=False,
-            kernel_size=self.d_conv,
+            kernel_size=self.conv_kernel_size,
             groups=self.intermediate_size,
             padding=0,
         )
@@ -111,20 +98,63 @@ class Mamba(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
+    def _conv(
+        self,
+        conv_input: mx.array,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
+    ) -> mx.array:
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
+
+        if cache is not None:
+            if cache[0] is None:
+                conv_state = mx.zeros(
+                    (
+                        conv_input.shape[0],
+                        self.conv_kernel_size - 1,
+                        self.intermediate_size,
+                    ),
+                    dtype=conv_input.dtype,
+                )
+            else:
+                conv_state = cache[0]
+            padded_input = mx.concatenate([conv_state, conv_input], axis=1)
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                t = padded_input.shape[1]
+                ends = mx.clip(cache.lengths, 0, t - n_keep)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(padded_input, positions, axis=1)
+            else:
+                cache[0] = padded_input[:, -n_keep:, :]
+        else:
+            padded_input = mx.pad(
+                conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+            )
+
+        conv_output = self.conv1d(padded_input)
+        return nn.silu(conv_output)
+
     def _ssm(
         self,
         x: mx.array,
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        state: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        cache: Optional[Any],
+        mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = x.shape
 
         x = x.reshape(batch_size, seq_len, self.num_heads, self.hidden_size_per_head)
         B = B.reshape(batch_size, seq_len, 1, self.d_state)
         C = C.reshape(batch_size, seq_len, 1, self.d_state)
+        if cache:
+            state = cache[1]
+            lengths = cache.lengths
+        else:
+            state, lengths = None, None
 
         y, state = ssm_update(
             x,
@@ -136,8 +166,11 @@ class Mamba(nn.Module):
             self.dt_bias,
             state,
             mask=mask,
+            lengths=lengths,
         )
-        return y.reshape(batch_size, seq_len, self.intermediate_size), state
+        if cache:
+            cache[1] = state
+        return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
         self,
@@ -146,14 +179,6 @@ class Mamba(nn.Module):
         cache=None,
     ):
         bsize, length, _ = hidden_states.shape
-
-        if cache is not None and cache[0] is not None:
-            conv_state = cache[0]
-        else:
-            conv_state = mx.zeros(
-                (bsize, self.d_conv - 1, self.intermediate_size),
-                dtype=hidden_states.dtype,
-            )
 
         zx = self.in_proj(hidden_states)
         zx = zx.reshape(bsize, length, self.num_heads, -1)
@@ -168,9 +193,8 @@ class Mamba(nn.Module):
         )
 
         x = x.reshape(bsize, -1, self.num_heads * self.hidden_size_per_head)
-        if mask is not None:
-            x = mx.where(mask[..., None], x, 0)
-        x, conv_state = causal_conv1d_update(conv_state, x, self.conv1d.weight)
+        x = self._conv(x, cache, mask)
+
         BCdt = self.bcdt_proj(x)
         B, C, dt = mx.split(BCdt, [self.d_state, self.d_state * 2], axis=-1)
 
@@ -181,18 +205,18 @@ class Mamba(nn.Module):
 
         # (bsize, length, num_heads)
         dt = self.dt_proj(dt)
-        out, ssm_state = self._ssm(
+        out = self._ssm(
             x,
             B,
             C,
             dt,
-            cache[1] if cache else None,
+            cache,
             mask,
         )
-        out = out * nn.silu(z.flatten(-2))
-        if cache is not None:
-            cache[0] = conv_state
-            cache[1] = ssm_state
+        if cache:
+            cache.advance(out.shape[1])
+
+        out = swiglu(z.flatten(-2), out)
         return self.out_proj(out)
 
 
@@ -282,7 +306,7 @@ class MLP(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         h = self.gate_up_proj(x)
         hs = mx.split(h, 2, axis=-1)
-        return self.down_proj(nn.silu(hs[0]) * hs[1])
+        return self.down_proj(swiglu(hs[0], hs[1]))
 
 
 class PlamoDecoderLayer(nn.Module):
@@ -435,7 +459,7 @@ class Model(nn.Module):
     def make_cache(self):
         # TODO use RotatingKVCache is not full_attn
         # full_attn = self.layer_idx in self.config.full_attention_idx
-        return [MambaCache() if l.is_mamba else KVCache() for l in self.layers]
+        return [ArraysCache(size=2) if l.is_mamba else KVCache() for l in self.layers]
 
     def __call__(self, inputs: mx.array, cache=None) -> mx.array:
         outputs = self.model(

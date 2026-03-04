@@ -11,6 +11,7 @@ class TestLosses(unittest.TestCase):
 
     def test_kl_div_loss(self):
         self.assertTrue(can_run_metal())
+        mx.random.seed(0)
 
         logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
         logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
@@ -23,6 +24,7 @@ class TestLosses(unittest.TestCase):
 
     def test_js_div_loss(self):
         self.assertTrue(can_run_metal())
+        mx.random.seed(0)
 
         logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
         logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
@@ -35,6 +37,7 @@ class TestLosses(unittest.TestCase):
 
     def test_kl_div_loss_vjp(self):
         self.assertTrue(can_run_metal())
+        mx.random.seed(0)
 
         logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
         logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
@@ -48,6 +51,7 @@ class TestLosses(unittest.TestCase):
 
     def test_js_div_loss_vjp(self):
         self.assertTrue(can_run_metal())
+        mx.random.seed(0)
 
         logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
         logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)

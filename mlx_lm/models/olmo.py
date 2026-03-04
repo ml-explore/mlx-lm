@@ -7,6 +7,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask
 
 try:
@@ -105,7 +106,7 @@ class TransformerBlock(nn.Module):
 
         x1, x2 = mx.split(self.ff_proj(self.ff_norm(h)), 2, axis=-1)
 
-        out = h + self.ff_out(nn.silu(x2) * x1)
+        out = h + self.ff_out(swiglu(x2, x1))
         return out
 
 

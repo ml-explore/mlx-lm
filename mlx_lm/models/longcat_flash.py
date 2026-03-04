@@ -4,9 +4,13 @@ from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
+from .mla import MultiLinear
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -38,6 +42,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     norm_topk_prob: bool = False
     router_bias: bool = False
+    rope_scaling: Optional[Dict] = None
 
 
 class LongcatFlashMLA(nn.Module):
@@ -76,10 +81,11 @@ class LongcatFlashMLA(nn.Module):
             bias=args.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_attention_heads * (self.qk_nope_head_dim + args.v_head_dim),
-            bias=False,
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, self.kv_lora_rank, self.num_attention_heads
+        )
+        self.unembed_out = MultiLinear(
+            self.kv_lora_rank, self.v_head_dim, self.num_attention_heads
         )
 
         self.o_proj = nn.Linear(
@@ -93,8 +99,20 @@ class LongcatFlashMLA(nn.Module):
         if args.mla_scale_kv_lora:
             self.mla_scale_kv_lora = (args.hidden_size / self.kv_lora_rank) ** 0.5
 
-        self.rope = nn.RoPE(
-            dims=self.qk_rope_head_dim, base=args.rope_theta, traditional=True
+        if args.rope_scaling is not None:
+            mscale_all_dim = args.rope_scaling.get("mscale_all_dim", 0)
+            if mscale_all_dim:
+                scaling_factor = args.rope_scaling["factor"]
+                if scaling_factor > 1:
+                    s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
+                    self.scale = self.scale * s * s
+
+        self.rope = initialize_rope(
+            dims=self.qk_rope_head_dim,
+            base=args.rope_theta,
+            traditional=True,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -106,56 +124,59 @@ class LongcatFlashMLA(nn.Module):
         B, L, _ = x.shape
 
         if self.q_lora_rank is None:
-            q_states = self.q_proj(x)
+            q = self.q_proj(x)
         else:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
 
-        q_states = q_states.reshape(B, L, -1, self.qk_head_dim).transpose(0, 2, 1, 3)
-
-        if self.mla_scale_q_lora is not None:
-            q_states = q_states * self.mla_scale_q_lora
-
-        q_pass, q_rot = mx.split(q_states, [self.qk_nope_head_dim], axis=-1)
-
-        compressed_kv = self.kv_a_proj_with_mqa(x)
-        k_pass, k_rot = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
-        k_pass = self.kv_a_layernorm(k_pass)
-
-        if self.mla_scale_kv_lora is not None:
-            k_pass = k_pass * self.mla_scale_kv_lora
-
-        key_shape = (B, L, -1, self.qk_nope_head_dim + self.v_head_dim)
-        k_pass = self.kv_b_proj(k_pass).reshape(*key_shape).transpose(0, 2, 1, 3)
-        k_pass, value_states = mx.split(k_pass, [self.qk_nope_head_dim], axis=-1)
-
-        k_rot = k_rot.reshape(B, 1, L, self.qk_rope_head_dim)
-
-        if cache is not None:
-            q_rot = self.rope(q_rot, cache.offset)
-            k_rot = self.rope(k_rot, cache.offset)
-        else:
-            q_rot = self.rope(q_rot)
-            k_rot = self.rope(k_rot)
-
-        k_rot = mx.broadcast_to(k_rot, (*k_pass.shape[:-1], k_rot.shape[-1]))
-
-        query_states = mx.concatenate([q_pass, q_rot], axis=-1)
-        key_states = mx.concatenate([k_pass, k_rot], axis=-1)
-
-        if cache is not None:
-            key_states, value_states = cache.update_and_fetch(key_states, value_states)
-
-        attn_output = scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
+        q = q.reshape(B, L, self.num_attention_heads, self.qk_head_dim).transpose(
+            0, 2, 1, 3
         )
 
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(attn_output)
+        if self.mla_scale_q_lora is not None:
+            q = q * self.mla_scale_q_lora
+
+        q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(x)
+        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
+        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
+
+        if self.mla_scale_kv_lora is not None:
+            kv_latent = kv_latent * self.mla_scale_kv_lora
+
+        offset = cache.offset if cache is not None else 0
+        q_pe = self.rope(q_pe, offset)
+        k_pe = self.rope(k_pe, offset)
+
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
+
+        if cache is not None:
+            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
+
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+
+        if L == 1:
+            q_nope = self.embed_q(q_nope)
+            k = v = kv_latent
+        else:
+            k = self.embed_q(kv_latent, transpose=False)
+            v = self.unembed_out(kv_latent)
+
+        output = scaled_dot_product_attention(
+            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+        )
+        if L == 1:
+            output = self.unembed_out(output)
+
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
 
 
 class LongcatFlashMLP(nn.Module):
@@ -168,7 +189,7 @@ class LongcatFlashMLP(nn.Module):
         self.down_proj = nn.Linear(hidden_size, args.hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class LongcatFlashTopkRouter(nn.Module):
@@ -223,8 +244,11 @@ class LongcatFlashMoE(nn.Module):
         )
 
         self.router = LongcatFlashTopkRouter(args)
+        self.sharding_group = None
 
     def __call__(self, hidden_states):
+        if self.sharding_group is not None:
+            hidden_states = sum_gradients(self.sharding_group)(hidden_states)
 
         topk_indices, topk_weights = self.router(hidden_states)
 
@@ -236,14 +260,20 @@ class LongcatFlashMoE(nn.Module):
         regular_outputs = self.switch_mlp(hidden_states, topk_indices)
 
         weighted_outputs = regular_outputs * regular_weights[..., None]
-
-        # Add identity expert contribution if needed
-        assert self.zero_expert_type == "identity"
-        identity_weights = mx.where(mask, topk_weights, 0.0)
-        identity_outputs = hidden_states[..., None, :] * identity_weights[..., None]
-        weighted_outputs = weighted_outputs + identity_outputs
-
         final_output = mx.sum(weighted_outputs, axis=-2)
+
+        if self.sharding_group is not None:
+            final_output = mx.distributed.all_sum(
+                final_output, group=self.sharding_group
+            )
+
+        # Add identity expert contribution after all_sum to avoid summing it N times
+        assert self.zero_expert_type == "identity"
+        identity_weights_sum = mx.sum(
+            mx.where(mask, topk_weights, 0.0), axis=-1, keepdims=True
+        )
+        final_output = final_output + hidden_states * identity_weights_sum
+
         return final_output
 
 
@@ -314,7 +344,7 @@ class LongcatFlashModel(nn.Module):
         if cache is None:
             cache = [(None, None)] * self.num_layers
 
-        mask = create_attention_mask(h, cache[0][0])
+        mask = create_attention_mask(h, cache[0][0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
@@ -370,6 +400,47 @@ class Model(nn.Module):
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
+        for l in range(self.args.num_layers):
+            for i in range(2):
+                prefix = f"model.layers.{l}.self_attn.{i}"
+                kv_b_key = f"{prefix}.kv_b_proj.weight"
+                if kv_b_key in weights:
+                    num_heads = self.args.num_attention_heads
+                    head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+                    quantized = f"{prefix}.kv_b_proj.scales" in weights
+                    v = weights.pop(kv_b_key)
+
+                    if quantized:
+                        dims = self.args.kv_lora_rank
+                        scales = weights.pop(f"{prefix}.kv_b_proj.scales")
+                        biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+                        bits = (v.shape[-1] * 32) // dims
+                        group_size = dims // scales.shape[-1]
+                        v = mx.dequantize(
+                            v, scales, biases, bits=bits, group_size=group_size
+                        )
+
+                    v = v.reshape(num_heads, head_dim, -1)
+                    wk = mx.contiguous(
+                        v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                    )
+                    wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
+
+                    if quantized:
+                        wk, wk_s, wk_b = mx.quantize(
+                            wk, bits=bits, group_size=group_size
+                        )
+                        wv, wv_s, wv_b = mx.quantize(
+                            wv, bits=bits, group_size=group_size
+                        )
+                        weights[f"{prefix}.embed_q.scales"] = wk_s
+                        weights[f"{prefix}.embed_q.biases"] = wk_b
+                        weights[f"{prefix}.unembed_out.scales"] = wv_s
+                        weights[f"{prefix}.unembed_out.biases"] = wv_b
+
+                    weights[f"{prefix}.embed_q.weight"] = wk
+                    weights[f"{prefix}.unembed_out.weight"] = wv
+
         new_weights = {}
         for k, v in weights.items():
             if k.startswith("model.mtp"):
@@ -379,3 +450,44 @@ class Model(nn.Module):
 
     def make_cache(self):
         return [CacheList(KVCache(), KVCache()) for _ in self.model.layers]
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        rank = group.rank()
+
+        for layer in self.model.layers:
+            for attn in layer.self_attn:
+                if attn.q_lora_rank is None:
+                    attn.q_proj = shard_linear(
+                        attn.q_proj, "all-to-sharded", group=group
+                    )
+                else:
+                    attn.q_b_proj = shard_linear(
+                        attn.q_b_proj, "all-to-sharded", group=group
+                    )
+                attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+                attn.num_attention_heads //= N
+                num_heads = attn.num_attention_heads
+                sh = rank * num_heads
+                eh = sh + num_heads
+
+                def shard_heads(w):
+                    return w[sh:eh]
+
+                attn.embed_q.apply(shard_heads)
+                attn.unembed_out.apply(shard_heads)
+
+            for mlp in layer.mlps:
+                mlp.gate_proj = shard_linear(
+                    mlp.gate_proj, "all-to-sharded", group=group
+                )
+                mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
+                mlp.down_proj = shard_linear(
+                    mlp.down_proj, "sharded-to-all", group=group
+                )
+
+            layer.mlp.sharding_group = group
+            shard_inplace(layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+            shard_inplace(layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+            shard_inplace(layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group)

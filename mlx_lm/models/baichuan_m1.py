@@ -6,8 +6,9 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache, MambaCache, RotatingKVCache
+from .cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
 
 @dataclass
@@ -140,7 +141,7 @@ class MLP(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class DecoderLayer(nn.Module):
@@ -222,7 +223,7 @@ class Model(nn.Module):
         caches = []
         for i, layer in enumerate(self.model.layers):
             is_swa = i in self.config.sliding_window_layers
-            conv_cache = MambaCache()
+            conv_cache = ArraysCache(size=2)
             if is_swa:
                 kv_cache = RotatingKVCache(max_size=self.config.sliding_window)
             else:

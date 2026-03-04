@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache
 from .rope_utils import initialize_rope
 
 
@@ -329,6 +330,9 @@ class NemotronNASModel(nn.Module):
             for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.num_attn_layers = sum(
+            1 for layer in self.layers if layer.self_attn is not None
+        )
 
     def __call__(
         self,
@@ -338,11 +342,17 @@ class NemotronNASModel(nn.Module):
         h = self.embed_tokens(inputs)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * self.num_attn_layers
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        cache_idx = 0
+        for layer in self.layers:
+            if layer.self_attn is not None:
+                c = cache[cache_idx]
+                cache_idx += 1
+            else:
+                c = None
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
@@ -380,3 +390,6 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def make_cache(self):
+        return [KVCache() for layer in self.layers if layer.self_attn is not None]

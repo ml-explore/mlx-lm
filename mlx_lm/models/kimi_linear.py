@@ -6,15 +6,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
-from .rope_utils import initialize_rope
+from .mla import MultiLinear
 from .switch_layers import SwitchGLU
 
 
@@ -68,7 +69,7 @@ class KimiMLP(nn.Module):
         self.down_proj = nn.Linear(hidden, dim, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 @mx.compile
@@ -164,6 +165,7 @@ class KimiMLAAttention(nn.Module):
         self.qk_rope_head_dim = args.qk_rope_head_dim or 0
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim or args.head_dim
+        self.kv_lora_rank = args.kv_lora_rank
         self.scale = self.q_head_dim**-0.5
 
         hidden = args.hidden_size
@@ -174,22 +176,13 @@ class KimiMLAAttention(nn.Module):
             bias=False,
         )
         self.kv_a_layernorm = nn.RMSNorm(args.kv_lora_rank, eps=args.rms_norm_eps)
-        self.kv_b_proj = nn.Linear(
-            args.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, args.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            args.kv_lora_rank, self.v_head_dim, self.num_heads
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
-
-        rope_dim = self.qk_rope_head_dim or self.q_head_dim
-        self.rope = initialize_rope(
-            rope_dim,
-            base=args.rope_theta,
-            traditional=False,
-            scaling_config=args.rope_scaling,
-            max_position_embeddings=args.model_max_length,
-        )
 
     def __call__(
         self,
@@ -198,51 +191,45 @@ class KimiMLAAttention(nn.Module):
         cache: Optional[KVCache] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        q_states = self.q_proj(x).reshape(B, L, self.num_heads, self.q_head_dim)
-        q_pass, q_rot = mx.split(q_states, [self.qk_nope_head_dim], axis=-1)
 
-        compressed = self.kv_a_proj_with_mqa(x)
-        k_pass, k_rot = mx.split(
-            compressed, [compressed.shape[-1] - self.qk_rope_head_dim], axis=-1
-        )
-        k_pass = self.kv_a_layernorm(k_pass)
-        kv = self.kv_b_proj(k_pass)
-        kv = kv.reshape(
-            B,
-            L,
-            self.num_heads,
-            self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim,
-        )
-        k_pass, v_states = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.q_head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
-        if self.qk_rope_head_dim:
-            k_rot = mx.reshape(k_rot, (B, L, 1, self.qk_rope_head_dim))
-            k_rot = mx.broadcast_to(k_rot, (*k_pass.shape[:-1], self.qk_rope_head_dim))
-        else:
-            k_rot = mx.zeros((*k_pass.shape[:-1], 0), dtype=k_pass.dtype)
+        compressed_kv = self.kv_a_proj_with_mqa(x)
+        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
+        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
 
-        queries = mx.concatenate([q_pass, q_rot], axis=-1).transpose(0, 2, 1, 3)
-        keys = mx.concatenate([k_pass, k_rot], axis=-1).transpose(0, 2, 1, 3)
-        values = v_states.transpose(0, 2, 1, 3)
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        out = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache,
-            scale=self.scale,
-            mask=mask,
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+
+        if L == 1:
+            q_nope = self.embed_q(q_nope)
+            k = v = kv_latent
+        else:
+            k = self.embed_q(kv_latent, transpose=False)
+            v = self.unembed_out(kv_latent)
+
+        output = scaled_dot_product_attention(
+            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(out)
+
+        if L == 1:
+            output = self.unembed_out(output)
+
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
 
 
 class ShortConv1d(nn.Module):
@@ -259,18 +246,30 @@ class ShortConv1d(nn.Module):
         )
 
     def __call__(
-        self, x: mx.array, cache: Optional[mx.array]
+        self,
+        x: mx.array,
+        state: Optional[mx.array],
+        mask: Optional[mx.array],
+        lengths: Optional[mx.array],
     ) -> Tuple[mx.array, mx.array]:
-        if cache is None:
-            pad = mx.zeros(
+        if mask is not None:
+            x = mx.where(mask[..., None], x, 0)
+
+        if state is None:
+            state = mx.zeros(
                 (x.shape[0], self.kernel_size - 1, x.shape[-1]), dtype=x.dtype
             )
-        else:
-            pad = cache
-        conv_input = mx.concatenate([pad, x], axis=1)
+        conv_input = mx.concatenate([state, x], axis=1)
         out = nn.silu(self.conv(conv_input))
-        new_cache = conv_input[:, -self.kernel_size + 1 :, :]
-        return out, new_cache
+        n_keep = self.kernel_size - 1
+        if lengths is not None:
+            ends = mx.clip(lengths, 0, x.shape[1])
+            positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+            new_state = mx.take_along_axis(conv_input, positions, axis=1)
+        else:
+            new_state = conv_input[:, -n_keep:, :]
+
+        return out, new_state
 
 
 class KimiDeltaAttention(nn.Module):
@@ -322,37 +321,37 @@ class KimiDeltaAttention(nn.Module):
         dtype = x.dtype
 
         if cache is not None:
-            conv_state, ssm_state = cache
+            q_state, k_state, v_state, ssm_state = cache
+            lengths = cache.lengths
         else:
-            conv_state = None
+            q_state = None
+            k_state = None
+            v_state = None
             ssm_state = None
+            lengths = None
 
-        if conv_state is None:
+        if q_state is None:
             s = mx.zeros((B, self.conv_kernel - 1, self.projection_dim), dtype=dtype)
             q_state = s
             k_state = s
             v_state = s
-        else:
-            q_state, k_state, v_state = conv_state
 
-        q_conv, q_state = self.q_conv(self.q_proj(x), q_state)
-        k_conv, k_state = self.k_conv(self.k_proj(x), k_state)
-        v_conv, v_state = self.v_conv(self.v_proj(x), v_state)
+        q_conv, q_state = self.q_conv(self.q_proj(x), q_state, mask, lengths)
+        k_conv, k_state = self.k_conv(self.k_proj(x), k_state, mask, lengths)
+        v_conv, v_state = self.v_conv(self.v_proj(x), v_state, mask, lengths)
 
         if cache is not None:
-            cache[0] = (q_state, k_state, v_state)
+            cache[0] = q_state
+            cache[1] = k_state
+            cache[2] = v_state
 
         q = q_conv.reshape(B, T, self.num_heads, self.head_dim)
         k = k_conv.reshape(B, T, self.num_heads, self.head_dim)
         v = v_conv.reshape(B, T, self.num_heads, self.head_dim)
 
-        def _l2norm(x, eps=1e-6):
-            norm = mx.linalg.norm(x, axis=-1, keepdims=True)
-            return x / (norm + eps)
-
-        q = _l2norm(q)
-        k = _l2norm(k)
-        q = q * self.scale
+        inv_scale = self.scale
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim
@@ -373,7 +372,8 @@ class KimiDeltaAttention(nn.Module):
         )
 
         if cache is not None:
-            cache[1] = ssm_state
+            cache[3] = ssm_state
+            cache.advance(T)
 
         gate = self.g_b_proj(self.g_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim
@@ -446,7 +446,7 @@ class KimiLinearModel(nn.Module):
             cache = [None] * len(self.layers)
 
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
-        attn_mask = create_attention_mask(h, cache[self.attn_idx])
+        attn_mask = create_attention_mask(h, cache[self.attn_idx], return_array=True)
 
         for layer, layer_cache in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else attn_mask
@@ -484,7 +484,7 @@ class Model(nn.Module):
         caches: List[Any] = []
         for layer in self.layers:
             if layer.is_linear:
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=4))
             else:
                 caches.append(KVCache())
         return caches
@@ -551,6 +551,42 @@ class Model(nn.Module):
                 if dt_key in weights:
                     if weights[dt_key].ndim > 1:
                         weights[dt_key] = mx.reshape(weights[dt_key], (-1,))
+
+            attn_prefix = f"{prefix}.self_attn"
+            kv_b_key = f"{attn_prefix}.kv_b_proj.weight"
+            if kv_b_key in weights:
+                qk_nope = self.args.qk_nope_head_dim or self.args.head_dim
+                v_head = self.args.v_head_dim or self.args.head_dim
+                head_dim = qk_nope + v_head
+                num_heads = self.args.num_attention_heads
+
+                quantized = f"{attn_prefix}.kv_b_proj.scales" in weights
+                v = weights.pop(kv_b_key)
+
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{attn_prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{attn_prefix}.kv_b_proj.biases")
+                    bits = (v.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    v = mx.dequantize(
+                        v, scales, biases, bits=bits, group_size=group_size
+                    )
+
+                v = v.reshape(num_heads, head_dim, -1)
+                wk = mx.contiguous(v[:, :qk_nope, :].swapaxes(-1, -2))
+                wv = mx.contiguous(v[:, qk_nope:, :])
+
+                if quantized:
+                    wk, wk_s, wk_b = mx.quantize(wk, bits=bits, group_size=group_size)
+                    wv, wv_s, wv_b = mx.quantize(wv, bits=bits, group_size=group_size)
+                    weights[f"{attn_prefix}.embed_q.scales"] = wk_s
+                    weights[f"{attn_prefix}.embed_q.biases"] = wk_b
+                    weights[f"{attn_prefix}.unembed_out.scales"] = wv_s
+                    weights[f"{attn_prefix}.unembed_out.biases"] = wv_b
+
+                weights[f"{attn_prefix}.embed_q.weight"] = wk
+                weights[f"{attn_prefix}.unembed_out.weight"] = wv
 
         return weights
 

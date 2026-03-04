@@ -71,7 +71,7 @@ prompt = "Write a story about Einstein"
 
 messages = [{"role": "user", "content": prompt}]
 prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True
+    messages, add_generation_prompt=True,
 )
 
 text = generate(model, tokenizer, prompt=prompt, verbose=True)
@@ -130,7 +130,7 @@ prompt = "Write a story about Einstein"
 
 messages = [{"role": "user", "content": prompt}]
 prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True
+    messages, add_generation_prompt=True,
 )
 
 for response in stream_generate(model, tokenizer, prompt, max_tokens=512):
@@ -170,7 +170,7 @@ mlx_lm.generate --help
 To quantize a model from the command line run:
 
 ```
-mlx_lm.convert --hf-path mistralai/Mistral-7B-Instruct-v0.3 -q
+mlx_lm.convert --model mistralai/Mistral-7B-Instruct-v0.3 -q
 ```
 
 For more options run:
@@ -185,7 +185,7 @@ You can upload new models to Hugging Face by specifying `--upload-repo` to
 
 ```
 mlx_lm.convert \
-    --hf-path mistralai/Mistral-7B-Instruct-v0.3 \
+    --model mistralai/Mistral-7B-Instruct-v0.3 \
     -q \
     --upload-repo mlx-community/my-4bit-mistral
 ```
