@@ -762,6 +762,104 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_step3p5_make_cache_uses_rotating_for_sliding_layers(self):
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 10000.0, 10000.0, 10000.0],
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            partial_rotary_factors=[0.5, 1.0, 1.0, 0.5],
+            attention_other_setting={
+                "num_attention_heads": 8,
+                "num_attention_groups": 2,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        model = step3p5.Model(args)
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]], dtype=mx.int32)
+        step = model(tokens[:, :3], cache=caches)
+        mx.eval(step)
+        for i in range(3, 7):
+            step = model(tokens[:, i : i + 1], cache=caches)
+            mx.eval(step)
+
+        self.assertEqual(caches[0].size(), 7)
+        self.assertEqual(caches[1].size(), args.sliding_window)
+        self.assertEqual(caches[2].size(), args.sliding_window)
+        self.assertEqual(caches[3].size(), 7)
+
+    def test_step3p5_make_cache_uses_fallback_sliding_pattern(self):
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=5,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            sliding_window=4,
+            partial_rotary_factors=[1.0] * 5,
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3,4",
+        )
+        model = step3p5.Model(args)
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[1], KVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+        self.assertIsInstance(caches[4], RotatingKVCache)
+
+        tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        for i in range(2, 6):
+            step = model(tokens[:, i : i + 1], cache=caches)
+            mx.eval(step)
+
+        self.assertEqual(caches[0].size(), args.sliding_window)
+        self.assertEqual(caches[1].size(), 6)
+        self.assertEqual(caches[2].size(), args.sliding_window)
+        self.assertEqual(caches[3].size(), 6)
+        self.assertEqual(caches[4].size(), args.sliding_window)
+
     def test_cohere(self):
         from mlx_lm.models import cohere
 
