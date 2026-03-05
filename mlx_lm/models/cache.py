@@ -473,7 +473,8 @@ class RotatingKVCache(_BaseCache):
             prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size
         ):
             v_head_dim = values.shape[3]
-            new_size = min(self.step, self.max_size - prev)
+            current_size = 0 if self.keys is None else self.keys.shape[2]
+            new_size = min(self.step, self.max_size - current_size)
             k_shape = (B, n_kv_heads, new_size, k_head_dim)
             v_shape = (B, n_kv_heads, new_size, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
@@ -1140,7 +1141,8 @@ class BatchRotatingKVCache(_BaseCache):
             prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size
         ):
             v_head_dim = values.shape[3]
-            new_size = min(self.step, self.max_size - prev)
+            current_size = 0 if self.keys is None else self.keys.shape[2]
+            new_size = min(self.step, self.max_size - current_size)
             k_shape = (B, n_kv_heads, new_size, k_head_dim)
             v_shape = (B, n_kv_heads, new_size, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
