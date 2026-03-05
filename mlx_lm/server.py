@@ -851,6 +851,7 @@ class ResponseGenerator:
                         stop_tokens=tokenizer.eos_token_ids,
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
+                        prefill_step_size=self.cli_args.prefill_step_size,
                         prompt_progress_callback=progress_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -994,6 +995,7 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                prefill_step_size=self.cli_args.prefill_step_size,
             ):
                 rqueue.put(
                     Response(
@@ -1903,6 +1905,12 @@ def main():
         type=int,
         default=8,
         help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prefill processing (default: 2048)",
     )
     parser.add_argument(
         "--prompt-cache-size",
