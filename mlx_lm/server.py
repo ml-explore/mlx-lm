@@ -995,7 +995,7 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
-                prefill_step_size=self.model_provider.cli_args.prefill_step_size,
+                prefill_step_size=self.cli_args.prefill_step_size,
             ):
                 rqueue.put(
                     Response(
