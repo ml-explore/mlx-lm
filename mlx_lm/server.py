@@ -2060,7 +2060,7 @@ def main():
         "--prefill-step-size",
         type=int,
         default=2048,
-        help="Prompt processing chunk size; lower values reduce memory spikes",
+        help="Step size for prefill processing (default: 2048)",
     )
     parser.add_argument(
         "--prompt-cache-size",
