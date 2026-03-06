@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -53,6 +54,13 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
 
 
+@partial(mx.compile, shapeless=True)
+def _precise_swiglu(h, gate, x):
+    gate = nn.silu(gate.astype(mx.float32))
+    x = x.astype(mx.float32)
+    return (gate * x).astype(h.dtype)
+
+
 class Qwen3NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -64,8 +72,9 @@ class Qwen3NextRMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            x = swiglu(gate, x)
-        return x
+            return _precise_swiglu(hidden_states, gate, x)
+        else:
+            return x.astype(hidden_states.dtype)
 
 
 class Qwen3NextAttention(nn.Module):
