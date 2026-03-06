@@ -1,7 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -30,6 +29,11 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class Attention(nn.Module):
