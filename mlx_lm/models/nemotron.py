@@ -30,8 +30,11 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
         if self.rope_scaling:
             if not "factor" in self.rope_scaling:
                 raise ValueError(f"rope_scaling must contain 'factor'")
