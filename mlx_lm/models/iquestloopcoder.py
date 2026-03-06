@@ -51,6 +51,11 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     loop_num: int = 2
     loop_window_size: int = 64
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 500000.0)
 
 
 class LoopGateProjection(nn.Module):
