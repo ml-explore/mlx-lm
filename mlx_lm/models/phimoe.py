@@ -27,6 +27,11 @@ class ModelArgs(BaseModelArgs):
     num_local_experts: int = 16
     num_experts_per_tok: int = 2
     rope_theta: float = 10000.0
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class Attention(nn.Module):
