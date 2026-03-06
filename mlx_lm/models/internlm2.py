@@ -26,8 +26,12 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
+
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
@@ -38,7 +42,7 @@ class ModelArgs(BaseModelArgs):
 
             if self.rope_scaling["type"] not in ["linear", "dynamic"]:
                 raise ValueError(
-                    "rope_scaling 'type' currently only supports 'linear' or 'dynamic"
+                    "rope_scaling 'type' currently only supports 'linear' or 'dynamic'"
                 )
 
 
