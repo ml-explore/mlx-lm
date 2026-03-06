@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -23,6 +23,11 @@ class ModelArgs(BaseModelArgs):
     n_shared_head: int = 8
     rope_theta: float = 10000
     rope_traditional: bool = False
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 class Attention(nn.Module):
