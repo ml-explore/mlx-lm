@@ -27,6 +27,11 @@ class ModelArgs(BaseModelArgs):
     head_dim: int
     tie_word_embeddings: bool
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 class Attention(nn.Module):
