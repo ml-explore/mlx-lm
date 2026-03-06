@@ -31,7 +31,6 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
-    # MoE config
     num_experts: int = 128
     num_experts_per_tok: int = 8
     num_shared_experts: int = 1
@@ -43,6 +42,11 @@ class ModelArgs(BaseModelArgs):
     topk_group: int = 1
     sliding_window: int = 2048
     mup_enabled: bool = True
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class Attention(nn.Module):
