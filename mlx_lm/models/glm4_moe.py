@@ -44,6 +44,11 @@ class ModelArgs(BaseModelArgs):
     partial_rotary_factor: float
     scoring_func: str = "sigmoid"
     topk_method: str = "noaux_tc"
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class Attention(nn.Module):
