@@ -51,6 +51,11 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 class Qwen3NextRMSNormGated(nn.Module):
