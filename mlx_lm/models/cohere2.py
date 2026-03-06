@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -28,6 +28,11 @@ class ModelArgs(BaseModelArgs):
     layer_norm_bias: bool = False
     sliding_window: int = 4096
     sliding_window_pattern: int = 4
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 50000.0)
 
 
 class Attention(nn.Module):
