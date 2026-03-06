@@ -141,3 +141,58 @@ list contains the following fields:
 
 - `id`: The Hugging Face repo id.
 - `created`: A time-stamp representing the model creation time.
+
+### Server Memory Controls
+
+When using `mlx_lm.server`, these options help prevent OOM during long
+multi-turn sessions:
+
+- `--prompt-cache-bytes`: upper limit for the LRU prompt cache memory.
+- `--max-prompt-tokens`: max prompt token cap to avoid unbounded memory growth.
+- `--prompt-overflow-policy`: `error` (reject) or `truncate` (drop tokens from
+  the beginning/middle of the prompt).
+- `--prompt-keep-tokens`: with `truncate`, keep this many tokens from the beginning
+  of the prompt.
+- `--max-active-kv-bytes`: reject requests if projected active KV usage would
+  exceed this limit.
+- `--max-active-memory-bytes`: abort requests when current MLX active memory is
+  above this limit.
+- `--max-kv-size`: fixed active KV window (rotating cache). This limits per-request
+  KV growth but can effectively reduce context window.
+
+Examples:
+
+```bash
+# Fixed active-KV window (stable bounded memory)
+mlx_lm.server \
+  --model <model> \
+  --max-prompt-tokens 8192 \
+  --prompt-overflow-policy error \
+  --max-kv-size 8192 \
+  --prompt-cache-bytes 2G \
+  --max-active-kv-bytes 8G \
+  --max-active-memory-bytes 28G
+```
+
+Notes:
+
+- `--max-prompt-tokens` is the primary control to stop memory creep across long chats.
+- `--max-active-kv-bytes`, `--max-active-memory-bytes`, and `--max-kv-size`
+  work at different levels:
+  - `--max-active-kv-bytes`: projected KV-only admission control.
+  - `--max-active-memory-bytes`: runtime limit for all active MLX memory.
+  - `--max-kv-size`: hard limit on attention window in KV cache (potential quality degradation).
+- Practical tuning order:
+  1. Set `--max-prompt-tokens` first (for example `8192`).
+  2. Set `--max-active-memory-bytes` below total RAM by ~20% to leave room for OS and other apps.
+  3. Set `--max-active-kv-bytes` as a subset of that budget (~20-40% of
+     `--max-active-memory-bytes`).
+  4. Only add `--max-kv-size` if memory still growth; start high (for example `8192`
+     or `16384`) and lower only if required.
+- Extensively tested example for GLM-4.7.Flash-5bit running on a 36 GB machine:
+  - `--max-active-memory-bytes 27G`
+  - `--max-active-kv-bytes 6G`
+  - `--max-prompt-tokens 8192`
+- OOM-style failures now return HTTP `503` instead of crashing the server
+  process.
+

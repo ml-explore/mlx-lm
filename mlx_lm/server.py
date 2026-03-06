@@ -61,6 +61,55 @@ def parse_size(x):
     return int(digits * sizes[size])
 
 
+def is_metal_oom_error(error: Exception) -> bool:
+    text = str(error).lower()
+    patterns = (
+        "out of memory",
+        "insufficient memory",
+        "kiogpucommandbuffercallbackerroroutofmemory",
+        "mps backend out of memory",
+    )
+    return any(pattern in text for pattern in patterns)
+
+
+def projected_kv_bytes(prompt_cache: List[Any], extra_tokens: int) -> int:
+    cache_bytes = sum(c.nbytes for c in prompt_cache)
+    if cache_bytes <= 0 or extra_tokens <= 0:
+        return cache_bytes
+
+    cache_tokens = max(
+        (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
+    )
+    if cache_tokens <= 0:
+        return cache_bytes
+
+    bytes_per_token = cache_bytes / cache_tokens
+    return cache_bytes + int(bytes_per_token * extra_tokens)
+
+
+def apply_prompt_token_limit(
+    tokens: List[int],
+    *,
+    max_prompt_tokens: Optional[int],
+    overflow_policy: str,
+    keep_tokens: int,
+) -> List[int]:
+    if max_prompt_tokens is None or len(tokens) <= max_prompt_tokens:
+        return tokens
+
+    if overflow_policy == "error":
+        raise ValueError(
+            "Prompt exceeds max prompt token limit: "
+            f"prompt_tokens={len(tokens)}, max_prompt_tokens={max_prompt_tokens}"
+        )
+
+    keep_tokens = max(0, min(keep_tokens, max_prompt_tokens))
+    tail_tokens = max_prompt_tokens - keep_tokens
+    if tail_tokens <= 0:
+        return tokens[:max_prompt_tokens]
+    return tokens[:keep_tokens] + tokens[-tail_tokens:]
+
+
 class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
@@ -702,17 +751,35 @@ class ResponseGenerator:
                 if args.chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
                     chat_template_args.update(args.chat_template_kwargs)
-                return tokenizer.apply_chat_template(
+                tokens = tokenizer.apply_chat_template(
                     messages,
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
                     **chat_template_args,
                 )
+                return apply_prompt_token_limit(
+                    tokens,
+                    max_prompt_tokens=self.cli_args.max_prompt_tokens,
+                    overflow_policy=self.cli_args.prompt_overflow_policy,
+                    keep_tokens=self.cli_args.prompt_keep_tokens,
+                )
             else:
-                return tokenizer.encode(convert_chat(messages, role_mapping))
+                tokens = tokenizer.encode(convert_chat(messages, role_mapping))
+                return apply_prompt_token_limit(
+                    tokens,
+                    max_prompt_tokens=self.cli_args.max_prompt_tokens,
+                    overflow_policy=self.cli_args.prompt_overflow_policy,
+                    keep_tokens=self.cli_args.prompt_keep_tokens,
+                )
         else:
-            return tokenizer.encode(request.prompt)
+            tokens = tokenizer.encode(request.prompt)
+            return apply_prompt_token_limit(
+                tokens,
+                max_prompt_tokens=self.cli_args.max_prompt_tokens,
+                overflow_policy=self.cli_args.prompt_overflow_policy,
+                keep_tokens=self.cli_args.prompt_keep_tokens,
+            )
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -721,6 +788,44 @@ class ResponseGenerator:
             return False
 
         return True
+
+    def _make_prompt_cache(self, model, draft_model=None):
+        cache = make_prompt_cache(
+            model,
+            max_kv_size=self.model_provider.cli_args.max_kv_size,
+        )
+        if draft_model is not None:
+            cache += make_prompt_cache(
+                draft_model,
+                max_kv_size=self.model_provider.cli_args.max_kv_size,
+            )
+        return cache
+
+    def _memory_admission_error(
+        self, prompt_cache: List[Any], extra_tokens: int, active_bytes: int = 0
+    ) -> Optional[str]:
+        limit = self.model_provider.cli_args.max_active_kv_bytes
+        if limit is None:
+            return None
+        projected = active_bytes + projected_kv_bytes(prompt_cache, extra_tokens)
+        if projected <= limit:
+            return None
+        return (
+            "Projected KV memory usage exceeds configured active KV limit. "
+            f"projected={projected} bytes, limit={limit} bytes"
+        )
+
+    def _check_active_memory_limit(self):
+        limit = self.model_provider.cli_args.max_active_memory_bytes
+        if limit is None:
+            return
+        active = mx.get_active_memory()
+        if active > limit:
+            raise MemoryError(
+                "Active MLX memory exceeded configured limit: "
+                f"active={active} bytes, limit={limit} bytes. "
+                "Consider lowering prompt length or max_tokens."
+            )
 
     def _generate(self):
         current_model = None
@@ -740,6 +845,7 @@ class ResponseGenerator:
                 return self._next_request(timeout)
 
         def progress_callback(info):
+            self._check_active_memory_limit()
             for uid, processed, total in info:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
@@ -797,7 +903,16 @@ class ResponseGenerator:
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
-                        cache = make_prompt_cache(self.model_provider.model)
+                        cache = self._make_prompt_cache(self.model_provider.model)
+
+                    admission_error = self._memory_admission_error(
+                        cache,
+                        len(rest) + args.max_tokens,
+                        batch_generator.prompt_cache_nbytes,
+                    )
+                    if admission_error is not None:
+                        rqueue.put(MemoryError(admission_error))
+                        continue
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
@@ -853,6 +968,7 @@ class ResponseGenerator:
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
                         prompt_progress_callback=progress_callback,
+                        max_kv_size=self.cli_args.max_kv_size,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -878,59 +994,78 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
-                for _ in self._time_budget:
-                    responses = batch_generator.next()
-                    if not responses:
-                        break
+                try:
+                    for _ in self._time_budget:
+                        responses = batch_generator.next()
+                        if not responses:
+                            break
 
-                    for r in responses:
-                        result = batch_results[r.uid]
-                        result["cache_key"].append(r.token)
-                        if r.finish_reason != "stop":
-                            result["detokenizer"].add_token(r.token)
+                        for r in responses:
+                            result = batch_results[r.uid]
+                            result["cache_key"].append(r.token)
+                            if r.finish_reason != "stop":
+                                result["detokenizer"].add_token(r.token)
 
-                        result["rqueue"].put(
-                            Response(
-                                result["detokenizer"].last_segment,
-                                r.token,
-                                r.logprobs[r.token].item(),
-                                r.finish_reason,
-                                _format_top_logprobs(
-                                    r.logprobs, args.top_logprobs, current_tokenizer
-                                ),
+                            result["rqueue"].put(
+                                Response(
+                                    result["detokenizer"].last_segment,
+                                    r.token,
+                                    r.logprobs[r.token].item(),
+                                    r.finish_reason,
+                                    _format_top_logprobs(
+                                        r.logprobs, args.top_logprobs, current_tokenizer
+                                    ),
+                                )
                             )
-                        )
 
-                        if r.finish_reason is not None:
-                            result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
+                            if r.finish_reason is not None:
+                                result["rqueue"].put(None)
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    result["cache_key"],
+                                    r.prompt_cache,
+                                )
+                                del batch_results[r.uid]
+
+                            if result["ctx"]._should_stop:
+                                uids_to_remove.append(r.uid)
+
+                    uids_to_remove = self._share_object(uids_to_remove)
+                    if uids_to_remove:
+                        with mx.stream(generation_stream):
+                            caches = batch_generator.remove(
+                                uids_to_remove, return_prompt_caches=True
                             )
-                            del batch_results[r.uid]
-
-                        if result["ctx"]._should_stop:
-                            uids_to_remove.append(r.uid)
-
-                uids_to_remove = self._share_object(uids_to_remove)
-                if uids_to_remove:
-                    with mx.stream(generation_stream):
-                        caches = batch_generator.remove(
-                            uids_to_remove, return_prompt_caches=True
-                        )
-                        for uid, prompt_cache in caches.items():
-                            if uid not in batch_results:
-                                continue
-                            result = batch_results[uid]
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], prompt_cache
-                            )
-                            del batch_results[uid]
+                            for uid, prompt_cache in caches.items():
+                                if uid not in batch_results:
+                                    continue
+                                result = batch_results[uid]
+                                self.prompt_cache.insert_cache(
+                                    current_model_key, result["cache_key"], prompt_cache
+                                )
+                                del batch_results[uid]
+                except Exception as e:
+                    logging.exception("Batched generation failed")
+                    if is_metal_oom_error(e):
+                        mx.clear_cache()
+                    for result in batch_results.values():
+                        result["rqueue"].put(e)
+                        result["rqueue"].put(None)
+                    batch_results = {}
+                    current_model = None
+                    current_sampling = None
+                    current_tokenizer = None
+                    current_model_key = None
+                    batch_generator.close()
+                    batch_generator = None
+                    drain_batch = False
 
     def _serve_single(self, request):
         rqueue, request, args = request
 
         # Define the progress callback
         def progress(tokens_processed, tokens_total):
+            self._check_active_memory_limit()
             rqueue.put((tokens_processed, tokens_total))
 
         try:
@@ -976,9 +1111,16 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+                cache = self._make_prompt_cache(
+                    self.model_provider.model, self.model_provider.draft_model
+                )
+
+            admission_error = self._memory_admission_error(
+                cache,
+                len(rest) + args.max_tokens,
+            )
+            if admission_error is not None:
+                raise MemoryError(admission_error)
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
             logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
@@ -995,6 +1137,7 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                max_kv_size=self.cli_args.max_kv_size,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
                 rqueue.put(
@@ -1023,6 +1166,8 @@ class ResponseGenerator:
             )
 
         except Exception as e:
+            if is_metal_oom_error(e):
+                mx.clear_cache()
             rqueue.put(e)
 
     def generate(
@@ -1408,7 +1553,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
+            status_code = 503 if is_metal_oom_error(e) else 500
+            self._set_completion_headers(status_code)
             self.end_headers()
             self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
@@ -1790,7 +1936,11 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache_bytes = model_provider.cli_args.prompt_cache_bytes
+    prompt_cache = LRUPromptCache(
+        model_provider.cli_args.prompt_cache_size,
+        prompt_cache_bytes if prompt_cache_bytes is not None else (1 << 63),
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1922,6 +2072,50 @@ def main():
         "--prompt-cache-bytes",
         type=parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        help="Maximum prompt token count accepted by the server",
+    )
+    parser.add_argument(
+        "--prompt-overflow-policy",
+        type=str,
+        default="error",
+        choices=["error", "truncate"],
+        help="Behavior when prompt exceeds --max-prompt-tokens",
+    )
+    parser.add_argument(
+        "--prompt-keep-tokens",
+        type=int,
+        default=512,
+        help=(
+            "When truncating prompts, keep this many tokens from the start and fill "
+            "the remainder from the end"
+        ),
+    )
+    parser.add_argument(
+        "--max-active-kv-bytes",
+        type=parse_size,
+        help=(
+            "Reject requests when projected active KV memory would exceed this limit "
+            "(bytes or shorthand like 20G)"
+        ),
+    )
+    parser.add_argument(
+        "--max-active-memory-bytes",
+        type=parse_size,
+        help=(
+            "Abort requests when current active MLX memory exceeds this limit "
+            "(bytes or shorthand like 30G)"
+        ),
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum size of the active KV cache per sequence",
     )
     parser.add_argument(
         "--pipeline",
