@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,6 +25,11 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
     layer_norm_bias: bool = False
     use_qk_norm: bool = False
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 8000000.0)
 
 
 class LayerNorm2D(nn.Module):
