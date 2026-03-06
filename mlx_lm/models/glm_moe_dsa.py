@@ -38,14 +38,15 @@ class ModelArgs(BaseModelArgs):
     first_k_dense_replace: int
     max_position_embeddings: int
     rms_norm_eps: float
-    rope_parameters: Dict
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
         self.rope_scaling = self.rope_parameters
-        self.rope_theta = self.rope_parameters["rope_theta"]
 
 
 class Model(DSV32Model):
