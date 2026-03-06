@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -61,6 +61,12 @@ class ModelArgs(BaseModelArgs):
     position_embedding_type: str = "rope"
     tie_word_embeddings: bool = True
     time_step_limit: Tuple[float, float] = (0.001, 100.0)
+
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
     # Mode flags - inferred from num_local_experts
     @property
