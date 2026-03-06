@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,9 +14,12 @@ class ModelArgs(llama.ModelArgs):
     model_type: str
     no_rope_layer_interval: int = 4
     no_rope_layers: Optional[list[int]] = None
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
         super().__post_init__()
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
         if self.no_rope_layers is None:
             self.no_rope_layers = [
                 int((i + 1) % self.no_rope_layer_interval != 0)
