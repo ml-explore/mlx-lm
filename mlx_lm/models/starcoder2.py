@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,6 +21,11 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int = 49152
     rope_theta: float = 100000
     tie_word_embeddings: bool = True
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 class Attention(nn.Module):
