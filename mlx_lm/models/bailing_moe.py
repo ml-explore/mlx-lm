@@ -48,6 +48,11 @@ class ModelArgs(BaseModelArgs):
     topk_group: int = 4
     moe_shared_expert_intermediate_size: Optional[int] = None
     moe_router_enable_shared_expert: bool = True
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 @partial(mx.compile, shapeless=True)
