@@ -2,7 +2,7 @@
 
 import sys
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,8 +30,12 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     mlp_ratio: int = 4
     weight_tying: bool = False
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
+
         self.mlp_hidden_size = (
             self.mlp_hidden_size
             if self.mlp_hidden_size is not None
