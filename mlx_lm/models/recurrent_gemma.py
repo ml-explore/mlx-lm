@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+from ast import Dict
 import math
 from dataclasses import dataclass
 from typing import List, Optional
@@ -29,8 +30,11 @@ class ModelArgs(BaseModelArgs):
     embeddings_scale_by_sqrt_dim: bool = True
     block_types: Optional[List[str]] = None
     _block_types: Optional[List[str]] = None
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
         # For some reason these have different names in 2B and 9B
         if self.block_types is None:
             self.block_types = self._block_types
