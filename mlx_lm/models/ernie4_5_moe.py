@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,6 +37,11 @@ class ModelArgs(BaseModelArgs):
     moe_layer_end_index: Optional[int] = None
     head_dim: Optional[int] = None
     moe_gate_act: str = "softmax"
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class Attention(nn.Module):
