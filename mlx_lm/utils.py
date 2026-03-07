@@ -515,7 +515,7 @@ def sharded_load(
     # weights we need to download.
     model, config = load_model(model_path, lazy=True, strict=False)
 
-    has_pipelining = hasattr(model.model, "pipeline")
+    has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_tensor_parallel = hasattr(model, "shard")
 
     if pipeline_group is not None and not has_pipelining:
