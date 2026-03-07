@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn

@@ -1,10 +1,10 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from typing import Optional, Dict
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
