@@ -431,6 +431,7 @@ class Model(nn.Module):
                 layer.linear_attn.num_v_heads //= N
                 layer.linear_attn.key_dim //= N
                 layer.linear_attn.value_dim //= N
+                layer.linear_attn.conv_dim //= N
 
             # Softmax attention
             else:
