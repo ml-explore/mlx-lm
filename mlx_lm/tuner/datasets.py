@@ -30,7 +30,7 @@ class TextDataset:
         return (d, 0)
 
     def __getitem__(self, idx: int):
-        return self._data[idx]
+        return self.process(self._data[idx])
 
     def __len__(self):
         return len(self._data)
@@ -77,7 +77,7 @@ class ChatDataset:
             return (tokens, 0)
 
     def __getitem__(self, idx: int):
-        return self._data[idx]
+        return self.process(self._data[idx])
 
     def __len__(self):
         return len(self._data)
@@ -127,7 +127,7 @@ class CompletionsDataset:
         return (tokens, 0)
 
     def __getitem__(self, idx: int):
-        return self._data[idx]
+        return self.process(self._data[idx])
 
     def __len__(self):
         return len(self._data)
