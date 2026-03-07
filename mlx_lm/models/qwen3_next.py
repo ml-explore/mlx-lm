@@ -321,10 +321,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
+        self.sharding_group = None
+
     def __call__(
         self,
         x: mx.array,
     ) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
@@ -340,7 +345,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         shared_y = self.shared_expert(x)
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
 
-        return y + shared_y
+        y = y + shared_y
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
 
 
 class Qwen3NextDecoderLayer(nn.Module):

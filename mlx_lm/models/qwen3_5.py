@@ -125,6 +125,8 @@ class GatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+        self.sharding_group = None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -132,6 +134,9 @@ class GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+
+        if self.sharding_group is not None:
+            inputs = sum_gradients(self.sharding_group)(inputs)
 
         qkv = self.in_proj_qkv(inputs)
         z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
@@ -184,7 +189,12 @@ class GatedDeltaNet(nn.Module):
             cache[1] = state
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        out = self.out_proj(out.reshape(B, S, -1))
+
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+
+        return out
 
 
 class DecoderLayer(nn.Module):
@@ -377,6 +387,101 @@ class Model(nn.Module):
                 key = "language_model." + key
             sanitized[key] = value
         return self.language_model.sanitize(sanitized)
+
+    def shard(self, group=None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        rank = group.rank()
+
+        # A sharding factory for the convolution in gated delta net
+        def conv_sharding(key_dim):
+            return lambda p, w: (0, [key_dim, 2 * key_dim])
+
+        for layer in self.layers:
+            # Linear attention
+            if layer.is_linear:
+                kd = layer.linear_attn.key_dim
+                vh = layer.linear_attn.num_v_heads
+                layer.linear_attn.sharding_group = group
+                shard_inplace(layer.linear_attn.conv1d, conv_sharding, group=group)
+                layer.linear_attn.conv1d.groups //= N
+                shard_inplace(
+                    layer.linear_attn.in_proj_qkv,
+                    "all-to-sharded",
+                    segments=[kd, 2 * kd],
+                    group=group,
+                )
+                shard_inplace(
+                    layer.linear_attn.in_proj_z, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.linear_attn.in_proj_b, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.linear_attn.in_proj_a, "all-to-sharded", group=group
+                )
+                layer.linear_attn.dt_bias = mx.contiguous(
+                    mx.split(layer.linear_attn.dt_bias, N)[rank]
+                )
+                layer.linear_attn.A_log = mx.contiguous(
+                    mx.split(layer.linear_attn.A_log, N)[rank]
+                )
+                shard_inplace(layer.linear_attn.out_proj, "sharded-to-all", group=group)
+                layer.linear_attn.num_k_heads //= N
+                layer.linear_attn.num_v_heads //= N
+                layer.linear_attn.key_dim //= N
+                layer.linear_attn.value_dim //= N
+
+            # Softmax attention
+            else:
+                layer.self_attn.q_proj = shard_linear(
+                    layer.self_attn.q_proj, "all-to-sharded", segments=2, group=group
+                )
+                layer.self_attn.k_proj = shard_linear(
+                    layer.self_attn.k_proj, "all-to-sharded", group=group
+                )
+                layer.self_attn.v_proj = shard_linear(
+                    layer.self_attn.v_proj, "all-to-sharded", group=group
+                )
+                layer.self_attn.o_proj = shard_linear(
+                    layer.self_attn.o_proj, "sharded-to-all", group=group
+                )
+                layer.self_attn.num_key_value_heads //= N
+                layer.self_attn.num_attention_heads //= N
+
+            # MLP
+            if isinstance(layer.mlp, MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+
+            # MoE
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.shared_expert.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.shared_expert.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
 
     @property
     def layers(self):
