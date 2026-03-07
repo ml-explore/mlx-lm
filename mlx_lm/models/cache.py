@@ -1159,6 +1159,7 @@ class BatchRotatingKVCache(_BaseCache):
             self.values = self._trim(trim_size, self.values)
             self._idx = self.max_size
             self.left_padding -= trim_size
+            mx.eval(self.left_padding)
 
         # Rotate
         if self._idx == self.max_size:
@@ -1166,6 +1167,7 @@ class BatchRotatingKVCache(_BaseCache):
             self._idx = 0
         if self.rotated:
             self.left_padding -= S
+            mx.eval(self.left_padding)
 
         # Assign
         self.keys[..., self._idx : self._idx + S, :] = keys
