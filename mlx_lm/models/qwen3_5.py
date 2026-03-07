@@ -436,7 +436,7 @@ class Model(nn.Module):
             # Softmax attention
             else:
                 layer.self_attn.q_proj = shard_linear(
-                    layer.self_attn.q_proj, "all-to-sharded", segments=2, group=group
+                    layer.self_attn.q_proj, "all-to-sharded", group=group
                 )
                 layer.self_attn.k_proj = shard_linear(
                     layer.self_attn.k_proj, "all-to-sharded", group=group
