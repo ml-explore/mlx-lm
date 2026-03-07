@@ -402,9 +402,8 @@ class Model(nn.Module):
             # Linear attention
             if layer.is_linear:
                 kd = layer.linear_attn.key_dim
-                vh = layer.linear_attn.num_v_heads
                 layer.linear_attn.sharding_group = group
-                shard_inplace(layer.linear_attn.conv1d, conv_sharding, group=group)
+                shard_inplace(layer.linear_attn.conv1d, conv_sharding(kd), group=group)
                 layer.linear_attn.conv1d.groups //= N
                 shard_inplace(
                     layer.linear_attn.in_proj_qkv,
