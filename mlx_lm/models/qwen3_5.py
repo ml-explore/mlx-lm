@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.utils import tree_map
 
 from .base import (
     BaseModelArgs,
@@ -398,6 +399,21 @@ class Model(nn.Module):
         def conv_sharding(key_dim):
             return lambda p, w: (0, [key_dim, 2 * key_dim])
 
+        def repeat_kv_layer_inplace(layer, h):
+            # No repeat needed cause we have more heads than nodes
+            if N <= h:
+                return
+
+            # Repeat function to apply to the layer weights
+            def _repeat(p):
+                s = p.shape
+                p = p.reshape(h, s[0] // h, *s[1:])
+                p = mx.repeat(p, N // h, axis=0)
+                p = p.reshape(-1, *s[1:])
+                return p
+
+            layer.update(tree_map(_repeat, layer.parameters()))
+
         for layer in self.layers:
             # Linear attention
             if layer.is_linear:
@@ -435,8 +451,17 @@ class Model(nn.Module):
 
             # Softmax attention
             else:
+                layer.self_attn.o_proj = shard_linear(
+                    layer.self_attn.o_proj, "sharded-to-all", group=group
+                )
                 layer.self_attn.q_proj = shard_linear(
                     layer.self_attn.q_proj, "all-to-sharded", group=group
+                )
+                repeat_kv_layer_inplace(
+                    layer.self_attn.k_proj, layer.self_attn.num_key_value_heads
+                )
+                repeat_kv_layer_inplace(
+                    layer.self_attn.v_proj, layer.self_attn.num_key_value_heads
                 )
                 layer.self_attn.k_proj = shard_linear(
                     layer.self_attn.k_proj, "all-to-sharded", group=group
@@ -444,11 +469,10 @@ class Model(nn.Module):
                 layer.self_attn.v_proj = shard_linear(
                     layer.self_attn.v_proj, "all-to-sharded", group=group
                 )
-                layer.self_attn.o_proj = shard_linear(
-                    layer.self_attn.o_proj, "sharded-to-all", group=group
-                )
-                layer.self_attn.num_key_value_heads //= N
                 layer.self_attn.num_attention_heads //= N
+                layer.self_attn.num_key_value_heads = max(
+                    1, layer.self_attn.num_key_value_heads // N
+                )
 
             # MLP
             if isinstance(layer.mlp, MLP):
