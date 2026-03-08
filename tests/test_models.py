@@ -238,6 +238,22 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
 
+    def test_suscaledrope_does_not_mutate_input(self):
+        rope = rope_utils.SuScaledRoPE(
+            dims=2,
+            max_position_embeddings=8192,
+            original_max_position_embeddings=4096,
+        )
+        x = mx.array([[[[1.0, 2.0, 3.0, 4.0]]]])
+        original = mx.array(x)
+
+        y = rope(x)
+        mx.eval(x, original, y)
+
+        self.assertTrue(mx.array_equal(x, original))
+        self.assertFalse(mx.array_equal(y[..., :2], original[..., :2]))
+        self.assertTrue(mx.array_equal(y[..., 2:], original[..., 2:]))
+
     def test_quantized_sdpa(self):
         cache = KVCache()
 
