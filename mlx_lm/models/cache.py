@@ -546,7 +546,9 @@ class RotatingKVCache(_BaseCache):
         self._idx -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> "QuantizedRotatingKVCache":
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4
+    ) -> "QuantizedRotatingKVCache":
         quant_cache = QuantizedRotatingKVCache(
             max_size=self.max_size,
             keep=self.keep,
@@ -556,8 +558,12 @@ class RotatingKVCache(_BaseCache):
         quant_cache.offset = self.offset
         quant_cache._idx = self._idx
         if self.keys is not None:
-            quant_cache.keys = list(mx.quantize(self.keys, group_size=group_size, bits=bits))
-            quant_cache.values = list(mx.quantize(self.values, group_size=group_size, bits=bits))
+            quant_cache.keys = list(
+                mx.quantize(self.keys, group_size=group_size, bits=bits)
+            )
+            quant_cache.values = list(
+                mx.quantize(self.values, group_size=group_size, bits=bits)
+            )
         return quant_cache
 
     def make_mask(
@@ -617,7 +623,9 @@ class QuantizedRotatingKVCache(_BaseCache):
 
     step = 256
 
-    def __init__(self, max_size: int, keep: int = 0, group_size: int = 64, bits: int = 4):
+    def __init__(
+        self, max_size: int, keep: int = 0, group_size: int = 64, bits: int = 4
+    ):
         self.keep = keep
         self.keys = None
         self.values = None
@@ -657,11 +665,13 @@ class QuantizedRotatingKVCache(_BaseCache):
             return v
         elif self._idx < self.offset:
             # Buffer has rotated: [keep | _idx..end | keep.._idx]
-            return self._q_cat([
-                self._q_slice(v, 0, self.keep),
-                self._q_slice(v, self._idx, seq_len),
-                self._q_slice(v, self.keep, self._idx),
-            ])
+            return self._q_cat(
+                [
+                    self._q_slice(v, 0, self.keep),
+                    self._q_slice(v, self._idx, seq_len),
+                    self._q_slice(v, self.keep, self._idx),
+                ]
+            )
         else:
             return self._q_slice(v, 0, self._idx)
 
@@ -702,16 +712,51 @@ class QuantizedRotatingKVCache(_BaseCache):
 
             def _init_q(dim):
                 return [
-                    mx.zeros((B, n_kv_heads, new_size, dim // el_per_int), dtype=mx.uint32),
-                    mx.zeros((B, n_kv_heads, new_size, dim // self.group_size), dtype=keys.dtype),
-                    mx.zeros((B, n_kv_heads, new_size, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros(
+                        (B, n_kv_heads, new_size, dim // el_per_int), dtype=mx.uint32
+                    ),
+                    mx.zeros(
+                        (B, n_kv_heads, new_size, dim // self.group_size),
+                        dtype=keys.dtype,
+                    ),
+                    mx.zeros(
+                        (B, n_kv_heads, new_size, dim // self.group_size),
+                        dtype=keys.dtype,
+                    ),
                 ]
 
             def _expand_q(qx, dim):
                 return [
-                    mx.concatenate([qx[0], mx.zeros((B, n_kv_heads, new_size, dim // el_per_int), dtype=mx.uint32)], axis=2),
-                    mx.concatenate([qx[1], mx.zeros((B, n_kv_heads, new_size, dim // self.group_size), dtype=keys.dtype)], axis=2),
-                    mx.concatenate([qx[2], mx.zeros((B, n_kv_heads, new_size, dim // self.group_size), dtype=keys.dtype)], axis=2),
+                    mx.concatenate(
+                        [
+                            qx[0],
+                            mx.zeros(
+                                (B, n_kv_heads, new_size, dim // el_per_int),
+                                dtype=mx.uint32,
+                            ),
+                        ],
+                        axis=2,
+                    ),
+                    mx.concatenate(
+                        [
+                            qx[1],
+                            mx.zeros(
+                                (B, n_kv_heads, new_size, dim // self.group_size),
+                                dtype=keys.dtype,
+                            ),
+                        ],
+                        axis=2,
+                    ),
+                    mx.concatenate(
+                        [
+                            qx[2],
+                            mx.zeros(
+                                (B, n_kv_heads, new_size, dim // self.group_size),
+                                dtype=keys.dtype,
+                            ),
+                        ],
+                        axis=2,
+                    ),
                 ]
 
             if self.keys is not None:
@@ -746,7 +791,9 @@ class QuantizedRotatingKVCache(_BaseCache):
         self._idx += S
 
         if self.offset < self.max_size:
-            return self._q_slice(self.keys, 0, self.offset), self._q_slice(self.values, 0, self.offset)
+            return self._q_slice(self.keys, 0, self.offset), self._q_slice(
+                self.values, 0, self.offset
+            )
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
@@ -774,11 +821,25 @@ class QuantizedRotatingKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx, self.group_size, self.bits)))
+        return tuple(
+            map(
+                str,
+                (
+                    self.keep,
+                    self.max_size,
+                    self.offset,
+                    self._idx,
+                    self.group_size,
+                    self.bits,
+                ),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.keep, self.max_size, self.offset, self._idx, self.group_size, self.bits = map(int, v)
+        self.keep, self.max_size, self.offset, self._idx, self.group_size, self.bits = (
+            map(int, v)
+        )
 
     def is_trimmable(self):
         return self.offset < self.max_size

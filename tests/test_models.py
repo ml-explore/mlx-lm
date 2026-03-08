@@ -229,7 +229,7 @@ class TestModels(unittest.TestCase):
             qk, qv = cache.update_and_fetch(k, v)
 
         self.assertEqual(cache.offset, 14)  # 2 sink + 12 generated
-        self.assertEqual(cache.size(), 8)   # capped at max_size
+        self.assertEqual(cache.size(), 8)  # capped at max_size
 
         # Verify sink tokens at positions 0..keep-1 are still the originals
         mx.eval(qk[0], qk[1], qk[2])
@@ -243,7 +243,9 @@ class TestModels(unittest.TestCase):
         b, h, d = 1, 2, 64
         keep = 2
         max_size = 8
-        cache = QuantizedRotatingKVCache(max_size=max_size, keep=keep, group_size=32, bits=8)
+        cache = QuantizedRotatingKVCache(
+            max_size=max_size, keep=keep, group_size=32, bits=8
+        )
         atol = 0.1
 
         # Write sink tokens
@@ -347,7 +349,9 @@ class TestModels(unittest.TestCase):
         b, h, d = 1, 2, 64
         group_size, bits = 32, 8
 
-        cache = QuantizedRotatingKVCache(max_size=16, keep=2, group_size=group_size, bits=bits)
+        cache = QuantizedRotatingKVCache(
+            max_size=16, keep=2, group_size=group_size, bits=bits
+        )
 
         # Fill with data so rotation has started
         for _ in range(20):
@@ -383,7 +387,9 @@ class TestModels(unittest.TestCase):
         group_size = 32
         bits = 8
         atol = 0.1
-        cache = QuantizedRotatingKVCache(max_size=max_size, keep=keep, group_size=group_size, bits=bits)
+        cache = QuantizedRotatingKVCache(
+            max_size=max_size, keep=keep, group_size=group_size, bits=bits
+        )
 
         # In-place writes until rotation has happened (_idx has wrapped back to keep)
         for _ in range(max_size + 1):
@@ -413,7 +419,9 @@ class TestModels(unittest.TestCase):
         atol = 0.1
 
         for path_name, n_tokens in [("concat", 5), ("in_place", 1)]:
-            cache = QuantizedRotatingKVCache(max_size=max_size, keep=0, group_size=group_size, bits=bits)
+            cache = QuantizedRotatingKVCache(
+                max_size=max_size, keep=0, group_size=group_size, bits=bits
+            )
 
             k = mx.ones((b, h, n_tokens, d), dtype=mx.float16)
             v = -mx.ones((b, h, n_tokens, d), dtype=mx.float16)
@@ -425,11 +433,11 @@ class TestModels(unittest.TestCase):
 
             self.assertTrue(
                 mx.allclose(dq_k, mx.ones_like(dq_k), atol=atol).item(),
-                f"[{path_name}] keys cross-wired with values"
+                f"[{path_name}] keys cross-wired with values",
             )
             self.assertTrue(
                 mx.allclose(dq_v, -mx.ones_like(dq_v), atol=atol).item(),
-                f"[{path_name}] values cross-wired with keys"
+                f"[{path_name}] values cross-wired with keys",
             )
 
     def test_causal_mask_padding(self):
