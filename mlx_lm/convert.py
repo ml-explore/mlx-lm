@@ -77,7 +77,50 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
+def jamba_int8_safe_predicate_builder(
+    group_size: Optional[int] = None,
+) -> Callable[[str, nn.Module], Union[bool, dict]]:
+    mode = "affine"
+    bits = 8
+    resolved_group_size = group_size if group_size is not None else 64
+    direct_feed_forward_modules = {"gate_proj", "up_proj", "down_proj"}
+    switch_mlp_modules = {"gate_proj", "up_proj", "down_proj"}
+
+    def jamba_int8_safe_predicate(path: str, module: nn.Module) -> Union[bool, dict]:
+        parts = path.split(".")
+
+        is_direct_feed_forward = (
+            len(parts) == 5
+            and parts[0] == "model"
+            and parts[1] == "layers"
+            and parts[2].isdigit()
+            and parts[3] == "feed_forward"
+            and parts[4] in direct_feed_forward_modules
+        )
+
+        is_switch_mlp = (
+            len(parts) == 6
+            and parts[0] == "model"
+            and parts[1] == "layers"
+            and parts[2].isdigit()
+            and parts[3] == "feed_forward"
+            and parts[4] == "switch_mlp"
+            and parts[5] in switch_mlp_modules
+        )
+
+        if is_direct_feed_forward or is_switch_mlp:
+            return {
+                "group_size": resolved_group_size,
+                "bits": bits,
+                "mode": mode,
+            }
+
+        return False
+
+    return jamba_int8_safe_predicate
+
+
+QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6", "jamba_int8_safe"]
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
@@ -120,11 +163,14 @@ def convert(
     if isinstance(quant_predicate, str):
         if q_mode != "affine":
             raise ValueError(f"Quant predicates only support 'affine' quantization.")
-        quant_predicate = mixed_quant_predicate_builder(
-            quant_predicate,
-            model,
-            q_group_size,
-        )
+        if quant_predicate == "jamba_int8_safe":
+            quant_predicate = jamba_int8_safe_predicate_builder(q_group_size)
+        else:
+            quant_predicate = mixed_quant_predicate_builder(
+                quant_predicate,
+                model,
+                q_group_size,
+            )
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
