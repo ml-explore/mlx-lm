@@ -116,7 +116,7 @@ class CompletionsDataset:
         if self.mask_prompt:
             offset = len(
                 self.tokenizer.apply_chat_template(
-                    messages[0],
+                    messages[:-1],
                     tools=tools,
                     add_generation_prompt=True,
                     return_dict=False,
