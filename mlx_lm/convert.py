@@ -164,6 +164,16 @@ def convert(
         if q_mode != "affine":
             raise ValueError(f"Quant predicates only support 'affine' quantization.")
         if quant_predicate == "jamba_int8_safe":
+            if getattr(model, "model_type", None) != "jamba":
+                raise ValueError(
+                    "The 'jamba_int8_safe' quant predicate only supports Jamba architectures."
+                )
+            if q_bits is None:
+                q_bits = 8
+            elif q_bits != 8:
+                raise ValueError(
+                    "The 'jamba_int8_safe' quant predicate requires --q-bits 8."
+                )
             quant_predicate = jamba_int8_safe_predicate_builder(q_group_size)
         else:
             quant_predicate = mixed_quant_predicate_builder(
