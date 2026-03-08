@@ -652,11 +652,12 @@ def speculative_generate_step(
                     if draft_corr:
                         if len(draft_corr) > 1:
                             with mx.stream(generation_stream):
-                                draft_model(
-                                    mx.array(draft_corr[:-1], mx.uint32)[None],
-                                    cache=draft_cache,
+                                mx.async_eval(
+                                    draft_model(
+                                        mx.array(draft_corr[:-1], mx.uint32)[None],
+                                        cache=draft_cache,
+                                    )
                                 )
-                                mx.eval([c.state for c in draft_cache])
                         draft_y = mx.array(draft_corr[-1:], mx.uint32)
                     else:
                         fallback = draft_tokenizer.encode(
@@ -726,13 +727,14 @@ def speculative_generate_step(
                 if new_draft_tokens:
                     if len(new_draft_tokens) > 1:
                         with mx.stream(generation_stream):
-                            draft_model(
-                                mx.array(
-                                    new_draft_tokens[:-1], mx.uint32
-                                )[None],
-                                cache=draft_cache,
+                            mx.async_eval(
+                                draft_model(
+                                    mx.array(
+                                        new_draft_tokens[:-1], mx.uint32
+                                    )[None],
+                                    cache=draft_cache,
+                                )
                             )
-                            mx.eval([c.state for c in draft_cache])
                     draft_y = mx.array(new_draft_tokens[-1:], mx.uint32)
                 else:
                     fallback = draft_tokenizer.encode(
