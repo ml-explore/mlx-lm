@@ -267,7 +267,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--q-group-size",
-        help="Group size for quantization.",
+        help="Group size for quantization (defaults to 64 unless overridden).",
         type=int,
         default=None,
     )
@@ -286,7 +286,12 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
+        help=(
+            "Mixed-bit quantization recipe. `jamba_int8_safe` is intended for "
+            "Jamba hybrid models: it quantizes only FFN + expert projections "
+            "with INT8 affine while keeping Mamba/state-space parts at higher "
+            "precision for quality stability."
+        ),
         choices=QUANT_RECIPES,
         type=str,
         required=False,

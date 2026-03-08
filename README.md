@@ -179,6 +179,11 @@ For more options run:
 mlx_lm.convert --help
 ```
 
+For Jamba hybrid models, you can use `--quant-predicate jamba_int8_safe` to
+apply INT8 affine quantization only to FFN and expert projection layers while
+keeping Mamba/state-space parts in higher precision for quality stability.
+Unless overridden, `--q-group-size` defaults to `64`.
+
 You can upload new models to Hugging Face by specifying `--upload-repo` to
 `convert`. For example, to upload a quantized Mistral-7B model to the
 [MLX Hugging Face community](https://huggingface.co/mlx-community) you can do:
