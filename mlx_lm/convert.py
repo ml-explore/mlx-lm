@@ -162,6 +162,15 @@ def convert(
 
     if isinstance(quant_predicate, str):
         if quant_predicate == "jamba_int8_safe":
+            if getattr(model, "model_type", None) != "jamba":
+                raise ValueError(
+                    "The 'jamba_int8_safe' quant predicate only supports Jamba architectures."
+                )
+            if q_bits is None:
+                q_bits = 8
+            elif q_bits != 8:
+                raise ValueError(
+                    "The 'jamba_int8_safe' quant predicate requires --q-bits 8."
             model_type = (
                 config.get("model_type")
                 or getattr(model, "model_type", None)
