@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import tempfile
 import unittest
 
 import mlx.core as mx
@@ -9,7 +10,15 @@ from mlx.utils import tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    QuantizedRotatingKVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+    save_prompt_cache,
+    load_prompt_cache,
+)
+from mlx_lm.generate import maybe_quantize_kv_cache
 from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
 from mlx_lm.models.ssm import ssm_attn, ssm_update
 
@@ -132,6 +141,296 @@ class TestModels(unittest.TestCase):
         k, v = cache.update_and_fetch(x, x)
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
+
+    def test_quantized_rotating_kv_cache_in_place(self):
+        b, h, d = 1, 2, 64
+        cache = QuantizedRotatingKVCache(max_size=8, keep=0, group_size=32, bits=8)
+
+        # Fill partially (in-place path)
+        k = mx.random.normal(shape=(b, h, 1, d))
+        v = mx.random.normal(shape=(b, h, 1, d))
+        qk, qv = cache.update_and_fetch(k, v)
+        self.assertEqual(qk[0].shape[2], 1)
+        self.assertEqual(cache.offset, 1)
+
+        # Fill up to max_size
+        for i in range(7):
+            k = mx.random.normal(shape=(b, h, 1, d))
+            v = mx.random.normal(shape=(b, h, 1, d))
+            qk, qv = cache.update_and_fetch(k, v)
+
+        self.assertEqual(cache.offset, 8)
+        self.assertEqual(qk[0].shape[2], 8)
+
+        # Continue past max_size (rotation)
+        k_rot = mx.random.normal(shape=(b, h, 1, d))
+        v_rot = mx.random.normal(shape=(b, h, 1, d))
+        qk, qv = cache.update_and_fetch(k_rot, v_rot)
+        self.assertEqual(cache.offset, 9)
+        # Buffer stays at max_size
+        self.assertEqual(qk[0].shape[2], 8)
+
+        # Verify the rotated token actually landed at position keep=0
+        # by dequantizing and comparing against the known written value.
+        mx.eval(qk[0], qk[1], qk[2])
+        dq_k = mx.dequantize(*qk, group_size=cache.group_size, bits=cache.bits)
+        self.assertTrue(
+            mx.allclose(dq_k[..., 0, :], k_rot[..., 0, :], atol=0.1).item(),
+            "Rotated token at position 0 should match the most recently written key",
+        )
+
+        # Check bits and group_size are set (for SDPA dispatch)
+        self.assertEqual(cache.bits, 8)
+        self.assertEqual(cache.group_size, 32)
+
+    def test_quantized_rotating_kv_cache_concat(self):
+        b, h, d = 1, 2, 64
+        cache = QuantizedRotatingKVCache(max_size=8, keep=2, group_size=32, bits=8)
+
+        # Large initial prefill (concat path)
+        k = mx.random.normal(shape=(b, h, 20, d))
+        v = mx.random.normal(shape=(b, h, 20, d))
+        qk, qv = cache.update_and_fetch(k, v)
+        self.assertEqual(cache.offset, 20)
+        # Stored data should be trimmed to at most max_size + S - 1
+        self.assertLessEqual(qk[0].shape[2], 8 + 20 - 1)
+
+        # Second multi-token update (concat path)
+        k2 = mx.random.normal(shape=(b, h, 5, d))
+        v2 = mx.random.normal(shape=(b, h, 5, d))
+        qk2, qv2 = cache.update_and_fetch(k2, v2)
+        self.assertEqual(cache.offset, 25)
+        self.assertLessEqual(qk2[0].shape[2], 8 + 5 - 1)
+
+        # Verify the last written tokens are recoverable after dequantization
+        mx.eval(qk2[0], qk2[1], qk2[2])
+        dq_k2 = mx.dequantize(*qk2, group_size=cache.group_size, bits=cache.bits)
+        self.assertTrue(
+            mx.allclose(dq_k2[..., -5:, :], k2, atol=0.1).item(),
+            "Last 5 tokens in concat-path cache should match written keys within quantization tolerance",
+        )
+
+    def test_quantized_rotating_kv_cache_keep(self):
+        b, h, d = 1, 2, 64
+        keep = 2
+        cache = QuantizedRotatingKVCache(max_size=8, keep=keep, group_size=32, bits=8)
+        atol = 0.1
+
+        # Write the sink tokens first — these must never be evicted
+        sink_k = mx.random.normal(shape=(b, h, keep, d))
+        sink_v = mx.random.normal(shape=(b, h, keep, d))
+        cache.update_and_fetch(sink_k, sink_v)
+        mx.eval(sink_k, sink_v)
+
+        # Fill to max_size then keep rotating (12 more tokens, well past max_size=8)
+        for _ in range(12):
+            k = mx.random.normal(shape=(b, h, 1, d))
+            v = mx.random.normal(shape=(b, h, 1, d))
+            qk, qv = cache.update_and_fetch(k, v)
+
+        self.assertEqual(cache.offset, 14)  # 2 sink + 12 generated
+        self.assertEqual(cache.size(), 8)   # capped at max_size
+
+        # Verify sink tokens at positions 0..keep-1 are still the originals
+        mx.eval(qk[0], qk[1], qk[2])
+        dq_k = mx.dequantize(*qk, group_size=cache.group_size, bits=cache.bits)
+        self.assertTrue(
+            mx.allclose(dq_k[..., :keep, :], sink_k, atol=atol).item(),
+            "Sink tokens (keep positions) must not be overwritten during rotation",
+        )
+
+    def test_quantized_rotating_kv_cache_wraparound(self):
+        b, h, d = 1, 2, 64
+        keep = 2
+        max_size = 8
+        cache = QuantizedRotatingKVCache(max_size=max_size, keep=keep, group_size=32, bits=8)
+        atol = 0.1
+
+        # Write sink tokens
+        sink_k = mx.random.normal(shape=(b, h, keep, d))
+        cache.update_and_fetch(sink_k, sink_k)
+
+        # Fill the rest of the buffer exactly (max_size - keep = 6 tokens)
+        for _ in range(max_size - keep):
+            k = mx.random.normal(shape=(b, h, 1, d))
+            cache.update_and_fetch(k, k)
+
+        # At this point _idx == max_size; the next write should wrap to keep
+        self.assertEqual(cache._idx, max_size)
+
+        # Write the wraparound token
+        k_wrap = mx.random.normal(shape=(b, h, 1, d))
+        qk, _ = cache.update_and_fetch(k_wrap, k_wrap)
+        mx.eval(qk[0], qk[1], qk[2])
+
+        # _idx should now be keep+1 (wrapped and advanced one)
+        self.assertEqual(cache._idx, keep + 1)
+
+        # The token at position `keep` must be the newly written one
+        dq_k = mx.dequantize(*qk, group_size=cache.group_size, bits=cache.bits)
+        self.assertTrue(
+            mx.allclose(dq_k[..., keep : keep + 1, :], k_wrap, atol=atol).item(),
+            "After wraparound, token at position `keep` must hold the newly written value",
+        )
+
+        # Sink tokens at 0..keep-1 must be unchanged
+        self.assertTrue(
+            mx.allclose(dq_k[..., :keep, :], sink_k, atol=atol).item(),
+            "Sink tokens must survive wraparound",
+        )
+
+    def test_rotating_kv_cache_to_quantized(self):
+        b, h, d = 1, 2, 64
+        group_size = 32
+        bits = 8
+
+        rot_cache = RotatingKVCache(max_size=16, keep=2)
+
+        # Prefill with multi-token prompt (offset < max_size, no rotation yet)
+        k = 1e-1 * mx.random.normal(shape=(b, h, 12, d))
+        v = 1e-1 * mx.random.normal(shape=(b, h, 12, d))
+        rot_cache.update_and_fetch(k, v)
+
+        # Must not raise NotImplementedError
+        qrot_cache = rot_cache.to_quantized(group_size=group_size, bits=bits)
+
+        self.assertIsInstance(qrot_cache, QuantizedRotatingKVCache)
+        self.assertEqual(qrot_cache.max_size, rot_cache.max_size)
+        self.assertEqual(qrot_cache.keep, rot_cache.keep)
+        self.assertEqual(qrot_cache.offset, rot_cache.offset)
+        self.assertEqual(qrot_cache._idx, rot_cache._idx)
+        self.assertEqual(qrot_cache.group_size, group_size)
+        self.assertEqual(qrot_cache.bits, bits)
+        self.assertEqual(len(qrot_cache.keys), 3)
+        self.assertEqual(len(qrot_cache.values), 3)
+
+        # Continued generation must work and advance offset correctly
+        k_new = 1e-1 * mx.random.normal(shape=(b, h, 1, d))
+        v_new = 1e-1 * mx.random.normal(shape=(b, h, 1, d))
+        qk, qv = qrot_cache.update_and_fetch(k_new, v_new)
+        self.assertEqual(qrot_cache.offset, 13)
+        self.assertEqual(len(qk), 3)
+
+    def test_rotating_kv_cache_to_quantized_empty(self):
+        rot_cache = RotatingKVCache(max_size=16, keep=0)
+        qrot_cache = rot_cache.to_quantized(group_size=64, bits=4)
+        self.assertIsInstance(qrot_cache, QuantizedRotatingKVCache)
+        self.assertIsNone(qrot_cache.keys)
+
+        # state property must not crash on an empty cache (Bug #1 regression test)
+        state = qrot_cache.state
+        self.assertIsNone(state[0])
+        self.assertIsNone(state[1])
+
+    def test_maybe_quantize_kv_cache_rotating(self):
+        # Verify maybe_quantize_kv_cache converts RotatingKVCache when kv_bits is set
+        b, h, d = 1, 2, 64
+        cache_list = [RotatingKVCache(max_size=32, keep=0) for _ in range(2)]
+
+        # Populate past the quantized_kv_start threshold
+        for c in cache_list:
+            k = mx.random.normal(shape=(b, h, 10, d))
+            v = mx.random.normal(shape=(b, h, 10, d))
+            c.update_and_fetch(k, v)
+
+        maybe_quantize_kv_cache(
+            cache_list,
+            quantized_kv_start=5,
+            kv_group_size=32,
+            kv_bits=8,
+        )
+
+        for c in cache_list:
+            self.assertIsInstance(c, QuantizedRotatingKVCache)
+
+    def test_quantized_rotating_kv_cache_save_load(self):
+        b, h, d = 1, 2, 64
+        group_size, bits = 32, 8
+
+        cache = QuantizedRotatingKVCache(max_size=16, keep=2, group_size=group_size, bits=bits)
+
+        # Fill with data so rotation has started
+        for _ in range(20):
+            k = mx.random.normal(shape=(b, h, 1, d))
+            cache.update_and_fetch(k, k)
+        mx.eval(cache.keys[0])
+
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+            path = f.name
+
+        save_prompt_cache(path, [cache])
+        [loaded] = load_prompt_cache(path)
+
+        self.assertIsInstance(loaded, QuantizedRotatingKVCache)
+        self.assertEqual(loaded.offset, cache.offset)
+        self.assertEqual(loaded._idx, cache._idx)
+        self.assertEqual(loaded.max_size, cache.max_size)
+        self.assertEqual(loaded.keep, cache.keep)
+        self.assertEqual(loaded.group_size, cache.group_size)
+        self.assertEqual(loaded.bits, cache.bits)
+
+        # Continue generating after load — must not crash and shape must be valid
+        k_new = mx.random.normal(shape=(b, h, 1, d))
+        qk, qv = loaded.update_and_fetch(k_new, k_new)
+        mx.eval(qk[0])
+        self.assertEqual(qk[0].shape[2], cache.max_size)
+        self.assertEqual(loaded.offset, cache.offset + 1)
+
+    def test_quantized_rotating_kv_cache_temporal_reorder_after_rotation(self):
+        b, h, d = 1, 2, 64
+        keep = 2
+        max_size = 8
+        group_size = 32
+        bits = 8
+        atol = 0.1
+        cache = QuantizedRotatingKVCache(max_size=max_size, keep=keep, group_size=group_size, bits=bits)
+
+        # In-place writes until rotation has happened (_idx has wrapped back to keep)
+        for _ in range(max_size + 1):
+            k = mx.random.normal(shape=(b, h, 1, d)).astype(mx.float16)
+            cache.update_and_fetch(k, k)
+
+        self.assertGreater(cache.offset, max_size)
+        self.assertLess(cache._idx, max_size)
+
+        # Multi-token concat triggers _temporal_order_q (rotated branch)
+        k_new = mx.random.normal(shape=(b, h, 3, d)).astype(mx.float16)
+        v_new = mx.random.normal(shape=(b, h, 3, d)).astype(mx.float16)
+        qk, qv = cache.update_and_fetch(k_new, v_new)
+        mx.eval(qk[0], qk[1], qk[2], qv[0], qv[1], qv[2])
+
+        dq_k = mx.dequantize(*qk, group_size=group_size, bits=bits)
+        dq_v = mx.dequantize(*qv, group_size=group_size, bits=bits)
+
+        self.assertTrue(mx.allclose(dq_k[..., -3:, :], k_new, atol=atol).item())
+        self.assertTrue(mx.allclose(dq_v[..., -3:, :], v_new, atol=atol).item())
+
+    def test_quantized_rotating_kv_cache_keys_not_values(self):
+        b, h, d = 1, 2, 64
+        max_size = 8
+        group_size = 32
+        bits = 8
+        atol = 0.1
+
+        for path_name, n_tokens in [("concat", 5), ("in_place", 1)]:
+            cache = QuantizedRotatingKVCache(max_size=max_size, keep=0, group_size=group_size, bits=bits)
+
+            k = mx.ones((b, h, n_tokens, d), dtype=mx.float16)
+            v = -mx.ones((b, h, n_tokens, d), dtype=mx.float16)
+            qk, qv = cache.update_and_fetch(k, v)
+            mx.eval(qk[0], qk[1], qk[2], qv[0], qv[1], qv[2])
+
+            dq_k = mx.dequantize(*qk, group_size=group_size, bits=bits)
+            dq_v = mx.dequantize(*qv, group_size=group_size, bits=bits)
+
+            self.assertTrue(
+                mx.allclose(dq_k, mx.ones_like(dq_k), atol=atol).item(),
+                f"[{path_name}] keys cross-wired with values"
+            )
+            self.assertTrue(
+                mx.allclose(dq_v, -mx.ones_like(dq_v), atol=atol).item(),
+                f"[{path_name}] values cross-wired with keys"
+            )
 
     def test_causal_mask_padding(self):
         right_padding = mx.array([2, 1, 0])
