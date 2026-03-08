@@ -161,11 +161,32 @@ def convert(
     )
 
     if isinstance(quant_predicate, str):
-        if q_mode != "affine":
-            raise ValueError(f"Quant predicates only support 'affine' quantization.")
         if quant_predicate == "jamba_int8_safe":
+            model_type = (
+                config.get("model_type")
+                or getattr(model, "model_type", None)
+                or getattr(getattr(model, "config", None), "model_type", None)
+            )
+            if model_type != "jamba":
+                raise ValueError(
+                    "The 'jamba_int8_safe' quantization recipe is only compatible "
+                    f"with Jamba models (model_type='jamba'). Got model_type={model_type!r}."
+                )
+            if q_mode != "affine":
+                raise ValueError(
+                    "The 'jamba_int8_safe' quantization recipe requires "
+                    "--q-mode affine."
+                )
+            if q_bits is not None and q_bits != 8:
+                raise ValueError(
+                    "The 'jamba_int8_safe' quantization recipe uses 8-bit "
+                    "quantization for recipe-selected layers. Please use --q-bits 8 "
+                    "or leave --q-bits unset."
+                )
             quant_predicate = jamba_int8_safe_predicate_builder(q_group_size)
         else:
+            if q_mode != "affine":
+                raise ValueError(f"Quant predicates only support 'affine' quantization.")
             quant_predicate = mixed_quant_predicate_builder(
                 quant_predicate,
                 model,
