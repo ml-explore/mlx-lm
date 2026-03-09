@@ -272,10 +272,15 @@ class TokenizerWrapper:
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
+        _eids = getattr(tokenizer, "eos_token_ids", [])
+        if _eids is None: _eids = []
+        if isinstance(_eids, int): _eids = [_eids]
+        _eid = getattr(tokenizer, "eos_token_id", None)
+        if _eid is not None: _eids.append(_eid)
         self._eos_token_ids = (
             set(eos_token_ids)
             if eos_token_ids is not None
-            else {tokenizer.eos_token_id}
+            else set(_eids)
         )
         self._think_start = None
         self._think_end = None
