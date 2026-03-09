@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import warnings
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -13,6 +14,7 @@ from .base import create_causal_mask
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
+    compact_kv_budget: Optional[int] = None,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -25,8 +27,24 @@ def make_prompt_cache(
         max_kv_size (Optional[int]): If provided and the model does not have a
             ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
             size of ``max_kv_size``
+        compact_kv_budget (Optional[int]): If provided and the model does not
+            have a ``make_cache`` method, a ``CompressedKVCache`` is used with
+            the given budget for L2-norm based eviction.
     """
+    if max_kv_size is not None and compact_kv_budget is not None:
+        raise ValueError(
+            "max_kv_size and compact_kv_budget are mutually exclusive. "
+            "Use max_kv_size for a rotating cache or compact_kv_budget "
+            "for L2-norm based eviction, but not both."
+        )
+
     if hasattr(model, "make_cache"):
+        if max_kv_size is not None or compact_kv_budget is not None:
+            warnings.warn(
+                "Model provides make_cache(); max_kv_size and "
+                "compact_kv_budget are ignored.",
+                UserWarning,
+            )
         return model.make_cache()
 
     num_layers = len(model.layers)
@@ -34,6 +52,8 @@ def make_prompt_cache(
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
         ]
+    elif compact_kv_budget is not None:
+        return [CompressedKVCache(budget=compact_kv_budget) for _ in range(num_layers)]
     else:
         return [KVCache() for _ in range(num_layers)]
 
@@ -578,6 +598,304 @@ class RotatingKVCache(_BaseCache):
     @classmethod
     def merge(_, caches):
         return BatchRotatingKVCache.merge(caches)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+
+class CompressedKVCache(_BaseCache):
+    """KV cache with L2-norm based key eviction for intelligent compression.
+
+    Maintains a budget of cached tokens by evicting those with the lowest
+    L2-norm keys, while protecting recent tokens from eviction. Compatible
+    with GQA architectures.
+
+    Based on the KNorm strategy from Devoto et al. (2024), "A Simple and
+    Effective L2 Norm-Based Strategy for KV Cache Compression"
+    (https://arxiv.org/abs/2406.11430), which demonstrates that key vectors
+    with low L2 norms consistently attract high attention scores, enabling
+    50-90% cache reduction without accuracy loss on standard benchmarks.
+
+    **Eviction heuristic rationale**: Tokens whose key vectors have large
+    L2-norms tend to attract more attention (since attention is proportional
+    to the dot product of queries and keys). These high-norm keys often
+    correspond to "attention sinks" (BOS, punctuation, etc.) whose removal
+    causes cascading attention collapse (cf. H2O, Zhang et al. 2023;
+    ScissorHands, Liu et al. 2023). By keeping high-norm keys and evicting
+    low-norm ones, we retain the tokens most critical for attention
+    stability, while the protected recent window preserves local coherence.
+    Cross-layer coherent eviction (via ``maybe_compact_kv_cache``) ensures
+    the same token positions are kept across all layers, maintaining
+    representational consistency.
+
+    References:
+        - Devoto et al., "A Simple and Effective L2 Norm-Based Strategy for
+          KV Cache Compression", arXiv:2406.11430, 2024.
+        - Zhang et al., "H2O: Heavy-Hitter Oracle for Efficient Generative
+          Inference of Large Language Models", NeurIPS 2023.
+        - Liu et al., "ScissorHands: Exploiting the Persistence of Importance
+          Hypothesis for LLM KV Cache Compression at Test Time", NeurIPS 2023.
+
+    .. warning::
+        Batch size B>1 is not supported. After per-batch eviction with
+        different kept indices, the scalar ``offset`` (used for RoPE) becomes
+        meaningless since each batch element retains different original
+        positions. Use ``BatchKVCache`` / ``BatchRotatingKVCache`` for
+        multi-sequence generation.
+
+    Args:
+        budget (int): Maximum number of tokens to retain after compaction.
+        keep_recent (int): Number of recent tokens protected from eviction.
+    """
+
+    step = 256
+
+    def __new__(cls, *args, **kwargs):
+        # Initialise attributes that from_state needs before meta_state is set,
+        # since _BaseCache.from_state bypasses __init__.
+        obj = super().__new__(cls)
+        obj.keys = None
+        obj.values = None
+        obj.offset = 0
+        obj._physical_idx = 0
+        obj.budget = 0
+        obj.keep_recent = 0
+        return obj
+
+    def __init__(self, budget: int, keep_recent: int = 32):
+        if budget <= 0:
+            raise ValueError("budget must be a positive integer")
+        if keep_recent < 0:
+            raise ValueError("keep_recent must be non-negative")
+        if budget <= keep_recent:
+            raise ValueError(
+                f"budget ({budget}) must be greater than keep_recent ({keep_recent})"
+            )
+        self.budget = budget
+        self.keep_recent = keep_recent
+
+    def update_and_fetch(self, keys, values):
+        prev = self._physical_idx
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self._physical_idx += keys.shape[2]
+        self.offset += keys.shape[2]
+        self.keys[..., prev : self._physical_idx, :] = keys
+        self.values[..., prev : self._physical_idx, :] = values
+        return (
+            self.keys[..., : self._physical_idx, :],
+            self.values[..., : self._physical_idx, :],
+        )
+
+    def compact(self, kept_indices: Optional[mx.array] = None):
+        """Compact the cache by evicting tokens with the lowest L2-norm keys.
+
+        .. note::
+            Calling ``compact()`` without ``kept_indices`` computes eviction
+            from this layer's keys alone. For cross-layer coherent eviction
+            (keeping the same tokens in every layer), use
+            :func:`~mlx_lm.generate.maybe_compact_kv_cache` instead.
+
+        Args:
+            kept_indices: Pre-computed indices of tokens to keep, shape
+                ``(B, budget)``, sorted in temporal order. When provided, skips
+                norm computation and uses these directly. This enables
+                cross-layer coherent eviction (same tokens kept in all layers).
+        """
+        if self._physical_idx <= self.budget:
+            if kept_indices is not None:
+                raise ValueError(
+                    f"kept_indices provided but cache size ({self._physical_idx}) "
+                    f"<= budget ({self.budget}). Nothing to compact."
+                )
+            return
+
+        if self.keys.shape[0] > 1:
+            raise ValueError(
+                "CompressedKVCache does not support batch size > 1. "
+                "After eviction, the scalar offset cannot represent "
+                "per-batch RoPE positions. Use BatchKVCache instead."
+            )
+
+        active_keys = self.keys[..., : self._physical_idx, :]
+        active_values = self.values[..., : self._physical_idx, :]
+
+        if kept_indices is None:
+            kept_indices = self._compute_kept_indices(active_keys)
+        else:
+            if kept_indices.shape[0] != active_keys.shape[0]:
+                raise ValueError(
+                    f"kept_indices batch size ({kept_indices.shape[0]}) must match "
+                    f"cache batch size ({active_keys.shape[0]})"
+                )
+            if kept_indices.shape[1] != self.budget:
+                raise ValueError(
+                    f"kept_indices must have shape[1] == budget ({self.budget}), "
+                    f"got {kept_indices.shape[1]}"
+                )
+
+        # Expand for gather: (B, 1, n_kept, 1)
+        n_kept = kept_indices.shape[1]
+        gather_idx = kept_indices[:, None, :, None]
+        k_idx = mx.broadcast_to(
+            gather_idx, (*active_keys.shape[:2], n_kept, active_keys.shape[3])
+        )
+        v_idx = mx.broadcast_to(
+            gather_idx, (*active_values.shape[:2], n_kept, active_values.shape[3])
+        )
+
+        compacted_keys = mx.take_along_axis(active_keys, k_idx, axis=2)
+        compacted_values = mx.take_along_axis(active_values, v_idx, axis=2)
+
+        # Pad to next step boundary so update_and_fetch doesn't reallocate
+        # on the very next token (keys.shape[2] must leave room for growth).
+        # Always add at least one step of headroom, even when n_kept is
+        # already a multiple of step.
+        padded_len = ((n_kept // self.step) + 1) * self.step
+        k_pad = mx.zeros(
+            (
+                *compacted_keys.shape[:2],
+                padded_len - n_kept,
+                compacted_keys.shape[3],
+            ),
+            compacted_keys.dtype,
+        )
+        v_pad = mx.zeros(
+            (
+                *compacted_values.shape[:2],
+                padded_len - n_kept,
+                compacted_values.shape[3],
+            ),
+            compacted_values.dtype,
+        )
+        self.keys = mx.concatenate([compacted_keys, k_pad], axis=2)
+        self.values = mx.concatenate([compacted_values, v_pad], axis=2)
+
+        self._physical_idx = n_kept
+        # offset is NOT modified (critical invariant for RoPE)
+
+    def _compute_kept_indices(self, active_keys: mx.array) -> mx.array:
+        """Compute which token indices to keep based on L2-norm scoring."""
+        # L2 norms per token per head: (B, n_kv_heads, seq_len)
+        norms = mx.linalg.norm(active_keys, axis=-1)
+        # Aggregate across heads: (B, seq_len)
+        norms = norms.sum(axis=1)
+        return self.indices_from_norms(norms)
+
+    def indices_from_norms(self, norms: mx.array) -> mx.array:
+        """Given per-token aggregated norms ``(B, seq_len)``, return kept indices.
+
+        This is the public entry-point used by
+        :func:`~mlx_lm.generate.maybe_compact_kv_cache` for cross-layer
+        coherent eviction.
+        """
+        seq_len = norms.shape[1]
+        if seq_len <= self.keep_recent:
+            raise ValueError(
+                f"norms seq_len ({seq_len}) must be > keep_recent ({self.keep_recent})"
+            )
+        n_evictable = seq_len - self.keep_recent
+        n_keep_from_evictable = self.budget - self.keep_recent
+
+        if n_keep_from_evictable > n_evictable:
+            raise ValueError(
+                f"Not enough evictable tokens ({n_evictable}) to fill budget "
+                f"({n_keep_from_evictable} needed). Ensure seq_len > budget."
+            )
+
+        # Score only the evictable (non-recent) tokens
+        evictable_norms = norms[:, :n_evictable]
+        # Descending sort: highest norms first (attention sinks kept)
+        sorted_indices = mx.argsort(-evictable_norms, axis=-1)
+        kept_evictable = sorted_indices[:, :n_keep_from_evictable]
+
+        # Combine with protected recent token indices
+        recent_indices = mx.arange(n_evictable, seq_len)
+        recent_indices = mx.broadcast_to(
+            recent_indices[None, :], (kept_evictable.shape[0], self.keep_recent)
+        )
+        all_kept = mx.concatenate([kept_evictable, recent_indices], axis=-1)
+
+        # Sort to preserve temporal order
+        return mx.sort(all_kept, axis=-1)
+
+    def size(self):
+        return self._physical_idx
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return []
+        return (
+            self.keys[..., : self._physical_idx, :],
+            self.values[..., : self._physical_idx, :],
+        )
+
+    @state.setter
+    def state(self, v):
+        if v is not None and v:
+            self.keys, self.values = v
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(str, (self.offset, self._physical_idx, self.budget, self.keep_recent))
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset, self._physical_idx, self.budget, self.keep_recent = map(int, v)
+
+    def is_trimmable(self):
+        # Safe to trim only when no eviction has occurred (offset == physical).
+        # After compaction, offset diverges from _physical_idx to preserve
+        # absolute RoPE position, and trimming would break that invariant.
+        return self.offset == self._physical_idx
+
+    def trim(self, n):
+        if not self.is_trimmable():
+            return 0
+        n = min(self._physical_idx, n)
+        self._physical_idx -= n
+        self.offset -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        raise NotImplementedError("CompressedKVCache quantization NYI")
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        # Uses _physical_idx (not offset) because the mask covers physical cache
+        # slots. After compaction, offset preserves the true sequence position
+        # for RoPE, but the attention mask must match the actual KV length.
+        return create_attention_mask(
+            N,
+            offset=self._physical_idx,
+            return_array=return_array,
+            window_size=window_size,
+        )
 
     def empty(self):
         return self.keys is None
