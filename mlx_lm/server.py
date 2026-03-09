@@ -395,6 +395,10 @@ class LogitsProcessorArguments:
     logit_bias: Optional[Dict[int, float]]
     repetition_penalty: float
     repetition_context_size: int
+    presence_penalty: float
+    presence_context_size: int
+    frequency_penalty: float
+    frequency_context_size: int
 
 
 @dataclass
@@ -623,6 +627,10 @@ def _make_logits_processors(args):
         args.logits.logit_bias,
         args.logits.repetition_penalty,
         args.logits.repetition_context_size,
+        args.logits.presence_penalty,
+        args.logits.presence_context_size,
+        args.logits.frequency_penalty,
+        args.logits.frequency_context_size,
     )
 
 
@@ -1208,6 +1216,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
         self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.presence_penalty = self.body.get("presence_penalty", 0.0)
+        self.presence_context_size = self.body.get("presence_context_size", 20)
+        self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
+        self.frequency_context_size = self.body.get("frequency_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
@@ -1256,6 +1268,25 @@ class APIHandler(BaseHTTPRequestHandler):
             or self.repetition_penalty < 0
         ):
             raise ValueError("repetition_penalty must be a non-negative float")
+        if (
+            not isinstance(self.repetition_context_size, int)
+            or self.repetition_context_size < 0
+        ):
+            raise ValueError("repetition_context_size must be a non-negative integer")
+        if not isinstance(self.presence_penalty, (float, int)):
+            raise ValueError("Presence penalty must be must be a float")
+        if (
+            not isinstance(self.presence_context_size, int)
+            or self.presence_context_size < 0
+        ):
+            raise ValueError("presence_context_size must be a non-negative integer")
+        if not isinstance(self.frequency_penalty, (float, int)):
+            raise ValueError("Presence penalty must be must be a float")
+        if (
+            not isinstance(self.frequency_context_size, int)
+            or self.frequency_context_size < 0
+        ):
+            raise ValueError("frequency_context_size must be a non-negative integer")
 
         if not isinstance(self.logprobs, bool):
             raise ValueError("logprobs must be a boolean")
@@ -1264,12 +1295,6 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError(
                 f"top_logprobs must be between 1 and 10 but got {self.top_logprobs:,}"
             )
-
-        if (
-            not isinstance(self.repetition_context_size, int)
-            or self.repetition_context_size < 0
-        ):
-            raise ValueError("repetition_context_size must be a non-negative integer")
 
         if self.logit_bias is not None:
             if not isinstance(self.logit_bias, dict):
@@ -1430,6 +1455,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 logit_bias=self.logit_bias,
                 repetition_penalty=self.repetition_penalty,
                 repetition_context_size=self.repetition_context_size,
+                presence_penalty=self.presence_penalty,
+                presence_context_size=self.presence_context_size,
+                frequency_penalty=self.frequency_penalty,
+                frequency_context_size=self.frequency_context_size,
             ),
             stop_words=stop_words,
             max_tokens=self.max_tokens,
