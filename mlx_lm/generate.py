@@ -927,6 +927,11 @@ def _merge_caches(caches):
     return batch_cache
 
 
+def _lazy_extract_cache(cache, i):
+    # Generators like lambdas are late bound so we can't just use it in the loop
+    return (c.extract(i) for c in cache)
+
+
 class BatchGenerator:
     @dataclass
     class Response:
@@ -1155,7 +1160,7 @@ class BatchGenerator:
         if self.prompt_checkpoint_callback is not None:
             self.prompt_checkpoint_callback(
                 [
-                    (uid, prompt_checkpoint, (c.extract(i) for c in prompt_cache))
+                    (uid, prompt_checkpoint, _lazy_extract_cache(prompt_cache, i))
                     for i, uid in enumerate(uids)
                 ]
             )
