@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -35,7 +35,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, generation_stream, stream_generate
+from .generate import BatchGenerator, generate_step, generation_stream, stream_generate
 from .models.cache import (
     can_trim_prompt_cache,
     make_prompt_cache,
@@ -179,7 +179,7 @@ def process_message_content(messages):
         if tool_calls := message.get("tool_calls", False):
             for tool_call in tool_calls:
                 if func := tool_call.get("function", False):
-                    if args := func.get("arguments", False):
+                    if isinstance(args := func.get("arguments", False), str):
                         func["arguments"] = json.loads(args)
 
 
@@ -429,6 +429,15 @@ class CompletionRequest:
 
 
 @dataclass
+class _PromptCacheWarmup:
+    model: ModelDescription
+    messages: List[Any]
+    tools: Optional[List[Any]]
+    role_mapping: Optional[Dict[str, Any]]
+    chat_template_kwargs: Optional[Dict[str, Any]]
+
+
+@dataclass
 class GenerationContext:
     has_tool_calling: bool
     tool_call_start: str
@@ -653,10 +662,21 @@ class ResponseGenerator:
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
+        self._prompt_cache_warmup = None
+        self._prompt_cache_warmup_lock = Lock()
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
+        if self.cli_args.prompt_cache_warmup:
+            if self._is_distributed:
+                raise ValueError(
+                    "prompt cache warmup is not supported in distributed mode"
+                )
+            if self.cli_args.draft_model is not None:
+                raise ValueError(
+                    "prompt cache warmup is not supported with a draft model"
+                )
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
@@ -716,36 +736,147 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
+    def _tokenize_chat(self, tokenizer, messages, tools, role_mapping, extra_args):
+        if tokenizer.has_chat_template:
+            process_message_content(messages)
+            if tools and not tokenizer.has_tool_calling:
+                logging.warning(
+                    "Received tools but model does not support tool calling. "
+                    "If you think this is an error, file an issue here: "
+                    "https://github.com/ml-explore/mlx-lm/issues"
+                )
+
+            chat_template_args = self.model_provider.cli_args.chat_template_args
+            if extra_args:
+                chat_template_args = chat_template_args.copy()
+                chat_template_args.update(extra_args)
+
+            return tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=True,
+                **chat_template_args,
+            )
+
+        return tokenizer.encode(convert_chat(messages, role_mapping))
+
     def _tokenize(self, tokenizer, request, args):
         if request.request_type == "chat":
-            messages = request.messages
-            tools = request.tools
-            role_mapping = request.role_mapping
-
-            if tokenizer.has_chat_template:
-                process_message_content(messages)
-                if tools and not tokenizer.has_tool_calling:
-                    logging.warning(
-                        "Received tools but model does not support tool calling. "
-                        "If you think this is an error, file an issue here: "
-                        "https://github.com/ml-explore/mlx-lm/issues"
-                    )
-
-                chat_template_args = self.model_provider.cli_args.chat_template_args
-                if args.chat_template_kwargs:
-                    chat_template_args = chat_template_args.copy()
-                    chat_template_args.update(args.chat_template_kwargs)
-                return tokenizer.apply_chat_template(
-                    messages,
-                    tools=tools,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    **chat_template_args,
-                )
-            else:
-                return tokenizer.encode(convert_chat(messages, role_mapping))
+            return self._tokenize_chat(
+                tokenizer,
+                request.messages,
+                request.tools,
+                request.role_mapping,
+                args.chat_template_kwargs,
+            )
         else:
             return tokenizer.encode(request.prompt)
+
+    def _build_prefill_request(self, tokenizer, warmup):
+        # Warm the replayed assistant turn against two synthetic next-user turns
+        # and use the shared token prefix as the cache key.
+        def common_prefix(s1, s2):
+            prefix_length = 0
+            for left, right in zip(s1, s2):
+                if left != right:
+                    break
+                prefix_length += 1
+            return list(s1[:prefix_length])
+
+        probes = (
+            "Any pair of distinct",
+            "strings would work.",
+        )
+        prompts = []
+        for content in probes:
+            messages = copy.deepcopy(warmup.messages)
+            messages.append({"role": "user", "content": content})
+            prompts.append(
+                self._tokenize_chat(
+                    tokenizer,
+                    messages,
+                    warmup.tools,
+                    warmup.role_mapping,
+                    warmup.chat_template_kwargs,
+                )
+            )
+
+        prompt = common_prefix(*prompts)
+        if len(prompt) == 0:
+            return None
+        return prompt
+
+    def enqueue_prompt_cache_warmup(self, request, generation_args, assistant_message):
+        if not self.cli_args.prompt_cache_warmup or request.request_type != "chat":
+            return
+        if generation_args.model.draft not in (None, "default_model") or (
+            generation_args.model.draft == "default_model"
+            and self.cli_args.draft_model is not None
+        ):
+            logging.debug("Skipping prompt cache warmup with draft model enabled.")
+            return
+        if not any(assistant_message.get(key) for key in ("content", "reasoning")):
+            return
+
+        messages = copy.deepcopy(request.messages)
+        messages.append(copy.deepcopy(assistant_message))
+        with self._prompt_cache_warmup_lock:
+            self._prompt_cache_warmup = _PromptCacheWarmup(
+                model=copy.deepcopy(generation_args.model),
+                messages=messages,
+                tools=copy.deepcopy(request.tools),
+                role_mapping=copy.deepcopy(request.role_mapping),
+                chat_template_kwargs=copy.deepcopy(
+                    generation_args.chat_template_kwargs
+                ),
+            )
+
+    def _run_prompt_cache_warmup(self):
+        with self._prompt_cache_warmup_lock:
+            warmup = self._prompt_cache_warmup
+            self._prompt_cache_warmup = None
+        if warmup is None:
+            return False
+
+        def progress(tokens_processed, total_tokens):
+            logging.info(
+                f"Prompt cache warmup progress: {tokens_processed}/{total_tokens}"
+            )
+
+        try:
+            model, tokenizer = self.model_provider.load(
+                warmup.model.model,
+                warmup.model.adapter,
+                warmup.model.draft,
+            )
+            prompt = self._build_prefill_request(tokenizer, warmup)
+            if prompt is not None:
+                self.prompt_cache.log_cache_stats()
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                if cache is None:
+                    cache = make_prompt_cache(model)
+                if len(rest) > 0:
+                    for _ in generate_step(
+                        mx.array(rest),
+                        model,
+                        max_tokens=0,
+                        prompt_cache=cache,
+                        prefill_step_size=self.cli_args.prefill_step_size,
+                        prompt_progress_callback=progress,
+                    ):
+                        pass
+                    self.prompt_cache.insert_cache(
+                        self.model_provider.model_key,
+                        prompt,
+                        cache,
+                        checkpoint=True,
+                    )
+        except Exception:
+            logging.exception("Prompt cache warmup failed.")
+        return True
 
     def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
         if request.request_type != "chat":
@@ -933,7 +1064,10 @@ class ResponseGenerator:
             # No request so serve from the current batch
             elif batch_generator is not None:
                 if len(batch_results) == 0:
-                    if drain_batch:
+                    with self._prompt_cache_warmup_lock:
+                        warmup_pending = self._prompt_cache_warmup is not None
+                    should_close_batch = drain_batch or warmup_pending
+                    if should_close_batch:
                         current_model = None
                         current_sampling = None
                         current_tokenizer = None
@@ -942,55 +1076,68 @@ class ResponseGenerator:
                         batch_generator = None
                         drain_batch = False
                     continue
+                else:
+                    uids_to_remove = []
+                    for _ in self._time_budget:
+                        responses = batch_generator.next()
+                        if not responses:
+                            break
 
-                uids_to_remove = []
-                for _ in self._time_budget:
-                    responses = batch_generator.next()
-                    if not responses:
-                        break
+                        for r in responses:
+                            result = batch_results[r.uid]
+                            result["cache_key"].append(r.token)
+                            if r.finish_reason != "stop":
+                                result["detokenizer"].add_token(r.token)
 
-                    for r in responses:
-                        result = batch_results[r.uid]
-                        result["cache_key"].append(r.token)
-                        if r.finish_reason != "stop":
-                            result["detokenizer"].add_token(r.token)
-
-                        result["rqueue"].put(
-                            Response(
-                                result["detokenizer"].last_segment,
-                                r.token,
-                                r.logprobs[r.token].item(),
-                                r.finish_reason,
-                                _format_top_logprobs(
-                                    r.logprobs, args.top_logprobs, current_tokenizer
+                            result["rqueue"].put(
+                                Response(
+                                    result["detokenizer"].last_segment,
+                                    r.token,
+                                    r.logprobs[r.token].item(),
+                                    r.finish_reason,
+                                    _format_top_logprobs(
+                                        r.logprobs, args.top_logprobs, current_tokenizer,
+                                    ),
                                 ),
                             )
-                        )
 
-                        if r.finish_reason is not None:
-                            result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
+                            if r.finish_reason is not None:
+                                result["rqueue"].put(None)
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    result["cache_key"],
+                                    r.prompt_cache,
+                                )
+                                del batch_results[r.uid]
+
+                            if result["ctx"]._should_stop:
+                                uids_to_remove.append(r.uid)
+
+                    uids_to_remove = self._share_object(uids_to_remove)
+                    if uids_to_remove:
+                        with mx.stream(generation_stream):
+                            caches = batch_generator.remove(
+                                uids_to_remove, return_prompt_caches=True
                             )
-                            del batch_results[r.uid]
+                            for uid, prompt_cache in caches.items():
+                                if uid not in batch_results:
+                                    continue
+                                result = batch_results[uid]
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    result["cache_key"],
+                                    prompt_cache,
+                                )
+                                del batch_results[uid]
+                    continue
 
-                        if result["ctx"]._should_stop:
-                            uids_to_remove.append(r.uid)
+            # Prefer a newly arrived foreground request over best-effort warmup.
+            request = get_next_request(timeout=0)
+            if request is not None:
+                unprocessed_requests.append(request)
+                continue
 
-                uids_to_remove = self._share_object(uids_to_remove)
-                if uids_to_remove:
-                    with mx.stream(generation_stream):
-                        caches = batch_generator.remove(
-                            uids_to_remove, return_prompt_caches=True
-                        )
-                        for uid, prompt_cache in caches.items():
-                            if uid not in batch_results:
-                                continue
-                            result = batch_results[uid]
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], prompt_cache
-                            )
-                            del batch_results[uid]
+            self._run_prompt_cache_warmup()
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -1554,6 +1701,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     in_reasoning = True
                     break
         reasoning_text = ""
+        warmup_reasoning = ""
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
@@ -1576,6 +1724,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     in_reasoning = False
                 else:
                     reasoning_text += gen.text
+                    warmup_reasoning += gen.text
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 made_tool_call = True
                 in_tool_call = True
@@ -1643,6 +1792,21 @@ class APIHandler(BaseHTTPRequestHandler):
         # Flush any remaining tool text (e.g. when tool_call_end is empty)
         if in_tool_call and tool_text:
             tool_calls.append(tool_text)
+
+        if not made_tool_call and finish_reason != "tool_calls":
+            assistant_message = {
+                "role": "assistant",
+                "content": text or "",
+            }
+            if warmup_reasoning:
+                # Preserve both the response-facing and template-facing keys.
+                assistant_message["reasoning"] = warmup_reasoning
+                assistant_message["reasoning_content"] = warmup_reasoning
+            self.response_generator.enqueue_prompt_cache_warmup(
+                request,
+                args,
+                assistant_message,
+            )
 
         if self.stream:
             response = self.generate_response(
@@ -2007,6 +2171,11 @@ def main():
         "--prompt-cache-bytes",
         type=parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-warmup",
+        action="store_true",
+        help="Best-effort warmup of the next-turn prompt cache after each chat completion",
     )
     parser.add_argument(
         "--pipeline",
