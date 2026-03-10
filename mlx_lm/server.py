@@ -179,7 +179,7 @@ def process_message_content(messages):
         if tool_calls := message.get("tool_calls", False):
             for tool_call in tool_calls:
                 if func := tool_call.get("function", False):
-                    if isinstance(args := func.get("arguments", False), str):
+                    if args := func.get("arguments", False):
                         func["arguments"] = json.loads(args)
 
 
@@ -774,20 +774,17 @@ class ResponseGenerator:
             return tokenizer.encode(request.prompt)
 
     def _build_prefill_request(self, tokenizer, warmup):
-        # Warm the replayed assistant turn against two synthetic next-user turns
-        # and use the shared token prefix as the cache key.
+        # Tokenize the conversation twice with different synthetic next-user
+        # messages and take the shared prefix as the cacheable portion.
         def common_prefix(s1, s2):
-            prefix_length = 0
-            for left, right in zip(s1, s2):
-                if left != right:
+            n = 0
+            for a, b in zip(s1, s2):
+                if a != b:
                     break
-                prefix_length += 1
-            return list(s1[:prefix_length])
+                n += 1
+            return list(s1[:n])
 
-        probes = (
-            "Any pair of distinct",
-            "strings would work.",
-        )
+        probes = ("A", "B")
         prompts = []
         for content in probes:
             messages = copy.deepcopy(warmup.messages)
@@ -810,26 +807,23 @@ class ResponseGenerator:
     def enqueue_prompt_cache_warmup(self, request, generation_args, assistant_message):
         if not self.cli_args.prompt_cache_warmup or request.request_type != "chat":
             return
-        if generation_args.model.draft not in (None, "default_model") or (
-            generation_args.model.draft == "default_model"
-            and self.cli_args.draft_model is not None
-        ):
+        if generation_args.model.draft not in (None, "default_model"):
             logging.debug("Skipping prompt cache warmup with draft model enabled.")
             return
         if not any(assistant_message.get(key) for key in ("content", "reasoning")):
             return
 
         messages = copy.deepcopy(request.messages)
-        messages.append(copy.deepcopy(assistant_message))
+        messages.append(assistant_message)
         with self._prompt_cache_warmup_lock:
             self._prompt_cache_warmup = _PromptCacheWarmup(
-                model=copy.deepcopy(generation_args.model),
+                model=generation_args.model,
                 messages=messages,
                 tools=copy.deepcopy(request.tools),
-                role_mapping=copy.deepcopy(request.role_mapping),
-                chat_template_kwargs=copy.deepcopy(
-                    generation_args.chat_template_kwargs
-                ),
+                role_mapping=request.role_mapping,
+                chat_template_kwargs=generation_args.chat_template_kwargs.copy()
+                if generation_args.chat_template_kwargs
+                else {},
             )
 
     def _run_prompt_cache_warmup(self):
@@ -1096,7 +1090,7 @@ class ResponseGenerator:
                                     r.logprobs[r.token].item(),
                                     r.finish_reason,
                                     _format_top_logprobs(
-                                        r.logprobs, args.top_logprobs, current_tokenizer,
+                                        r.logprobs, args.top_logprobs, current_tokenizer
                                     ),
                                 ),
                             )
@@ -1701,7 +1695,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     in_reasoning = True
                     break
         reasoning_text = ""
-        warmup_reasoning = ""
+        warmup_reasoning = "" # Separate accumulator; reasoning_text resets during streaming
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
