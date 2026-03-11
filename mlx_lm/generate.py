@@ -482,6 +482,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    translation_prefix_tokens: int = 0,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -512,6 +513,12 @@ def speculative_generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        translation_prefix_tokens (int): Number of previously generated verifier
+          tokens to prepend as context when re-encoding draft text into verifier
+          tokens during cross-tokenizer translation. Providing context avoids
+          boundary mis-tokenisation (e.g. a leading ``w`` being tokenised as the
+          beginning-of-word ``_w`` instead of the mid-word ``w``). Only active
+          when ``draft_tokenizer`` is set. Default: ``0`` (no prefix context).
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
@@ -588,6 +595,19 @@ def speculative_generate_step(
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
+    def _translate_to_verifier(draft_token_list, context_ids=None):
+        draft_text = draft_tokenizer.decode(draft_token_list)
+        if context_ids:
+            prefix_text = tokenizer.decode(context_ids)
+            full_ids = tokenizer.encode(prefix_text + draft_text, add_special_tokens=False)
+            prefix_len = len(tokenizer.encode(prefix_text, add_special_tokens=False))
+            return draft_text, full_ids[prefix_len:]
+        return draft_text, tokenizer.encode(draft_text, add_special_tokens=False)
+
+    def _translate_to_draft(verifier_token_ids):
+        text = tokenizer.decode(verifier_token_ids)
+        return text, draft_tokenizer.encode(text, add_special_tokens=False)
+
     def _draft_generate(y, num_draft):
         if num_draft == 0:
             return mx.array([], mx.uint32)
@@ -617,6 +637,7 @@ def speculative_generate_step(
         n_verifier = 0
         n_accept_v = 0
         needs_cleanup = False
+        verifier_context: List[int] = []
 
         try:
             while True:
@@ -627,10 +648,16 @@ def speculative_generate_step(
                 mx.eval(draft_tokens)
                 draft_token_list = draft_tokens.tolist()
 
-                # Decode draft tokens to text, re-encode with verifier tokenizer
-                draft_text = draft_tokenizer.decode(draft_token_list)
-                verifier_token_ids = tokenizer.encode(
-                    draft_text, add_special_tokens=False
+                # Decode draft tokens to text, re-encode with verifier tokenizer.
+                # Pass recent verifier tokens as context so the tokenizer sees the
+                # correct word-boundary for the first subword of the draft text.
+                context_ids = (
+                    verifier_context[-translation_prefix_tokens:]
+                    if translation_prefix_tokens > 0
+                    else None
+                )
+                draft_text, verifier_token_ids = _translate_to_verifier(
+                    draft_token_list, context_ids
                 )
                 n_verifier = len(verifier_token_ids)
 
@@ -639,14 +666,15 @@ def speculative_generate_step(
                     tokens_v, logprobs_v = _step(model, model_cache, y, 1)
                     mx.eval(tokens_v)
                     ntoks += 1
-                    yield tokens_v.item(), logprobs_v.squeeze(0), False
+                    fallback_tok = tokens_v.item()
+                    verifier_context.append(fallback_tok)
+                    if translation_prefix_tokens > 0:
+                        verifier_context = verifier_context[-translation_prefix_tokens:]
+                    yield fallback_tok, logprobs_v.squeeze(0), False
                     if ntoks == max_tokens:
                         break
-                    y = mx.array([tokens_v.item()], mx.uint32)
-                    corr_text = tokenizer.decode([tokens_v.item()])
-                    draft_corr = draft_tokenizer.encode(
-                        corr_text, add_special_tokens=False
-                    )
+                    y = mx.array([fallback_tok], mx.uint32)
+                    _, draft_corr = _translate_to_draft([fallback_tok])
                     cache.trim_prompt_cache(draft_cache, num_draft - 1)
                     num_draft = 0
                     if draft_corr:
@@ -706,6 +734,13 @@ def speculative_generate_step(
 
                 correction_token = tokens_list[n_accept_v]
 
+                # Keep a sliding window of recent verifier tokens for prefix context
+                if translation_prefix_tokens > 0:
+                    verifier_context.extend(
+                        verifier_token_ids[:n_accept_v] + [correction_token]
+                    )
+                    verifier_context = verifier_context[-translation_prefix_tokens:]
+
                 # Rewind verifier cache: keep y + accepted positions
                 cache.trim_prompt_cache(model_cache, n_verifier - n_accept_v)
 
@@ -716,13 +751,8 @@ def speculative_generate_step(
 
                 # Translate accepted + correction text back to draft tokens
                 # and feed them to the draft model so it stays in sync
-                all_new_verifier = (
-                    verifier_token_ids[:n_accept_v] + [correction_token]
-                )
-                new_text = tokenizer.decode(all_new_verifier)
-                new_draft_tokens = draft_tokenizer.encode(
-                    new_text, add_special_tokens=False
-                )
+                all_new_verifier = verifier_token_ids[:n_accept_v] + [correction_token]
+                _, new_draft_tokens = _translate_to_draft(all_new_verifier)
 
                 if new_draft_tokens:
                     if len(new_draft_tokens) > 1:
@@ -775,6 +805,7 @@ def speculative_generate_step(
                 mx.eval(tokens, draft_tokens)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
+
                 n = 0
                 while n < num_draft:
                     tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
@@ -814,6 +845,7 @@ def stream_generate(
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     draft_tokenizer: Optional[Union[PreTrainedTokenizer, TokenizerWrapper]] = None,
+    translation_prefix_tokens: int = 0,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -832,6 +864,9 @@ def stream_generate(
           cross-tokenizer speculative decoding where draft tokens are decoded
           to text and re-encoded with the verifier tokenizer before
           verification. Default: ``None``.
+        translation_prefix_tokens (int): Number of previously generated verifier
+          tokens used as context when re-encoding draft text into verifier tokens.
+          Only active when ``draft_tokenizer`` is set. Default: ``0``.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -871,6 +906,7 @@ def stream_generate(
             draft_model,
             tokenizer=tokenizer,
             draft_tokenizer=draft_tokenizer,
+            translation_prefix_tokens=translation_prefix_tokens,
             **kwargs,
         )
     with wired_limit(model, [generation_stream]):
