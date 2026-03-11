@@ -212,7 +212,7 @@ def train(
     training_callback: TrainingCallback = None,
 ):
     if mx.metal.is_available():
-        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     print(f"Starting training..., iters: {args.iters}")
     world = mx.distributed.init()
     world_size = world.size()
