@@ -1576,16 +1576,23 @@ class APIHandler(BaseHTTPRequestHandler):
                     in_reasoning = False
                 else:
                     reasoning_text += gen.text
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                made_tool_call = True
-                in_tool_call = True
             elif in_tool_call:
-                if gen.text == ctx.tool_call_end:
+                tool_text += gen.text
+                # Detect end tag: exact single-token match or substring in buffer
+                if gen.text == ctx.tool_call_end or ctx.tool_call_end in tool_text:
+                    tool_text = tool_text[: tool_text.index(ctx.tool_call_end)]
                     tool_calls.append(tool_text)
                     tool_text = ""
                     in_tool_call = False
-                else:
-                    tool_text += gen.text
+            elif ctx.has_tool_calling:
+                text += gen.text
+                segment += gen.text
+                # Detect start tag: exact single-token match or substring in buffer
+                if ctx.tool_call_start in text:
+                    text = text[: text.index(ctx.tool_call_start)]
+                    segment = ""
+                    made_tool_call = True
+                    in_tool_call = True
             else:
                 text += gen.text
                 segment += gen.text
