@@ -397,7 +397,19 @@ class TestModels(unittest.TestCase):
     def test_phi2(self):
         from mlx_lm.models import phi
 
-        args = phi.ModelArgs()
+        args = phi.ModelArgs(
+            model_type="phi",
+            max_position_embeddings=128,
+            vocab_size=10_000,
+            hidden_size=1024,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            num_key_value_heads=4,
+            partial_rotary_factor=0.4,
+            intermediate_size=2048,
+            layer_norm_eps=1e-5,
+            rope_theta=1000,
+        )
         model = phi.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers

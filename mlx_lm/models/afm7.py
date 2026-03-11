@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
