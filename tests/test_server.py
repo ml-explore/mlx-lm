@@ -5,6 +5,8 @@ import io
 import json
 import threading
 import unittest
+from contextlib import nullcontext
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -18,7 +20,7 @@ from mlx_lm.server import (
     LRUPromptCache,
     ModelDescription,
     ResponseGenerator,
-    _PromptCacheWarmup,
+    process_message_content,
 )
 from mlx_lm.utils import load
 
@@ -124,33 +126,51 @@ class SequencedTokenizer:
 class TestPromptCacheWarmup(unittest.TestCase):
     MODEL = ModelDescription(model="default_model", adapter=None, draft=None)
     MODEL_KEY = ("default_model", None, None)
+    HANDLER_DEFAULTS = {
+        "request_id": "chatcmpl-test",
+        "system_fingerprint": "fp",
+        "requested_model": "chat_model",
+        "requested_draft_model": None,
+        "created": 0,
+        "adapter": None,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "xtc_probability": 0.0,
+        "xtc_threshold": 0.0,
+        "logit_bias": None,
+        "repetition_penalty": 1.0,
+        "repetition_context_size": 20,
+        "presence_penalty": 0.0,
+        "presence_context_size": 20,
+        "frequency_penalty": 0.0,
+        "frequency_context_size": 20,
+        "max_tokens": 16,
+        "num_draft_tokens": 3,
+        "logprobs": False,
+        "top_logprobs": 0,
+        "seed": None,
+        "chat_template_kwargs": {},
+    }
 
     def _make_generator(self, prompt_cache, *, warmup_enabled=True):
-        cli_args = type(
-            "obj",
-            (object,),
-            {
-                "chat_template_args": {},
-                "draft_model": None,
-                "prefill_step_size": 16,
-                "prompt_cache_warmup": warmup_enabled,
-            },
+        cli_args = SimpleNamespace(
+            chat_template_args={},
+            draft_model=None,
+            prefill_step_size=16,
+            prompt_cache_warmup=warmup_enabled,
         )
-        model_provider = type(
-            "obj",
-            (object,),
-            {
-                "cli_args": cli_args,
-                "model": object(),
-                "model_key": self.MODEL_KEY,
-                "load": Mock(
-                    return_value=(object(), SequencedTokenizer(([1], [1])))
-                ),
-            },
+        model_provider = SimpleNamespace(
+            cli_args=cli_args,
+            model=object(),
+            model_key=self.MODEL_KEY,
+            load=Mock(return_value=(object(), SequencedTokenizer(([1], [1])))),
         )
         gen = ResponseGenerator.__new__(ResponseGenerator)
         gen.model_provider = model_provider
         gen.prompt_cache = prompt_cache
+        gen.requests = Queue()
         gen._prompt_cache_warmup = None
         gen._prompt_cache_warmup_lock = threading.Lock()
         gen._is_distributed = False
@@ -158,7 +178,7 @@ class TestPromptCacheWarmup(unittest.TestCase):
 
     def _make_gen_args(self, draft=None):
         model = ModelDescription(model="default_model", adapter=None, draft=draft)
-        return type("obj", (), {"model": model, "chat_template_kwargs": {}})
+        return SimpleNamespace(model=model, chat_template_kwargs={})
 
     def _chat_request(self, messages=None):
         return CompletionRequest(
@@ -168,26 +188,6 @@ class TestPromptCacheWarmup(unittest.TestCase):
             None,
             None,
         )
-
-    def _tool_messages(self, arguments):
-        return [
-            {"role": "user", "content": "What is 2+3?"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "id": "123",
-                        "function": {
-                            "name": "add",
-                            "arguments": arguments,
-                        },
-                    }
-                ],
-            },
-            {"role": "tool", "content": "5", "tool_call_id": "123"},
-        ]
 
     def _make_ctx(self, **kwargs):
         attrs = {
@@ -221,6 +221,40 @@ class TestPromptCacheWarmup(unittest.TestCase):
             top_tokens=(),
         )
 
+    def _assert_generate_step_call(self, generate_step_mock, rest, prompt_cache):
+        call_args, call_kwargs = generate_step_mock.call_args
+        self.assertEqual(call_args[0].tolist(), rest)
+        self.assertEqual(call_kwargs["max_tokens"], 0)
+        if isinstance(prompt_cache, list):
+            self.assertEqual(call_kwargs["prompt_cache"], prompt_cache)
+        else:
+            self.assertIs(call_kwargs["prompt_cache"], prompt_cache)
+        self.assertEqual(call_kwargs["prefill_step_size"], 16)
+        self.assertIn("prompt_progress_callback", call_kwargs)
+
+    def _queue_warmup(
+        self,
+        prompt_cache,
+        prompts,
+        *,
+        assistant_message=None,
+        request=None,
+        args=None,
+    ):
+        gen = self._make_generator(prompt_cache)
+        gen.model_provider.load = Mock(
+            return_value=(
+                gen.model_provider.model,
+                SequencedTokenizer(prompts),
+            )
+        )
+        gen.enqueue_prompt_cache_warmup(
+            request or self._chat_request(),
+            args or self._make_gen_args(),
+            assistant_message or {"role": "assistant", "content": "Hi"},
+        )
+        return gen
+
     def _make_handler(self, ctx, responses, *, stream):
         handler = APIHandler.__new__(APIHandler)
         handler.response_generator = Mock()
@@ -232,63 +266,280 @@ class TestPromptCacheWarmup(unittest.TestCase):
         handler._set_stream_headers = Mock()
         handler.send_header = Mock()
         handler.end_headers = Mock()
-        for key, value in {
-            "request_id": "chatcmpl-test",
-            "system_fingerprint": "fp",
+        attrs = self.HANDLER_DEFAULTS | {
             "object_type": "chat.completion.chunk" if stream else "chat.completion",
-            "requested_model": "chat_model",
-            "requested_draft_model": None,
-            "created": 0,
-            "adapter": None,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": 0,
-            "min_p": 0.0,
-            "xtc_probability": 0.0,
-            "xtc_threshold": 0.0,
-            "logit_bias": None,
-            "repetition_penalty": 1.0,
-            "repetition_context_size": 20,
-            "presence_penalty": 0.0,
-            "presence_context_size": 20,
-            "frequency_penalty": 0.0,
-            "frequency_context_size": 20,
-            "max_tokens": 16,
-            "num_draft_tokens": 3,
-            "logprobs": False,
-            "top_logprobs": 0,
-            "seed": None,
-            "chat_template_kwargs": {},
-        }.items():
+        }
+        for key, value in attrs.items():
             setattr(handler, key, value)
         return handler
 
-    def test_build_prefill_request_returns_common_prefix(self):
-        gen = self._make_generator(None)
-        warmup = _PromptCacheWarmup(
-            model=self.MODEL,
-            messages=[{"role": "user", "content": "Hi"}],
-            tools=None,
-            role_mapping=None,
-            chat_template_kwargs={},
+    def test_enqueue_prompt_cache_warmup_handles_eligible_and_skipped_requests(self):
+        cases = (
+            {
+                "name": "stores chat reply",
+                "warmup_enabled": True,
+                "request": self._chat_request(),
+                "args": self._make_gen_args(),
+                "assistant_message": {"role": "assistant", "content": "Hi"},
+                "expected_messages": 2,
+            },
+            {
+                "name": "disabled",
+                "warmup_enabled": False,
+                "request": self._chat_request(),
+                "args": self._make_gen_args(),
+                "assistant_message": {"role": "assistant", "content": "Hi"},
+                "expected_messages": None,
+            },
+            {
+                "name": "draft model",
+                "warmup_enabled": True,
+                "request": self._chat_request(),
+                "args": self._make_gen_args(draft="draft-model"),
+                "assistant_message": {"role": "assistant", "content": "Hi"},
+                "expected_messages": None,
+            },
         )
-        tokenizer = SequencedTokenizer(([10, 20, 30, 99], [10, 20, 30, 88]))
-        self.assertEqual(gen._build_prefill_request(tokenizer, warmup), [10, 20, 30])
 
-    def test_build_prefill_request_returns_none_for_empty_prefix(self):
-        gen = self._make_generator(None)
-        warmup = _PromptCacheWarmup(
-            model=self.MODEL,
-            messages=[{"role": "user", "content": "Hi"}],
-            tools=None,
-            role_mapping=None,
-            chat_template_kwargs={},
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                gen = self._make_generator(
+                    None, warmup_enabled=case["warmup_enabled"]
+                )
+                gen.enqueue_prompt_cache_warmup(
+                    case["request"],
+                    case["args"],
+                    case["assistant_message"],
+                )
+                if case["expected_messages"] is None:
+                    self.assertIsNone(gen._prompt_cache_warmup)
+                else:
+                    self.assertIsNotNone(gen._prompt_cache_warmup)
+                    self.assertEqual(
+                        len(gen._prompt_cache_warmup.messages),
+                        case["expected_messages"],
+                    )
+
+    def test_run_warmup_syncs_stream_before_wired_limit(self):
+        # mx.synchronize(generation_stream) must happen before wired_limit is
+        # entered so that any outstanding async batch work is flushed before
+        # the wired memory state changes.
+        prompt_cache = MockPromptCacheManager(["base-cache"], [7])
+        gen = self._queue_warmup(
+            prompt_cache,
+            ([1, 2, 3, 7, 10], [1, 2, 3, 7, 20]),
         )
-        tokenizer = SequencedTokenizer(([1, 2], [3, 4]))
-        self.assertIsNone(gen._build_prefill_request(tokenizer, warmup))
 
-    def test_tokenize_chat_handles_tool_arguments(self):
-        gen = self._make_generator(None)
+        call_log = []
+        with patch("mlx_lm.server.generate_step", return_value=iter(())), patch(
+            "mlx_lm.server.wired_limit",
+            side_effect=lambda *a, **k: (call_log.append("wired_limit"), nullcontext())[1],
+        ), patch(
+            "mlx_lm.server.mx.synchronize",
+            side_effect=lambda *a, **k: call_log.append("sync"),
+        ):
+            gen._run_prompt_cache_warmup()
+
+        sync_pos = next((i for i, v in enumerate(call_log) if v == "sync"), None)
+        wl_pos = next((i for i, v in enumerate(call_log) if v == "wired_limit"), None)
+        self.assertIsNotNone(sync_pos, "mx.synchronize was not called")
+        self.assertIsNotNone(wl_pos, "wired_limit was not called")
+        self.assertLess(sync_pos, wl_pos, "sync must precede wired_limit")
+
+    def test_run_warmup_handles_interrupt_edges(self):
+        def partial_interrupt_step(gen):
+            def run_step(*args, **kwargs):
+                gen.requests.put("incoming-request")
+                kwargs["prompt_progress_callback"](1, 2)
+                return iter(())
+
+            return run_step
+
+        def zero_progress_step(_):
+            def run_step(*args, **kwargs):
+                kwargs["prompt_progress_callback"](0, 1)
+                return iter(())
+
+            return run_step
+
+        cases = (
+            {
+                "name": "partial interruption checkpoints work",
+                "prompt_cache": MockPromptCacheManager(["base-cache"], [7, 10]),
+                "prompts": ([1, 2, 3, 7, 10, 99], [1, 2, 3, 7, 10, 88]),
+                "generate_step": partial_interrupt_step,
+                "expected_tokens": [1, 2, 3, 7],
+            },
+            {
+                "name": "zero progress does not interrupt",
+                "prompt_cache": MockPromptCacheManager(["base-cache"], [7]),
+                "prompts": ([1, 2, 3, 7, 10], [1, 2, 3, 7, 20]),
+                "generate_step": zero_progress_step,
+                "queue_request": True,
+                "expected_tokens": [1, 2, 3, 7],
+                "expected_rest": [7],
+                "expected_cache": ["base-cache"],
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                gen = self._queue_warmup(case["prompt_cache"], case["prompts"])
+                if case.get("queue_request"):
+                    gen.requests.put("incoming-request")
+
+                with patch(
+                    "mlx_lm.server.generate_step",
+                    side_effect=case["generate_step"](gen),
+                ) as gs, patch(
+                    "mlx_lm.server.wired_limit", return_value=nullcontext()
+                ):
+                    self.assertTrue(gen._run_prompt_cache_warmup())
+
+                if case.get("expected_rest") is not None:
+                    self._assert_generate_step_call(
+                        gs,
+                        case["expected_rest"],
+                        case["expected_cache"],
+                    )
+                self.assertEqual(len(case["prompt_cache"].insert_calls), 1)
+                _, tokens, _, checkpoint = case["prompt_cache"].insert_calls[0]
+                self.assertEqual(tokens, case["expected_tokens"])
+                self.assertTrue(checkpoint)
+
+    def test_run_warmup_prefills_uncached_tokens(self):
+        cases = (
+            {
+                "name": "partial cache hit",
+                "prompt_cache": MockPromptCacheManager(["base-cache"], [7]),
+                "prompts": ([1, 2, 3, 7, 10], [1, 2, 3, 7, 20]),
+                "expected_rest": [7],
+                "expected_cache": ["base-cache"],
+                "expected_fetch": [1, 2, 3, 7],
+            },
+            {
+                "name": "cold start",
+                "prompt_cache": MockPromptCacheManager(None, [1, 2, 3]),
+                "prompts": ([1, 2, 3, 9], [1, 2, 3, 8]),
+                "expected_rest": [1, 2, 3],
+                "new_cache": object(),
+                "expected_fetch": [1, 2, 3],
+            },
+            {
+                "name": "exact cache hit",
+                "prompt_cache": MockPromptCacheManager(["exact-cache"], []),
+                "prompts": ([1, 2, 3, 9], [1, 2, 3, 8]),
+                "expected_fetch": [1, 2, 3],
+                "expects_prefill": False,
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                gen = self._queue_warmup(case["prompt_cache"], case["prompts"])
+                with patch(
+                    "mlx_lm.server.generate_step", return_value=iter(())
+                ) as gs, patch(
+                    "mlx_lm.server.wired_limit", return_value=nullcontext()
+                ) as wl, patch(
+                    "mlx_lm.server.make_prompt_cache",
+                    return_value=case.get("new_cache"),
+                ) as make_cache:
+                    gen._run_prompt_cache_warmup()
+
+                if not case.get("expects_prefill", True):
+                    gs.assert_not_called()
+                    wl.assert_not_called()
+                    make_cache.assert_not_called()
+                    self.assertEqual(case["prompt_cache"].insert_calls, [])
+                    continue
+
+                gs.assert_called_once()
+                wl.assert_called_once()
+                expected_cache = case.get("new_cache") or case["prompt_cache"].cache
+                self._assert_generate_step_call(gs, case["expected_rest"], expected_cache)
+                self.assertEqual(
+                    case["prompt_cache"].fetch_calls,
+                    [(self.MODEL_KEY, case["expected_fetch"])],
+                )
+                _, tokens, stored_cache, checkpoint = case["prompt_cache"].insert_calls[0]
+                self.assertEqual(tokens, case["expected_fetch"])
+                self.assertIs(stored_cache, expected_cache)
+                self.assertTrue(checkpoint)
+                if case["prompt_cache"].cache is None:
+                    make_cache.assert_called_once()
+                else:
+                    make_cache.assert_not_called()
+
+    def test_handle_completion_only_enqueues_for_text_reply(self):
+        cases = (
+            {
+                "name": "streaming reasoning reply",
+                "ctx": self._make_ctx(
+                    has_thinking=True,
+                    prompt=[9, 1],
+                ),
+                "responses": [
+                    self._make_response("A", 10),
+                    self._make_response("B", 11),
+                    self._make_response("</think>", 12),
+                    self._make_response("Hi", 13, "stop"),
+                ],
+                "stream": True,
+                "expected_message": {
+                    "content": "Hi",
+                    "reasoning": "AB",
+                    "reasoning_content": "AB",
+                },
+            },
+            {
+                "name": "tool call reply",
+                "ctx": self._make_ctx(
+                    has_tool_calling=True,
+                    tool_call_start="<tool>",
+                    tool_call_end="</tool>",
+                    tool_parser=lambda tool_text, tools: {
+                        "name": "noop",
+                        "arguments": {},
+                    },
+                ),
+                "responses": [
+                    self._make_response("<tool>", 10),
+                    self._make_response('{"name":"noop","arguments":{}}', 11),
+                    self._make_response("</tool>", 12, "tool_calls"),
+                ],
+                "stream": False,
+                "expected_message": None,
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                handler = self._make_handler(
+                    case["ctx"],
+                    case["responses"],
+                    stream=case["stream"],
+                )
+                handler.handle_completion(self._chat_request(), [])
+
+                if case["expected_message"] is None:
+                    handler.response_generator.enqueue_prompt_cache_warmup.assert_not_called()
+                else:
+                    handler.response_generator.enqueue_prompt_cache_warmup.assert_called_once()
+                    _, _, assistant_message = (
+                        handler.response_generator.enqueue_prompt_cache_warmup.call_args.args
+                    )
+                    self.assertEqual(assistant_message["content"], "Hi")
+                    self.assertEqual(
+                        assistant_message["reasoning"],
+                        case["expected_message"]["reasoning"],
+                    )
+                    self.assertEqual(
+                        assistant_message["reasoning_content"],
+                        case["expected_message"]["reasoning_content"],
+                    )
+
+    def test_process_message_content_handles_tool_arguments(self):
         cases = (
             ('{"a": 2, "b": 3}', {"a": 2, "b": 3}),  # string → parsed dict
             ("", ""),  # empty string → unchanged
@@ -297,131 +548,35 @@ class TestPromptCacheWarmup(unittest.TestCase):
 
         for arguments, expected in cases:
             with self.subTest(arguments=arguments):
-                tokenizer = SequencedTokenizer(([1], [2]))
-                messages = self._tool_messages(arguments)
+                messages = [
+                    {"role": "user", "content": "What is 2+3?"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "id": "123",
+                                "function": {
+                                    "name": "add",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "content": "5", "tool_call_id": "123"},
+                ]
 
-                self.assertEqual(
-                    gen._tokenize_chat(tokenizer, messages, None, None, None),
-                    [1],
-                )
+                process_message_content(messages)
                 self.assertEqual(
                     messages[1]["tool_calls"][0]["function"]["arguments"],
                     expected,
                 )
+                process_message_content(messages)
                 self.assertEqual(
-                    gen._tokenize_chat(tokenizer, messages, None, None, None),
-                    [2],
+                    messages[1]["tool_calls"][0]["function"]["arguments"],
+                    expected,
                 )
-
-    def test_enqueue_prompt_cache_warmup_stores_chat_reply(self):
-        gen = self._make_generator(None)
-        gen.enqueue_prompt_cache_warmup(
-            self._chat_request(),
-            self._make_gen_args(),
-            {"role": "assistant", "content": "Hi"},
-        )
-        self.assertIsNotNone(gen._prompt_cache_warmup)
-        self.assertEqual(len(gen._prompt_cache_warmup.messages), 2)
-
-    def test_run_warmup_prefills_on_partial_cache_hit(self):
-        prompt_cache = MockPromptCacheManager(["base-cache"], [7])
-        gen = self._make_generator(prompt_cache)
-        gen.model_provider.load = Mock(
-            return_value=(
-                gen.model_provider.model,
-                SequencedTokenizer(([1, 2, 3, 7, 10], [1, 2, 3, 7, 20])),
-            )
-        )
-        gen.enqueue_prompt_cache_warmup(
-            self._chat_request(),
-            self._make_gen_args(),
-            {"role": "assistant", "content": "Hi"},
-        )
-
-        with patch("mlx_lm.server.generate_step", return_value=iter(())) as gs:
-            self.assertTrue(gen._run_prompt_cache_warmup())
-
-        gs.assert_called_once()
-        self.assertEqual(prompt_cache.fetch_calls, [(self.MODEL_KEY, [1, 2, 3, 7])])
-        self.assertEqual(len(prompt_cache.insert_calls), 1)
-        _, tokens, _, checkpoint = prompt_cache.insert_calls[0]
-        self.assertEqual(tokens, [1, 2, 3, 7])
-        self.assertTrue(checkpoint)
-
-    def test_run_warmup_creates_cache_on_cold_start(self):
-        prompt_cache = MockPromptCacheManager(None, [1, 2, 3])
-        gen = self._make_generator(prompt_cache)
-        gen.model_provider.load = Mock(
-            return_value=(
-                gen.model_provider.model,
-                SequencedTokenizer(([1, 2, 3, 9], [1, 2, 3, 8])),
-            )
-        )
-        gen.enqueue_prompt_cache_warmup(
-            self._chat_request(),
-            self._make_gen_args(),
-            {"role": "assistant", "content": "Hi"},
-        )
-
-        new_cache = object()
-        with patch("mlx_lm.server.generate_step", return_value=iter(())) as gs:
-            with patch("mlx_lm.server.make_prompt_cache", return_value=new_cache):
-                gen._run_prompt_cache_warmup()
-
-        gs.assert_called_once()
-        _, call_kwargs = gs.call_args
-        self.assertIs(call_kwargs["prompt_cache"], new_cache)
-        _, _, stored_cache, checkpoint = prompt_cache.insert_calls[0]
-        self.assertIs(stored_cache, new_cache)
-        self.assertTrue(checkpoint)
-
-    def test_run_warmup_skips_generate_on_exact_cache_hit(self):
-        prompt_cache = MockPromptCacheManager(["exact-cache"], [])
-        gen = self._make_generator(prompt_cache)
-        gen.model_provider.load = Mock(
-            return_value=(
-                gen.model_provider.model,
-                SequencedTokenizer(([1, 2, 3, 9], [1, 2, 3, 8])),
-            )
-        )
-        gen.enqueue_prompt_cache_warmup(
-            self._chat_request(),
-            self._make_gen_args(),
-            {"role": "assistant", "content": "Hi"},
-        )
-
-        with patch("mlx_lm.server.generate_step", return_value=iter(())) as gs:
-            self.assertTrue(gen._run_prompt_cache_warmup())
-
-        gs.assert_not_called()
-        self.assertEqual(prompt_cache.insert_calls, [])
-
-    def test_handle_completion_enqueues_full_reasoning_for_streaming_reply(self):
-        request = self._chat_request()
-        ctx = self._make_ctx(
-            has_thinking=True,
-            prompt=[9, 1],
-        )
-        handler = self._make_handler(
-            ctx,
-            [
-                self._make_response("A", 10),
-                self._make_response("B", 11),
-                self._make_response(ctx.think_end, 12),
-                self._make_response("Hi", 13, "stop"),
-            ],
-            stream=True,
-        )
-
-        handler.handle_completion(request, [])
-
-        handler.response_generator.enqueue_prompt_cache_warmup.assert_called_once()
-        _, _, assistant_message = (
-            handler.response_generator.enqueue_prompt_cache_warmup.call_args.args
-        )
-        self.assertEqual(assistant_message["content"], "Hi")
-        self.assertEqual(assistant_message["reasoning"], "AB")
-        self.assertEqual(assistant_message["reasoning_content"], "AB")
 
 
 class TestServer(unittest.TestCase):

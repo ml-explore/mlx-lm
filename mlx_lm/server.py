@@ -35,7 +35,13 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, generate_step, generation_stream, stream_generate
+from .generate import (
+    BatchGenerator,
+    generate_step,
+    generation_stream,
+    stream_generate,
+    wired_limit,
+)
 from .models.cache import (
     can_trim_prompt_cache,
     make_prompt_cache,
@@ -438,6 +444,11 @@ class _PromptCacheWarmup:
     chat_template_kwargs: Optional[Dict[str, Any]]
 
 
+class _WarmupInterrupted(Exception):
+    def __init__(self, tokens_processed):
+        self.tokens_processed = tokens_processed
+
+
 @dataclass
 class GenerationContext:
     has_tool_calling: bool
@@ -775,15 +786,13 @@ class ResponseGenerator:
             return tokenizer.encode(request.prompt)
 
     def _build_prefill_request(self, tokenizer, warmup):
-        # Tokenize the conversation twice with different synthetic next-user
-        # messages and take the shared prefix as the cacheable portion.
-        def common_prefix(s1, s2):
-            n = 0
-            for a, b in zip(s1, s2):
-                if a != b:
-                    break
-                n += 1
-            return list(s1[:n])
+        # Tokenize the conversation twice with different next user messages and
+        # take the shared prefix. Actual messages used don't matter.
+        def shared_prefix(left, right):
+            for idx, (left_tok, right_tok) in enumerate(zip(left, right)):
+                if left_tok != right_tok:
+                    return list(left[:idx])
+            return list(left[: min(len(left), len(right))])
 
         probes = ("A", "B")
         prompts = []
@@ -800,7 +809,7 @@ class ResponseGenerator:
                 )
             )
 
-        prompt = common_prefix(*prompts)
+        prompt = shared_prefix(*prompts)
         if len(prompt) == 0:
             return None
         return prompt
@@ -808,6 +817,8 @@ class ResponseGenerator:
     def enqueue_prompt_cache_warmup(self, request, generation_args, assistant_message):
         if not self.cli_args.prompt_cache_warmup or request.request_type != "chat":
             return
+        # CLI startup already rejects a configured draft model, but requests can
+        # still ask for one explicitly via `draft_model`.
         if generation_args.model.draft not in (None, "default_model"):
             logging.debug("Skipping prompt cache warmup with draft model enabled.")
             return
@@ -838,6 +849,8 @@ class ResponseGenerator:
             logging.info(
                 f"Prompt cache warmup progress: {tokens_processed}/{total_tokens}"
             )
+            if tokens_processed > 0 and not self.requests.empty():
+                raise _WarmupInterrupted(tokens_processed)
 
         try:
             model, tokenizer = self.model_provider.load(
@@ -848,27 +861,50 @@ class ResponseGenerator:
             prompt = self._build_prefill_request(tokenizer, warmup)
             if prompt is not None:
                 self.prompt_cache.log_cache_stats()
-                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                cache, uncached = self.prompt_cache.fetch_nearest_cache(
                     self.model_provider.model_key, prompt
                 )
                 if cache is None:
                     cache = make_prompt_cache(model)
-                if len(rest) > 0:
-                    for _ in generate_step(
-                        mx.array(rest),
-                        model,
-                        max_tokens=0,
-                        prompt_cache=cache,
-                        prefill_step_size=self.cli_args.prefill_step_size,
-                        prompt_progress_callback=progress,
-                    ):
-                        pass
-                    self.prompt_cache.insert_cache(
-                        self.model_provider.model_key,
-                        prompt,
-                        cache,
-                        checkpoint=True,
-                    )
+                if len(uncached) > 0:
+                    # Flush outstanding work on the shared generation stream before
+                    # setting the wired limit for warm-up prefill.
+                    mx.synchronize(generation_stream)
+                    try:
+                        with wired_limit(model, [generation_stream]):
+                            for _ in generate_step(
+                                mx.array(uncached),
+                                model,
+                                max_tokens=0,
+                                prompt_cache=cache,
+                                prefill_step_size=self.cli_args.prefill_step_size,
+                                prompt_progress_callback=progress,
+                            ):
+                                pass
+                    except _WarmupInterrupted as e:
+                        # Checkpoint partial work so the next request (likely extending
+                        # this same conversation) can reuse it.
+                        # `tokens_processed` is reported against `uncached`, so extend the
+                        # cached prompt prefix by that many tokens.
+                        prefix_len = len(prompt) - len(uncached) + e.tokens_processed
+                        if prefix_len > 0:
+                            self.prompt_cache.insert_cache(
+                                self.model_provider.model_key,
+                                prompt[:prefix_len],
+                                cache,
+                                checkpoint=True,
+                            )
+                        logging.info(
+                            f"Prompt cache warmup interrupted at {e.tokens_processed}/{len(uncached)} tokens, "
+                            "partial cache checkpointed."
+                        )
+                    else:
+                        self.prompt_cache.insert_cache(
+                            self.model_provider.model_key,
+                            prompt,
+                            cache,
+                            checkpoint=True,
+                        )
         except Exception:
             logging.exception("Prompt cache warmup failed.")
         return True
@@ -987,7 +1023,7 @@ class ResponseGenerator:
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
-                        cache = make_prompt_cache(self.model_provider.model)
+                        cache = make_prompt_cache(batch_model)
 
                     do_checkpoint, checkpoint_position = (
                         self._compute_prompt_checkpoint(tokenizer, request, prompt)
@@ -1034,6 +1070,7 @@ class ResponseGenerator:
                         continue
 
                     current_model = args.model
+                    batch_model = model
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
                     batch_results = {}
@@ -1059,18 +1096,16 @@ class ResponseGenerator:
             # No request so serve from the current batch
             elif batch_generator is not None:
                 if len(batch_results) == 0:
-                    with self._prompt_cache_warmup_lock:
-                        warmup_pending = self._prompt_cache_warmup is not None
-                    should_close_batch = drain_batch or warmup_pending
-                    if should_close_batch:
+                    if drain_batch:
                         current_model = None
+                        batch_model = None
                         current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
                         batch_generator.close()
                         batch_generator = None
                         drain_batch = False
-                    continue
+                        continue
                 else:
                     uids_to_remove = []
                     for _ in self._time_budget:
@@ -1695,8 +1730,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 elif ctx.prompt[i] == ctx.think_start_id:
                     in_reasoning = True
                     break
-        reasoning_text = ""
-        full_reasoning = ""
+        reasoning_delta = ""
+        reasoning_full = ""
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
@@ -1718,8 +1753,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 if gen.text == ctx.think_end:
                     in_reasoning = False
                 else:
-                    reasoning_text += gen.text
-                    full_reasoning += gen.text
+                    reasoning_delta += gen.text
+                    reasoning_full += gen.text
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 made_tool_call = True
                 in_tool_call = True
@@ -1768,16 +1803,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
-                elif segment or tool_calls or reasoning_text:
+                elif segment or tool_calls or reasoning_delta:
                     response = self.generate_response(
                         segment,
                         None,
                         tool_calls=parse_tools(tool_calls),
-                        reasoning_text=reasoning_text,
+                        reasoning_text=reasoning_delta,
                     )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
-                    reasoning_text = ""
+                    reasoning_delta = ""
                     segment = ""
                     tool_calls = []
 
@@ -1793,10 +1828,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "role": "assistant",
                 "content": text or "",
             }
-            if full_reasoning:
+            if reasoning_full:
                 # Preserve both the response-facing and template-facing keys.
-                assistant_message["reasoning"] = full_reasoning
-                assistant_message["reasoning_content"] = full_reasoning
+                assistant_message["reasoning"] = reasoning_full
+                assistant_message["reasoning_content"] = reasoning_full
             self.response_generator.enqueue_prompt_cache_warmup(
                 request,
                 args,
@@ -1808,7 +1843,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 segment,
                 finish_reason,
                 tool_calls=parse_tools(tool_calls),
-                reasoning_text=reasoning_text,
+                reasoning_text=reasoning_delta,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
@@ -1832,7 +1867,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
-                reasoning_text=reasoning_text,
+                reasoning_text=reasoning_delta,
                 tool_calls=parse_tools(tool_calls),
             )
             response_json = json.dumps(response).encode()
