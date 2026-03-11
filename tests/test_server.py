@@ -168,6 +168,26 @@ class TestPromptCacheWarmup(unittest.TestCase):
             None,
         )
 
+    def _tool_messages(self, arguments):
+        return [
+            {"role": "user", "content": "What is 2+3?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "123",
+                        "function": {
+                            "name": "add",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "5", "tool_call_id": "123"},
+        ]
+
     def test_build_prefill_request_returns_common_prefix(self):
         gen = self._make_generator(None)
         warmup = _PromptCacheWarmup(
@@ -191,6 +211,43 @@ class TestPromptCacheWarmup(unittest.TestCase):
         )
         tokenizer = SequencedTokenizer(([1, 2], [3, 4]))
         self.assertIsNone(gen._build_prefill_request(tokenizer, warmup))
+
+    def test_build_prefill_request_accepts_dict_tool_arguments(self):
+        gen = self._make_generator(None)
+        warmup = _PromptCacheWarmup(
+            model=self.MODEL,
+            messages=self._tool_messages({"a": 2, "b": 3}),
+            tools=None,
+            role_mapping=None,
+            chat_template_kwargs={},
+        )
+        tokenizer = SequencedTokenizer(([10, 20, 30, 99], [10, 20, 30, 88]))
+        self.assertEqual(gen._build_prefill_request(tokenizer, warmup), [10, 20, 30])
+
+    def test_tokenize_chat_handles_tool_arguments(self):
+        gen = self._make_generator(None)
+        cases = (
+            ('{"a": 2, "b": 3}', {"a": 2, "b": 3}),
+            ("", ""),
+        )
+
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                tokenizer = SequencedTokenizer(([1], [2]))
+                messages = self._tool_messages(arguments)
+
+                self.assertEqual(
+                    gen._tokenize_chat(tokenizer, messages, None, None, None),
+                    [1],
+                )
+                self.assertEqual(
+                    messages[1]["tool_calls"][0]["function"]["arguments"],
+                    expected,
+                )
+                self.assertEqual(
+                    gen._tokenize_chat(tokenizer, messages, None, None, None),
+                    [2],
+                )
 
     def test_enqueue_stores_warmup(self):
         gen = self._make_generator(MockPromptCacheManager(None, []))
