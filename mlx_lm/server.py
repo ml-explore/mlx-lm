@@ -179,10 +179,8 @@ def process_message_content(messages):
         if tool_calls := message.get("tool_calls", False):
             for tool_call in tool_calls:
                 if func := tool_call.get("function", False):
-                    if isinstance(
-                        args := func.get("arguments", False),
-                        (str, bytes, bytearray),
-                    ) and args:
+                    args = func.get("arguments")
+                    if isinstance(args, (str, bytes, bytearray)) and args:
                         func["arguments"] = json.loads(args)
 
 
@@ -1698,7 +1696,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     in_reasoning = True
                     break
         reasoning_text = ""
-        warmup_reasoning = "" # Separate accumulator; reasoning_text resets during streaming
+        full_reasoning = ""
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
@@ -1721,7 +1719,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     in_reasoning = False
                 else:
                     reasoning_text += gen.text
-                    warmup_reasoning += gen.text
+                    full_reasoning += gen.text
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 made_tool_call = True
                 in_tool_call = True
@@ -1795,10 +1793,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "role": "assistant",
                 "content": text or "",
             }
-            if warmup_reasoning:
+            if full_reasoning:
                 # Preserve both the response-facing and template-facing keys.
-                assistant_message["reasoning"] = warmup_reasoning
-                assistant_message["reasoning_content"] = warmup_reasoning
+                assistant_message["reasoning"] = full_reasoning
+                assistant_message["reasoning_content"] = full_reasoning
             self.response_generator.enqueue_prompt_cache_warmup(
                 request,
                 args,
