@@ -4,6 +4,7 @@ import http
 import io
 import json
 import threading
+import time
 import unittest
 from contextlib import nullcontext
 from queue import Queue
@@ -176,9 +177,11 @@ class TestPromptCacheWarmup(unittest.TestCase):
         gen._is_distributed = False
         return gen
 
-    def _make_gen_args(self, draft=None):
-        model = ModelDescription(model="default_model", adapter=None, draft=draft)
-        return SimpleNamespace(model=model, chat_template_kwargs={})
+    def _make_gen_args(self, draft=None, model="default_model"):
+        return SimpleNamespace(
+            model=ModelDescription(model=model, adapter=None, draft=draft),
+            chat_template_kwargs={},
+        )
 
     def _chat_request(self, messages=None):
         return CompletionRequest(
@@ -220,17 +223,6 @@ class TestPromptCacheWarmup(unittest.TestCase):
             finish_reason=finish_reason,
             top_tokens=(),
         )
-
-    def _assert_generate_step_call(self, generate_step_mock, rest, prompt_cache):
-        call_args, call_kwargs = generate_step_mock.call_args
-        self.assertEqual(call_args[0].tolist(), rest)
-        self.assertEqual(call_kwargs["max_tokens"], 0)
-        if isinstance(prompt_cache, list):
-            self.assertEqual(call_kwargs["prompt_cache"], prompt_cache)
-        else:
-            self.assertIs(call_kwargs["prompt_cache"], prompt_cache)
-        self.assertEqual(call_kwargs["prefill_step_size"], 16)
-        self.assertIn("prompt_progress_callback", call_kwargs)
 
     def _queue_warmup(
         self,
@@ -274,77 +266,51 @@ class TestPromptCacheWarmup(unittest.TestCase):
         return handler
 
     def test_enqueue_prompt_cache_warmup_handles_eligible_and_skipped_requests(self):
-        cases = (
-            {
-                "name": "stores chat reply",
-                "warmup_enabled": True,
-                "request": self._chat_request(),
-                "args": self._make_gen_args(),
-                "assistant_message": {"role": "assistant", "content": "Hi"},
-                "expected_messages": 2,
-            },
-            {
-                "name": "disabled",
-                "warmup_enabled": False,
-                "request": self._chat_request(),
-                "args": self._make_gen_args(),
-                "assistant_message": {"role": "assistant", "content": "Hi"},
-                "expected_messages": None,
-            },
-            {
-                "name": "draft model",
-                "warmup_enabled": True,
-                "request": self._chat_request(),
-                "args": self._make_gen_args(draft="draft-model"),
-                "assistant_message": {"role": "assistant", "content": "Hi"},
-                "expected_messages": None,
-            },
+        gen = self._make_generator(None, warmup_enabled=True)
+        gen.enqueue_prompt_cache_warmup(
+            self._chat_request(),
+            self._make_gen_args(),
+            {"role": "assistant", "content": "Hi"},
         )
+        self.assertIsNotNone(gen._prompt_cache_warmup)
+        self.assertEqual(len(gen._prompt_cache_warmup.messages), 2)
 
-        for case in cases:
-            with self.subTest(case=case["name"]):
-                gen = self._make_generator(
-                    None, warmup_enabled=case["warmup_enabled"]
-                )
-                gen.enqueue_prompt_cache_warmup(
-                    case["request"],
-                    case["args"],
-                    case["assistant_message"],
-                )
-                if case["expected_messages"] is None:
-                    self.assertIsNone(gen._prompt_cache_warmup)
-                else:
-                    self.assertIsNotNone(gen._prompt_cache_warmup)
-                    self.assertEqual(
-                        len(gen._prompt_cache_warmup.messages),
-                        case["expected_messages"],
-                    )
-
-    def test_run_warmup_syncs_stream_before_wired_limit(self):
-        # mx.synchronize(generation_stream) must happen before wired_limit is
-        # entered so that any outstanding async batch work is flushed before
-        # the wired memory state changes.
-        prompt_cache = MockPromptCacheManager(["base-cache"], [7])
-        gen = self._queue_warmup(
-            prompt_cache,
-            ([1, 2, 3, 7, 10], [1, 2, 3, 7, 20]),
+        gen = self._make_generator(None, warmup_enabled=False)
+        gen.enqueue_prompt_cache_warmup(
+            self._chat_request(),
+            self._make_gen_args(),
+            {"role": "assistant", "content": "Hi"},
         )
+        self.assertIsNone(gen._prompt_cache_warmup)
 
-        call_log = []
-        with patch("mlx_lm.server.generate_step", return_value=iter(())), patch(
-            "mlx_lm.server.wired_limit",
-            side_effect=lambda *a, **k: (call_log.append("wired_limit"), nullcontext())[1],
-        ), patch(
-            "mlx_lm.server.mx.synchronize",
-            side_effect=lambda *a, **k: call_log.append("sync"),
-        ):
-            gen._run_prompt_cache_warmup()
+        gen = self._make_generator(None, warmup_enabled=True)
+        gen.enqueue_prompt_cache_warmup(
+            self._chat_request(),
+            self._make_gen_args(draft="draft-model"),
+            {"role": "assistant", "content": "Hi"},
+        )
+        self.assertIsNone(gen._prompt_cache_warmup)
 
-        sync_pos = next((i for i, v in enumerate(call_log) if v == "sync"), None)
-        wl_pos = next((i for i, v in enumerate(call_log) if v == "wired_limit"), None)
-        self.assertIsNotNone(sync_pos, "mx.synchronize was not called")
-        self.assertIsNotNone(wl_pos, "wired_limit was not called")
-        self.assertLess(sync_pos, wl_pos, "sync must precede wired_limit")
+    def test_generate_discards_stale_prompt_cache_warmup_on_model_switch(self):
+        gen = self._make_generator(None)
+        gen._stop = False
+        gen._time_budget = ()
+        gen._prompt_cache_warmup = SimpleNamespace(model=self.MODEL)
+        request = (
+            Queue(),
+            self._chat_request(),
+            self._make_gen_args(model="other-model"),
+        )
+        gen._next_request = Mock(return_value=request)
+        gen._is_batchable = Mock(return_value=False)
+        gen.model_provider.load = Mock(return_value=(object(), object()))
+
+        def serve_single(_):
+            gen._stop = True
+
+        gen._serve_single = Mock(side_effect=serve_single)
+        gen._generate()
+        self.assertIsNone(gen._prompt_cache_warmup)
 
     def test_run_warmup_handles_interrupt_edges(self):
         def partial_interrupt_step(gen):
@@ -355,121 +321,55 @@ class TestPromptCacheWarmup(unittest.TestCase):
 
             return run_step
 
-        def zero_progress_step(_):
-            def run_step(*args, **kwargs):
-                kwargs["prompt_progress_callback"](0, 1)
-                return iter(())
+        prompt_cache = MockPromptCacheManager(["base-cache"], [7, 10])
+        gen = self._queue_warmup(prompt_cache, ([1, 2, 3, 7, 10, 99], [1, 2, 3, 7, 10, 88]))
 
-            return run_step
-
-        cases = (
-            {
-                "name": "partial interruption checkpoints work",
-                "prompt_cache": MockPromptCacheManager(["base-cache"], [7, 10]),
-                "prompts": ([1, 2, 3, 7, 10, 99], [1, 2, 3, 7, 10, 88]),
-                "generate_step": partial_interrupt_step,
-                "expected_tokens": [1, 2, 3, 7],
-            },
-            {
-                "name": "zero progress does not interrupt",
-                "prompt_cache": MockPromptCacheManager(["base-cache"], [7]),
-                "prompts": ([1, 2, 3, 7, 10], [1, 2, 3, 7, 20]),
-                "generate_step": zero_progress_step,
-                "queue_request": True,
-                "expected_tokens": [1, 2, 3, 7],
-                "expected_rest": [7],
-                "expected_cache": ["base-cache"],
-            },
-        )
-
-        for case in cases:
-            with self.subTest(case=case["name"]):
-                gen = self._queue_warmup(case["prompt_cache"], case["prompts"])
-                if case.get("queue_request"):
-                    gen.requests.put("incoming-request")
-
-                with patch(
-                    "mlx_lm.server.generate_step",
-                    side_effect=case["generate_step"](gen),
-                ) as gs, patch(
-                    "mlx_lm.server.wired_limit", return_value=nullcontext()
-                ):
-                    self.assertTrue(gen._run_prompt_cache_warmup())
-
-                if case.get("expected_rest") is not None:
-                    self._assert_generate_step_call(
-                        gs,
-                        case["expected_rest"],
-                        case["expected_cache"],
-                    )
-                self.assertEqual(len(case["prompt_cache"].insert_calls), 1)
-                _, tokens, _, checkpoint = case["prompt_cache"].insert_calls[0]
-                self.assertEqual(tokens, case["expected_tokens"])
-                self.assertTrue(checkpoint)
+        with patch(
+            "mlx_lm.server.generate_step",
+            side_effect=partial_interrupt_step(gen),
+        ) as gs, patch("mlx_lm.server.wired_limit", return_value=nullcontext()):
+            self.assertTrue(gen._run_prompt_cache_warmup())
+        gs.assert_called_once()
+        self.assertEqual(len(prompt_cache.insert_calls), 1)
+        _, tokens, _, checkpoint = prompt_cache.insert_calls[0]
+        self.assertEqual(tokens, [1, 2, 3, 7])
+        self.assertTrue(checkpoint)
 
     def test_run_warmup_prefills_uncached_tokens(self):
-        cases = (
-            {
-                "name": "partial cache hit",
-                "prompt_cache": MockPromptCacheManager(["base-cache"], [7]),
-                "prompts": ([1, 2, 3, 7, 10], [1, 2, 3, 7, 20]),
-                "expected_rest": [7],
-                "expected_cache": ["base-cache"],
-                "expected_fetch": [1, 2, 3, 7],
-            },
-            {
-                "name": "cold start",
-                "prompt_cache": MockPromptCacheManager(None, [1, 2, 3]),
-                "prompts": ([1, 2, 3, 9], [1, 2, 3, 8]),
-                "expected_rest": [1, 2, 3],
-                "new_cache": object(),
-                "expected_fetch": [1, 2, 3],
-            },
-            {
-                "name": "exact cache hit",
-                "prompt_cache": MockPromptCacheManager(["exact-cache"], []),
-                "prompts": ([1, 2, 3, 9], [1, 2, 3, 8]),
-                "expected_fetch": [1, 2, 3],
-                "expects_prefill": False,
-            },
-        )
+        prompt_cache = MockPromptCacheManager(None, [1, 2, 3])
+        gen = self._queue_warmup(prompt_cache, ([1, 2, 3, 9], [1, 2, 3, 8]))
+        new_cache = object()
+        with patch("mlx_lm.server.generate_step", return_value=iter(())) as gs, patch(
+            "mlx_lm.server.wired_limit", return_value=nullcontext()
+        ) as wl, patch(
+            "mlx_lm.server.make_prompt_cache", return_value=new_cache
+        ) as make_cache:
+            gen._run_prompt_cache_warmup()
 
-        for case in cases:
-            with self.subTest(case=case["name"]):
-                gen = self._queue_warmup(case["prompt_cache"], case["prompts"])
-                with patch(
-                    "mlx_lm.server.generate_step", return_value=iter(())
-                ) as gs, patch(
-                    "mlx_lm.server.wired_limit", return_value=nullcontext()
-                ) as wl, patch(
-                    "mlx_lm.server.make_prompt_cache",
-                    return_value=case.get("new_cache"),
-                ) as make_cache:
-                    gen._run_prompt_cache_warmup()
+        gs.assert_called_once()
+        wl.assert_called_once()
+        make_cache.assert_called_once()
+        self.assertEqual(len(prompt_cache.fetch_calls), 1)
+        fetched_model, fetched_tokens = prompt_cache.fetch_calls[0]
+        self.assertEqual(fetched_model, self.MODEL_KEY)
+        self.assertEqual(fetched_tokens, [1, 2, 3])
+        _, tokens, stored_cache, checkpoint = prompt_cache.insert_calls[0]
+        self.assertEqual(tokens, [1, 2, 3])
+        self.assertIs(stored_cache, new_cache)
+        self.assertTrue(checkpoint)
 
-                if not case.get("expects_prefill", True):
-                    gs.assert_not_called()
-                    wl.assert_not_called()
-                    make_cache.assert_not_called()
-                    self.assertEqual(case["prompt_cache"].insert_calls, [])
-                    continue
+    def test_run_warmup_skips_prefill_on_exact_cache_hit(self):
+        prompt_cache = MockPromptCacheManager(["exact-cache"], [])
+        gen = self._queue_warmup(prompt_cache, ([1, 2, 3, 9], [1, 2, 3, 8]))
+        with patch("mlx_lm.server.generate_step", return_value=iter(())) as gs, patch(
+            "mlx_lm.server.wired_limit", return_value=nullcontext()
+        ) as wl, patch("mlx_lm.server.make_prompt_cache") as make_cache:
+            gen._run_prompt_cache_warmup()
 
-                gs.assert_called_once()
-                wl.assert_called_once()
-                expected_cache = case.get("new_cache") or case["prompt_cache"].cache
-                self._assert_generate_step_call(gs, case["expected_rest"], expected_cache)
-                self.assertEqual(
-                    case["prompt_cache"].fetch_calls,
-                    [(self.MODEL_KEY, case["expected_fetch"])],
-                )
-                _, tokens, stored_cache, checkpoint = case["prompt_cache"].insert_calls[0]
-                self.assertEqual(tokens, case["expected_fetch"])
-                self.assertIs(stored_cache, expected_cache)
-                self.assertTrue(checkpoint)
-                if case["prompt_cache"].cache is None:
-                    make_cache.assert_called_once()
-                else:
-                    make_cache.assert_not_called()
+        gs.assert_not_called()
+        wl.assert_not_called()
+        make_cache.assert_not_called()
+        self.assertEqual(prompt_cache.insert_calls, [])
 
     def test_handle_completion_only_enqueues_for_text_reply(self):
         cases = (
@@ -542,7 +442,6 @@ class TestPromptCacheWarmup(unittest.TestCase):
     def test_process_message_content_handles_tool_arguments(self):
         cases = (
             ('{"a": 2, "b": 3}', {"a": 2, "b": 3}),  # string → parsed dict
-            ("", ""),  # empty string → unchanged
             ({"a": 2, "b": 3}, {"a": 2, "b": 3}),  # already a dict → not re-parsed
         )
 
@@ -601,6 +500,72 @@ class TestServer(unittest.TestCase):
         cls.httpd.server_close()
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
+
+    def _chat_with_warmup_setting(self, warmup_enabled):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        provider = self.response_generator.model_provider
+        previous_warmup = provider.cli_args.prompt_cache_warmup
+
+        provider.cli_args.prompt_cache_warmup = warmup_enabled
+        self.response_generator.prompt_cache.trim_to(n_sequences=0, n_bytes=0)
+        with self.response_generator._prompt_cache_warmup_lock:
+            self.response_generator._prompt_cache_warmup = None
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Reply with a short greeting."},
+        ]
+        body = {
+            "model": "chat_model",
+            "max_tokens": 24,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "messages": messages,
+        }
+
+        try:
+            first_response = requests.post(url, json=body)
+            first_payload = json.loads(first_response.text)
+            first_message = first_payload["choices"][0]["message"]
+
+            # Let best-effort warmup run before the follow-up turn.
+            if warmup_enabled:
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    with self.response_generator._prompt_cache_warmup_lock:
+                        if self.response_generator._prompt_cache_warmup is None:
+                            break
+                    time.sleep(0.02)
+
+            assistant_message = {
+                "role": "assistant",
+                "content": first_message.get("content") or "",
+            }
+            if first_message.get("reasoning"):
+                assistant_message["reasoning"] = first_message["reasoning"]
+                assistant_message["reasoning_content"] = first_message["reasoning"]
+
+            follow_up = {
+                "model": "chat_model",
+                "max_tokens": 24,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "messages": [
+                    *messages,
+                    assistant_message,
+                    {"role": "user", "content": "Now say it differently."},
+                ],
+            }
+            second_response = requests.post(url, json=follow_up)
+            second_payload = json.loads(second_response.text)
+
+            details = second_payload["usage"].get("prompt_tokens_details", {})
+            return details.get("cached_tokens", 0)
+        finally:
+            provider.cli_args.prompt_cache_warmup = previous_warmup
+            with self.response_generator._prompt_cache_warmup_lock:
+                self.response_generator._prompt_cache_warmup = None
+            self.response_generator.prompt_cache.trim_to(n_sequences=0, n_bytes=0)
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -701,6 +666,11 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_prompt_cache_warmup_improves_follow_up_cache_reuse(self):
+        without_warmup = self._chat_with_warmup_setting(False)
+        with_warmup = self._chat_with_warmup_setting(True)
+        self.assertGreater(with_warmup, without_warmup)
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"

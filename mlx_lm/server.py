@@ -986,6 +986,11 @@ class ResponseGenerator:
             # We got a request
             if request is not None:
                 rqueue, request, args = request
+                if self.cli_args.prompt_cache_warmup:
+                    with self._prompt_cache_warmup_lock:
+                        warmup = self._prompt_cache_warmup
+                        if warmup is not None and warmup.model != args.model:
+                            self._prompt_cache_warmup = None
 
                 # Can it be added to the current batch?
                 if (
@@ -1161,13 +1166,17 @@ class ResponseGenerator:
                                 del batch_results[uid]
                     continue
 
-            # Prefer a newly arrived foreground request over best-effort warmup.
-            request = get_next_request(timeout=0)
-            if request is not None:
-                unprocessed_requests.append(request)
-                continue
+            if self.cli_args.prompt_cache_warmup:
+                with self._prompt_cache_warmup_lock:
+                    has_pending_warmup = self._prompt_cache_warmup is not None
+                if has_pending_warmup:
+                    # Prefer a newly arrived foreground request over best-effort warmup.
+                    request = get_next_request(timeout=0)
+                    if request is not None:
+                        unprocessed_requests.append(request)
+                        continue
 
-            self._run_prompt_cache_warmup()
+                    self._run_prompt_cache_warmup()
 
     def _serve_single(self, request):
         rqueue, request, args = request
