@@ -844,13 +844,6 @@ class ResponseGenerator:
                 return False
             self._prompt_cache_warmup = None
 
-        def progress(tokens_processed, total_tokens):
-            logging.info(
-                f"Prompt cache warmup progress: {tokens_processed}/{total_tokens}"
-            )
-            if tokens_processed > 0 and not self.requests.empty():
-                raise _WarmupInterrupted(tokens_processed)
-
         try:
             model, tokenizer = self.model_provider.load(
                 warmup.model.model,
@@ -863,6 +856,16 @@ class ResponseGenerator:
                 cache, uncached = self.prompt_cache.fetch_nearest_cache(
                     self.model_provider.model_key, prompt
                 )
+                cached_tokens = len(prompt) - len(uncached)
+
+                def progress(tokens_processed, total_tokens):
+                    logging.info(
+                        "Prompt cache warmup progress: "
+                        f"{cached_tokens + tokens_processed}/{cached_tokens + total_tokens}"
+                    )
+                    if tokens_processed > 0 and not self.requests.empty():
+                        raise _WarmupInterrupted(tokens_processed)
+
                 if cache is None:
                     cache = make_prompt_cache(model)
                 if len(uncached) > 0:
@@ -892,7 +895,8 @@ class ResponseGenerator:
                                 checkpoint=True,
                             )
                         logging.info(
-                            f"Prompt cache warmup interrupted at {e.tokens_processed}/{len(uncached)} tokens, "
+                            "Prompt cache warmup interrupted at "
+                            f"{cached_tokens + e.tokens_processed}/{len(prompt)} tokens, "
                             "partial cache checkpointed."
                         )
                     else:
