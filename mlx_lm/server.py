@@ -436,20 +436,6 @@ class CompletionRequest:
 
 
 @dataclass
-class _PromptCacheWarmup:
-    model: ModelDescription
-    messages: List[Any]
-    tools: Optional[List[Any]]
-    role_mapping: Optional[Dict[str, Any]]
-    chat_template_kwargs: Optional[Dict[str, Any]]
-
-
-class _WarmupInterrupted(Exception):
-    def __init__(self, tokens_processed):
-        self.tokens_processed = tokens_processed
-
-
-@dataclass
 class GenerationContext:
     has_tool_calling: bool
     tool_call_start: str
@@ -669,7 +655,20 @@ def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, A
     )
 
 
+class _WarmupInterrupted(Exception):
+    def __init__(self, tokens_processed):
+        self.tokens_processed = tokens_processed
+
+
 class ResponseGenerator:
+    @dataclass
+    class _Warmup:
+        model: ModelDescription
+        messages: List[Any]
+        tools: Optional[List[Any]]
+        role_mapping: Optional[Dict[str, Any]]
+        chat_template_kwargs: Optional[Dict[str, Any]]
+
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
@@ -828,7 +827,7 @@ class ResponseGenerator:
         messages = copy.deepcopy(request.messages)
         messages.append(assistant_message)
         with self._prompt_cache_warmup_lock:
-            self._prompt_cache_warmup = _PromptCacheWarmup(
+            self._prompt_cache_warmup = self._Warmup(
                 model=generation_args.model,
                 messages=messages,
                 tools=copy.deepcopy(request.tools),
@@ -841,9 +840,9 @@ class ResponseGenerator:
     def _run_prompt_cache_warmup(self):
         with self._prompt_cache_warmup_lock:
             warmup = self._prompt_cache_warmup
+            if warmup is None:
+                return False
             self._prompt_cache_warmup = None
-        if warmup is None:
-            return False
 
         def progress(tokens_processed, total_tokens):
             logging.info(
@@ -882,10 +881,8 @@ class ResponseGenerator:
                             ):
                                 pass
                     except _WarmupInterrupted as e:
-                        # Checkpoint partial work so the next request (likely extending
-                        # this same conversation) can reuse it.
-                        # `tokens_processed` is reported against `uncached`, so extend the
-                        # cached prompt prefix by that many tokens.
+                        # Save whatever we prefilled so far. The offset
+                        # accounts for tokens already in the cache.
                         prefix_len = len(prompt) - len(uncached) + e.tokens_processed
                         if prefix_len > 0:
                             self.prompt_cache.insert_cache(
@@ -1110,73 +1107,61 @@ class ResponseGenerator:
                         batch_generator.close()
                         batch_generator = None
                         drain_batch = False
-                        continue
-                else:
-                    uids_to_remove = []
-                    for _ in self._time_budget:
-                        responses = batch_generator.next()
-                        if not responses:
-                            break
-
-                        for r in responses:
-                            result = batch_results[r.uid]
-                            result["cache_key"].append(r.token)
-                            if r.finish_reason != "stop":
-                                result["detokenizer"].add_token(r.token)
-
-                            result["rqueue"].put(
-                                Response(
-                                    result["detokenizer"].last_segment,
-                                    r.token,
-                                    r.logprobs[r.token].item(),
-                                    r.finish_reason,
-                                    _format_top_logprobs(
-                                        r.logprobs, args.top_logprobs, current_tokenizer
-                                    ),
-                                ),
-                            )
-
-                            if r.finish_reason is not None:
-                                result["rqueue"].put(None)
-                                self.prompt_cache.insert_cache(
-                                    current_model_key,
-                                    result["cache_key"],
-                                    r.prompt_cache,
-                                )
-                                del batch_results[r.uid]
-
-                            if result["ctx"]._should_stop:
-                                uids_to_remove.append(r.uid)
-
-                    uids_to_remove = self._share_object(uids_to_remove)
-                    if uids_to_remove:
-                        with mx.stream(generation_stream):
-                            caches = batch_generator.remove(
-                                uids_to_remove, return_prompt_caches=True
-                            )
-                            for uid, prompt_cache in caches.items():
-                                if uid not in batch_results:
-                                    continue
-                                result = batch_results[uid]
-                                self.prompt_cache.insert_cache(
-                                    current_model_key,
-                                    result["cache_key"],
-                                    prompt_cache,
-                                )
-                                del batch_results[uid]
+                    else:
+                        self._run_prompt_cache_warmup()
                     continue
 
-            if self.cli_args.prompt_cache_warmup:
-                with self._prompt_cache_warmup_lock:
-                    has_pending_warmup = self._prompt_cache_warmup is not None
-                if has_pending_warmup:
-                    # Prefer a newly arrived foreground request over best-effort warmup.
-                    request = get_next_request(timeout=0)
-                    if request is not None:
-                        unprocessed_requests.append(request)
-                        continue
+                uids_to_remove = []
+                for _ in self._time_budget:
+                    responses = batch_generator.next()
+                    if not responses:
+                        break
 
-                    self._run_prompt_cache_warmup()
+                    for r in responses:
+                        result = batch_results[r.uid]
+                        result["cache_key"].append(r.token)
+                        if r.finish_reason != "stop":
+                            result["detokenizer"].add_token(r.token)
+
+                        result["rqueue"].put(
+                            Response(
+                                result["detokenizer"].last_segment,
+                                r.token,
+                                r.logprobs[r.token].item(),
+                                r.finish_reason,
+                                _format_top_logprobs(
+                                    r.logprobs, args.top_logprobs, current_tokenizer
+                                ),
+                            )
+                        )
+
+                        if r.finish_reason is not None:
+                            result["rqueue"].put(None)
+                            self.prompt_cache.insert_cache(
+                                current_model_key, result["cache_key"], r.prompt_cache
+                            )
+                            del batch_results[r.uid]
+
+                        if result["ctx"]._should_stop:
+                            uids_to_remove.append(r.uid)
+
+                uids_to_remove = self._share_object(uids_to_remove)
+                if uids_to_remove:
+                    with mx.stream(generation_stream):
+                        caches = batch_generator.remove(
+                            uids_to_remove, return_prompt_caches=True
+                        )
+                        for uid, prompt_cache in caches.items():
+                            if uid not in batch_results:
+                                continue
+                            result = batch_results[uid]
+                            self.prompt_cache.insert_cache(
+                                current_model_key, result["cache_key"], prompt_cache
+                            )
+                            del batch_results[uid]
+
+            else:
+                self._run_prompt_cache_warmup()
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -1739,8 +1724,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 elif ctx.prompt[i] == ctx.think_start_id:
                     in_reasoning = True
                     break
-        reasoning_delta = ""
-        reasoning_full = ""
+        reasoning_text = ""
+        reasoning_full = ""  # accumulated across stream chunks for warmup
 
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
@@ -1762,7 +1747,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if gen.text == ctx.think_end:
                     in_reasoning = False
                 else:
-                    reasoning_delta += gen.text
+                    reasoning_text += gen.text
                     reasoning_full += gen.text
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 made_tool_call = True
@@ -1812,16 +1797,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
-                elif segment or tool_calls or reasoning_delta:
+                elif segment or tool_calls or reasoning_text:
                     response = self.generate_response(
                         segment,
                         None,
                         tool_calls=parse_tools(tool_calls),
-                        reasoning_text=reasoning_delta,
+                        reasoning_text=reasoning_text,
                     )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
-                    reasoning_delta = ""
+                    reasoning_text = ""
                     segment = ""
                     tool_calls = []
 
@@ -1852,7 +1837,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 segment,
                 finish_reason,
                 tool_calls=parse_tools(tool_calls),
-                reasoning_text=reasoning_delta,
+                reasoning_text=reasoning_text,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
@@ -1876,7 +1861,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
-                reasoning_text=reasoning_delta,
+                reasoning_text=reasoning_text,
                 tool_calls=parse_tools(tool_calls),
             )
             response_json = json.dumps(response).encode()

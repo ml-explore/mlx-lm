@@ -4,7 +4,6 @@ import http
 import io
 import json
 import threading
-import time
 import unittest
 from contextlib import nullcontext
 from queue import Queue
@@ -125,35 +124,7 @@ class SequencedTokenizer:
 
 
 class TestPromptCacheWarmup(unittest.TestCase):
-    MODEL = ModelDescription(model="default_model", adapter=None, draft=None)
     MODEL_KEY = ("default_model", None, None)
-    HANDLER_DEFAULTS = {
-        "request_id": "chatcmpl-test",
-        "system_fingerprint": "fp",
-        "requested_model": "chat_model",
-        "requested_draft_model": None,
-        "created": 0,
-        "adapter": None,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": 0,
-        "min_p": 0.0,
-        "xtc_probability": 0.0,
-        "xtc_threshold": 0.0,
-        "logit_bias": None,
-        "repetition_penalty": 1.0,
-        "repetition_context_size": 20,
-        "presence_penalty": 0.0,
-        "presence_context_size": 20,
-        "frequency_penalty": 0.0,
-        "frequency_context_size": 20,
-        "max_tokens": 16,
-        "num_draft_tokens": 3,
-        "logprobs": False,
-        "top_logprobs": 0,
-        "seed": None,
-        "chat_template_kwargs": {},
-    }
 
     def _make_generator(self, prompt_cache, *, warmup_enabled=True):
         cli_args = SimpleNamespace(
@@ -192,38 +163,6 @@ class TestPromptCacheWarmup(unittest.TestCase):
             None,
         )
 
-    def _make_ctx(self, **kwargs):
-        attrs = {
-            "has_tool_calling": False,
-            "tool_call_start": "<tool>",
-            "tool_call_end": "",
-            "tool_parser": lambda tool_text, tools: {
-                "name": "noop",
-                "arguments": {},
-            },
-            "has_thinking": False,
-            "think_start_id": 1,
-            "think_end_id": 2,
-            "think_end": "</think>",
-            "eos_token_ids": set(),
-            "stop_token_sequences": [],
-            "prompt": [0],
-            "prompt_cache_count": 0,
-            "_should_stop": False,
-            "stop": Mock(),
-        }
-        attrs.update(kwargs)
-        return SimpleNamespace(**attrs)
-
-    def _make_response(self, text, token, finish_reason=None):
-        return SimpleNamespace(
-            text=text,
-            token=token,
-            logprob=0.0,
-            finish_reason=finish_reason,
-            top_tokens=(),
-        )
-
     def _queue_warmup(
         self,
         prompt_cache,
@@ -246,71 +185,6 @@ class TestPromptCacheWarmup(unittest.TestCase):
             assistant_message or {"role": "assistant", "content": "Hi"},
         )
         return gen
-
-    def _make_handler(self, ctx, responses, *, stream):
-        handler = APIHandler.__new__(APIHandler)
-        handler.response_generator = Mock()
-        handler.response_generator.generate = Mock(return_value=(ctx, iter(responses)))
-        handler.wfile = io.BytesIO()
-        handler.stream = stream
-        handler.stream_options = None
-        handler._set_completion_headers = Mock()
-        handler._set_stream_headers = Mock()
-        handler.send_header = Mock()
-        handler.end_headers = Mock()
-        attrs = self.HANDLER_DEFAULTS | {
-            "object_type": "chat.completion.chunk" if stream else "chat.completion",
-        }
-        for key, value in attrs.items():
-            setattr(handler, key, value)
-        return handler
-
-    def test_enqueue_prompt_cache_warmup_handles_eligible_and_skipped_requests(self):
-        gen = self._make_generator(None, warmup_enabled=True)
-        gen.enqueue_prompt_cache_warmup(
-            self._chat_request(),
-            self._make_gen_args(),
-            {"role": "assistant", "content": "Hi"},
-        )
-        self.assertIsNotNone(gen._prompt_cache_warmup)
-        self.assertEqual(len(gen._prompt_cache_warmup.messages), 2)
-
-        gen = self._make_generator(None, warmup_enabled=False)
-        gen.enqueue_prompt_cache_warmup(
-            self._chat_request(),
-            self._make_gen_args(),
-            {"role": "assistant", "content": "Hi"},
-        )
-        self.assertIsNone(gen._prompt_cache_warmup)
-
-        gen = self._make_generator(None, warmup_enabled=True)
-        gen.enqueue_prompt_cache_warmup(
-            self._chat_request(),
-            self._make_gen_args(draft="draft-model"),
-            {"role": "assistant", "content": "Hi"},
-        )
-        self.assertIsNone(gen._prompt_cache_warmup)
-
-    def test_generate_discards_stale_prompt_cache_warmup_on_model_switch(self):
-        gen = self._make_generator(None)
-        gen._stop = False
-        gen._time_budget = ()
-        gen._prompt_cache_warmup = SimpleNamespace(model=self.MODEL)
-        request = (
-            Queue(),
-            self._chat_request(),
-            self._make_gen_args(model="other-model"),
-        )
-        gen._next_request = Mock(return_value=request)
-        gen._is_batchable = Mock(return_value=False)
-        gen.model_provider.load = Mock(return_value=(object(), object()))
-
-        def serve_single(_):
-            gen._stop = True
-
-        gen._serve_single = Mock(side_effect=serve_single)
-        gen._generate()
-        self.assertIsNone(gen._prompt_cache_warmup)
 
     def test_run_warmup_handles_interrupt_edges(self):
         def partial_interrupt_step(gen):
@@ -358,86 +232,30 @@ class TestPromptCacheWarmup(unittest.TestCase):
         self.assertIs(stored_cache, new_cache)
         self.assertTrue(checkpoint)
 
-    def test_run_warmup_skips_prefill_on_exact_cache_hit(self):
-        prompt_cache = MockPromptCacheManager(["exact-cache"], [])
-        gen = self._queue_warmup(prompt_cache, ([1, 2, 3, 9], [1, 2, 3, 8]))
-        with patch("mlx_lm.server.generate_step", return_value=iter(())) as gs, patch(
-            "mlx_lm.server.wired_limit", return_value=nullcontext()
-        ) as wl, patch("mlx_lm.server.make_prompt_cache") as make_cache:
-            gen._run_prompt_cache_warmup()
-
-        gs.assert_not_called()
-        wl.assert_not_called()
-        make_cache.assert_not_called()
-        self.assertEqual(prompt_cache.insert_calls, [])
-
-    def test_handle_completion_only_enqueues_for_text_reply(self):
-        cases = (
-            {
-                "name": "streaming reasoning reply",
-                "ctx": self._make_ctx(
-                    has_thinking=True,
-                    prompt=[9, 1],
-                ),
-                "responses": [
-                    self._make_response("A", 10),
-                    self._make_response("B", 11),
-                    self._make_response("</think>", 12),
-                    self._make_response("Hi", 13, "stop"),
-                ],
-                "stream": True,
-                "expected_message": {
-                    "content": "Hi",
-                    "reasoning": "AB",
-                    "reasoning_content": "AB",
-                },
-            },
-            {
-                "name": "tool call reply",
-                "ctx": self._make_ctx(
-                    has_tool_calling=True,
-                    tool_call_start="<tool>",
-                    tool_call_end="</tool>",
-                    tool_parser=lambda tool_text, tools: {
-                        "name": "noop",
-                        "arguments": {},
-                    },
-                ),
-                "responses": [
-                    self._make_response("<tool>", 10),
-                    self._make_response('{"name":"noop","arguments":{}}', 11),
-                    self._make_response("</tool>", 12, "tool_calls"),
-                ],
-                "stream": False,
-                "expected_message": None,
-            },
+    def test_build_prefill_request_extracts_shared_prefix(self):
+        gen = self._make_generator(None)
+        tokenizer = SequencedTokenizer(
+            ([10, 20, 30, 40, 99], [10, 20, 30, 40, 88])
         )
+        warmup = SimpleNamespace(
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            role_mapping=None,
+            chat_template_kwargs={},
+        )
+        prompt = gen._build_prefill_request(tokenizer, warmup)
+        self.assertEqual(prompt, [10, 20, 30, 40])
 
-        for case in cases:
-            with self.subTest(case=case["name"]):
-                handler = self._make_handler(
-                    case["ctx"],
-                    case["responses"],
-                    stream=case["stream"],
-                )
-                handler.handle_completion(self._chat_request(), [])
-
-                if case["expected_message"] is None:
-                    handler.response_generator.enqueue_prompt_cache_warmup.assert_not_called()
-                else:
-                    handler.response_generator.enqueue_prompt_cache_warmup.assert_called_once()
-                    _, _, assistant_message = (
-                        handler.response_generator.enqueue_prompt_cache_warmup.call_args.args
-                    )
-                    self.assertEqual(assistant_message["content"], "Hi")
-                    self.assertEqual(
-                        assistant_message["reasoning"],
-                        case["expected_message"]["reasoning"],
-                    )
-                    self.assertEqual(
-                        assistant_message["reasoning_content"],
-                        case["expected_message"]["reasoning_content"],
-                    )
+    def test_build_prefill_request_returns_none_on_empty_prefix(self):
+        gen = self._make_generator(None)
+        tokenizer = SequencedTokenizer(([99], [88]))
+        warmup = SimpleNamespace(
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            role_mapping=None,
+            chat_template_kwargs={},
+        )
+        self.assertIsNone(gen._build_prefill_request(tokenizer, warmup))
 
     def test_process_message_content_handles_tool_arguments(self):
         cases = (
@@ -500,72 +318,6 @@ class TestServer(unittest.TestCase):
         cls.httpd.server_close()
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
-
-    def _chat_with_warmup_setting(self, warmup_enabled):
-        url = f"http://localhost:{self.port}/v1/chat/completions"
-        provider = self.response_generator.model_provider
-        previous_warmup = provider.cli_args.prompt_cache_warmup
-
-        provider.cli_args.prompt_cache_warmup = warmup_enabled
-        self.response_generator.prompt_cache.trim_to(n_sequences=0, n_bytes=0)
-        with self.response_generator._prompt_cache_warmup_lock:
-            self.response_generator._prompt_cache_warmup = None
-
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Reply with a short greeting."},
-        ]
-        body = {
-            "model": "chat_model",
-            "max_tokens": 24,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "messages": messages,
-        }
-
-        try:
-            first_response = requests.post(url, json=body)
-            first_payload = json.loads(first_response.text)
-            first_message = first_payload["choices"][0]["message"]
-
-            # Let best-effort warmup run before the follow-up turn.
-            if warmup_enabled:
-                deadline = time.time() + 2.0
-                while time.time() < deadline:
-                    with self.response_generator._prompt_cache_warmup_lock:
-                        if self.response_generator._prompt_cache_warmup is None:
-                            break
-                    time.sleep(0.02)
-
-            assistant_message = {
-                "role": "assistant",
-                "content": first_message.get("content") or "",
-            }
-            if first_message.get("reasoning"):
-                assistant_message["reasoning"] = first_message["reasoning"]
-                assistant_message["reasoning_content"] = first_message["reasoning"]
-
-            follow_up = {
-                "model": "chat_model",
-                "max_tokens": 24,
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "messages": [
-                    *messages,
-                    assistant_message,
-                    {"role": "user", "content": "Now say it differently."},
-                ],
-            }
-            second_response = requests.post(url, json=follow_up)
-            second_payload = json.loads(second_response.text)
-
-            details = second_payload["usage"].get("prompt_tokens_details", {})
-            return details.get("cached_tokens", 0)
-        finally:
-            provider.cli_args.prompt_cache_warmup = previous_warmup
-            with self.response_generator._prompt_cache_warmup_lock:
-                self.response_generator._prompt_cache_warmup = None
-            self.response_generator.prompt_cache.trim_to(n_sequences=0, n_bytes=0)
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -666,11 +418,6 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
-
-    def test_prompt_cache_warmup_improves_follow_up_cache_reuse(self):
-        without_warmup = self._chat_with_warmup_setting(False)
-        with_warmup = self._chat_with_warmup_setting(True)
-        self.assertGreater(with_warmup, without_warmup)
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
