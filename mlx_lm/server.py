@@ -1131,7 +1131,13 @@ class APIHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def _set_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed_origins = self.response_generator.cli_args.allowed_origins
+        origin = self.headers.get("Origin")
+        if "*" in allowed_origins:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin in allowed_origins:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
 
@@ -1879,6 +1885,12 @@ def main():
         help="Port for the HTTP server (default: 8080)",
     )
     parser.add_argument(
+        "--allowed-origins",
+        type=str,
+        default="*",
+        help="Allowed origins (default: *)",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -1985,6 +1997,7 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    args.allowed_origins = [o.strip() for o in args.allowed_origins.split(",")]
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
