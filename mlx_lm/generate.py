@@ -677,10 +677,11 @@ def mtp_generate_step(
         model_cache = cache.make_prompt_cache(model)
         mtp_cache = model.make_mtp_cache()
     else:
-        # When a pre-built cache is provided, split at backbone length
+        # Split a pre-built cache at backbone length.  If MTP entries are
+        # absent (e.g. cache created by make_prompt_cache), create them.
         n_main = len(model.layers)
         model_cache = prompt_cache[:n_main]
-        mtp_cache = prompt_cache[n_main:]
+        mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -756,7 +757,7 @@ def mtp_generate_step(
                 main_lp = lps[0]
 
                 ntoks += 1
-                yield main_tok, main_lp, False
+                yield main_tok.item(), main_lp, False
                 if ntoks >= max_tokens:
                     break
 
@@ -785,12 +786,12 @@ def mtp_generate_step(
                             c.rollback_state = None
 
                     ntoks += 1
-                    yield draft_tok, draft_lp, True
+                    yield draft_tok.item(), draft_lp, True
                     if ntoks >= max_tokens:
                         break
 
                     ntoks += 1
-                    yield bonus_tok, bonus_lp, False
+                    yield bonus_tok.item(), bonus_lp, False
                     if ntoks >= max_tokens:
                         break
 
@@ -814,7 +815,7 @@ def mtp_generate_step(
                     cache.trim_prompt_cache(mtp_cache, 1)
 
                     ntoks += 1
-                    yield verify_pred, verify_lp, False
+                    yield verify_pred.item(), verify_lp, False
                     if ntoks >= max_tokens:
                         break
 
