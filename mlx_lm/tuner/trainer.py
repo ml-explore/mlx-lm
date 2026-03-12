@@ -194,9 +194,12 @@ def evaluate(
         all_losses += losses * toks
         ntokens += toks
         mx.eval(all_losses, ntokens)
+        mx.clear_cache()
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+    mx.eval(all_losses, ntokens)
+    mx.clear_cache()
 
     return (all_losses / ntokens).item()
 
@@ -312,6 +315,7 @@ def train(
         n_tokens += toks
         steps += 1
         mx.eval(state, losses, n_tokens, grad_accum)
+        mx.clear_cache()
         train_time += time.perf_counter() - tic
 
         # Report training loss if needed
