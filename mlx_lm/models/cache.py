@@ -598,6 +598,9 @@ class ArraysCache(_BaseCache):
         self.cache = [None] * size
         self.left_padding = mx.array(left_padding) if left_padding else None
         self.lengths = None
+        # Snapshot of (conv_state, ssm_state) saved after processing confirmed tokens
+        # in an MTP draft-verification step. Cleared after each step.
+        self.rollback_state = None
 
     @property
     def batch_size(self):
