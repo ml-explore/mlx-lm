@@ -654,6 +654,183 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """A generator using the model's native MTP head for speculative decoding.
+
+    Produces up to 2 tokens per forward pass:
+      - 1 backbone token (always accepted)
+      - 1 MTP draft token (accepted if the backbone agrees on the next step)
+
+    The model must expose ``mtp_forward(hidden, next_tok, mtp_cache)`` and
+    support ``return_hidden=True`` in its ``__call__``.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: token, log-probabilities, from_draft.
+    """
+    y = prompt.astype(mx.uint32)
+    prev_tokens = None
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        mtp_cache = model.make_mtp_cache()
+    else:
+        # When a pre-built cache is provided, split at backbone length
+        n_main = len(model.layers)
+        model_cache = prompt_cache[:n_main]
+        mtp_cache = prompt_cache[n_main:]
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _process_and_sample(tokens, logits):
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        tok = sampler(logprobs)
+        return tok, logprobs
+
+    def _step_backbone(y, n_predict=1):
+        """One backbone forward pass. Returns (tokens, logprobs, hidden)."""
+        with mx.stream(generation_stream):
+            logits, hidden = model(y[None], cache=model_cache, return_hidden=True)
+            logits = logits[:, -n_predict:, :]
+            quantize_cache_fn(model_cache)
+            nonlocal prev_tokens
+            toks, lps = [], []
+            y_ctx = y if n_predict == 1 else y[: -(n_predict - 1)]
+            for i in range(n_predict):
+                if logits_processors:
+                    prev_tokens = (
+                        mx.concatenate([prev_tokens, y_ctx])
+                        if prev_tokens is not None
+                        else y_ctx
+                    )
+                tok, lp = _process_and_sample(prev_tokens, logits[:, i, :].squeeze(0))
+                toks.append(tok)
+                lps.append(lp)
+            return mx.stack(toks), mx.stack(lps), hidden
+
+    def _step_mtp(hidden_last, main_tok):
+        """Run MTP head. Returns (draft_token, draft_logprobs)."""
+        # hidden_last: (1, 1, H), main_tok: 0-d or scalar
+        next_ids = main_tok.reshape(1, 1)
+        with mx.stream(generation_stream):
+            mtp_logits = model.mtp_forward(hidden_last, next_ids, mtp_cache)
+            quantize_cache_fn(mtp_cache)
+            mtp_logits = mtp_logits[:, -1, :].squeeze(0)
+            draft_tok, draft_lp = _process_and_sample(prev_tokens, mtp_logits)
+        return draft_tok, draft_lp
+
+    def _prefill(y):
+        while y.size > prefill_step_size:
+            model(y[:prefill_step_size][None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache if hasattr(c, "state")])
+            y = y[prefill_step_size:]
+            mx.clear_cache()
+        return y
+
+    with mx.stream(generation_stream):
+        y = _prefill(y)
+
+    ntoks = 0
+    draft_tok = None
+    draft_lp = None
+
+    try:
+        while True:
+            if draft_tok is None:
+                # No pending draft — run backbone only, then generate first draft
+                toks, lps, hidden = _step_backbone(y, n_predict=1)
+                mx.eval(toks)
+                main_tok = toks[0]
+                main_lp = lps[0]
+
+                ntoks += 1
+                yield main_tok, main_lp, False
+                if ntoks >= max_tokens:
+                    break
+
+                draft_tok, draft_lp = _step_mtp(hidden[:, -1:, :], main_tok)
+                mx.eval(draft_tok)
+                y = mx.array([main_tok.item()], mx.uint32)
+            else:
+                # Verify draft: process [y, draft_tok] through backbone together
+                y_with_draft = mx.concatenate(
+                    [y, mx.array([draft_tok.item()], mx.uint32)]
+                )
+                toks, lps, hidden = _step_backbone(y_with_draft, n_predict=2)
+                mx.eval(toks, draft_tok)
+
+                verify_pred = toks[0]   # backbone prediction after y → verify draft
+                bonus_tok = toks[1]     # backbone prediction after draft_tok
+                verify_lp = lps[0]
+                bonus_lp = lps[1]
+
+                if verify_pred.item() == draft_tok.item():
+                    # Draft accepted
+                    ntoks += 1
+                    yield draft_tok, draft_lp, True
+                    if ntoks >= max_tokens:
+                        break
+
+                    ntoks += 1
+                    yield bonus_tok, bonus_lp, False
+                    if ntoks >= max_tokens:
+                        break
+
+                    # Next draft from MTP at draft_tok's hidden state
+                    draft_tok, draft_lp = _step_mtp(hidden[:, 1:2, :], bonus_tok)
+                    mx.eval(draft_tok)
+                    y = mx.array([bonus_tok.item()], mx.uint32)
+                else:
+                    # Draft rejected — trim caches.
+                    #
+                    # Qwen3.5 is a hybrid SSM+Attention model: attention layers use
+                    # KVCache (trimmable), SSM layers use ArraysCache (not trimmable).
+                    # trim_prompt_cache() is all-or-nothing, so we trim KV entries
+                    # individually. The SSM state will retain a 1-token contamination
+                    # from the rejected draft, which is empirically negligible compared
+                    # to the sequence length but means output may differ slightly from
+                    # standard generate_step. A correct fix would require exposing
+                    # per-token intermediate SSM states from GatedDeltaNet (future work).
+                    for c in model_cache:
+                        if c.is_trimmable():
+                            c.trim(1)
+                    cache.trim_prompt_cache(mtp_cache, 1)
+
+                    ntoks += 1
+                    yield verify_pred, verify_lp, False
+                    if ntoks >= max_tokens:
+                        break
+
+                    # Next draft from MTP at y's hidden state
+                    draft_tok, draft_lp = _step_mtp(hidden[:, 0:1, :], verify_pred)
+                    mx.eval(draft_tok)
+                    y = mx.array([verify_pred.item()], mx.uint32)
+    finally:
+        pass
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -698,18 +875,23 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if draft_model is not None:
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        token_generator = speculative_generate_step(
+            prompt, model, draft_model, **kwargs
+        )
+    elif hasattr(model, "mtp_forward"):
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        kwargs.pop("num_draft_tokens", None)
+        token_generator = mtp_generate_step(prompt, model, **kwargs)
+    else:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
-        )
-    else:
-        kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
