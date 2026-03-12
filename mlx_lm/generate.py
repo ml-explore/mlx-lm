@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 import functools
+import warnings
 import json
 import sys
 import time
@@ -902,6 +903,17 @@ def stream_generate(
         kwargs.pop("prompt_progress_callback", None)
         kwargs.pop("num_draft_tokens", None)
         token_generator = mtp_generate_step(prompt, model, **kwargs)
+    elif mtp:
+        warnings.warn(
+            "--mtp flag ignored: model does not have an MTP head. "
+            "Falling back to standard generation.",
+            stacklevel=2,
+        )
+        kwargs.pop("num_draft_tokens", None)
+        token_generator = generate_step(prompt, model, **kwargs)
+        token_generator = (
+            (token, logprobs, False) for token, logprobs in token_generator
+        )
     else:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
