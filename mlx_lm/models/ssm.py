@@ -46,7 +46,7 @@ def make_ssm_kernel():
             auto idx = d_idx * Ds + s_idx;
             auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
             auto state = dA * i_state[idx] + dB_by_x;
-            o_state[idx] = static_cast<T>(state);
+            o_state[idx] = state;
             acc += state * C_[s_idx];
         }
         acc = simd_sum(acc);
@@ -79,14 +79,19 @@ def ssm_update_kernel(
     n, _, h, d = hidden_states.shape
     input_type = hidden_states.dtype
     hb, ds = B.shape[-2:]
-    dt = compute_dt(dt, dt_bias, time_step_limit)
+    # Use float32 for dt and recurrent state to maintain numerical
+    # stability in the decode kernel. The SSM recurrence is sensitive
+    # to precision loss, especially for models with large A_log values.
+    dt = compute_dt(dt, dt_bias, time_step_limit).astype(mx.float32)
+    if state.dtype != mx.float32:
+        state = state.astype(mx.float32)
     return _ssm_kernel(
         inputs=[hidden_states, A_log, B, C, D, dt, state],
         template=[("T", input_type), ("Dh", d), ("Ds", ds), ("H", h), ("G", h // hb)],
         grid=(32, d, h * n),
         threadgroup=(32, 8, 1),
         output_shapes=[(n, 1, h, d), state.shape],
-        output_dtypes=[input_type, input_type],
+        output_dtypes=[input_type, mx.float32],
     )
 
 
