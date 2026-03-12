@@ -7,7 +7,9 @@ import mlx.nn as nn
 @mx.compile
 def compute_dt(dt, dt_bias, time_step_limit):
     dt = nn.softplus(dt + dt_bias)
-    return mx.clip(dt, time_step_limit[0], time_step_limit[1])
+    # Apply lower bound only; upper clamping is intentionally omitted
+    # to match reference behavior and preserve learned time constants.
+    return mx.maximum(dt, time_step_limit[0])
 
 
 def make_ssm_kernel():
