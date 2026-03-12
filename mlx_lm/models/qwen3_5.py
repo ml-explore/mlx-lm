@@ -359,7 +359,7 @@ class Qwen3_5TextModel(nn.Module):
             kw = {"n_confirmed": n_confirmed} if layer.is_linear and n_confirmed > 0 else {}
             hidden_states = layer(hidden_states, mask=mask, cache=c, **kw)
 
-        return self.norm(hidden_states)
+        return hidden_states
 
 
 class TextModel(nn.Module):
@@ -382,12 +382,13 @@ class TextModel(nn.Module):
         n_confirmed: int = 0,
     ) -> mx.array:
         hidden = self.model(inputs, cache, input_embeddings=input_embeddings, n_confirmed=n_confirmed)
+        normed = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(hidden)
+            out = self.model.embed_tokens.as_linear(normed)
         else:
-            out = self.lm_head(hidden)
+            out = self.lm_head(normed)
         if return_hidden:
-            return out, hidden
+            return out, hidden  # pre-norm hidden for MTP head
         return out
 
     def mtp_forward(
@@ -465,14 +466,16 @@ class TextModel(nn.Module):
 
     @property
     def quant_predicate(self):
-        if self.args.num_experts <= 0:
-            return None
-
         def predicate(path, _):
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
+            # Keep the MTP fusion projection in full precision.
+            if path.endswith("mtp.fc"):
+                return False
             return True
 
+        if self.args.num_experts <= 0 and self.args.mtp_num_hidden_layers <= 0:
+            return None
         return predicate
 
     @property
