@@ -160,6 +160,107 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
+def _transform_compressed_tensors_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Dict[str, Any]]:
+    """Transform compressed-tensors (vLLM/NeuralMagic) weights to MLX format.
+
+    compressed-tensors uses:
+      - *.weight_packed (int32): packed 4-bit weights, shape (out, in//8)
+      - *.weight_scale (bf16/fp16): per-group scales, shape (out, in//group_size)
+      - *.weight_shape (int64): original weight shape metadata (dropped)
+      - No zero points (symmetric quantization)
+
+    The packing order and layout already match MLX, so this is mostly
+    key renaming + bias computation.
+    """
+    # Extract params from compressed-tensors config_groups
+    config_groups = quantization_config.get("config_groups", {})
+    if not config_groups:
+        raise ValueError("compressed-tensors config has no config_groups")
+    first_group = next(iter(config_groups.values()))
+    weights_cfg = first_group.get("weights", {})
+    bits = weights_cfg.get("num_bits", 4)
+    group_size = weights_cfg.get("group_size", 128)
+    symmetric = weights_cfg.get("symmetric", True)
+
+    # Validate supported format - only pack-quantized with sequential packing
+    fmt = first_group.get("format", quantization_config.get("format", ""))
+    if fmt and fmt not in ("pack-quantized", "dense"):
+        raise ValueError(
+            f"Unsupported compressed-tensors format '{fmt}'. "
+            "Only 'pack-quantized' is supported."
+        )
+
+    if bits != 4:
+        raise ValueError(f"Only 4-bit compressed-tensors is supported, got {bits}")
+
+    new_weights = {}
+    model_dtype = None
+
+    for key in list(weights.keys()):
+        if key.endswith(".weight_packed"):
+            prefix = key.rsplit(".", 1)[0]
+
+            weight_packed = weights[f"{prefix}.weight_packed"]
+            scale_key = f"{prefix}.weight_scale"
+
+            if scale_key not in weights:
+                raise ValueError(f"Missing {scale_key} for {prefix}")
+
+            scales = weights[scale_key]
+            if model_dtype is None:
+                model_dtype = scales.dtype
+
+            # Weight: already in MLX format (out, in//8), just ensure uint32
+            mlx_weight = weight_packed.astype(mx.uint32)
+
+            # Scales: already in MLX layout (out, in//group_size)
+            mlx_scales = scales
+
+            # Biases: symmetric quantization
+            if symmetric:
+                # For symmetric 4-bit: zero point at midpoint (8)
+                # dequant = (q_uint - 8) * scale = q_uint * scale + (-8 * scale)
+                zero_point = 1 << (bits - 1)  # 8 for 4-bit
+                mlx_biases = (
+                    mx.full(scales.shape, -zero_point, dtype=mx.float32) * scales
+                )
+                mlx_biases = mlx_biases.astype(scales.dtype)
+            else:
+                raise NotImplementedError(
+                    "Asymmetric compressed-tensors quantization is not yet supported. "
+                    "Please use a model with symmetric=True."
+                )
+
+            new_weights[f"{prefix}.weight"] = mlx_weight
+            new_weights[f"{prefix}.scales"] = mlx_scales
+            new_weights[f"{prefix}.biases"] = mlx_biases
+
+        elif key.endswith(".weight_scale") or key.endswith(".weight_shape"):
+            # Handled above (scale) or metadata to drop (shape)
+            continue
+
+        else:
+            # Pass through non-quantized tensors
+            new_weights[key] = weights[key]
+
+    # Cast all floating point tensors to consistent dtype
+    if model_dtype is not None:
+        for k, w in new_weights.items():
+            if mx.issubdtype(w.dtype, mx.floating) and w.dtype != model_dtype:
+                new_weights[k] = w.astype(model_dtype)
+
+    mlx_quantization = {
+        "group_size": group_size,
+        "bits": bits,
+        "mode": "affine",
+    }
+
+    return new_weights, mlx_quantization
+
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -366,7 +467,9 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            weights, quantization = _transform_compressed_tensors_weights(
+                weights, quantization_config
+            )
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
