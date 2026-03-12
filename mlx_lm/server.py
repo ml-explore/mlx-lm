@@ -378,8 +378,11 @@ class ModelProvider:
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
-        # MTP speculative decoding requires single-sequence generation.
-        if hasattr(model, "mtp_forward"):
+        # MTP speculative decoding uses single-sequence generation
+        # (draft/verify loop is incompatible with batch generation).
+        # TODO: dynamically switch between MTP (1 request) and
+        # BatchGenerator (>= 2 concurrent requests).
+        if self.cli_args.mtp and hasattr(model, "mtp_forward"):
             is_batchable = False
         self.is_batchable = is_batchable
 
@@ -988,6 +991,7 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                mtp=getattr(self.cli_args, "mtp", False),
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1886,6 +1890,12 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. Qwen3.5).",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
