@@ -373,6 +373,10 @@ class ModelProvider:
             self.is_batchable = all(
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
             )
+            # MTP speculative decoding requires single-sequence generation
+            # (draft/verify loop is incompatible with batch generation).
+            if hasattr(self.model, "mtp_forward"):
+                self.is_batchable = False
 
         return self.model, self.tokenizer
 
