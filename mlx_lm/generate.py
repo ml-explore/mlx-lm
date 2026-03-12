@@ -659,17 +659,19 @@ def mtp_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
-    """A generator using the model's native MTP head for speculative decoding.
+    """A generator that uses the model's native MTP head for speculative decoding.
 
-    Produces up to 2 tokens per forward pass:
-      - 1 backbone token (always accepted)
-      - 1 MTP draft token (accepted if the backbone agrees on the next step)
+    Each iteration runs one backbone forward pass over the current token and its
+    pending draft, then one MTP forward pass to propose the next draft.  Up to 2
+    tokens are emitted per backbone step: one always-accepted backbone token and
+    one conditionally-accepted draft token.
 
-    The model must expose ``mtp_forward(hidden, next_tok, mtp_cache)`` and
+    The model must implement ``mtp_forward(hidden, next_tok, mtp_cache)`` and
     support ``return_hidden=True`` in its ``__call__``.
 
     Yields:
-        Tuple[mx.array, mx.array, bool]: token, log-probabilities, from_draft.
+        Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
+            ``from_draft`` is ``True`` when the token came from the MTP head.
     """
     y = prompt.astype(mx.uint32)
     prev_tokens = None
@@ -700,10 +702,10 @@ def mtp_generate_step(
         tok = sampler(logprobs)
         return tok, logprobs
 
-    def _step_backbone(y, n_predict=1):
-        """One backbone forward pass. Returns (tokens, logprobs, hidden)."""
+    def _step_backbone(y, n_predict=1, n_confirmed=0):
+        """Run the backbone on ``y`` and return (tokens, logprobs, hidden)."""
         with mx.stream(generation_stream):
-            logits, hidden = model(y[None], cache=model_cache, return_hidden=True)
+            logits, hidden = model(y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed)
             logits = logits[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
             nonlocal prev_tokens
@@ -722,8 +724,7 @@ def mtp_generate_step(
             return mx.stack(toks), mx.stack(lps), hidden
 
     def _step_mtp(hidden_last, main_tok):
-        """Run MTP head. Returns (draft_token, draft_logprobs)."""
-        # hidden_last: (1, 1, H), main_tok: 0-d or scalar
+        """Run the MTP head and return (draft_token, draft_logprobs)."""
         next_ids = main_tok.reshape(1, 1)
         with mx.stream(generation_stream):
             mtp_logits = model.mtp_forward(hidden_last, next_ids, mtp_cache)
@@ -766,11 +767,13 @@ def mtp_generate_step(
                 mx.eval(draft_tok)
                 y = mx.array([main_tok.item()], mx.uint32)
             else:
-                # Verify draft: process [y, draft_tok] through backbone together
+                # Verify draft: run backbone over [y, draft_tok].
+                # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
+                # after the confirmed token y, enabling exact rollback on rejection.
                 y_with_draft = mx.concatenate(
                     [y, mx.array([draft_tok.item()], mx.uint32)]
                 )
-                toks, lps, hidden = _step_backbone(y_with_draft, n_predict=2)
+                toks, lps, hidden = _step_backbone(y_with_draft, n_predict=2, n_confirmed=1)
                 mx.eval(toks, draft_tok)
 
                 verify_pred = toks[0]   # backbone prediction after y → verify draft
@@ -779,7 +782,11 @@ def mtp_generate_step(
                 bonus_lp = lps[1]
 
                 if verify_pred.item() == draft_tok.item():
-                    # Draft accepted
+                    # Draft accepted — discard rollback snapshots.
+                    for c in model_cache:
+                        if hasattr(c, "rollback_state"):
+                            c.rollback_state = None
+
                     ntoks += 1
                     yield draft_tok, draft_lp, True
                     if ntoks >= max_tokens:
@@ -795,18 +802,17 @@ def mtp_generate_step(
                     mx.eval(draft_tok)
                     y = mx.array([bonus_tok.item()], mx.uint32)
                 else:
-                    # Draft rejected — trim caches.
-                    #
-                    # Qwen3.5 is a hybrid SSM+Attention model: attention layers use
-                    # KVCache (trimmable), SSM layers use ArraysCache (not trimmable).
-                    # trim_prompt_cache() is all-or-nothing, so we trim KV entries
-                    # individually. The SSM state will retain a 1-token contamination
-                    # from the rejected draft, which is empirically negligible compared
-                    # to the sequence length but means output may differ slightly from
-                    # standard generate_step. A correct fix would require exposing
-                    # per-token intermediate SSM states from GatedDeltaNet (future work).
+                    # Draft rejected — roll back all caches to the state after y.
+                    # SSM layers (ArraysCache): restore the conv/ssm snapshot saved
+                    # by GatedDeltaNet after the confirmed token.
+                    # Attention layers (KVCache): trim the draft-token entry.
                     for c in model_cache:
-                        if c.is_trimmable():
+                        if hasattr(c, "rollback_state") and c.rollback_state is not None:
+                            conv_snap, ssm_snap = c.rollback_state
+                            c[0] = conv_snap
+                            c[1] = ssm_snap
+                            c.rollback_state = None
+                        elif c.is_trimmable():
                             c.trim(1)
                     cache.trim_prompt_cache(mtp_cache, 1)
 
