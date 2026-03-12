@@ -219,6 +219,12 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. Qwen3.5).",
+    )
     return parser
 
 
@@ -844,6 +850,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    mtp: bool = False,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -859,6 +866,8 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        mtp (bool): Use native Multi-Token Prediction for speculative
+          decoding. Requires a model with an MTP head. Default: ``False``.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -888,7 +897,7 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    elif hasattr(model, "mtp_forward"):
+    elif mtp and hasattr(model, "mtp_forward"):
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         kwargs.pop("num_draft_tokens", None)
@@ -2264,6 +2273,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        mtp=args.mtp,
     )
     if not args.verbose:
         print(response)
