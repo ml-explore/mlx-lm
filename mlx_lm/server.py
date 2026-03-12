@@ -378,6 +378,9 @@ class ModelProvider:
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
+        # MTP speculative decoding requires single-sequence generation.
+        if hasattr(model, "mtp_forward"):
+            is_batchable = False
         self.is_batchable = is_batchable
 
     def load_default(self):
