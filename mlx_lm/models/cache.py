@@ -405,7 +405,7 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
-class RotatingKVCache(_BaseCache):
+class _RotatingKVCacheBase(_BaseCache):
     step = 256
 
     def __init__(self, max_size, keep=0):
@@ -415,6 +415,57 @@ class RotatingKVCache(_BaseCache):
         self.offset = 0
         self.max_size = max_size
         self._idx = 0
+
+    def update_and_fetch(self, keys, values):
+        if keys.shape[2] == 1:
+            return self._update_in_place(keys, values)
+        return self._update_concat(keys, values)
+
+    def size(self):
+        return min(self.offset, self.max_size)
+
+    def is_trimmable(self):
+        return self.offset < self.max_size
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        self._idx -= n
+        return n
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        if N > 1:
+            window_size = window_size or self.max_size
+            offset = min(self.max_size - 1, self.offset)
+            if offset + N > window_size or return_array:
+                return create_causal_mask(N, offset, window_size=window_size)
+            else:
+                return "causal"
+        else:
+            if window_size is None:
+                return None
+            # May need a mask for when window_size < max_size
+            if self.offset >= window_size and self.max_size > window_size:
+                idx = self._idx
+                if idx >= self.max_size:
+                    idx = 0
+                if self.offset < self.max_size:
+                    mask_size = self.offset + 1
+                else:
+                    mask_size = self.max_size
+                mask = mx.arange(mask_size) >= (mask_size - window_size)
+                mask = mx.roll(mask, shift=idx + 1)
+                return mask
+
+    def empty(self):
+        return self.keys is None
+
+
+class RotatingKVCache(_RotatingKVCacheBase):
+    def __init__(self, max_size, keep=0):
+        super().__init__(max_size, keep)
 
     def _trim(self, trim_size, v, append=None):
         to_cat = []
@@ -507,14 +558,6 @@ class RotatingKVCache(_BaseCache):
             return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
         return self.keys, self.values
 
-    def update_and_fetch(self, keys, values):
-        if keys.shape[2] == 1:
-            return self._update_in_place(keys, values)
-        return self._update_concat(keys, values)
-
-    def size(self):
-        return min(self.offset, self.max_size)
-
     @property
     def state(self):
         if self.offset < self.keys.shape[2]:
@@ -537,15 +580,6 @@ class RotatingKVCache(_BaseCache):
             v,
         )
 
-    def is_trimmable(self):
-        return self.offset < self.max_size
-
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        self._idx -= n
-        return n
-
     def to_quantized(
         self, group_size: int = 64, bits: int = 4
     ) -> "QuantizedRotatingKVCache":
@@ -566,38 +600,9 @@ class RotatingKVCache(_BaseCache):
             )
         return quant_cache
 
-    def make_mask(
-        self, N: int, window_size: Optional[int] = None, return_array: bool = False
-    ):
-        if N > 1:
-            window_size = window_size or self.max_size
-            offset = min(self.max_size - 1, self.offset)
-            if offset + N > window_size or return_array:
-                return create_causal_mask(N, offset, window_size=window_size)
-            else:
-                return "causal"
-        else:
-            if window_size is None:
-                return None
-            # May need a mask for when window_size < max_size
-            if self.offset >= window_size and self.max_size > window_size:
-                idx = self._idx
-                if idx >= self.max_size:
-                    idx = 0
-                if self.offset < self.max_size:
-                    mask_size = self.offset + 1
-                else:
-                    mask_size = self.max_size
-                mask = mx.arange(mask_size) >= (mask_size - window_size)
-                mask = mx.roll(mask, shift=idx + 1)
-                return mask
-
     @classmethod
     def merge(_, caches):
         return BatchRotatingKVCache.merge(caches)
-
-    def empty(self):
-        return self.keys is None
 
     @property
     def nbytes(self):
@@ -606,7 +611,7 @@ class RotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
-class QuantizedRotatingKVCache(_BaseCache):
+class QuantizedRotatingKVCache(_RotatingKVCacheBase):
     """A quantized variant of :class:`RotatingKVCache`.
 
     Keys and values are stored in quantized form to reduce memory usage.
@@ -621,17 +626,10 @@ class QuantizedRotatingKVCache(_BaseCache):
         bits (int): Number of bits for quantization. Default: ``4``.
     """
 
-    step = 256
-
     def __init__(
         self, max_size: int, keep: int = 0, group_size: int = 64, bits: int = 4
     ):
-        self.keep = keep
-        self.keys = None
-        self.values = None
-        self.offset = 0
-        self.max_size = max_size
-        self._idx = 0
+        super().__init__(max_size, keep)
         self.group_size = group_size
         self.bits = bits
 
@@ -641,7 +639,7 @@ class QuantizedRotatingKVCache(_BaseCache):
     def _q_cat(self, qs):
         return [mx.concatenate([q[i] for q in qs], axis=2) for i in range(len(qs[0]))]
 
-    def _trim_q(self, trim_size, v, append=None):
+    def _trim(self, trim_size, v, append=None):
         to_cat = []
         if trim_size > 0:
             if self.keep > 0:
@@ -659,7 +657,7 @@ class QuantizedRotatingKVCache(_BaseCache):
             return to_cat[0]
         return self._q_cat(to_cat)
 
-    def _temporal_order_q(self, v):
+    def _temporal_order(self, v):
         seq_len = v[0].shape[2]
         if self._idx == seq_len:
             return v
@@ -684,15 +682,15 @@ class QuantizedRotatingKVCache(_BaseCache):
             self.values = q_values
         else:
             # Put the keys/values in temporal order to preserve context
-            self.keys = self._temporal_order_q(self.keys)
-            self.values = self._temporal_order_q(self.values)
+            self.keys = self._temporal_order(self.keys)
+            self.values = self._temporal_order(self.values)
             self._idx = self.keys[0].shape[2]
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
             trim_size = self._idx - self.max_size + 1
-            self.keys = self._trim_q(trim_size, self.keys, q_keys)
-            self.values = self._trim_q(trim_size, self.values, q_values)
+            self.keys = self._trim(trim_size, self.keys, q_keys)
+            self.values = self._trim(trim_size, self.values, q_values)
 
         self.offset += keys.shape[2]
         self._idx = self.keys[0].shape[2]
@@ -770,8 +768,8 @@ class QuantizedRotatingKVCache(_BaseCache):
         # Trim if oversized
         trim_size = self.keys[0].shape[2] - self.max_size
         if trim_size > 0:
-            self.keys = self._trim_q(trim_size, self.keys)
-            self.values = self._trim_q(trim_size, self.values)
+            self.keys = self._trim(trim_size, self.keys)
+            self.values = self._trim(trim_size, self.values)
             self._idx = self.max_size
 
         # Rotate write pointer when full
@@ -795,14 +793,6 @@ class QuantizedRotatingKVCache(_BaseCache):
                 self.values, 0, self.offset
             )
         return self.keys, self.values
-
-    def update_and_fetch(self, keys, values):
-        if keys.shape[2] == 1:
-            return self._update_in_place(keys, values)
-        return self._update_concat(keys, values)
-
-    def size(self):
-        return min(self.offset, self.max_size)
 
     @property
     def state(self):
@@ -840,43 +830,6 @@ class QuantizedRotatingKVCache(_BaseCache):
         self.keep, self.max_size, self.offset, self._idx, self.group_size, self.bits = (
             map(int, v)
         )
-
-    def is_trimmable(self):
-        return self.offset < self.max_size
-
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        self._idx -= n
-        return n
-
-    def make_mask(
-        self, N: int, window_size: Optional[int] = None, return_array: bool = False
-    ):
-        if N > 1:
-            window_size = window_size or self.max_size
-            offset = min(self.max_size - 1, self.offset)
-            if offset + N > window_size or return_array:
-                return create_causal_mask(N, offset, window_size=window_size)
-            else:
-                return "causal"
-        else:
-            if window_size is None:
-                return None
-            if self.offset >= window_size and self.max_size > window_size:
-                idx = self._idx
-                if idx >= self.max_size:
-                    idx = 0
-                if self.offset < self.max_size:
-                    mask_size = self.offset + 1
-                else:
-                    mask_size = self.max_size
-                mask = mx.arange(mask_size) >= (mask_size - window_size)
-                mask = mx.roll(mask, shift=idx + 1)
-                return mask
-
-    def empty(self):
-        return self.keys is None
 
     @property
     def nbytes(self):
