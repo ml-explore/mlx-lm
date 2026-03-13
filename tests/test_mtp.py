@@ -2,8 +2,9 @@ import importlib
 import unittest
 
 import mlx.core as mx
-from mlx_lm.models.cache import make_prompt_cache
+
 from mlx_lm.generate import generate_step, mtp_generate_step
+from mlx_lm.models.cache import make_prompt_cache
 
 
 def _make_qwen3_5_mtp_model():
