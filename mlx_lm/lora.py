@@ -74,6 +74,7 @@ CONFIG_DEFAULTS = {
     "mask_prompt": False,
     "report_to": None,
     "project_name": None,
+    "tokenizer_config": {"trust_remote_code": True},
 }
 
 
@@ -319,7 +320,19 @@ def run(args, training_callback: TrainingCallback = None):
     )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
+
+    # Build tokenizer_config, handling chat_template_file if specified
+    tokenizer_config = getattr(args, "tokenizer_config", {}) or {}
+    tokenizer_config = dict(tokenizer_config)  # Make a copy to avoid modifying original
+    tokenizer_config.setdefault("trust_remote_code", True)
+
+    # Support loading chat_template from a file path
+    if "chat_template_file" in tokenizer_config:
+        template_path = tokenizer_config.pop("chat_template_file")
+        with open(template_path, "r") as f:
+            tokenizer_config["chat_template"] = f.read()
+
+    model, tokenizer = load(args.model, tokenizer_config=tokenizer_config)
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
