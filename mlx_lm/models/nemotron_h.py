@@ -540,6 +540,7 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
+        weights = {k: v for (k, v) in weights.items() if "mtp." not in k}
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
