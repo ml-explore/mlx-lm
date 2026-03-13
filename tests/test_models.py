@@ -1683,7 +1683,7 @@ class TestModels(unittest.TestCase):
                 "rms_norm_eps": 1e-5,
                 "vocab_size": 1000,
                 "num_key_value_heads": 2,
-                "partial_rotary_factor": 0,
+                "partial_rotary_factor": 0.5,
                 "rope_theta": 1000,
             },
             {
@@ -1711,7 +1711,7 @@ class TestModels(unittest.TestCase):
                 "use_qk_norm": True,
                 "tie_word_embeddings": False,
                 "attention_bias": False,
-                "partial_rotary_factor": 0.0,
+                "partial_rotary_factor": 0.5,
             },
             {
                 "model_type": "glm4_moe_lite",
