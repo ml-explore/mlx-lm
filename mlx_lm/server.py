@@ -856,6 +856,10 @@ class ResponseGenerator:
                 cache, uncached = self.prompt_cache.fetch_nearest_cache(
                     self.model_provider.model_key, prompt
                 )
+                # Ignore tiny uncached lengths (close checkpoint already exists)
+                if len(uncached) < 10:
+                    return True
+
                 def progress(tokens_processed, total_tokens):
                     logging.info(
                         f"Prompt cache warmup progress: {tokens_processed}/{total_tokens}"
