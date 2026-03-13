@@ -3,10 +3,10 @@
 import argparse
 import contextlib
 import functools
-import warnings
 import json
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from typing import (
@@ -710,7 +710,9 @@ def mtp_generate_step(
     def _step_backbone(y, n_predict=1, n_confirmed=0):
         """Run the backbone on ``y`` and return (tokens, logprobs, hidden)."""
         with mx.stream(generation_stream):
-            logits, hidden = model(y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed)
+            logits, hidden = model(
+                y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed
+            )
             logits = logits[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
             nonlocal prev_tokens
@@ -778,11 +780,13 @@ def mtp_generate_step(
                 y_with_draft = mx.concatenate(
                     [y, mx.array([draft_tok.item()], mx.uint32)]
                 )
-                toks, lps, hidden = _step_backbone(y_with_draft, n_predict=2, n_confirmed=1)
+                toks, lps, hidden = _step_backbone(
+                    y_with_draft, n_predict=2, n_confirmed=1
+                )
                 mx.eval(toks, draft_tok)
 
-                verify_pred = toks[0]   # backbone prediction after y → verify draft
-                bonus_tok = toks[1]     # backbone prediction after draft_tok
+                verify_pred = toks[0]  # backbone prediction after y → verify draft
+                bonus_tok = toks[1]  # backbone prediction after draft_tok
                 verify_lp = lps[0]
                 bonus_lp = lps[1]
 
@@ -812,7 +816,10 @@ def mtp_generate_step(
                     # by GatedDeltaNet after the confirmed token.
                     # Attention layers (KVCache): trim the draft-token entry.
                     for c in model_cache:
-                        if hasattr(c, "rollback_state") and c.rollback_state is not None:
+                        if (
+                            hasattr(c, "rollback_state")
+                            and c.rollback_state is not None
+                        ):
                             conv_snap, ssm_snap = c.rollback_state
                             c[0] = conv_snap
                             c[1] = ssm_snap
