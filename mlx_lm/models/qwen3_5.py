@@ -159,8 +159,15 @@ class GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         out, new_ssm_state = gated_delta_update(
-            q, k, v, a_chunk, b_chunk,
-            self.A_log, self.dt_bias, ssm_state, ssm_mask,
+            q,
+            k,
+            v,
+            a_chunk,
+            b_chunk,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            ssm_mask,
             use_kernel=not self.training,
         )
         return out, new_conv_state, new_ssm_state
@@ -185,7 +192,9 @@ class GatedDeltaNet(nn.Module):
         conv_state = (
             cache[0]
             if cache is not None and cache[0] is not None
-            else mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
+            else mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
+            )
         )
         ssm_state = cache[1] if cache else None
 
@@ -198,18 +207,28 @@ class GatedDeltaNet(nn.Module):
             mask_c = mask[:, :n_confirmed] if mask is not None else None
             mask_d = mask[:, n_confirmed:] if mask is not None else None
             out_c, conv_c, ssm_c = self._process_chunk(
-                qkv[:, :n_confirmed], a[:, :n_confirmed], b[:, :n_confirmed],
-                conv_state, ssm_state, mask_c,
+                qkv[:, :n_confirmed],
+                a[:, :n_confirmed],
+                b[:, :n_confirmed],
+                conv_state,
+                ssm_state,
+                mask_c,
             )
             if cache is not None:
                 cache.rollback_state = (conv_c, ssm_c)
             out_d, conv_f, ssm_f = self._process_chunk(
-                qkv[:, n_confirmed:], a[:, n_confirmed:], b[:, n_confirmed:],
-                conv_c, ssm_c, mask_d,
+                qkv[:, n_confirmed:],
+                a[:, n_confirmed:],
+                b[:, n_confirmed:],
+                conv_c,
+                ssm_c,
+                mask_d,
             )
             out = mx.concatenate([out_c, out_d], axis=1)
         else:
-            out, conv_f, ssm_f = self._process_chunk(qkv, a, b, conv_state, ssm_state, mask)
+            out, conv_f, ssm_f = self._process_chunk(
+                qkv, a, b, conv_state, ssm_state, mask
+            )
 
         if cache is not None:
             cache[0] = conv_f
@@ -252,7 +271,9 @@ class DecoderLayer(nn.Module):
         n_confirmed: int = 0,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -267,7 +288,9 @@ class MTPDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = Attention(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         if args.num_experts > 0:
             self.mlp = SparseMoeBlock(args)
         else:
@@ -296,9 +319,7 @@ class MTPModule(nn.Module):
         self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
-        self.layers = [
-            MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)
-        ]
+        self.layers = [MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
@@ -356,7 +377,11 @@ class Qwen3_5TextModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            kw = {"n_confirmed": n_confirmed} if layer.is_linear and n_confirmed > 0 else {}
+            kw = (
+                {"n_confirmed": n_confirmed}
+                if layer.is_linear and n_confirmed > 0
+                else {}
+            )
             hidden_states = layer(hidden_states, mask=mask, cache=c, **kw)
 
         return hidden_states
@@ -381,7 +406,9 @@ class TextModel(nn.Module):
         return_hidden: bool = False,
         n_confirmed: int = 0,
     ) -> mx.array:
-        hidden = self.model(inputs, cache, input_embeddings=input_embeddings, n_confirmed=n_confirmed)
+        hidden = self.model(
+            inputs, cache, input_embeddings=input_embeddings, n_confirmed=n_confirmed
+        )
         normed = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(normed)
