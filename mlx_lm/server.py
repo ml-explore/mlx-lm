@@ -42,24 +42,12 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load, sharded_load
+from .utils import _parse_size, load, sharded_load
 
 
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
-
-
-def parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
-    split = 0
-    for xi in x:
-        if not (xi.isdigit() or xi == "."):
-            break
-        split += 1
-    digits = float(x[:split])
-    size = (x[split:]).strip().upper()
-    return int(digits * sizes[size])
 
 
 class StopCondition(NamedTuple):
@@ -2005,7 +1993,7 @@ def main():
     )
     parser.add_argument(
         "--prompt-cache-bytes",
-        type=parse_size,
+        type=_parse_size,
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(

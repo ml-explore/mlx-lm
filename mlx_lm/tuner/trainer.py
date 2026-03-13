@@ -17,6 +17,11 @@ from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
 
+def _clear_cache(threshold: int):
+    if mx.get_cache_memory() > threshold:
+        mx.clear_cache()
+
+
 def grad_checkpoint(layer):
     """
     Update all instances of type(layer) to use gradient checkpointing.
@@ -68,6 +73,12 @@ class TrainingArgs:
         default=1,
         metadata={
             "help": "Number of steps to accumulate gradients before applying an optimizer update."
+        },
+    )
+    clear_cache_threshold: int = field(
+        default=0,
+        metadata={
+            "help": "Clear the allocator cache between steps if it grows too large."
         },
     )
 
@@ -170,6 +181,7 @@ def evaluate(
     max_seq_length=2048,
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
+    clear_cache_threshold: int = 0,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -194,14 +206,13 @@ def evaluate(
         all_losses += losses * toks
         ntokens += toks
         mx.eval(all_losses, ntokens)
-        mx.clear_cache()
+        _clear_cache(clear_cache_threshold)
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
-    mx.eval(all_losses, ntokens)
-    mx.clear_cache()
+    avg_loss = (all_losses / ntokens).item()
 
-    return (all_losses / ntokens).item()
+    return avg_loss
 
 
 def train(
@@ -315,7 +326,7 @@ def train(
         n_tokens += toks
         steps += 1
         mx.eval(state, losses, n_tokens, grad_accum)
-        mx.clear_cache()
+        _clear_cache(args.clear_cache_threshold)
         train_time += time.perf_counter() - tic
 
         # Report training loss if needed

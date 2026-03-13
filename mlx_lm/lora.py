@@ -21,7 +21,7 @@ from .tuner.utils import (
     load_adapters,
     print_trainable_parameters,
 )
-from .utils import load, save_config
+from .utils import _parse_size, load, save_config
 
 yaml_loader = yaml.SafeLoader
 yaml_loader.add_implicit_resolver(
@@ -69,6 +69,7 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
+    "clear_cache_threshold": 0,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -189,6 +190,12 @@ def build_parser():
         action="store_true",
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
+    )
+    parser.add_argument(
+        "--clear-cache-threshold",
+        type=_parse_size,
+        default=0,
+        help="Clear the allocator cache between steps if it grows too large.",
     )
     parser.add_argument(
         "--report-to",
