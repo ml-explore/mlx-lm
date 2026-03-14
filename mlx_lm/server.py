@@ -172,7 +172,6 @@ def process_message_content(messages):
 
 
 class LRUPromptCache:
-
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
@@ -357,7 +356,7 @@ class LRUPromptCache:
             else 0
         )
         logging.info(
-            f"KV Caches: {ncaches} seq, {nbytes/1e9:.2f} GB, latest user cache {ntok} tokens"
+            f"KV Caches: {ncaches} seq, {nbytes / 1e9:.2f} GB, latest user cache {ntok} tokens"
         )
 
 
@@ -1169,7 +1168,23 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            self._set_completion_headers(411)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Content-Length header is required"}).encode()
+            )
+            return
+        try:
+            content_length = int(content_length)
+        except ValueError:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Invalid Content-Length header"}).encode()
+            )
+            return
         raw_body = self.rfile.read(content_length)
         try:
             self.body = json.loads(raw_body.decode())
