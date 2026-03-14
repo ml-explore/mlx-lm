@@ -541,8 +541,9 @@ class RotatingKVCache(_BaseCache):
         return True
 
     def trim(self, n):
-        n = min(self.offset, n)
-        if n >= self.max_size or n == self.offset:
+        effective = min(self.offset, self.max_size)
+        n = min(effective, n)
+        if n == effective:
             self.keys = None
             self.values = None
             self.offset = 0
@@ -1252,8 +1253,9 @@ class BatchRotatingKVCache(_BaseCache):
         return True
 
     def trim(self, n):
-        n = min(self._offset, n)
-        if n >= self.max_size or n == self._offset:
+        effective = min(self._offset, self.max_size)
+        n = min(effective, n)
+        if n == effective:
             self.keys = None
             self.values = None
             self._offset = 0
