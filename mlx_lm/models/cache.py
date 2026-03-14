@@ -548,8 +548,11 @@ class RotatingKVCache(_BaseCache):
             self.offset = 0
             self._idx = 0
         else:
-            self.offset -= n
-            self._idx = (self._idx - n) % self.max_size
+            new_size = effective - n
+            self.keys = self._temporal_order(self.keys)[..., :new_size, :]
+            self.values = self._temporal_order(self.values)[..., :new_size, :]
+            self.offset = new_size
+            self._idx = new_size
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
@@ -1257,8 +1260,12 @@ class BatchRotatingKVCache(_BaseCache):
             self._idx = 0
             self.rotated = False
         else:
-            self._offset -= n
-            self._idx = (self._idx - n) % self.max_size
+            new_size = effective - n
+            self._temporal_order()
+            self.keys = self.keys[..., :new_size, :]
+            self.values = self.values[..., :new_size, :]
+            self._offset = new_size
+            self._idx = new_size
         self.offset -= n
         return n
 

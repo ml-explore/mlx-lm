@@ -241,14 +241,13 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 4)
 
-        # Can't trim fixed-size KV cache after processing
-        # more than max_kv_size tokens
+        # Trimming is still possible after the cache has wrapped
         for c in cache:
             x = mx.random.uniform(shape=(1, 8, 10, 4))
             c.update_and_fetch(x, x)
 
         num_trimmed = trim_prompt_cache(cache, 4)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 4)
 
         cache = [QuantizedKVCache() for _ in range(2)]
         for c in cache:
