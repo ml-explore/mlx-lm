@@ -1886,7 +1886,7 @@ def main():
     )
     parser.add_argument(
         "--allowed-origins",
-        type=str,
+        type=lambda x: x.split(","),
         default="*",
         help="Allowed origins (default: *)",
     )
@@ -1997,7 +1997,6 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
-    args.allowed_origins = [o.strip() for o in args.allowed_origins.split(",")]
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
