@@ -57,6 +57,18 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 
+def _parse_size(x):
+    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    split = 0
+    for xi in x:
+        if not (xi.isdigit() or xi == "."):
+            break
+        split += 1
+    digits = float(x[:split])
+    size = (x[split:]).strip().upper()
+    return int(digits * sizes[size])
+
+
 def _unpack_awq_weights(qweight: mx.array) -> mx.array:
     bits = 4
     pack_factor = 32 // bits

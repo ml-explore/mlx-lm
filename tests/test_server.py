@@ -47,6 +47,7 @@ class DummyModelProvider:
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
+                "allowed_origins": ["*"],
             },
         )
 
