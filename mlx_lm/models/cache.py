@@ -538,12 +538,18 @@ class RotatingKVCache(_BaseCache):
         )
 
     def is_trimmable(self):
-        return self.offset < self.max_size
+        return True
 
     def trim(self, n):
         n = min(self.offset, n)
-        self.offset -= n
-        self._idx -= n
+        if n >= self.max_size or n == self.offset:
+            self.keys = None
+            self.values = None
+            self.offset = 0
+            self._idx = 0
+        else:
+            self.offset -= n
+            self._idx = (self._idx - n) % self.max_size
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
@@ -1240,12 +1246,19 @@ class BatchRotatingKVCache(_BaseCache):
         self.rotated = bool(v[3])
 
     def is_trimmable(self):
-        return self._offset < self.max_size
+        return True
 
     def trim(self, n):
         n = min(self._offset, n)
-        self._offset -= n
-        self._idx -= n
+        if n >= self.max_size or n == self._offset:
+            self.keys = None
+            self.values = None
+            self._offset = 0
+            self._idx = 0
+            self.rotated = False
+        else:
+            self._offset -= n
+            self._idx = (self._idx - n) % self.max_size
         self.offset -= n
         return n
 
