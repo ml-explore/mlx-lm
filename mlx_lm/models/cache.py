@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
 
@@ -405,7 +405,7 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
-class RotatingKVCache(_BaseCache):
+class _RotatingKVCacheBase(_BaseCache):
     step = 256
 
     def __init__(self, max_size, keep=0):
@@ -415,6 +415,57 @@ class RotatingKVCache(_BaseCache):
         self.offset = 0
         self.max_size = max_size
         self._idx = 0
+
+    def update_and_fetch(self, keys, values):
+        if keys.shape[2] == 1:
+            return self._update_in_place(keys, values)
+        return self._update_concat(keys, values)
+
+    def size(self):
+        return min(self.offset, self.max_size)
+
+    def is_trimmable(self):
+        return self.offset < self.max_size
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        self._idx -= n
+        return n
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        if N > 1:
+            window_size = window_size or self.max_size
+            offset = min(self.max_size - 1, self.offset)
+            if offset + N > window_size or return_array:
+                return create_causal_mask(N, offset, window_size=window_size)
+            else:
+                return "causal"
+        else:
+            if window_size is None:
+                return None
+            # May need a mask for when window_size < max_size
+            if self.offset >= window_size and self.max_size > window_size:
+                idx = self._idx
+                if idx >= self.max_size:
+                    idx = 0
+                if self.offset < self.max_size:
+                    mask_size = self.offset + 1
+                else:
+                    mask_size = self.max_size
+                mask = mx.arange(mask_size) >= (mask_size - window_size)
+                mask = mx.roll(mask, shift=idx + 1)
+                return mask
+
+    def empty(self):
+        return self.keys is None
+
+
+class RotatingKVCache(_RotatingKVCacheBase):
+    def __init__(self, max_size, keep=0):
+        super().__init__(max_size, keep)
 
     def _trim(self, trim_size, v, append=None):
         to_cat = []
@@ -507,14 +558,6 @@ class RotatingKVCache(_BaseCache):
             return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
         return self.keys, self.values
 
-    def update_and_fetch(self, keys, values):
-        if keys.shape[2] == 1:
-            return self._update_in_place(keys, values)
-        return self._update_concat(keys, values)
-
-    def size(self):
-        return min(self.offset, self.max_size)
-
     @property
     def state(self):
         if self.offset < self.keys.shape[2]:
@@ -537,56 +580,262 @@ class RotatingKVCache(_BaseCache):
             v,
         )
 
-    def is_trimmable(self):
-        return self.offset < self.max_size
-
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        self._idx -= n
-        return n
-
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
-        raise NotImplementedError("RotatingKVCache Quantization NYI")
-
-    def make_mask(
-        self, N: int, window_size: Optional[int] = None, return_array: bool = False
-    ):
-        if N > 1:
-            window_size = window_size or self.max_size
-            offset = min(self.max_size - 1, self.offset)
-            if offset + N > window_size or return_array:
-                return create_causal_mask(N, offset, window_size=window_size)
-            else:
-                return "causal"
-        else:
-            if window_size is None:
-                return None
-            # May need a mask for when window_size < max_size
-            if self.offset >= window_size and self.max_size > window_size:
-                idx = self._idx
-                if idx >= self.max_size:
-                    idx = 0
-                if self.offset < self.max_size:
-                    mask_size = self.offset + 1
-                else:
-                    mask_size = self.max_size
-                mask = mx.arange(mask_size) >= (mask_size - window_size)
-                mask = mx.roll(mask, shift=idx + 1)
-                return mask
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4
+    ) -> "QuantizedRotatingKVCache":
+        quant_cache = QuantizedRotatingKVCache(
+            max_size=self.max_size,
+            keep=self.keep,
+            group_size=group_size,
+            bits=bits,
+        )
+        quant_cache.offset = self.offset
+        quant_cache._idx = self._idx
+        if self.keys is not None:
+            quant_cache.keys = list(
+                mx.quantize(self.keys, group_size=group_size, bits=bits)
+            )
+            quant_cache.values = list(
+                mx.quantize(self.values, group_size=group_size, bits=bits)
+            )
+        return quant_cache
 
     @classmethod
     def merge(_, caches):
         return BatchRotatingKVCache.merge(caches)
-
-    def empty(self):
-        return self.keys is None
 
     @property
     def nbytes(self):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class QuantizedRotatingKVCache(_RotatingKVCacheBase):
+    """A quantized variant of :class:`RotatingKVCache`.
+
+    Keys and values are stored in quantized form to reduce memory usage.
+    The cache uses the same rotating/sliding-window strategy as
+    :class:`RotatingKVCache`.
+
+    Args:
+        max_size (int): Maximum number of tokens to keep in the cache.
+        keep (int): Number of initial (sink) tokens that are never evicted.
+            Default: ``0``.
+        group_size (int): Group size for quantization. Default: ``64``.
+        bits (int): Number of bits for quantization. Default: ``4``.
+    """
+
+    def __init__(
+        self, max_size: int, keep: int = 0, group_size: int = 64, bits: int = 4
+    ):
+        super().__init__(max_size, keep)
+        self.group_size = group_size
+        self.bits = bits
+
+    def _q_slice(self, q, start, stop):
+        return [x[..., start:stop, :] for x in q]
+
+    def _q_cat(self, qs):
+        return [mx.concatenate([q[i] for q in qs], axis=2) for i in range(len(qs[0]))]
+
+    def _trim(self, trim_size, v, append=None):
+        to_cat = []
+        if trim_size > 0:
+            if self.keep > 0:
+                to_cat = [
+                    self._q_slice(v, 0, self.keep),
+                    self._q_slice(v, trim_size + self.keep, v[0].shape[2]),
+                ]
+            else:
+                to_cat = [self._q_slice(v, trim_size, v[0].shape[2])]
+        else:
+            to_cat = [v]
+        if append is not None:
+            to_cat.append(append)
+        if len(to_cat) == 1:
+            return to_cat[0]
+        return self._q_cat(to_cat)
+
+    def _temporal_order(self, v):
+        seq_len = v[0].shape[2]
+        if self._idx == seq_len:
+            return v
+        elif self._idx < self.offset:
+            # Buffer has rotated: [keep | _idx..end | keep.._idx]
+            return self._q_cat(
+                [
+                    self._q_slice(v, 0, self.keep),
+                    self._q_slice(v, self._idx, seq_len),
+                    self._q_slice(v, self.keep, self._idx),
+                ]
+            )
+        else:
+            return self._q_slice(v, 0, self._idx)
+
+    def _update_concat(self, keys, values):
+        q_keys = list(mx.quantize(keys, group_size=self.group_size, bits=self.bits))
+        q_values = list(mx.quantize(values, group_size=self.group_size, bits=self.bits))
+
+        if self.keys is None:
+            self.keys = q_keys
+            self.values = q_values
+        else:
+            # Put the keys/values in temporal order to preserve context
+            self.keys = self._temporal_order(self.keys)
+            self.values = self._temporal_order(self.values)
+            self._idx = self.keys[0].shape[2]
+
+            # The largest size is self.max_size + S - 1 to ensure
+            # every token gets at least self.max_size context
+            trim_size = self._idx - self.max_size + 1
+            self.keys = self._trim(trim_size, self.keys, q_keys)
+            self.values = self._trim(trim_size, self.values, q_values)
+
+        self.offset += keys.shape[2]
+        self._idx = self.keys[0].shape[2]
+        return self.keys, self.values
+
+    def _update_in_place(self, keys, values):
+        B, n_kv_heads, S, k_head_dim = keys.shape
+        prev = self.offset
+
+        el_per_int = 8 * mx.uint32.size // self.bits
+
+        if self.keys is None or (
+            prev >= self.keys[0].shape[2] and self.keys[0].shape[2] < self.max_size
+        ):
+            v_head_dim = values.shape[3]
+            new_size = min(self.step, self.max_size - prev)
+
+            def _init_q(dim):
+                return [
+                    mx.zeros(
+                        (B, n_kv_heads, new_size, dim // el_per_int), dtype=mx.uint32
+                    ),
+                    mx.zeros(
+                        (B, n_kv_heads, new_size, dim // self.group_size),
+                        dtype=keys.dtype,
+                    ),
+                    mx.zeros(
+                        (B, n_kv_heads, new_size, dim // self.group_size),
+                        dtype=keys.dtype,
+                    ),
+                ]
+
+            def _expand_q(qx, dim):
+                return [
+                    mx.concatenate(
+                        [
+                            qx[0],
+                            mx.zeros(
+                                (B, n_kv_heads, new_size, dim // el_per_int),
+                                dtype=mx.uint32,
+                            ),
+                        ],
+                        axis=2,
+                    ),
+                    mx.concatenate(
+                        [
+                            qx[1],
+                            mx.zeros(
+                                (B, n_kv_heads, new_size, dim // self.group_size),
+                                dtype=keys.dtype,
+                            ),
+                        ],
+                        axis=2,
+                    ),
+                    mx.concatenate(
+                        [
+                            qx[2],
+                            mx.zeros(
+                                (B, n_kv_heads, new_size, dim // self.group_size),
+                                dtype=keys.dtype,
+                            ),
+                        ],
+                        axis=2,
+                    ),
+                ]
+
+            if self.keys is not None:
+                self.keys = _expand_q(self.keys, k_head_dim)
+                self.values = _expand_q(self.values, v_head_dim)
+            else:
+                self.keys = _init_q(k_head_dim)
+                self.values = _init_q(v_head_dim)
+            self._idx = prev
+
+        # Trim if oversized
+        trim_size = self.keys[0].shape[2] - self.max_size
+        if trim_size > 0:
+            self.keys = self._trim(trim_size, self.keys)
+            self.values = self._trim(trim_size, self.values)
+            self._idx = self.max_size
+
+        # Rotate write pointer when full
+        if self._idx == self.max_size:
+            self._idx = self.keep
+
+        q_keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        q_values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        self.keys[0][..., self._idx : self._idx + S, :] = q_keys[0]
+        self.keys[1][..., self._idx : self._idx + S, :] = q_keys[1]
+        self.keys[2][..., self._idx : self._idx + S, :] = q_keys[2]
+        self.values[0][..., self._idx : self._idx + S, :] = q_values[0]
+        self.values[1][..., self._idx : self._idx + S, :] = q_values[1]
+        self.values[2][..., self._idx : self._idx + S, :] = q_values[2]
+
+        self.offset += S
+        self._idx += S
+
+        if self.offset < self.max_size:
+            return self._q_slice(self.keys, 0, self.offset), self._q_slice(
+                self.values, 0, self.offset
+            )
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        if self.offset < self.keys[0].shape[2]:
+            return (
+                self._q_slice(self.keys, 0, self.offset),
+                self._q_slice(self.values, 0, self.offset),
+            )
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.keep,
+                    self.max_size,
+                    self.offset,
+                    self._idx,
+                    self.group_size,
+                    self.bits,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.keep, self.max_size, self.offset, self._idx, self.group_size, self.bits = (
+            map(int, v)
+        )
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
 class ArraysCache(_BaseCache):
