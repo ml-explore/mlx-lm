@@ -58,6 +58,7 @@ class SuScaledRoPE(nn.Module):
         self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
 
     def __call__(self, x, offset: Union[int, mx.array] = 0):
+        x = x[...]
         x[..., : self.dim] = self._scale * x[..., : self.dim]
         return mx.fast.rope(
             x,
@@ -71,7 +72,6 @@ class SuScaledRoPE(nn.Module):
 
 
 class Llama3RoPE(nn.Module):
-
     def __init__(
         self,
         dims: int,
@@ -183,6 +183,7 @@ class YarnRoPE(nn.Module):
 
     def __call__(self, x, offset=0):
         if self.mscale != 1.0:
+            x = x[...]
             x[..., : self.dims] = self.mscale * x[..., : self.dims]
         return mx.fast.rope(
             x,
