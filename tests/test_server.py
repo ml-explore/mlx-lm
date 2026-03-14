@@ -48,6 +48,7 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "thinking_budget": None,
             },
         )
 
@@ -559,6 +560,108 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class TestThinkingBudgetIntegration(unittest.TestCase):
+    """Integration tests for thinking_budget via HTTP.
+
+    Uses DummyModelProvider (Qwen1.5, non-thinking model) — verifies that
+    valid budgets are accepted and invalid ones are rejected at the HTTP layer.
+    A second provider with cli_args.thinking_budget set verifies CLI fallback.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Standard server (cli thinking_budget = None)
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
+        cls.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+        # Server with CLI thinking_budget = 64
+        cli_provider = DummyModelProvider()
+        cli_provider.cli_args.thinking_budget = 64
+        cls.response_generator_cli = ResponseGenerator(cli_provider, LRUPromptCache())
+        cls.httpd_cli = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(
+                cls.response_generator_cli, *args, **kwargs
+            ),
+        )
+        cls.port_cli = cls.httpd_cli.server_port
+        cls.server_thread_cli = threading.Thread(target=cls.httpd_cli.serve_forever)
+        cls.server_thread_cli.daemon = True
+        cls.server_thread_cli.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+        cls.httpd_cli.shutdown()
+        cls.httpd_cli.server_close()
+        cls.server_thread_cli.join()
+        cls.response_generator_cli.stop_and_join()
+
+    def _chat_url(self, port):
+        return f"http://localhost:{port}/v1/chat/completions"
+
+    def _base_payload(self):
+        return {
+            "model": "chat_model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5,
+        }
+
+    def test_valid_thinking_budget_accepted(self):
+        # Non-thinking model: budget is ignored (with warning), but request succeeds
+        payload = {**self._base_payload(), "thinking_budget": 100}
+        response = requests.post(self._chat_url(self.port), json=payload)
+        self.assertEqual(response.status_code, 200)
+
+    def test_zero_thinking_budget_accepted(self):
+        payload = {**self._base_payload(), "thinking_budget": 0}
+        response = requests.post(self._chat_url(self.port), json=payload)
+        self.assertEqual(response.status_code, 200)
+
+    def test_cli_budget_fallback_when_request_omits_budget(self):
+        # CLI has thinking_budget=64; request omits it → should still succeed
+        payload = self._base_payload()
+        response = requests.post(self._chat_url(self.port_cli), json=payload)
+        self.assertEqual(response.status_code, 200)
+
+    def test_request_budget_overrides_cli(self):
+        # CLI has thinking_budget=64; request sends 32 → 32 wins; should succeed
+        payload = {**self._base_payload(), "thinking_budget": 32}
+        response = requests.post(self._chat_url(self.port_cli), json=payload)
+        self.assertEqual(response.status_code, 200)
+
+    def test_negative_thinking_budget_rejected(self):
+        # Server closes connection on validation error (pre-existing behaviour
+        # for all invalid parameters); accept either non-200 or ConnectionError.
+        payload = {**self._base_payload(), "thinking_budget": -1}
+        try:
+            response = requests.post(self._chat_url(self.port), json=payload)
+            self.assertNotEqual(response.status_code, 200)
+        except requests.exceptions.ConnectionError:
+            pass
+
+    def test_float_thinking_budget_rejected(self):
+        payload = {**self._base_payload(), "thinking_budget": 1.5}
+        try:
+            response = requests.post(self._chat_url(self.port), json=payload)
+            self.assertNotEqual(response.status_code, 200)
+        except requests.exceptions.ConnectionError:
+            pass
 
 
 if __name__ == "__main__":

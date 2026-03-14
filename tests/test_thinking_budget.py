@@ -1,0 +1,359 @@
+import unittest
+from unittest.mock import MagicMock
+
+import mlx.core as mx
+
+from mlx_lm.thinking_budget import (
+    FORCED_LOGIT_VALUE,
+    MASKED_LOGIT_VALUE,
+    ThinkingBudgetProcessor,
+    has_open_think_block,
+)
+
+VOCAB_SIZE = 1000
+THINK_START = 100
+THINK_END = 101
+
+
+def _logits():
+    return mx.zeros((1, VOCAB_SIZE))
+
+
+def _make_args(thinking_budget):
+    from mlx_lm.server import (
+        GenerationArguments,
+        LogitsProcessorArguments,
+        ModelDescription,
+        SamplingArguments,
+    )
+
+    return GenerationArguments(
+        model=ModelDescription(model="test", draft=None, adapter=None),
+        sampling=SamplingArguments(
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            xtc_probability=0.0,
+            xtc_threshold=0.0,
+        ),
+        logits=LogitsProcessorArguments(
+            logit_bias=None,
+            repetition_penalty=0.0,
+            repetition_context_size=20,
+            presence_penalty=0.0,
+            presence_context_size=20,
+            frequency_penalty=0.0,
+            frequency_context_size=20,
+        ),
+        stop_words=[],
+        max_tokens=512,
+        num_draft_tokens=0,
+        logprobs=False,
+        top_logprobs=-1,
+        seed=None,
+        chat_template_kwargs=None,
+        thinking_budget=thinking_budget,
+    )
+
+
+def _make_handler(thinking_budget):
+    # Bypass __init__ (requires a live socket) to test validate_model_parameters
+    # in isolation. Must be kept in sync with do_POST's attribute assignments.
+    from mlx_lm.server import APIHandler
+
+    handler = object.__new__(APIHandler)
+    handler.stream = False
+    handler.max_tokens = 512
+    handler.temperature = 1.0
+    handler.top_p = 1.0
+    handler.top_k = 0
+    handler.min_p = 0.0
+    handler.num_draft_tokens = 0
+    handler.repetition_penalty = 0.0
+    handler.repetition_context_size = 20
+    handler.presence_penalty = 0.0
+    handler.presence_context_size = 20
+    handler.frequency_penalty = 0.0
+    handler.frequency_context_size = 20
+    handler.logprobs = False
+    handler.top_logprobs = -1
+    handler.logit_bias = None
+    handler.xtc_probability = 0.0
+    handler.xtc_threshold = 0.0
+    handler.requested_model = "test-model"
+    handler.adapter = None
+    handler.seed = None
+    handler.thinking_budget = thinking_budget
+    return handler
+
+
+def _thinking_tokenizer():
+    tok = MagicMock()
+    tok.has_thinking = True
+    tok.think_start_id = THINK_START
+    tok.think_end_id = THINK_END
+    return tok
+
+
+def _non_thinking_tokenizer():
+    tok = MagicMock()
+    tok.has_thinking = False
+    return tok
+
+
+class TestThinkingBudgetProcessor(unittest.TestCase):
+    def test_passthrough_when_no_think_token(self):
+        proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=10)
+        tokens = mx.array([1, 2, 3])
+        logits = _logits()
+        result = proc(tokens, logits)
+        self.assertTrue(mx.array_equal(result, logits))
+        self.assertFalse(proc.in_thinking)
+
+    def test_budget_forces_think_end_at_limit(self):
+        proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=3)
+
+        proc(mx.array([1, THINK_START]), _logits())
+        self.assertTrue(proc.in_thinking)
+        self.assertEqual(proc.count, 0)
+
+        proc(mx.array([1, THINK_START, 50]), _logits())
+        self.assertEqual(proc.count, 1)
+        proc(mx.array([1, THINK_START, 50, 51]), _logits())
+        self.assertEqual(proc.count, 2)
+        result = proc(mx.array([1, THINK_START, 50, 51, 52]), _logits())
+        self.assertEqual(proc.count, 3)
+
+        self.assertEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+        self.assertEqual(result[0, 0].item(), MASKED_LOGIT_VALUE)
+        self.assertEqual(result[0, 99].item(), MASKED_LOGIT_VALUE)
+
+    def test_budget_zero_forces_immediate_close(self):
+        proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=0)
+        result = proc(mx.array([1, THINK_START]), _logits())
+        self.assertEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+        self.assertEqual(result[0, 0].item(), MASKED_LOGIT_VALUE)
+
+    def test_think_end_clears_thinking_state(self):
+        proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=10)
+        proc(mx.array([1, THINK_START]), _logits())
+        self.assertTrue(proc.in_thinking)
+        proc(mx.array([1, THINK_START, THINK_END]), _logits())
+        self.assertFalse(proc.in_thinking)
+
+    def test_multiple_think_blocks_reset_count(self):
+        proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=2)
+
+        proc(mx.array([THINK_START]), _logits())
+        proc(mx.array([THINK_START, 50]), _logits())
+        proc(mx.array([THINK_START, 50, THINK_END]), _logits())
+        self.assertFalse(proc.in_thinking)
+
+        proc(mx.array([THINK_START, 50, THINK_END, THINK_START]), _logits())
+        self.assertTrue(proc.in_thinking)
+        self.assertEqual(proc.count, 0)
+
+    def test_natural_close_before_budget_no_force(self):
+        proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=100)
+        proc(mx.array([THINK_START]), _logits())
+        proc(mx.array([THINK_START, 50]), _logits())
+        self.assertEqual(proc.count, 1)
+        result = proc(mx.array([THINK_START, 50, THINK_END]), _logits())
+        self.assertFalse(proc.in_thinking)
+        self.assertNotEqual(result[0, 0].item(), MASKED_LOGIT_VALUE)
+
+    def test_in_thinking_init_forces_immediate_close_at_budget_zero(self):
+        """When prompt already contains <think>, processor starts in_thinking=True."""
+        proc = ThinkingBudgetProcessor(
+            THINK_START, THINK_END, budget=0, in_thinking=True
+        )
+        self.assertTrue(proc.in_thinking)
+        # First generated token (not <think>) triggers budget enforcement
+        result = proc(mx.array([50]), _logits())
+        self.assertEqual(proc.count, 1)
+        self.assertEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+        self.assertEqual(result[0, 0].item(), MASKED_LOGIT_VALUE)
+
+    def test_in_thinking_init_counts_from_zero(self):
+        """With in_thinking=True and budget=3, allows 3 tokens before forcing."""
+        proc = ThinkingBudgetProcessor(
+            THINK_START, THINK_END, budget=3, in_thinking=True
+        )
+        # Tokens 1, 2 — under budget
+        result = proc(mx.array([50]), _logits())
+        self.assertEqual(proc.count, 1)
+        self.assertTrue(mx.array_equal(result, _logits()))  # not forced
+        result = proc(mx.array([50, 51]), _logits())
+        self.assertEqual(proc.count, 2)
+        self.assertTrue(mx.array_equal(result, _logits()))
+        # Token 3 — hits budget
+        result = proc(mx.array([50, 51, 52]), _logits())
+        self.assertEqual(proc.count, 3)
+        self.assertEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+
+    def test_repr(self):
+        proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=42)
+        self.assertEqual(repr(proc), "ThinkingBudgetProcessor(budget=42)")
+
+
+class TestHasOpenThinkBlock(unittest.TestCase):
+    def test_open_think_block(self):
+        prompt = [1, 2, THINK_START, 50, 51]
+        self.assertTrue(has_open_think_block(prompt, THINK_START, THINK_END))
+
+    def test_closed_think_block(self):
+        prompt = [1, THINK_START, 50, THINK_END, 3]
+        self.assertFalse(has_open_think_block(prompt, THINK_START, THINK_END))
+
+    def test_no_think_tokens(self):
+        prompt = [1, 2, 3, 4, 5]
+        self.assertFalse(has_open_think_block(prompt, THINK_START, THINK_END))
+
+    def test_empty_prompt(self):
+        self.assertFalse(has_open_think_block([], THINK_START, THINK_END))
+
+    def test_think_end_after_think_start(self):
+        # Multiple blocks: <think>...</think><think>... — last is open
+        prompt = [THINK_START, 50, THINK_END, THINK_START, 60]
+        self.assertTrue(has_open_think_block(prompt, THINK_START, THINK_END))
+
+    def test_think_end_is_last_token(self):
+        prompt = [THINK_START, 50, THINK_END]
+        self.assertFalse(has_open_think_block(prompt, THINK_START, THINK_END))
+
+
+class TestFromPrompt(unittest.TestCase):
+    def test_from_prompt_with_open_think(self):
+        prompt = [1, THINK_START, 50]
+        proc = ThinkingBudgetProcessor.from_prompt(
+            THINK_START, THINK_END, budget=100, prompt=prompt
+        )
+        self.assertTrue(proc.in_thinking)
+        self.assertEqual(proc.budget, 100)
+
+    def test_from_prompt_with_closed_think(self):
+        prompt = [1, THINK_START, 50, THINK_END, 3]
+        proc = ThinkingBudgetProcessor.from_prompt(
+            THINK_START, THINK_END, budget=100, prompt=prompt
+        )
+        self.assertFalse(proc.in_thinking)
+
+    def test_from_prompt_none(self):
+        proc = ThinkingBudgetProcessor.from_prompt(
+            THINK_START, THINK_END, budget=100, prompt=None
+        )
+        self.assertFalse(proc.in_thinking)
+
+    def test_from_prompt_no_think_tokens(self):
+        proc = ThinkingBudgetProcessor.from_prompt(
+            THINK_START, THINK_END, budget=100, prompt=[1, 2, 3]
+        )
+        self.assertFalse(proc.in_thinking)
+
+
+class TestMakeLogitsProcessors(unittest.TestCase):
+    def test_processor_appended_when_thinking_supported(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=100)
+        processors = _make_logits_processors(args, _thinking_tokenizer())
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 1)
+        self.assertEqual(thinking_procs[0].budget, 100)
+
+    def test_budget_zero_with_thinking_support_appends_processor(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=0)
+        processors = _make_logits_processors(args, _thinking_tokenizer())
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 1)
+        self.assertEqual(thinking_procs[0].budget, 0)
+
+    def test_no_processor_when_budget_is_none(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=None)
+        processors = _make_logits_processors(args, _thinking_tokenizer())
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 0)
+
+    def test_warning_when_model_has_no_thinking_support(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=100)
+        with self.assertLogs("root", level="WARNING") as cm:
+            processors = _make_logits_processors(args, _non_thinking_tokenizer())
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 0)
+        self.assertTrue(any("no thinking support" in msg for msg in cm.output))
+
+    def test_no_warning_when_tokenizer_is_none(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=100)
+        with self.assertNoLogs("root", level="WARNING"):
+            _make_logits_processors(args, tokenizer=None)
+
+    def test_baseline_no_budget_no_tokenizer(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=None)
+        with self.assertNoLogs("root", level="WARNING"):
+            processors = _make_logits_processors(args, tokenizer=None)
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 0)
+
+    def test_prompt_with_open_think_sets_in_thinking(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=512)
+        # Prompt ends with <think> followed by newline — no closing </think>
+        prompt = [1, 2, 3, THINK_START, 10]  # 10 = newline or other token
+        processors = _make_logits_processors(args, _thinking_tokenizer(), prompt)
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 1)
+        self.assertTrue(thinking_procs[0].in_thinking)
+
+    def test_prompt_with_closed_think_block_not_in_thinking(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=512)
+        # Prompt has <think>.....</think> — closed block
+        prompt = [1, 2, THINK_START, 50, 51, THINK_END, 3]
+        processors = _make_logits_processors(args, _thinking_tokenizer(), prompt)
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 1)
+        self.assertFalse(thinking_procs[0].in_thinking)
+
+    def test_prompt_none_defaults_to_not_in_thinking(self):
+        from mlx_lm.server import _make_logits_processors
+
+        args = _make_args(thinking_budget=512)
+        processors = _make_logits_processors(args, _thinking_tokenizer(), prompt=None)
+        thinking_procs = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        self.assertEqual(len(thinking_procs), 1)
+        self.assertFalse(thinking_procs[0].in_thinking)
+
+
+class TestThinkingBudgetValidation(unittest.TestCase):
+    def test_negative_thinking_budget_raises(self):
+        handler = _make_handler(thinking_budget=-1)
+        with self.assertRaises(ValueError):
+            handler.validate_model_parameters()
+
+    def test_non_integer_thinking_budget_raises(self):
+        handler = _make_handler(thinking_budget=1.5)
+        with self.assertRaises(ValueError):
+            handler.validate_model_parameters()
+
+    def test_zero_thinking_budget_valid(self):
+        _make_handler(thinking_budget=0).validate_model_parameters()
+
+    def test_none_thinking_budget_valid(self):
+        _make_handler(thinking_budget=None).validate_model_parameters()
+
+
+if __name__ == "__main__":
+    unittest.main()

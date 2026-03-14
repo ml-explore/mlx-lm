@@ -110,6 +110,13 @@ curl localhost:8080/v1/chat/completions \
 - `num_draft_tokens`: (Optional) The number of draft tokens the draft model
   should predict at once. Defaults to `3`.
 
+- `thinking_budget`: (Optional) An integer specifying the maximum number of
+  tokens allowed in each `<think>...</think>` block. When the budget is
+  exceeded, the model is forced to emit `</think>` and continue with the
+  response. Only effective for models that support thinking (e.g. Qwen3).
+  Defaults to `None` (unlimited). Can also be set via the `--thinking-budget`
+  CLI flag.
+
 ### Response Fields
 
 - `id`: A unique identifier for the chat.

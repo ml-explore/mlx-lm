@@ -42,6 +42,7 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
+from .thinking_budget import ThinkingBudgetProcessor, has_open_think_block
 from .utils import _parse_size, load, sharded_load
 
 
@@ -403,6 +404,7 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    thinking_budget: Optional[int] = None
 
 
 @dataclass
@@ -610,8 +612,8 @@ def _make_sampler(args, tokenizer):
     )
 
 
-def _make_logits_processors(args):
-    return make_logits_processors(
+def _make_logits_processors(args, tokenizer=None, prompt=None):
+    processors = make_logits_processors(
         args.logits.logit_bias,
         args.logits.repetition_penalty,
         args.logits.repetition_context_size,
@@ -620,6 +622,24 @@ def _make_logits_processors(args):
         args.logits.frequency_penalty,
         args.logits.frequency_context_size,
     )
+    if (
+        args.thinking_budget is not None
+        and tokenizer is not None
+        and getattr(tokenizer, "has_thinking", False)
+    ):
+        processors.append(
+            ThinkingBudgetProcessor.from_prompt(
+                tokenizer.think_start_id,
+                tokenizer.think_end_id,
+                args.thinking_budget,
+                prompt,
+            )
+        )
+    elif args.thinking_budget is not None and tokenizer is not None:
+        logging.warning(
+            "thinking_budget set but model has no thinking support, ignoring"
+        )
+    return processors
 
 
 def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, Any]]:
@@ -860,7 +880,7 @@ class ResponseGenerator:
                         args.max_tokens,
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[_make_logits_processors(args, tokenizer, prompt)],
                         prompt_checkpoints=[checkpoint_position],
                     )
                     batch_results[uid] = {
@@ -1021,7 +1041,7 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _make_logits_processors(args, tokenizer, prompt)
 
             # Load the KV cache
             self.prompt_cache.log_cache_stats()
@@ -1221,6 +1241,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        self.thinking_budget = self.body.get("thinking_budget", None)
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1313,6 +1334,9 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("adapter must be a string")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("seed must be an integer")
+        if self.thinking_budget is not None:
+            if not isinstance(self.thinking_budget, int) or self.thinking_budget < 0:
+                raise ValueError("thinking_budget must be a non-negative integer")
 
     def generate_response(
         self,
@@ -1461,6 +1485,13 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            thinking_budget=(
+                self.thinking_budget
+                if self.thinking_budget is not None
+                else getattr(
+                    self.response_generator.cli_args, "thinking_budget", None
+                )
+            ),
         )
 
         # Create keepalive callback to send SSE comments during long prompt processing
@@ -1539,14 +1570,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token
-        in_reasoning = False
-        if ctx.has_thinking:
-            for i in range(len(ctx.prompt) - 1, -1, -1):
-                if ctx.prompt[i] == ctx.think_end_id:
-                    break
-                elif ctx.prompt[i] == ctx.think_start_id:
-                    in_reasoning = True
-                    break
+        in_reasoning = ctx.has_thinking and has_open_think_block(
+            ctx.prompt, ctx.think_start_id, ctx.think_end_id
+        )
         reasoning_text = ""
 
         # Variables to save the generated tokens and the corresponding probs
@@ -2012,6 +2038,12 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum number of thinking tokens per <think> block (default: None, unlimited)",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
