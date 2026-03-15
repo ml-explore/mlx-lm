@@ -591,6 +591,10 @@ class ModelProvider:
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
             )
 
+        self._cache_is_trimmable = can_trim_prompt_cache(
+            make_prompt_cache(self.model)
+        )
+
         return self.model, self.tokenizer
 
 
@@ -734,21 +738,67 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
-    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
+    def _compute_prompt_checkpoint(self, tokenizer, request, prompt, args=None):
         if request.request_type != "chat":
             return False, -1
         if request.messages[-1]["role"] != "user":
             return False, -1
 
-        # Save the KV cache at the end of the prompt just before
-        # the think start token which will likely be removed in the
-        # next turn.
         prompt_checkpoint = -1
-        if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt)) - 1, 1):
-                if prompt[-i] == tokenizer.think_start_id:
-                    prompt_checkpoint = -i - 1
-                    break
+
+        if not self.model_provider._cache_is_trimmable:
+            # For hybrid models with non-trimmable caches (ArraysCache),
+            # checkpoint at the last-message boundary so the prefix
+            # can be reused via the shorter-cache path.
+            #
+            # We find the boundary by replacing the last user message
+            # with a short sentinel and comparing tokens: the common
+            # prefix is the part before the user message content.
+            prefix_messages = request.messages[:-1]
+            if len(prefix_messages) > 0:
+                chat_template_args = self.model_provider.cli_args.chat_template_args
+                if args is not None and hasattr(args, 'chat_template_kwargs') and args.chat_template_kwargs:
+                    chat_template_args = chat_template_args.copy()
+                    chat_template_args.update(args.chat_template_kwargs)
+
+                sentinel_msg = {"role": "user", "content": "x"}
+                sentinel_messages = prefix_messages + [sentinel_msg]
+                try:
+                    if tokenizer.has_chat_template:
+                        sentinel_tokens = tokenizer.apply_chat_template(
+                            sentinel_messages,
+                            tools=request.tools,
+                            add_generation_prompt=True,
+                            tokenize=True,
+                            **chat_template_args,
+                        )
+                    else:
+                        sentinel_tokens = tokenizer.encode(
+                            convert_chat(sentinel_messages, request.role_mapping)
+                        )
+                    # Find the common prefix between the full prompt
+                    # and the sentinel-substituted prompt.
+                    common = 0
+                    for a, b in zip(prompt, sentinel_tokens):
+                        if a != b:
+                            break
+                        common += 1
+                    if common > 0:
+                        user_msg_length = len(prompt) - common
+                        if user_msg_length > 0:
+                            prompt_checkpoint = -user_msg_length
+                except Exception as e:
+                    logging.debug(
+                        "Could not compute prompt checkpoint for "
+                        f"non-trimmable cache: {e}"
+                    )
+        else:
+            # For trimmable models: save cache before <think> token
+            if tokenizer.has_thinking:
+                for i in range(1, min(11, len(prompt)) - 1, 1):
+                    if prompt[-i] == tokenizer.think_start_id:
+                        prompt_checkpoint = -i - 1
+                        break
 
         return True, prompt_checkpoint
 
@@ -851,7 +901,7 @@ class ResponseGenerator:
                         cache = make_prompt_cache(self.model_provider.model)
 
                     do_checkpoint, checkpoint_position = (
-                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
+                        self._compute_prompt_checkpoint(tokenizer, request, prompt, args)
                     )
 
                     (uid,) = batch_generator.insert(
