@@ -10,7 +10,11 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
-from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+from mlx_lm.models.gated_delta import (
+    gated_delta_kernel,
+    gated_delta_ops,
+    gated_delta_update,
+)
 from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
@@ -2629,6 +2633,60 @@ class TestModels(unittest.TestCase):
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_precision(self):
+        mx.random.seed(42)
+
+        N_STEPS = 512
+        B = 1
+        Hk = 4
+        Hv = 4
+        Dk = 64
+        Dv = 64
+
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+
+        all_q = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_k = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_v = mx.random.normal(shape=(N_STEPS, B, 1, Hv, Dv)) * 0.1
+        all_a = -7.0 + mx.random.normal(shape=(N_STEPS, B, 1, Hv)) * 0.3
+        all_b = mx.random.normal(shape=(N_STEPS, B, 1, Hv))
+        mx.eval(all_q, all_k, all_v, all_a, all_b, A_log, dt_bias)
+
+        state_ref = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        for t in range(N_STEPS):
+            y_ref, state_ref = gated_delta_update(
+                all_q[t],
+                all_k[t],
+                all_v[t],
+                all_a[t],
+                all_b[t],
+                A_log,
+                dt_bias,
+                state_ref,
+                use_kernel=False,
+            )
+            mx.eval(y_ref, state_ref)
+
+        for use_kernel in (False, True):
+            state_lo = mx.zeros((B, Hv, Dv, Dk), dtype=mx.bfloat16)
+            for t in range(N_STEPS):
+                y_lo, state_lo = gated_delta_update(
+                    all_q[t].astype(mx.bfloat16),
+                    all_k[t].astype(mx.bfloat16),
+                    all_v[t].astype(mx.bfloat16),
+                    all_a[t].astype(mx.bfloat16),
+                    all_b[t].astype(mx.bfloat16),
+                    A_log,
+                    dt_bias,
+                    state_lo,
+                    use_kernel=use_kernel,
+                )
+                mx.eval(y_lo, state_lo)
+
+            self.assertTrue(mx.allclose(state_lo, state_ref, rtol=0.05, atol=0.01))
+            self.assertTrue(mx.allclose(y_lo, y_ref, rtol=0.05, atol=0.01))
 
     def test_gated_delta_masked(self):
         B = 1
