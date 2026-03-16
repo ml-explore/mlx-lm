@@ -757,9 +757,10 @@ class ResponseGenerator:
             prefix_messages = request.messages[:-1]
             if len(prefix_messages) > 0:
                 chat_template_args = self.model_provider.cli_args.chat_template_args
-                if args is not None and hasattr(args, 'chat_template_kwargs') and args.chat_template_kwargs:
+                extra_kwargs = getattr(args, 'chat_template_kwargs', None)
+                if extra_kwargs:
                     chat_template_args = chat_template_args.copy()
-                    chat_template_args.update(args.chat_template_kwargs)
+                    chat_template_args.update(extra_kwargs)
 
                 sentinel_msg = {"role": "user", "content": "x"}
                 sentinel_messages = prefix_messages + [sentinel_msg]

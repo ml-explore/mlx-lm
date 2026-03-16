@@ -1121,7 +1121,13 @@ class BatchGenerator:
         #   2. Process
         #   3. Finalize the KV caches so they are left padded again
         else:
-            last_inputs = mx.array([p[-prompt_checkpoint:] for p in inputs])
+            last_inputs = [p[-prompt_checkpoint:] for p in inputs]
+            last_inputs = mx.array(
+                [
+                    [0] * (prompt_checkpoint - len(li)) + li
+                    for li in last_inputs
+                ]
+            )
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
 
