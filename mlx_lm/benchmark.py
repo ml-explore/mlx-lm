@@ -67,7 +67,7 @@ def setup_arg_parser():
         default=2048,
         help="Step size for prefill processing (default: 2048)",
     )
-    parser.add_arugment(
+    parser.add_argument(
         "--delay",
         type=int,
         default=0,
