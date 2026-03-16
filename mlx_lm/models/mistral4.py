@@ -1,7 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-import math
 from typing import Union, Dict, Optional, List, Any
 
 import mlx.core as mx
@@ -31,7 +30,7 @@ def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "mistral4"
+    model_type: str
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -58,16 +57,12 @@ class ModelArgs(BaseModelArgs):
     qk_head_dim: Optional[int] = None
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
-    rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = None
     rope_interleave: Optional[bool] = None
     attention_bias: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = None
 
     def __post_init__(self, **kwargs):
-        if self.num_key_value_groups is None:
-            self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-
         if self.qk_head_dim is None:
             self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         
@@ -138,18 +133,10 @@ class Mistral4Attention(nn.Module):
             bias=args.attention_bias,
         )
 
-        if self.args.rope_parameters is not None:
-            mscale_all_dim = self.args.rope_parameters.get("mscale_all_dim", 0)
-            if mscale_all_dim:
-                scaling_factor = self.args.rope_parameters["factor"]
-                if scaling_factor > 1:
-                    s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
-                    self.scale = self.scale * s * s
-
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
-            traditional=True,
+            traditional=args.rope_interleave if args.rope_interleave is not None else True,
             max_position_embeddings=self.max_position_embeddings,
             scaling_args=self.args.rope_parameters,
         )
@@ -229,53 +216,30 @@ def mistral4_expert_select(
     routed_scaling_factor,
     norm_topk_prob,
 ):
-    """Mistral-4 routing using softmax instead of sigmoid."""
-    # Apply softmax to get normalized probabilities
+    """Mistral-4 routing using softmax."""
     scores = mx.softmax(gates.astype(mx.float32), axis=-1)
-    
+
     if n_group > 1:
-        # Reshape to groups
         scores_grouped = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        # Get top-2 scores per group and sum them
         group_scores = mx.topk(scores_grouped, 2, axis=-1).sum(axis=-1, keepdims=True)
-        
-        # Select top topk_group groups
-        group_idx = mx.topk(group_scores, topk_group, axis=-2)[1]
-        
-        # Create mask for selected groups
-        group_mask = mx.zeros_like(group_scores)
-        group_mask = mx.put_along_axis(
-            group_mask, group_idx, mx.array(1.0), axis=-2
+        # Zero out bottom (n_group - topk_group) groups
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores_grouped = mx.put_along_axis(
+            scores_grouped, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
         )
-        
-        # Expand mask to expert dimension
-        score_mask = mx.flatten(
-            mx.broadcast_to(
-                group_mask,
-                group_scores.shape[:-1] + (n_group, scores_grouped.shape[-1])
-            ),
-            -2, -1
-        )
-        
-        # Mask out non-selected groups
-        scores_for_choice = scores * score_mask
+        scores_for_choice = mx.flatten(scores_grouped, -2, -1)
     else:
         scores_for_choice = scores
-    
-    # Select top-k experts
-    inds = mx.topk(scores_for_choice, top_k, axis=-1)[1]
-    
-    # Gather weights from original scores
+
+    inds = mx.argpartition(-scores_for_choice, kth=top_k - 1, axis=-1)[..., :top_k]
+
     selected_scores = mx.take_along_axis(scores, inds, axis=-1)
-    
-    # Normalize if requested
-    if top_k > 1 and norm_topk_prob:
+    if norm_topk_prob:
         denominator = selected_scores.sum(axis=-1, keepdims=True) + 1e-20
         selected_scores = selected_scores / denominator
-    
-    # Apply scaling factor
     selected_scores = selected_scores * routed_scaling_factor
-    
+
     return inds, selected_scores
 
 
@@ -289,10 +253,10 @@ class Mistral4MoEGate(nn.Module):
         self.routed_scaling_factor = args.routed_scaling_factor
         self.n_group = args.n_group
         self.topk_group = args.topk_group
-        self.weight = mx.zeros((args.hidden_size, self.n_routed_experts))
+        self.weight = mx.zeros((self.n_routed_experts, args.hidden_size))
 
     def __call__(self, x):
-        gates = x @ self.weight
+        gates = x @ self.weight.T
         return mistral4_expert_select(
             gates,
             self.top_k,
@@ -318,7 +282,7 @@ class Mistral4MoE(nn.Module):
         if args.n_shared_experts is not None:
             intermediate_size = args.moe_intermediate_size * args.n_shared_experts
             self.shared_experts = DeepseekV3MLP(
-                args=args, intermediate_size=intermediate_size
+                args, intermediate_size=intermediate_size
             )
 
     def __call__(self, x):
@@ -443,7 +407,20 @@ class Model(nn.Module):
 
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+
+            # Handle fused gate_up_proj format (Mistral4NaiveMoe)
+            gup_key = f"{prefix}.mlp.experts.gate_up_proj"
+            if gup_key in weights:
+                gate_up = weights.pop(gup_key)
+                gate, up = mx.split(gate_up, 2, axis=1)
+                weights[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
+                weights[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
+            down_key = f"{prefix}.mlp.experts.down_proj"
+            if down_key in weights:
+                weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = weights.pop(down_key)
+
+            # Handle per-expert weights format
+            for m in ["gate_proj", "down_proj", "up_proj"]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
