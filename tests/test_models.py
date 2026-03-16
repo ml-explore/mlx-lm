@@ -246,10 +246,9 @@ class TestModels(unittest.TestCase):
             long_factor=[1.0] * 4,
         )
         x = mx.ones((1, 2, 4, 8))
-        x_before = x[0, 0, 0, 0].item()
         rope(x)
         mx.eval(x)
-        self.assertEqual(x[0, 0, 0, 0].item(), x_before)
+        self.assertTrue((x == 1).all())
 
     def test_yarn_rope_no_mutation(self):
         rope = rope_utils.YarnRoPE(
@@ -259,10 +258,9 @@ class TestModels(unittest.TestCase):
             mscale_all_dim=0,
         )
         x = mx.ones((1, 2, 4, 8))
-        x_before = x[0, 0, 0, 0].item()
         rope(x)
         mx.eval(x)
-        self.assertEqual(x[0, 0, 0, 0].item(), x_before)
+        self.assertTrue((x == 1).all())
 
     def test_quantized_sdpa(self):
         cache = KVCache()
