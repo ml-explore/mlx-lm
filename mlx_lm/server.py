@@ -294,11 +294,12 @@ class LRUPromptCache:
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                trimmed = trim_prompt_cache(cache, num_to_trim)
+                if trimmed >= num_to_trim:
+                    return cache, tokens[prefix:]
 
         if short_length > 0:
             cache_entry = self._get(result.model, result.shorter)
@@ -308,6 +309,7 @@ class LRUPromptCache:
 
     def insert_cache(self, model, tokens, prompt_cache, checkpoint: bool = False):
         is_trimmable = can_trim_prompt_cache(prompt_cache)
+        max_trimmable = min(c.size() for c in prompt_cache) if is_trimmable else 0
 
         if model not in self._cache:
             self._cache[model] = {}
@@ -316,9 +318,10 @@ class LRUPromptCache:
             if tok not in current:
                 current[tok] = {}
             if is_trimmable and "cache" in current:
-                self._n_bytes -= current["cache"].nbytes
-                del current["cache"]
-                self._lru.remove(model, tokens[:i])
+                if len(tokens) - i <= max_trimmable:
+                    self._n_bytes -= current["cache"].nbytes
+                    del current["cache"]
+                    self._lru.remove(model, tokens[:i])
             current = current[tok]
 
         if "cache" in current:
