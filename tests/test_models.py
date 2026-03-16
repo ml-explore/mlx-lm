@@ -242,6 +242,30 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
 
+    def test_su_scaled_rope_no_mutation(self):
+        rope = rope_utils.SuScaledRoPE(
+            dims=8,
+            max_position_embeddings=131072,
+            original_max_position_embeddings=4096,
+            long_factor=[1.0] * 4,
+        )
+        x = mx.ones((1, 2, 4, 8))
+        rope(x)
+        mx.eval(x)
+        self.assertTrue((x == 1).all())
+
+    def test_yarn_rope_no_mutation(self):
+        rope = rope_utils.YarnRoPE(
+            dims=8,
+            scaling_factor=2.0,
+            mscale=1.0,
+            mscale_all_dim=0,
+        )
+        x = mx.ones((1, 2, 4, 8))
+        rope(x)
+        mx.eval(x)
+        self.assertTrue((x == 1).all())
+
     def test_quantized_sdpa(self):
         cache = KVCache()
 
