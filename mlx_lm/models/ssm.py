@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 @mx.compile
 def compute_dt(dt, dt_bias, time_step_limit):
+    dt = dt.astype(mx.float32)
     dt = nn.softplus(dt + dt_bias)
     return mx.clip(dt, time_step_limit[0], time_step_limit[1])
 
@@ -44,7 +45,7 @@ def make_ssm_kernel():
             auto idx = d_idx * Ds + s_idx;
             auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
             auto state = dA * i_state[idx] + dB_by_x;
-            o_state[idx] = static_cast<T>(state);
+            o_state[idx] = static_cast<U>(state);
             acc += state * C_[s_idx];
         }
         acc = simd_sum(acc);
@@ -76,15 +77,23 @@ def ssm_update_kernel(
 ):
     n, _, h, d = hidden_states.shape
     input_type = hidden_states.dtype
+    state_type = state.dtype
     hb, ds = B.shape[-2:]
     dt = compute_dt(dt, dt_bias, time_step_limit)
     return _ssm_kernel(
         inputs=[hidden_states, A_log, B, C, D, dt, state],
-        template=[("T", input_type), ("Dh", d), ("Ds", ds), ("H", h), ("G", h // hb)],
+        template=[
+            ("T", input_type),
+            ("U", state_type),
+            ("Dh", d),
+            ("Ds", ds),
+            ("H", h),
+            ("G", h // hb),
+        ],
         grid=(32, d, h * n),
         threadgroup=(32, 8, 1),
         output_shapes=[(n, 1, h, d), state.shape],
-        output_dtypes=[input_type, input_type],
+        output_dtypes=[input_type, state_type],
     )
 
 
@@ -186,7 +195,7 @@ def ssm_attn(
                 mx.expand_dims(lengths < 0, (1, 2, 3)), state, next_state
             )
 
-        return y, next_state
+        return y.astype(x.dtype), next_state
 
     ys = []
     for i in range(0, l, step):
