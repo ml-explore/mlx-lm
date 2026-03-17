@@ -14,6 +14,7 @@ from .deepseek_v3 import (
     DeepseekV3Model,
 )
 from .switch_layers import SwitchGLU
+from .pipeline import PipelineMixin
 
 
 def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
@@ -200,7 +201,7 @@ class Mistral4Attention(nn.Module):
 
         # Standard attention
         output = scaled_dot_product_attention(
-            query_states, key_states, v, scale=self.scale, mask=mask
+            query_states, key_states, v, cache=cache, scale=self.scale, mask=mask
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -323,9 +324,9 @@ class Mistral4DecoderLayer(nn.Module):
         return h + r
 
 
-class Mistral4Model(DeepseekV3Model):
+class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
-        nn.Module.__init__(self)
+        PipelineMixin.__init__(self)
         self.vocab_size = args.vocab_size
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
