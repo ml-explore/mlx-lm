@@ -198,7 +198,7 @@ class Mistral4Attention(nn.Module):
             attn_scale = _get_llama_4_attn_scale(
                 L, offset, llama_4_beta, original_max_pos
             )
-            query_states = query_states * attn_scale
+            query_states = query_states * attn_scale.astype(query_states.dtype)
 
         # Update cache
         if cache is not None:
