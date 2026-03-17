@@ -34,11 +34,6 @@ class ModelArgs(BaseModelArgs):
     mamba_enabled: bool = True
     intermediate_size: int = 13312
     vocab_size: int = 32000
-    rope_parameters: Optional[Dict] = None
-
-    def __post_init__(self):
-        if self.rope_parameters is not None:
-            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 class RMSNorm(nn.Module):

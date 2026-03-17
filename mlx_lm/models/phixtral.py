@@ -24,6 +24,7 @@ class ModelArgs(BaseModelArgs):
     num_local_experts: int = 4
 
 
+
 class RoPEAttention(nn.Module):
     def __init__(self, dims: int, num_heads: int, rotary_dim: int):
         super().__init__()

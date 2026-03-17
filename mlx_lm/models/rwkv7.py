@@ -25,11 +25,6 @@ class ModelArgs(BaseModelArgs):
     gate_low_rank_dim: int
     decay_low_rank_dim: int
     tie_word_embeddings: bool = False
-    rope_parameters: Optional[Dict] = None
-
-    def __post_init__(self):
-        if self.rope_parameters is not None:
-            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 @partial(mx.compile, shapeless=True)

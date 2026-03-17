@@ -40,9 +40,7 @@ class ModelArgs(BaseModelArgs):
 
     def __post_init__(self):
         if self.rope_parameters is not None:
-            self.rope_theta = self.rope_parameters.get("rope_theta", 1000000.0)
-        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
-            self.rope_theta = self.rope_parameters["rope_theta"]
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         if self.full_attn_idxs is None:

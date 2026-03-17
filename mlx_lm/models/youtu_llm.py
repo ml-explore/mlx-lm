@@ -36,8 +36,9 @@ class ModelArgs(BaseModelArgs):
     rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
-        if self.rope_parameters is not None:
-            self.rope_theta = self.rope_parameters.get("rope_theta", 500000.0)
+        if self.rope_parameters:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 class YoutuLLMAttention(nn.Module):

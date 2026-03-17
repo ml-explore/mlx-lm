@@ -31,6 +31,7 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.rope_parameters is not None:
             self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 class Attention(nn.Module):

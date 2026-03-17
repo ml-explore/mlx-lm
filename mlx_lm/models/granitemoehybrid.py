@@ -21,7 +21,6 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    # Required fields (no defaults)
     model_type: str
     vocab_size: int
     hidden_size: int
@@ -38,14 +37,9 @@ class ModelArgs(BaseModelArgs):
     layer_types: List[str]
     rms_norm_eps: float
     rope_theta: float
-
-    # Optional fields (with defaults)
-    # MoE parameters (optional for dense mode)
     num_local_experts: Optional[int] = None
     num_experts_per_tok: Optional[int] = None
     shared_intermediate_size: Optional[int] = None
-
-    # Mamba parameters (optional for non-hybrid mode)
     mamba_n_heads: Optional[int] = None
     mamba_d_head: Optional[int] = None
     mamba_proj_bias: Optional[bool] = None
@@ -53,11 +47,7 @@ class ModelArgs(BaseModelArgs):
     mamba_d_conv: Optional[int] = None
     mamba_n_groups: Optional[int] = None
     mamba_conv_bias: Optional[bool] = None
-
-    # Dense MLP parameters (for non-MoE mode)
     mlp_bias: bool = False
-
-    # Other optional parameters
     position_embedding_type: str = "rope"
     tie_word_embeddings: bool = True
     time_step_limit: Tuple[float, float] = (0.001, 100.0)
@@ -68,7 +58,6 @@ class ModelArgs(BaseModelArgs):
         if self.rope_parameters is not None:
             self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
-    # Mode flags - inferred from num_local_experts
     @property
     def use_moe(self) -> bool:
         return bool(self.num_local_experts)
