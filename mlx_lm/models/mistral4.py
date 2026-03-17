@@ -1,20 +1,20 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Union, Dict, Optional, List, Any
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from .base import BaseModelArgs, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 from .deepseek_v3 import (
     DeepseekV3MLP,
     DeepseekV3Model,
 )
-from .switch_layers import SwitchGLU
 from .pipeline import PipelineMixin
+from .rope_utils import initialize_rope
+from .switch_layers import SwitchGLU
 
 
 def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
@@ -28,6 +28,7 @@ def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: 
         return scaling[:, None, :, None]
     else:
         return scaling[:, None]
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -66,10 +67,10 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self, **kwargs):
         if self.qk_head_dim is None:
             self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        
+
         if self.head_dim is None:
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        
+
         if self.rope_parameters is None:
             self.rope_parameters = {
                 "type": "yarn",
@@ -137,7 +138,9 @@ class Mistral4Attention(nn.Module):
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
-            traditional=args.rope_interleave if args.rope_interleave is not None else True,
+            traditional=(
+                args.rope_interleave if args.rope_interleave is not None else True
+            ),
             max_position_embeddings=self.max_position_embeddings,
             scaling_config=self.args.rope_parameters,
         )
@@ -178,7 +181,9 @@ class Mistral4Attention(nn.Module):
         k_rope = self.rope(k_rope, offset)
 
         # Expand k_rope to all heads
-        k_rope = mx.broadcast_to(k_rope, [B, self.num_heads, k_rope.shape[2], self.qk_rope_head_dim])
+        k_rope = mx.broadcast_to(
+            k_rope, [B, self.num_heads, k_rope.shape[2], self.qk_rope_head_dim]
+        )
 
         # Concatenate to form full query and key states
         query_states = mx.concatenate([q_nope, q_rope], axis=-1)
@@ -330,8 +335,7 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
         self.vocab_size = args.vocab_size
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Mistral4DecoderLayer(args, idx)
-            for idx in range(args.num_hidden_layers)
+            Mistral4DecoderLayer(args, idx) for idx in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -429,7 +433,9 @@ class Model(nn.Module):
                 weights[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
             down_key = f"{prefix}.mlp.experts.down_proj"
             if down_key in weights:
-                weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = weights.pop(down_key)
+                weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = weights.pop(
+                    down_key
+                )
 
             # Handle per-expert weights format
             for m in ["gate_proj", "down_proj", "up_proj"]:
@@ -441,17 +447,13 @@ class Model(nn.Module):
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
-        return {
-            k: v
-            for k, v in weights.items()
-            if "rotary_emb.inv_freq" not in k
-        }
+        return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
-        
+
         for layer in self.model.layers:
             if layer.self_attn.q_lora_rank is None:
                 layer.self_attn.q_proj = shard_linear(
@@ -461,11 +463,11 @@ class Model(nn.Module):
                 layer.self_attn.q_b_proj = shard_linear(
                     layer.self_attn.q_b_proj, "all-to-sharded", group=group
                 )
-            
+
             layer.self_attn.kv_b_proj = shard_linear(
                 layer.self_attn.kv_b_proj, "all-to-sharded", group=group
             )
-            
+
             layer.self_attn.num_heads //= N
 
             layer.self_attn.o_proj = shard_linear(
@@ -484,12 +486,16 @@ class Model(nn.Module):
                 )
 
             else:
-                if hasattr(layer.mlp, 'shared_experts'):
+                if hasattr(layer.mlp, "shared_experts"):
                     shard_inplace(
-                        layer.mlp.shared_experts.gate_proj, "all-to-sharded", group=group
+                        layer.mlp.shared_experts.gate_proj,
+                        "all-to-sharded",
+                        group=group,
                     )
                     shard_inplace(
-                        layer.mlp.shared_experts.down_proj, "sharded-to-all", group=group
+                        layer.mlp.shared_experts.down_proj,
+                        "sharded-to-all",
+                        group=group,
                     )
                     shard_inplace(
                         layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
