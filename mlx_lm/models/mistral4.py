@@ -362,6 +362,17 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
+        sanitized = {}
+        for key, value in weights.items():
+            if key.startswith("vision_tower") or key.startswith("model.visual"):
+                continue
+            if key.startswith("model.language_model."):
+                key = key.replace("model.language_model.", "")
+            elif key.startswith("language_model."):
+                key = key.replace("language_model.", "")
+            sanitized[key] = value
+        weights = sanitized
+
         def dequant(weight, scale_inv):
             dtype = mx.bfloat16
             weight = mx.from_fp8(weight, dtype=mx.bfloat16)
