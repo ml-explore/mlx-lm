@@ -138,7 +138,7 @@ class Mistral4Attention(nn.Module):
             base=self.rope_theta,
             traditional=args.rope_interleave if args.rope_interleave is not None else True,
             max_position_embeddings=self.max_position_embeddings,
-            scaling_args=self.args.rope_parameters,
+            scaling_config=self.args.rope_parameters,
         )
 
     def __call__(
