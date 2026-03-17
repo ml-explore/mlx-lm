@@ -13,7 +13,7 @@ from .base import BaseModelArgs, create_attention_mask
 try:
     import hf_olmo
 except ImportError:
-    print("To run olmo install ai2-olmo: pip install ai2-olmo")
+    print("To run olmo install ai2-olmo: `pip install ai2-olmo`")
     sys.exit(1)
 
 
