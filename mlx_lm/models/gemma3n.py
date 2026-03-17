@@ -46,7 +46,9 @@ class TextConfig(BaseModelArgs):
         if self.rope_parameters is not None:
             self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
             self.rope_scaling = self.rope_parameters
-            self.rope_local_base_freq = self.rope_parameters.get("rope_local_base_freq", 10000.0)
+            self.rope_local_base_freq = self.rope_parameters.get(
+                "rope_local_base_freq", 10000.0
+            )
 
 
 @dataclass
