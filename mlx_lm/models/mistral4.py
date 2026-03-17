@@ -153,7 +153,6 @@ class Mistral4Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        # Query projection
         if self.q_lora_rank is None:
             q = self.q_proj(x)
         else:
@@ -162,7 +161,6 @@ class Mistral4Attention(nn.Module):
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_rope = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
-        # KV projection
         compressed_kv = self.kv_a_proj_with_mqa(x)
         k_latent, k_rope = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
 
@@ -172,10 +170,8 @@ class Mistral4Attention(nn.Module):
         kv = kv.transpose(0, 2, 1, 3)
         k_nope, v = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
 
-        # Reshape k_rope to match k_nope shape
         k_rope = k_rope.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
 
-        # Apply RoPE
         offset = cache.offset if cache is not None else 0
         q_rope = self.rope(q_rope, offset)
         k_rope = self.rope(k_rope, offset)
@@ -185,7 +181,6 @@ class Mistral4Attention(nn.Module):
             k_rope, [B, self.num_heads, k_rope.shape[2], self.qk_rope_head_dim]
         )
 
-        # Concatenate to form full query and key states
         query_states = mx.concatenate([q_nope, q_rope], axis=-1)
         key_states = mx.concatenate([k_nope, k_rope], axis=-1)
 
@@ -200,11 +195,9 @@ class Mistral4Attention(nn.Module):
             )
             query_states = query_states * attn_scale.astype(query_states.dtype)
 
-        # Update cache
         if cache is not None:
             key_states, v = cache.update_and_fetch(key_states, v)
 
-        # Standard attention
         output = scaled_dot_product_attention(
             query_states, key_states, v, cache=cache, scale=self.scale, mask=mask
         )
@@ -222,7 +215,6 @@ def mistral4_expert_select(
     routed_scaling_factor,
     norm_topk_prob,
 ):
-    """Mistral-4 routing using softmax."""
     scores = mx.softmax(gates.astype(mx.float32), axis=-1)
 
     if n_group > 1:
