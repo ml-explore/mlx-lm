@@ -1595,6 +1595,10 @@ class APIHandler(BaseHTTPRequestHandler):
             if in_reasoning:
                 if gen.text == ctx.think_end:
                     in_reasoning = False
+                elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                    in_reasoning = False
+                    made_tool_call = True
+                    in_tool_call = True
                 else:
                     reasoning_text += gen.text
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
