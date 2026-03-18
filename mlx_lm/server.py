@@ -1,8 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
-import copy
-import heapq
 import json
 import logging
 import pickle
@@ -11,7 +9,6 @@ import socket
 import time
 import uuid
 import warnings
-from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +34,7 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import BatchGenerator, generation_stream, stream_generate
 from .models.cache import (
+    LRUPromptCache,
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
@@ -169,195 +167,6 @@ def process_message_content(messages):
                 if func := tool_call.get("function", False):
                     if args := func.get("arguments", False):
                         func["arguments"] = json.loads(args)
-
-
-class LRUPromptCache:
-    @dataclass
-    class CacheEntry:
-        prompt_cache: List[Any]
-        nbytes: int
-
-    class CacheOrder:
-        def __init__(self):
-            self._lru_checkpoints = deque()
-            self._lru = deque()
-
-        def __len__(self):
-            return len(self._lru) + len(self._lru_checkpoints)
-
-        def push(self, model, tokens, checkpoint: bool = False):
-            c = self._lru_checkpoints if checkpoint else self._lru
-            c.append((model, tokens))
-
-        def remove(self, model, tokens):
-            try:
-                self._lru.remove((model, tokens))
-            except ValueError:
-                self._lru_checkpoints.remove((model, tokens))
-
-        def pop(self):
-            if len(self._lru) >= len(self._lru_checkpoints):
-                return self._lru.popleft()
-            else:
-                return self._lru_checkpoints.popleft()
-
-    @dataclass
-    class SearchResult:
-        model: Any
-        exact: List[int]
-        shorter: List[int]
-        longer: List[int]
-        common_prefix: int
-
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
-        self.max_size = max_size
-        self.max_bytes = max_bytes
-        self._cache = {}
-        self._lru = self.CacheOrder()
-        self._n_bytes = 0
-
-    def __len__(self):
-        return len(self._lru)
-
-    @property
-    def nbytes(self):
-        return self._n_bytes
-
-    def _search(self, model, tokens):
-        """Search the cache for a prompt cache. Return exact or close match."""
-        if model not in self._cache:
-            return self.SearchResult(model, None, None, None, 0)
-
-        current = self._cache[model]
-        last_cache_index = -1
-        index = 0
-
-        while index < len(tokens) and tokens[index] in current:
-            current = current[tokens[index]]
-            if "cache" in current:
-                last_cache_index = index
-            index += 1
-
-        # Exact match no need to search for longer or shorter caches
-        if last_cache_index == len(tokens) - 1:
-            return self.SearchResult(model, tokens, None, None, 0)
-
-        # Find the shorter cache
-        shorter = None
-        if last_cache_index > 0:
-            shorter = tokens[: last_cache_index + 1]
-
-        # Check for caches that are longer
-        longer = None
-        common_prefix = index
-        if index > 0:
-            best = None
-            stack = [(current, [])]
-            while stack:
-                current, extra = stack.pop()
-                if "cache" in current:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                else:
-                    for tok in current:
-                        stack.append((current[tok], extra + [tok]))
-            longer = tokens[:index] + best
-        return self.SearchResult(model, None, shorter, longer, common_prefix)
-
-    def _get(self, model, tokens):
-        current = self._cache[model]
-        for tok in tokens:
-            current = current[tok]
-        return current["cache"]
-
-    def _delete(self, model, tokens):
-        path = [self._cache[model]]
-        for tok in tokens:
-            path.append(path[-1][tok])
-        cache_bytes = path[-1]["cache"].nbytes
-        self._n_bytes -= cache_bytes
-        del path[-1]["cache"]
-        for i in reversed(range(len(tokens))):
-            d_prev, d, t = path[i], path[i + 1], tokens[i]
-            if len(d) > 0:
-                break
-            del d_prev[t]
-
-    def fetch_nearest_cache(self, model, tokens):
-        result = self._search(model, tokens)
-        if result.exact is not None:
-            cache_entry = self._get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
-
-        short_length = len(result.shorter) if result.shorter is not None else 0
-        if result.longer is not None and result.common_prefix > short_length:
-            cache_entry = self._get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
-
-        if short_length > 0:
-            cache_entry = self._get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
-
-        return None, tokens
-
-    def insert_cache(self, model, tokens, prompt_cache, checkpoint: bool = False):
-        is_trimmable = can_trim_prompt_cache(prompt_cache)
-
-        if model not in self._cache:
-            self._cache[model] = {}
-        current = self._cache[model]
-        for i, tok in enumerate(tokens):
-            if tok not in current:
-                current[tok] = {}
-            if is_trimmable and "cache" in current:
-                self._n_bytes -= current["cache"].nbytes
-                del current["cache"]
-                self._lru.remove(model, tokens[:i])
-            current = current[tok]
-
-        if "cache" in current:
-            self._lru.remove(model, tokens)
-        else:
-            cache_bytes = sum(c.nbytes for c in prompt_cache)
-            current["cache"] = self.CacheEntry(prompt_cache, cache_bytes)
-            self._n_bytes += cache_bytes
-
-        self._lru.push(model, tokens, checkpoint=checkpoint)
-        if len(self._lru) > self.max_size:
-            model, tokens = self._lru.pop()
-            self._delete(model, tokens)
-        while self._n_bytes > self.max_bytes and len(self._lru) > 1:
-            model, tokens = self._lru.pop()
-            self._delete(model, tokens)
-
-    def trim_to(
-        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
-    ):
-        n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
-        n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
-
-        while len(self._lru) > n_sequences:
-            model, tokens = self._lru.pop()
-            self._delete(model, tokens)
-        while self._n_bytes > n_bytes:
-            model, tokens = self._lru.pop()
-            self._delete(model, tokens)
-
-    def log_cache_stats(self):
-        ncaches, nbytes = len(self), self.nbytes
-        ntok = (
-            len(self._lru._lru_checkpoints[-1][1])
-            if len(self._lru._lru_checkpoints) > 0
-            else 0
-        )
-        logging.info(
-            f"KV Caches: {ncaches} seq, {nbytes / 1e9:.2f} GB, latest user cache {ntok} tokens"
-        )
 
 
 @dataclass
@@ -655,6 +464,11 @@ class ResponseGenerator:
     def join(self):
         self._generation_thread.join()
 
+    def _log_cache_stats(self):
+        ncaches = len(self.prompt_cache)
+        nbytes = self.prompt_cache.nbytes
+        logging.info(f"KV Caches: {ncaches} seq, {nbytes / 1e9:.2f} GB")
+
     def _next_request(self, timeout=None):
         request = None
         if not self._is_distributed or self._rank == 0:
@@ -791,7 +605,7 @@ class ResponseGenerator:
                     current_model_key,
                     rs["cache_key"][:-prompt_end],
                     list(cache),
-                    checkpoint=True,
+                    cache_type="user",
                 )
 
         if self._is_distributed:
@@ -842,7 +656,7 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
-                    self.prompt_cache.log_cache_stats()
+                    self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
@@ -1023,7 +837,7 @@ class ResponseGenerator:
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
-            self.prompt_cache.log_cache_stats()
+            self._log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
