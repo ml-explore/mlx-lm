@@ -60,6 +60,7 @@ class ThinkingBudgetProcessor:
         self.eos_token_ids = eos_token_ids
         self.in_thinking: bool = in_thinking
         self.count: int = 0
+        self._thinking_done: bool = False
         # Lazy-initialised on first EOS-masking call; vocab size is fixed per
         # model so the cache is valid for all subsequent calls.
         self._eos_mask: Optional[mx.array] = None
@@ -108,10 +109,17 @@ class ThinkingBudgetProcessor:
 
         # --- State machine ---
         if last_token == self.think_start_id:
-            self.in_thinking = True
-            self.count = 0
+            if not self._thinking_done:
+                self.in_thinking = True
+                self.count = 0
         elif last_token == self.think_end_id:
             self.in_thinking = False
+            # Lock out re-entry: no supported model generates multiple
+            # <think> blocks per turn.  Without this guard, a spurious
+            # <think> token emitted mid-tool-call (observed in quantised
+            # Qwen3.5-4B under context pressure) causes the forced
+            # </think> to land inside JSON arguments, corrupting tool calls.
+            self._thinking_done = True
             if self.eos_token_ids is not None:
                 # Mask all EOS tokens for exactly this one step so the model
                 # generates at least one visible token after </think>.

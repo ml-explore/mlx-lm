@@ -145,7 +145,15 @@ class TestThinkingBudgetProcessor(unittest.TestCase):
         proc(mx.array([1, THINK_START, THINK_END]), _logits())
         self.assertFalse(proc.in_thinking)
 
-    def test_multiple_think_blocks_reset_count(self):
+    def test_second_think_block_ignored_after_first_close(self):
+        """After the first </think>, subsequent <think> tokens are ignored.
+
+        No supported model generates multiple <think> blocks per turn.
+        Without this lock-out, a spurious <think> emitted mid-tool-call
+        (observed in quantised Qwen3.5-4B under context pressure) causes
+        the forced </think> to land inside JSON arguments, corrupting
+        tool calls.
+        """
         proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=2)
 
         proc(mx.array([THINK_START]), _logits())
@@ -153,9 +161,9 @@ class TestThinkingBudgetProcessor(unittest.TestCase):
         proc(mx.array([THINK_START, 50, THINK_END]), _logits())
         self.assertFalse(proc.in_thinking)
 
+        # Second <think> must NOT re-enter thinking mode
         proc(mx.array([THINK_START, 50, THINK_END, THINK_START]), _logits())
-        self.assertTrue(proc.in_thinking)
-        self.assertEqual(proc.count, 0)
+        self.assertFalse(proc.in_thinking)
 
     def test_natural_close_before_budget_no_force(self):
         proc = ThinkingBudgetProcessor(THINK_START, THINK_END, budget=100)
