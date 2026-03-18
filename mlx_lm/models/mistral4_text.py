@@ -12,22 +12,10 @@ from .deepseek_v3 import (
     DeepseekV3MLP,
     DeepseekV3Model,
 )
+from .ministral3 import _get_llama_4_attn_scale
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
-
-
-def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
-    if isinstance(offset, mx.array) and offset.ndim > 0:
-        offset = offset[:, None]
-
-    scaling = 1 + beta * mx.log(
-        1 + mx.floor((mx.arange(size) + offset) / max_position_embeddings)
-    )
-    if scaling.ndim == 2:
-        return scaling[:, None, :, None]
-    else:
-        return scaling[:, None]
 
 
 @dataclass
