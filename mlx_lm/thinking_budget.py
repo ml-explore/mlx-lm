@@ -75,7 +75,7 @@ class ThinkingBudgetProcessor:
         eos_token_ids: Optional[FrozenSet[int]] = None,
     ) -> "ThinkingBudgetProcessor":
         """Create a processor, detecting if the prompt starts inside a
-        ``<think>`` block (e.g. Qwen3 chat templates include ``<think>``
+        ``<think>`` block (e.g. Qwen3.5 chat templates include ``<think>``
         in the assistant preamble)."""
         in_thinking = (
             has_open_think_block(prompt, think_start_id, think_end_id)
@@ -93,9 +93,20 @@ class ThinkingBudgetProcessor:
     def __repr__(self) -> str:
         return f"ThinkingBudgetProcessor(budget={self.budget})"
 
+    def _apply_eos_mask(self, logits: mx.array) -> mx.array:
+        """Return logits with all EOS token positions set to -inf."""
+        if self._eos_mask is None:
+            vocab = logits.shape[-1]
+            mask = mx.zeros((vocab,), dtype=mx.bool_)
+            for eid in self.eos_token_ids:  # type: ignore[union-attr]
+                mask = mask | (mx.arange(vocab) == eid)
+            self._eos_mask = mask
+        return mx.where(self._eos_mask, MASKED_LOGIT_VALUE, logits)
+
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         last_token = tokens[-1].item()
 
+        # --- State machine ---
         if last_token == self.think_start_id:
             self.in_thinking = True
             self.count = 0
@@ -104,29 +115,22 @@ class ThinkingBudgetProcessor:
             if self.eos_token_ids is not None:
                 # Mask all EOS tokens for exactly this one step so the model
                 # generates at least one visible token after </think>.
-                if self._eos_mask is None:
-                    vocab = logits.shape[-1]
-                    mask = mx.zeros((vocab,), dtype=mx.bool_)
-                    for eid in self.eos_token_ids:
-                        mask = mask | (mx.arange(vocab) == eid)
-                    self._eos_mask = mask
-                return mx.where(self._eos_mask, MASKED_LOGIT_VALUE, logits)
+                return self._apply_eos_mask(logits)
         elif self.in_thinking:
             self.count += 1
-            if self.eos_token_ids is not None:
-                # Mask EOS while inside a <think> block so the model cannot
-                # terminate generation before outputting </think>.
-                if self._eos_mask is None:
-                    vocab = logits.shape[-1]
-                    mask = mx.zeros((vocab,), dtype=mx.bool_)
-                    for eid in self.eos_token_ids:
-                        mask = mask | (mx.arange(vocab) == eid)
-                    self._eos_mask = mask
-                return mx.where(self._eos_mask, MASKED_LOGIT_VALUE, logits)
 
+        # --- Budget enforcement (runs after think_start too, handles budget=0) ---
+        # Must precede EOS masking so forced-close is never shadowed.
         if self.in_thinking and self.count >= self.budget:
             forced = mx.full(logits.shape, MASKED_LOGIT_VALUE)
             forced[:, self.think_end_id] = FORCED_LOGIT_VALUE
             return forced
+
+        # --- EOS masking during thinking ---
+        # Prevents the model from emitting EOS before </think>, which would
+        # produce finish_reason=stop with only 2-3 reasoning tokens and no
+        # visible content.
+        if self.in_thinking and self.eos_token_ids is not None:
+            return self._apply_eos_mask(logits)
 
         return logits

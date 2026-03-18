@@ -560,6 +560,24 @@ class TestEosMaskingDuringThinking(unittest.TestCase):
 
         self.assertEqual(result[0, EOS_ID].item(), MASKED_LOGIT_VALUE)
 
+    def test_budget_enforced_when_eos_token_ids_set(self):
+        """Budget forced-close takes priority over EOS masking.
+
+        When eos_token_ids is set (production always passes it), the budget
+        check must still fire: EOS masking must not shadow the forced-close
+        path via an early return.
+        """
+        proc = self._make_proc(budget=2)
+
+        proc(mx.array([THINK_START]), _logits())
+        proc(mx.array([THINK_START, 50]), _logits())  # count=1, EOS masked
+        result = proc(mx.array([THINK_START, 50, 51]), _logits())  # count=2, budget hit
+
+        # Must return forced-close logits, not EOS-masked logits.
+        self.assertEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+        self.assertEqual(result[0, EOS_ID].item(), MASKED_LOGIT_VALUE)
+        self.assertEqual(result[0, 0].item(), MASKED_LOGIT_VALUE)
+
 
 if __name__ == "__main__":
     unittest.main()
