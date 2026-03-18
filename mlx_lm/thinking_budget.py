@@ -113,6 +113,16 @@ class ThinkingBudgetProcessor:
                 return mx.where(self._eos_mask, MASKED_LOGIT_VALUE, logits)
         elif self.in_thinking:
             self.count += 1
+            if self.eos_token_ids is not None:
+                # Mask EOS while inside a <think> block so the model cannot
+                # terminate generation before outputting </think>.
+                if self._eos_mask is None:
+                    vocab = logits.shape[-1]
+                    mask = mx.zeros((vocab,), dtype=mx.bool_)
+                    for eid in self.eos_token_ids:
+                        mask = mask | (mx.arange(vocab) == eid)
+                    self._eos_mask = mask
+                return mx.where(self._eos_mask, MASKED_LOGIT_VALUE, logits)
 
         if self.in_thinking and self.count >= self.budget:
             forced = mx.full(logits.shape, MASKED_LOGIT_VALUE)

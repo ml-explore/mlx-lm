@@ -517,5 +517,49 @@ class TestEosMaskingAfterThinkClose(unittest.TestCase):
         self.assertEqual(result[0, EOS_ID].item(), MASKED_LOGIT_VALUE)
 
 
+class TestEosMaskingDuringThinking(unittest.TestCase):
+    """Regression tests for EOS masking DURING thinking (in_thinking=True).
+
+    Bug (observed 2026-03-18, Tasks 2/3/5 in SWE-bench):
+    Model generated EOS while still inside the <think> block (before </think>),
+    producing finish_reason=stop with completion_tokens=2-3 and empty content.
+    Fixed by masking EOS in the ``elif self.in_thinking`` branch.
+    """
+
+    def _make_proc(self, budget: int) -> ThinkingBudgetProcessor:
+        return ThinkingBudgetProcessor(
+            THINK_START,
+            THINK_END,
+            budget=budget,
+            eos_token_ids=frozenset({EOS_ID}),
+        )
+
+    def test_eos_must_be_masked_mid_thinking(self):
+        """EOS must be suppressed while in_thinking=True.
+
+        Without this guard, models can generate EOS before </think>, producing
+        finish_reason=stop with 2-3 tokens and empty visible content.
+        """
+        proc = self._make_proc(budget=100)
+
+        proc(mx.array([THINK_START]), _logits())
+        proc(mx.array([THINK_START, 50]), _logits())  # count=1
+
+        result = proc(mx.array([THINK_START, 50, 51]), _logits())
+
+        self.assertEqual(result[0, EOS_ID].item(), MASKED_LOGIT_VALUE)
+
+    def test_eos_masked_on_first_thinking_token(self):
+        """EOS must be blocked from the very first thinking step."""
+        proc = self._make_proc(budget=100)
+
+        # Processor sees think_start_id → sets in_thinking=True, returns unmodified logits.
+        # Next call: first real thinking token — EOS must be blocked.
+        proc(mx.array([THINK_START]), _logits())
+        result = proc(mx.array([THINK_START, 50]), _logits())
+
+        self.assertEqual(result[0, EOS_ID].item(), MASKED_LOGIT_VALUE)
+
+
 if __name__ == "__main__":
     unittest.main()
