@@ -838,6 +838,14 @@ class ResponseGenerator:
                 rs = batch_results[uid]
                 if not rs["checkpoint"]:
                     continue
+                # prompt_end is the batch-global max checkpoint offset.
+                # Only save the checkpoint for requests whose per-request
+                # offset matches prompt_end. For other requests, the
+                # cache state doesn't align with their prefix boundary
+                # (the batch processes up to the global max, which may
+                # cut into shorter requests' prefixes).
+                if -rs["checkpoint_position"] != prompt_end:
+                    continue
                 self.prompt_cache.insert_cache(
                     current_model_key,
                     rs["cache_key"][:-prompt_end],
@@ -919,6 +927,7 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                         "checkpoint": do_checkpoint,
+                        "checkpoint_position": checkpoint_position,
                     }
                     # just making sure we don't leave a reference around
                     del cache
