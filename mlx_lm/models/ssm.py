@@ -38,9 +38,9 @@ def compute_dt_eff(dt: mx.array, lam: mx.array) -> mx.array:
     Returns:
         dt_eff of the same shape as dt.
     """
-    lam = mx.sigmoid(lam)                                    # (b, l, h) ∈ (0,1)
-    dt_gamma     = lam * dt                                  # γ_t = λ_t Δt_t
-    dt_beta_next = mx.concatenate(                           # (1-λ_{t+1}) Δt_{t+1}
+    lam = mx.sigmoid(lam) # (b, l, h) ∈ (0,1)
+    dt_gamma = lam * dt # γ_t = λ_t Δt_t
+    dt_beta_next = mx.concatenate( # (1-λ_{t+1}) Δt_{t+1}
         [(1.0 - lam[:, 1:]) * dt[:, 1:],
          mx.zeros_like(dt[:, :1])],
         axis=1,
@@ -194,7 +194,7 @@ def ssm_attn(
     dt = compute_dt(dt, dt_bias, time_step_limit)
     repeats = h // g
     A = -mx.exp(A_log).astype(dt.dtype)
-    dtA = dt * A.reshape(1, 1, -1)               # decay always uses original dt
+    dtA = dt * A.reshape(1, 1, -1) # decay always uses original dt
 
     # Mamba-3: swap in dt_eff for the input term only; Mamba-2: same as dt
     dt_input = _dt_eff if _dt_eff is not None else dt
@@ -307,9 +307,7 @@ def ssm_update(
         )
 
 
-# ---------------------------------------------------------------------------
-# Mamba-3: exponential-trapezoidal SSM
-# ---------------------------------------------------------------------------
+# Mamba-3: exponential-trapezoidal SSM update
 
 def _ssm_decode_trap(
     hidden_states: mx.array,
@@ -317,8 +315,8 @@ def _ssm_decode_trap(
     B: mx.array,
     C: mx.array,
     D: mx.array,
-    dt: mx.array,        # already processed by compute_dt, shape (b, 1, h)
-    lam: mx.array,       # raw logits, shape (b, 1, h)
+    dt: mx.array, # already processed by compute_dt, shape (b, 1, h)
+    lam: mx.array, # raw logits, shape (b, 1, h)
     state: Optional[mx.array],
     prev_Bx: Optional[mx.array],
 ) -> Tuple[mx.array, mx.array, mx.array]:
@@ -342,35 +340,35 @@ def _ssm_decode_trap(
         new_Bx    (batch, num_heads, head_dim, state_size) — B_t ⊗ x_t for next step
     """
     b, _, h, dh = hidden_states.shape
-    _, _, g, d  = B.shape
+    _, _, g, d = B.shape
     repeats = h // g
 
-    lam_s = mx.sigmoid(lam[:, 0])              # (b, h)
-    dt_s  = dt[:, 0]                            # (b, h)
+    lam_s = mx.sigmoid(lam[:, 0]) # (b, h)
+    dt_s = dt[:, 0] # (b, h)
 
-    A     = -mx.exp(A_log.astype(mx.float32))  # (h,)
-    alpha =  mx.exp(dt_s * A[None, :])          # (b, h)
-    gamma =  lam_s * dt_s                       # γ_t  (b, h)
-    beta  =  (1.0 - lam_s) * dt_s * alpha      # β_t  (b, h)
+    A = -mx.exp(A_log.astype(mx.float32)) # (h,)
+    alpha = mx.exp(dt_s * A[None, :]) # (b, h)
+    gamma = lam_s * dt_s # γ_t  (b, h)
+    beta = (1.0 - lam_s) * dt_s * alpha # β_t  (b, h)
 
-    x_s  = hidden_states[:, 0]                             # (b, h, dh)
-    B_s  = mx.repeat(B[:, 0], repeats, axis=1)             # (b, h, d)
-    C_s  = mx.repeat(C[:, 0], repeats, axis=1)             # (b, h, d)
+    x_s = hidden_states[:, 0] # (b, h, dh)
+    B_s = mx.repeat(B[:, 0], repeats, axis=1) # (b, h, d)
+    C_s = mx.repeat(C[:, 0], repeats, axis=1) # (b, h, d)
 
-    Bx = x_s[:, :, :, None] * B_s[:, :, None, :]          # (b, h, dh, d)  outer product
+    Bx = x_s[:, :, :, None] * B_s[:, :, None, :] # (b, h, dh, d)  outer product
 
     alpha_r = alpha[:, :, None, None]
     gamma_r = gamma[:, :, None, None]
-    beta_r  = beta[:, :, None, None]
+    beta_r = beta[:, :, None, None]
 
-    if state   is None: state   = mx.zeros((b, h, dh, d), dtype=mx.float32)
+    if state   is None: state = mx.zeros((b, h, dh, d), dtype=mx.float32)
     if prev_Bx is None: prev_Bx = mx.zeros_like(state)
 
     new_state = alpha_r * state + gamma_r * Bx + beta_r * prev_Bx
 
-    y = mx.sum(new_state * C_s[:, :, None, :], axis=-1)    # (b, h, dh)
+    y = mx.sum(new_state * C_s[:, :, None, :], axis=-1) # (b, h, dh)
     y = y + x_s * D[None, :, None]
-    y = y[:, None]                                          # (b, 1, h, dh)
+    y = y[:, None] # (b, 1, h, dh)
 
     return y.astype(hidden_states.dtype), new_state, Bx
 
@@ -421,7 +419,7 @@ def ssm_update_trap(
     # ---- prefill ----
     if seq_len > 1 or state is None:
         dt_proc = compute_dt(dt, dt_bias, time_step_limit)   # (b, l, h)
-        dt_eff  = compute_dt_eff(dt_proc, lam)               # (b, l, h)
+        dt_eff = compute_dt_eff(dt_proc, lam)               # (b, l, h)
 
         y, state = ssm_attn(
             hidden_states, A_log, B, C, D,
@@ -431,8 +429,8 @@ def ssm_update_trap(
         )
 
         # cache B_{l-1} ⊗ x_{l-1} for the first decode step's β term
-        x_last  = hidden_states[:, -1]                               # (b, h, dh)
-        B_last  = mx.repeat(B[:, -1], repeats, axis=1)               # (b, h, d)
+        x_last = hidden_states[:, -1]                               # (b, h, dh)
+        B_last = mx.repeat(B[:, -1], repeats, axis=1)               # (b, h, d)
         prev_Bx = x_last[:, :, :, None] * B_last[:, :, None, :]     # (b, h, dh, d)
 
         return y, state, prev_Bx
