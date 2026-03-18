@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
-from .base import BaseModelArgs, scaled_dot_product_attention
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .deepseek_v3 import (
     DeepseekV3MLP,
     DeepseekV3Model,
@@ -331,6 +331,23 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
+    def __call__(
+        self,
+        x: mx.array,
+        cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
+    ) -> mx.array:
+        h = input_embeddings if input_embeddings is not None else self.embed_tokens(x)
+
+        if cache is None:
+            cache = [None] * len(self.pipeline_layers)
+        mask = create_attention_mask(h, cache[0], return_array=True)
+
+        for l, c in zip(self.pipeline_layers, cache):
+            h = l(h, mask, cache=c)
+
+        return self.norm(h)
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -345,8 +362,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache=cache)
+        out = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -358,17 +376,6 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
-        sanitized = {}
-        for key, value in weights.items():
-            if key.startswith("vision_tower") or key.startswith("model.visual"):
-                continue
-            if key.startswith("model.language_model."):
-                key = key.replace("model.language_model.", "")
-            elif key.startswith("language_model."):
-                key = key.replace("language_model.", "")
-            sanitized[key] = value
-        weights = sanitized
-
         def dequant(weight, scale_inv):
             dtype = mx.bfloat16
             weight = mx.from_fp8(weight, dtype=mx.bfloat16)

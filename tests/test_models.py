@@ -1193,9 +1193,9 @@ class TestModels(unittest.TestCase):
         )
 
     def test_mistral4(self):
-        from mlx_lm.models import mistral4
+        from mlx_lm.models import mistral4_text
 
-        args = mistral4.ModelArgs(
+        args = mistral4_text.ModelArgs(
             model_type="mistral4",
             vocab_size=1024,
             hidden_size=128,
@@ -1220,7 +1220,7 @@ class TestModels(unittest.TestCase):
             rms_norm_eps=1e-6,
             first_k_dense_replace=0,
         )
-        model = mistral4.Model(args)
+        model = mistral4_text.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )

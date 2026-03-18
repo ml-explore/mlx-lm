@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
-from . import llama, ministral3
+from . import llama, ministral3, mistral4_text
 from .base import BaseModelArgs
 
 
@@ -29,6 +29,10 @@ class Model(nn.Module):
         if args.text_config.get("model_type") == "ministral3":
             self.language_model = ministral3.Model(
                 ministral3.ModelArgs.from_dict(args.text_config)
+            )
+        elif args.text_config.get("model_type") == "mistral4":
+            self.language_model = mistral4_text.Model(
+                mistral4_text.ModelArgs.from_dict(args.text_config)
             )
         else:
             self.language_model = llama.Model(
