@@ -418,8 +418,8 @@ def ssm_update_trap(
 
     # ---- prefill ----
     if seq_len > 1 or state is None:
-        dt_proc = compute_dt(dt, dt_bias, time_step_limit)   # (b, l, h)
-        dt_eff = compute_dt_eff(dt_proc, lam)               # (b, l, h)
+        dt_proc = compute_dt(dt, dt_bias, time_step_limit) # (b, l, h)
+        dt_eff = compute_dt_eff(dt_proc, lam) # (b, l, h)
 
         y, state = ssm_attn(
             hidden_states, A_log, B, C, D,
@@ -429,9 +429,9 @@ def ssm_update_trap(
         )
 
         # cache B_{l-1} ⊗ x_{l-1} for the first decode step's β term
-        x_last = hidden_states[:, -1]                               # (b, h, dh)
-        B_last = mx.repeat(B[:, -1], repeats, axis=1)               # (b, h, d)
-        prev_Bx = x_last[:, :, :, None] * B_last[:, :, None, :]     # (b, h, dh, d)
+        x_last = hidden_states[:, -1] # (b, h, dh)
+        B_last = mx.repeat(B[:, -1], repeats, axis=1) # (b, h, d)
+        prev_Bx = x_last[:, :, :, None] * B_last[:, :, None, :] # (b, h, dh, d)
 
         return y, state, prev_Bx
 
