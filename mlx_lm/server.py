@@ -633,6 +633,7 @@ def _make_logits_processors(args, tokenizer=None, prompt=None):
                 tokenizer.think_end_id,
                 args.thinking_budget,
                 prompt,
+                eos_token_ids=frozenset(tokenizer.eos_token_ids),
             )
         )
     elif args.thinking_budget is not None and tokenizer is not None:
@@ -880,7 +881,9 @@ class ResponseGenerator:
                         args.max_tokens,
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args, tokenizer, prompt)],
+                        logits_processors=[
+                            _make_logits_processors(args, tokenizer, prompt)
+                        ],
                         prompt_checkpoints=[checkpoint_position],
                     )
                     batch_results[uid] = {
@@ -1488,9 +1491,7 @@ class APIHandler(BaseHTTPRequestHandler):
             thinking_budget=(
                 self.thinking_budget
                 if self.thinking_budget is not None
-                else getattr(
-                    self.response_generator.cli_args, "thinking_budget", None
-                )
+                else getattr(self.response_generator.cli_args, "thinking_budget", None)
             ),
         )
 
