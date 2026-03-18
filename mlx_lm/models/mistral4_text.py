@@ -136,6 +136,7 @@ class Mistral4Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        attn_scale: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
@@ -172,16 +173,7 @@ class Mistral4Attention(nn.Module):
         query_states = mx.concatenate([q_nope, q_rope], axis=-1)
         key_states = mx.concatenate([k_nope, k_rope], axis=-1)
 
-        # Apply Llama-4 attention scaling
-        if self.args.rope_parameters is not None:
-            llama_4_beta = self.args.rope_parameters.get("llama_4_scaling_beta", 0.1)
-            original_max_pos = self.args.rope_parameters.get(
-                "original_max_position_embeddings", 8192
-            )
-            attn_scale = _get_llama_4_attn_scale(
-                L, offset, llama_4_beta, original_max_pos
-            )
-            query_states = query_states * attn_scale.astype(query_states.dtype)
+        query_states = query_states * attn_scale
 
         if cache is not None:
             key_states, v = cache.update_and_fetch(key_states, v)
@@ -300,10 +292,11 @@ class Mistral4DecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        attn_scale: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), attn_scale, mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
@@ -312,6 +305,7 @@ class Mistral4DecoderLayer(nn.Module):
 class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         PipelineMixin.__init__(self)
+        self.args = args
         self.vocab_size = args.vocab_size
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
@@ -329,10 +323,19 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
+
+        offset = cache[0].offset if cache[0] is not None else 0
         mask = create_attention_mask(h, cache[0], return_array=True)
 
+        attn_scale = _get_llama_4_attn_scale(
+            x.shape[1],
+            offset,
+            self.args.rope_parameters["llama_4_scaling_beta"],
+            self.args.rope_parameters["original_max_position_embeddings"],
+        ).astype(h.dtype)
+
         for l, c in zip(self.pipeline_layers, cache):
-            h = l(h, mask, cache=c)
+            h = l(h, attn_scale, mask, cache=c)
 
         return self.norm(h)
 
