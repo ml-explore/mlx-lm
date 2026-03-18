@@ -1024,6 +1024,11 @@ class BatchKVCache(_BaseCache):
     def merge(cls, caches):
         lengths = [c.size() for c in caches]
         max_length = max(lengths)
+
+        # No cache has content so make an empty one
+        if max_length == 0:
+            return BatchKVCache([0] * len(caches))
+
         padding = [max_length - l for l in lengths]
         B = len(caches)
         H = max(c.keys.shape[1] for c in caches if c.keys is not None)
@@ -1351,6 +1356,11 @@ class BatchRotatingKVCache(_BaseCache):
         offsets = [c.offset for c in caches]
         lengths = [c.size() for c in caches]
         max_length = max(lengths)
+
+        # No cache has content so make an empty one
+        if max_length == 0:
+            return cls(caches[0].max_size, [0] * len(caches))
+
         padding = [max_length - l for l in lengths]
         B = len(caches)
         H = max(c.keys.shape[1] for c in caches if c.keys is not None)
