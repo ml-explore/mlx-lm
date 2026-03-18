@@ -1547,7 +1547,7 @@ class LRUPromptCache:
                 return cache, tokens[prefix:]
 
         if short_length > 0:
-            cache_entry = self._get(result.model, result.shorter)
+            cache_entry = self._trie.get(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
