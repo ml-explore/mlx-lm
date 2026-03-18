@@ -50,7 +50,7 @@ class ModelArgs(BaseModelArgs):
     rope_interleave: Optional[bool] = None
     attention_bias: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = None
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self, **kwargs):
         if self.qk_head_dim is None:
@@ -59,20 +59,9 @@ class ModelArgs(BaseModelArgs):
         if self.head_dim is None:
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
-        if self.rope_parameters is None:
-            self.rope_parameters = {
-                "type": "yarn",
-                "rope_theta": 10000.0,
-                "factor": 128.0,
-                "original_max_position_embeddings": 8192,
-                "max_position_embeddings": self.max_position_embeddings,
-                "beta_fast": 32.0,
-                "beta_slow": 1.0,
-                "mscale_all_dim": 1.0,
-                "mscale": 1.0,
-                "llama_4_scaling_beta": 0.1,
-                "partial_rotary_factor": self.qk_rope_head_dim / self.head_dim,
-            }
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 class Mistral4Attention(nn.Module):
