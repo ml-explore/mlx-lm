@@ -5,7 +5,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
 
 from . import llama, ministral3, mistral4_text
 from .base import BaseModelArgs
@@ -50,12 +49,22 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
-        weights = tree_unflatten(list(weights.items()))
-        weights.pop("vision_tower", None)
-        weights.pop("multi_modal_projector", None)
-        lm_weights = dict(tree_flatten(weights["language_model"]))
-        weights["language_model"] = self.language_model.sanitize(lm_weights)
-        return dict(tree_flatten(weights))
+        sanitized = {}
+        for key, value in weights.items():
+            if "vision_tower" in key or "multi_modal_projector" in key:
+                continue
+            if key.startswith("model."):
+                key = key[len("model."):]
+            sanitized[key] = value
+
+        lm_weights = {
+            k[len("language_model."):]: v
+            for k, v in sanitized.items()
+            if k.startswith("language_model.")
+        }
+
+        sanitized_lm = self.language_model.sanitize(lm_weights)
+        return {"language_model." + k: v for k, v in sanitized_lm.items()}
 
     @property
     def layers(self):
