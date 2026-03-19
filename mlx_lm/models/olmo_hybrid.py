@@ -64,7 +64,7 @@ class RMSNormGated(nn.Module):
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         normed = mx.fast.rms_norm(x, self.weight, self.eps)
-        return normed * nn.silu(gate.astype(mx.float32)).astype(x.dtype)
+        return normed * nn.silu(gate)
 
 
 class GatedDeltaNet(nn.Module):
