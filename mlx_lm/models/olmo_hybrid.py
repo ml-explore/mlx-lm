@@ -1,7 +1,4 @@
-# Copyright © 2025 Apple Inc.
-# OLMo Hybrid (GatedDeltaNet + Full Attention) MLX implementation
-
-from __future__ import annotations
+# Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -22,42 +19,37 @@ from .rope_utils import initialize_rope
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "olmo_hybrid"
-    hidden_size: int = 3840
-    intermediate_size: int = 11008
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 30
-    num_key_value_heads: int = 30
-    rms_norm_eps: float = 1e-6
-    vocab_size: int = 100352
-    max_position_embeddings: int = 65536
+    model_type: str
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    rms_norm_eps: float
+    vocab_size: int
+    max_position_embeddings: int
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
+    linear_allow_neg_eigval: bool
+    tie_word_embeddings: bool
+    attention_bias: bool
+    layer_norm_epsilon: float = 1e-5
+    head_dim: Optional[int] = None
     layer_types: Optional[List[str]] = None
-    # RoPE is stored as a nested dict in config.json
     rope_parameters: Optional[Dict] = None
-    # Linear attention params
-    linear_num_key_heads: int = 30
-    linear_num_value_heads: int = 30
-    linear_key_head_dim: int = 96
-    linear_value_head_dim: int = 192
-    linear_conv_kernel_dim: int = 4
-    linear_allow_neg_eigval: bool = True
-    tie_word_embeddings: bool = False
-    attention_bias: bool = False
-
-    # Derived fields (populated in __post_init__)
-    rope_theta: Optional[float] = 10000.0
-    head_dim: int = 0
+    rope_theta: Optional[float] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-        if self.head_dim == 0:
+        if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.rope_parameters is not None:
-            # Explicit rope_theta: null in config → NoPE mode
-            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0) or 10000.0
         if self.layer_types is None:
-            # Default: full_attention every 4th layer
             self.layer_types = [
                 "full_attention" if (i % 4 == 3) else "linear_attention"
                 for i in range(self.num_hidden_layers)
@@ -65,35 +57,17 @@ class ModelArgs(BaseModelArgs):
 
 
 class RMSNormGated(nn.Module):
-    """
-    RMSNorm followed by a multiplicative SiLU gate.
-
-    Matches OlmoHybridRMSNormGated: norm(x) * silu(gate), where norm includes
-    a learnable weight and float32 accumulation.
-    """
-
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = mx.ones(hidden_size)
         self.eps = eps
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
-        # mx.fast.rms_norm accumulates in float32 internally
         normed = mx.fast.rms_norm(x, self.weight, self.eps)
-        # Gate in float32, result kept in original dtype
         return normed * nn.silu(gate.astype(mx.float32)).astype(x.dtype)
 
 
 class GatedDeltaNet(nn.Module):
-    """
-    GatedDeltaNet linear attention block for OLMo Hybrid.
-
-    Key differences from Qwen3NextGatedDeltaNet:
-    - Separate q/k/v/a/b/g projections (not fused)
-    - Per-projection conv1d for q, k, v (not a single fused conv)
-    - allow_neg_eigval: scale beta by 2.0 to allow range [0, 2]
-    """
-
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.num_v_heads = args.linear_num_value_heads
@@ -113,8 +87,6 @@ class GatedDeltaNet(nn.Module):
         self.g_proj = nn.Linear(args.hidden_size, self.value_dim, bias=False)
         self.o_proj = nn.Linear(self.value_dim, args.hidden_size, bias=False)
 
-        # Separate depthwise conv1d for each of q, k, v
-        # padding=0 because we manually prepend the conv state
         self.q_conv1d = nn.Conv1d(
             in_channels=self.key_dim,
             out_channels=self.key_dim,
@@ -140,12 +112,10 @@ class GatedDeltaNet(nn.Module):
             padding=0,
         )
 
-        # Learnable decay parameters
         self.A_log = mx.zeros(self.num_v_heads)
         self.dt_bias = mx.zeros(self.num_v_heads)
 
-        # Output norm: per-head RMSNorm + SiLU gate, eps=1e-5 to match FLA default
-        self.o_norm = RMSNormGated(self.head_v_dim, eps=1e-5)
+        self.o_norm = RMSNormGated(self.head_v_dim, eps=args.layer_norm_epsilon)
 
     def _apply_conv1d(
         self,
@@ -155,14 +125,12 @@ class GatedDeltaNet(nn.Module):
         cache_slot: Optional[Any],
         slot_idx: int,
     ) -> mx.array:
-        """Apply a single depthwise conv1d with state management."""
         B, S, D = x.shape
         n_keep = self.conv_kernel_size - 1
 
         if conv_state is not None:
             padded = mx.concatenate([conv_state, x], axis=1)
         else:
-            # Zero-pad with kernel_size-1 zeros
             padded = mx.concatenate(
                 [mx.zeros((B, n_keep, D), dtype=x.dtype), x], axis=1
             )
@@ -192,33 +160,26 @@ class GatedDeltaNet(nn.Module):
         k = self._apply_conv1d(k, self.k_conv1d, conv_k_state, cache, 1)
         v = self._apply_conv1d(v, self.v_conv1d, conv_v_state, cache, 2)
 
-        # Reshape into heads
         q = q.reshape(B, S, self.num_k_heads, self.head_k_dim)
         k = k.reshape(B, S, self.num_k_heads, self.head_k_dim)
         v = v.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
-        # Expand q and k when num_v_heads > num_k_heads (multi-head expansion)
         if self.num_v_heads > self.num_k_heads:
             repeat = self.num_v_heads // self.num_k_heads
             q = mx.repeat(q, repeat, axis=2)
             k = mx.repeat(k, repeat, axis=2)
 
-        # Normalize q and k: l2norm(x)/sqrt(Dk) ≡ rms_norm(x) * inv_scale^2
-        # l2norm(x) ≡ rms_norm(x) * inv_scale
         inv_scale = self.head_k_dim ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        # Beta (write strength): optionally scaled by 2 for allow_neg_eigval
-        beta = mx.sigmoid(self.b_proj(x))  # [B, S, num_v_heads]
+        beta = mx.sigmoid(self.b_proj(x))
         if self.allow_neg_eigval:
             beta = beta * 2.0
 
-        # Decay gate g
-        a = self.a_proj(x)  # [B, S, num_v_heads]
-        g = compute_g(self.A_log, a, self.dt_bias)  # [B, S, num_v_heads]
+        a = self.a_proj(x)
+        g = compute_g(self.A_log, a, self.dt_bias)
 
-        # Recurrent state
         state = cache[3] if (cache is not None and cache[3] is not None) else None
         if state is None:
             state = mx.zeros(
@@ -226,7 +187,6 @@ class GatedDeltaNet(nn.Module):
                 dtype=mx.float32,
             )
 
-        # Use Metal kernel for inference, ops for training
         use_kernel = (
             not self.training
             and mx.default_device() == mx.gpu
@@ -241,24 +201,16 @@ class GatedDeltaNet(nn.Module):
             cache[3] = state
             cache.advance(S)
 
-        # Gate and output normalization (per-head, with float32 gate)
-        # out: [B, S, Hv, Dv] → (-1, Dv), gate: [B, S, Hv*Dv] → (-1, Dv)
-        gate = self.g_proj(x)  # [B, S, value_dim = Hv*Dv]
+        gate = self.g_proj(x)
         out = out.reshape(-1, self.head_v_dim)
         gate = gate.reshape(-1, self.head_v_dim)
         out = self.o_norm(out, gate)
-        out = out.reshape(B, S, -1)  # [B, S, value_dim]
+        out = out.reshape(B, S, -1)
 
         return self.o_proj(out)
 
 
 class Attention(nn.Module):
-    """
-    Multi-head attention for OLMo Hybrid full-attention layers.
-
-    Uses q_norm and k_norm (RMSNorm on full projected q/k) plus RoPE.
-    """
-
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
@@ -274,20 +226,14 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(args.hidden_size, total_kv_dim, bias=args.attention_bias)
         self.o_proj = nn.Linear(total_q_dim, args.hidden_size, bias=args.attention_bias)
 
-        # Norms applied to the full (pre-split) projections
         self.q_norm = nn.RMSNorm(total_q_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(total_kv_dim, eps=args.rms_norm_eps)
 
-        # RoPE is optional — NoPE mode when rope_theta is None
-        self.rope = (
-            initialize_rope(
-                self.head_dim,
-                base=args.rope_theta,
-                traditional=False,
-                max_position_embeddings=args.max_position_embeddings,
-            )
-            if args.rope_theta is not None
-            else None
+        self.rope = initialize_rope(
+            self.head_dim,
+            base=args.rope_theta,
+            traditional=False,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -298,23 +244,19 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
-        # Project and normalize before splitting into heads
         q = self.q_norm(self.q_proj(x))
         k = self.k_norm(self.k_proj(x))
         v = self.v_proj(x)
 
-        # Split into heads: [B, heads, L, head_dim]
         q = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # Apply RoPE (skipped in NoPE mode)
         if cache is not None:
-            if self.rope is not None:
-                q = self.rope(q, offset=cache.offset)
-                k = self.rope(k, offset=cache.offset)
+            q = self.rope(q, offset=cache.offset)
+            k = self.rope(k, offset=cache.offset)
             k, v = cache.update_and_fetch(k, v)
-        elif self.rope is not None:
+        else:
             q = self.rope(q)
             k = self.rope(k)
 
@@ -337,21 +279,10 @@ class MLP(nn.Module):
 
 
 class LinearAttentionDecoderLayer(nn.Module):
-    """
-    Decoder layer with GatedDeltaNet linear attention.
-
-    Normalization style (pre-norm for both sub-blocks):
-      - input_layernorm → linear_attn → residual
-      - post_attention_layernorm → mlp → residual
-    """
-
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.linear_attn = GatedDeltaNet(args)
         self.mlp = MLP(args)
-        # Use transformers attribute names so fine-tuned models load directly.
-        # Original checkpoint names (attention_layer_norm, feedforward_layer_norm)
-        # are remapped in sanitize().
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
@@ -363,27 +294,16 @@ class LinearAttentionDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        # Linear attention sub-block (pre-norm)
         h = x + self.linear_attn(self.input_layernorm(x), mask=mask, cache=cache)
-        # MLP sub-block (pre-norm)
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
 
 
 class FullAttentionDecoderLayer(nn.Module):
-    """
-    Decoder layer with standard multi-head attention.
-
-    Normalization style (post-norm for both sub-blocks):
-      - self_attn → post_attention_layernorm → residual
-      - mlp → post_feedforward_layernorm → residual
-    """
-
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.self_attn = Attention(args)
         self.mlp = MLP(args)
-        # Names match the checkpoint weight keys directly
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
@@ -397,9 +317,7 @@ class FullAttentionDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        # Attention sub-block (post-norm)
         h = x + self.post_attention_layernorm(self.self_attn(x, mask=mask, cache=cache))
-        # MLP sub-block (post-norm)
         out = h + self.post_feedforward_layernorm(self.mlp(h))
         return out
 
@@ -416,7 +334,6 @@ class OlmoHybridModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        # Track which layer index holds the first full-attention (for mask creation)
         self._fa_idx = next(
             i for i, lt in enumerate(args.layer_types) if lt == "full_attention"
         )
@@ -470,7 +387,6 @@ class Model(nn.Module):
         caches = []
         for lt in self.args.layer_types:
             if lt == "linear_attention":
-                # [conv_q_state, conv_k_state, conv_v_state, recurrent_state]
                 caches.append(ArraysCache(size=4))
             else:
                 caches.append(KVCache())
@@ -479,10 +395,8 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized = {}
         for k, v in weights.items():
-            # Transpose depthwise conv1d weights: (out, 1, kernel) → (out, kernel, 1)
             if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
                 v = v.moveaxis(2, 1)
-            # Remap original checkpoint norm names to transformers attribute names
             k = k.replace(".attention_layer_norm.", ".input_layernorm.")
             k = k.replace(".feedforward_layer_norm.", ".post_attention_layernorm.")
             sanitized[k] = v
