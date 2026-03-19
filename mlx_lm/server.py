@@ -634,6 +634,12 @@ def _make_logits_processors(args, tokenizer=None, prompt=None):
                 args.thinking_budget,
                 prompt,
                 eos_token_ids=frozenset(tokenizer.eos_token_ids),
+                tool_call_start_id=getattr(
+                    tokenizer, "tool_call_start_id", None
+                ),
+                tool_call_end_id=getattr(
+                    tokenizer, "tool_call_end_id", None
+                ),
             )
         )
     elif args.thinking_budget is not None and tokenizer is not None:

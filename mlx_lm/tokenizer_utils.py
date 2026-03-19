@@ -289,6 +289,8 @@ class TokenizerWrapper:
         self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
+        self._tool_call_start_id = None
+        self._tool_call_end_id = None
 
         vocab = tokenizer.get_vocab()
         THINK_TOKENS = [
@@ -310,6 +312,11 @@ class TokenizerWrapper:
             self._tool_call_start = None
             self._tool_call_end = None
             self._tool_parser = None
+        else:
+            if tool_call_start and tool_call_start in vocab:
+                self._tool_call_start_id = vocab[tool_call_start]
+            if tool_call_end and tool_call_end in vocab:
+                self._tool_call_end_id = vocab[tool_call_end]
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
@@ -362,8 +369,16 @@ class TokenizerWrapper:
         return self._tool_call_start
 
     @property
+    def tool_call_start_id(self):
+        return self._tool_call_start_id
+
+    @property
     def tool_call_end(self):
         return self._tool_call_end
+
+    @property
+    def tool_call_end_id(self):
+        return self._tool_call_end_id
 
     @property
     def tool_parser(self):

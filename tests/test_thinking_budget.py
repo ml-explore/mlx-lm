@@ -587,5 +587,127 @@ class TestEosMaskingDuringThinking(unittest.TestCase):
         self.assertEqual(result[0, 0].item(), MASKED_LOGIT_VALUE)
 
 
+TC_START_ID = 200
+TC_END_ID = 201
+
+
+class TestToolCallAwareness(unittest.TestCase):
+    """ThinkingBudgetProcessor pauses budget enforcement during tool calls.
+
+    When the model enters a <tool_call> block, the processor must not
+    force </think> — doing so would corrupt JSON arguments.  Budget
+    enforcement resumes after </tool_call>.
+    """
+
+    def _make_proc(self, budget=5):
+        return ThinkingBudgetProcessor(
+            THINK_START,
+            THINK_END,
+            budget,
+            eos_token_ids=frozenset({EOS_ID}),
+            tool_call_start_id=TC_START_ID,
+            tool_call_end_id=TC_END_ID,
+            in_thinking=True,
+        )
+
+    def test_no_forced_close_during_tool_call(self):
+        """Budget exceeded mid-tool-call must NOT force </think>."""
+        proc = self._make_proc(budget=2)
+        # 2 thinking tokens → budget hit
+        proc(mx.array([THINK_START, 50]), _logits())       # count=1
+        proc(mx.array([THINK_START, 50, 51]), _logits())   # count=2, budget=2
+
+        # Enter tool call — budget enforcement should pause
+        proc(mx.array([THINK_START, 50, 51, TC_START_ID]), _logits())
+
+        # Token inside tool call — must not force close
+        result = proc(mx.array([THINK_START, 50, 51, TC_START_ID, 60]), _logits())
+        self.assertNotEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+        # </think> must be masked (not just not-forced, but actively blocked)
+        self.assertEqual(result[0, THINK_END].item(), MASKED_LOGIT_VALUE)
+
+    def test_budget_resumes_after_tool_call_end(self):
+        """After </tool_call>, budget enforcement resumes."""
+        proc = self._make_proc(budget=2)
+        tokens = [THINK_START, 50, 51]  # count=2, budget hit
+        proc(mx.array(tokens[:2]), _logits())
+        proc(mx.array(tokens), _logits())
+
+        # Enter and exit tool call
+        tokens.append(TC_START_ID)
+        proc(mx.array(tokens), _logits())
+        tokens.append(60)  # tool call content
+        proc(mx.array(tokens), _logits())
+        tokens.append(TC_END_ID)
+        proc(mx.array(tokens), _logits())
+
+        # Next thinking token — budget should be enforced again
+        tokens.append(70)
+        result = proc(mx.array(tokens), _logits())
+        self.assertEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+
+    def test_eos_not_masked_during_tool_call(self):
+        """EOS masking (thinking) should not apply inside tool calls."""
+        proc = self._make_proc(budget=100)
+        proc(mx.array([THINK_START, 50]), _logits())  # in_thinking, count=1
+
+        # Enter tool call
+        proc(mx.array([THINK_START, 50, TC_START_ID]), _logits())
+
+        # Inside tool call — EOS should NOT be masked
+        result = proc(mx.array([THINK_START, 50, TC_START_ID, 60]), _logits())
+        self.assertNotEqual(result[0, EOS_ID].item(), MASKED_LOGIT_VALUE)
+
+    def test_think_end_masked_during_tool_call(self):
+        """</think> is actively masked during tool calls (not just budget paused).
+
+        Prevents both forced AND spontaneous </think> emission mid-tool-call.
+        Quantised models under context pressure can emit </think> spontaneously
+        even without budget forcing.
+        """
+        proc = self._make_proc(budget=100)
+        proc(mx.array([THINK_START, 50]), _logits())
+
+        # Enter tool call
+        proc(mx.array([THINK_START, 50, TC_START_ID]), _logits())
+
+        # </think> must be masked
+        result = proc(mx.array([THINK_START, 50, TC_START_ID, 60]), _logits())
+        self.assertEqual(result[0, THINK_END].item(), MASKED_LOGIT_VALUE)
+        # Other tokens remain unaffected
+        self.assertEqual(result[0, 0].item(), 0.0)
+
+    def test_passthrough_without_tool_call_ids(self):
+        """Without tool_call IDs, processor ignores tool call tokens."""
+        proc = ThinkingBudgetProcessor(
+            THINK_START,
+            THINK_END,
+            budget=2,
+            eos_token_ids=frozenset({EOS_ID}),
+            # No tool_call_start_id / tool_call_end_id
+            in_thinking=True,
+        )
+        proc(mx.array([THINK_START, 50]), _logits())       # count=1
+        proc(mx.array([THINK_START, 50, 51]), _logits())   # count=2
+
+        # TC_START_ID is just a regular token, budget still enforced
+        result = proc(mx.array([THINK_START, 50, 51, TC_START_ID]), _logits())
+        self.assertEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+
+    def test_tool_call_inside_reasoning_no_forced_close(self):
+        """Tool call emitted while in_thinking — budget paused immediately."""
+        proc = self._make_proc(budget=1)
+        # 1 thinking token → budget hit
+        proc(mx.array([THINK_START, 50]), _logits())  # count=1, budget=1
+
+        # Model emits <tool_call> instead of </think>
+        proc(mx.array([THINK_START, 50, TC_START_ID]), _logits())
+
+        # Inside tool call — </think> must be masked, not forced
+        result = proc(mx.array([THINK_START, 50, TC_START_ID, 60]), _logits())
+        self.assertEqual(result[0, THINK_END].item(), MASKED_LOGIT_VALUE)
+        self.assertNotEqual(result[0, THINK_END].item(), FORCED_LOGIT_VALUE)
+
+
 if __name__ == "__main__":
     unittest.main()

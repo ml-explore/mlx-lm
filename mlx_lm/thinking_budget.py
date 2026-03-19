@@ -37,6 +37,12 @@ class ThinkingBudgetProcessor:
     ``finish_reason=stop`` with no content.  One step is the minimal
     intervention: after the first non-EOS token, autoregressive momentum
     carries generation forward.
+
+    Tool-call awareness: when the model enters a ``<tool_call>`` block, budget
+    enforcement is paused until ``</tool_call>`` closes it.  This prevents
+    forced ``</think>`` from landing inside JSON arguments and corrupting tool
+    calls — the budget will be enforced on the next thinking token after the
+    tool call completes.
     """
 
     def __init__(
@@ -46,6 +52,8 @@ class ThinkingBudgetProcessor:
         budget: int,
         *,
         eos_token_ids: Optional[FrozenSet[int]] = None,
+        tool_call_start_id: Optional[int] = None,
+        tool_call_end_id: Optional[int] = None,
         in_thinking: bool = False,
     ) -> None:
         if eos_token_ids is not None and think_end_id in eos_token_ids:
@@ -58,9 +66,12 @@ class ThinkingBudgetProcessor:
         self.think_end_id = think_end_id
         self.budget = budget
         self.eos_token_ids = eos_token_ids
+        self.tool_call_start_id = tool_call_start_id
+        self.tool_call_end_id = tool_call_end_id
         self.in_thinking: bool = in_thinking
         self.count: int = 0
         self._thinking_done: bool = False
+        self._in_tool_call: bool = False
         # Lazy-initialised on first EOS-masking call; vocab size is fixed per
         # model so the cache is valid for all subsequent calls.
         self._eos_mask: Optional[mx.array] = None
@@ -74,6 +85,8 @@ class ThinkingBudgetProcessor:
         prompt: Optional[List[int]] = None,
         *,
         eos_token_ids: Optional[FrozenSet[int]] = None,
+        tool_call_start_id: Optional[int] = None,
+        tool_call_end_id: Optional[int] = None,
     ) -> "ThinkingBudgetProcessor":
         """Create a processor, detecting if the prompt starts inside a
         ``<think>`` block (e.g. Qwen3.5 chat templates include ``<think>``
@@ -88,6 +101,8 @@ class ThinkingBudgetProcessor:
             think_end_id,
             budget,
             eos_token_ids=eos_token_ids,
+            tool_call_start_id=tool_call_start_id,
+            tool_call_end_id=tool_call_end_id,
             in_thinking=in_thinking,
         )
 
@@ -106,6 +121,26 @@ class ThinkingBudgetProcessor:
 
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         last_token = tokens[-1].item()
+
+        # --- Tool-call boundary tracking ---
+        # When inside a tool call, pause all budget enforcement so that a
+        # forced </think> never lands inside JSON arguments.
+        if (
+            self.tool_call_start_id is not None
+            and last_token == self.tool_call_start_id
+        ):
+            self._in_tool_call = True
+        elif (
+            self.tool_call_end_id is not None
+            and last_token == self.tool_call_end_id
+        ):
+            self._in_tool_call = False
+
+        if self._in_tool_call:
+            # Mask </think> to prevent both forced and spontaneous emission
+            # mid-tool-call.  </think> inside JSON arguments is never valid.
+            logits[:, self.think_end_id] = MASKED_LOGIT_VALUE
+            return logits
 
         # --- State machine ---
         if last_token == self.think_start_id:
