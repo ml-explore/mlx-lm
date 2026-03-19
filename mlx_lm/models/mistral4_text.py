@@ -1,7 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -416,7 +416,6 @@ class Model(nn.Module):
                     down_key
                 )
 
-            # Handle per-expert weights format
             for m in ["gate_proj", "down_proj", "up_proj"]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
@@ -431,7 +430,6 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
-        rank = group.rank()
 
         for layer in self.model.layers:
             if layer.self_attn.q_lora_rank is None:

@@ -1,4 +1,4 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Optional
@@ -54,11 +54,11 @@ class Model(nn.Module):
             if "vision_tower" in key or "multi_modal_projector" in key:
                 continue
             if key.startswith("model."):
-                key = key[len("model."):]
+                key = key[len("model.") :]
             sanitized[key] = value
 
         lm_weights = {
-            k[len("language_model."):]: v
+            k[len("language_model.") :]: v
             for k, v in sanitized.items()
             if k.startswith("language_model.")
         }
