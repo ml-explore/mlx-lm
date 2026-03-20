@@ -6,6 +6,7 @@ import functools
 import json
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from typing import (
@@ -29,6 +30,7 @@ from .models.cache import (
     BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
+    CompressedKVCache,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -215,6 +217,13 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--compact-kv-budget",
+        type=int,
+        help="If set, use a CompressedKVCache that evicts tokens by L2-norm "
+        "to stay within the given budget.",
+        default=None,
+    )
     return parser
 
 
@@ -300,6 +309,66 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+def maybe_compact_kv_cache(prompt_cache):
+    all_compressed = [c for c in prompt_cache if isinstance(c, CompressedKVCache)]
+    if not all_compressed:
+        return
+
+    # Fail fast on B>1 before doing any norm aggregation work
+    ref_keys = all_compressed[0].keys
+    if ref_keys is not None and ref_keys.shape[0] > 1:
+        raise ValueError(
+            "maybe_compact_kv_cache does not support batch size > 1. "
+            "After eviction, the scalar offset cannot represent "
+            "per-batch RoPE positions. Use BatchKVCache instead."
+        )
+
+    # Validate uniform configuration across all layers
+    ref = all_compressed[0]
+    for i, c in enumerate(all_compressed):
+        if c.budget != ref.budget or c.keep_recent != ref.keep_recent:
+            raise ValueError(
+                f"CompressedKVCache layer {i} diverges from layer 0: "
+                f"budget={c.budget} vs {ref.budget}, "
+                f"keep_recent={c.keep_recent} vs {ref.keep_recent}"
+            )
+
+    # Use hysteresis to avoid compacting on every token: only trigger when
+    # ANY layer has grown meaningfully beyond budget. Once triggered, compact
+    # ALL layers together to maintain cross-layer coherence.
+    should_compact = any(
+        c.size() > c.budget + max(c.keep_recent, 64) for c in all_compressed
+    )
+    if not should_compact:
+        return
+
+    # Verify all layers have the same physical size
+    ref_size = ref.size()
+    for i, c in enumerate(all_compressed):
+        if c.size() != ref_size:
+            raise ValueError(
+                f"CompressedKVCache layer {i} has size {c.size()} "
+                f"vs layer 0 size {ref_size}. All layers must have "
+                f"the same physical size for cross-layer eviction."
+            )
+
+    # Compute shared eviction indices by aggregating norms across all layers.
+    # This ensures the same tokens are kept in every layer (cross-layer coherence)
+    # and reduces argsort from N_layers to 1.
+    # NOTE: Norms are summed unweighted. This is correct for standard
+    # transformers (uniform head_dim/n_kv_heads). Architectures with
+    # heterogeneous KV geometry (e.g. MLA) may need per-layer normalisation.
+    agg_norms = None
+    for c in all_compressed:
+        active_keys = c.keys[..., : c.size(), :]
+        norms = mx.linalg.norm(active_keys, axis=-1).sum(axis=1)  # (B, seq_len)
+        agg_norms = norms if agg_norms is None else agg_norms + norms
+    kept_indices = ref.indices_from_norms(agg_norms)
+
+    for c in all_compressed:
+        c.compact(kept_indices)
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -315,6 +384,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    compact_kv_budget: Optional[int] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -343,6 +413,11 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        compact_kv_budget (int, optional): If provided, use a CompressedKVCache with
+          the given budget. The cache is allowed to grow up to ``budget + margin``
+          tokens before compaction triggers (margin = ``max(keep_recent, 64)``),
+          then compacts back to ``budget``. Mutually exclusive with ``kv_bits``.
+          Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -361,6 +436,12 @@ def generate_step(
             "Either input_embeddings or prompt (or both) must be provided."
         )
 
+    if compact_kv_budget is not None and kv_bits is not None:
+        raise ValueError(
+            "compact_kv_budget and kv_bits (KV quantization) are currently "
+            "mutually exclusive. CompressedKVCache quantization is not yet implemented."
+        )
+
     tokens = None
 
     # Create the KV cache for generation
@@ -368,9 +449,21 @@ def generate_step(
         prompt_cache = cache.make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
+            compact_kv_budget=compact_kv_budget,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+
+    has_compressed = any(isinstance(c, CompressedKVCache) for c in prompt_cache)
+    if compact_kv_budget is not None and not has_compressed:
+        warnings.warn(
+            "compact_kv_budget was set but the provided prompt_cache "
+            "contains no CompressedKVCache layers; budget will be ignored."
+        )
+    if has_compressed:
+        compact_cache_fn = maybe_compact_kv_cache
+    else:
+        compact_cache_fn = lambda _: None
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -411,6 +504,7 @@ def generate_step(
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
+            compact_cache_fn(prompt_cache)
             quantize_cache_fn(prompt_cache)
 
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
@@ -434,6 +528,7 @@ def generate_step(
                     else None
                 ),
             )
+            compact_cache_fn(prompt_cache)
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             prompt_processed_tokens += n_to_process
@@ -665,7 +760,9 @@ def stream_generate(
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
         kwargs: The remaining options get passed to :func:`generate_step`.
-          See :func:`generate_step` for more details.
+          See :func:`generate_step` for more details. Notable options include
+          ``compact_kv_budget`` for L2-norm based KV cache compression and
+          ``max_kv_size`` for a rotating KV cache.
 
     Yields:
         GenerationResponse: An instance containing the generated text segment and
@@ -696,6 +793,12 @@ def stream_generate(
         )
     else:
         kwargs.pop("max_kv_size", None)
+        if kwargs.pop("compact_kv_budget", None) is not None:
+            warnings.warn(
+                "compact_kv_budget is not supported with speculative decoding "
+                "and will be ignored.",
+                UserWarning,
+            )
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
@@ -1526,6 +1629,7 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        compact_kv_budget=args.compact_kv_budget,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
