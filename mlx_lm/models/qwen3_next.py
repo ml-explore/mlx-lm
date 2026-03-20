@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import sum_gradients
 
 from .activations import swiglu
 from .base import (
@@ -53,6 +55,13 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
 
 
+@partial(mx.compile, shapeless=True)
+def _precise_swiglu(h, gate, x):
+    gate = nn.silu(gate.astype(mx.float32))
+    x = x.astype(mx.float32)
+    return (gate * x).astype(h.dtype)
+
+
 class Qwen3NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -64,8 +73,9 @@ class Qwen3NextRMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            x = swiglu(gate, x)
-        return x
+            return _precise_swiglu(hidden_states, gate, x)
+        else:
+            return x.astype(hidden_states.dtype)
 
 
 class Qwen3NextAttention(nn.Module):
@@ -312,10 +322,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
+        self.sharding_group = None
+
     def __call__(
         self,
         x: mx.array,
     ) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
@@ -331,7 +346,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         shared_y = self.shared_expert(x)
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
 
-        return y + shared_y
+        y = y + shared_y
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
 
 
 class Qwen3NextDecoderLayer(nn.Module):

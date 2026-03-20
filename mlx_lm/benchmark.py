@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 import argparse
+import time
 
 import mlx.core as mx
 
@@ -60,6 +61,18 @@ def setup_arg_parser():
         action="store_true",
         help="Quantize activations using the same quantization config as the corresponding layer.",
     )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=0,
+        help="Delay between each test in seconds (default: 0)",
+    )
     return parser
 
 
@@ -103,14 +116,22 @@ def main():
 
     def single_bench():
         for response in stream_generate(
-            model, tokenizer, prompt, max_tokens=generation_tokens
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
         ):
             pass
         return response
 
     def batch_bench():
         return batch_generate(
-            model, tokenizer, prompts, max_tokens=generation_tokens
+            model,
+            tokenizer,
+            prompts,
+            max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
         ).stats
 
     if batch_size == 1:
@@ -125,6 +146,8 @@ def main():
     rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
+        if args.delay > 0:
+            time.sleep(args.delay)
         response = _bench()
         responses.append(response)
         results = [(k, getattr(response, k)) for k in report_keys]

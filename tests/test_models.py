@@ -10,7 +10,11 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
-from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+from mlx_lm.models.gated_delta import (
+    gated_delta_kernel,
+    gated_delta_ops,
+    gated_delta_update,
+)
 from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
@@ -237,6 +241,30 @@ class TestModels(unittest.TestCase):
             scaling_config={"rope_type": "llama3", "factor": 2.0},
         )
         self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
+
+    def test_su_scaled_rope_no_mutation(self):
+        rope = rope_utils.SuScaledRoPE(
+            dims=8,
+            max_position_embeddings=131072,
+            original_max_position_embeddings=4096,
+            long_factor=[1.0] * 4,
+        )
+        x = mx.ones((1, 2, 4, 8))
+        rope(x)
+        mx.eval(x)
+        self.assertTrue((x == 1).all())
+
+    def test_yarn_rope_no_mutation(self):
+        rope = rope_utils.YarnRoPE(
+            dims=8,
+            scaling_factor=2.0,
+            mscale=1.0,
+            mscale_all_dim=0,
+        )
+        x = mx.ones((1, 2, 4, 8))
+        rope(x)
+        mx.eval(x)
+        self.assertTrue((x == 1).all())
 
     def test_quantized_sdpa(self):
         cache = KVCache()
@@ -761,6 +789,104 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_step3p5_make_cache_uses_rotating_for_sliding_layers(self):
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 10000.0, 10000.0, 10000.0],
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            partial_rotary_factors=[0.5, 1.0, 1.0, 0.5],
+            attention_other_setting={
+                "num_attention_heads": 8,
+                "num_attention_groups": 2,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        model = step3p5.Model(args)
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]], dtype=mx.int32)
+        step = model(tokens[:, :3], cache=caches)
+        mx.eval(step)
+        for i in range(3, 7):
+            step = model(tokens[:, i : i + 1], cache=caches)
+            mx.eval(step)
+
+        self.assertEqual(caches[0].size(), 7)
+        self.assertEqual(caches[1].size(), args.sliding_window)
+        self.assertEqual(caches[2].size(), args.sliding_window)
+        self.assertEqual(caches[3].size(), 7)
+
+    def test_step3p5_make_cache_uses_fallback_sliding_pattern(self):
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=5,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            sliding_window=4,
+            partial_rotary_factors=[1.0] * 5,
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3,4",
+        )
+        model = step3p5.Model(args)
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[1], KVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+        self.assertIsInstance(caches[4], RotatingKVCache)
+
+        tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        for i in range(2, 6):
+            step = model(tokens[:, i : i + 1], cache=caches)
+            mx.eval(step)
+
+        self.assertEqual(caches[0].size(), args.sliding_window)
+        self.assertEqual(caches[1].size(), 6)
+        self.assertEqual(caches[2].size(), args.sliding_window)
+        self.assertEqual(caches[3].size(), 6)
+        self.assertEqual(caches[4].size(), args.sliding_window)
 
     def test_cohere(self):
         from mlx_lm.models import cohere
@@ -1585,7 +1711,7 @@ class TestModels(unittest.TestCase):
                 "rms_norm_eps": 1e-5,
                 "vocab_size": 1000,
                 "num_key_value_heads": 2,
-                "partial_rotary_factor": 0,
+                "partial_rotary_factor": 0.5,
                 "rope_theta": 1000,
             },
             {
@@ -1613,7 +1739,7 @@ class TestModels(unittest.TestCase):
                 "use_qk_norm": True,
                 "tie_word_embeddings": False,
                 "attention_bias": False,
-                "partial_rotary_factor": 0.0,
+                "partial_rotary_factor": 0.5,
             },
             {
                 "model_type": "glm4_moe_lite",
@@ -2531,6 +2657,60 @@ class TestModels(unittest.TestCase):
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_precision(self):
+        mx.random.seed(42)
+
+        N_STEPS = 512
+        B = 1
+        Hk = 4
+        Hv = 4
+        Dk = 64
+        Dv = 64
+
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+
+        all_q = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_k = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_v = mx.random.normal(shape=(N_STEPS, B, 1, Hv, Dv)) * 0.1
+        all_a = -7.0 + mx.random.normal(shape=(N_STEPS, B, 1, Hv)) * 0.3
+        all_b = mx.random.normal(shape=(N_STEPS, B, 1, Hv))
+        mx.eval(all_q, all_k, all_v, all_a, all_b, A_log, dt_bias)
+
+        state_ref = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        for t in range(N_STEPS):
+            y_ref, state_ref = gated_delta_update(
+                all_q[t],
+                all_k[t],
+                all_v[t],
+                all_a[t],
+                all_b[t],
+                A_log,
+                dt_bias,
+                state_ref,
+                use_kernel=False,
+            )
+            mx.eval(y_ref, state_ref)
+
+        for use_kernel in (False, True):
+            state_lo = mx.zeros((B, Hv, Dv, Dk), dtype=mx.bfloat16)
+            for t in range(N_STEPS):
+                y_lo, state_lo = gated_delta_update(
+                    all_q[t].astype(mx.bfloat16),
+                    all_k[t].astype(mx.bfloat16),
+                    all_v[t].astype(mx.bfloat16),
+                    all_a[t].astype(mx.bfloat16),
+                    all_b[t].astype(mx.bfloat16),
+                    A_log,
+                    dt_bias,
+                    state_lo,
+                    use_kernel=use_kernel,
+                )
+                mx.eval(y_lo, state_lo)
+
+            self.assertTrue(mx.allclose(state_lo, state_ref, rtol=0.05, atol=0.01))
+            self.assertTrue(mx.allclose(y_lo, y_ref, rtol=0.05, atol=0.01))
 
     def test_gated_delta_masked(self):
         B = 1
