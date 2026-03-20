@@ -12,7 +12,7 @@ MLX LM was developed with contributions from the following individuals:
 OpenBMB's `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's `Mamba v1` and 
 `Mamba v2`, Z.ai & THUKEG's `GLM`, `GLM4`, `GLM5 (GLM MoE DSA)`, Rednote `dots.llm1`, Baidu's `Ernie4.5 MoE`, 
 inclusionAI's `Bailing MoE e.g. Ling-family`, `Bailing MoE Linear e.g. Ling-Linear-family`, 
-Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba` IBM's `Granite MoE`, 
+Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba` IBM's `Granite MoE`, Mistral AI's `Mistral4`, 
 Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's `Apertus`, Nikity's `Lille130m`, 
 Alibaba Qwen's `Qwen3Next`, Tele-AI's `TeleChat3`, and Allenai's `OLMoE` and `Olmo 3`; 
 Helped add support for the following model architectures: 
