@@ -39,7 +39,7 @@ class TestToolCallDedup(unittest.TestCase):
         self.assertFalse(dedup.is_duplicate('{"name":"run"}'))
         self.assertFalse(dedup.is_duplicate('{"name": "run"}'))
 
-    def test_logs_warning_on_duplicate(self, ):
+    def test_logs_warning_on_duplicate(self):
         dedup = ToolCallDedup()
         text = '{"name": "run", "arguments": {}}'
         dedup.is_duplicate(text)
