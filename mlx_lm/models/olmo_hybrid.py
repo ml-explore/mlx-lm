@@ -48,7 +48,7 @@ class ModelArgs(BaseModelArgs):
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.rope_parameters is not None:
-            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0) or 10000.0
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
         if self.layer_types is None:
             self.layer_types = [
                 "full_attention" if (i % 4 == 3) else "linear_attention"
@@ -229,11 +229,15 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(total_q_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(total_kv_dim, eps=args.rms_norm_eps)
 
-        self.rope = initialize_rope(
-            self.head_dim,
-            base=args.rope_theta,
-            traditional=False,
-            max_position_embeddings=args.max_position_embeddings,
+        self.rope = (
+            initialize_rope(
+                self.head_dim,
+                base=args.rope_theta,
+                traditional=False,
+                max_position_embeddings=args.max_position_embeddings,
+            )
+            if args.rope_theta is not None
+            else None
         )
 
     def __call__(
@@ -253,10 +257,11 @@ class Attention(nn.Module):
         v = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            q = self.rope(q, offset=cache.offset)
-            k = self.rope(k, offset=cache.offset)
+            if self.rope is not None:
+                q = self.rope(q, offset=cache.offset)
+                k = self.rope(k, offset=cache.offset)
             k, v = cache.update_and_fetch(k, v)
-        else:
+        elif self.rope is not None:
             q = self.rope(q)
             k = self.rope(k)
 
