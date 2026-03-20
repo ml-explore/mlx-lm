@@ -29,7 +29,6 @@ HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
 
 class TestPromptCache(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()
@@ -661,6 +660,35 @@ class TestPromptCache(unittest.TestCase):
         c2.update_and_fetch(kv, kv)
         c_out = KVCache.merge((c1, c2))
         self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
+
+    def test_merge_rotating_caches_different_offsets(self):
+        max_size = 8
+        H, D = 2, 4
+
+        # c1: short prompt (4 tokens), no rotation
+        c1 = RotatingKVCache(max_size=max_size)
+        k1 = mx.ones((1, H, 4, D))
+        c1.update_and_fetch(k1, k1)
+        self.assertEqual(c1.offset, 4)
+        self.assertEqual(c1._idx, 4)
+        self.assertEqual(c1.size(), 4)
+
+        # c2: long prompt that fills the buffer then wraps with single-token
+        # updates, so _idx wraps around and diverges from size()
+        c2 = RotatingKVCache(max_size=max_size)
+        k2 = mx.full((1, H, max_size, D), 2.0)
+        c2.update_and_fetch(k2, k2)
+        for _ in range(4):
+            k_step = mx.full((1, H, 1, D), 3.0)
+            c2.update_and_fetch(k_step, k_step)
+        self.assertEqual(c2.offset, 12)
+        self.assertEqual(c2.size(), max_size)
+        self.assertTrue(c2._idx < c2.size())  # _idx has wrapped
+
+        # this would crash before the fix with a shape mismatch
+        merged = RotatingKVCache.merge([c1, c2])
+        self.assertEqual(merged.keys.shape, (2, H, max_size, D))
+        self.assertEqual(merged.values.shape, (2, H, max_size, D))
 
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()
