@@ -44,6 +44,12 @@ def setup_arg_parser():
         "--top-p", type=float, default=None, help="Sampling top-p"
     )
     parser.add_argument(
+        "--min-p", type=float, default=None, help="Sampling min-p"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Sampling top-k"
+    )
+    parser.add_argument(
         "--xtc-probability",
         type=float,
         default=DEFAULT_XTC_PROBABILITY,
@@ -125,6 +131,10 @@ def main():
         args.temp = generation_defaults.get("temp", DEFAULT_TEMP)
     if args.top_p is None:
         args.top_p = generation_defaults.get("top_p", DEFAULT_TOP_P)
+    if args.min_p is None:
+        args.min_p = generation_defaults.get("min_p", 0.0)
+    if args.top_k is None:
+        args.top_k = generation_defaults.get("top_k", 0)
     if args.max_tokens is None:
         args.max_tokens = generation_defaults.get("max_tokens", DEFAULT_MAX_TOKENS)
 
@@ -163,6 +173,8 @@ def main():
             sampler=make_sampler(
                 args.temp,
                 args.top_p,
+                min_p=args.min_p,
+                top_k=args.top_k,
                 xtc_threshold=args.xtc_threshold,
                 xtc_probability=args.xtc_probability,
                 xtc_special_tokens=(

@@ -494,6 +494,7 @@ class ModelProvider:
         "top_k": 0,
         "min_p": 0.0,
         "max_tokens": 512,
+        "repetition_penalty": 0.0,
     }
 
     def __init__(self, cli_args: argparse.Namespace):
@@ -773,7 +774,7 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
-    def _compute_prompt_checkpoint(self, tokenizer, request, prompt, args):
+    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
         if request.request_type != "chat":
             return False, -1
         if request.messages[-1]["role"] != "user":
@@ -783,27 +784,13 @@ class ResponseGenerator:
         # the think start token which will likely be removed in the
         # next turn.
         prompt_checkpoint = -1
-        if self._has_thinking(tokenizer, args):
+        if tokenizer.has_thinking:
             for i in range(1, min(11, len(prompt)) - 1, 1):
                 if prompt[-i] == tokenizer.think_start_id:
                     prompt_checkpoint = -i - 1
                     break
 
         return True, prompt_checkpoint
-
-    def _has_thinking(self, tokenizer, args):
-        """Return whether thinking is active for this request.
-
-        Check (in priority order) the per-request chat_template_kwargs, the
-        CLI --chat-template-args, and finally the tokenizer's own capability
-        flag.
-        """
-        if args.chat_template_kwargs and "enable_thinking" in args.chat_template_kwargs:
-            return args.chat_template_kwargs["enable_thinking"]
-        cli_args = self.model_provider.cli_args.chat_template_args
-        if "enable_thinking" in cli_args:
-            return cli_args["enable_thinking"]
-        return tokenizer.has_thinking
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -882,7 +869,7 @@ class ResponseGenerator:
                         tool_call_start=tokenizer.tool_call_start,
                         tool_call_end=tokenizer.tool_call_end,
                         tool_parser=tokenizer.tool_parser,
-                        has_thinking=self._has_thinking(tokenizer, args),
+                        has_thinking=tokenizer.has_thinking,
                         think_start_id=tokenizer.think_start_id,
                         think_end=tokenizer.think_end,
                         think_end_id=tokenizer.think_end_id,
@@ -905,7 +892,7 @@ class ResponseGenerator:
 
                     do_checkpoint, checkpoint_position = (
                         self._compute_prompt_checkpoint(
-                            tokenizer, request, prompt, args
+                            tokenizer, request, prompt
                         )
                     )
 
@@ -1056,7 +1043,7 @@ class ResponseGenerator:
                 tool_call_start=tokenizer.tool_call_start,
                 tool_call_end=tokenizer.tool_call_end,
                 tool_parser=tokenizer.tool_parser,
-                has_thinking=self._has_thinking(tokenizer, args),
+                has_thinking=tokenizer.has_thinking,
                 think_start_id=tokenizer.think_start_id,
                 think_end=tokenizer.think_end,
                 think_end_id=tokenizer.think_end_id,
@@ -1293,9 +1280,7 @@ class APIHandler(BaseHTTPRequestHandler):
         )
         self.repetition_penalty = self.body.get(
             "repetition_penalty",
-            self.response_generator.generation_config.get(
-                "repetition_penalty", 0.0
-            ),
+            self.response_generator.resolve_default("repetition_penalty"),
         )
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.presence_penalty = self.body.get("presence_penalty", 0.0)
