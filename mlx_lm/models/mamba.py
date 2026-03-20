@@ -133,7 +133,7 @@ class MambaBlock(nn.Module):
         conv_out = self.conv1d(x_full)
         new_conv_cache = x_full[:, -(K - 1) :, :]
         x = nn.silu(conv_out)
-        A = -mx.exp(self.A_log)
+        A = -mx.exp(self.A_log.astype(mx.float32))
         current_state = state_cache
         y = []
         for t in range(T):
