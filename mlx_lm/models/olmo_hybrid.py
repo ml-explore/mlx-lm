@@ -165,11 +165,6 @@ class GatedDeltaNet(nn.Module):
         k = k.reshape(B, S, self.num_k_heads, self.head_k_dim)
         v = v.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
-        if self.num_v_heads > self.num_k_heads:
-            repeat = self.num_v_heads // self.num_k_heads
-            q = mx.repeat(q, repeat, axis=2)
-            k = mx.repeat(k, repeat, axis=2)
-
         inv_scale = self.head_k_dim ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
