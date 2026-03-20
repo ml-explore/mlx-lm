@@ -50,5 +50,45 @@ class TestTunerTrainer(unittest.TestCase):
         run(3, 4, 8)
 
 
+from unittest.mock import MagicMock
+
+from mlx_lm.tuner.datasets import ChatDataset, CompletionsDataset, TextDataset
+
+
+def make_tokenizer():
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template = lambda msgs, **kw: [1, 2, 3, 4, 5]
+    tokenizer.eos_token_id = 2
+    tokenizer.encode = lambda text: [1, 2, 3]
+    return tokenizer
+
+
+class TestIterateBatchesWithDatasets(unittest.TestCase):
+    def test_chat_dataset(self):
+        data = [
+            {"messages": [{"role": "user", "content": f"msg{i}"}]} for i in range(4)
+        ]
+        dataset = ChatDataset(data, make_tokenizer())
+        batches = iterate_batches(dataset, batch_size=2, max_seq_length=512)
+        batch, lengths = next(batches)
+        self.assertIsNotNone(batch)
+
+    def test_text_dataset(self):
+        data = [{"text": f"hello {i}"} for i in range(4)]
+        dataset = TextDataset(data, make_tokenizer())
+        batches = iterate_batches(dataset, batch_size=2, max_seq_length=512)
+        batch, lengths = next(batches)
+        self.assertIsNotNone(batch)
+
+    def test_completions_dataset(self):
+        data = [{"prompt": f"q{i}", "completion": f"a{i}"} for i in range(4)]
+        dataset = CompletionsDataset(
+            data, make_tokenizer(), "prompt", "completion", False
+        )
+        batches = iterate_batches(dataset, batch_size=2, max_seq_length=512)
+        batch, lengths = next(batches)
+        self.assertIsNotNone(batch)
+
+
 if __name__ == "__main__":
     unittest.main()
