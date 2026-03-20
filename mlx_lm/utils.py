@@ -276,6 +276,56 @@ def load_config(model_path: Path) -> dict:
         if eos_token_id := generation_config.get("eos_token_id", False):
             config["eos_token_id"] = eos_token_id
 
+    config["generation_config"] = load_generation_config(model_path)
+
+    return config
+
+
+def load_generation_config(model_path: Path) -> dict:
+    """
+    Load generation defaults from ``generation_config.json`` if present.
+
+    The returned dictionary uses the parameter names expected by
+    :func:`generate` / :func:`stream_generate` (e.g. ``temp`` instead of
+    ``temperature``).  Only keys that are actually present in the file are
+    included, so callers can treat the result as a sparse set of overrides.
+
+    Args:
+        model_path (Path): The local model directory.
+
+    Returns:
+        dict: A (possibly empty) mapping of generation parameter names to
+        their default values.
+    """
+    generation_config_file = model_path / "generation_config.json"
+    if not generation_config_file.exists():
+        return {}
+
+    try:
+        with open(generation_config_file, "r") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    # Map HuggingFace generation_config keys to mlx-lm parameter names.
+    key_map = {
+        "temperature": "temp",
+        "top_p": "top_p",
+        "top_k": "top_k",
+        "min_p": "min_p",
+        "max_new_tokens": "max_tokens",
+        "repetition_penalty": "repetition_penalty",
+    }
+
+    config = {}
+    for hf_key, mlx_key in key_map.items():
+        if hf_key in raw:
+            config[mlx_key] = raw[hf_key]
+
+    # When do_sample is explicitly false, force greedy decoding.
+    if raw.get("do_sample") is False:
+        config["temp"] = 0.0
+
     return config
 
 
