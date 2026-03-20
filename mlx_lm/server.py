@@ -520,15 +520,22 @@ class ModelProvider:
             self.load(self.cli_args.model, draft_model_path="default_model")
 
     def _apply_generation_defaults(self, generation_config):
-        """Fill in CLI args that the user left unset, using values from
-        the model's generation_config.json (if any), then hardcoded defaults.
+        """Store the model's generation_config so it can be consulted at
+        request time.  Does *not* mutate ``cli_args``; the resolution
+        chain (user CLI arg > generation_config > hardcoded default) is
+        evaluated lazily via :meth:`resolve_default`.
         """
         self.generation_config = generation_config
-        for key, hardcoded in self._server_defaults.items():
-            if getattr(self.cli_args, key) is None:
-                setattr(
-                    self.cli_args, key, generation_config.get(key, hardcoded)
-                )
+
+    def resolve_default(self, key):
+        """Return the effective default for *key*.
+
+        Priority: user-supplied CLI arg > generation_config.json > hardcoded.
+        """
+        cli_val = getattr(self.cli_args, key, None)
+        if cli_val is not None:
+            return cli_val
+        return self.generation_config.get(key, self._server_defaults.get(key))
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
@@ -766,7 +773,7 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
-    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
+    def _compute_prompt_checkpoint(self, tokenizer, request, prompt, args):
         if request.request_type != "chat":
             return False, -1
         if request.messages[-1]["role"] != "user":
@@ -776,13 +783,27 @@ class ResponseGenerator:
         # the think start token which will likely be removed in the
         # next turn.
         prompt_checkpoint = -1
-        if tokenizer.has_thinking:
+        if self._has_thinking(tokenizer, args):
             for i in range(1, min(11, len(prompt)) - 1, 1):
                 if prompt[-i] == tokenizer.think_start_id:
                     prompt_checkpoint = -i - 1
                     break
 
         return True, prompt_checkpoint
+
+    def _has_thinking(self, tokenizer, args):
+        """Return whether thinking is active for this request.
+
+        Check (in priority order) the per-request chat_template_kwargs, the
+        CLI --chat-template-args, and finally the tokenizer's own capability
+        flag.
+        """
+        if args.chat_template_kwargs and "enable_thinking" in args.chat_template_kwargs:
+            return args.chat_template_kwargs["enable_thinking"]
+        cli_args = self.model_provider.cli_args.chat_template_args
+        if "enable_thinking" in cli_args:
+            return cli_args["enable_thinking"]
+        return tokenizer.has_thinking
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -861,7 +882,7 @@ class ResponseGenerator:
                         tool_call_start=tokenizer.tool_call_start,
                         tool_call_end=tokenizer.tool_call_end,
                         tool_parser=tokenizer.tool_parser,
-                        has_thinking=tokenizer.has_thinking,
+                        has_thinking=self._has_thinking(tokenizer, args),
                         think_start_id=tokenizer.think_start_id,
                         think_end=tokenizer.think_end,
                         think_end_id=tokenizer.think_end_id,
@@ -883,7 +904,9 @@ class ResponseGenerator:
                         cache = make_prompt_cache(self.model_provider.model)
 
                     do_checkpoint, checkpoint_position = (
-                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
+                        self._compute_prompt_checkpoint(
+                            tokenizer, request, prompt, args
+                        )
                     )
 
                     (uid,) = batch_generator.insert(
@@ -1033,7 +1056,7 @@ class ResponseGenerator:
                 tool_call_start=tokenizer.tool_call_start,
                 tool_call_end=tokenizer.tool_call_end,
                 tool_parser=tokenizer.tool_parser,
-                has_thinking=tokenizer.has_thinking,
+                has_thinking=self._has_thinking(tokenizer, args),
                 think_start_id=tokenizer.think_start_id,
                 think_end=tokenizer.think_end,
                 think_end_id=tokenizer.think_end_id,
@@ -1144,6 +1167,9 @@ class ResponseGenerator:
     def generation_config(self):
         return self.model_provider.generation_config
 
+    def resolve_default(self, key):
+        return self.model_provider.resolve_default(key)
+
 
 class APIHandler(BaseHTTPRequestHandler):
     def __init__(
@@ -1251,14 +1277,20 @@ class APIHandler(BaseHTTPRequestHandler):
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
+                "max_tokens", self.response_generator.resolve_default("max_tokens")
             )
         self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
+            "temperature", self.response_generator.resolve_default("temp")
         )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
+        self.top_p = self.body.get(
+            "top_p", self.response_generator.resolve_default("top_p")
+        )
+        self.top_k = self.body.get(
+            "top_k", self.response_generator.resolve_default("top_k")
+        )
+        self.min_p = self.body.get(
+            "min_p", self.response_generator.resolve_default("min_p")
+        )
         self.repetition_penalty = self.body.get(
             "repetition_penalty",
             self.response_generator.generation_config.get(
