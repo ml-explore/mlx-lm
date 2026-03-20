@@ -514,7 +514,7 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(c, [MockCache("test3")])
         self.assertEqual(t, [])
 
-        cache.insert_cache(model, [4, 5], [MockCache("test4")], checkpoint=True)
+        cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
         c, t = cache.fetch_nearest_cache(model, [2, 3])
         self.assertEqual(c, None)
         self.assertEqual(t, [2, 3])
