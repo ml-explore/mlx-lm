@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,7 +13,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "nanochat"
+    model_type: str
     hidden_size: int = 1280
     num_hidden_layers: int = 20
     num_attention_heads: int = 10
@@ -22,6 +22,11 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 2048
     intermediate_size: int = 5120  # 4 * hidden_size
     rope_theta: float = 10000.0
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 def rms_norm(x):

@@ -23,13 +23,22 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1.0e-6
     vocab_size: int = 262144
     num_key_value_heads: int = 1
-    rope_theta: float = 1_000_000.0
+    rope_theta: float = 1000000.0
     rope_local_base_freq: float = 10_000.0
     query_pre_attn_scalar: float = 256
     sliding_window: int = 512
     sliding_window_pattern: int = 6
     max_position_embeddings: int = 32768
     rope_scaling: Dict = None
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
+            self.rope_local_base_freq = self.rope_parameters.get(
+                "rope_local_base_freq", 10000.0
+            )
 
 
 class Attention(nn.Module):

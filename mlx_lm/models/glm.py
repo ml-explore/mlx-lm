@@ -1,14 +1,13 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 
 
 @dataclass
@@ -20,12 +19,17 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    head_dim: int
     num_key_value_heads: int
+    head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
     attention_bias: bool = False
     rope_theta: float = 10000
     tie_word_embeddings: bool = True
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class GLMAttention(nn.Module):
