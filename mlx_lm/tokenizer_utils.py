@@ -303,13 +303,17 @@ class TokenizerWrapper:
                 self._think_end_id = vocab[think_end]
                 break
 
-        # Disable tool calling if tool call tokens aren't in vocab
+        # Warn if tool call tokens aren't in vocab but keep tool calling
+        # enabled — the streaming parser uses text matching which still works
+        # for multi-token delimiters (e.g. <tool_call> tokenized as subwords)
         if (tool_call_start and tool_call_start not in vocab) or (
             tool_call_end and tool_call_end not in vocab
         ):
-            self._tool_call_start = None
-            self._tool_call_end = None
-            self._tool_parser = None
+            logging.warning(
+                f"Tool call tokens ({tool_call_start}, {tool_call_end}) not "
+                "found as single tokens in vocab. "
+                "Tool call parsing will use text matching."
+            )
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
