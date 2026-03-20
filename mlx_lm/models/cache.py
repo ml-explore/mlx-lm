@@ -413,6 +413,7 @@ class RotatingKVCache(_BaseCache):
         self.keys = None
         self.values = None
         self.offset = 0
+        self._offset = 0
         self.max_size = max_size
         self._idx = 0
 
@@ -432,7 +433,7 @@ class RotatingKVCache(_BaseCache):
         """
         if self._idx == v.shape[2]:
             return v
-        elif self._idx < self.offset:
+        elif self._idx < self._offset:
             return mx.concatenate(
                 [
                     v[..., : self.keep, :],
@@ -461,6 +462,7 @@ class RotatingKVCache(_BaseCache):
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
         self.offset += keys.shape[2]
+        self._offset += keys.shape[2]
         self._idx = self.keys.shape[2]
         return self.keys, self.values
 
@@ -468,7 +470,7 @@ class RotatingKVCache(_BaseCache):
         # May not have hit the max size yet, so potentially
         # keep growing the cache
         B, n_kv_heads, S, k_head_dim = keys.shape
-        prev = self.offset
+        prev = self._offset
         if self.keys is None or (
             prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size
         ):
@@ -500,11 +502,15 @@ class RotatingKVCache(_BaseCache):
         self.keys[..., self._idx : self._idx + S, :] = keys
         self.values[..., self._idx : self._idx + S, :] = values
         self.offset += S
+        self._offset += S
         self._idx += S
 
         # If the buffer is not full, slice off the end
-        if self.offset < self.max_size:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        if self._offset < self.max_size:
+            return (
+                self.keys[..., : self._offset, :],
+                self.values[..., : self._offset, :],
+            )
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
@@ -513,12 +519,15 @@ class RotatingKVCache(_BaseCache):
         return self._update_concat(keys, values)
 
     def size(self):
-        return min(self.offset, self.max_size)
+        return min(self._offset, self.max_size)
 
     @property
     def state(self):
-        if self.offset < self.keys.shape[2]:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        if self._offset < self.keys.shape[2]:
+            return (
+                self.keys[..., : self._offset, :],
+                self.values[..., : self._offset, :],
+            )
         else:
             return self.keys, self.values
 
@@ -528,22 +537,36 @@ class RotatingKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        return tuple(
+            map(str, (self.keep, self.max_size, self.offset, self._offset, self._idx))
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.keep, self.max_size, self.offset, self._idx = map(
-            int,
-            v,
-        )
+        if len(v) == 4:
+            self.keep, self.max_size, self.offset, self._idx = map(int, v)
+            self._offset = min(self.offset, self.max_size)
+        else:
+            self.keep, self.max_size, self.offset, self._offset, self._idx = map(int, v)
 
     def is_trimmable(self):
-        return self.offset < self.max_size
+        return True
 
     def trim(self, n):
-        n = min(self.offset, n)
+        effective = min(self._offset, self.max_size)
+        n = min(effective, n)
+        if n == effective:
+            self.keys = None
+            self.values = None
+            self._offset = 0
+            self._idx = 0
+        else:
+            new_size = effective - n
+            self.keys = self._temporal_order(self.keys)[..., :new_size, :]
+            self.values = self._temporal_order(self.values)[..., :new_size, :]
+            self._offset = new_size
+            self._idx = new_size
         self.offset -= n
-        self._idx -= n
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
@@ -554,7 +577,7 @@ class RotatingKVCache(_BaseCache):
     ):
         if N > 1:
             window_size = window_size or self.max_size
-            offset = min(self.max_size - 1, self.offset)
+            offset = min(self.max_size - 1, self._offset)
             if offset + N > window_size or return_array:
                 return create_causal_mask(N, offset, window_size=window_size)
             else:
@@ -563,12 +586,12 @@ class RotatingKVCache(_BaseCache):
             if window_size is None:
                 return None
             # May need a mask for when window_size < max_size
-            if self.offset >= window_size and self.max_size > window_size:
+            if self._offset >= window_size and self.max_size > window_size:
                 idx = self._idx
                 if idx >= self.max_size:
                     idx = 0
-                if self.offset < self.max_size:
-                    mask_size = self.offset + 1
+                if self._offset < self.max_size:
+                    mask_size = self._offset + 1
                 else:
                     mask_size = self.max_size
                 mask = mx.arange(mask_size) >= (mask_size - window_size)
@@ -1240,12 +1263,24 @@ class BatchRotatingKVCache(_BaseCache):
         self.rotated = bool(v[3])
 
     def is_trimmable(self):
-        return self._offset < self.max_size
+        return True
 
     def trim(self, n):
-        n = min(self._offset, n)
-        self._offset -= n
-        self._idx -= n
+        effective = min(self._offset, self.max_size)
+        n = min(effective, n)
+        if n == effective:
+            self.keys = None
+            self.values = None
+            self._offset = 0
+            self._idx = 0
+            self.rotated = False
+        else:
+            new_size = effective - n
+            self._temporal_order()
+            self.keys = self.keys[..., :new_size, :]
+            self.values = self.values[..., :new_size, :]
+            self._offset = new_size
+            self._idx = new_size
         self.offset -= n
         return n
 
@@ -1324,6 +1359,8 @@ class BatchRotatingKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = RotatingKVCache(self.max_size)
+        if self.keys is None:
+            return cache
         padding = self.left_padding[idx].item()
         offset = self.offset[idx].item()
         cache.keys = self.keys[idx : idx + 1]
@@ -1337,6 +1374,7 @@ class BatchRotatingKVCache(_BaseCache):
         cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
         cache.offset = offset
         cache._idx = cache.keys.shape[2]
+        cache._offset = cache.keys.shape[2]
         return cache
 
     @classmethod
