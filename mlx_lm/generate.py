@@ -105,20 +105,20 @@ def setup_arg_parser():
         "--max-tokens",
         "-m",
         type=int,
-        default=DEFAULT_MAX_TOKENS,
+        default=None,
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
-        "--temp", type=float, default=DEFAULT_TEMP, help="Sampling temperature"
+        "--temp", type=float, default=None, help="Sampling temperature"
     )
     parser.add_argument(
-        "--top-p", type=float, default=DEFAULT_TOP_P, help="Sampling top-p"
+        "--top-p", type=float, default=None, help="Sampling top-p"
     )
     parser.add_argument(
-        "--min-p", type=float, default=DEFAULT_MIN_P, help="Sampling min-p"
+        "--min-p", type=float, default=None, help="Sampling min-p"
     )
     parser.add_argument(
-        "--top-k", type=int, default=DEFAULT_TOP_K, help="Sampling top-k"
+        "--top-k", type=int, default=None, help="Sampling top-k"
     )
     parser.add_argument(
         "--xtc-probability",
@@ -1450,12 +1450,28 @@ def main():
             )
     model_path = model_path or DEFAULT_MODEL
 
-    model, tokenizer = load(
+    model, tokenizer, config = load(
         model_path,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        return_config=True,
     )
+
+    # Apply generation_config.json defaults for parameters the user did not
+    # explicitly set on the command line.
+    generation_defaults = config.get("generation_config", {})
+    if args.temp is None:
+        args.temp = generation_defaults.get("temp", DEFAULT_TEMP)
+    if args.top_p is None:
+        args.top_p = generation_defaults.get("top_p", DEFAULT_TOP_P)
+    if args.min_p is None:
+        args.min_p = generation_defaults.get("min_p", DEFAULT_MIN_P)
+    if args.top_k is None:
+        args.top_k = generation_defaults.get("top_k", DEFAULT_TOP_K)
+    if args.max_tokens is None:
+        args.max_tokens = generation_defaults.get("max_tokens", DEFAULT_MAX_TOKENS)
+
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
 
