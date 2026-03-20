@@ -12,6 +12,13 @@ def swiglu(gate, x):
 
 
 @partial(mx.compile, shapeless=True)
+def precise_swiglu(h, gate, x):
+    gate = nn.silu(gate.astype(mx.float32))
+    x = x.astype(mx.float32)
+    return (gate * x).astype(h.dtype)
+
+
+@partial(mx.compile, shapeless=True)
 def xielu(x, alpha_p, alpha_n, beta, eps):
     alpha_p = nn.softplus(alpha_p)
     alpha_n = beta + nn.softplus(alpha_n)
