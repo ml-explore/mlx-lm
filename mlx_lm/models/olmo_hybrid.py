@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import precise_swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -64,7 +65,7 @@ class RMSNormGated(nn.Module):
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         normed = mx.fast.rms_norm(x, self.weight, self.eps)
-        return normed * nn.silu(gate)
+        return precise_swiglu(x, gate, normed)
 
 
 class GatedDeltaNet(nn.Module):
