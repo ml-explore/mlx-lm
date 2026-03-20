@@ -398,7 +398,5 @@ class Model(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
                 v = v.moveaxis(2, 1)
-            k = k.replace(".attention_layer_norm.", ".input_layernorm.")
-            k = k.replace(".feedforward_layer_norm.", ".post_attention_layernorm.")
             sanitized[k] = v
         return sanitized
