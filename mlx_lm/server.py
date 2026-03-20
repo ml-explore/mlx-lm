@@ -42,6 +42,7 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
+from .tool_call_dedup import ToolCallDedup
 from .utils import _parse_size, load, sharded_load
 
 
@@ -1507,6 +1508,7 @@ class APIHandler(BaseHTTPRequestHandler):
         made_tool_call = False
         tool_calls = []
         tool_text = ""
+        _dedup = ToolCallDedup()
         tool_idx = 0
 
         def format_tool_call(tool_call):
@@ -1575,6 +1577,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 in_tool_call = True
             elif in_tool_call:
                 if gen.text == ctx.tool_call_end:
+                    if _dedup.is_duplicate(tool_text):
+                        finish_reason = "tool_calls"
+                        ctx.stop()
+                        tool_text = ""
+                        in_tool_call = False
+                        break
                     tool_calls.append(tool_text)
                     tool_text = ""
                     in_tool_call = False
