@@ -165,7 +165,7 @@ class SwitchGLU(nn.Module):
         num_experts: int,
         activation=SwiGLU(),
         bias: bool = False,
-        fuse_gate_up: bool = False,
+        fuse_gate_up: bool = True,
     ):
         super().__init__()
 

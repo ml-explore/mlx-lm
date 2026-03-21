@@ -155,11 +155,12 @@ class MoE(nn.Module):
         self.top_k = args.num_experts_per_tok
         assert self.top_k == 1, "Only 1 expert per token supported"
         self.num_experts = args.num_local_experts
+        fuse = getattr(args, "fuse_gate_up", True)
         self.experts = SwitchGLU(
             args.hidden_size,
             args.intermediate_size,
             self.num_experts,
-            fuse_gate_up=True,
+            fuse_gate_up=fuse,
         )
         self.router = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
         self.shared_expert = MLP(args)
@@ -298,12 +299,20 @@ class Model(nn.Module):
         # Remove vision weights
         weights = {k: v for k, v in weights.items() if not to_remove(k)}
 
-        # Rename expert weights for SwitchGLU (fused gate_up_proj)
+        # Rename expert weights for SwitchGLU
+        fuse = getattr(self.args.text_config, "fuse_gate_up", True)
         for l in range(self.args.text_config.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.feed_forward.experts"
             if f"{prefix}.gate_up_proj" in weights:
                 v = weights.pop(f"{prefix}.gate_up_proj")
-                weights[f"{prefix}.gate_up_proj.weight"] = mx.swapaxes(v, 1, 2)
+                v = mx.swapaxes(v, 1, 2)
+                if fuse:
+                    weights[f"{prefix}.gate_up_proj.weight"] = v
+                else:
+                    # Split fused gate_up into separate gate_proj and up_proj
+                    gate, up = mx.split(v, 2, axis=1)
+                    weights[f"{prefix}.gate_proj.weight"] = gate
+                    weights[f"{prefix}.up_proj.weight"] = up
             if f"{prefix}.down_proj" in weights:
                 down_proj = weights.pop(f"{prefix}.down_proj")
                 weights[f"{prefix}.down_proj.weight"] = mx.swapaxes(down_proj, 1, 2)

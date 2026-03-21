@@ -118,8 +118,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.norm_topk_prob = args.norm_topk_prob
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
+        fuse = getattr(args, "fuse_gate_up", True)
         self.switch_mlp = SwitchGLU(
-            dim, intermediate_size, num_experts, fuse_gate_up=True
+            dim, intermediate_size, num_experts, fuse_gate_up=fuse
         )
 
     def __call__(
@@ -236,15 +237,43 @@ class Model(nn.Module):
             weights.pop("lm_head.weight", None)
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
             return weights
+        fuse = getattr(self.args, "fuse_gate_up", True)
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
+            if fuse and f"{prefix}.mlp.experts.0.gate_proj.weight" in weights:
+                gate = mx.stack(
+                    [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.gate_proj.weight")
                         for e in range(self.args.num_experts)
                     ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                )
+                up = mx.stack(
+                    [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.up_proj.weight")
+                        for e in range(self.args.num_experts)
+                    ]
+                )
+                weights[f"{prefix}.mlp.switch_mlp.gate_up_proj.weight"] = (
+                    mx.concatenate([gate, up], axis=1)
+                )
+                if f"{prefix}.mlp.experts.0.down_proj.weight" in weights:
+                    down = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.down_proj.weight")
+                            for e in range(self.args.num_experts)
+                        ]
+                    )
+                    weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = down
+            else:
+                for n in ["up_proj", "down_proj", "gate_proj"]:
+                    if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
+                        to_join = [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
+                            for e in range(self.args.num_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(
+                            to_join
+                        )
         return weights
 
     @property

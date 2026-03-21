@@ -33,15 +33,24 @@ class Model(Qwen3_5Model):
                 key = "language_model." + key
             new_weights[key] = value
 
+        fuse = getattr(self.language_model.args, "fuse_gate_up", True)
         for l in range(self.language_model.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key in new_weights:
-                new_weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = (
-                    new_weights.pop(gate_up_key)
-                )
-                new_weights[f"{prefix}.switch_mlp.down_proj.weight"] = new_weights.pop(
-                    f"{prefix}.experts.down_proj"
+                gate_up = new_weights.pop(gate_up_key)
+                if fuse:
+                    new_weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = gate_up
+                else:
+                    mid = gate_up.shape[-2] // 2
+                    new_weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
+                        ..., :mid, :
+                    ]
+                    new_weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
+                        ..., mid:, :
+                    ]
+                new_weights[f"{prefix}.switch_mlp.down_proj.weight"] = (
+                    new_weights.pop(f"{prefix}.experts.down_proj")
                 )
 
         return self.language_model.sanitize(new_weights)
