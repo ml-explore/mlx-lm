@@ -55,6 +55,7 @@ def is_metal_oom_error(exc: Exception) -> bool:
     oom_markers = (
         "out of memory",
         "insufficient memory",
+        "insufficient memory for buffer",
         "resource exhausted",
         "failed to allocate",
         "metal error: command buffer execution failed due to out of memory",
@@ -1161,6 +1162,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def _classify_generation_error(self, exc: Exception):
         if is_metal_oom_error(exc):
+            logging.warning(
+                "Metal OOM detected while serving request_id=%s: %s",
+                self.request_id,
+                exc,
+            )
             return (
                 503,
                 {
