@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import requests
@@ -229,6 +230,58 @@ class TestServer(unittest.TestCase):
         self.assertFalse(sequence_overlap([1], [2]))
         self.assertFalse(sequence_overlap([1, 2], [3, 4]))
         self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
+
+    def test_oom_returns_503_without_crashing_server(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with mock.patch.object(
+            self.response_generator,
+            "generate",
+            side_effect=RuntimeError(
+                "Metal error: command buffer execution failed due to out of memory"
+            ),
+        ):
+            response = requests.post(url, json=post_data)
+
+        self.assertEqual(response.status_code, 503)
+        response_body = json.loads(response.text)
+        self.assertIn("error", response_body)
+        self.assertEqual(response_body["error"]["code"], "metal_out_of_memory")
+        self.assertEqual(response_body["error"]["type"], "resource_exhausted_error")
+
+        # Server should continue serving requests after an OOM.
+        next_response = requests.post(url, json=post_data)
+        self.assertEqual(next_response.status_code, 200)
+
+    def test_streaming_oom_returns_terminal_error_event(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 4,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with mock.patch.object(
+            self.response_generator,
+            "generate",
+            side_effect=RuntimeError("out of memory"),
+        ):
+            response = requests.post(url, json=post_data, stream=True)
+            lines = [line.decode("utf-8") for line in response.iter_lines() if line]
+
+        self.assertEqual(response.status_code, 503)
+        self.assertGreaterEqual(len(lines), 2)
+        self.assertEqual(lines[-1], "data: [DONE]")
+
+        error_event = json.loads(lines[0][6:])
+        self.assertIn("error", error_event)
+        self.assertEqual(error_event["error"]["code"], "metal_out_of_memory")
 
 
 class TestServerWithDraftModel(unittest.TestCase):

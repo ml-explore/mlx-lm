@@ -140,6 +140,22 @@ curl localhost:8080/v1/chat/completions \
     - `completion_tokens`: The number of tokens generated.
     - `total_tokens`: The total number of tokens, i.e. the sum of the above two fields.
 
+### OOM Behavior
+
+If generation hits a Metal out-of-memory error, the server now returns a
+structured error instead of crashing:
+
+- Non-streaming requests return HTTP `503` with a JSON body containing an
+  `error` object.
+- Streaming requests return HTTP `503`, emit a final SSE error event, and then
+  close the stream with `data: [DONE]`.
+
+Useful mitigation knobs:
+
+- `--prefill-step-size` to reduce memory pressure during prompt prefill.
+- `--prompt-cache-size` to limit the number of cached prompt KV states.
+- `--prompt-cache-bytes` to limit total prompt cache memory.
+
 ### List Models
 
 Use the `v1/models` endpoint to list available models:
