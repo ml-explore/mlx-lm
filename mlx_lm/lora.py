@@ -210,6 +210,11 @@ def build_parser():
         help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+    parser.add_argument(
+        "--drop-unknown-weights",
+        action="store_true",
+        help="Drop weights not present in the instantiated model.",
+    )
     return parser
 
 
@@ -326,7 +331,11 @@ def run(args, training_callback: TrainingCallback = None):
     )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
+    model, tokenizer = load(
+        args.model,
+        tokenizer_config={"trust_remote_code": True},
+        drop_unknown_weights=args.drop_unknown_weights,
+    )
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)

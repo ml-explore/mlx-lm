@@ -182,10 +182,19 @@ def main():
         choices=["float32", "bfloat16"],
         help="What type to use to accumulate the gradients for the sensitivities",
     )
+    parser.add_argument(
+        "--drop-unknown-weights",
+        action="store_true",
+        help="Drop weights not present in the instantiated model.",
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
-    model, tokenizer, config = load(args.model, return_config=True)
+    model, tokenizer, config = load(
+        args.model,
+        return_config=True,
+        drop_unknown_weights=args.drop_unknown_weights,
+    )
 
     if args.sensitivities is None:
         mx.random.seed(args.seed)

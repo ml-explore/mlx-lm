@@ -197,11 +197,21 @@ def main():
         help="Sequence length for the calibration data.",
     )
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--drop-unknown-weights",
+        action="store_true",
+        help="Drop weights not present in the instantiated model.",
+    )
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
 
-    model, tokenizer, config = load(args.model, lazy=True, return_config=True)
+    model, tokenizer, config = load(
+        args.model,
+        lazy=True,
+        return_config=True,
+        drop_unknown_weights=args.drop_unknown_weights,
+    )
     calibration_data = load_data(tokenizer, args.num_samples, args.sequence_length)
 
     model, config["quantization"] = gptq_quantize(

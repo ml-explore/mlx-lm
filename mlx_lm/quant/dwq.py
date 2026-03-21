@@ -300,6 +300,11 @@ def main():
         action="store_true",
         help="Use pipeline parallel instead of data parallel.",
     )
+    parser.add_argument(
+        "--drop-unknown-weights",
+        action="store_true",
+        help="Drop weights not present in the instantiated model.",
+    )
 
     args = parser.parse_args()
 
@@ -328,9 +333,18 @@ def main():
     # Load the base model if we need it
     if not has_targets or args.quantized_model is None:
         if args.pipeline and group.size() > 1:
-            model, _, config = pipeline_load(args.model, return_config=True)
+            model, _, config = pipeline_load(
+                args.model,
+                return_config=True,
+                drop_unknown_weights=args.drop_unknown_weights,
+            )
         else:
-            model, _, config = load(args.model, return_config=True, lazy=True)
+            model, _, config = load(
+                args.model,
+                return_config=True,
+                lazy=True,
+                drop_unknown_weights=args.drop_unknown_weights,
+            )
     else:
         model = None
 
@@ -366,6 +380,7 @@ def main():
             args.quantized_model,
             lazy=True,
             return_config=True,
+            drop_unknown_weights=args.drop_unknown_weights,
         )
         if "quantization" not in config:
             raise ValueError("Quantized model must already be quantized.")

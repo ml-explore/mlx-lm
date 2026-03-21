@@ -77,6 +77,11 @@ def setup_arg_parser():
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
     )
+    parser.add_argument(
+        "--drop-unknown-weights",
+        action="store_true",
+        help="Drop weights not present in the instantiated model.",
+    )
     return parser
 
 
@@ -93,6 +98,7 @@ def main():
         args.model,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
+        drop_unknown_weights=args.drop_unknown_weights,
     )
 
     args.prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
