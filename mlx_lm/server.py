@@ -513,6 +513,7 @@ class ModelProvider:
         model_path = self.default_model_map.get(model_path, model_path)
         if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
+        drop = self.cli_args.drop_unknown_weights
 
         # Remove the old model if it exists.
         self.model = None
@@ -537,25 +538,33 @@ class ModelProvider:
             # TODO: Generalize distributed load
             if self.is_distributed:
                 model, tokenizer = sharded_load(
-                    self.cli_args.model, self.pipeline_group, self.tensor_group
+                    self.cli_args.model,
+                    self.pipeline_group,
+                    self.tensor_group,
+                    drop_unknown_weights=drop,
                 )
             else:
                 model, tokenizer = load(
                     self.cli_args.model,
                     adapter_path=adapter_path,
                     tokenizer_config=tokenizer_config,
+                    drop_unknown_weights=drop,
                 )
         else:
             # TODO: Generalize distributed load
             if self.is_distributed:
                 model, tokenizer = sharded_load(
-                    model_path, self.pipeline_group, self.tensor_group
+                    model_path,
+                    self.pipeline_group,
+                    self.tensor_group,
+                    drop_unknown_weights=drop,
                 )
             else:
                 model, tokenizer = load(
                     model_path,
                     adapter_path=adapter_path,
                     tokenizer_config=tokenizer_config,
+                    drop_unknown_weights=drop,
                 )
 
         if self.cli_args.use_default_chat_template:
@@ -579,11 +588,17 @@ class ModelProvider:
             draft_model_path == "default_model"
             and self.cli_args.draft_model is not None
         ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
+            self.draft_model, draft_tokenizer = load(
+                self.cli_args.draft_model,
+                drop_unknown_weights=drop,
+            )
             validate_draft_tokenizer(draft_tokenizer)
 
         elif draft_model_path is not None and draft_model_path != "default_model":
-            self.draft_model, draft_tokenizer = load(draft_model_path)
+            self.draft_model, draft_tokenizer = load(
+                draft_model_path,
+                drop_unknown_weights=drop,
+            )
             validate_draft_tokenizer(draft_tokenizer)
 
         if self.draft_model is None:
@@ -2027,6 +2042,11 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--drop-unknown-weights",
+        action="store_true",
+        help="Drop weights not present in the instantiated model.",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
