@@ -662,6 +662,11 @@ class ArraysCache(_BaseCache):
         n_state = len(caches[0].cache)
         B = len(caches)
         cache = cls(n_state)
+
+        # All caches are empty so return early
+        if all(c.empty() for c in caches):
+            return cache
+
         for e in range(n_state):
             c_init = next(iter(c[e] for c in caches if c[e] is not None))
             shape = list(c_init.shape)
