@@ -155,7 +155,7 @@ class MoE(nn.Module):
         self.top_k = args.num_experts_per_tok
         assert self.top_k == 1, "Only 1 expert per token supported"
         self.num_experts = args.num_local_experts
-        fuse = getattr(args, "fuse_gate_up", True)
+        fuse = getattr(args, "fuse_gate_up", False)
         self.experts = SwitchGLU(
             args.hidden_size,
             args.intermediate_size,
@@ -300,7 +300,7 @@ class Model(nn.Module):
         weights = {k: v for k, v in weights.items() if not to_remove(k)}
 
         # Rename expert weights for SwitchGLU
-        fuse = getattr(self.args.text_config, "fuse_gate_up", True)
+        fuse = getattr(self.args.text_config, "fuse_gate_up", False)
         for l in range(self.args.text_config.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.feed_forward.experts"
             if f"{prefix}.gate_up_proj" in weights:

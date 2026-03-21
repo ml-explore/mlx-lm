@@ -50,7 +50,7 @@ class Model(nn.Module):
             )
         )
 
-        fuse = getattr(self.language_model.args, "fuse_gate_up", True)
+        fuse = getattr(self.language_model.args, "fuse_gate_up", False)
         for l in range(self.language_model.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"

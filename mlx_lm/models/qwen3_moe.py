@@ -118,7 +118,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.norm_topk_prob = args.norm_topk_prob
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        fuse = getattr(args, "fuse_gate_up", True)
+        fuse = getattr(args, "fuse_gate_up", False)
         self.switch_mlp = SwitchGLU(
             dim, intermediate_size, num_experts, fuse_gate_up=fuse
         )
@@ -237,7 +237,7 @@ class Model(nn.Module):
             weights.pop("lm_head.weight", None)
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
             return weights
-        fuse = getattr(self.args, "fuse_gate_up", True)
+        fuse = getattr(self.args, "fuse_gate_up", False)
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             if fuse and f"{prefix}.mlp.experts.0.gate_proj.weight" in weights:

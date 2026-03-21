@@ -317,7 +317,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        fuse = getattr(args, "fuse_gate_up", True)
+        fuse = getattr(args, "fuse_gate_up", False)
         self.switch_mlp = SwitchGLU(
             dim, intermediate_size, num_experts, fuse_gate_up=fuse
         )
@@ -460,7 +460,7 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        fuse = getattr(self.args, "fuse_gate_up", True)
+        fuse = getattr(self.args, "fuse_gate_up", False)
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}.mlp"
             if fuse:

@@ -106,7 +106,7 @@ class OlmoeSparseMoeBlock(nn.Module):
             args.intermediate_size,
             self.num_experts,
             bias=args.mlp_bias,
-            fuse_gate_up=getattr(args, "fuse_gate_up", True),
+            fuse_gate_up=getattr(args, "fuse_gate_up", False),
         )
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -198,7 +198,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
             return weights
-        fuse = getattr(self.args, "fuse_gate_up", True)
+        fuse = getattr(self.args, "fuse_gate_up", False)
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             if fuse and f"{prefix}.mlp.experts.0.gate_proj.weight" in weights:

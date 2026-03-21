@@ -165,7 +165,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
         self.num_experts_per_tok = args.num_experts_per_tok
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
-        fuse = getattr(args, "fuse_gate_up", True)
+        fuse = getattr(args, "fuse_gate_up", False)
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             args.intermediate_size,
@@ -313,7 +313,7 @@ class Model(nn.Module):
         if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:
             return weights
 
-        fuse = getattr(self.args, "fuse_gate_up", True)
+        fuse = getattr(self.args, "fuse_gate_up", False)
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             w1_key = f"{prefix}.block_sparse_moe.experts.0.w1.weight"
