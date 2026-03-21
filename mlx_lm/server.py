@@ -1178,7 +1178,9 @@ class APIHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _completion_error_response(self, status_code: int, error_payload: Dict[str, str]):
+    def _completion_error_response(
+        self, status_code: int, error_payload: Dict[str, str]
+    ):
         self._set_completion_headers(status_code)
         self.end_headers()
         self.wfile.write(json.dumps({"error": error_payload}).encode())
@@ -1566,7 +1568,9 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             status_code, error_payload = self._classify_generation_error(e)
             if self.stream:
-                self._stream_error_response(status_code, error_payload, stream_started=False)
+                self._stream_error_response(
+                    status_code, error_payload, stream_started=False
+                )
             else:
                 self._completion_error_response(status_code, error_payload)
             return
