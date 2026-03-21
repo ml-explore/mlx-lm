@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
-from . import llama, ministral3
+from . import llama, ministral3, mistral4
 from .base import BaseModelArgs
 
 
@@ -26,7 +26,14 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        if args.text_config.get("model_type") == "ministral3":
+        # Route based on architecture structure, not model_type string.
+        # MoE models (Mistral Small 4) have n_routed_experts in config.
+        # Dense models (Ministral 3B/8B/14B) use ministral3 or llama paths.
+        if args.text_config.get("n_routed_experts") is not None:
+            self.language_model = mistral4.Model(
+                mistral4.ModelArgs.from_dict(args.text_config)
+            )
+        elif args.text_config.get("model_type") == "ministral3":
             self.language_model = ministral3.Model(
                 ministral3.ModelArgs.from_dict(args.text_config)
             )
