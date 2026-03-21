@@ -105,7 +105,9 @@ class MixtralSparseMoeBlock(nn.Module):
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
-        self.switch_mlp = SwitchGLU(self.hidden_dim, self.ffn_dim, self.num_experts)
+        self.switch_mlp = SwitchGLU(
+            self.hidden_dim, self.ffn_dim, self.num_experts, fuse_gate_up=True
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
@@ -209,18 +211,37 @@ class Model(nn.Module):
             return weights
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.block_sparse_moe.experts.0.{n}.{k}" in weights:
-                        to_join = [
-                            weights.pop(
-                                f"{prefix}.block_sparse_moe.experts.{e}.{n}.{k}"
-                            )
+            # Stack and fuse gate(w1)+up(w3) into single gate_up_proj
+            for k in ["weight", "scales", "biases"]:
+                w1_key = f"{prefix}.block_sparse_moe.experts.0.w1.{k}"
+                w3_key = f"{prefix}.block_sparse_moe.experts.0.w3.{k}"
+                if w1_key in weights and w3_key in weights:
+                    gate = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.block_sparse_moe.experts.{e}.w1.{k}")
                             for e in range(self.args.num_local_experts)
                         ]
-                        weights[f"{prefix}.block_sparse_moe.switch_mlp.{m}.{k}"] = (
-                            mx.stack(to_join)
-                        )
+                    )
+                    up = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.block_sparse_moe.experts.{e}.w3.{k}")
+                            for e in range(self.args.num_local_experts)
+                        ]
+                    )
+                    weights[
+                        f"{prefix}.block_sparse_moe.switch_mlp.gate_up_proj.{k}"
+                    ] = mx.concatenate([gate, up], axis=1)
+            # Stack down(w2) normally
+            for k in ["weight", "scales", "biases"]:
+                w2_key = f"{prefix}.block_sparse_moe.experts.0.w2.{k}"
+                if w2_key in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.block_sparse_moe.experts.{e}.w2.{k}")
+                        for e in range(self.args.num_local_experts)
+                    ]
+                    weights[f"{prefix}.block_sparse_moe.switch_mlp.down_proj.{k}"] = (
+                        mx.stack(to_join)
+                    )
         return weights
 
     @property

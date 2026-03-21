@@ -106,6 +106,7 @@ class OlmoeSparseMoeBlock(nn.Module):
             args.intermediate_size,
             self.num_experts,
             bias=args.mlp_bias,
+            fuse_gate_up=True,
         )
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -199,14 +200,37 @@ class Model(nn.Module):
             return weights
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{n}.{k}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{n}.{k}")
+            # Stack and fuse gate+up into single gate_up_proj
+            for k in ["weight", "scales", "biases"]:
+                gate_key = f"{prefix}.mlp.experts.0.gate_proj.{k}"
+                up_key = f"{prefix}.mlp.experts.0.up_proj.{k}"
+                if gate_key in weights and up_key in weights:
+                    gate = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.gate_proj.{k}")
                             for e in range(self.args.num_experts)
                         ]
-                        weights[f"{prefix}.mlp.switch_mlp.{n}.{k}"] = mx.stack(to_join)
+                    )
+                    up = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.up_proj.{k}")
+                            for e in range(self.args.num_experts)
+                        ]
+                    )
+                    weights[f"{prefix}.mlp.switch_mlp.gate_up_proj.{k}"] = (
+                        mx.concatenate([gate, up], axis=1)
+                    )
+            # Stack down_proj normally
+            for k in ["weight", "scales", "biases"]:
+                down_key = f"{prefix}.mlp.experts.0.down_proj.{k}"
+                if down_key in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.down_proj.{k}")
+                        for e in range(self.args.num_experts)
+                    ]
+                    weights[f"{prefix}.mlp.switch_mlp.down_proj.{k}"] = mx.stack(
+                        to_join
+                    )
         return weights
 
     @property

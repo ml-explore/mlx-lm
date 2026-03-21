@@ -118,7 +118,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.norm_topk_prob = args.norm_topk_prob
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.switch_mlp = SwitchGLU(
+            dim, intermediate_size, num_experts, fuse_gate_up=True
+        )
 
     def __call__(
         self,

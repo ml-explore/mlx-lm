@@ -166,7 +166,10 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
         self.switch_mlp = SwitchGLU(
-            args.hidden_size, args.intermediate_size, args.num_local_experts
+            args.hidden_size,
+            args.intermediate_size,
+            args.num_local_experts,
+            fuse_gate_up=True,
         )
         self.e_score_correction_bias = mx.zeros((args.num_local_experts,))
         self.sharding_group = None
@@ -311,18 +314,35 @@ class Model(nn.Module):
 
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-            for orig_name, new_name in mapping.items():
-                if f"{prefix}.block_sparse_moe.experts.0.{orig_name}.weight" in weights:
-                    to_join = [
-                        weights.pop(
-                            f"{prefix}.block_sparse_moe.experts.{e}.{orig_name}.weight"
-                        )
+            # Stack and fuse gate(w1)+up(w3) into single gate_up_proj
+            w1_key = f"{prefix}.block_sparse_moe.experts.0.w1.weight"
+            w3_key = f"{prefix}.block_sparse_moe.experts.0.w3.weight"
+            if w1_key in weights and w3_key in weights:
+                gate = mx.stack(
+                    [
+                        weights.pop(f"{prefix}.block_sparse_moe.experts.{e}.w1.weight")
                         for e in range(self.args.num_local_experts)
                     ]
-                    weights[
-                        f"{prefix}.block_sparse_moe.switch_mlp.{new_name}.weight"
-                    ] = mx.stack(to_join)
+                )
+                up = mx.stack(
+                    [
+                        weights.pop(f"{prefix}.block_sparse_moe.experts.{e}.w3.weight")
+                        for e in range(self.args.num_local_experts)
+                    ]
+                )
+                weights[f"{prefix}.block_sparse_moe.switch_mlp.gate_up_proj.weight"] = (
+                    mx.concatenate([gate, up], axis=1)
+                )
+            # Stack down(w2) normally
+            w2_key = f"{prefix}.block_sparse_moe.experts.0.w2.weight"
+            if w2_key in weights:
+                to_join = [
+                    weights.pop(f"{prefix}.block_sparse_moe.experts.{e}.w2.weight")
+                    for e in range(self.args.num_local_experts)
+                ]
+                weights[f"{prefix}.block_sparse_moe.switch_mlp.down_proj.weight"] = (
+                    mx.stack(to_join)
+                )
 
         return weights
 

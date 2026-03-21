@@ -54,14 +54,9 @@ class Model(nn.Module):
             prefix = f"language_model.model.layers.{l}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key in weights:
-                gate_up = weights.pop(gate_up_key)
-                mid = gate_up.shape[-1] // 2
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
-                    ..., :mid
-                ].swapaxes(-2, -1)
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
-                    ..., mid:
-                ].swapaxes(-2, -1)
+                weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = weights.pop(
+                    gate_up_key
+                ).swapaxes(-2, -1)
                 weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
                     f"{prefix}.experts.down_proj"
                 ).swapaxes(-2, -1)
