@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
 
@@ -309,8 +309,33 @@ class QuantizedKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def size(self):
+        return self.offset
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    @classmethod
+    def merge(cls, caches):
+        """Merge multiple QuantizedKVCache instances for batching.
+
+        Dequantizes each cache to float, delegates to BatchKVCache.merge,
+        then returns the float-based BatchKVCache.  KV quantization is
+        re-applied on extract via ``BatchKVCache.extract_quantized``.
+        """
+        float_caches = []
+        for c in caches:
+            fc = KVCache()
+            if c.keys is not None:
+                fc.keys = mx.dequantize(
+                    *c.keys, group_size=c.group_size, bits=c.bits
+                )
+                fc.values = mx.dequantize(
+                    *c.values, group_size=c.group_size, bits=c.bits
+                )
+                fc.offset = c.offset
+            float_caches.append(fc)
+        return BatchKVCache.merge(float_caches)
 
     def empty(self):
         return self.keys is None
@@ -627,7 +652,7 @@ class ArraysCache(_BaseCache):
         """
         self.cache = [mx.concatenate([c, o]) for c, o in zip(self.cache, other.cache)]
 
-    def extract(self, idx):
+    def extract(self, idx, **kwargs):
         cache = ArraysCache(len(self.cache))
         cache.cache = [c[idx : idx + 1] for c in self.cache]
         return cache
@@ -821,8 +846,8 @@ class CacheList(_BaseCache):
         )
         return cache
 
-    def extract(self, idx):
-        return CacheList(*(c.extract(idx) for c in self.caches))
+    def extract(self, idx, **kwargs):
+        return CacheList(*(c.extract(idx, **kwargs) for c in self.caches))
 
     def prepare(self, **kwargs):
         for c in self.caches:
@@ -1010,12 +1035,22 @@ class BatchKVCache(_BaseCache):
         )
         self._idx = max_idx
 
-    def extract(self, idx):
+    def extract(self, idx, quantize_config=None):
+        """Extract a single-sequence cache from the batch.
+
+        Args:
+            idx: Batch index to extract.
+            quantize_config: If provided, a dict with ``group_size`` and
+                ``bits`` keys.  The extracted cache will be returned as a
+                :class:`QuantizedKVCache` to save memory in LRU storage.
+        """
         cache = KVCache()
         padding = self.left_padding[idx].item()
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
+        if quantize_config is not None:
+            return cache.to_quantized(**quantize_config)
         return cache
 
     @classmethod
@@ -1322,7 +1357,7 @@ class BatchRotatingKVCache(_BaseCache):
         self._idx = max_idx
         self._offset = max(self._offset, other._offset)
 
-    def extract(self, idx):
+    def extract(self, idx, **kwargs):
         cache = RotatingKVCache(self.max_size)
         padding = self.left_padding[idx].item()
         offset = self.offset[idx].item()
