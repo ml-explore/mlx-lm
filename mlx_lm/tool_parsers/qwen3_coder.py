@@ -4,6 +4,7 @@
 Modified from:
 https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/qwen3coder_tool_parser.py
 """
+
 import ast
 import json
 from typing import Any, Optional
@@ -70,7 +71,10 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             or param_type.startswith("dict")
             or param_type.startswith("list")
         ):
-            return json.loads(param_value)
+            try:
+                return json.loads(param_value)
+            except json.JSONDecodeError:
+                return ast.literal_eval(param_value)
 
         return ast.literal_eval(param_value)
 

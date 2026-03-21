@@ -48,24 +48,12 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load, sharded_load
+from .utils import _parse_size, load, sharded_load
 
 
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
-
-
-def parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
-    split = 0
-    for xi in x:
-        if not (xi.isdigit() or xi == "."):
-            break
-        split += 1
-    digits = float(x[:split])
-    size = (x[split:]).strip().upper()
-    return int(digits * sizes[size])
 
 
 class StopCondition(NamedTuple):
@@ -191,7 +179,6 @@ def process_message_content(messages):
 
 
 class LRUPromptCache:
-
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
@@ -376,7 +363,7 @@ class LRUPromptCache:
             else 0
         )
         logging.info(
-            f"KV Caches: {ncaches} seq, {nbytes/1e9:.2f} GB, latest user cache {ntok} tokens"
+            f"KV Caches: {ncaches} seq, {nbytes / 1e9:.2f} GB, latest user cache {ntok} tokens"
         )
 
 
@@ -1314,7 +1301,13 @@ class APIHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def _set_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed_origins = self.response_generator.cli_args.allowed_origins
+        origin = self.headers.get("Origin")
+        if "*" in allowed_origins:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin in allowed_origins:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
 
@@ -1350,7 +1343,23 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            self._set_completion_headers(411)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Content-Length header is required"}).encode()
+            )
+            return
+        try:
+            content_length = int(content_length)
+        except ValueError:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Invalid Content-Length header"}).encode()
+            )
+            return
         raw_body = self.rfile.read(content_length)
         try:
             self.body = json.loads(raw_body.decode())
@@ -2100,6 +2109,12 @@ def main():
         help="Port for the HTTP server (default: 8080)",
     )
     parser.add_argument(
+        "--allowed-origins",
+        type=lambda x: x.split(","),
+        default="*",
+        help="Allowed origins (default: *)",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -2197,7 +2212,7 @@ def main():
     )
     parser.add_argument(
         "--prompt-cache-bytes",
-        type=parse_size,
+        type=_parse_size,
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(

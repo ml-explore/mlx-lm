@@ -40,10 +40,12 @@ class ModelArgs(BaseModelArgs):
     layer_norm_epsilon: float
     use_bias: bool
     use_conv_bias: bool
-    hybrid_override_pattern: List[str]
+    hybrid_override_pattern: Optional[List[str]] = None
+    layers_block_type: Optional[List[str]] = None
     head_dim: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     moe_shared_expert_intermediate_size: Optional[int] = None
+    moe_latent_size: Optional[int] = None
     n_group: Optional[int] = None
     n_routed_experts: Optional[int] = None
     n_shared_experts: Optional[int] = None
@@ -55,13 +57,20 @@ class ModelArgs(BaseModelArgs):
     time_step_min: Optional[float] = None
     time_step_max: Optional[float] = None
 
+    # Map from layers_block_type names to single-char pattern codes
+    _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
+
     def __post_init__(self):
-        if (
-            self.time_step_limit is None
-            and self.time_step_min is not None
-            and self.time_step_max is not None
-        ):
-            self.time_step_limit = (self.time_step_min, self.time_step_max)
+        if self.time_step_limit is None and self.time_step_min is not None:
+            self.time_step_limit = (self.time_step_min, float("inf"))
+
+        # Normalize to hybrid_override_pattern (single-char list)
+        if self.hybrid_override_pattern is None and self.layers_block_type is not None:
+            self.hybrid_override_pattern = [
+                self._block_type_to_char[t] for t in self.layers_block_type
+            ]
+        if self.hybrid_override_pattern is not None:
+            self.num_hidden_layers = len(self.hybrid_override_pattern)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -365,8 +374,16 @@ class NemotronHMoE(nn.Module):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.moe_latent_size = config.moe_latent_size
+
+        # When latent projection is used, experts operate on the latent dim
+        expert_input_dim = (
+            config.moe_latent_size
+            if config.moe_latent_size is not None
+            else config.hidden_size
+        )
         self.switch_mlp = SwitchMLP(
-            config.hidden_size,
+            expert_input_dim,
             config.moe_intermediate_size,
             config.n_routed_experts,
             activation=nn.ReLU2(),
@@ -379,12 +396,30 @@ class NemotronHMoE(nn.Module):
                 config, intermediate_size=intermediate_size
             )
 
+        # Latent projection layers for dimensionality reduction before/after experts
+        if config.moe_latent_size is not None:
+            self.fc1_latent_proj = nn.Linear(
+                config.hidden_size, config.moe_latent_size, bias=config.mlp_bias
+            )
+            self.fc2_latent_proj = nn.Linear(
+                config.moe_latent_size, config.hidden_size, bias=config.mlp_bias
+            )
+
     def __call__(self, x):
+        residuals = x
         inds, scores = self.gate(x)
+
+        if self.moe_latent_size is not None:
+            x = self.fc1_latent_proj(x)
+
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+        if self.moe_latent_size is not None:
+            y = self.fc2_latent_proj(y)
+
         if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(x)
+            y = y + self.shared_experts(residuals)
 
         return y
 
@@ -501,6 +536,7 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
+        weights = {k: v for (k, v) in weights.items() if not k.startswith("mtp.")}
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
