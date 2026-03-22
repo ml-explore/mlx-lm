@@ -27,6 +27,7 @@ class DummyModelProvider:
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
+        self.generation_config = {}
 
         # Add draft model support
         self.draft_model = None
@@ -63,6 +64,9 @@ class DummyModelProvider:
             self.draft_model, _ = load(HF_MODEL_PATH)
             self.draft_model_key = HF_MODEL_PATH
             self.cli_args.draft_model = HF_MODEL_PATH
+
+    def resolve_default(self, key):
+        return getattr(self.cli_args, key)
 
     def load(self, model, adapter=None, draft_model=None):
         assert model in ["default_model", "chat_model"]
