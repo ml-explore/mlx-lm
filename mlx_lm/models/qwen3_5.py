@@ -476,6 +476,11 @@ class TextModel(nn.Module):
         # Keep MTP weights if this model has an MTP head; drop them otherwise
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        elif not any("mtp." in k for k in weights):
+            raise ValueError(
+                "Config specifies mtp_num_hidden_layers > 0 but the model weights "
+                "contain no MTP parameters. Set mtp_num_hidden_layers=0 to disable MTP."
+            )
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
