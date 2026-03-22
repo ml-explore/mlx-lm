@@ -1,8 +1,10 @@
 # Copyright © 2024 Apple Inc.
 
+import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -122,6 +124,75 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(hasattr(model, "custom_attribute"))
         self.assertEqual(model.custom_attribute, "This is a custom model")
         self.assertTrue(hasattr(model, "qwenWeights"))
+
+
+class TestGenerationConfig(unittest.TestCase):
+
+    def _write_config(self, tmpdir, data):
+        with open(os.path.join(tmpdir, "generation_config.json"), "w") as f:
+            json.dump(data, f)
+
+    def test_load_generation_config_key_mapping(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(
+                tmpdir,
+                {
+                    "temperature": 0.6,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "min_p": 0.05,
+                    "max_new_tokens": 2048,
+                    "repetition_penalty": 1.1,
+                },
+            )
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result["temp"], 0.6)
+            self.assertEqual(result["top_p"], 0.95)
+            self.assertEqual(result["top_k"], 40)
+            self.assertEqual(result["min_p"], 0.05)
+            self.assertEqual(result["max_tokens"], 2048)
+            self.assertEqual(result["repetition_penalty"], 1.1)
+
+    def test_load_generation_config_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result, {})
+
+    def test_load_generation_config_malformed_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "generation_config.json"), "w") as f:
+                f.write("{invalid json")
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result, {})
+
+    def test_load_generation_config_do_sample_false(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(tmpdir, {"do_sample": False, "temperature": 0.7})
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result["temp"], 0.0)
+
+    def test_load_generation_config_do_sample_true(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(tmpdir, {"do_sample": True, "temperature": 0.7})
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result["temp"], 0.7)
+
+    def test_load_generation_config_sparse(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(tmpdir, {"temperature": 0.8})
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result, {"temp": 0.8})
+            self.assertNotIn("top_p", result)
+            self.assertNotIn("max_tokens", result)
+
+    def test_load_generation_config_unknown_keys_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(
+                tmpdir,
+                {"temperature": 0.5, "num_beams": 4, "length_penalty": 1.2},
+            )
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result, {"temp": 0.5})
 
 
 if __name__ == "__main__":
