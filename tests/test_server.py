@@ -677,17 +677,23 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         )()
         generator.model_provider.tokenizer.has_thinking = has_thinking
         generator.model_provider.tokenizer.think_start_id = think_start_id
-        for tokens, prompt_cache in seeded_entries or []:
+        for entry in seeded_entries or []:
+            if len(entry) == 3:
+                tokens, prompt_cache, checkpoint = entry
+            else:
+                tokens, prompt_cache = entry
+                checkpoint = False
             generator.prompt_cache.insert_cache(
                 generator.model_provider.model_key,
                 tokens,
                 prompt_cache,
+                checkpoint=checkpoint,
             )
 
         request_queue = Queue()
         request_args = self._generation_args()
         request_seen = False
-        captured = {}
+        captured = {"request_queue": request_queue}
 
         def next_request(timeout=None):
             nonlocal request_seen
@@ -1121,6 +1127,67 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         self.assertIsNotNone(checkpoint_cache)
         self.assertEqual([layer.offset for layer in checkpoint_cache], [3])
         self.assertEqual(len(generator.prompt_cache), 2)
+
+    def test_generate_batch_mode_exact_checkpoint_hit_does_not_forward_empty_prompt(
+        self,
+    ):
+        request = CompletionRequest(
+            request_type="chat",
+            prompt="",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            role_mapping=None,
+        )
+        generator, captured = self._run_batch_checkpoint_probe(
+            request=request,
+            tokenized_prompt=[11, 12, 13],
+            seeded_entries=[([11, 12, 13], [MockCache("checkpoint")], True)],
+        )
+
+        self.assertTrue(captured["insert_prompts"][0])
+        request_queue = captured["request_queue"]
+        ctx = request_queue.get_nowait()
+        response = request_queue.get_nowait()
+        self.assertFalse(isinstance(ctx, Exception))
+        self.assertEqual(response.finish_reason, "stop")
+        self.assertIsNone(request_queue.get_nowait())
+
+    def test_serve_single_exact_checkpoint_hit_does_not_forward_empty_prompt(self):
+        generator = self._build_response_generator()
+        generator.prompt_cache.insert_cache(
+            generator.model_provider.model_key,
+            [11, 12, 13],
+            [MockCache("checkpoint")],
+            checkpoint=True,
+        )
+        request_queue = Queue()
+        gen_result = type(
+            "GenResult",
+            (),
+            {
+                "text": "x",
+                "token": 0,
+                "logprobs": mx.array([0.0], dtype=mx.float32),
+                "finish_reason": "stop",
+            },
+        )()
+
+        def stream_generate_probe(**stream_kwargs):
+            self.assertTrue(stream_kwargs["prompt"])
+            yield gen_result
+
+        with patch("mlx_lm.server.stream_generate", side_effect=stream_generate_probe):
+            with patch.object(generator, "_tokenize", return_value=[11, 12, 13]):
+                generator._serve_single(
+                    (request_queue, self._make_text_request(), self._generation_args())
+                )
+
+        ctx = request_queue.get_nowait()
+        response = request_queue.get_nowait()
+        self.assertFalse(isinstance(ctx, Exception))
+        self.assertFalse(isinstance(response, Exception))
+        self.assertEqual(response.finish_reason, "stop")
+        self.assertIsNone(request_queue.get_nowait())
 
     def test_generate_batch_mode_real_generator_suppresses_impossible_warm_cache_checkpoint(
         self,

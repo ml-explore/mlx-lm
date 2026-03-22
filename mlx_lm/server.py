@@ -898,6 +898,21 @@ class ResponseGenerator:
             return None
         return -(prompt_len - checkpoint_prefix)
 
+    def _materialize_prompt_tail_for_generation(self, prompt, cache, rest):
+        if cache is None or rest or not prompt:
+            return cache, rest
+
+        # Exact prompt-cache hits need one token outside the cache so generation
+        # can resume through the normal prefill/decode entry points.
+        if self.prompt_cache._can_rewind_prompt_cache(
+            cache, 1
+        ) and self.prompt_cache._rewind_prompt_cache(cache, 1):
+            return cache, prompt[-1:]
+
+        # If the extracted cache cannot be safely rewound, fall back to replaying
+        # the full prompt instead of forwarding an unusable empty remainder.
+        return None, prompt
+
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
             return False
@@ -998,6 +1013,9 @@ class ResponseGenerator:
 
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
+                    )
+                    cache, rest = self._materialize_prompt_tail_for_generation(
+                        prompt, cache, rest
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
@@ -1182,6 +1200,9 @@ class ResponseGenerator:
             self.prompt_cache.log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
+            )
+            cache, rest = self._materialize_prompt_tail_for_generation(
+                prompt, cache, rest
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
