@@ -215,11 +215,6 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
-    parser.add_argument(
-        "--drop-unknown-weights",
-        action="store_true",
-        help="Drop weights not present in the instantiated model.",
-    )
     return parser
 
 
@@ -1460,7 +1455,6 @@ def main():
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
-        drop_unknown_weights=args.drop_unknown_weights,
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
@@ -1505,10 +1499,7 @@ def main():
         prompt = tokenizer.encode(prompt)
 
     if args.draft_model is not None:
-        draft_model, draft_tokenizer = load(
-            args.draft_model,
-            drop_unknown_weights=args.drop_unknown_weights,
-        )
+        draft_model, draft_tokenizer = load(args.draft_model)
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:

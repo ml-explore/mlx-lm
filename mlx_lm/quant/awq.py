@@ -544,11 +544,6 @@ def main():
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument(
-        "--drop-unknown-weights",
-        action="store_true",
-        help="Drop weights not present in the instantiated model.",
-    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -559,12 +554,7 @@ def main():
 
     mx.random.seed(args.seed)
 
-    model, tokenizer, config = load(
-        args.model,
-        lazy=True,
-        return_config=True,
-        drop_unknown_weights=args.drop_unknown_weights,
-    )
+    model, tokenizer, config = load(args.model, lazy=True, return_config=True)
 
     model_type = config["model_type"]
     if (awq_config := AWQ_MODEL_CONFIGS.get(model_type, None)) is None:

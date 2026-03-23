@@ -54,11 +54,6 @@ def parse_arguments() -> argparse.Namespace:
         default="ggml-model-f16.gguf",
         type=str,
     )
-    parser.add_argument(
-        "--drop-unknown-weights",
-        action="store_true",
-        help="Drop weights not present in the instantiated model.",
-    )
     return parser.parse_args()
 
 
@@ -67,10 +62,7 @@ def main() -> None:
     args = parse_arguments()
 
     model, tokenizer, config = load(
-        args.model,
-        adapter_path=args.adapter_path,
-        return_config=True,
-        drop_unknown_weights=args.drop_unknown_weights,
+        args.model, adapter_path=args.adapter_path, return_config=True
     )
 
     fused_linears = [

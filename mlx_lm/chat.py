@@ -84,11 +84,6 @@ def setup_arg_parser():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
-    parser.add_argument(
-        "--drop-unknown-weights",
-        action="store_true",
-        help="Drop weights not present in the instantiated model.",
-    )
     return parser
 
 
@@ -110,12 +105,7 @@ def main():
     if group.size() > 1:
         if args.adapter_path:
             parser.error("Adapters not supported in distributed mode")
-        model, tokenizer = sharded_load(
-            args.model,
-            pipeline_group,
-            tensor_group,
-            drop_unknown_weights=args.drop_unknown_weights,
-        )
+        model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
     else:
         model, tokenizer = load(
             args.model,
@@ -123,7 +113,6 @@ def main():
             tokenizer_config={
                 "trust_remote_code": True if args.trust_remote_code else None
             },
-            drop_unknown_weights=args.drop_unknown_weights,
         )
 
     def print_help():

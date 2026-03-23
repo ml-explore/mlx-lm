@@ -285,7 +285,6 @@ def load_model(
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
-    drop_unknown_weights: bool = False,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -302,9 +301,6 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
-        drop_unknown_weights (bool): If ``True`` drop sanitized weights
-            that do not exist in the instantiated model before loading.
-            Default: ``False``
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
@@ -416,19 +412,18 @@ def load_model(
         model.update_modules(leaves)
 
     model.eval()
-    if drop_unknown_weights:
-        expected_keys = {key for key, _ in tree_flatten(model.parameters())}
-        unknown_keys = [key for key in weights if key not in expected_keys]
-        if unknown_keys:
-            sample_keys = sorted(unknown_keys)[:3]
-            sample = ", ".join(sample_keys)
-            if len(unknown_keys) > 3:
-                sample = f"{sample}, ..."
-            print(
-                "[INFO] Dropping weights not present in the instantiated model: "
-                f"count={len(unknown_keys)} sample=[{sample}]"
-            )
-            weights = {key: value for key, value in weights.items() if key in expected_keys}
+    expected_keys = {key for key, _ in tree_flatten(model.parameters())}
+    unknown_keys = [key for key in weights if key not in expected_keys]
+    if unknown_keys:
+        sample_keys = sorted(unknown_keys)[:3]
+        sample = ", ".join(sample_keys)
+        if len(unknown_keys) > 3:
+            sample = f"{sample}, ..."
+        print(
+            "[INFO] Dropping weights not present in the instantiated model: "
+            f"count={len(unknown_keys)} sample=[{sample}]"
+        )
+        weights = {key: value for key, value in weights.items() if key in expected_keys}
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -476,7 +471,6 @@ def load(
     lazy: bool = False,
     return_config: bool = False,
     revision: Optional[str] = None,
-    drop_unknown_weights: bool = False,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -497,8 +491,6 @@ def load(
             when needed. Default: ``False``
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
-        drop_unknown_weights (bool): If ``True`` drop sanitized weights
-            that are not supported by the instantiated model before loading.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -509,12 +501,7 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(
-        model_path,
-        lazy,
-        model_config=model_config,
-        drop_unknown_weights=drop_unknown_weights,
-    )
+    model, config = load_model(model_path, lazy, model_config=model_config)
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -533,7 +520,6 @@ def sharded_load(
     pipeline_group: Optional[mx.distributed.Group] = None,
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
-    drop_unknown_weights: bool = False,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -552,12 +538,7 @@ def sharded_load(
 
     # Lazy load model to figure out what type of sharding we can do and which
     # weights we need to download.
-    model, config = load_model(
-        model_path,
-        lazy=True,
-        strict=False,
-        drop_unknown_weights=drop_unknown_weights,
-    )
+    model, config = load_model(model_path, lazy=True, strict=False)
 
     has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_tensor_parallel = hasattr(model, "shard")
@@ -606,12 +587,7 @@ def sharded_load(
         {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
-    model, _ = load_model(
-        model_path,
-        lazy=True,
-        strict=False,
-        drop_unknown_weights=drop_unknown_weights,
-    )
+    model, _ = load_model(model_path, lazy=True, strict=False)
     if tensor_group is not None:
         model.shard(tensor_group)
     if pipeline_group is not None:
@@ -626,17 +602,8 @@ def sharded_load(
         return model, tokenizer
 
 
-def pipeline_load(
-    repo,
-    return_config: bool = False,
-    drop_unknown_weights: bool = False,
-):
-    return sharded_load(
-        repo,
-        pipeline_group=mx.distributed.init(),
-        return_config=return_config,
-        drop_unknown_weights=drop_unknown_weights,
-    )
+def pipeline_load(repo, return_config=False):
+    return sharded_load(repo, mx.distributed.init(), None, return_config)
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:

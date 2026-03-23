@@ -73,11 +73,6 @@ def setup_arg_parser():
         default=0,
         help="Delay between each test in seconds (default: 0)",
     )
-    parser.add_argument(
-        "--drop-unknown-weights",
-        action="store_true",
-        help="Drop weights not present in the instantiated model.",
-    )
     return parser
 
 
@@ -99,11 +94,7 @@ def main():
 
     if group.size() > 1:
         model, tokenizer, config = sharded_load(
-            model_path,
-            pipeline_group,
-            tensor_group,
-            return_config=True,
-            drop_unknown_weights=args.drop_unknown_weights,
+            model_path, pipeline_group, tensor_group, return_config=True
         )
     else:
         model, tokenizer, config = load(
@@ -111,7 +102,6 @@ def main():
             return_config=True,
             tokenizer_config={"trust_remote_code": True},
             model_config={"quantize_activations": args.quantize_activations},
-            drop_unknown_weights=args.drop_unknown_weights,
         )
 
     # Empty to avoid early stopping

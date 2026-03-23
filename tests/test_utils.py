@@ -1,11 +1,9 @@
 # Copyright © 2024 Apple Inc.
 
-import io
 import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 
 import mlx.core as mx
@@ -189,42 +187,24 @@ class TestUtils(unittest.TestCase):
         mx.save_safetensors(str(model_dir / "model.safetensors"), weights)
         return model_dir
 
-    def _load_tiny_model(self, model_dir, **kwargs):
-        return utils.load_model(model_dir, get_model_classes=get_tiny_classes, **kwargs)
+    def _load_tiny_model(self, model_dir):
+        return utils.load_model(
+            model_dir,
+            get_model_classes=get_tiny_classes,
+        )
 
-    def _capture_tiny_load(self, model_dir, **kwargs):
-        stdout = io.StringIO()
-        with redirect_stdout(stdout):
-            model, config = self._load_tiny_model(model_dir, **kwargs)
-        return model, config, stdout.getvalue()
-
-    def test_load_model_drops_unknown_weights_when_enabled(self):
-        weights = self._tiny_weights()
+    def test_load_model_drops_unknown_weights(self):
+        base = self._tiny_weights()
+        weights = dict(base)
         weights["vision_tower.encoder.weight"] = mx.zeros((1,), dtype=mx.float32)
         weights["audio_tower.encoder.weight"] = mx.zeros((1,), dtype=mx.float32)
         model_dir = self._write_model_dir(weights)
 
-        with self.assertRaises(ValueError):
-            self._load_tiny_model(model_dir)
-
-        # No output when there is nothing to drop
-        clean_dir = self._write_model_dir(self._tiny_weights())
-        _, _, clean_output = self._capture_tiny_load(
-            clean_dir, drop_unknown_weights=True
-        )
-        self.assertEqual(clean_output, "")
-
-        model, _, output = self._capture_tiny_load(
-            model_dir,
-            drop_unknown_weights=True,
-        )
+        model, _ = self._load_tiny_model(model_dir)
 
         loaded = dict(tree_flatten(model.parameters()))
-        self.assertIn("count=2", output)
-        self.assertIn("audio_tower.encoder.weight", output)
-        self.assertIn("vision_tower.encoder.weight", output)
-        self.assertNotIn("vision_tower.encoder.weight", loaded)
-        self.assertNotIn("audio_tower.encoder.weight", loaded)
+        self.assertTrue(mx.allclose(loaded["embed.weight"], base["embed.weight"]))
+        self.assertTrue(mx.allclose(loaded["proj.weight"], base["proj.weight"]))
 
     def test_load_model_drops_unknown_weights_after_sanitize(self):
         base = self._tiny_weights()
@@ -232,14 +212,9 @@ class TestUtils(unittest.TestCase):
         weights["vision_tower.encoder.weight"] = mx.zeros((1,), dtype=mx.float32)
         model_dir = self._write_model_dir(weights)
 
-        model, _, output = self._capture_tiny_load(
-            model_dir,
-            drop_unknown_weights=True,
-        )
+        model, _ = self._load_tiny_model(model_dir)
 
         loaded = dict(tree_flatten(model.parameters()))
-        self.assertIn("count=1", output)
-        self.assertIn("vision_tower.encoder.weight", output)
         self.assertTrue(mx.allclose(loaded["embed.weight"], base["embed.weight"]))
         self.assertTrue(mx.allclose(loaded["proj.weight"], base["proj.weight"]))
 
@@ -249,7 +224,7 @@ class TestUtils(unittest.TestCase):
         model_dir = self._write_model_dir(weights)
 
         with self.assertRaises(ValueError):
-            self._load_tiny_model(model_dir, drop_unknown_weights=True)
+            self._load_tiny_model(model_dir)
 
     def test_load_model_keeps_supported_quantized_weights(self):
         weights = self._quantized_tiny_weights()
@@ -259,10 +234,7 @@ class TestUtils(unittest.TestCase):
             extra_config={"quantization": {"bits": 4, "group_size": 32}},
         )
 
-        model, _ = self._load_tiny_model(
-            model_dir,
-            drop_unknown_weights=True,
-        )
+        model, _ = self._load_tiny_model(model_dir)
 
         loaded = dict(tree_flatten(model.parameters()))
         self.assertIn("proj.weight", loaded)

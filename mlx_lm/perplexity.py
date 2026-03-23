@@ -135,11 +135,6 @@ def main():
     parser.add_argument(
         "--seed", type=int, default=123, help="Random seed for data sampling"
     )
-    parser.add_argument(
-        "--drop-unknown-weights",
-        action="store_true",
-        help="Drop weights not present in the instantiated model.",
-    )
 
     args = parser.parse_args()
 
@@ -150,11 +145,7 @@ def main():
     # Load model
     print(f"Loading model from {args.model}...")
     tokenizer_config = {"trust_remote_code": True if args.trust_remote_code else None}
-    model, tokenizer = load(
-        args.model,
-        tokenizer_config=tokenizer_config,
-        drop_unknown_weights=args.drop_unknown_weights,
-    )
+    model, tokenizer = load(args.model, tokenizer_config=tokenizer_config)
 
     # Count parameters
     total_params = get_total_parameters(model)
