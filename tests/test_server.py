@@ -1055,6 +1055,26 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         self.assertEqual(captured["insert_prompts"], [[99, 13, 14]])
         self.assertEqual(captured["insert_prompt_checkpoints"], [None])
 
+    def test_localize_prompt_checkpoint_at_prompt_start_suppressed_with_warm_cache(
+        self,
+    ):
+        """When checkpoint_position = -len(prompt) (position 0 = start of
+        prompt) and a warm cache covers a prefix, _localize_prompt_checkpoint
+        returns None because the checkpoint falls before the reused region."""
+        generator = self._build_response_generator()
+        prompt = [11, 12, 13, 14]
+        rest = [13, 14]  # cache hit covered [11, 12]
+
+        # checkpoint_position = -4 means position 0 (start of prompt).
+        # rest_offset = 4 - 2 = 2, checkpoint_prefix = 0 < 2 → suppressed.
+        result = generator._localize_prompt_checkpoint(prompt, rest, -len(prompt))
+        self.assertIsNone(result)
+
+        # Also verify that -1 (last token) is NOT suppressed in same scenario.
+        result2 = generator._localize_prompt_checkpoint(prompt, rest, -1)
+        self.assertIsNotNone(result2)
+        self.assertEqual(result2, -1)
+
     def test_generate_batch_mode_real_generator_stores_checkpoint_cache(self):
         class DeterministicBatchModel:
             layers = [object()]
