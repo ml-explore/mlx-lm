@@ -701,8 +701,15 @@ def mtp_generate_step(
 
     def _process_and_sample(tokens, logits):
         if logits_processors:
+            # Logits processors expect 2D (batch, vocab); MTP path
+            # squeezes to 1D so unsqueeze before and squeeze after.
+            is_1d = logits.ndim == 1
+            if is_1d:
+                logits = logits[None]
             for processor in logits_processors:
                 logits = processor(tokens, logits)
+            if is_1d:
+                logits = logits.squeeze(0)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         tok = sampler(logprobs)
         return tok, logprobs
