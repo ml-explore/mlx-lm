@@ -582,6 +582,19 @@ class TestLRUPromptCache(unittest.TestCase):
 class FailingResponseGenerator:
     def __init__(self, exc: Exception):
         self.exc = exc
+        self._cli_args = type(
+            "obj",
+            (),
+            {
+                "allowed_origins": ["*"],
+                "num_draft_tokens": 0,
+                "max_tokens": 100,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+            },
+        )()
 
     def stop_and_join(self):
         return None
@@ -591,7 +604,7 @@ class FailingResponseGenerator:
 
     @property
     def cli_args(self):
-        return type("obj", (), {"allowed_origins": ["*"]})()
+        return self._cli_args
 
 
 class TestErrorStatusCodes(unittest.TestCase):
