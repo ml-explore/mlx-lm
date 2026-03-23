@@ -1450,6 +1450,13 @@ class SequenceMatcher:
 
 
 class PromptProcessingBatch:
+    @dataclass
+    class Response:
+        uid: int
+        progress: tuple
+        end_of_segment: bool
+        end_of_prompt: bool
+
     def __init__(
         self,
         model,
@@ -1473,7 +1480,60 @@ class PromptProcessingBatch:
         self.fallback_sampler = fallback_sampler or (lambda x: mx.argmax(x, axis=-1))
         self.logits_processors = logits_processors or []
         self.stop_matcher = stop_matcher or SequenceMatcher([])
-        self.max_tokens = max_tokens or 1 << 31
+        self.max_tokens = max_tokens or [1 << 31] * len(self.uids)
+
+    def __len__(self):
+        return len(self.uids)
+
+    def extend(self, batch):
+        if not self.samplers:
+            self.samplers = [None] * len(self.uids)
+        if not self.logits_processors:
+            self.logits_processors = [None] * len(self.uids)
+        samplers = batch.samplers
+        if not samplers:
+            samplers = [None] * len(batch.uids)
+        logits_processors = batch.logits_processors
+        if not logits_processors:
+            logits_processors = [None] * len(batch.uids)
+
+        self.uids.extend(batch.uids)
+        self.prompt_cache.extend(batch.prompt_cache)
+        self.tokens.extend(batch.tokens)
+        self.samplers.extend(batch.samplers)
+        self.logits_processors.extend(batch.logits_processors)
+        self.max_tokens.extend(batch.max_tokens)
+
+        if not any(self.samplers):
+            self.samplers = []
+        if not any(self.logits_processors):
+            self.logits_processors = []
+
+    def split(self, indices: List[int]):
+        indices = sorted(indices)
+        indices_left = sorted(set(range(len(self.uids))) - set(indices))
+        new_batch = copy.deepcopy(self)
+        self.filter(indices_left)
+        new_batch.filter(indices)
+
+        return new_batch
+
+    def filter(self, keep: List[int]):
+        self.uids = [self.uids[idx] for idx in keep]
+        if not keep:
+            self.prompt_cache.clear()
+        else:
+            for c in self.prompt_cache:
+                c.filter(keep)
+        self.tokens = [self.tokens[idx] for idx in keep]
+        if any(self.samplers):
+            self.samplers = [self.samplers[idx] for idx in keep]
+        if any(self.logits_processors):
+            self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        self.max_tokens = [self.max_tokens[idx] for idx in keep]
+
+    def extract_cache(self, idx: int):
+        return [c.extract(idx) for c in self.prompt_cache]
 
     def prompt(self, tokens):
         if len(self.uids) != len(tokens):
@@ -1515,7 +1575,8 @@ class PromptProcessingBatch:
             mx.clear_cache()
 
     def generate(self, tokens):
-        self.prompt([t[:-1] for t in tokens])
+        if any(len(t) > 1 for t in tokens):
+            self.prompt([t[:-1] for t in tokens])
         last_token = mx.array([t[-1] for t in tokens])
 
         generation = GenerationBatch(
@@ -1588,6 +1649,12 @@ class GenerationBatch:
 
         self._step()
 
+    def __len__(self):
+        return len(self.uids)
+
+    def extend(self, batch):
+        pass
+
     def _step(self):
         # Move next to current and kick of the computation of next. Also assign
         # current to a local var for convenience.
@@ -1644,10 +1711,10 @@ class GenerationBatch:
             sti.append(ti)
         return inputs, self._current_logprobs
 
-    def _extract_cache(self, idx: int):
+    def extract_cache(self, idx: int):
         return [c.extract(idx) for c in self.prompt_cache]
 
-    def _filter(self, keep: List[int]):
+    def filter(self, keep: List[int]):
         # Visible state
         self.uids = [self.uids[idx] for idx in keep]
         if not keep:
@@ -1701,7 +1768,7 @@ class GenerationBatch:
             # If we are done add the cache and corresponding tokens to the
             # response.
             if resp.finish_reason is not None:
-                resp.prompt_cache = self._extract_cache(i)
+                resp.prompt_cache = self.extract_cache(i)
                 resp.all_tokens = self.tokens[i]
             else:
                 keep.append(i)
@@ -1710,9 +1777,215 @@ class GenerationBatch:
 
         # Remove all sequences that are done.
         if len(keep) < len(self.uids):
-            self._filter(keep)
+            self.filter(keep)
 
         return responses
+
+
+class BatchGenerator2:
+    def __init__(
+        self,
+        model,
+        max_tokens: int = 128,
+        stop_tokens: Optional[List[List[int]]] = None,
+        sampler: Optional[Callable[[mx.array], mx.array]] = None,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
+        completion_batch_size: int = 32,
+        prefill_batch_size: int = 8,
+        prefill_step_size: int = 2048,
+    ):
+        self.model = model
+        self.max_tokens = max_tokens
+        self.stop_matcher = SequenceMatcher(stop_tokens)
+        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.logits_processors = logits_processors or []
+        self.uid_count = 0
+        self.prefill_step_size = prefill_step_size
+        self.prefill_batch_size = prefill_batch_size
+        self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+
+        self._uid_count = 0
+        self._prompt_batch = None
+        self._generation_batch = None
+        self._unprocessed_sequences = deque()
+        self._currently_processing = []
+
+        if mx.metal.is_available():
+            self._old_wired_limit = mx.set_wired_limit(
+                mx.device_info()["max_recommended_working_set_size"]
+            )
+        else:
+            self._old_wired_limit = None
+
+    def close(self):
+        if self._old_wired_limit is not None:
+            mx.synchronize(generation_stream)
+            mx.set_wired_limit(self._old_wired_limit)
+            self._old_wired_limit = None
+
+    def __del__(self):
+        self.close()
+
+    def insert(
+        self,
+        prompts,
+        max_tokens=None,
+        caches=None,
+        all_tokens=None,
+        samplers=None,
+        logits_processors=None,
+    ):
+        self.insert_segments(
+            [[p] for p in prompts],
+            max_tokens,
+            caches,
+            all_tokens,
+            samplers,
+            logits_processors,
+        )
+
+    def insert_segments(
+        self,
+        segments,
+        max_tokens=None,
+        caches=None,
+        all_tokens=None,
+        samplers=None,
+        logits_processors=None,
+    ):
+        uids = []
+
+        if max_tokens is None or isinstance(max_tokens, int):
+            max_tokens = [max_tokens or self.max_tokens] * len(prompts)
+
+        if caches is None:
+            caches = [None] * len(segments)
+        for i in range(len(segments)):
+            if caches[i] is None:
+                caches[i] = cache.make_prompt_cache(self.model)
+
+        all_tokens = all_tokens or [[] for _ in range(len(segments))]
+
+        samplers = samplers or [None] * len(segments)
+        logits_processors = logits_processors or [self.logits_processors] * len(
+            segments
+        )
+
+        for seq, m, c, at, s, lp in zip(
+            segments, max_tokens, caches, all_tokens, samplers, logits_processors
+        ):
+            seq = list(seq)
+            if len(seq[-1]) != 1:
+                seq.append(seq[-1][-1:])
+                seq[-2] = seq[-2][:-1]
+            self._unprocessed_sequences.append((self._uid_count, seq, m, c, at, s, lp))
+            uids.append(self._uid_count)
+            self._uid_count += 1
+
+        return uids
+
+    def _make_batch(self, n):
+        uids = []
+        caches = []
+        tokens = []
+        samplers = []
+        logits_processors = []
+        max_tokens = []
+        while n > 0:
+            n -= 1
+            sequence = self._unprocessed_sequences.popleft()
+            uids.append(sequence[0])
+            caches.append(sequence[3])
+            tokens.append(sequence[4])
+            samplers.append(sequence[5])
+            logits_processors.append(sequence[6])
+            max_tokens.append(sequence[2])
+            self._currently_processing.append(
+                [sequence[1], 0, sum(len(s) for s in sequence[1])]
+            )
+        return PromptProcessingBatch(
+            self.model,
+            uids,
+            caches,
+            tokens,
+            self.prefill_step_size,
+            samplers,
+            logits_processors,
+            self.stop_matcher,
+            max_tokens,
+        )
+
+    def _next(self):
+        generation_responses = []
+        prompt_responses = []
+
+        # Generate tokens first
+        if len(self._generation_batch) > 0:
+            generation_responses = self._generation_batch.next()
+
+        # Exit early because we already have our hands full with decoding
+        if len(self._generation_batch) >= self.completion_batch_size:
+            return prompt_responses, generation_responses
+
+        # Check if we have sequences and add them to the prompt batch
+        n = min(
+            self.prefill_batch_size - len(self._prompt_batch),
+            self.completion_batch_size - len(self._generation_batch),
+            len(self._unprocessed_sequences),
+        )
+        if n > 0:
+            self._prompt_batch.extend(self._make_batch(n))
+
+        # Split the prompt sequences to the ones moving to generation and the rest
+        keep = []
+        split = []
+        for i, seq in enumerate(self._currently_processing):
+            if len(segments) == 1 and len(segments[0]) == 1:
+                split.append(i)
+            else:
+                keep.append(i)
+
+        # Actually split off part of the prompt batch and start generation
+        if split:
+            last_inputs = [self._currently_processing[i][0] for i in split]
+            progress = [(self._currently_processing[i][2],) * 2 for i in split]
+            self._currently_processing = [self._currently_processing[i] for i in keep]
+            gen_batch = self._prompt_batch.split(split).generate(last_inputs)
+            for i, p in enumerate(progress):
+                prompt_responses.append(
+                    self.Response(
+                        gen_batch.uids[i],
+                        p,
+                        True,
+                        True,
+                    )
+                )
+            if self._generation_batch is not None:
+                self._generation_batch.extend(gen_batch)
+            else:
+                self._generation_batch = gen_batch
+
+        # Extract the next prompts input
+        prompts = []
+        for i, seq in enumerate(self._currently_processing):
+            response = self.Response(self._prompt_batch.uids[i], 0, False, False)
+            segments = seq[0]
+            n = min(len(segments[0]), self.prefill_step_size)
+            prompts.append(segments[0][:n])
+            segments[0] = segments[0][n:]
+            if len(segments[0]) == 0:
+                segments.pop(0)
+                response.end_of_segment = True
+            seq[1] += len(prompts[-1])
+            response.progress = (seq[1], seq[2])
+            prompt_responses.append(response)
+
+        # Process the prompts
+        self._prompt_batch.prompt(prompts)
+
+        return prompt_responses, generation_responses
 
 
 def main():
