@@ -975,6 +975,9 @@ class BatchKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        if self.keys is None:
+            return
+
         self.keys = self.keys[batch_indices]
         self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
@@ -1297,6 +1300,9 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        if self.keys is None:
+            return
+
         self.keys = self.keys[batch_indices]
         self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
