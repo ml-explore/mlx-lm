@@ -877,12 +877,14 @@ class ResponseGenerator:
         if last_message["role"] != "user":
             return False, -1
 
+        if not tokenizer.has_thinking:
+            return False, -1
+
         prompt_checkpoint = -1
-        if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt)) - 1, 1):
-                if prompt[-i] == tokenizer.think_start_id:
-                    prompt_checkpoint = -i - 1
-                    break
+        for i in range(1, min(11, len(prompt)) - 1, 1):
+            if prompt[-i] == tokenizer.think_start_id:
+                prompt_checkpoint = -i - 1
+                break
 
         return True, prompt_checkpoint
 

@@ -866,6 +866,8 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         generator, captured = self._run_batch_checkpoint_probe(
             request=request,
             tokenized_prompt=[11, 12, 13, 14],
+            has_thinking=True,
+            think_start_id=99,
         )
 
         self.assertIn("prompt_checkpoint_callback", captured["constructor_kwargs"])
@@ -878,6 +880,23 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         )
         self.assertEqual(rest, [])
         self.assertEqual([cache.value for cache in checkpoint_cache], ["checkpoint"])
+
+    def test_generate_batch_mode_non_thinking_model_skips_checkpoint(self):
+        request = CompletionRequest(
+            request_type="chat",
+            prompt="",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            role_mapping=None,
+        )
+        generator, captured = self._run_batch_checkpoint_probe(
+            request=request,
+            tokenized_prompt=[11, 12, 13, 14],
+        )
+
+        self.assertIn("prompt_checkpoint_callback", captured["constructor_kwargs"])
+        self.assertEqual(captured["insert_prompt_checkpoints"], [None])
+        self.assertEqual(len(generator.prompt_cache), 1)
 
     def test_generate_batch_mode_does_not_store_checkpoint_for_non_user_terminal_chat(
         self,
@@ -946,6 +965,8 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
             request=request,
             tokenized_prompt=[11, 12, 13, 14],
             callback_prompt_end=4,
+            has_thinking=True,
+            think_start_id=99,
         )
 
         self.assertIn("prompt_checkpoint_callback", captured["constructor_kwargs"])
@@ -1099,6 +1120,8 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         generator = self._build_response_generator()
         generator._time_budget = [None]
         generator.model_provider.model = DeterministicBatchModel()
+        generator.model_provider.tokenizer.has_thinking = True
+        generator.model_provider.tokenizer.think_start_id = 99
         generator.model_provider.tokenizer.detokenizer = type(
             "FakeDetokenizer",
             (),
