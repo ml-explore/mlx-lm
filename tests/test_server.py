@@ -881,7 +881,13 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         self.assertEqual(rest, [])
         self.assertEqual([cache.value for cache in checkpoint_cache], ["checkpoint"])
 
-    def test_generate_batch_mode_non_thinking_model_skips_checkpoint(self):
+    def test_generate_batch_mode_non_thinking_model_stores_checkpoint(self):
+        """Non-thinking models still save a checkpoint at -1 (last token).
+
+        This is important for models with non-trimmable caches (ArraysCache)
+        where the completion entry can't be rewound, but a checkpoint entry
+        at the prompt boundary enables reuse via the shorter-cache path.
+        """
         request = CompletionRequest(
             request_type="chat",
             prompt="",
@@ -895,8 +901,15 @@ class TestResponseGeneratorBatchPromptCheckpoints(unittest.TestCase):
         )
 
         self.assertIn("prompt_checkpoint_callback", captured["constructor_kwargs"])
-        self.assertEqual(captured["insert_prompt_checkpoints"], [None])
-        self.assertEqual(len(generator.prompt_cache), 1)
+        self.assertEqual(captured["insert_prompt_checkpoints"], [-1])
+        self.assertEqual(len(generator.prompt_cache), 2)
+
+        checkpoint_cache, rest = generator.prompt_cache.fetch_nearest_cache(
+            generator.model_provider.model_key,
+            [11, 12, 13],
+        )
+        self.assertEqual(rest, [])
+        self.assertEqual([cache.value for cache in checkpoint_cache], ["checkpoint"])
 
     def test_generate_batch_mode_does_not_store_checkpoint_for_non_user_terminal_chat(
         self,
