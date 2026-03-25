@@ -164,6 +164,22 @@ class _BaseCache:
         """
         raise NotImplementedError("Cache sub-class must implement this.")
 
+    def rewind(self, num_to_trim: int) -> bool:
+        raise NotImplementedError("Cache sub-class must implement rewind.")
+
+    def _has_rewind_impl(self):
+        """Check whether this cache has a real rewind implementation.
+
+        Returns True if the concrete class overrides rewind() beyond the
+        _BaseCache default.  This uses method identity rather than a separate
+        opt-in flag so that third-party caches that implement rewind()
+        participate automatically without needing to know about this helper.
+        """
+        try:
+            return type(self).rewind is not _BaseCache.rewind
+        except Exception:
+            return False
+
     @classmethod
     def from_state(cls, state, meta_state):
         # Create an instance of cls without calling __init__
@@ -1247,7 +1263,27 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset -= n
         self._idx -= n
         self.offset -= n
+        if self.rotated:
+            self.left_padding += n
         return n
+
+    def can_rewind(self, num_to_trim: int) -> bool:
+        if num_to_trim <= 0:
+            return True
+        if self.keys is None or self.values is None:
+            return False
+        if self._idx < 0 or self._idx > self.keys.shape[2]:
+            return False
+        if num_to_trim > self._offset or num_to_trim > self._idx:
+            return False
+        return True
+
+    def rewind(self, num_to_trim: int) -> bool:
+        if not self.can_rewind(num_to_trim):
+            return False
+        if num_to_trim <= 0:
+            return True
+        return self.trim(num_to_trim) == num_to_trim
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("BatchRotatingKVCache Quantization NYI")

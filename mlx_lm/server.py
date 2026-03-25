@@ -2,9 +2,9 @@
 
 import argparse
 import copy
-import heapq
 import json
 import logging
+import numbers
 import pickle
 import platform
 import socket
@@ -36,11 +36,7 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import BatchGenerator, generation_stream, stream_generate
-from .models.cache import (
-    can_trim_prompt_cache,
-    make_prompt_cache,
-    trim_prompt_cache,
-)
+from .models.cache import _BaseCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -175,19 +171,21 @@ class LRUPromptCache:
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
+        ref_count: int
         nbytes: int
+        checkpoint: bool = False
 
     class CacheOrder:
         def __init__(self):
-            self._lru_checkpoints = deque()
             self._lru = deque()
+            self._lru_checkpoints = deque()
 
         def __len__(self):
             return len(self._lru) + len(self._lru_checkpoints)
 
         def push(self, model, tokens, checkpoint: bool = False):
-            c = self._lru_checkpoints if checkpoint else self._lru
-            c.append((model, tokens))
+            queue = self._lru_checkpoints if checkpoint else self._lru
+            queue.append((model, tokens))
 
         def remove(self, model, tokens):
             try:
@@ -198,15 +196,14 @@ class LRUPromptCache:
         def pop(self):
             if len(self._lru) >= len(self._lru_checkpoints):
                 return self._lru.popleft()
-            else:
-                return self._lru_checkpoints.popleft()
+            return self._lru_checkpoints.popleft()
 
     @dataclass
     class SearchResult:
         model: Any
         exact: List[int]
         shorter: List[int]
-        longer: List[int]
+        longer: List[List[int]]
         common_prefix: int
 
     def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
@@ -229,6 +226,10 @@ class LRUPromptCache:
             return self.SearchResult(model, None, None, None, 0)
 
         current = self._cache[model]
+        if not tokens:
+            if "cache" in current:
+                return self.SearchResult(model, tokens, None, None, 0)
+            return self.SearchResult(model, None, None, None, 0)
         last_cache_index = -1
         index = 0
 
@@ -244,24 +245,26 @@ class LRUPromptCache:
 
         # Find the shorter cache
         shorter = None
-        if last_cache_index > 0:
+        if last_cache_index >= 0:
             shorter = tokens[: last_cache_index + 1]
 
         # Check for caches that are longer
         longer = None
         common_prefix = index
         if index > 0:
-            best = None
+            candidates = []
             stack = [(current, [])]
             while stack:
                 current, extra = stack.pop()
-                if "cache" in current:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                else:
-                    for tok in current:
-                        stack.append((current[tok], extra + [tok]))
-            longer = tokens[:index] + best
+                if "cache" in current and extra:
+                    candidates.append(extra)
+                for tok in current:
+                    if tok == "cache":
+                        continue
+                    stack.append((current[tok], extra + [tok]))
+            if candidates:
+                candidates.sort(key=lambda extra: (len(extra), extra))
+                longer = [tokens[:index] + extra for extra in candidates]
         return self.SearchResult(model, None, shorter, longer, common_prefix)
 
     def _get(self, model, tokens):
@@ -283,51 +286,179 @@ class LRUPromptCache:
                 break
             del d_prev[t]
 
+        logging.debug(f"[LRUPromptCache] Removed {cache_bytes} bytes from the cache")
+
+    def _extract(self, model, tokens):
+        cache_entry = self._get(model, tokens)
+        if cache_entry.checkpoint:
+            try:
+                extracted_cache = copy.deepcopy(cache_entry.prompt_cache)
+            except Exception:
+                return None
+            self._lru.remove(model, tokens)
+            self._lru.push(model, tokens, checkpoint=True)
+            return self.CacheEntry(extracted_cache, 1, cache_entry.nbytes, True)
+
+        if cache_entry.ref_count == 1:
+            self._delete(model, tokens)
+            self._lru.remove(model, tokens)
+            return cache_entry
+
+        try:
+            extracted_cache = copy.deepcopy(cache_entry.prompt_cache)
+        except Exception:
+            return None
+        cache_entry.ref_count -= 1
+        self._refresh_recency(model, tokens, checkpoint=False)
+        return self.CacheEntry(extracted_cache, 1, cache_entry.nbytes)
+
+    def _refresh_recency(self, model, tokens, checkpoint: bool):
+        self._lru.remove(model, tokens)
+        self._lru.push(model, tokens, checkpoint=checkpoint)
+
+    def _can_rewind_layer_cache(self, layer_cache, num_to_trim):
+        can_rewind = getattr(layer_cache, "can_rewind", None)
+        is_trimmable = getattr(layer_cache, "is_trimmable", None)
+        trim = getattr(layer_cache, "trim", None)
+        if callable(can_rewind):
+            if isinstance(layer_cache, _BaseCache):
+                has_custom_rewind = layer_cache._has_rewind_impl()
+            else:
+                has_custom_rewind = callable(getattr(layer_cache, "rewind", None))
+            has_execution_path = has_custom_rewind or (
+                callable(is_trimmable) and callable(trim)
+            )
+            if not has_execution_path:
+                return False
+            try:
+                can_rewind_result = can_rewind(num_to_trim)
+                if isinstance(can_rewind_result, bool):
+                    return can_rewind_result
+                if isinstance(can_rewind_result, numbers.Integral) and not isinstance(
+                    can_rewind_result, bool
+                ):
+                    return int(can_rewind_result) >= num_to_trim
+                return False
+            except Exception:
+                return False
+
+        # Compatibility fallback for custom caches that only implement the
+        # legacy is_trimmable()/trim()/rewind() contract.
+        rewind = getattr(layer_cache, "rewind", None)
+        if not callable(is_trimmable) or (not callable(trim) and not callable(rewind)):
+            return False
+        try:
+            if not bool(is_trimmable()):
+                return False
+            if num_to_trim <= 0:
+                return True
+
+            # If legacy cache exposes an offset, avoid deepcopy on guaranteed
+            # misses where trim can never satisfy the requested rewind.
+            offset = getattr(layer_cache, "offset", None)
+            if isinstance(offset, numbers.Integral):
+                return num_to_trim <= offset
+            return True
+        except Exception:
+            return False
+
+    def _can_rewind_prompt_cache(self, cache, num_to_trim):
+        return all(
+            self._can_rewind_layer_cache(layer_cache, num_to_trim)
+            for layer_cache in cache
+        )
+
+    def _rewind_layer_cache(self, layer_cache, num_to_trim):
+        rewind = getattr(layer_cache, "rewind", None)
+        has_real_rewind = (
+            isinstance(layer_cache, _BaseCache) and layer_cache._has_rewind_impl()
+        ) or (not isinstance(layer_cache, _BaseCache) and callable(rewind))
+        if has_real_rewind:
+            try:
+                rewind_result = rewind(num_to_trim)
+                if isinstance(rewind_result, bool):
+                    return rewind_result
+                if isinstance(rewind_result, numbers.Integral) and not isinstance(
+                    rewind_result, bool
+                ):
+                    return int(rewind_result) == num_to_trim
+                return False
+            except Exception:
+                return False
+
+        # Compatibility fallback for caches that only implement the
+        # legacy is_trimmable()/trim() contract.
+        is_trimmable = getattr(layer_cache, "is_trimmable", None)
+        trim = getattr(layer_cache, "trim", None)
+        if not callable(is_trimmable) or not callable(trim):
+            return False
+        try:
+            return bool(is_trimmable()) and trim(num_to_trim) == num_to_trim
+        except Exception:
+            return False
+
+    def _rewind_prompt_cache(self, cache, num_to_trim):
+        return all(
+            self._rewind_layer_cache(layer_cache, num_to_trim) for layer_cache in cache
+        )
+
     def fetch_nearest_cache(self, model, tokens):
         result = self._search(model, tokens)
         if result.exact is not None:
-            cache_entry = self._get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            cache_entry = self._extract(result.model, result.exact)
+            if cache_entry is None:
+                return None, tokens
+            return cache_entry.prompt_cache, []
 
-        short_length = len(result.shorter) if result.shorter is not None else 0
-        if result.longer is not None and result.common_prefix > short_length:
-            cache_entry = self._get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+        if result.longer is not None:
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            for longer_tokens in result.longer:
+                cache_entry = self._get(result.model, longer_tokens)
+                num_to_trim = len(longer_tokens) - prefix
 
-        if short_length > 0:
-            cache_entry = self._get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+                if not self._can_rewind_prompt_cache(
+                    cache_entry.prompt_cache, num_to_trim
+                ):
+                    continue
+                try:
+                    cache = copy.deepcopy(cache_entry.prompt_cache)
+                except Exception:
+                    cache = None
+                if cache is not None and self._rewind_prompt_cache(cache, num_to_trim):
+                    self._refresh_recency(
+                        result.model, longer_tokens, checkpoint=cache_entry.checkpoint
+                    )
+                    return cache, tokens[prefix:]
+
+        if result.shorter is not None:
+            cache_entry = self._extract(result.model, result.shorter)
+            if cache_entry is None:
+                return None, tokens
+            prefix_len = len(result.shorter)
+            return cache_entry.prompt_cache, tokens[prefix_len:]
 
         return None, tokens
 
     def insert_cache(self, model, tokens, prompt_cache, checkpoint: bool = False):
-        is_trimmable = can_trim_prompt_cache(prompt_cache)
-
         if model not in self._cache:
             self._cache[model] = {}
         current = self._cache[model]
-        for i, tok in enumerate(tokens):
+        for tok in tokens:
             if tok not in current:
                 current[tok] = {}
-            if is_trimmable and "cache" in current:
-                self._n_bytes -= current["cache"].nbytes
-                del current["cache"]
-                self._lru.remove(model, tokens[:i])
             current = current[tok]
 
         if "cache" in current:
+            current["cache"].ref_count += 1
+            current["cache"].checkpoint = current["cache"].checkpoint or checkpoint
             self._lru.remove(model, tokens)
         else:
             cache_bytes = sum(c.nbytes for c in prompt_cache)
-            current["cache"] = self.CacheEntry(prompt_cache, cache_bytes)
+            current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes, checkpoint)
             self._n_bytes += cache_bytes
+            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} to the cache")
 
-        self._lru.push(model, tokens, checkpoint=checkpoint)
+        self._lru.push(model, tokens, checkpoint=current["cache"].checkpoint)
         if len(self._lru) > self.max_size:
             model, tokens = self._lru.pop()
             self._delete(model, tokens)
@@ -737,12 +868,14 @@ class ResponseGenerator:
     def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
         if request.request_type != "chat":
             return False, -1
-        if request.messages[-1]["role"] != "user":
+        if not request.messages:
+            raise ValueError("Chat request messages must be a non-empty list")
+        last_message = request.messages[-1]
+        if not isinstance(last_message, dict) or "role" not in last_message:
+            raise ValueError("Chat request last message must include a role")
+        if last_message["role"] != "user":
             return False, -1
 
-        # Save the KV cache at the end of the prompt just before
-        # the think start token which will likely be removed in the
-        # next turn.
         prompt_checkpoint = -1
         if tokenizer.has_thinking:
             for i in range(1, min(11, len(prompt)) - 1, 1):
@@ -751,6 +884,33 @@ class ResponseGenerator:
                     break
 
         return True, prompt_checkpoint
+
+    def _localize_prompt_checkpoint(self, prompt, rest, checkpoint_position):
+        prompt_len = len(prompt)
+        rest_offset = prompt_len - len(rest)
+        checkpoint_prefix = (
+            checkpoint_position
+            if checkpoint_position > 0
+            else prompt_len + checkpoint_position
+        )
+        if checkpoint_prefix < rest_offset or checkpoint_prefix >= prompt_len:
+            return None
+        return -(prompt_len - checkpoint_prefix)
+
+    def _materialize_prompt_tail_for_generation(self, prompt, cache, rest):
+        if cache is None or rest or not prompt:
+            return cache, rest
+
+        # Exact prompt-cache hits need one token outside the cache so generation
+        # can resume through the normal prefill/decode entry points.
+        if self.prompt_cache._can_rewind_prompt_cache(
+            cache, 1
+        ) and self.prompt_cache._rewind_prompt_cache(cache, 1):
+            return cache, prompt[-1:]
+
+        # If the extracted cache cannot be safely rewound, fall back to replaying
+        # the full prompt instead of forwarding an unusable empty remainder.
+        return None, prompt
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -784,12 +944,15 @@ class ResponseGenerator:
 
         def checkpoint_callback(prompts):
             for uid, prompt_end, cache in prompts:
-                rs = batch_results[uid]
-                if not rs["checkpoint"]:
+                result = batch_results.get(uid)
+                if result is None or not result["checkpoint"]:
+                    continue
+                cache_key = result["cache_key"][:-prompt_end]
+                if not cache_key:
                     continue
                 self.prompt_cache.insert_cache(
                     current_model_key,
-                    rs["cache_key"][:-prompt_end],
+                    cache_key,
                     list(cache),
                     checkpoint=True,
                 )
@@ -820,6 +983,11 @@ class ResponseGenerator:
                 ):
                     try:
                         prompt = self._tokenize(current_tokenizer, request, args)
+                        do_checkpoint, checkpoint_position = (
+                            self._compute_prompt_checkpoint(
+                                current_tokenizer, request, prompt
+                            )
+                        )
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -842,17 +1010,22 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
-                    self.prompt_cache.log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
+                    )
+                    cache, rest = self._materialize_prompt_tail_for_generation(
+                        prompt, cache, rest
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
-                    do_checkpoint, checkpoint_position = (
-                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
-                    )
+                    localized_checkpoint = None
+                    if do_checkpoint:
+                        localized_checkpoint = self._localize_prompt_checkpoint(
+                            prompt, rest, checkpoint_position
+                        )
+                        do_checkpoint = localized_checkpoint is not None
 
                     (uid,) = batch_generator.insert(
                         [rest],
@@ -860,7 +1033,7 @@ class ResponseGenerator:
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        prompt_checkpoints=[checkpoint_position],
+                        prompt_checkpoints=[localized_checkpoint],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -1026,6 +1199,9 @@ class ResponseGenerator:
             self.prompt_cache.log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
+            )
+            cache, rest = self._materialize_prompt_tail_for_generation(
+                prompt, cache, rest
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]

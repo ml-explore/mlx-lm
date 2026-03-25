@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import copy
+import gc
 import os
 import tempfile
 import unittest
@@ -26,6 +27,71 @@ from mlx_lm.models.cache import (
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+
+
+class TestBatchRotatingKVCacheState(unittest.TestCase):
+
+    @staticmethod
+    def _run_batch_rotating_memory_loop(*, step_size: int, force_padding_eval: bool):
+        gc.collect()
+        mx.clear_cache()
+
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
+        prompt_kv = mx.zeros((2, 1, 4, 8))
+        prompt_k, prompt_v = cache.update_and_fetch(prompt_kv, prompt_kv)
+        mx.eval(prompt_k, prompt_v)
+
+        step_kv = mx.zeros((2, 1, step_size, 8))
+        mx.reset_peak_memory()
+        for _ in range(120):
+            keys, values = cache.update_and_fetch(step_kv, step_kv)
+            output = keys.sum() + values.sum()
+            if force_padding_eval:
+                mx.eval(output, cache.left_padding, cache.offset)
+            else:
+                mx.eval(output)
+
+        return mx.get_peak_memory(), mx.get_active_memory()
+
+    def test_update_eval_preserves_pre_decode_mask_snapshot(self):
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
+
+        prompt_kv = mx.zeros((2, 1, 4, 8))
+        prompt_k, prompt_v = cache.update_and_fetch(prompt_kv, prompt_kv)
+        mx.eval(prompt_k, prompt_v)
+
+        pre_decode_mask = cache.make_mask(1)
+
+        decode_kv = mx.zeros((2, 1, 1, 8))
+        decode_k, decode_v = cache.update_and_fetch(decode_kv, decode_kv)
+        mx.eval(decode_k, decode_v)
+
+        self.assertEqual(pre_decode_mask.shape, (2, 1, 1, 4))
+        self.assertEqual(pre_decode_mask[0, 0, 0].tolist(), [True, False, True, True])
+        self.assertEqual(pre_decode_mask[1, 0, 0].tolist(), [True, True, True, True])
+
+        post_decode_mask = cache.make_mask(1)
+        mx.eval(post_decode_mask)
+        self.assertEqual(post_decode_mask.shape, (2, 1, 1, 4))
+        self.assertEqual(post_decode_mask[0, 0, 0].tolist(), [True, True, True, True])
+        self.assertEqual(post_decode_mask[1, 0, 0].tolist(), [True, True, True, True])
+
+    def test_returned_tensor_eval_keeps_batch_rotating_memory_close_to_explicit_padding_eval(
+        self,
+    ):
+        for path_name, step_size in (("decode", 1), ("prompt", 4)):
+            with self.subTest(path=path_name):
+                baseline_peak, baseline_active = self._run_batch_rotating_memory_loop(
+                    step_size=step_size,
+                    force_padding_eval=True,
+                )
+                trial_peak, trial_active = self._run_batch_rotating_memory_loop(
+                    step_size=step_size,
+                    force_padding_eval=False,
+                )
+
+                self.assertLessEqual(trial_peak, int(baseline_peak * 2.0))
+                self.assertLessEqual(trial_active, int(baseline_active * 2.0))
 
 
 class TestPromptCache(unittest.TestCase):

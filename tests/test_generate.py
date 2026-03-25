@@ -633,5 +633,457 @@ class TestGenerate(unittest.TestCase):
         self._continued_generation_test_helper(model)
 
 
+class TestBatchGeneratorPromptCheckpoints(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+        cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
+        cls.model.set_dtype(mx.float32)
+
+    def test_batch_generator_rejects_prompt_checkpoint_outside_prompt_length(self):
+        prompt = self.tokenizer.encode(
+            "Write a short paragraph about caches and rewind behavior."
+        )
+        for checkpoint in (0, len(prompt) + 1, -(len(prompt) + 1)):
+            with self.subTest(checkpoint=checkpoint):
+                gen = BatchGenerator(
+                    self.model,
+                    stop_tokens=self.tokenizer.eos_token_ids,
+                    max_tokens=1,
+                )
+                try:
+                    with self.assertRaisesRegex(ValueError, "prompt checkpoint"):
+                        gen.insert([prompt], prompt_checkpoints=checkpoint)
+                finally:
+                    gen.close()
+
+    def test_batch_generator_rejects_list_prompt_checkpoint_outside_prompt_length(self):
+        prompts = [
+            self.tokenizer.encode("Brief note about caches."),
+            self.tokenizer.encode(
+                "Write a short paragraph about caches and rewind behavior."
+            ),
+        ]
+        invalid_checkpoints = [
+            [0, -2],
+            [-2, -(len(prompts[1]) + 1)],
+            [2, len(prompts[1]) + 1],
+        ]
+        for prompt_checkpoints in invalid_checkpoints:
+            with self.subTest(prompt_checkpoints=prompt_checkpoints):
+                gen = BatchGenerator(
+                    self.model,
+                    stop_tokens=self.tokenizer.eos_token_ids,
+                    max_tokens=1,
+                )
+                try:
+                    with self.assertRaisesRegex(ValueError, "prompt checkpoint"):
+                        gen.insert(prompts, prompt_checkpoints=prompt_checkpoints)
+                finally:
+                    gen.close()
+
+    def test_batch_generator_callback_without_prompt_checkpoints_defaults_to_last_token_checkpoint(
+        self,
+    ):
+        prompt = self.tokenizer.encode(
+            "Write a short paragraph about caches and rewind behavior."
+        )
+        checkpoint_batches = []
+
+        def checkpoint_callback(records):
+            checkpoint_batches.append(list(records))
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prompt_checkpoint_callback=checkpoint_callback,
+        )
+
+        (uid,) = gen.insert([prompt])
+        batch_responses = {}
+        while responses := gen.next():
+            for response in responses:
+                batch_responses[response.uid] = response
+
+        self.assertEqual(len(checkpoint_batches), 1)
+        self.assertEqual(len(checkpoint_batches[0]), 1)
+        checkpoint_uid, checkpoint_size, checkpoint_cache_iter = checkpoint_batches[0][
+            0
+        ]
+        self.assertEqual(checkpoint_uid, uid)
+        self.assertEqual(checkpoint_size, 1)
+
+        checkpoint_cache = list(checkpoint_cache_iter)
+        resumed = next(
+            generate_step(
+                prompt=mx.array(prompt[-checkpoint_size:], dtype=mx.uint32),
+                model=self.model,
+                prompt_cache=checkpoint_cache,
+                max_tokens=1,
+            )
+        )
+        self.assertEqual(batch_responses[uid].token, resumed[0])
+        self.assertTrue(
+            mx.allclose(batch_responses[uid].logprobs, resumed[1], rtol=1e-4, atol=1e-4)
+        )
+
+    def test_batch_generator_negative_prompt_checkpoint_resume_matches_full_prompt(
+        self,
+    ):
+        prompt = self.tokenizer.encode(
+            "Write a short paragraph about caches and rewind behavior."
+        )
+        checkpoint_batches = []
+
+        def checkpoint_callback(records):
+            checkpoint_batches.append(list(records))
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prompt_checkpoint_callback=checkpoint_callback,
+        )
+
+        (uid,) = gen.insert([prompt], prompt_checkpoints=-2)
+        batch_responses = {}
+        while responses := gen.next():
+            for response in responses:
+                batch_responses[response.uid] = response
+
+        self.assertEqual(len(checkpoint_batches), 1)
+        self.assertEqual(len(checkpoint_batches[0]), 1)
+        checkpoint_uid, checkpoint_size, checkpoint_cache_iter = checkpoint_batches[0][
+            0
+        ]
+        self.assertEqual(checkpoint_uid, uid)
+        self.assertEqual(checkpoint_size, 2)
+
+        checkpoint_cache = list(checkpoint_cache_iter)
+        self.assertEqual(len(checkpoint_cache), len(self.model.layers))
+        resumed = next(
+            generate_step(
+                prompt=mx.array(prompt[-checkpoint_size:], dtype=mx.uint32),
+                model=self.model,
+                prompt_cache=checkpoint_cache,
+                max_tokens=1,
+            )
+        )
+        self.assertEqual(batch_responses[uid].token, resumed[0])
+        self.assertTrue(
+            mx.allclose(batch_responses[uid].logprobs, resumed[1], rtol=1e-4, atol=1e-4)
+        )
+
+    def test_batch_generator_prompt_checkpoints_use_shared_batch_checkpoint_and_resume(
+        self,
+    ):
+        prompts = [
+            self.tokenizer.encode("Tell me something about the moon."),
+            self.tokenizer.encode("Tell me something about the sun."),
+        ]
+        checkpoint_batches = []
+
+        def checkpoint_callback(records):
+            checkpoint_batches.append(list(records))
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prompt_checkpoint_callback=checkpoint_callback,
+        )
+
+        uids = gen.insert(prompts, prompt_checkpoints=[-1, -3])
+        batch_responses = {}
+        while responses := gen.next():
+            for response in responses:
+                batch_responses[response.uid] = response
+
+        self.assertEqual(len(checkpoint_batches), 1)
+        checkpoint_records = checkpoint_batches[0]
+        self.assertEqual(len(checkpoint_records), len(uids))
+        self.assertEqual({record[0] for record in checkpoint_records}, set(uids))
+        self.assertEqual({record[1] for record in checkpoint_records}, {3})
+        records_by_uid = {record[0]: record for record in checkpoint_records}
+        for uid, prompt in zip(uids, prompts):
+            _uid, checkpoint_size, checkpoint_cache_iter = records_by_uid[uid]
+            checkpoint_cache = list(checkpoint_cache_iter)
+            self.assertEqual(len(checkpoint_cache), len(self.model.layers))
+            resumed = next(
+                generate_step(
+                    prompt=mx.array(prompt[-checkpoint_size:], dtype=mx.uint32),
+                    model=self.model,
+                    prompt_cache=checkpoint_cache,
+                    max_tokens=1,
+                )
+            )
+            self.assertEqual(batch_responses[uid].token, resumed[0])
+            self.assertTrue(
+                mx.allclose(
+                    batch_responses[uid].logprobs,
+                    resumed[1],
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+            )
+
+    def test_batch_generator_positive_prompt_checkpoint_is_length_normalized_and_resumable(
+        self,
+    ):
+        prompt = self.tokenizer.encode(
+            "Write a short paragraph about the mountains and the clouds."
+        )
+        expected_checkpoint_size = max(1, len(prompt) - 2)
+        checkpoint_batches = []
+
+        def checkpoint_callback(records):
+            checkpoint_batches.append(list(records))
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prompt_checkpoint_callback=checkpoint_callback,
+        )
+
+        (uid,) = gen.insert([prompt], prompt_checkpoints=2)
+        batch_responses = {}
+        while responses := gen.next():
+            for response in responses:
+                batch_responses[response.uid] = response
+
+        self.assertEqual(len(checkpoint_batches), 1)
+        self.assertEqual(len(checkpoint_batches[0]), 1)
+        checkpoint_uid, checkpoint_size, checkpoint_cache_iter = checkpoint_batches[0][
+            0
+        ]
+        self.assertEqual(checkpoint_uid, uid)
+        self.assertEqual(checkpoint_size, expected_checkpoint_size)
+
+        checkpoint_cache = list(checkpoint_cache_iter)
+        resumed = next(
+            generate_step(
+                prompt=mx.array(prompt[-checkpoint_size:], dtype=mx.uint32),
+                model=self.model,
+                prompt_cache=checkpoint_cache,
+                max_tokens=1,
+            )
+        )
+        self.assertEqual(batch_responses[uid].token, resumed[0])
+        self.assertTrue(
+            mx.allclose(batch_responses[uid].logprobs, resumed[1], rtol=1e-4, atol=1e-4)
+        )
+
+    def test_batch_generator_checkpoint_resume_matches_merge_path_continuation(self):
+        prompts_a = [
+            self.tokenizer.encode("A short warmup prompt about the ocean."),
+            self.tokenizer.encode("A short warmup prompt about the forest."),
+        ]
+        prompts_b = [
+            self.tokenizer.encode("Now continue with one sentence about tides."),
+            self.tokenizer.encode("Now continue with one sentence about moss."),
+        ]
+
+        base_gen = BatchGenerator(
+            self.model, stop_tokens=self.tokenizer.eos_token_ids, max_tokens=1
+        )
+        base_uids = base_gen.insert(prompts_a)
+        base_caches = {uid: None for uid in base_uids}
+        base_tokens = {}
+        while responses := base_gen.next():
+            for response in responses:
+                if response.finish_reason is not None:
+                    base_caches[response.uid] = response.prompt_cache
+                    base_tokens[response.uid] = response.token
+        caches = [base_caches[uid] for uid in base_uids]
+        for cache_value in caches:
+            self.assertIsNotNone(cache_value)
+
+        checkpoint_batches = []
+
+        def checkpoint_callback(records):
+            checkpoint_batches.append(list(records))
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prompt_checkpoint_callback=checkpoint_callback,
+        )
+        uids = gen.insert(prompts_b, caches=caches, prompt_checkpoints=-2)
+        batch_responses = {}
+        while responses := gen.next():
+            for response in responses:
+                batch_responses[response.uid] = response
+
+        self.assertEqual(len(checkpoint_batches), 1)
+        checkpoint_records = checkpoint_batches[0]
+        self.assertEqual(len(checkpoint_records), len(uids))
+        self.assertEqual({record[0] for record in checkpoint_records}, set(uids))
+        self.assertEqual({record[1] for record in checkpoint_records}, {2})
+        records_by_uid = {record[0]: record for record in checkpoint_records}
+        for uid, base_uid, prompt_a, prompt_b in zip(
+            uids, base_uids, prompts_a, prompts_b
+        ):
+            _uid, checkpoint_size, checkpoint_cache_iter = records_by_uid[uid]
+            checkpoint_cache = list(checkpoint_cache_iter)
+            expected = next(
+                generate_step(
+                    prompt=mx.array(
+                        prompt_a + [base_tokens[base_uid]] + prompt_b,
+                        dtype=mx.uint32,
+                    ),
+                    model=self.model,
+                    max_tokens=1,
+                )
+            )
+            resumed = next(
+                generate_step(
+                    prompt=mx.array(prompt_b[-checkpoint_size:], dtype=mx.uint32),
+                    model=self.model,
+                    prompt_cache=checkpoint_cache,
+                    max_tokens=1,
+                )
+            )
+            self.assertEqual(batch_responses[uid].token, expected[0])
+            self.assertTrue(
+                mx.allclose(
+                    batch_responses[uid].logprobs,
+                    expected[1],
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+            )
+            self.assertEqual(resumed[0], expected[0])
+            self.assertTrue(
+                mx.allclose(
+                    resumed[1],
+                    expected[1],
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+            )
+            self.assertTrue(
+                mx.allclose(
+                    batch_responses[uid].logprobs,
+                    resumed[1],
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+            )
+
+    def test_batch_generator_merge_path_allows_mixed_none_and_longer_checkpoint_tails(
+        self,
+    ):
+        prompts_a = [
+            self.tokenizer.encode("A short warmup prompt about the ocean."),
+            self.tokenizer.encode("A short warmup prompt about the forest."),
+        ]
+        prompts_b = [
+            self.tokenizer.encode("Brief.")[:1],
+            self.tokenizer.encode("Now continue with one sentence about moss."),
+        ]
+        self.assertLess(len(prompts_b[0]), 3)
+
+        base_gen = BatchGenerator(
+            self.model, stop_tokens=self.tokenizer.eos_token_ids, max_tokens=1
+        )
+        base_uids = base_gen.insert(prompts_a)
+        base_caches = {uid: None for uid in base_uids}
+        base_tokens = {}
+        while responses := base_gen.next():
+            for response in responses:
+                if response.finish_reason is not None:
+                    base_caches[response.uid] = response.prompt_cache
+                    base_tokens[response.uid] = response.token
+        caches = [base_caches[uid] for uid in base_uids]
+        for cache_value in caches:
+            self.assertIsNotNone(cache_value)
+
+        checkpoint_batches = []
+
+        def checkpoint_callback(records):
+            checkpoint_batches.append(list(records))
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prompt_checkpoint_callback=checkpoint_callback,
+        )
+        uids = gen.insert(prompts_b, caches=caches, prompt_checkpoints=[None, -3])
+        batch_responses = {}
+        while responses := gen.next():
+            for response in responses:
+                batch_responses[response.uid] = response
+
+        self.assertEqual(set(batch_responses), set(uids))
+        expected_short = next(
+            generate_step(
+                prompt=mx.array(
+                    prompts_a[0] + [base_tokens[base_uids[0]]] + prompts_b[0],
+                    dtype=mx.uint32,
+                ),
+                model=self.model,
+                max_tokens=1,
+            )
+        )
+        self.assertEqual(batch_responses[uids[0]].token, expected_short[0])
+        self.assertTrue(
+            mx.allclose(
+                batch_responses[uids[0]].logprobs,
+                expected_short[1],
+                rtol=1e-4,
+                atol=1e-4,
+            )
+        )
+        self.assertEqual(len(checkpoint_batches), 1)
+        self.assertEqual(len(checkpoint_batches[0]), 1)
+        checkpoint_uid, checkpoint_size, checkpoint_cache_iter = checkpoint_batches[0][
+            0
+        ]
+        self.assertEqual(checkpoint_uid, uids[1])
+        self.assertEqual(checkpoint_size, 3)
+
+        checkpoint_cache = list(checkpoint_cache_iter)
+        expected = next(
+            generate_step(
+                prompt=mx.array(
+                    prompts_a[1] + [base_tokens[base_uids[1]]] + prompts_b[1],
+                    dtype=mx.uint32,
+                ),
+                model=self.model,
+                max_tokens=1,
+            )
+        )
+        resumed = next(
+            generate_step(
+                prompt=mx.array(prompts_b[1][-checkpoint_size:], dtype=mx.uint32),
+                model=self.model,
+                prompt_cache=checkpoint_cache,
+                max_tokens=1,
+            )
+        )
+        self.assertEqual(batch_responses[uids[1]].token, expected[0])
+        self.assertEqual(resumed[0], expected[0])
+        self.assertTrue(
+            mx.allclose(
+                batch_responses[uids[1]].logprobs,
+                expected[1],
+                rtol=1e-4,
+                atol=1e-4,
+            )
+        )
+        self.assertTrue(
+            mx.allclose(
+                resumed[1],
+                expected[1],
+                rtol=1e-4,
+                atol=1e-4,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
