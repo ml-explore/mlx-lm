@@ -16,6 +16,7 @@ from typing import (
     Generator,
     List,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -827,21 +828,6 @@ class BatchStats:
 
 
 @dataclass
-class BatchResponse:
-    """
-    An data object to hold a batch generation response.
-
-    Args:
-        texts: (List[str]): The generated text for each prompt.
-        stats (BatchStats): Statistics about the generation.
-    """
-
-    texts: List[str]
-    stats: BatchStats
-    caches: Optional[List[List[Any]]]
-
-
-@dataclass
 class Batch:
     uids: List[int]
     y: mx.array
@@ -950,9 +936,13 @@ class SequenceMatcher:
         # Make the trie
         for seq in sequences:
             current = self._trie
-            for x in seq:
-                current = current.setdefault(x, {})
-            current["__seq__"] = tuple(seq)
+            try:
+                for x in seq:
+                    current = current.setdefault(x, {})
+                current["__seq__"] = tuple(seq)
+            except TypeError:
+                current = current.setdefault(seq, {})
+                current["__seq__"] = (seq,)
 
         # Propagate failure links and matched sequences
         queue = deque()
@@ -1077,8 +1067,12 @@ class PromptProcessingBatch:
         self.tokens = [self.tokens[idx] for idx in keep]
         if any(self.samplers):
             self.samplers = [self.samplers[idx] for idx in keep]
+        else:
+            self.samplers = [None] * len(keep)
         if any(self.logits_processors):
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        else:
+            self.logits_processors = [[]] * len(keep)
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
 
     def prompt(self, tokens: List[List[int]]):
@@ -1352,6 +1346,7 @@ class GenerationBatch:
             self.samplers = [self.samplers[idx] for idx in keep]
         if any(self.logits_processors):
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        self.max_tokens = [self.max_tokens[idx] for idx in keep]
 
         self._next_tokens = self._next_tokens[keep] if keep else None
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
@@ -1455,7 +1450,7 @@ class BatchGenerator:
         self,
         model: nn.Module,
         max_tokens: int = 128,
-        stop_tokens: Optional[List[List[int]]] = None,
+        stop_tokens: Optional[Sequence[Sequence[int]]] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
         logits_processors: Optional[
             List[Callable[[mx.array, mx.array], mx.array]]
@@ -1505,6 +1500,9 @@ class BatchGenerator:
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
+    def __del__(self):
+        self.close()
+
     @contextlib.contextmanager
     def stats(self, stats=None):
         stats = stats or BatchStats()
@@ -1525,9 +1523,6 @@ class BatchGenerator:
             stats.generation_time += gen_time
             stats.generation_tps = stats.generation_tokens / stats.generation_time
             stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
-
-    def __del__(self):
-        self.close()
 
     def insert(
         self,
@@ -1741,6 +1736,35 @@ class BatchGenerator:
         with mx.stream(generation_stream):
             return self._next()
 
+    def next_generated(self):
+        """
+        Return only generated tokens ignoring batch generation responses.
+
+        Returns:
+            List of GenerationBatch.Response objects
+        """
+        with mx.stream(generation_stream):
+            while True:
+                prompt_responses, generation_responses = self._next()
+                if not generation_responses and prompt_responses:
+                    continue
+                return generation_responses
+
+
+@dataclass
+class BatchResponse:
+    """
+    A data object to hold a batch generation response.
+
+    Args:
+        texts: (List[str]): The generated text for each prompt.
+        stats (BatchStats): Statistics about the generation.
+    """
+
+    texts: List[str]
+    stats: BatchStats
+    caches: Optional[List[List[Any]]]
+
 
 def batch_generate(
     model,
@@ -1789,11 +1813,8 @@ def batch_generate(
     results = {uid: [] for uid in uids}
     prompt_caches = {}
     with gen.stats() as stats:
-        while True:
-            prompt_responses, token_responses = gen.next()
-            if not prompt_responses and not token_responses:
-                break
-            for r in token_responses:
+        while responses := gen.next_generated():
+            for r in responses:
                 if r.finish_reason is not None:
                     if return_prompt_caches:
                         prompt_caches[r.uid] = r.prompt_cache

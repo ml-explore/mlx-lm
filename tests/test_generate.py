@@ -199,7 +199,7 @@ class TestGenerate(unittest.TestCase):
             self.model, stop_tokens=self.tokenizer.eos_token_ids, max_tokens=1
         )
         uids = gen.insert(prompts)
-        batch_responses = {r.uid: r for r in gen.next()}
+        batch_responses = {r.uid: r for r in gen.next_generated()}
 
         # Do a test for each prompt the logits are close
         for e, prompt in enumerate(prompts):
@@ -241,7 +241,7 @@ class TestGenerate(unittest.TestCase):
         batch_responses = {}
         not_in = True
         iters = 0
-        while responses := gen.next():
+        while responses := gen.next_generated():
             for r in responses:
                 not_in &= r.uid not in batch_responses
                 batch_responses[r.uid] = r
@@ -289,7 +289,7 @@ class TestGenerate(unittest.TestCase):
         num_toks = [2, 3, 4, 5]
         uids = gen.insert(prompts, max_tokens=num_toks)
         batch_responses = {uid: [] for uid in uids}
-        while responses := gen.next():
+        while responses := gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.token)
 
@@ -337,7 +337,7 @@ class TestGenerate(unittest.TestCase):
         )
         uids = batch_gen.insert(prompts)
         batch_responses = {uid: [] for uid in uids}
-        while responses := batch_gen.next():
+        while responses := batch_gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.logprobs)
 
@@ -370,7 +370,7 @@ class TestGenerate(unittest.TestCase):
         )
         prompt = self.tokenizer.encode("hello")
         uids = batch_gen.insert([prompt])
-        response = batch_gen.next()[0]
+        response = batch_gen.next_generated()[0]
         logprobs = response.logprobs
         self.assertEqual(logprobs[0].item(), 0.0)
         self.assertEqual(logprobs.argmin().item(), 1)
@@ -395,7 +395,7 @@ class TestGenerate(unittest.TestCase):
         processors = make_logits_processors(logit_bias)
         (uid2,) = batch_gen.insert([prompt], logits_processors=[processors])
 
-        responses = batch_gen.next()
+        responses = batch_gen.next_generated()
         responses = {response.uid: response for response in responses}
         self.assertEqual(responses[uid0].logprobs[0].item(), 0.0)
         self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
@@ -410,7 +410,7 @@ class TestGenerate(unittest.TestCase):
         )
         prompt = self.tokenizer.encode("hello")
         uids = batch_gen.insert([prompt])
-        response = batch_gen.next()[0]
+        response = batch_gen.next_generated()[0]
         self.assertEqual(response.token, 1)
 
         del batch_gen
@@ -427,7 +427,7 @@ class TestGenerate(unittest.TestCase):
             samplers=[lambda _: mx.array([2]), lambda _: mx.array([3])],
         )
 
-        responses = batch_gen.next()
+        responses = batch_gen.next_generated()
         responses = {response.uid: response for response in responses}
         self.assertEqual(responses[uid0].token, 1)
         self.assertEqual(responses[uid1].token, 2)
@@ -481,7 +481,7 @@ class TestGenerate(unittest.TestCase):
             )
             uids = batch_gen.insert(prompts_a)
             caches = {uid: None for uid in uids}
-            while responses := batch_gen.next():
+            while responses := batch_gen.next_generated():
                 for r in responses:
                     if r.finish_reason is not None:
                         caches[r.uid] = r.prompt_cache
@@ -490,7 +490,7 @@ class TestGenerate(unittest.TestCase):
             # Generate the 2nd time
             uids = batch_gen.insert(prompts_b, caches=caches)
             batch_responses = {uid: [] for uid in uids}
-            while responses := batch_gen.next():
+            while responses := batch_gen.next_generated():
                 for r in responses:
                     batch_responses[r.uid].append(r.logprobs)
 
@@ -543,7 +543,7 @@ class TestGenerate(unittest.TestCase):
 
         uids = batch_gen.insert(prompts_a)
         caches = {uid: None for uid in uids}
-        while responses := batch_gen.next():
+        while responses := batch_gen.next_generated():
             for r in responses:
                 if r.finish_reason is not None:
                     caches[r.uid] = r.prompt_cache
@@ -553,7 +553,7 @@ class TestGenerate(unittest.TestCase):
         # Generate the 2nd time
         uids = batch_gen.insert(prompts_b, caches=caches)
         batch_responses = {uid: [] for uid in uids}
-        while responses := batch_gen.next():
+        while responses := batch_gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.logprobs)
 

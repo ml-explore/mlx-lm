@@ -621,13 +621,23 @@ class ArraysCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
-        self.cache = [c[batch_indices] for c in self.cache]
+        self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
+        if self.lengths is not None:
+            self.lengths = self.lengths[batch_indices]
 
     def extend(self, other):
         """
         In-place extend this cache with the other cache.
         """
-        self.cache = [mx.concatenate([c, o]) for c, o in zip(self.cache, other.cache)]
+
+        def cat(a, b):
+            if a is None:
+                return b
+            if b is None:
+                return a
+            return mx.concatenate([a, b])
+
+        self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -975,19 +985,18 @@ class BatchKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
-        if self.keys is None:
-            return
-
-        self.keys = self.keys[batch_indices]
-        self.values = self.values[batch_indices]
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+            self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()
         if min_left_pad > 0:
-            self.keys = self.keys[..., min_left_pad:, :]
-            self.values = self.values[..., min_left_pad:, :]
+            if self.keys is not None:
+                self.keys = self.keys[..., min_left_pad:, :]
+                self.values = self.values[..., min_left_pad:, :]
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
 
@@ -995,15 +1004,30 @@ class BatchKVCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
         max_idx = max(self._idx, other._idx)
-        max_size = max(self.keys.shape[2], other.keys.shape[2])
+        L1 = L2 = 0
+        if self.keys is not None:
+            B, H, L1, D = self.keys.shape
+            M = self.values.shape[3]
+        if other.keys is not None:
+            B, H, L2, D = other.keys.shape
+            M = other.values.shape[3]
+        max_size = max(L1, L2)
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
         def pad(c):
-            left = max_idx - c._idx
-            right = max_size - c.keys.shape[2] - left
             k, v = c.keys, c.values
+            if k is None:
+                k = mx.array([]).reshape(B, H, 0, D)
+                v = mx.array([]).reshape(B, H, 0, M)
+            left = max_idx - c._idx
+            right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
                 v = v[..., :right, :]
@@ -1300,11 +1324,9 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
-        if self.keys is None:
-            return
-
-        self.keys = self.keys[batch_indices]
-        self.values = self.values[batch_indices]
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+            self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
