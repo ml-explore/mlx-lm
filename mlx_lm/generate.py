@@ -1378,9 +1378,9 @@ def batch_generate(
           See :obj:`BatchGenerator` for more details.
     """
 
-    gen = BatchGenerator(
+    gen = BatchGenerator2(
         model,
-        stop_tokens=tokenizer.eos_token_ids,
+        stop_tokens=[[t] for t in tokenizer.eos_token_ids],
         **kwargs,
     )
     num_samples = len(prompts)
@@ -1391,26 +1391,29 @@ def batch_generate(
     uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
     results = {uid: [] for uid in uids}
     prompt_caches = {}
-    while responses := gen.next():
-        for r in responses:
-            if r.finish_reason is not None:
-                if return_prompt_caches:
-                    prompt_caches[r.uid] = r.prompt_cache
-                if verbose:
-                    fin += 1
-                    print(
-                        f"[batch_generate] Finished processing {fin}/{num_samples} ...",
-                        end="\r",
-                    )
-            if r.finish_reason != "stop":
-                results[r.uid].append(r.token)
+    with gen.stats() as stats:
+        while True:
+            prompt_responses, token_responses = gen.next()
+            if not prompt_responses and not token_responses:
+                break
+            for r in token_responses:
+                if r.finish_reason is not None:
+                    if return_prompt_caches:
+                        prompt_caches[r.uid] = r.prompt_cache
+                    if verbose:
+                        fin += 1
+                        print(
+                            f"[batch_generate] Finished processing {fin}/{num_samples} ...",
+                            end="\r",
+                        )
+                if r.finish_reason != "stop":
+                    results[r.uid].append(r.token)
     gen.close()
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
 
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
-    stats = gen.stats()
     caches = [prompt_caches[uid] for uid in uids] if return_prompt_caches else None
     if verbose:
         print(
@@ -1966,6 +1969,11 @@ class BatchGenerator2:
         self._unprocessed_sequences = deque()
         self._currently_processing = []
 
+        self._prompt_tokens_counter = 0
+        self._prompt_time_counter = 0
+        self._gen_tokens_counter = 0
+        self._steps_counter = 0
+
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
@@ -1978,6 +1986,27 @@ class BatchGenerator2:
             mx.synchronize(generation_stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
+
+    @contextlib.contextmanager
+    def stats(self, stats=None):
+        stats = stats or BatchStats()
+        self._prompt_tokens_counter = 0
+        self._prompt_time_counter = 0
+        self._gen_tokens_counter = 0
+        tic = time.perf_counter()
+        try:
+            yield stats
+        finally:
+            toc = time.perf_counter()
+            total_time = toc - tic
+            gen_time = total_time - self._prompt_time_counter
+            stats.prompt_tokens += self._prompt_tokens_counter
+            stats.prompt_time += self._prompt_time_counter
+            stats.prompt_tps = stats.prompt_tokens / stats.prompt_time
+            stats.generation_tokens += self._gen_tokens_counter
+            stats.generation_time += gen_time
+            stats.generation_tps = stats.generation_tokens / stats.generation_time
+            stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
 
     def __del__(self):
         self.close()
@@ -2044,6 +2073,15 @@ class BatchGenerator2:
 
         return uids
 
+    def _find_uid(self, uid):
+        for i, uid_i in enumerate(self._prompt_batch.uids):
+            if uid_i == uid:
+                return (0, i)
+        for i, uid_i in enumerate(self._generation_batch.uids):
+            if uid_i == uid:
+                return (1, i)
+        return False
+
     def _make_batch(self, n: int):
         uids = []
         caches = []
@@ -2082,6 +2120,7 @@ class BatchGenerator2:
         # Generate tokens first
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
+            self._gen_tokens_counter += len(generation_responses)
 
         # Exit early because we already have our hands full with decoding
         if len(self._generation_batch) >= self.completion_batch_size:
@@ -2141,7 +2180,11 @@ class BatchGenerator2:
             prompt_responses.append(response)
 
         # Process the prompts
+        self._prompt_tokens_counter += sum(len(p) for p in prompts)
+        tic = time.perf_counter()
         self._prompt_batch.prompt(prompts)
+        toc = time.perf_counter()
+        self._prompt_time_counter += toc - tic
 
         return prompt_responses, generation_responses
 
