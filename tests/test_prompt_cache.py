@@ -686,6 +686,44 @@ class TestBatchRotatingKVCacheMerge(unittest.TestCase):
         self.assertEqual(merged.keys.shape[2], 70)
         self.assertEqual(merged.values.shape[2], 70)
 
+    def test_merge_contains_most_recent_tokens_when_prompt_length_exceeds_max_size(
+        self,
+    ):
+        """merge() must place the most-recent max_size tokens into the merged cache."""
+        max_size, seq_len, H, D = 4, 8, 2, 16
+        vals = mx.arange(1, seq_len + 1, dtype=mx.float32).reshape(1, 1, seq_len, 1)
+        keys = mx.broadcast_to(vals, (1, H, seq_len, D))
+        cache = RotatingKVCache(max_size=max_size)
+        cache.update_and_fetch(keys, keys)
+        expected_first_slot_value = float(seq_len - max_size + 1)
+
+        merged = BatchRotatingKVCache.merge([cache])
+        mx.eval(merged.keys)
+
+        self.assertAlmostEqual(
+            merged.keys[0, 0, 0, 0].item(), expected_first_slot_value
+        )
+
+    def test_merge_after_rotation_preserves_temporal_order(self):
+        """merge() must roll the ring buffer into temporal order after autoregressive wrap-around."""
+        max_size, H, D = 4, 2, 8
+        cache = RotatingKVCache(max_size=max_size)
+        cache.update_and_fetch(
+            mx.ones((1, H, max_size, D)), mx.ones((1, H, max_size, D))
+        )
+        for _ in range(2):
+            cache.update_and_fetch(
+                mx.full((1, H, 1, D), 2.0), mx.full((1, H, 1, D), 2.0)
+            )
+        expected_first_slot_value = 1.0
+
+        merged = BatchRotatingKVCache.merge([cache])
+        mx.eval(merged.keys)
+
+        self.assertAlmostEqual(
+            merged.keys[0, 0, 0, 0].item(), expected_first_slot_value
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
