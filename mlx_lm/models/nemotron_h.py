@@ -61,8 +61,8 @@ class ModelArgs(BaseModelArgs):
     _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
 
     def __post_init__(self):
-        if self.time_step_limit is None:
-            self.time_step_limit = (0.0, float("inf"))
+        if self.time_step_limit is None and self.time_step_min is not None:
+            self.time_step_limit = (self.time_step_min, float("inf"))
 
         # Normalize to hybrid_override_pattern (single-char list)
         if self.hybrid_override_pattern is None and self.layers_block_type is not None:

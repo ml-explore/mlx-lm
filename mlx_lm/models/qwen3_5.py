@@ -233,6 +233,7 @@ class GatedDeltaNet(nn.Module):
         if cache is not None:
             cache[0] = conv_f
             cache[1] = ssm_f
+            cache.advance(S)
 
         out = self.norm(out, z)
         out = self.out_proj(out.reshape(B, S, -1))
