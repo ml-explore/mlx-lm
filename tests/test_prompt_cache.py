@@ -673,5 +673,19 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(mask, expected))
 
 
+class TestBatchRotatingKVCacheMerge(unittest.TestCase):
+    def test_merge_output_shape_is_bounded_by_max_size_when_prompt_length_exceeds_max_size(
+        self,
+    ):
+        """merge() output sequence dimension must equal max_size, not prompt length."""
+        cache = RotatingKVCache(max_size=70)
+        cache.update_and_fetch(mx.ones((1, 8, 128, 64)), mx.ones((1, 8, 128, 64)))
+
+        merged = BatchRotatingKVCache.merge([cache])
+
+        self.assertEqual(merged.keys.shape[2], 70)
+        self.assertEqual(merged.values.shape[2], 70)
+
+
 if __name__ == "__main__":
     unittest.main()
