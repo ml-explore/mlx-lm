@@ -2070,14 +2070,36 @@ class BatchGenerator2:
 
         return uids
 
-    def _find_uid(self, uid):
-        for i, uid_i in enumerate(self._prompt_batch.uids):
-            if uid_i == uid:
-                return (0, i)
+    def _find_uids(self, uids):
+        uids = set(uids)
+        results = {}
         for i, uid_i in enumerate(self._generation_batch.uids):
-            if uid_i == uid:
-                return (1, i)
-        return False
+            if uid_i in uid:
+                result[uid_i] = (2, i)
+        for i, uid_i in enumerate(self._prompt_batch.uids):
+            if uid_i in uids:
+                result[uid_i] = (1, i)
+        for i, seq in enumerate(self._unprocessed_sequences):
+            if seq[0] in uid:
+                result[seq[0]] = (0, i)
+        return results
+
+    def extract_cache(self, uids):
+        results = {}
+        for uid, (stage, idx) in self._find_uids(uids).items():
+            if stage == 0:
+                results[uid] = self._unprocessed_sequences[idx][3:5]
+            elif stage == 1:
+                results[uid] = (
+                    self._prompt_batch.extract_cache(idx),
+                    self._prompt_batch.tokens[i],
+                )
+            else:
+                results[uid] = (
+                    self._generation_batch.extract_cache(idx),
+                    self._generation_batch.tokens[i],
+                )
+        return results
 
     def _make_batch(self, n: int):
         uids = []
