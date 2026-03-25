@@ -164,6 +164,22 @@ class _BaseCache:
         """
         raise NotImplementedError("Cache sub-class must implement this.")
 
+    def rewind(self, num_to_trim: int) -> bool:
+        raise NotImplementedError("Cache sub-class must implement rewind.")
+
+    def _has_rewind_impl(self):
+        """Check whether this cache has a real rewind implementation.
+
+        Returns True if the concrete class overrides rewind() beyond the
+        _BaseCache default.  This uses method identity rather than a separate
+        opt-in flag so that third-party caches that implement rewind()
+        participate automatically without needing to know about this helper.
+        """
+        try:
+            return type(self).rewind is not _BaseCache.rewind
+        except Exception:
+            return False
+
     @classmethod
     def from_state(cls, state, meta_state):
         # Create an instance of cls without calling __init__

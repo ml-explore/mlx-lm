@@ -171,7 +171,7 @@ class LRUPromptCache:
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
-        count: int
+        ref_count: int
         nbytes: int
         checkpoint: bool = False
 
@@ -299,7 +299,7 @@ class LRUPromptCache:
             self._lru.push(model, tokens, checkpoint=True)
             return self.CacheEntry(extracted_cache, 1, cache_entry.nbytes, True)
 
-        if cache_entry.count == 1:
+        if cache_entry.ref_count == 1:
             self._delete(model, tokens)
             self._lru.remove(model, tokens)
             return cache_entry
@@ -308,7 +308,7 @@ class LRUPromptCache:
             extracted_cache = copy.deepcopy(cache_entry.prompt_cache)
         except Exception:
             return None
-        cache_entry.count -= 1
+        cache_entry.ref_count -= 1
         self._refresh_recency(model, tokens, checkpoint=False)
         return self.CacheEntry(extracted_cache, 1, cache_entry.nbytes)
 
@@ -318,18 +318,13 @@ class LRUPromptCache:
 
     def _can_rewind_layer_cache(self, layer_cache, num_to_trim):
         can_rewind = getattr(layer_cache, "can_rewind", None)
-        rewind = getattr(layer_cache, "rewind", None)
         is_trimmable = getattr(layer_cache, "is_trimmable", None)
         trim = getattr(layer_cache, "trim", None)
         if callable(can_rewind):
-            has_custom_rewind = callable(rewind)
-            if has_custom_rewind and isinstance(layer_cache, _BaseCache):
-                try:
-                    has_custom_rewind = (
-                        type(layer_cache).rewind is not _BaseCache.rewind
-                    )
-                except Exception:
-                    has_custom_rewind = False
+            if isinstance(layer_cache, _BaseCache):
+                has_custom_rewind = layer_cache._has_rewind_impl()
+            else:
+                has_custom_rewind = callable(getattr(layer_cache, "rewind", None))
             has_execution_path = has_custom_rewind or (
                 callable(is_trimmable) and callable(trim)
             )
@@ -450,7 +445,7 @@ class LRUPromptCache:
             current = current[tok]
 
         if "cache" in current:
-            current["cache"].count += 1
+            current["cache"].ref_count += 1
             current["cache"].checkpoint = current["cache"].checkpoint or checkpoint
             self._lru.remove(model, tokens)
         else:

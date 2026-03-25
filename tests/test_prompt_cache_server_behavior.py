@@ -150,7 +150,7 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
                 self.assertIsNone(cache_entry)
                 self.assertEqual(rest, sibling_tokens)
 
-    # -- Extraction and count semantics --
+    # -- Extraction and ref_count semantics --
 
     def test_checkpoint_extract_persists_through_multiple_fetches(self):
         """Checkpoint entries are persistent: extraction always deepcopies and
@@ -189,7 +189,7 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertEqual(len(cache), 1)
 
     def test_insert_existing_key_keeps_original_cache(self):
-        """Re-inserting the same token key increments count but keeps the
+        """Re-inserting the same token key increments ref_count but keeps the
         original prompt_cache list (the new one is silently dropped)."""
         cache = LRUPromptCache(max_size=10)
         model = ("reinsert-keeps-original", None, None)
@@ -197,12 +197,12 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         cache.insert_cache(model, [1, 2], [MockCache("original")])
         cache.insert_cache(model, [1, 2], [MockCache("different")])
 
-        # First extract: deepcopy (count 2 → 1), returns original value.
+        # First extract: deepcopy (ref_count 2 → 1), returns original value.
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(t, [])
         self.assertEqual(c, [MockCache("original")])
 
-        # Second extract: count==1 ownership transfer, still original.
+        # Second extract: ref_count==1 ownership transfer, still original.
         c2, t2 = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(t2, [])
         self.assertEqual(c2, [MockCache("original")])
@@ -212,9 +212,9 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertIsNone(c3)
         self.assertEqual(t3, [1, 2])
 
-    def test_deepcopy_failure_on_refcounted_entry_does_not_decrement_count(self):
-        """When deepcopy fails on a refcounted (count > 1) non-checkpoint entry,
-        _extract returns None without decrementing the count."""
+    def test_deepcopy_failure_on_refcounted_entry_does_not_decrement_ref_count(self):
+        """When deepcopy fails on a refcounted (ref_count > 1) non-checkpoint entry,
+        _extract returns None without decrementing the ref_count."""
 
         class FailDeepCopy:
             @property
@@ -228,13 +228,13 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         model = ("deepcopy-fail-refcount", None, None)
 
         cache.insert_cache(model, [1, 2], [FailDeepCopy()])
-        cache.insert_cache(model, [1, 2], [FailDeepCopy()])  # count -> 2
+        cache.insert_cache(model, [1, 2], [FailDeepCopy()])  # ref_count -> 2
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertIsNone(c)
         self.assertEqual(t, [1, 2])
 
-        # Entry still alive — count was not decremented.
+        # Entry still alive — ref_count was not decremented.
         result = cache._search(model, [1, 2])
         self.assertIsNotNone(result.exact)
         self.assertEqual(len(cache), 1)
