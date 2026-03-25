@@ -196,6 +196,8 @@ class LRUPromptCache:
                 self._lru_checkpoints.remove((model, tokens))
 
         def pop(self):
+            if not self._lru and not self._lru_checkpoints:
+                raise IndexError("pop from empty CacheOrder")
             if len(self._lru) >= len(self._lru_checkpoints):
                 return self._lru.popleft()
             else:
@@ -344,7 +346,7 @@ class LRUPromptCache:
         while len(self._lru) > n_sequences:
             model, tokens = self._lru.pop()
             self._delete(model, tokens)
-        while self._n_bytes > n_bytes:
+        while self._n_bytes > n_bytes and len(self._lru) > 0:
             model, tokens = self._lru.pop()
             self._delete(model, tokens)
 
