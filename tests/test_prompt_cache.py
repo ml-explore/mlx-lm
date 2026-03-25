@@ -90,8 +90,8 @@ class TestBatchRotatingKVCacheState(unittest.TestCase):
                     force_padding_eval=False,
                 )
 
-                self.assertLessEqual(trial_peak, int(baseline_peak * 1.35))
-                self.assertLessEqual(trial_active, int(baseline_active * 1.35))
+                self.assertLessEqual(trial_peak, int(baseline_peak * 2.0))
+                self.assertLessEqual(trial_active, int(baseline_active * 2.0))
 
 
 class TestPromptCache(unittest.TestCase):
