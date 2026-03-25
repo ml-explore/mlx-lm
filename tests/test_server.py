@@ -560,6 +560,23 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
 
+    def test_trim_to_zero_bytes_on_empty_cache(self):
+        cache = LRUPromptCache(max_size=10)
+        # Should not raise IndexError on empty cache
+        cache.trim_to(n_bytes=0)
+        self.assertEqual(len(cache), 0)
+
+    def test_trim_to_zero_bytes_evicts_all(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        cache.insert_cache(model, [1, 2], [MockCache("aaa")])
+        cache.insert_cache(model, [3, 4], [MockCache("bbb")])
+        self.assertEqual(len(cache), 2)
+
+        cache.trim_to(n_bytes=0)
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.nbytes, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
