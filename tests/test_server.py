@@ -283,6 +283,25 @@ class TestServer(unittest.TestCase):
         self.assertIn("error", error_event)
         self.assertEqual(error_event["error"]["code"], "metal_out_of_memory")
 
+    def test_oom_marker_attempting_to_allocate_maps_to_503(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with mock.patch.object(
+            self.response_generator,
+            "generate",
+            side_effect=RuntimeError(
+                "Error: attempting to allocate 12.3 GB, maximum allowed buffer size reached"
+            ),
+        ):
+            response = requests.post(url, json=post_data)
+
+        self.assertEqual(response.status_code, 503)
+
 
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod

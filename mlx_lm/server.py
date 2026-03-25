@@ -56,6 +56,8 @@ def is_metal_oom_error(exc: Exception) -> bool:
         "out of memory",
         "insufficient memory",
         "insufficient memory for buffer",
+        "attempting to allocate",
+        "maximum allowed buffer size",
         "resource exhausted",
         "failed to allocate",
         "metal error: command buffer execution failed due to out of memory",
