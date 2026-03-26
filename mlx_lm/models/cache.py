@@ -1084,6 +1084,9 @@ class BatchKVCache(_BaseCache):
 
         return cache
 
+    def size(self):
+        return self._idx
+
     def empty(self):
         return self.keys is None
 
@@ -1334,17 +1337,32 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
         if (self.rotated != other.rotated) or self._idx != other._idx:
             self._temporal_order()
             other._temporal_order()
 
         max_idx = max(self._idx, other._idx)
-        max_size = max(self.keys.shape[2], other.keys.shape[2])
+        L1 = L2 = 0
+        if self.keys is not None:
+            B, H, L1, D = self.keys.shape
+            M = self.values.shape[3]
+        if other.keys is not None:
+            B, H, L2, D = other.keys.shape
+            M = other.values.shape[3]
+        max_size = max(L1, L2)
 
         def pad(c):
             left = max_idx - c._idx
-            right = max_size - c.keys.shape[2] - left
             k, v = c.keys, c.values
+            if k is None:
+                k = mx.array([]).reshape(B, H, 0, D)
+                v = mx.array([]).reshape(B, H, 0, M)
+            right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
                 v = v[..., :right, :]
@@ -1403,11 +1421,11 @@ class BatchRotatingKVCache(_BaseCache):
 
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
-        for i, (p, c) in enumerate(zip(padding, caches)):
+        for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
             if c.keys is None:
                 continue
-            keys[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.keys)
-            values[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.values)
+            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)
+            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
@@ -1417,6 +1435,9 @@ class BatchRotatingKVCache(_BaseCache):
         cache._offset = keys.shape[2]
 
         return cache
+
+    def size(self):
+        return min(self._offset, self.max_size)
 
     def empty(self):
         return self.keys is None
