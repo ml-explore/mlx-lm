@@ -662,6 +662,131 @@ class TestPromptCache(unittest.TestCase):
         c_out = KVCache.merge((c1, c2))
         self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
 
+    def test_quantized_kv_cache_merge(self):
+        """Test merging QuantizedKVCache instances into a BatchKVCache."""
+        num_heads = 4
+        head_dim = 64  # must be divisible by group_size
+        seq_len1, seq_len2 = 5, 8
+        bits = 4
+        group_size = 32
+
+        # Create two QuantizedKVCaches with different sequence lengths
+        c1 = QuantizedKVCache(bits=bits, group_size=group_size)
+        k1 = mx.random.uniform(shape=(1, num_heads, seq_len1, head_dim))
+        v1 = mx.random.uniform(shape=(1, num_heads, seq_len1, head_dim))
+        c1.update_and_fetch(k1, v1)
+
+        c2 = QuantizedKVCache(bits=bits, group_size=group_size)
+        k2 = mx.random.uniform(shape=(1, num_heads, seq_len2, head_dim))
+        v2 = mx.random.uniform(shape=(1, num_heads, seq_len2, head_dim))
+        c2.update_and_fetch(k2, v2)
+
+        # Merge should produce a BatchKVCache
+        merged = QuantizedKVCache.merge([c1, c2])
+        self.assertIsInstance(merged, BatchKVCache)
+
+        # Batch size should be 2
+        self.assertEqual(merged.keys.shape[0], 2)
+        # Sequence length should be max(seq_len1, seq_len2)
+        self.assertEqual(merged.keys.shape[2], seq_len2)
+        # Heads and head_dim preserved
+        self.assertEqual(merged.keys.shape[1], num_heads)
+        self.assertEqual(merged.keys.shape[3], head_dim)
+
+    def test_quantized_kv_cache_merge_with_empty(self):
+        """Test merging when one QuantizedKVCache is empty."""
+        bits = 4
+        group_size = 32
+
+        c1 = QuantizedKVCache(bits=bits, group_size=group_size)
+        c2 = QuantizedKVCache(bits=bits, group_size=group_size)
+        k = mx.random.uniform(shape=(1, 2, 4, 64))
+        v = mx.random.uniform(shape=(1, 2, 4, 64))
+        c2.update_and_fetch(k, v)
+
+        merged = QuantizedKVCache.merge([c1, c2])
+        self.assertIsInstance(merged, BatchKVCache)
+        self.assertEqual(merged.keys.shape[0], 2)
+
+    def test_batch_kv_cache_extract_quantized(self):
+        """Test extracting a QuantizedKVCache from a BatchKVCache."""
+        num_heads = 2
+        head_dim = 64
+        bits = 4
+        group_size = 32
+        quantize_config = {"bits": bits, "group_size": group_size}
+
+        # Create a KVCache, merge into batch, then extract with quantization
+        c1 = KVCache()
+        k = mx.random.uniform(shape=(1, num_heads, 6, head_dim))
+        v = mx.random.uniform(shape=(1, num_heads, 6, head_dim))
+        c1.update_and_fetch(k, v)
+
+        c2 = KVCache()
+        k2 = mx.random.uniform(shape=(1, num_heads, 4, head_dim))
+        v2 = mx.random.uniform(shape=(1, num_heads, 4, head_dim))
+        c2.update_and_fetch(k2, v2)
+
+        batch = BatchKVCache.merge([c1, c2])
+
+        # Extract without quantization -> KVCache
+        extracted_float = batch.extract(0)
+        self.assertIsInstance(extracted_float, KVCache)
+        self.assertEqual(extracted_float.offset, 6)
+
+        # Extract with quantization -> QuantizedKVCache
+        extracted_quant = batch.extract(0, quantize_config=quantize_config)
+        self.assertIsInstance(extracted_quant, QuantizedKVCache)
+        self.assertEqual(extracted_quant.offset, 6)
+        self.assertEqual(extracted_quant.bits, bits)
+        self.assertEqual(extracted_quant.group_size, group_size)
+
+        # Keys/values should be quantized tuples (data, scales, biases)
+        self.assertIsNotNone(extracted_quant.keys)
+        self.assertEqual(len(extracted_quant.keys), 3)
+
+    def test_quantized_roundtrip_merge_extract(self):
+        """Test full roundtrip: QuantizedKVCache -> merge -> extract(quantized)."""
+        bits = 8
+        group_size = 32
+        num_heads = 2
+        head_dim = 64
+        quantize_config = {"bits": bits, "group_size": group_size}
+
+        # Start with quantized caches
+        c1 = QuantizedKVCache(bits=bits, group_size=group_size)
+        k1 = mx.random.uniform(shape=(1, num_heads, 5, head_dim))
+        v1 = mx.random.uniform(shape=(1, num_heads, 5, head_dim))
+        c1.update_and_fetch(k1, v1)
+
+        c2 = QuantizedKVCache(bits=bits, group_size=group_size)
+        k2 = mx.random.uniform(shape=(1, num_heads, 3, head_dim))
+        v2 = mx.random.uniform(shape=(1, num_heads, 3, head_dim))
+        c2.update_and_fetch(k2, v2)
+
+        # Merge (dequantizes into BatchKVCache)
+        batch = QuantizedKVCache.merge([c1, c2])
+        self.assertIsInstance(batch, BatchKVCache)
+
+        # Extract back as quantized
+        ex1 = batch.extract(0, quantize_config=quantize_config)
+        ex2 = batch.extract(1, quantize_config=quantize_config)
+
+        self.assertIsInstance(ex1, QuantizedKVCache)
+        self.assertIsInstance(ex2, QuantizedKVCache)
+        self.assertEqual(ex1.offset, 5)
+        self.assertEqual(ex2.offset, 3)
+
+    def test_quantized_kv_cache_size(self):
+        """Test QuantizedKVCache.size() returns offset."""
+        c = QuantizedKVCache()
+        self.assertEqual(c.size(), 0)
+
+        k = mx.random.uniform(shape=(1, 2, 10, 64))
+        v = mx.random.uniform(shape=(1, 2, 10, 64))
+        c.update_and_fetch(k, v)
+        self.assertEqual(c.size(), 10)
+
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()
         kv = mx.zeros((1, 1, 32, 128))

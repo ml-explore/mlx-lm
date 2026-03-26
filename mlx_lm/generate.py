@@ -879,8 +879,8 @@ class Batch:
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
-    def extract_cache(self, idx):
-        return [c.extract(idx) for c in self.cache]
+    def extract_cache(self, idx, quantize_config=None):
+        return [c.extract(idx, quantize_config=quantize_config) for c in self.cache]
 
 
 def _make_cache(model, left_padding, max_kv_size):
@@ -890,7 +890,7 @@ def _make_cache(model, left_padding, max_kv_size):
     """
 
     def to_batch_cache(c):
-        if type(c) is KVCache:
+        if type(c) is KVCache or type(c) is QuantizedKVCache:
             return BatchKVCache(left_padding)
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
@@ -960,6 +960,8 @@ class BatchGenerator:
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
         max_kv_size: Optional[int] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -976,6 +978,11 @@ class BatchGenerator:
         self._stats = BatchStats()
         self._next_count = 0
         self.max_kv_size = max_kv_size
+        self._quantize_config = (
+            {"group_size": kv_group_size, "bits": kv_bits}
+            if kv_bits is not None
+            else None
+        )
 
         self.active_batch = None
 
@@ -1043,7 +1050,9 @@ class BatchGenerator:
                 for e, uid in enumerate(batch.uids):
                     if uid not in uids:
                         continue
-                    caches[uid] = batch.extract_cache(e)
+                    caches[uid] = batch.extract_cache(
+                        e, quantize_config=self._quantize_config
+                    )
             keep_idx = [e for e, uid in enumerate(batch.uids) if uid not in uids]
             if len(keep_idx) > 0:
                 batch.filter(keep_idx)
@@ -1308,7 +1317,9 @@ class BatchGenerator:
                 finish_reason = None
                 keep_idx.append(e)
             if finish_reason is not None:
-                cache = batch.extract_cache(e)
+                cache = batch.extract_cache(
+                    e, quantize_config=self._quantize_config
+                )
             responses.append(self.Response(uid, t, logprobs[e], finish_reason, cache))
 
         # Remove any finished completions
