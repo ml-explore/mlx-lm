@@ -1922,6 +1922,9 @@ def batch_generate(
     if verbose:
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
+    if isinstance(max_tokens, int):
+        max_tokens = [max_tokens] * len(prompts)
+
     uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
     results = {uid: [] for uid in uids}
     prompt_caches = {}
