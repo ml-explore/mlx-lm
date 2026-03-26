@@ -1005,7 +1005,7 @@ class PromptProcessingBatch:
         logits_processors: Optional[
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ] = None,
-        stop_matcher: Optional[SequenceMatcher] = None,
+        stop_matchers: Optional[List[SequenceMatcher]] = None,
         max_tokens: Optional[List[int]] = None,
     ):
         self.model = model
@@ -1019,7 +1019,11 @@ class PromptProcessingBatch:
         self.logits_processors = (
             logits_processors if logits_processors is not None else []
         )
-        self.stop_matcher = stop_matcher or SequenceMatcher([])
+        self.stop_matchers = (
+            stop_matchers
+            if stop_matchers is not None
+            else [SequenceMatcher([])] * len(uids)
+        )
         self.max_tokens = (
             max_tokens
             if max_tokens is not None
@@ -1047,6 +1051,7 @@ class PromptProcessingBatch:
         self.samplers.extend(samplers)
         self.logits_processors.extend(logits_processors)
         self.max_tokens.extend(batch.max_tokens)
+        self.stop_matchers.extend(batch.stop_matchers)
 
     def split(self, indices: List[int]):
         indices = sorted(indices)
@@ -1074,6 +1079,7 @@ class PromptProcessingBatch:
         else:
             self.logits_processors = [[]] * len(keep)
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
+        self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
     def prompt(self, tokens: List[List[int]]):
         """
@@ -1146,7 +1152,7 @@ class PromptProcessingBatch:
             self.samplers,
             self.fallback_sampler,
             self.logits_processors,
-            self.stop_matcher,
+            self.stop_matchers,
             self.max_tokens,
         )
 
@@ -1170,7 +1176,6 @@ class PromptProcessingBatch:
         return cls(
             model=model,
             fallback_sampler=fallback_sampler,
-            stop_matcher=stop_matcher,
             prefill_step_size=prefill_step_size,
             uids=[],
             caches=[],
@@ -1178,6 +1183,7 @@ class PromptProcessingBatch:
             samplers=[],
             logits_processors=[],
             max_tokens=[],
+            stop_matchers=[],
         )
 
 
@@ -1211,7 +1217,7 @@ class GenerationBatch:
         logits_processors: Optional[
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ],
-        stop_matcher: SequenceMatcher,
+        stop_matchers: List[SequenceMatcher],
         max_tokens: List[int],
     ):
         self.model = model
@@ -1222,7 +1228,7 @@ class GenerationBatch:
         self.samplers = samplers
         self.fallback_sampler = fallback_sampler
         self.logits_processors = logits_processors
-        self.stop_matcher = stop_matcher
+        self.stop_matchers = stop_matchers
         self.max_tokens = max_tokens
 
         if self.samplers and len(self.samplers) != len(self.uids):
@@ -1236,7 +1242,7 @@ class GenerationBatch:
         self._next_logprobs = []
         self._token_context = [mx.array(t[-256:]) for t in tokens]
         self._num_tokens = [0] * len(self.uids)
-        self._matcher_states = [self.stop_matcher.make_state()] * len(self.uids)
+        self._matcher_states = [m.make_state() for m in stop_matchers]
 
         if self.uids:
             self._step()
@@ -1252,6 +1258,7 @@ class GenerationBatch:
         self.samplers.extend(batch.samplers)
         self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
+        self.stop_matchers.extend(batch.stop_matchers)
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
             self._current_logprobs = batch._current_logprobs
@@ -1347,6 +1354,7 @@ class GenerationBatch:
         if any(self.logits_processors):
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
+        self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
         self._next_tokens = self._next_tokens[keep] if keep else None
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
@@ -1376,7 +1384,7 @@ class GenerationBatch:
             if self._num_tokens[i] >= self.max_tokens[i]:
                 finish_reason = "length"
 
-            self._matcher_states[i], match = self.stop_matcher.match(
+            self._matcher_states[i], match = self.stop_matchers[i].match(
                 self._matcher_states[i], tokens[i]
             )
             if match is not None:
@@ -1419,12 +1427,10 @@ class GenerationBatch:
         cls,
         model: nn.Module,
         fallback_sampler: Callable[[mx.array], mx.array],
-        stop_matcher: SequenceMatcher,
     ):
         return cls(
             model=model,
             fallback_sampler=fallback_sampler,
-            stop_matcher=stop_matcher,
             uids=[],
             inputs=mx.array([], dtype=mx.uint32),
             prompt_cache=[],
@@ -1432,6 +1438,7 @@ class GenerationBatch:
             samplers=[],
             logits_processors=[],
             max_tokens=[],
+            stop_matchers=[],
         )
 
 
@@ -1461,7 +1468,6 @@ class BatchGenerator:
     ):
         self.model = model
         self.max_tokens = max_tokens
-        self.stop_matcher = SequenceMatcher(stop_tokens or [])
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.logits_processors = logits_processors or []
         self.uid_count = 0
@@ -1469,16 +1475,15 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
 
+        self._default_stop_matcher = SequenceMatcher(stop_tokens or [])
         self._uid_count = 0
         self._prompt_batch = PromptProcessingBatch.empty(
             self.model,
             self.sampler,
-            self.stop_matcher,
+            self._default_stop_matcher,
             prefill_step_size=prefill_step_size,
         )
-        self._generation_batch = GenerationBatch.empty(
-            self.model, self.sampler, self.stop_matcher
-        )
+        self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
         self._currently_processing = []
 
@@ -1534,6 +1539,7 @@ class BatchGenerator:
         logits_processors: Optional[
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ] = None,
+        stop_matchers: Optional[List[SequenceMatcher]] = None,
     ):
         return self.insert_segments(
             [[p] for p in prompts],
@@ -1542,6 +1548,7 @@ class BatchGenerator:
             all_tokens,
             samplers,
             logits_processors,
+            stop_matchers,
         )
 
     def insert_segments(
@@ -1554,6 +1561,7 @@ class BatchGenerator:
         logits_processors: Optional[
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ] = None,
+        stop_matchers: Optional[List[SequenceMatcher]] = None,
     ):
         uids = []
 
@@ -1573,14 +1581,25 @@ class BatchGenerator:
             [self.logits_processors] * len(segments)
         )
 
-        for seq, m, c, at, s, lp in zip(
-            segments, max_tokens, caches, all_tokens, samplers, logits_processors
+        if stop_matchers is None:
+            stop_matchers = [self._default_stop_matcher] * len(segments)
+
+        for seq, m, c, at, s, lp, sm in zip(
+            segments,
+            max_tokens,
+            caches,
+            all_tokens,
+            samplers,
+            logits_processors,
+            stop_matchers,
         ):
             seq = list(seq)
             if len(seq[-1]) != 1:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
-            self._unprocessed_sequences.append((self._uid_count, seq, m, c, at, s, lp))
+            self._unprocessed_sequences.append(
+                (self._uid_count, seq, m, c, at, s, lp, sm)
+            )
             uids.append(self._uid_count)
             self._uid_count += 1
 
@@ -1624,6 +1643,7 @@ class BatchGenerator:
         samplers = []
         logits_processors = []
         max_tokens = []
+        stop_matchers = []
         for _ in range(n):
             sequence = self._unprocessed_sequences.popleft()
             uids.append(sequence[0])
@@ -1632,9 +1652,11 @@ class BatchGenerator:
             samplers.append(sequence[5])
             logits_processors.append(sequence[6])
             max_tokens.append(sequence[2])
+            stop_matchers.append(sequence[7])
             self._currently_processing.append(
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
+
         return PromptProcessingBatch(
             model=self.model,
             uids=uids,
@@ -1644,7 +1666,7 @@ class BatchGenerator:
             samplers=samplers,
             fallback_sampler=self.sampler,
             logits_processors=logits_processors,
-            stop_matcher=self.stop_matcher,
+            stop_matchers=stop_matchers,
             max_tokens=max_tokens,
         )
 
