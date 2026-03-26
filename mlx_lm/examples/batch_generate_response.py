@@ -30,9 +30,6 @@ result = batch_generate(
     model, tokenizer, prompts, verbose=False, return_prompt_caches=True, max_tokens=2048
 )
 print(result.texts[-1])
-import pdb
-
-pdb.set_trace()
 
 prompts = [
     "Could you summarize that?",
