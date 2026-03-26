@@ -499,14 +499,25 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
-                )
+                if hasattr(layer.mlp.switch_mlp, "gate_up_proj"):
+                    shard_inplace(
+                        layer.mlp.switch_mlp.gate_up_proj,
+                        "all-to-sharded",
+                        group=group,
+                    )
+                else:
+                    shard_inplace(
+                        layer.mlp.switch_mlp.gate_proj,
+                        "all-to-sharded",
+                        group=group,
+                    )
+                    shard_inplace(
+                        layer.mlp.switch_mlp.up_proj,
+                        "all-to-sharded",
+                        group=group,
+                    )
                 shard_inplace(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 
     @property
