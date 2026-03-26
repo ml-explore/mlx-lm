@@ -1537,8 +1537,8 @@ class BatchGenerator:
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
 
         self._default_state_machine = SequenceStateMachine(
-            {"default": [(seq, None) for seq in (stop_tokens or [])]},
-            initial="default",
+            {"normal": [(seq, None) for seq in stop_tokens]} if stop_tokens else {},
+            initial="normal",
         )
         self._uid_count = 0
         self._prompt_batch = PromptProcessingBatch.empty(
