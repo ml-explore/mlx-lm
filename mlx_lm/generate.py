@@ -1609,14 +1609,14 @@ class BatchGenerator:
         uids = set(uids)
         results = {}
         for i, uid_i in enumerate(self._generation_batch.uids):
-            if uid_i in uid:
-                result[uid_i] = (2, i)
+            if uid_i in uids:
+                results[uid_i] = (2, i)
         for i, uid_i in enumerate(self._prompt_batch.uids):
             if uid_i in uids:
-                result[uid_i] = (1, i)
+                results[uid_i] = (1, i)
         for i, seq in enumerate(self._unprocessed_sequences):
-            if seq[0] in uid:
-                result[seq[0]] = (0, i)
+            if seq[0] in uids:
+                results[seq[0]] = (0, i)
         return results
 
     def extract_cache(self, uids):
@@ -1627,14 +1627,45 @@ class BatchGenerator:
             elif stage == 1:
                 results[uid] = (
                     self._prompt_batch.extract_cache(idx),
-                    self._prompt_batch.tokens[i],
+                    self._prompt_batch.tokens[idx],
                 )
             else:
                 results[uid] = (
                     self._generation_batch.extract_cache(idx),
-                    self._generation_batch.tokens[i],
+                    self._generation_batch.tokens[idx],
                 )
         return results
+
+    def remove(self, uids, return_prompt_caches=False):
+        caches = {}
+        if return_prompt_caches:
+            caches = self.extract_cache(uids)
+
+        keep = (
+            set(range(len(self._unprocessed_sequences))),
+            set(range(len(self._prompt_batch))),
+            set(range(len(self._generation_batch))),
+        )
+        for stage, idx in self._find_uids(uids).values():
+            keep[stage].remove(idx)
+
+        if len(keep[0]) < len(self._unprocessed_sequences):
+            self._unprocessed_sequences = deque(
+                x for i, x in enumerate(self._unprocessed_sequences) if i in keep[0]
+            )
+        if len(keep[1]) < len(self._prompt_batch):
+            self._prompt_batch.filter(sorted(keep[1]))
+        if len(keep[2]) < len(self._generation_batch):
+            self._generation_batch.filter(sorted(keep[2]))
+
+        return caches
+
+    @property
+    def prompt_cache_nbytes(self):
+        total = sum(c.nbytes for c in self._unprocessed_sequences for c in p[3])
+        total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
+        total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        return total
 
     def _make_batch(self, n: int):
         uids = []
