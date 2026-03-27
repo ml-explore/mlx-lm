@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,8 +25,13 @@ class ModelArgs(BaseModelArgs):
     num_heads: int
     num_kv_heads: int
     hidden_dim_scale_factor: float = 3.25
+    rope_parameters: Optional[Dict] = None
     rope_theta: float = 50000
     rms_norm_eps: float = 1e-5
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 50000.0)
 
 
 class FusedLoRALinear(nn.Module):

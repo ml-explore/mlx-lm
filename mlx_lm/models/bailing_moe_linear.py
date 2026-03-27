@@ -58,6 +58,13 @@ class ModelArgs(BaseModelArgs):
     moe_shared_expert_intermediate_size: Optional[int] = None
     moe_router_enable_shared_expert: bool = True
     head_dim: Optional[int] = None
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
+            self.rope_traditional = self.rope_parameters.get("rope_traditional", False)
 
 
 def recurrent_gla(

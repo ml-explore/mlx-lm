@@ -16,7 +16,7 @@ Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba` IBM's `Granite Mo
 Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's `Apertus`, Nikity's `Lille130m`, 
 Alibaba Qwen's `Qwen3Next`, Tele-AI's `TeleChat3`, and Allenai's `OLMoE` and `Olmo 3`; 
 Helped add support for the following model architectures: 
-Alibaba Qwen's `Qwen3 & Qwen3MoE)`; Added support for the following training algorithms: 
+Alibaba Qwen's `Qwen3 & Qwen3MoE), Qwen3.5 & Qwen3.5MoE`; Added support for the following training algorithms: 
 `Full Weight Fine-Tuning`, and the `Muon` optimizer; 
 Added support for the following other features: 
 `Multiple Optimizers to choose for training`, and `reporting training metrics to WandB (Weights & Biases)`.

@@ -52,6 +52,12 @@ class ModelArgs(BaseModelArgs):
     use_grouped_topk: bool = True
     num_expert_group: int = 1
     topk_group: int = 1
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 class KimiMLP(nn.Module):

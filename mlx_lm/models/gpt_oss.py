@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,7 +17,7 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "gpt_oss"
+    model_type: str
     num_hidden_layers: int = 36
     num_local_experts: int = 128
     num_experts_per_tok: int = 4
@@ -32,6 +32,12 @@ class ModelArgs(BaseModelArgs):
     rope_theta: int = 150000
     rope_scaling: Any = None
     layer_types: list = None
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 # These operators emulate particular methods in torch that don't exist in MLX natively

@@ -1,7 +1,8 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 import math
 from dataclasses import dataclass
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,7 +12,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "phi"
+    model_type: str
     max_position_embeddings: int = 2048
     vocab_size: int = 51200
     hidden_size: int = 2560
@@ -22,8 +23,12 @@ class ModelArgs(BaseModelArgs):
     intermediate_size: int = 10240
     layer_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
+
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 

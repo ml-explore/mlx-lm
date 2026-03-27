@@ -1,19 +1,19 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 import inspect
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import create_attention_mask, scaled_dot_product_attention
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchMLP
 
 
 @dataclass
-class ModelArgs:
+class ModelArgs(BaseModelArgs):
     model_type: str
     num_vocab: int = 51200
     model_dim: int = 2560
@@ -22,16 +22,6 @@ class ModelArgs:
     rotary_dim: int = 32
     num_experts_per_tok: int = 2
     num_local_experts: int = 4
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class RoPEAttention(nn.Module):
