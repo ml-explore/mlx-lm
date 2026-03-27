@@ -923,8 +923,15 @@ class ResponseGenerator:
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
 
-            # Prepare the prompt
+            # Prepare the prompt and state machine
             prompt, _, initial_state = self._tokenize(tokenizer, request, args)
+            sm = self._make_state_machine(
+                self.model_provider.model_key,
+                tokenizer,
+                args.stop_words,
+                initial_state=initial_state,
+            )
+            sm_state = sm.make_state()
 
             # Start the generation context
             ctx = GenerationContext(
@@ -979,12 +986,18 @@ class ResponseGenerator:
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
+                finish_reason = gen.finish_reason
+                sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
+                if match_sequence is not None and current_state is None:
+                    finish_reason = "stop"
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
+                        current_state,
+                        match_sequence,
                         gen.logprobs[gen.token].item(),
-                        gen.finish_reason,
+                        finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
                         ),
@@ -995,6 +1008,9 @@ class ResponseGenerator:
                 if ctx._should_stop:
                     if self._is_distributed:
                         raise NotImplementedError()
+                    break
+
+                if finish_reason is not None:
                     break
 
             rqueue.put(None)
