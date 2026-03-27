@@ -32,7 +32,12 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, generation_stream, stream_generate
+from .generate import (
+    BatchGenerator,
+    SequenceStateMachine,
+    generation_stream,
+    stream_generate,
+)
 from .models.cache import (
     LRUPromptCache,
     can_trim_prompt_cache,
@@ -249,6 +254,8 @@ class GenerationContext:
 class Response:
     text: str
     token: int
+    state: str
+    match: Tuple[int]
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
@@ -449,6 +456,7 @@ class ResponseGenerator:
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
+        self._state_machine_cache = {}
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -518,6 +526,17 @@ class ResponseGenerator:
         return rq, *shareable
 
     def _tokenize(self, tokenizer, request, args):
+        """Tokenize a request and split the prompt into segments.
+
+        Returns a tuple
+
+          * prompt - full list of tokens
+          * segments - a list of lists of tokens. Up to 3 segments that
+            correspond to system prompt, context, thinking tail.
+          * initial state - a string that contains the initial state of the
+            state machine (normal or thinking depending on whether we have tail
+            or not)
+        """
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
@@ -536,35 +555,118 @@ class ResponseGenerator:
                 if args.chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
                     chat_template_args.update(args.chat_template_kwargs)
-                return tokenizer.apply_chat_template(
-                    messages,
+                template_kwargs = dict(
                     tools=tools,
-                    add_generation_prompt=True,
                     tokenize=True,
                     **chat_template_args,
                 )
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
             else:
-                return tokenizer.encode(convert_chat(messages, role_mapping))
+                prompt = tokenizer.encode(convert_chat(messages, role_mapping))
+                return prompt, [prompt], "normal"
         else:
-            return tokenizer.encode(request.prompt)
+            prompt = tokenizer.encode(request.prompt)
+            return prompt, [prompt], "normal"
 
-    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
-        if request.request_type != "chat":
-            return False, -1
-        if request.messages[-1]["role"] != "user":
-            return False, -1
+        # If we are here it means we have a chat request so we need to search
+        # for segments for better cache management.
 
-        # Save the KV cache at the end of the prompt just before
-        # the think start token which will likely be removed in the
-        # next turn.
-        prompt_checkpoint = -1
+        # It is not a user message so no segmentation needed.
+        if messages[-1]["role"] != "user":
+            return prompt, [prompt], "normal"
+
+        segments = []
+        initial_state = "normal"
+
+        # Find where the system prompt ends and add it as a segment.
+        num_system = 0
+        sys_end = 0
+        for m in messages:
+            if m["role"] == "system":
+                num_system += 1
+            else:
+                break
+        if num_system > 0:
+            sys_tokens = tokenizer.apply_chat_template(
+                messages[:num_system],
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
+            sys_end = len(sys_tokens)
+            if sys_end > 0 and sys_end < len(prompt):
+                segments.append(prompt[:sys_end])
+
+        # The following code does 2 things:
+        #   1. Find a tail segment that contains thinking tokens
+        #   2. Find whether we have a think start token without corresponding
+        #      think end token and set the state to reasoning.
+        tail_start = len(prompt)
+        state = "reasoning"
         if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt)) - 1, 1):
+            for i in range(1, min(11, len(prompt) - sys_end), 1):
+                if prompt[-i] == tokenizer.think_end_id:
+                    state = "normal"
+                    continue
                 if prompt[-i] == tokenizer.think_start_id:
-                    prompt_checkpoint = -i - 1
+                    tail_start = len(prompt) - i
+                    initial_state = state
                     break
 
-        return True, prompt_checkpoint
+        # Finalize the segments and return
+        if sys_end < tail_start:
+            segments.append(prompt[sys_end:tail_start])
+        if tail_start < len(prompt):
+            segments.append(prompt[tail_start:])
+        if not segments:
+            segments = [prompt]
+
+        return prompt, segments, initial_state
+
+    def _make_state_machine(
+        self, model_key, tokenizer, stop_words, initial_state="normal"
+    ):
+        """Make a new SequenceStateMachine or fetch it if we 've made it before."""
+        cache_key = (model_key, tuple(stop_words))
+        sm = self._state_machine_cache.get(cache_key)
+        if sm is not None:
+            return sm
+
+        eos = [([t], None) for t in tokenizer.eos_token_ids]
+        stop = [
+            (tokenizer.encode(w, add_special_tokens=False), None) for w in stop_words
+        ]
+        common_stops = eos + stop
+
+        transitions = {"normal": list(common_stops)}
+
+        if tokenizer.has_thinking:
+            transitions["normal"].append(([tokenizer.think_start_id], "reasoning"))
+            transitions["reasoning"] = [
+                ([tokenizer.think_end_id], "normal"),
+            ] + common_stops
+
+        if tokenizer.has_tool_calling:
+            tool_start = tokenizer.encode(
+                tokenizer.tool_call_start, add_special_tokens=False
+            )
+            tool_end = tokenizer.encode(
+                tokenizer.tool_call_end, add_special_tokens=False
+            )
+            transitions["normal"].append((tool_start, "tool"))
+            transitions["tool"] = [
+                (tool_end, "normal"),
+            ] + common_stops
+
+        sm = SequenceStateMachine(transitions, initial=initial_state)
+        if len(self._state_machine_cache) > 100:
+            self._state_machine_cache.clear()
+        self._state_machine_cache[cache_key] = sm
+
+        return sm
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -591,23 +693,6 @@ class ResponseGenerator:
             else:
                 return self._next_request(timeout)
 
-        def progress_callback(info):
-            for uid, processed, total in info:
-                if uid in batch_results:
-                    batch_results[uid]["rqueue"].put((min(processed, total), total))
-
-        def checkpoint_callback(prompts):
-            for uid, prompt_end, cache in prompts:
-                rs = batch_results[uid]
-                if not rs["checkpoint"]:
-                    continue
-                self.prompt_cache.insert_cache(
-                    current_model_key,
-                    rs["cache_key"][:-prompt_end],
-                    list(cache),
-                    cache_type="user",
-                )
-
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
             mx.random.seed(seed)
@@ -633,7 +718,9 @@ class ResponseGenerator:
                     and self._is_batchable(args)
                 ):
                     try:
-                        prompt = self._tokenize(current_tokenizer, request, args)
+                        prompt, segments, initial_state = self._tokenize(
+                            current_tokenizer, request, args
+                        )
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -660,28 +747,38 @@ class ResponseGenerator:
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
-                    ctx.prompt_cache_count = len(prompt) - len(rest)
-                    if cache is None:
-                        cache = make_prompt_cache(self.model_provider.model)
+                    N = len(prompt) - len(rest)
+                    ctx.prompt_cache_count = N
+                    prompt = prompt[:N]
+                    while N >= 0:
+                        if N >= len(segments[0]):
+                            N -= len(segments.pop(0))
+                        else:
+                            segments[0] = segments[0][N:]
+                            break
 
-                    do_checkpoint, checkpoint_position = (
-                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
-                    )
-
-                    (uid,) = batch_generator.insert(
-                        [rest],
-                        args.max_tokens,
+                    (uid,) = batch_generator.insert_segments(
+                        segments=[segments],
+                        max_tokens=[args.max_tokens],
                         caches=[cache],
+                        all_tokens=[prompt],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        prompt_checkpoints=[checkpoint_position],
+                        state_machines=[
+                            self._make_state_machine(
+                                self.model_provider.model_key,
+                                tokenizer,
+                                args.stop_words,
+                                initial_state=initial_state,
+                            )
+                        ],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
-                        "cache_key": prompt[:],
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
-                        "checkpoint": do_checkpoint,
+                        "num_segments": len(segments),
+                        "top_logprobs": args.top_logprobs,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -714,12 +811,9 @@ class ResponseGenerator:
                     batch_results = {}
                     batch_generator = BatchGenerator(
                         model,
-                        stop_tokens=tokenizer.eos_token_ids,
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
-                        prompt_progress_callback=progress_callback,
-                        prompt_checkpoint_callback=checkpoint_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -746,24 +840,52 @@ class ResponseGenerator:
 
                 uids_to_remove = []
                 for _ in self._time_budget:
-                    responses = batch_generator.next()
-                    if not responses:
+                    prompt_responses, gen_responses = batch_generator.next()
+                    if not prompt_responses and not gen_responses:
                         break
 
-                    for r in responses:
+                    # Progress report for prompt processing
+                    for r in prompt_responses:
                         result = batch_results[r.uid]
-                        result["cache_key"].append(r.token)
-                        if r.finish_reason != "stop":
-                            result["detokenizer"].add_token(r.token)
+                        result["rqueue"].put(r.progress)
 
+                    # Save the caches at end of segments
+                    eos_ids = [
+                        r.uid
+                        for r in prompt_responses
+                        if r.end_of_segment and not r.end_of_prompt
+                    ]
+                    caches = batch_generator.extract_cache(eos_ids)
+                    for uid, (cache, cache_key) in caches.items():
+                        batch_results[uid]["num_segments"] -= 1
+                        cache_type = (
+                            "system"
+                            if batch_results[uid]["num_segments"] > 1
+                            else "user"
+                        )
+                        self.prompt_cache.insert_cache(
+                            self.model_provider.model_key,
+                            cache_key,
+                            cache,
+                            cache_type=cache_type,
+                        )
+                    del caches
+
+                    for r in gen_responses:
+                        result = batch_results[r.uid]
+                        result["detokenizer"].add_token(r.token)
                         result["rqueue"].put(
                             Response(
                                 result["detokenizer"].last_segment,
                                 r.token,
+                                r.current_state,
+                                r.match_sequence,
                                 r.logprobs[r.token].item(),
                                 r.finish_reason,
                                 _format_top_logprobs(
-                                    r.logprobs, args.top_logprobs, current_tokenizer
+                                    r.logprobs,
+                                    result["top_logprobs"],
+                                    current_tokenizer,
                                 ),
                             )
                         )
@@ -771,7 +893,10 @@ class ResponseGenerator:
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
                             self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
+                                current_model_key,
+                                r.all_tokens,
+                                r.prompt_cache,
+                                cache_type="assistant",
                             )
                             del batch_results[r.uid]
 
@@ -781,16 +906,8 @@ class ResponseGenerator:
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
                     with mx.stream(generation_stream):
-                        caches = batch_generator.remove(
-                            uids_to_remove, return_prompt_caches=True
-                        )
-                        for uid, prompt_cache in caches.items():
-                            if uid not in batch_results:
-                                continue
-                            result = batch_results[uid]
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], prompt_cache
-                            )
+                        batch_generator.remove(uids_to_remove)
+                        for uid in uids_to_remove:
                             del batch_results[uid]
 
     def _serve_single(self, request):
@@ -807,7 +924,7 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt
-            prompt = self._tokenize(tokenizer, request, args)
+            prompt, _, initial_state = self._tokenize(tokenizer, request, args)
 
             # Start the generation context
             ctx = GenerationContext(
