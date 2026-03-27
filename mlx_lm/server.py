@@ -349,6 +349,10 @@ class LRUPromptCache:
         while self._n_bytes > n_bytes and len(self._lru) > 0:
             model, tokens = self._lru.pop()
             self._delete(model, tokens)
+        if self._n_bytes > n_bytes:
+            raise RuntimeError(
+                "LRUPromptCache byte accounting drifted out of sync with cache order"
+            )
 
     def log_cache_stats(self):
         ncaches, nbytes = len(self), self.nbytes

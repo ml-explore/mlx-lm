@@ -566,6 +566,13 @@ class TestLRUPromptCache(unittest.TestCase):
         cache.trim_to(n_bytes=0)
         self.assertEqual(len(cache), 0)
 
+    def test_trim_to_raises_on_inconsistent_byte_accounting(self):
+        cache = LRUPromptCache(max_size=10)
+        cache._n_bytes = 1
+
+        with self.assertRaisesRegex(RuntimeError, "byte accounting"):
+            cache.trim_to(n_bytes=0)
+
     def test_trim_to_zero_bytes_evicts_all(self):
         cache = LRUPromptCache(max_size=10)
         model = ("test", None, None)
