@@ -632,6 +632,48 @@ class TestGenerate(unittest.TestCase):
         model = qwen3_next.Model(args)
         self._continued_generation_test_helper(model)
 
+    def test_prompt_checkpoint_cache_offset(self):
+        import copy
+
+        from mlx_lm.models.cache import make_prompt_cache
+
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hello"}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+
+        for pc in [-1, -2, -3]:
+            gen = BatchGenerator(
+                self.model,
+                stop_tokens={},
+                max_tokens=100,
+            )
+            cache = make_prompt_cache(self.model)
+            gen.insert(
+                [prompt],
+                max_tokens=100,
+                caches=[cache],
+                prompt_checkpoints=[pc],
+            )
+
+            cache_key = prompt[:]
+            for _ in range(5):
+                for r in gen.next():
+                    cache_key.append(r.token)
+
+            extracted = [c.extract(0) for c in gen.active_batch.cache]
+            mx.eval([c.state for c in extracted])
+            gen.close()
+
+            self.assertEqual(extracted[0].offset, len(cache_key))
+
+            shared_prefix_len = 5
+            trimmed = copy.deepcopy(extracted)
+            for c in trimmed:
+                c.trim(len(cache_key) - shared_prefix_len)
+            self.assertEqual(trimmed[0].offset, shared_prefix_len)
+
 
 if __name__ == "__main__":
     unittest.main()

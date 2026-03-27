@@ -1164,14 +1164,14 @@ class BatchGenerator:
                     for i, uid in enumerate(uids)
                 ]
             )
-        # Process the remaining prompt_checkpoint-1 tokens
-        if prompt_checkpoint > 1:
-            self.model(inputs[:, : prompt_checkpoint - 1], cache=prompt_cache)
+        # Process all remaining tokens except the last (which goes through _step)
+        if inputs.shape[1] > 1:
+            self.model(inputs[:, :-1], cache=prompt_cache)
             mx.eval([c.state for c in prompt_cache])
         mx.clear_cache()
 
         y, logprobs = self._step(
-            inputs, prompt_cache, samplers, logits_processors, tokens
+            inputs[:, -1:], prompt_cache, samplers, logits_processors, tokens
         )
 
         mx.async_eval(y, logprobs)
