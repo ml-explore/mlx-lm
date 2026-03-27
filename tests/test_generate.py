@@ -9,7 +9,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
-    SequenceMatcher,
+    SequenceStateMachine,
     batch_generate,
     generate,
     generate_step,
@@ -434,17 +434,17 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
-    def test_batch_generate_with_stop_matchers(self):
-        """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
+    def test_batch_generate_with_state_machines(self):
+        """Test that batch_generate with per-sequence state_machines stops on different tokens."""
         batch_gen = BatchGenerator(
             self.model,
             max_tokens=10,
         )
         prompt = self.tokenizer.encode("hello")
 
-        stop_matcher_0 = SequenceMatcher([[0]])
-        stop_matcher_1 = SequenceMatcher([[1]])
-        stop_matcher_2 = SequenceMatcher([[2]])
+        sm_0 = SequenceStateMachine({"normal": [([0], None)]}, initial="normal")
+        sm_1 = SequenceStateMachine({"normal": [([1], None)]}, initial="normal")
+        sm_2 = SequenceStateMachine({"normal": [([2], None)]}, initial="normal")
 
         processor_0 = make_logits_processors({0: 2000.0})
         processor_1 = make_logits_processors({1: 2000.0})
@@ -453,7 +453,7 @@ class TestGenerate(unittest.TestCase):
         uid0, uid1, uid2 = batch_gen.insert(
             [prompt, prompt, prompt],
             logits_processors=[processor_0, processor_1, processor_2],
-            stop_matchers=[stop_matcher_0, stop_matcher_1, stop_matcher_2],
+            state_machines=[sm_0, sm_1, sm_2],
         )
 
         responses = batch_gen.next_generated()
@@ -465,9 +465,9 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid0].finish_reason, "stop")
         self.assertEqual(responses[uid1].finish_reason, "stop")
         self.assertEqual(responses[uid2].finish_reason, "stop")
-        self.assertEqual(responses[uid0].stop_sequence, (0,))
-        self.assertEqual(responses[uid1].stop_sequence, (1,))
-        self.assertEqual(responses[uid2].stop_sequence, (2,))
+        self.assertEqual(responses[uid0].match_sequence, (0,))
+        self.assertEqual(responses[uid1].match_sequence, (1,))
+        self.assertEqual(responses[uid2].match_sequence, (2,))
 
     def test_batch_continued_generation(self):
         for rotating in [False, True]:

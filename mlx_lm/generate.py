@@ -1229,7 +1229,6 @@ class PromptProcessingBatch:
         cls,
         model: nn.Module,
         fallback_sampler: Callable[[mx.array], mx.array],
-        state_machine: SequenceStateMachine,
         prefill_step_size: int = 2048,
     ):
         return cls(
@@ -1544,7 +1543,6 @@ class BatchGenerator:
         self._prompt_batch = PromptProcessingBatch.empty(
             self.model,
             self.sampler,
-            self._default_state_machine,
             prefill_step_size=prefill_step_size,
         )
         self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
