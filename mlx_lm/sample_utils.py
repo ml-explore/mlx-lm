@@ -52,7 +52,7 @@ def make_sampler(
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
-    if xtc_probability > 0.0:
+    if xtc_probability > 0.0 and xtc_threshold > 0.0:
         sampling_methods.append(
             lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
         )
