@@ -730,7 +730,7 @@ class ResponseGenerator:
                     )
                     prompt_cache_count = len(prompt) - len(rest)
                     N = prompt_cache_count
-                    while N >= 0:
+                    while N > 0:
                         if N >= len(segments[0]):
                             N -= len(segments.pop(0))
                         else:
