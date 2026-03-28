@@ -1092,6 +1092,9 @@ class PromptProcessingBatch:
     def __len__(self):
         return len(self.uids)
 
+    def extract_cache(self, idx: int) -> List[Any]:
+        return [c.extract(idx) for c in self.prompt_cache]
+
     def extend(self, batch):
         if not any(self.samplers):
             self.samplers = [None] * len(self.uids)
@@ -1720,7 +1723,7 @@ class BatchGenerator:
 
     @property
     def prompt_cache_nbytes(self):
-        total = sum(c.nbytes for c in self._unprocessed_sequences for c in p[3])
+        total = sum(c.nbytes for p in self._unprocessed_sequences for c in p[3])
         total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
         total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
         return total
