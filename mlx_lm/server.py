@@ -559,11 +559,14 @@ class ResponseGenerator:
                 break
         if num_system > 0:
             sys_tokens = tokenizer.apply_chat_template(
-                messages[:num_system],
+                messages[:num_system] + [{"role": "user", "content": ""}],
                 add_generation_prompt=False,
                 **template_kwargs,
             )
-            sys_end = len(sys_tokens)
+            for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
+                if a != b:
+                    sys_end = i
+                    break
             if sys_end > 0 and sys_end < len(prompt):
                 segments.append(prompt[:sys_end])
 
