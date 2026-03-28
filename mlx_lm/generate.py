@@ -204,6 +204,20 @@ def setup_arg_parser():
         default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        help="TurboQuant KV cache compression bits (1-4). "
+        "3-bit gives 4.6x compression. Default: no compression.",
+        default=None,
+    )
+    parser.add_argument(
+        "--turbo-fp16-layers",
+        type=int,
+        help="Number of first/last layers to keep in FP16 "
+        "when using --turbo-kv-bits. Default: 1.",
+        default=1,
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -300,42 +314,6 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
-def make_turboquant_cache(model, bits=3, fp16_layers=1):
-    """Create layer-adaptive TurboQuant cache.
-
-    First and last ``fp16_layers`` layers use standard FP16 KVCache.
-    Middle layers use TurboQuantKVCache with ``bits``-bit compression.
-
-    Args:
-        model: The model to create caches for.
-        bits (int): Quantization bits (1-4). Default: ``3`` (4.6x compression).
-        fp16_layers (int): Number of first/last layers to keep in FP16. Default: ``1``.
-
-    Returns:
-        List of cache objects (one per layer).
-    """
-    from mlx_lm.models.turboquant_cache import TurboQuantKVCache
-
-    # Check for incompatible architectures
-    if hasattr(model, "make_cache"):
-        default_cache = model.make_cache()
-        if default_cache and not isinstance(default_cache[0], cache.KVCache):
-            cache_type = type(default_cache[0]).__name__
-            raise ValueError(
-                f"[TurboQuant] Incompatible cache type: {cache_type}. "
-                f"TurboQuant only works with standard multi-head attention "
-                f"(KVCache). MLA, SSM, and hybrid architectures are not supported."
-            )
-
-    num_layers = len(model.layers)
-    caches = []
-    for i in range(num_layers):
-        if i < fp16_layers or i >= num_layers - fp16_layers:
-            caches.append(cache.KVCache())
-        else:
-            caches.append(TurboQuantKVCache(bits=bits))
-    return caches
-
 
 def generate_step(
     prompt: mx.array,
@@ -409,15 +387,12 @@ def generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        if turbo_kv_bits is not None:
-            prompt_cache = make_turboquant_cache(
-                model, bits=turbo_kv_bits, fp16_layers=turbo_fp16_layers,
-            )
-        else:
-            prompt_cache = cache.make_prompt_cache(
-                model,
-                max_kv_size=max_kv_size,
-            )
+        prompt_cache = cache.make_prompt_cache(
+            model,
+            max_kv_size=max_kv_size,
+            turbo_kv_bits=turbo_kv_bits,
+            turbo_fp16_layers=turbo_fp16_layers,
+        )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
@@ -1575,6 +1550,8 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        turbo_kv_bits=args.turbo_kv_bits,
+        turbo_fp16_layers=args.turbo_fp16_layers,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
