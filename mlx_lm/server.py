@@ -843,7 +843,7 @@ class ResponseGenerator:
                         )
                         self.prompt_cache.insert_cache(
                             self.model_provider.model_key,
-                            cache_key,
+                            cache_key[:],
                             cache,
                             cache_type=cache_type,
                         )
@@ -872,7 +872,7 @@ class ResponseGenerator:
                             result["rqueue"].put(None)
                             self.prompt_cache.insert_cache(
                                 current_model_key,
-                                r.all_tokens,
+                                r.all_tokens[:],
                                 r.prompt_cache,
                                 cache_type="assistant",
                             )
