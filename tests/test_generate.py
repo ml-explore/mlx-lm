@@ -668,6 +668,57 @@ class TestGenerate(unittest.TestCase):
         model = qwen3_next.Model(args)
         self._continued_generation_test_helper(model)
 
+    def test_extend_cache_with_empty(self):
+        from mlx_lm.generate import _extend_cache
+        from mlx_lm.models.cache import make_prompt_cache
+
+        cache_a = make_prompt_cache(self.model)
+
+        prompt = mx.array([[1, 2, 3]])
+        self.model(prompt, cache=cache_a)
+        mx.eval([c.state for c in cache_a])
+
+        result = _extend_cache(cache_a, [])
+        self.assertEqual(len(result), len(cache_a))
+        for c in result:
+            self.assertGreater(c.offset, 0)
+
+        result = _extend_cache([], cache_a)
+        self.assertEqual(len(result), len(cache_a))
+        for c in result:
+            self.assertGreater(c.offset, 0)
+
+    def test_remove_prompt_batch_updates_currently_processing(self):
+        prompt_a = self.tokenizer.encode("Write a long story about a cat")
+        prompt_b = self.tokenizer.encode("Write a long story about a dog")
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=5,
+            prefill_batch_size=2,
+            prefill_step_size=4,
+            completion_batch_size=4,
+        )
+        uid_a, uid_b = gen.insert([prompt_a, prompt_b])
+
+        gen.next()
+
+        found = gen._find_uids([uid_a, uid_b])
+        for uid in [uid_a, uid_b]:
+            self.assertIn(uid, found)
+            self.assertEqual(found[uid][0], 1)
+
+        gen.remove([uid_a])
+
+        self.assertEqual(len(gen._currently_processing), len(gen._prompt_batch))
+
+        found = gen._find_uids([uid_b])
+        self.assertIn(uid_b, found)
+
+        while responses := gen.next_generated():
+            if all(r.finish_reason is not None for r in responses):
+                break
+
 
 if __name__ == "__main__":
     unittest.main()

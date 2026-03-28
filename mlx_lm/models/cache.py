@@ -1579,7 +1579,7 @@ class LRUPromptCache:
             while i + 1 < len(self._ordering):
                 lru_a = self._lrus[self._ordering[i]]
                 lru_b = self._lrus[self._ordering[i + 1]]
-                if len(lru_a) >= len(lru_b):
+                if len(lru_a) >= len(lru_b) > 0:
                     return lru_a.popleft()
                 i += 1
             return lru_b.popleft()

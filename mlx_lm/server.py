@@ -756,11 +756,12 @@ class ResponseGenerator:
                         logits_processors=[_make_logits_processors(args)],
                         state_machines=[sm],
                     )
+                    segment_cache = ["user", "system"]
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
-                        "num_segments": len(segments),
+                        "segment_cache": segment_cache[: len(segments) - 1],
                         "top_logprobs": args.top_logprobs,
                     }
                     # just making sure we don't leave a reference around
@@ -836,21 +837,17 @@ class ResponseGenerator:
                     eos_ids = [
                         r.uid
                         for r in prompt_responses
-                        if r.end_of_segment and not r.end_of_prompt
+                        if r.end_of_segment
+                        and not r.end_of_prompt
+                        and batch_results[r.uid]["segment_cache"]
                     ]
                     caches = batch_generator.extract_cache(eos_ids)
                     for uid, (cache, cache_key) in caches.items():
-                        batch_results[uid]["num_segments"] -= 1
-                        cache_type = (
-                            "system"
-                            if batch_results[uid]["num_segments"] > 1
-                            else "user"
-                        )
                         self.prompt_cache.insert_cache(
                             self.model_provider.model_key,
                             cache_key[:],
                             cache,
-                            cache_type=cache_type,
+                            cache_type=batch_results[uid]["segment_cache"].pop(),
                         )
                     del caches
 

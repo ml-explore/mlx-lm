@@ -923,7 +923,7 @@ def _extend_cache(cache_a, cache_b):
     if not cache_a:
         return cache_b
     if not cache_b:
-        return cache_b
+        return cache_a
     for ca, cb in zip(cache_a, cache_b):
         ca.extend(cb)
     return cache_a
@@ -1730,6 +1730,9 @@ class BatchGenerator:
             )
         if len(keep[1]) < len(self._prompt_batch):
             self._prompt_batch.filter(sorted(keep[1]))
+            self._currently_processing = [
+                x for i, x in enumerate(self._currently_processing) if i in keep[1]
+            ]
         if len(keep[2]) < len(self._generation_batch):
             self._generation_batch.filter(sorted(keep[2]))
 
