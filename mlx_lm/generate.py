@@ -300,6 +300,32 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+def make_turboquant_cache(model, bits=3, fp16_layers=1):
+    """Create layer-adaptive TurboQuant cache.
+
+    First and last ``fp16_layers`` layers use standard FP16 KVCache.
+    Middle layers use TurboQuantKVCache with ``bits``-bit compression.
+
+    Args:
+        model: The model to create caches for.
+        bits (int): Quantization bits (1-4). Default: ``3`` (4.6x compression).
+        fp16_layers (int): Number of first/last layers to keep in FP16. Default: ``1``.
+
+    Returns:
+        List of cache objects (one per layer).
+    """
+    from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+    num_layers = len(model.layers)
+    caches = []
+    for i in range(num_layers):
+        if i < fp16_layers or i >= num_layers - fp16_layers:
+            caches.append(cache.KVCache())
+        else:
+            caches.append(TurboQuantKVCache(bits=bits))
+    return caches
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -313,6 +339,8 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    turbo_kv_bits: Optional[int] = None,
+    turbo_fp16_layers: int = 1,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -339,6 +367,11 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        turbo_kv_bits (int, optional): TurboQuant KV cache compression bits (1-4).
+          Uses PolarQuant with Hadamard rotation. 3-bit gives 4.6x compression.
+          None implies no TurboQuant. Default: ``None``.
+        turbo_fp16_layers (int): Number of first/last layers to keep in FP16 when
+          using TurboQuant. Default: ``1``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -365,10 +398,15 @@ def generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(
-            model,
-            max_kv_size=max_kv_size,
-        )
+        if turbo_kv_bits is not None:
+            prompt_cache = make_turboquant_cache(
+                model, bits=turbo_kv_bits, fp16_layers=turbo_fp16_layers,
+            )
+        else:
+            prompt_cache = cache.make_prompt_cache(
+                model,
+                max_kv_size=max_kv_size,
+            )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
