@@ -315,6 +315,10 @@ class ModelProvider:
         self.default_model_map = {}
         if self.cli_args.model is not None:
             self.default_model_map[self.cli_args.model] = "default_model"
+            if getattr(self.cli_args, "served_model_name", None) is not None:
+                self.default_model_map[self.cli_args.served_model_name] = (
+                    "default_model"
+                )
             self.load(self.cli_args.model, draft_model_path="default_model")
 
     # Added in adapter_path to load dynamically
@@ -1638,10 +1642,25 @@ class APIHandler(BaseHTTPRequestHandler):
             for repo in downloaded_models
         ]
 
-        if self.response_generator.cli_args.model:
+        served_model_name = getattr(
+            self.response_generator.cli_args, "served_model_name", None
+        )
+        if served_model_name is not None:
+            if filter_repo_id is None or filter_repo_id == served_model_name:
+                models.append(
+                    {
+                        "id": served_model_name,
+                        "object": "model",
+                        "created": self.created,
+                    }
+                )
+        elif self.response_generator.cli_args.model:
             model_path = Path(self.response_generator.cli_args.model)
             if model_path.exists():
                 model_id = str(model_path.resolve())
+            else:
+                model_id = self.response_generator.cli_args.model
+            if filter_repo_id is None or filter_repo_id == model_id:
                 models.append(
                     {
                         "id": model_id,
@@ -1712,6 +1731,13 @@ def main():
         "--model",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="The model name reported in the API. If not specified, "
+        "the --model path is used.",
     )
     parser.add_argument(
         "--adapter-path",
