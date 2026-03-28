@@ -15,6 +15,8 @@ from .base import create_causal_mask
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
+    turbo_kv_bits: Optional[int] = None,
+    turbo_fp16_layers: int = 1,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -27,11 +29,39 @@ def make_prompt_cache(
         max_kv_size (Optional[int]): If provided and the model does not have a
             ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
             size of ``max_kv_size``
+        turbo_kv_bits (Optional[int]): If provided, use TurboQuant KV cache
+            compression at the given bit width (1-4). 3-bit gives 4.6x
+            compression. Default: ``None`` (no compression).
+        turbo_fp16_layers (int): Number of first/last layers to keep in FP16
+            when using TurboQuant. Default: ``1``.
     """
     if hasattr(model, "make_cache"):
-        return model.make_cache()
+        default_cache = model.make_cache()
+        if turbo_kv_bits is not None:
+            # Check compatibility
+            if not isinstance(default_cache[0], KVCache):
+                raise ValueError(
+                    f"[TurboQuant] Incompatible cache type: "
+                    f"{type(default_cache[0]).__name__}. "
+                    f"TurboQuant only works with standard multi-head "
+                    f"attention (KVCache)."
+                )
+        else:
+            return default_cache
 
     num_layers = len(model.layers)
+
+    if turbo_kv_bits is not None:
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+        caches = []
+        for i in range(num_layers):
+            if i < turbo_fp16_layers or i >= num_layers - turbo_fp16_layers:
+                caches.append(KVCache())
+            else:
+                caches.append(TurboQuantKVCache(bits=turbo_kv_bits))
+        return caches
+
     if max_kv_size is not None:
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
@@ -389,6 +419,17 @@ class KVCache(_BaseCache):
                 self.values, group_size=group_size, bits=bits
             )
         return quant_cache
+
+    def to_turbo_quantized(self, bits: int = 3):
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+        tq_cache = TurboQuantKVCache(bits=bits)
+        if self.keys is not None:
+            tq_cache.update_and_fetch(
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        return tq_cache
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
