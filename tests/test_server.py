@@ -218,18 +218,6 @@ class TestServer(unittest.TestCase):
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
 
-    def test_sequence_overlap(self):
-        from mlx_lm.server import sequence_overlap
-
-        self.assertTrue(sequence_overlap([1], [1]))
-        self.assertTrue(sequence_overlap([1, 2], [1, 2]))
-        self.assertTrue(sequence_overlap([1, 3], [3, 4]))
-        self.assertTrue(sequence_overlap([1, 2, 3], [2, 3]))
-
-        self.assertFalse(sequence_overlap([1], [2]))
-        self.assertFalse(sequence_overlap([1, 2], [3, 4]))
-        self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
-
 
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod

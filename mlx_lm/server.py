@@ -10,7 +10,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -41,9 +41,7 @@ from .generate import (
 )
 from .models.cache import (
     LRUPromptCache,
-    can_trim_prompt_cache,
     make_prompt_cache,
-    trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -87,69 +85,6 @@ class ToolCallFormatter:
             result.extend(self._format(tc) for tc in parsed)
 
         return result
-
-
-class StopCondition(NamedTuple):
-    stop_met: bool
-    trim_length: int
-    trim_text_length: int
-
-
-def stopping_criteria(
-    tokens: List[int],
-    eos_token_ids: set,
-    stop_id_sequences: List[List[int]],
-    stop_words: List[str],
-) -> StopCondition:
-    """
-    Determines whether the token generation should stop based on predefined
-    conditions.
-
-    Args:
-        tokens (List[int]): The current sequence of generated tokens.
-        eos_token_ids (set): The token IDs that represents the
-          end-of-sequence. If the last token in ``tokens`` is in the set,
-          the generation should stop.
-        stop_id_sequences (List[List[[int]]): A list of integer lists, each
-          representing a sequence of token IDs. If the end of the `tokens`
-          list matches any of these sequences, the generation should stop.
-        stop_words (List[str]): The stop words that correspond to the
-            ``stop_id_sequences``.
-
-    Returns:
-        StopCondition: A named tuple indicating whether the stop condition has
-          been met (`stop_met`) and how many tokens should be trimmed from the
-          end if it has (`trim_length`) as well as the text that should be
-          trimmed.
-    """
-    if tokens and tokens[-1] in eos_token_ids:
-        return StopCondition(stop_met=True, trim_length=0, trim_text_length=0)
-
-    for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
-        if len(tokens) >= len(stop_ids):
-            if tokens[-len(stop_ids) :] == stop_ids:
-                return StopCondition(
-                    stop_met=True,
-                    trim_length=len(stop_ids),
-                    trim_text_length=len(stop_word),
-                )
-
-    return StopCondition(stop_met=False, trim_length=0, trim_text_length=0)
-
-
-def sequence_overlap(s1: Sequence, s2: Sequence) -> bool:
-    """
-    Checks if a suffix of s1 has overlap with a prefix of s2
-
-    Args:
-        s1 (Sequence): The first sequence
-        s2 (Sequence): The second sequence
-
-    Returns:
-        bool: If the two sequences have overlap
-    """
-    max_overlap = min(len(s1), len(s2))
-    return any(s1[-i:] == s2[:i] for i in range(1, max_overlap + 1))
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -1445,8 +1380,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         Args:
             prompt (List[int]): The tokenized prompt.
-            stop_words (List[str]): A list of stop words passed to the
-                stopping_criteria function
+            stop_words (List[str]): A list of stop words
         """
         args = GenerationArguments(
             model=ModelDescription(
