@@ -316,6 +316,17 @@ def make_turboquant_cache(model, bits=3, fp16_layers=1):
     """
     from mlx_lm.models.turboquant_cache import TurboQuantKVCache
 
+    # Check for incompatible architectures
+    if hasattr(model, "make_cache"):
+        default_cache = model.make_cache()
+        if default_cache and not isinstance(default_cache[0], cache.KVCache):
+            cache_type = type(default_cache[0]).__name__
+            raise ValueError(
+                f"[TurboQuant] Incompatible cache type: {cache_type}. "
+                f"TurboQuant only works with standard multi-head attention "
+                f"(KVCache). MLA, SSM, and hybrid architectures are not supported."
+            )
+
     num_layers = len(model.layers)
     caches = []
     for i in range(num_layers):
