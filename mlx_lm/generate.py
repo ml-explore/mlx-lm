@@ -827,50 +827,6 @@ class BatchStats:
     peak_memory: float = 0
 
 
-@dataclass
-class Batch:
-    uids: List[int]
-    y: mx.array
-    logprobs: mx.array
-    max_tokens: List[int]
-    num_tokens: List[int]
-    cache: List[Any]
-    samplers: List[Any]
-    logits_processors: List[Any]
-    tokens: List[mx.array]
-
-    def __len__(self):
-        return len(self.uids)
-
-    def filter(self, keep_idx: List[int]):
-        self.uids = [self.uids[k] for k in keep_idx]
-        self.logprobs = [self.logprobs[k] for k in keep_idx]
-        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
-        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
-        self.samplers = [self.samplers[k] for k in keep_idx]
-        self.logits_processors = [self.logits_processors[k] for k in keep_idx]
-        self.tokens = [self.tokens[k] for k in keep_idx]
-        keep_idx = mx.array(keep_idx, mx.int32)
-        self.y = self.y[keep_idx]
-        for c in self.cache:
-            c.filter(keep_idx)
-
-    def extend(self, other):
-        self.uids.extend(other.uids)
-        self.y = mx.concatenate([self.y, other.y])
-        self.logprobs.extend(other.logprobs)
-        self.num_tokens.extend(other.num_tokens)
-        self.max_tokens.extend(other.max_tokens)
-        self.samplers.extend(other.samplers)
-        self.logits_processors.extend(other.logits_processors)
-        self.tokens.extend(other.tokens)
-        for c, o in zip(self.cache, other.cache):
-            c.extend(o)
-
-    def extract_cache(self, idx):
-        return [c.extract(idx) for c in self.cache]
-
-
 def _make_cache(model, left_padding, max_kv_size):
     """
     Convert a list of regular caches into their corresponding
