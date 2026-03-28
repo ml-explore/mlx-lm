@@ -571,19 +571,21 @@ class ResponseGenerator:
                 segments.append(prompt[:sys_end])
 
         # The following code does 2 things:
-        #   1. Find a tail segment that contains thinking tokens
+        #   1. Find a tail segment that contains thinking tokens (small up to
+        #      11 tokens)
         #   2. Find whether we have a think start token without corresponding
         #      think end token and set the state to reasoning.
         tail_start = len(prompt)
-        state = "reasoning"
         if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt) - sys_end), 1):
+            has_think_end = False
+            for i in range(1, len(prompt) - sys_end, 1):
                 if prompt[-i] == tokenizer.think_end_id:
-                    state = "normal"
-                    continue
-                if prompt[-i] == tokenizer.think_start_id:
+                    has_think_end = True
+                elif prompt[-i] == tokenizer.think_start_id:
                     tail_start = len(prompt) - i
-                    initial_state = state
+                    initial_state = "reasoning" if not has_think_end else "normal"
+                    break
+                if has_think_end and i >= 11:
                     break
 
         # Finalize the segments and return
