@@ -9,6 +9,7 @@ import socket
 import time
 import uuid
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,6 +52,41 @@ from .utils import _parse_size, load, sharded_load
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+
+
+class ToolCallFormatter:
+    def __init__(self, tool_parser, tools, streaming=False):
+        self._idx = 0
+        self._tool_parser = tool_parser
+        self._tools = tools
+        self._streaming = streaming
+
+    def _format(self, tc):
+        tc_id = tc.pop("id", None) or str(uuid.uuid4())
+        tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
+        out = {
+            "function": tc,
+            "type": "function",
+            "id": tc_id,
+        }
+        if self._streaming:
+            out["index"] = self._idx
+            self._idx += 1
+
+        return out
+
+    def __call__(self, tool_calls):
+        if not tool_calls:
+            return []
+
+        result = []
+        for tool_text in tool_calls:
+            parsed = self._tool_parser(tool_text, self._tools)
+            if not isinstance(parsed, list):
+                parsed = [parsed]
+            result.extend(self._format(tc) for tc in parsed)
+
+        return result
 
 
 class StopCondition(NamedTuple):
@@ -232,15 +268,11 @@ class CompletionRequest:
 @dataclass
 class GenerationContext:
     has_tool_calling: bool
-    tool_call_start: str
-    tool_call_end: str
-    tool_parser: Callable[[str, Any], Dict]
     has_thinking: bool
-    think_start_id: int
-    think_end_id: int
-    think_end: str
-    eos_token_ids: set
-    stop_token_sequences: List[List[int]]
+    tool_parser: Callable[[str, Any], Dict]
+
+    sequences: Dict[Tuple[int], str]
+
     prompt: List[int]
     prompt_cache_count: int = -1
 
@@ -629,44 +661,64 @@ class ResponseGenerator:
     def _make_state_machine(
         self, model_key, tokenizer, stop_words, initial_state="normal"
     ):
-        """Make a new SequenceStateMachine or fetch it if we 've made it before."""
-        cache_key = (model_key, tuple(stop_words))
-        sm = self._state_machine_cache.get(cache_key)
-        if sm is not None:
-            return sm
+        """Make a new SequenceStateMachine or fetch it if we 've made it before.
 
-        eos = [([t], None) for t in tokenizer.eos_token_ids]
-        stop = [
-            (tokenizer.encode(w, add_special_tokens=False), None) for w in stop_words
-        ]
-        common_stops = eos + stop
+        Return also a dictionary that maps the token sequences in the state
+        machine to their strings.
+        """
+        cache_key = (model_key, tuple(stop_words), initial_state)
+        rs = self._state_machine_cache.get(cache_key)
+        if rs is not None:
+            return rs
 
-        transitions = {"normal": list(common_stops)}
+        # Will hold the state machine transitions and the sequences map to
+        # strings.
+        transitions = {}
+        sequences = {}
 
+        # Add all the stop sequences
+        common_stops = []
+        for t in tokenizer.eos_token_ids:
+            sequences[(t,)] = tokenizer.convert_ids_to_tokens(t)
+            common_stops.append(((t,), None))
+        for w in stop_words:
+            t = tuple(tokenizer.encode(w, add_special_tokens=False))
+            sequences[t] = w
+            common_stops.append((t, None))
+
+        # From normal to stop
+        transitions["normal"] = list(common_stops)
+
+        # Reasoning related transitions
         if tokenizer.has_thinking:
-            transitions["normal"].append(([tokenizer.think_start_id], "reasoning"))
-            transitions["reasoning"] = [
-                ([tokenizer.think_end_id], "normal"),
-            ] + common_stops
+            ts = tokenizer.think_start_id
+            te = tokenizer.think_end_id
+            transitions["normal"].append(((ts,), "reasoning"))
+            transitions["reasoning"] = [((te,), "normal")]
+            transitions["reasoning"].extend(common_stops)
+            sequences[(ts,)] = tokenizer.convert_ids_to_tokens(ts)
+            sequences[(te,)] = tokenizer.convert_ids_to_tokens(te)
 
+        # Tool calling relating transitions
         if tokenizer.has_tool_calling:
-            tool_start = tokenizer.encode(
-                tokenizer.tool_call_start, add_special_tokens=False
+            ts = tuple(
+                tokenizer.encode(tokenizer.tool_call_start, add_special_tokens=False)
             )
-            tool_end = tokenizer.encode(
-                tokenizer.tool_call_end, add_special_tokens=False
+            te = tuple(
+                tokenizer.encode(tokenizer.tool_call_end, add_special_tokens=False)
             )
-            transitions["normal"].append((tool_start, "tool"))
-            transitions["tool"] = [
-                (tool_end, "normal"),
-            ] + common_stops
+            transitions["normal"].append((ts, "tool"))
+            transitions["tool"] = [(te, "normal")]
+            transitions["tool"].extend(common_stops)
+            sequences[ts] = tokenizer.tool_call_start
+            sequences[te] = tokenizer.tool_call_end
 
         sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = sm
+        self._state_machine_cache[cache_key] = (sm, sequences)
 
-        return sm
+        return sm, sequences
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -725,31 +777,19 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        tool_call_start=tokenizer.tool_call_start,
-                        tool_call_end=tokenizer.tool_call_end,
-                        tool_parser=tokenizer.tool_parser,
-                        has_thinking=tokenizer.has_thinking,
-                        think_start_id=tokenizer.think_start_id,
-                        think_end=tokenizer.think_end,
-                        think_end_id=tokenizer.think_end_id,
-                        eos_token_ids=tokenizer.eos_token_ids,
-                        stop_token_sequences=[
-                            tokenizer.encode(stop_word, add_special_tokens=False)
-                            for stop_word in args.stop_words
-                        ],
-                        prompt=prompt,
+                    sm, sequences = self._make_state_machine(
+                        self.model_provider.model_key,
+                        tokenizer,
+                        args.stop_words,
+                        initial_state,
                     )
-                    rqueue.put(ctx)
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
-                    N = len(prompt) - len(rest)
-                    ctx.prompt_cache_count = N
-                    prompt = prompt[:N]
+                    prompt_cache_count = len(prompt) - len(rest)
+                    N = prompt_cache_count
                     while N >= 0:
                         if N >= len(segments[0]):
                             N -= len(segments.pop(0))
@@ -757,21 +797,24 @@ class ResponseGenerator:
                             segments[0] = segments[0][N:]
                             break
 
+                    ctx = GenerationContext(
+                        has_tool_calling=tokenizer.has_tool_calling,
+                        has_thinking=tokenizer.has_thinking,
+                        tool_parser=tokenizer.tool_parser,
+                        sequences=sequences,
+                        prompt=prompt,
+                        prompt_cache_count=prompt_cache_count,
+                    )
+                    rqueue.put(ctx)
+
                     (uid,) = batch_generator.insert_segments(
                         segments=[segments],
                         max_tokens=[args.max_tokens],
                         caches=[cache],
-                        all_tokens=[prompt],
+                        all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        state_machines=[
-                            self._make_state_machine(
-                                self.model_provider.model_key,
-                                tokenizer,
-                                args.stop_words,
-                                initial_state=initial_state,
-                            )
-                        ],
+                        state_machines=[sm],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -925,7 +968,7 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, initial_state = self._tokenize(tokenizer, request, args)
-            sm = self._make_state_machine(
+            sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
@@ -935,19 +978,10 @@ class ResponseGenerator:
 
             # Start the generation context
             ctx = GenerationContext(
-                has_tool_calling=tokenizer.has_tool_calling,
-                tool_call_start=tokenizer.tool_call_start,
-                tool_call_end=tokenizer.tool_call_end,
-                tool_parser=tokenizer.tool_parser,
                 has_thinking=tokenizer.has_thinking,
-                think_start_id=tokenizer.think_start_id,
-                think_end=tokenizer.think_end,
-                think_end_id=tokenizer.think_end_id,
-                eos_token_ids=tokenizer.eos_token_ids,
-                stop_token_sequences=[
-                    tokenizer.encode(stop_word, add_special_tokens=False)
-                    for stop_word in args.stop_words
-                ],
+                has_tool_calling=tokenizer.has_tool_calling,
+                tool_parser=tokenizer.tool_parser,
+                sequences=sequences,
                 prompt=prompt,
             )
             rqueue.put(ctx)
@@ -1045,11 +1079,25 @@ class ResponseGenerator:
                     continue
                 yield response
 
+        def _process_control_tokens(ctx, token_stream):
+            buffer_size = max(len(s) for s in ctx.sequences)
+            buffered_stream = deque()
+
+            for tok in token_stream:
+                buffered_stream.append(tok)
+                if tok.match is not None:
+                    for _ in tok.match:
+                        buffered_stream.pop()
+                if len(buffered_stream) >= buffer_size:
+                    yield buffered_stream.popleft()
+            while len(buffered_stream) > 0:
+                yield buffered_stream.popleft()
+
         ctx = response_queue.get()
         if isinstance(ctx, Exception):
             raise ctx
 
-        return ctx, _inner()
+        return ctx, _process_control_tokens(ctx, _inner())
 
     @property
     def cli_args(self):
@@ -1144,11 +1192,18 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
-        indent = "\t"  # Backslashes can't be inside of f-strings
-        logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
-        assert isinstance(
-            self.body, dict
-        ), f"Request should be dict, but got {type(self.body)}"
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            debug_body = json.dumps(self.body, indent="\t")
+            logging.debug(f"Incoming Request Body: {debug_body}")
+        if not isinstance(self.body, dict):
+            debug_body = json.dumps(self.body, indent="\t")
+            logging.error(f"Invalid Request Body: {debug_body}")
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
+            )
+            return
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
@@ -1425,20 +1480,16 @@ class APIHandler(BaseHTTPRequestHandler):
             chat_template_kwargs=self.chat_template_kwargs,
         )
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
+        # Keep connection allive during long prompt processing (and also log
+        # the progress)
+        def keepalive_callback(processed, total):
+            logging.info(f"Prompt processing progress: {processed}/{total}")
             if self.stream:
                 try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
+                    msg = f": keepalive {processed}/{total}\n\n".encode()
+                    self.wfile.write(msg)
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
                     pass
 
         # Create the token generator
@@ -1451,7 +1502,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
         # Prepare the headers
@@ -1463,148 +1514,78 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
-        # Variables to save the tool calls in as they are being generated by
-        # the model.
-        in_tool_call = False
-        made_tool_call = False
-        tool_calls = []
-        tool_text = ""
-        tool_idx = 0
+        # Tool call formatter
+        tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
-        def format_tool_call(tool_call):
-            nonlocal tool_idx
-            tool_call_id = tool_call.pop("id", None) or str(uuid.uuid4())
-            tool_call["arguments"] = json.dumps(
-                tool_call["arguments"], ensure_ascii=False
-            )
-            out = {
-                "function": tool_call,
-                "type": "function",
-                "id": tool_call_id,
-            }
-            if self.stream:
-                out["index"] = tool_idx
-                tool_idx += 1
-            return out
-
-        def parse_tools(tool_calls):
-            if not tool_calls:
-                return []
-            result = []
-            for tool_text in tool_calls:
-                parsed = ctx.tool_parser(tool_text, request.tools)
-                if isinstance(parsed, list):
-                    result.extend(format_tool_call(tc) for tc in parsed)
-                else:
-                    result.append(format_tool_call(parsed))
-            return result
-
-        # Start out in reasoning if the model is a reasoning model and the
-        # prompt has an open think token but no closing think token
-        in_reasoning = False
-        if ctx.has_thinking:
-            for i in range(len(ctx.prompt) - 1, -1, -1):
-                if ctx.prompt[i] == ctx.think_end_id:
-                    break
-                elif ctx.prompt[i] == ctx.think_start_id:
-                    in_reasoning = True
-                    break
+        # Variables to save the generated text, tokens, logprobs, tools etc
+        prev_state = None
+        finish_reason = "stop"
         reasoning_text = ""
-
-        # Variables to save the generated tokens and the corresponding probs
+        made_tool_call = False
+        tool_text = ""
+        tool_calls = []
+        text = ""
         tokens = []
         token_logprobs = []
         top_tokens = []
 
-        # Variables to save the generated text
-        text = ""
-        segment = ""
-
-        # Well finally save the reason for stopping
-        finish_reason = "length"
-        # Process the generated tokens
         for gen in response:
             logging.debug(gen.text)
 
-            # Gather the text in tool calling or text variables
-            if in_reasoning:
-                if gen.text == ctx.think_end:
-                    in_reasoning = False
-                else:
-                    reasoning_text += gen.text
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                made_tool_call = True
-                in_tool_call = True
-            elif in_tool_call:
-                if gen.text == ctx.tool_call_end:
+            # Collect the text according to our current state and state
+            # transitions. Reasoning or tool or normal text.
+            if gen.state == "reasoning":
+                reasoning_text += gen.text
+            elif gen.state == "tool":
+                tool_text += gen.text
+            elif gen.state == "normal":
+                if prev_state == "tool":
                     tool_calls.append(tool_text)
                     tool_text = ""
-                    in_tool_call = False
-                else:
-                    tool_text += gen.text
-            else:
+                    made_tool_call = True
                 text += gen.text
-                segment += gen.text
 
-            # Save the token and its logprob
+            # Add the tokens and logprobs to the vars.
             tokens.append(gen.token)
             if args.logprobs:
                 token_logprobs.append(gen.logprob)
-
-            # If requested save the k top logprobs
             if args.top_logprobs > 0:
                 top_tokens.append(gen.top_tokens)
 
-            # Check if we should stop early
-            stop_condition = stopping_criteria(
-                tokens,
-                ctx.eos_token_ids,
-                ctx.stop_token_sequences,
-                stop_words,
-            )
-            if stop_condition.stop_met:
-                finish_reason = "tool_calls" if made_tool_call else "stop"
-                ctx.stop()
-                tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                text = text[: len(text) - stop_condition.trim_text_length]
-                segment = ""
-                break
-
-            if self.stream and not in_tool_call:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
-                if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in ctx.stop_token_sequences
-                    )
-                ):
-                    continue
-                elif segment or tool_calls or reasoning_text:
-                    response = self.generate_response(
-                        segment,
-                        None,
-                        tool_calls=parse_tools(tool_calls),
-                        reasoning_text=reasoning_text,
-                    )
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                    self.wfile.flush()
-                    reasoning_text = ""
-                    segment = ""
-                    tool_calls = []
+            if (
+                self.stream
+                and gen.state != "tool"
+                and (text or tool_calls or reasoning_text)
+            ):
+                response = self.generate_response(
+                    text,
+                    None,
+                    tool_calls=tool_formatter(tool_calls),
+                    reasoning_text=reasoning_text,
+                )
+                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                self.wfile.flush()
+                reasoning_text = ""
+                text = ""
+                tool_calls = []
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
-        # Flush any remaining tool text (e.g. when tool_call_end is empty)
-        if in_tool_call and tool_text:
+            prev_state = gen.state
+
+        if prev_state == "tool" and tool_text:
             tool_calls.append(tool_text)
+            made_tool_call = True
+
+        if finish_reason == "stop" and made_tool_call:
+            finish_reason = "tool_calls"
 
         if self.stream:
             response = self.generate_response(
-                segment,
+                text,
                 finish_reason,
-                tool_calls=parse_tools(tool_calls),
+                tool_calls=tool_formatter(tool_calls),
                 reasoning_text=reasoning_text,
             )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
@@ -1630,13 +1611,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 top_tokens=top_tokens,
                 tokens=tokens,
                 reasoning_text=reasoning_text,
-                tool_calls=parse_tools(tool_calls),
+                tool_calls=tool_formatter(tool_calls),
             )
-            response_json = json.dumps(response).encode()
-            indent = "\t"  # Backslashes can't be inside of f-strings
-            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                response_debug = json.dumps(response, indent="\t")
+                logging.debug(f"Outgoing Response: {response_debug}")
 
-            # Send an additional Content-Length header when it is known
+            response_json = json.dumps(response).encode()
             self.send_header("Content-Length", str(len(response_json)))
             self.end_headers()
             self.wfile.write(response_json)
