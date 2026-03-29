@@ -824,6 +824,8 @@ class ResponseGenerator:
                     for r in prompt_responses:
                         result = batch_results[r.uid]
                         result["rqueue"].put(r.progress)
+                        if result["ctx"]._should_stop:
+                            uids_to_remove.append(r.uid)
 
                     # Save the caches at end of segments
                     eos_ids = [
@@ -1386,12 +1388,9 @@ class APIHandler(BaseHTTPRequestHandler):
         def keepalive_callback(processed, total):
             logging.info(f"Prompt processing progress: {processed}/{total}")
             if self.stream:
-                try:
-                    msg = f": keepalive {processed}/{total}\n\n".encode()
-                    self.wfile.write(msg)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
+                msg = f": keepalive {processed}/{total}\n\n".encode()
+                self.wfile.write(msg)
+                self.wfile.flush()
 
         # Create the token generator
         try:
@@ -1430,99 +1429,105 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = []
         top_tokens = []
 
-        for gen in response:
-            logging.debug(gen.text)
+        try:
+            for gen in response:
+                logging.debug(gen.text)
 
-            # Collect the text according to our current state and state
-            # transitions. Reasoning or tool or normal text.
-            if gen.state == "reasoning":
-                reasoning_text += gen.text
-            elif gen.state == "tool":
-                tool_text += gen.text
-            elif gen.state == "normal":
-                if prev_state == "tool":
-                    tool_calls.append(tool_text)
-                    tool_text = ""
-                    made_tool_call = True
-                text += gen.text
+                # Collect the text according to our current state and state
+                # transitions. Reasoning or tool or normal text.
+                if gen.state == "reasoning":
+                    reasoning_text += gen.text
+                elif gen.state == "tool":
+                    tool_text += gen.text
+                elif gen.state == "normal":
+                    if prev_state == "tool":
+                        tool_calls.append(tool_text)
+                        tool_text = ""
+                        made_tool_call = True
+                    text += gen.text
 
-            # Add the tokens and logprobs to the vars.
-            tokens.append(gen.token)
-            if args.logprobs:
-                token_logprobs.append(gen.logprob)
-            if args.top_logprobs > 0:
-                top_tokens.append(gen.top_tokens)
+                # Add the tokens and logprobs to the vars.
+                tokens.append(gen.token)
+                if args.logprobs:
+                    token_logprobs.append(gen.logprob)
+                if args.top_logprobs > 0:
+                    top_tokens.append(gen.top_tokens)
 
-            if (
-                self.stream
-                and gen.state != "tool"
-                and (text or tool_calls or reasoning_text)
-            ):
-                response = self.generate_response(
+                if (
+                    self.stream
+                    and gen.state != "tool"
+                    and (text or tool_calls or reasoning_text)
+                ):
+                    resp = self.generate_response(
+                        text,
+                        None,
+                        tool_calls=tool_formatter(tool_calls),
+                        reasoning_text=reasoning_text,
+                    )
+                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self.wfile.flush()
+                    reasoning_text = ""
+                    text = ""
+                    tool_calls = []
+
+                if gen.finish_reason is not None:
+                    finish_reason = gen.finish_reason
+
+                prev_state = gen.state
+
+            if prev_state == "tool" and tool_text:
+                tool_calls.append(tool_text)
+                made_tool_call = True
+
+            if finish_reason == "stop" and made_tool_call:
+                finish_reason = "tool_calls"
+
+            if self.stream:
+                resp = self.generate_response(
                     text,
-                    None,
+                    finish_reason,
                     tool_calls=tool_formatter(tool_calls),
                     reasoning_text=reasoning_text,
                 )
-                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
-                reasoning_text = ""
-                text = ""
-                tool_calls = []
-
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
-
-            prev_state = gen.state
-
-        if prev_state == "tool" and tool_text:
-            tool_calls.append(tool_text)
-            made_tool_call = True
-
-        if finish_reason == "stop" and made_tool_call:
-            finish_reason = "tool_calls"
-
-        if self.stream:
-            response = self.generate_response(
-                text,
-                finish_reason,
-                tool_calls=tool_formatter(tool_calls),
-                reasoning_text=reasoning_text,
-            )
-            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-            self.wfile.flush()
-            if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(
+                if (
+                    self.stream_options is not None
+                    and self.stream_options["include_usage"]
+                ):
+                    resp = self.completion_usage_response(
+                        len(ctx.prompt),
+                        len(tokens),
+                        ctx.prompt_cache_count,
+                    )
+                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+            else:
+                resp = self.generate_response(
+                    text,
+                    finish_reason,
                     len(ctx.prompt),
                     len(tokens),
                     ctx.prompt_cache_count,
+                    token_logprobs=token_logprobs,
+                    top_tokens=top_tokens,
+                    tokens=tokens,
+                    reasoning_text=reasoning_text,
+                    tool_calls=tool_formatter(tool_calls),
                 )
-                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                self.wfile.flush()
-            self.wfile.write("data: [DONE]\n\n".encode())
-            self.wfile.flush()
-        else:
-            response = self.generate_response(
-                text,
-                finish_reason,
-                len(ctx.prompt),
-                len(tokens),
-                ctx.prompt_cache_count,
-                token_logprobs=token_logprobs,
-                top_tokens=top_tokens,
-                tokens=tokens,
-                reasoning_text=reasoning_text,
-                tool_calls=tool_formatter(tool_calls),
-            )
-            if logging.getLogger().isEnabledFor(logging.DEBUG):
-                response_debug = json.dumps(response, indent="\t")
-                logging.debug(f"Outgoing Response: {response_debug}")
+                if logging.getLogger().isEnabledFor(logging.DEBUG):
+                    response_debug = json.dumps(resp, indent="\t")
+                    logging.debug(f"Outgoing Response: {response_debug}")
 
-            response_json = json.dumps(response).encode()
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json)
-            self.wfile.flush()
+                response_json = json.dumps(resp).encode()
+                self.send_header("Content-Length", str(len(response_json)))
+                self.end_headers()
+                self.wfile.write(response_json)
+                self.wfile.flush()
+        finally:
+            ctx.stop()
 
     def completion_usage_response(
         self,
