@@ -206,3 +206,24 @@ class TurboQuantKVCache:
     def make_mask(self, *args, **kwargs):
         from mlx_lm.models.cache import create_attention_mask
         return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        obj.k_packed = None
+        obj.k_norms = None
+        obj.v_packed = None
+        obj.v_norms = None
+        obj._k_deq_buf = None
+        obj._v_deq_buf = None
+        obj._deq_offset = 0
+        obj._deq_alloc = 0
+        obj._k_q = None
+        obj._v_q = None
+        obj._k_dim = None
+        obj._v_dim = None
+        obj._k_pdim = None
+        obj._v_pdim = None
+        obj.meta_state = meta_state
+        obj.state = state
+        return obj

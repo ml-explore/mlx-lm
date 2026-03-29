@@ -106,6 +106,13 @@ def load_prompt_cache(file_name, return_metadata=False):
     arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
+
+    # Ensure TurboQuantKVCache is in globals for deserialization
+    if "TurboQuantKVCache" in classes and "TurboQuantKVCache" not in globals():
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+        globals()["TurboQuantKVCache"] = TurboQuantKVCache
+
     cache = [
         globals()[c].from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
