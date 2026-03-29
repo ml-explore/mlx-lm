@@ -70,7 +70,6 @@ class ToolCallFormatter:
         if self._streaming:
             out["index"] = self._idx
             self._idx += 1
-
         return out
 
     def __call__(self, tool_calls):
@@ -83,7 +82,6 @@ class ToolCallFormatter:
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
-
         return result
 
 
@@ -98,7 +96,7 @@ def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
         "assistant": "ASSISTANT: ",
         "stop": "\n",
     }
-    role_mapping = role_mapping if role_mapping is not None else default_role_mapping
+    role_mapping = role_mapping or default_role_mapping
 
     prompt = ""
     for line in messages:
@@ -128,7 +126,7 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message.get("content", None)
+        content = message.get("content")
         if isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
@@ -138,10 +136,11 @@ def process_message_content(messages):
             message["content"] = "".join(text_fragments)
         elif content is None:
             message["content"] = ""
-        if tool_calls := message.get("tool_calls", False):
+
+        if tool_calls := message.get("tool_calls"):
             for tool_call in tool_calls:
-                if func := tool_call.get("function", False):
-                    if args := func.get("arguments", False):
+                if func := tool_call.get("function"):
+                    if args := func.get("arguments"):
                         func["arguments"] = json.loads(args)
 
 
@@ -234,7 +233,6 @@ class TimeBudget:
         self._budget = budget
         self._iterations = iterations
         self._sync_frequency = sync_frequency
-
         self._start = None
         self._current_iterations = None
         self._loops = 0
@@ -252,20 +250,22 @@ class TimeBudget:
             return None
 
         self._current_iterations += 1
-        if self._current_iterations > self._iterations:
-            self._loops += 1
-            self._time_spent += time.time() - self._start
-            if self._loops % self._sync_frequency == 0:
-                with mx.stream(generation_stream):
-                    loop_time = mx.distributed.all_sum(self._time_spent).item()
-                avg_loop_time = loop_time / (
-                    mx.distributed.init().size() * self._sync_frequency
-                )
-                factor = self._budget / avg_loop_time
-                self._iterations = max(round(self._iterations * factor), 1)
-                self._loops = 0
-                self._time_spent = 0
-            raise StopIteration()
+        if self._current_iterations <= self._iterations:
+            return None
+
+        self._loops += 1
+        self._time_spent += time.time() - self._start
+        if self._loops % self._sync_frequency == 0:
+            with mx.stream(generation_stream):
+                loop_time = mx.distributed.all_sum(self._time_spent).item()
+            avg_loop_time = loop_time / (
+                mx.distributed.init().size() * self._sync_frequency
+            )
+            factor = self._budget / avg_loop_time
+            self._iterations = max(round(self._iterations * factor), 1)
+            self._loops = 0
+            self._time_spent = 0
+        raise StopIteration()
 
 
 class ModelProvider:
@@ -404,17 +404,17 @@ def _make_logits_processors(args):
     )
 
 
-def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, Any]]:
-    """Returns info dicts for the top `top_logprobs` tokens from `logprobs`"""
-    if top_logprobs <= 0:
+def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
+    """Returns info dicts for the top `top_n` tokens from `logprobs`"""
+    if top_n <= 0:
         return ()
-    sorted_indices = mx.argpartition(-logprobs, kth=top_logprobs - 1)
-    top_indices = sorted_indices[:top_logprobs].tolist()
-    top_logprobs = logprobs[top_indices].tolist()
+    sorted_indices = mx.argpartition(-logprobs, kth=top_n - 1)
+    top_indices = sorted_indices[:top_n].tolist()
+    top_probs = logprobs[top_indices].tolist()
     txts = tokenizer.convert_ids_to_tokens(top_indices)
     return tuple(
         {"id": i, "token": s, "logprob": g}
-        for i, s, g in zip(top_indices, txts, top_logprobs)
+        for i, s, g in zip(top_indices, txts, top_probs)
     )
 
 
@@ -454,7 +454,6 @@ class ResponseGenerator:
                     request = self.requests.get_nowait()
             except QueueEmpty:
                 pass
-
         return self._share_request(request)
 
     def _share_object(self, obj):
@@ -466,19 +465,17 @@ class ResponseGenerator:
                 if obj is None:
                     mx.eval(mx.distributed.all_sum(0))
                     return None
-                else:
-                    data = mx.array(pickle.dumps(obj))
-                    mx.eval(mx.distributed.all_sum(data.size))
-                    mx.eval(mx.distributed.all_sum(data))
-                    return obj
+                data = mx.array(pickle.dumps(obj))
+                mx.eval(mx.distributed.all_sum(data.size))
+                mx.eval(mx.distributed.all_sum(data))
+                return obj
             else:
                 size = mx.distributed.all_sum(0).item()
                 if size == 0:
                     return None
-                else:
-                    data = mx.zeros(size, dtype=mx.uint8)
-                    data = mx.distributed.all_sum(data)
-                    return pickle.loads(data)
+                data = mx.zeros(size, dtype=mx.uint8)
+                data = mx.distributed.all_sum(data)
+                return pickle.loads(data)
 
     def _share_request(self, request):
         if not self._is_distributed:
@@ -661,12 +658,7 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        if not self.model_provider.is_batchable:
-            return False
-        if args.seed is not None:
-            return False
-
-        return True
+        return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
         current_model = None
@@ -1186,87 +1178,60 @@ class APIHandler(BaseHTTPRequestHandler):
         request = request_factories[self.path]()
         self.handle_completion(request, stop_words)
 
+    def _validate(
+        self,
+        name,
+        expected_type,
+        min_val=None,
+        max_val=None,
+        optional=False,
+        whitelist=None,
+    ):
+        value = getattr(self, name)
+        if optional and value is None:
+            return
+        if not isinstance(value, expected_type):
+            try:
+                allowed = tuple(et.__name__ for et in expected_type)
+            except TypeError:
+                allowed = expected_type.__name__
+            raise ValueError(f"{name} must be of type {allowed}")
+        if whitelist is not None and value in whitelist:
+            return
+        if min_val is not None and value < min_val:
+            raise ValueError(f"{name} must be at least {min_val}")
+        if max_val is not None and value > max_val:
+            raise ValueError(f"{name} must be at most {max_val}")
+
     def validate_model_parameters(self):
-        """
-        Validate the model parameters passed in the request for the correct types and values.
-        """
-        if not isinstance(self.stream, bool):
-            raise ValueError("stream must be a boolean")
-
-        if not isinstance(self.max_tokens, int) or self.max_tokens < 0:
-            raise ValueError("max_tokens must be a non-negative integer")
-
-        if not isinstance(self.temperature, (float, int)) or self.temperature < 0:
-            raise ValueError("temperature must be a non-negative float")
-
-        if not isinstance(self.top_p, (float, int)) or self.top_p < 0 or self.top_p > 1:
-            raise ValueError("top_p must be a float between 0 and 1")
-
-        if not isinstance(self.top_k, int) or self.top_k < 0:
-            raise ValueError("top_k must be a non-negative integer")
-
-        if not isinstance(self.min_p, (float, int)) or self.min_p < 0 or self.min_p > 1:
-            raise ValueError("min_p must be a float between 0 and 1")
-
-        if not isinstance(self.num_draft_tokens, int) or self.num_draft_tokens < 0:
-            raise ValueError("num_draft_tokens must be a non-negative integer")
-
-        if (
-            not isinstance(self.repetition_penalty, (float, int))
-            or self.repetition_penalty < 0
-        ):
-            raise ValueError("repetition_penalty must be a non-negative float")
-        if (
-            not isinstance(self.repetition_context_size, int)
-            or self.repetition_context_size < 0
-        ):
-            raise ValueError("repetition_context_size must be a non-negative integer")
-        if not isinstance(self.presence_penalty, (float, int)):
-            raise ValueError("Presence penalty must be must be a float")
-        if (
-            not isinstance(self.presence_context_size, int)
-            or self.presence_context_size < 0
-        ):
-            raise ValueError("presence_context_size must be a non-negative integer")
-        if not isinstance(self.frequency_penalty, (float, int)):
-            raise ValueError("Presence penalty must be must be a float")
-        if (
-            not isinstance(self.frequency_context_size, int)
-            or self.frequency_context_size < 0
-        ):
-            raise ValueError("frequency_context_size must be a non-negative integer")
-
-        if not isinstance(self.logprobs, bool):
-            raise ValueError("logprobs must be a boolean")
-
-        if self.top_logprobs != -1 and not (0 < self.top_logprobs <= 10):
-            raise ValueError(
-                f"top_logprobs must be between 1 and 10 but got {self.top_logprobs:,}"
-            )
+        """Validate that the passed model parameters have correct types and values."""
+        self._validate("stream", bool)
+        self._validate("max_tokens", int, min_val=0)
+        self._validate("temperature", (float, int), min_val=0)
+        self._validate("top_p", (float, int), min_val=0, max_val=1)
+        self._validate("top_k", int, min_val=0)
+        self._validate("min_p", (float, int), min_val=0, max_val=1)
+        self._validate("num_draft_tokens", int, min_val=0)
+        self._validate("repetition_penalty", (float, int), min_val=0)
+        self._validate("repetition_context_size", int, min_val=0)
+        self._validate("presence_penalty", (float, int))
+        self._validate("presence_context_size", int, min_val=0)
+        self._validate("frequency_penalty", (float, int))
+        self._validate("frequency_context_size", int, min_val=0)
+        self._validate("logprobs", bool)
+        self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
+        self._validate("xtc_probability", float, min_val=0, max_val=1)
+        self._validate("xtc_threshold", float, min_val=0, max_val=1)
+        self._validate("requested_model", str)
+        self._validate("adapter", str, optional=True)
+        self._validate("seed", int, optional=True)
+        self._validate("logit_bias", dict, optional=True)
 
         if self.logit_bias is not None:
-            if not isinstance(self.logit_bias, dict):
-                raise ValueError("logit_bias must be a dict of int to float")
-
             try:
-                self.logit_bias = {int(k): v for k, v in self.logit_bias.items()}
+                self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
             except ValueError:
                 raise ValueError("logit_bias must be a dict of int to float")
-        if not (
-            isinstance(self.xtc_probability, float)
-            and 0.00 <= self.xtc_probability <= 1.00
-        ):
-            raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
-        if not (
-            isinstance(self.xtc_threshold, float) and 0.00 <= self.xtc_threshold <= 0.50
-        ):
-            raise ValueError(f"xtc_threshold must be a float between 0.00 and 0.5")
-        if not isinstance(self.requested_model, str):
-            raise ValueError("model must be a string")
-        if self.adapter is not None and not isinstance(self.adapter, str):
-            raise ValueError("adapter must be a string")
-        if self.seed is not None and not isinstance(self.seed, int):
-            raise ValueError("seed must be an integer")
 
     def generate_response(
         self,
