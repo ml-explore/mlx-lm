@@ -148,6 +148,74 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_json_tools_repairs_malformed_json(self):
+        tools_multiply = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "multiply",
+                    "description": "Multiply two numbers.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["a", "b"],
+                        "properties": {
+                            "a": {"type": "number", "description": "a is a number"},
+                            "b": {"type": "number", "description": "b is a number"},
+                        },
+                    },
+                },
+            }
+        ]
+        expected_multiply = {
+            "name": "multiply",
+            "arguments": {"a": 12234585, "b": 48838483920},
+        }
+        malformed_multiply = [
+            (
+                "trailing_comma",
+                '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920,},}',
+            ),
+            (
+                "single_quoted",
+                "{'name': 'multiply', 'arguments': {'a': 12234585, 'b': 48838483920}}",
+            ),
+        ]
+        for label, text in malformed_multiply:
+            with self.subTest(case=label):
+                self.assertEqual(
+                    json_tools.parse_tool_call(text, tools_multiply),
+                    expected_multiply,
+                )
+
+        tools_temp = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_temperature",
+                    "description": "Get the current temperature.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["location"],
+                        "properties": {
+                            "location": {"type": "str", "description": "The location."},
+                        },
+                    },
+                },
+            }
+        ]
+        expected_temp = {
+            "name": "get_current_temperature",
+            "arguments": {"location": "London"},
+        }
+        text = (
+            '{"name": "get_current_temperature", '
+            '"arguments": {"location": "London",},}'
+        )
+        self.assertEqual(
+            json_tools.parse_tool_call(text, tools_temp),
+            expected_temp,
+        )
+
     def test_qwen3_coder_single_quoted_params(self):
         tools = [
             {
