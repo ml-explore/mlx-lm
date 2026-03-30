@@ -895,7 +895,9 @@ class ResponseGenerator:
                     with mx.stream(generation_stream):
                         batch_generator.remove(uids_to_remove)
                         for uid in uids_to_remove:
-                            del batch_results[uid]
+                            # It may have already been removed during
+                            # generation
+                            batch_results.pop(uid, None)
 
     def _serve_single(self, request):
         rqueue, request, args = request
