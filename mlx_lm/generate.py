@@ -31,6 +31,7 @@ from .models.cache import (
     CacheList,
     KVCache,
     QuantizedKVCache,
+    QuantizedRotatingKVCache,
     RotatingKVCache,
     load_prompt_cache,
 )
