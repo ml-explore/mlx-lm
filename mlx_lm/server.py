@@ -440,9 +440,15 @@ class ResponseGenerator:
         self._generation_thread.join()
 
     def _log_cache_stats(self):
-        ncaches = len(self.prompt_cache)
-        nbytes = self.prompt_cache.nbytes
-        logging.info(f"KV Caches: {ncaches} seq, {nbytes / 1e9:.2f} GB")
+        n_sequences = len(self.prompt_cache)
+        n_bytes = self.prompt_cache.nbytes
+        logging.info(f"Prompt Cache: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB")
+        for cache_type, stats in self.prompt_cache.stats_by_type().items():
+            n_sequences = stats["n_sequences"]
+            n_bytes = stats["n_bytes"]
+            logging.info(
+                f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
+            )
 
     def _next_request(self, timeout=None):
         request = None
@@ -494,10 +500,12 @@ class ResponseGenerator:
 
         Returns a tuple
 
-          * prompt - full list of tokens
-          * segments - a list of lists of tokens. Up to 3 segments that
+          * prompt - Full list of tokens
+          * segments - A list of lists of tokens. Up to 3 segments that
             correspond to system prompt, context, thinking tail.
-          * initial state - a string that contains the initial state of the
+          * segment_types - A string per segment indicating if the segment is a
+            system prompt or a user prompt or nothing special.
+          * initial state - A string that contains the initial state of the
             state machine (normal or thinking depending on whether we have tail
             or not)
         """
@@ -531,10 +539,10 @@ class ResponseGenerator:
                 )
             else:
                 prompt = tokenizer.encode(convert_chat(messages, role_mapping))
-                return prompt, [prompt], "normal"
+                return prompt, [prompt], ["assistant"], "normal"
         else:
             prompt = tokenizer.encode(request.prompt)
-            return prompt, [prompt], "normal"
+            return prompt, [prompt], ["assistant"], "normal"
 
         # If we are here it means we have a chat request so we need to search
         # for segments for better cache management.
@@ -551,9 +559,10 @@ class ResponseGenerator:
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
-            return prompt, [prompt], initial_state
+            return prompt, [prompt], ["assistant"], initial_state
 
         segments = []
+        segment_types = []
 
         # Find where the system prompt ends and add it as a segment.
         num_system = 0
@@ -575,6 +584,7 @@ class ResponseGenerator:
                     break
             if sys_end > 0 and sys_end < len(prompt):
                 segments.append(prompt[:sys_end])
+                segment_types.append("system")
 
         # Find a tail segment that contains thinking tokens (small up to 11
         # tokens)
@@ -588,12 +598,15 @@ class ResponseGenerator:
         # Finalize the segments and return
         if sys_end < tail_start:
             segments.append(prompt[sys_end:tail_start])
+            segment_types.append("user")
         if tail_start < len(prompt):
             segments.append(prompt[tail_start:])
+            segment_types.append("assistant")
         if not segments:
             segments = [prompt]
+            segment_types = ["assistant"]
 
-        return prompt, segments, initial_state
+        return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(
         self, model_key, tokenizer, stop_words, initial_state="normal"
@@ -702,7 +715,7 @@ class ResponseGenerator:
                     and self._is_batchable(args)
                 ):
                     try:
-                        prompt, segments, initial_state = self._tokenize(
+                        prompt, segments, segment_types, initial_state = self._tokenize(
                             current_tokenizer, request, args
                         )
                     except Exception as e:
@@ -725,6 +738,7 @@ class ResponseGenerator:
                     while N > 0:
                         if N >= len(segments[0]):
                             N -= len(segments.pop(0))
+                            segment_types.pop(0)
                         else:
                             segments[0] = segments[0][N:]
                             break
@@ -748,12 +762,11 @@ class ResponseGenerator:
                         logits_processors=[_make_logits_processors(args)],
                         state_machines=[sm],
                     )
-                    segment_cache = ["user", "system"]
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
-                        "segment_cache": segment_cache[: len(segments) - 1],
+                        "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
                     }
                     # just making sure we don't leave a reference around
@@ -833,7 +846,7 @@ class ResponseGenerator:
                         for r in prompt_responses
                         if r.end_of_segment
                         and not r.end_of_prompt
-                        and batch_results[r.uid]["segment_cache"]
+                        and batch_results[r.uid]["segment_types"]
                     ]
                     caches = batch_generator.extract_cache(eos_ids)
                     for uid, (cache, cache_key) in caches.items():
@@ -841,7 +854,7 @@ class ResponseGenerator:
                             self.model_provider.model_key,
                             cache_key[:],
                             cache,
-                            cache_type=batch_results[uid]["segment_cache"].pop(),
+                            cache_type=batch_results[uid]["segment_types"].pop(),
                         )
                     del caches
 
@@ -898,7 +911,7 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
