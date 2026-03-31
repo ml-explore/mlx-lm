@@ -548,7 +548,7 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
-    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
+    def _compute_prompt_checkpoint(self, tokenizer, request, prompt, args):
         if request.request_type != "chat":
             return False, -1
         if request.messages[-1]["role"] != "user":
@@ -558,13 +558,27 @@ class ResponseGenerator:
         # the think start token which will likely be removed in the
         # next turn.
         prompt_checkpoint = -1
-        if tokenizer.has_thinking:
+        if self._has_thinking(tokenizer, args):
             for i in range(1, min(11, len(prompt)) - 1, 1):
                 if prompt[-i] == tokenizer.think_start_id:
                     prompt_checkpoint = -i - 1
                     break
 
         return True, prompt_checkpoint
+
+    def _has_thinking(self, tokenizer, args):
+        """Return whether thinking is active for this request.
+
+        Check (in priority order) the per-request chat_template_kwargs, the
+        CLI --chat-template-args, and finally the tokenizer's own capability
+        flag.
+        """
+        if args.chat_template_kwargs and "enable_thinking" in args.chat_template_kwargs:
+            return args.chat_template_kwargs["enable_thinking"]
+        cli_args = self.model_provider.cli_args.chat_template_args
+        if "enable_thinking" in cli_args:
+            return cli_args["enable_thinking"]
+        return tokenizer.has_thinking
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -643,7 +657,7 @@ class ResponseGenerator:
                         tool_call_start=tokenizer.tool_call_start,
                         tool_call_end=tokenizer.tool_call_end,
                         tool_parser=tokenizer.tool_parser,
-                        has_thinking=tokenizer.has_thinking,
+                        has_thinking=self._has_thinking(tokenizer, args),
                         think_start_id=tokenizer.think_start_id,
                         think_end=tokenizer.think_end,
                         think_end_id=tokenizer.think_end_id,
@@ -665,7 +679,9 @@ class ResponseGenerator:
                         cache = make_prompt_cache(self.model_provider.model)
 
                     do_checkpoint, checkpoint_position = (
-                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
+                        self._compute_prompt_checkpoint(
+                            tokenizer, request, prompt, args
+                        )
                     )
 
                     (uid,) = batch_generator.insert(
@@ -815,7 +831,7 @@ class ResponseGenerator:
                 tool_call_start=tokenizer.tool_call_start,
                 tool_call_end=tokenizer.tool_call_end,
                 tool_parser=tokenizer.tool_parser,
-                has_thinking=tokenizer.has_thinking,
+                has_thinking=self._has_thinking(tokenizer, args),
                 think_start_id=tokenizer.think_start_id,
                 think_end=tokenizer.think_end,
                 think_end_id=tokenizer.think_end_id,
