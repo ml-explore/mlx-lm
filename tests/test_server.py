@@ -561,6 +561,17 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertIsNotNone(c)
         self.assertEqual(t, [])
 
+    def test_fetch_empty_tokens_after_root_eviction(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        cache.insert_cache(model, [1], [MockCache("a")])
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNone(c)
+        self.assertEqual(t, [])
+
     def test_lru_bytes(self):
         cache = LRUPromptCache(max_size=100, max_bytes=10)
         model = ("test", None, None)

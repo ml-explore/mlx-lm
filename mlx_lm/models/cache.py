@@ -1446,8 +1446,13 @@ class PromptTrie:
         if model not in self._trie:
             return PromptTrieResult(model, None, None, None, 0)
 
-        # Walk the tokens as far as we can
         current = self._trie[model]
+
+        if not tokens:
+            exact = tokens if "__value__" in current else None
+            return PromptTrieResult(model, exact, None, None, 0)
+
+        # Walk the tokens as far as we can
         last_index = -1
         index = 0
         while index < len(tokens) and tokens[index] in current:
