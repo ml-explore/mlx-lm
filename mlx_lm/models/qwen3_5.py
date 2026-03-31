@@ -157,7 +157,10 @@ class GatedDeltaNet(nn.Module):
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+            # contiguous() breaks the shared-buffer reference chain: this slice
+            # shares the parent conv_input's Data buffer, which in turn keeps the
+            # full chunk's computation graph alive (~540 KB/tok leak at prefill).
+            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -188,7 +191,9 @@ class GatedDeltaNet(nn.Module):
         )
 
         if cache is not None:
-            cache[1] = state
+            # contiguous() for the same reason as cache[0] above: the kernel
+            # output may share buffers with its inputs.
+            cache[1] = mx.contiguous(state)
             cache.advance(S)
 
         out = self.norm(out, z)
