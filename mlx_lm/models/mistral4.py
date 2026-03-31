@@ -196,31 +196,33 @@ class Mistral4Attention(nn.Module):
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        # --- RoPE position scores (additive mask for SDPA) ---
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
-        if mask is not None:
-            pe_scores = mx.where(
-                mask,
-                pe_scores,
-                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-            )
-
         # --- Absorbed attention ---
-        # For L==1 (generation): absorb W_UK into Q, keep K=V=c_kv
-        # For L>1  (prefill):    expand K and V from c_kv via MultiLinear
+        # Concatenate nope and rope components into unified Q/K so that
+        # mx.fast.scaled_dot_product_attention uses its tiled flash-attention
+        # kernel without materialising a (B, H, L, S) score tensor in RAM.
+        # Correctness: dot(q_nope, k_nope) + dot(q_pe, k_pe)
+        #            = dot(concat(q_nope, q_pe), concat(k_nope, k_pe))
         if L == 1:
-            q_nope = self.embed_q(q_nope)
-            k = v = kv_latent
+            # Generation: absorb W_UK into q_nope; K = concat(c_kv, k_pe)
+            q_nope = self.embed_q(q_nope)                        # (B, H, 1, kv_lora_rank)
+            k = mx.concatenate([kv_latent, k_pe], axis=-1)       # (B, 1, S, kv_lora_rank + qk_rope_head_dim)
+            q = mx.concatenate([q_nope, q_pe], axis=-1)          # (B, H, 1, kv_lora_rank + qk_rope_head_dim)
+            v = kv_latent                                         # (B, 1, S, kv_lora_rank)
+            output = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=mask
+            )
+            output = self.unembed_out(output)                     # (B, H, 1, v_head_dim)
         else:
-            k = self.embed_q(kv_latent, transpose=False)
-            v = self.unembed_out(kv_latent)
-
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
-
-        if L == 1:
-            output = self.unembed_out(output)
+            # Prefill: expand latent to per-head K/V; broadcast k_pe to match
+            k_nope = self.embed_q(kv_latent, transpose=False)     # (B, H, S, qk_nope_head_dim)
+            k = mx.concatenate(
+                [k_nope, mx.broadcast_to(k_pe, k_nope.shape)], axis=-1
+            )                                                      # (B, H, S, q_head_dim)
+            v = self.unembed_out(kv_latent)                       # (B, H, S, v_head_dim)
+            q = mx.concatenate([q_nope, q_pe], axis=-1)           # (B, H, L, q_head_dim)
+            output = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=mask
+            )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
