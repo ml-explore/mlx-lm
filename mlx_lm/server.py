@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import copy
 import json
 import logging
 import pickle
