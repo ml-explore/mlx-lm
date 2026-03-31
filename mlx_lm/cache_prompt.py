@@ -112,11 +112,11 @@ def main():
     y = mx.array(prompt)
 
     # Process the prompt
-    start = time.time()
+    start = time.perf_counter()
     max_msg_len = 0
 
     def callback(processed, total_tokens):
-        current = time.time()
+        current = time.perf_counter()
         speed = processed / (current - start)
         msg = f"\rProcessed {processed:6d} tokens ({speed:6.2f} tok/s)"
         nonlocal max_msg_len

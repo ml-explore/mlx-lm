@@ -166,11 +166,11 @@ def main():
 
     # Evaluate perplexity
     print(f"\nEvaluating perplexity with batch size {args.batch_size}...")
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     ppl, se = eval_ppl(model, data, batch_size=args.batch_size)
 
-    eval_time = time.time() - start_time
+    eval_time = time.perf_counter() - start_time
     tokens_evaluated = data.shape[0] * (data.shape[1] - 1)  # B * (L - 1)
     # Print results
     print("\n" + "=" * 60)
