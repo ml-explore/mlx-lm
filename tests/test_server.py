@@ -3,14 +3,23 @@
 import http
 import io
 import json
+import sys
 import threading
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    ResponseGenerator,
+    apply_prompt_token_limit,
+    is_metal_oom_error,
+    projected_kv_bytes,
+)
 from mlx_lm.utils import load
 
 
@@ -48,6 +57,12 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "max_prompt_tokens": None,
+                "prompt_overflow_policy": "error",
+                "prompt_keep_tokens": 512,
+                "max_active_kv_bytes": None,
+                "max_active_memory_bytes": None,
+                "max_kv_size": None,
             },
         )
 
@@ -69,6 +84,9 @@ class MockCache:
 
     @property
     def nbytes(self):
+        return len(self.value)
+
+    def size(self):
         return len(self.value)
 
     def __eq__(self, other):
@@ -559,6 +577,148 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class FailingResponseGenerator:
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self._cli_args = type(
+            "obj",
+            (),
+            {
+                "allowed_origins": ["*"],
+                "num_draft_tokens": 0,
+                "max_tokens": 100,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+            },
+        )()
+
+    def stop_and_join(self):
+        return None
+
+    def generate(self, request, args, progress_callback=None):
+        raise self.exc
+
+    @property
+    def cli_args(self):
+        return self._cli_args
+
+
+class TestErrorStatusCodes(unittest.TestCase):
+    def _run_request(self, exc):
+        response_generator = FailingResponseGenerator(exc)
+        httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(response_generator, *args, **kwargs),
+        )
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        try:
+            url = f"http://localhost:{httpd.server_port}/v1/completions"
+            return requests.post(
+                url,
+                json={
+                    "model": "default_model",
+                    "prompt": "test",
+                    "max_tokens": 2,
+                },
+            )
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server_thread.join()
+
+    def test_oom_maps_to_service_unavailable(self):
+        response = self._run_request(
+            RuntimeError(
+                "[METAL] Command buffer execution failed: Insufficient Memory "
+                "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+            )
+        )
+        self.assertEqual(response.status_code, 503)
+
+    def test_non_oom_maps_to_internal_server_error(self):
+        response = self._run_request(RuntimeError("arbitrary failure"))
+        self.assertEqual(response.status_code, 500)
+
+    def test_is_metal_oom_error(self):
+        self.assertTrue(is_metal_oom_error(RuntimeError("out of memory")))
+        self.assertTrue(
+            is_metal_oom_error(
+                RuntimeError("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+            )
+        )
+        self.assertFalse(is_metal_oom_error(RuntimeError("other runtime failure")))
+
+
+class TestKVBudgeting(unittest.TestCase):
+    def test_projected_kv_bytes_without_growth(self):
+        cache = [MockCache("abcd")]
+        self.assertEqual(projected_kv_bytes(cache, 10), 14)
+
+    def test_projected_kv_bytes_with_no_extra(self):
+        cache = [MockCache("abcdef")]
+        self.assertEqual(projected_kv_bytes(cache, 0), 6)
+
+
+class TestPromptTokenLimit(unittest.TestCase):
+    def test_no_limit(self):
+        tokens = list(range(10))
+        self.assertEqual(
+            apply_prompt_token_limit(
+                tokens,
+                max_prompt_tokens=None,
+                overflow_policy="error",
+                keep_tokens=0,
+            ),
+            tokens,
+        )
+
+    def test_error_policy(self):
+        with self.assertRaisesRegex(
+            ValueError, "Prompt exceeds max prompt token limit"
+        ):
+            apply_prompt_token_limit(
+                list(range(20)),
+                max_prompt_tokens=8,
+                overflow_policy="error",
+                keep_tokens=0,
+            )
+
+    def test_truncate_policy(self):
+        out = apply_prompt_token_limit(
+            list(range(20)),
+            max_prompt_tokens=8,
+            overflow_policy="truncate",
+            keep_tokens=3,
+        )
+        self.assertEqual(out, [0, 1, 2, 15, 16, 17, 18, 19])
+
+
+class TestCLIValidation(unittest.TestCase):
+    def test_server_parses_new_memory_flags(self):
+        from mlx_lm import server as server_module
+
+        argv = [
+            "mlx_lm.server",
+            "--max-prompt-tokens",
+            "4096",
+            "--prompt-overflow-policy",
+            "truncate",
+            "--prompt-keep-tokens",
+            "512",
+            "--max-active-kv-bytes",
+            "8G",
+            "--max-active-memory-bytes",
+            "30G",
+        ]
+        with patch.object(sys, "argv", argv):
+            with patch("mlx_lm.server.run"):
+                server_module.main()
 
 
 if __name__ == "__main__":
