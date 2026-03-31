@@ -537,6 +537,30 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(c, [MockCache("test4")])
         self.assertEqual(t, [])
 
+    def test_insert_trimmable_cache_removes_immediate_prefix(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("ab")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 2)
+
+        cache.insert_cache(model, [1, 2, 3], [MockCache("abc")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 3)
+
+    def test_insert_empty_tokens_does_not_self_destruct(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 4)
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNotNone(c)
+        self.assertEqual(t, [])
+
     def test_lru_bytes(self):
         cache = LRUPromptCache(max_size=100, max_bytes=10)
         model = ("test", None, None)
