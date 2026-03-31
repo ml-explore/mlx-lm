@@ -143,12 +143,16 @@ class Qwen3NextAttention(nn.Module):
         )
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            queries = self.rope(
+                queries.astype(mx.float32), offset=cache.offset
+            ).astype(queries.dtype)
+            keys = self.rope(
+                keys.astype(mx.float32), offset=cache.offset
+            ).astype(keys.dtype)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            queries = self.rope(queries.astype(mx.float32)).astype(queries.dtype)
+            keys = self.rope(keys.astype(mx.float32)).astype(keys.dtype)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
