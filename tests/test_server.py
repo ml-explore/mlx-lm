@@ -94,24 +94,6 @@ class MockCache:
         return n
 
 
-class MockPromptCacheManager:
-    def __init__(self, cache, rest):
-        self.cache = cache
-        self.rest = rest
-        self.fetch_calls = []
-        self.insert_calls = []
-
-    def log_cache_stats(self):
-        return None
-
-    def fetch_nearest_cache(self, model_key, tokens):
-        self.fetch_calls.append((model_key, tokens))
-        return self.cache, self.rest
-
-    def insert_cache(self, model_key, tokens, prompt_cache, checkpoint=False):
-        self.insert_calls.append((model_key, tokens, prompt_cache, checkpoint))
-
-
 class SequencedTokenizer:
     """Returns pre-canned token sequences from apply_chat_template."""
 
@@ -164,6 +146,11 @@ class TestPromptCacheWarmup(unittest.TestCase):
             None,
         )
 
+    def _seed_cache(self, prompt_cache, tokens, cache=None, *, cache_type="assistant"):
+        cache = cache or [MockCache(f"cache-{len(tokens)}")]
+        prompt_cache.insert_cache(self.MODEL_KEY, tokens, cache, cache_type=cache_type)
+        return cache
+
     def _queue_warmup(
         self,
         prompt_cache,
@@ -196,7 +183,8 @@ class TestPromptCacheWarmup(unittest.TestCase):
 
             return run_step
 
-        prompt_cache = MockPromptCacheManager(["base-cache"], list(range(4, 21)))
+        prompt_cache = LRUPromptCache()
+        self._seed_cache(prompt_cache, [1, 2, 3])
         gen = self._queue_warmup(
             prompt_cache,
             (list(range(1, 21)) + [99], list(range(1, 21)) + [88]),
@@ -208,16 +196,18 @@ class TestPromptCacheWarmup(unittest.TestCase):
         ) as gs, patch("mlx_lm.server.wired_limit", return_value=nullcontext()):
             self.assertTrue(gen._run_prompt_cache_warmup())
         gs.assert_called_once()
-        self.assertEqual(len(prompt_cache.insert_calls), 1)
-        _, tokens, _, checkpoint = prompt_cache.insert_calls[0]
-        self.assertEqual(tokens, [1, 2, 3, 4])
-        self.assertTrue(checkpoint)
+        cached, rest = prompt_cache.fetch_nearest_cache(self.MODEL_KEY, [1, 2, 3, 4])
+        self.assertEqual(cached, [MockCache("cache-3")])
+        self.assertEqual(rest, [])
+        cached, rest = prompt_cache.fetch_nearest_cache(self.MODEL_KEY, list(range(1, 21)))
+        self.assertEqual(cached, [MockCache("cache-3")])
+        self.assertEqual(rest, list(range(5, 21)))
 
     def test_run_warmup_prefills_uncached_tokens(self):
         tokens = list(range(1, 21))
-        prompt_cache = MockPromptCacheManager(None, tokens)
+        prompt_cache = LRUPromptCache()
         gen = self._queue_warmup(prompt_cache, (tokens + [99], tokens + [88]))
-        new_cache = object()
+        new_cache = [MockCache("warmup")]
         with (
             patch("mlx_lm.server.generate_step", return_value=iter(())) as gs,
             patch("mlx_lm.server.wired_limit", return_value=nullcontext()) as wl,
@@ -230,17 +220,13 @@ class TestPromptCacheWarmup(unittest.TestCase):
         gs.assert_called_once()
         wl.assert_called_once()
         make_cache.assert_called_once()
-        self.assertEqual(len(prompt_cache.fetch_calls), 1)
-        fetched_model, fetched_tokens = prompt_cache.fetch_calls[0]
-        self.assertEqual(fetched_model, self.MODEL_KEY)
-        self.assertEqual(fetched_tokens, tokens)
-        _, stored_tokens, stored_cache, checkpoint = prompt_cache.insert_calls[0]
-        self.assertEqual(stored_tokens, list(range(1, 21)))
-        self.assertIs(stored_cache, new_cache)
-        self.assertTrue(checkpoint)
+        cached, rest = prompt_cache.fetch_nearest_cache(self.MODEL_KEY, tokens)
+        self.assertEqual(cached, new_cache)
+        self.assertEqual(rest, [])
 
     def test_run_warmup_skips_short_uncached_suffix(self):
-        prompt_cache = MockPromptCacheManager(["base-cache"], [7, 10, 11])
+        prompt_cache = LRUPromptCache()
+        self._seed_cache(prompt_cache, [1, 2, 3])
         gen = self._queue_warmup(
             prompt_cache,
             ([1, 2, 3, 7, 10, 11, 99], [1, 2, 3, 7, 10, 11, 88]),
@@ -254,7 +240,11 @@ class TestPromptCacheWarmup(unittest.TestCase):
 
         gs.assert_not_called()
         make_cache.assert_not_called()
-        self.assertEqual(len(prompt_cache.insert_calls), 0)
+        cached, rest = prompt_cache.fetch_nearest_cache(
+            self.MODEL_KEY, [1, 2, 3, 7, 10, 11]
+        )
+        self.assertEqual(cached, [MockCache("cache-3")])
+        self.assertEqual(rest, [7, 10, 11])
 
     def test_build_prefill_request_extracts_shared_prefix(self):
         gen = self._make_generator(None)

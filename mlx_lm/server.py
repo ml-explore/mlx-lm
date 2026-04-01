@@ -653,61 +653,63 @@ class ResponseGenerator:
                 warmup.model.draft,
             )
             prompt = self._build_prefill_request(tokenizer, warmup)
-            if prompt is not None:
-                self.prompt_cache.log_cache_stats()
-                cache, uncached = self.prompt_cache.fetch_nearest_cache(
-                    self.model_provider.model_key, prompt
+            if prompt is None:
+                return True
+
+            self._log_cache_stats()
+            cache, uncached = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key, prompt
+            )
+            # Ignore tiny uncached lengths (close checkpoint already exists)
+            if len(uncached) < 10:
+                return True
+
+            def progress(tokens_processed, total_tokens):
+                logging.info(
+                    f"Prompt cache warmup progress: {tokens_processed}/{total_tokens}"
                 )
-                # Ignore tiny uncached lengths (close checkpoint already exists)
-                if len(uncached) < 10:
-                    return True
+                if tokens_processed > 0 and not self.requests.empty():
+                    raise _WarmupInterrupted(tokens_processed)
 
-                def progress(tokens_processed, total_tokens):
-                    logging.info(
-                        f"Prompt cache warmup progress: {tokens_processed}/{total_tokens}"
+            if cache is None:
+                cache = make_prompt_cache(model)
+
+            # Flush outstanding work on the shared generation stream before
+            # setting the wired limit for warm-up prefill.
+            mx.synchronize(generation_stream)
+            try:
+                with wired_limit(model, [generation_stream]):
+                    for _ in generate_step(
+                        mx.array(uncached),
+                        model,
+                        max_tokens=0,
+                        prompt_cache=cache,
+                        prefill_step_size=self.cli_args.prefill_step_size,
+                        prompt_progress_callback=progress,
+                    ):
+                        pass
+            except _WarmupInterrupted as e:
+                # Save whatever we prefilled so far. The offset
+                # accounts for tokens already in the cache.
+                prefix_len = len(prompt) - len(uncached) + e.tokens_processed
+                if prefix_len > 0:
+                    self.prompt_cache.insert_cache(
+                        self.model_provider.model_key,
+                        prompt[:prefix_len],
+                        cache,
+                        cache_type="user",
                     )
-                    if tokens_processed > 0 and not self.requests.empty():
-                        raise _WarmupInterrupted(tokens_processed)
-
-                if cache is None:
-                    cache = make_prompt_cache(model)
-                if len(uncached) > 0:
-                    # Flush outstanding work on the shared generation stream before
-                    # setting the wired limit for warm-up prefill.
-                    mx.synchronize(generation_stream)
-                    try:
-                        with wired_limit(model, [generation_stream]):
-                            for _ in generate_step(
-                                mx.array(uncached),
-                                model,
-                                max_tokens=0,
-                                prompt_cache=cache,
-                                prefill_step_size=self.cli_args.prefill_step_size,
-                                prompt_progress_callback=progress,
-                            ):
-                                pass
-                    except _WarmupInterrupted as e:
-                        # Save whatever we prefilled so far. The offset
-                        # accounts for tokens already in the cache.
-                        prefix_len = len(prompt) - len(uncached) + e.tokens_processed
-                        if prefix_len > 0:
-                            self.prompt_cache.insert_cache(
-                                self.model_provider.model_key,
-                                prompt[:prefix_len],
-                                cache,
-                                checkpoint=True,
-                            )
-                        logging.info(
-                            f"Prompt cache warmup interrupted at {e.tokens_processed}/{len(uncached)} tokens, "
-                            "partial cache checkpointed."
-                        )
-                    else:
-                        self.prompt_cache.insert_cache(
-                            self.model_provider.model_key,
-                            prompt,
-                            cache,
-                            checkpoint=True,
-                        )
+                logging.info(
+                    f"Prompt cache warmup interrupted at {e.tokens_processed}/{len(uncached)} tokens, "
+                    "partial cache checkpointed."
+                )
+            else:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key,
+                    prompt,
+                    cache,
+                    cache_type="user",
+                )
         except Exception:
             logging.exception("Prompt cache warmup failed.")
         return True
