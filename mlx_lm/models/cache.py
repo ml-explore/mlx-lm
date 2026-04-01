@@ -621,13 +621,23 @@ class ArraysCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
-        self.cache = [c[batch_indices] for c in self.cache]
+        self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
+        if self.lengths is not None:
+            self.lengths = self.lengths[batch_indices]
 
     def extend(self, other):
         """
         In-place extend this cache with the other cache.
         """
-        self.cache = [mx.concatenate([c, o]) for c, o in zip(self.cache, other.cache)]
+
+        def cat(a, b):
+            if a is None:
+                return b
+            if b is None:
+                return a
+            return mx.concatenate([a, b])
+
+        self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -662,6 +672,11 @@ class ArraysCache(_BaseCache):
         n_state = len(caches[0].cache)
         B = len(caches)
         cache = cls(n_state)
+
+        # All caches are empty so return early
+        if all(c.empty() for c in caches):
+            return cache
+
         for e in range(n_state):
             c_init = next(iter(c[e] for c in caches if c[e] is not None))
             shape = list(c_init.shape)
@@ -970,16 +985,18 @@ class BatchKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
-        self.keys = self.keys[batch_indices]
-        self.values = self.values[batch_indices]
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+            self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()
         if min_left_pad > 0:
-            self.keys = self.keys[..., min_left_pad:, :]
-            self.values = self.values[..., min_left_pad:, :]
+            if self.keys is not None:
+                self.keys = self.keys[..., min_left_pad:, :]
+                self.values = self.values[..., min_left_pad:, :]
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
 
@@ -987,15 +1004,30 @@ class BatchKVCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
         max_idx = max(self._idx, other._idx)
-        max_size = max(self.keys.shape[2], other.keys.shape[2])
+        L1 = L2 = 0
+        if self.keys is not None:
+            B, H, L1, D = self.keys.shape
+            M = self.values.shape[3]
+        if other.keys is not None:
+            B, H, L2, D = other.keys.shape
+            M = other.values.shape[3]
+        max_size = max(L1, L2)
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
         def pad(c):
-            left = max_idx - c._idx
-            right = max_size - c.keys.shape[2] - left
             k, v = c.keys, c.values
+            if k is None:
+                k = mx.array([]).reshape(B, H, 0, D)
+                v = mx.array([]).reshape(B, H, 0, M)
+            left = max_idx - c._idx
+            right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
                 v = v[..., :right, :]
@@ -1024,6 +1056,11 @@ class BatchKVCache(_BaseCache):
     def merge(cls, caches):
         lengths = [c.size() for c in caches]
         max_length = max(lengths)
+
+        # No cache has content so make an empty one
+        if max_length == 0:
+            return BatchKVCache([0] * len(caches))
+
         padding = [max_length - l for l in lengths]
         B = len(caches)
         H = max(c.keys.shape[1] for c in caches if c.keys is not None)
@@ -1046,6 +1083,9 @@ class BatchKVCache(_BaseCache):
         cache._idx = keys.shape[2]
 
         return cache
+
+    def size(self):
+        return self._idx
 
     def empty(self):
         return self.keys is None
@@ -1287,8 +1327,9 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
-        self.keys = self.keys[batch_indices]
-        self.values = self.values[batch_indices]
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+            self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
@@ -1296,17 +1337,32 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
         if (self.rotated != other.rotated) or self._idx != other._idx:
             self._temporal_order()
             other._temporal_order()
 
         max_idx = max(self._idx, other._idx)
-        max_size = max(self.keys.shape[2], other.keys.shape[2])
+        L1 = L2 = 0
+        if self.keys is not None:
+            B, H, L1, D = self.keys.shape
+            M = self.values.shape[3]
+        if other.keys is not None:
+            B, H, L2, D = other.keys.shape
+            M = other.values.shape[3]
+        max_size = max(L1, L2)
 
         def pad(c):
             left = max_idx - c._idx
-            right = max_size - c.keys.shape[2] - left
             k, v = c.keys, c.values
+            if k is None:
+                k = mx.array([]).reshape(B, H, 0, D)
+                v = mx.array([]).reshape(B, H, 0, M)
+            right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
                 v = v[..., :right, :]
@@ -1351,6 +1407,11 @@ class BatchRotatingKVCache(_BaseCache):
         offsets = [c.offset for c in caches]
         lengths = [c.size() for c in caches]
         max_length = max(lengths)
+
+        # No cache has content so make an empty one
+        if max_length == 0:
+            return cls(caches[0].max_size, [0] * len(caches))
+
         padding = [max_length - l for l in lengths]
         B = len(caches)
         H = max(c.keys.shape[1] for c in caches if c.keys is not None)
@@ -1360,11 +1421,11 @@ class BatchRotatingKVCache(_BaseCache):
 
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
-        for i, (p, c) in enumerate(zip(padding, caches)):
+        for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
             if c.keys is None:
                 continue
-            keys[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.keys)
-            values[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.values)
+            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)
+            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
@@ -1374,6 +1435,9 @@ class BatchRotatingKVCache(_BaseCache):
         cache._offset = keys.shape[2]
 
         return cache
+
+    def size(self):
+        return min(self._offset, self.max_size)
 
     def empty(self):
         return self.keys is None
@@ -1490,6 +1554,7 @@ class LRUPromptCache:
     class CacheEntry:
         prompt_cache: List[Any]
         nbytes: int
+        cache_type: str
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1515,7 +1580,7 @@ class LRUPromptCache:
             while i + 1 < len(self._ordering):
                 lru_a = self._lrus[self._ordering[i]]
                 lru_b = self._lrus[self._ordering[i + 1]]
-                if len(lru_a) >= len(lru_b):
+                if lru_a and len(lru_a) >= len(lru_b):
                     return lru_a.popleft()
                 i += 1
             return lru_b.popleft()
@@ -1526,6 +1591,7 @@ class LRUPromptCache:
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
+        self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
 
     def __len__(self):
         return len(self._lru)
@@ -1566,14 +1632,16 @@ class LRUPromptCache:
     ):
         # Make the cache entry
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache)
+            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
         )
 
         # Insert into the trie and update the byte counter and lru position
         self._n_bytes += entry.nbytes
+        self._n_bytes_by_type[cache_type] += entry.nbytes
         prev = self._trie.add(model, tokens, entry)
         if prev is not None:
             self._n_bytes -= prev.nbytes
+            self._n_bytes_by_type[prev.cache_type] -= prev.nbytes
             self._lru.remove(model, tokens)
         self._lru.push(model, tokens, cache_type)
 
@@ -1582,6 +1650,7 @@ class LRUPromptCache:
         if can_trim_prompt_cache(prompt_cache):
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
                 self._n_bytes -= entry.nbytes
+                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._lru.remove(model, tokens[:prefix_len])
 
         # Ensure we match the constraints
@@ -1589,10 +1658,12 @@ class LRUPromptCache:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
         while self._n_bytes > self.max_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -1604,7 +1675,18 @@ class LRUPromptCache:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
         while self._n_bytes > n_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+
+    def stats_by_type(self):
+        result = {}
+        for cache_type in self._lru._ordering:
+            result[cache_type] = {
+                "n_sequences": len(self._lru._lrus[cache_type]),
+                "n_bytes": self._n_bytes_by_type[cache_type],
+            }
+        return result

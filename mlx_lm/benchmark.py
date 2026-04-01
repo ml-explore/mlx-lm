@@ -148,10 +148,13 @@ def main():
     for i in range(args.num_trials):
         if args.delay > 0:
             time.sleep(args.delay)
+        tic = time.perf_counter()
         response = _bench()
+        toc = time.perf_counter()
         responses.append(response)
         results = [(k, getattr(response, k)) for k in report_keys]
         results = [f"{k}={v:.3f}" for k, v in results]
+        results.append(f"total_time={toc - tic:.3f}")
         rprint(f"Trial {i+1}:  " + ", ".join(results))
 
     def avg(k):
