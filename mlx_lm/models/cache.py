@@ -1459,7 +1459,7 @@ class PromptTrie:
             index += 1
 
         # Got an exact match
-        if last_index == len(tokens) - 1:
+        if last_index == len(tokens) - 1 >= 0:
             return PromptTrieResult(model, tokens, None, None, 0)
 
         # Check if we found a prefix at any point
