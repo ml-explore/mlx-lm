@@ -183,37 +183,24 @@ def apply_min_p(
         )
     # reference implementation: https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L531-L605
 
-    # Indices sorted in decreasing order
-    sorted_indices = mx.argsort(-logprobs, axis=-1)
-    sorted_logprobs = mx.take_along_axis(logprobs, sorted_indices, axis=-1)
-
-    # Top probability
-    top_logprobs = sorted_logprobs[:, 0:1]
-
-    # Calculate the min_p threshold
+    # Threshold in log space: keep tokens with logprob >= max_logprob + log(min_p)
+    top_logprobs = mx.max(logprobs, axis=-1, keepdims=True)
     scaled_min_p = top_logprobs + math.log(min_p)
+    tokens_to_remove = logprobs < scaled_min_p
 
-    # Mask tokens that have a probability less than the scaled min_p
-    tokens_to_remove = sorted_logprobs < scaled_min_p
-    tokens_to_remove[..., :min_tokens_to_keep] = False
+    # Ensure at least min_tokens_to_keep survive the filter
+    if min_tokens_to_keep > 1:
+        top_indices = mx.argpartition(-logprobs, kth=min_tokens_to_keep - 1, axis=-1)[
+            ..., :min_tokens_to_keep
+        ]
+        tokens_to_remove = mx.put_along_axis(
+            tokens_to_remove,
+            top_indices,
+            mx.array(False),
+            axis=-1,
+        )
 
-    # Create pool of tokens with probability less than scaled min_p
-    selected_logprobs = mx.where(tokens_to_remove, -float("inf"), sorted_logprobs)
-
-    # Create a mapping to rearrange back to original indices
-    inverse_indices = mx.put_along_axis(
-        mx.zeros_like(sorted_indices),
-        sorted_indices,
-        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
-        axis=-1,
-    )
-
-    # Rearrange selected_logprobs back to original order
-    original_order_logprobs = mx.take_along_axis(
-        selected_logprobs, inverse_indices, axis=-1
-    )
-
-    return original_order_logprobs
+    return mx.where(tokens_to_remove, -float("inf"), logprobs)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
