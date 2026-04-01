@@ -425,7 +425,20 @@ def generate_step(
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
+            # Adaptive prefill step: GPU watchdog kills command buffers that
+            # exceed ~5s. Each step runs the full model forward (all layers
+            # including chunked SDPA) in one command buffer. Cost per eval
+            # grows with cached tokens. Scale step inversely to keep each
+            # eval under the watchdog. Mid-primitive command buffer commits
+            # are NOT safe (triggers Metal driver AGXMetalG14X coalescing
+            # assertion — mlx#3216 class bug), so this is the only lever.
+            effective_step = prefill_step_size
+            if prompt_processed_tokens > 65536:
+                effective_step = max(
+                    128,
+                    int(prefill_step_size * 65536 / prompt_processed_tokens),
+                )
+            n_to_process = min(effective_step, remaining)
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
