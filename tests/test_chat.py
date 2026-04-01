@@ -75,7 +75,7 @@ class TestChat(unittest.TestCase):
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
         mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
-        mock_load.return_value = (mock_model, mock_tokenizer)
+        mock_load.return_value = (mock_model, mock_tokenizer, {})
 
         # Mock prompt cache
         mock_prompt_cache = MagicMock()
@@ -130,7 +130,7 @@ class TestChat(unittest.TestCase):
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
         mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
-        mock_load.return_value = (mock_model, mock_tokenizer)
+        mock_load.return_value = (mock_model, mock_tokenizer, {})
 
         # Mock prompt cache
         mock_prompt_cache = MagicMock()
