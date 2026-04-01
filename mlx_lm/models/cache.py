@@ -1434,18 +1434,22 @@ class PromptTrie:
     def pop_prefixes(self, model: Any, tokens: List[int]):
         values = []
         current = self._trie[model]
-        for i in range(len(tokens) - 1):
+        for i, tok in enumerate(tokens):
             if "__value__" in current:
                 values.append((i, current.pop("__value__")))
-            current = current[tokens[i]]
+            current = current[tok]
         return values
 
     def search(self, model: Any, tokens: List[int]) -> PromptTrieResult:
         if model not in self._trie:
             return PromptTrieResult(model, None, None, None, 0)
 
-        # Walk the tokens as far as we can
         current = self._trie[model]
+
+        if not tokens and "__value__" in current:
+            return PromptTrieResult(model, [], None, None, 0)
+
+        # Walk the tokens as far as we can
         last_index = -1
         index = 0
         while index < len(tokens) and tokens[index] in current:
@@ -1455,7 +1459,7 @@ class PromptTrie:
             index += 1
 
         # Got an exact match
-        if last_index == len(tokens) - 1:
+        if last_index == len(tokens) - 1 >= 0:
             return PromptTrieResult(model, tokens, None, None, 0)
 
         # Check if we found a prefix at any point
