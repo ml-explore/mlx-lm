@@ -259,10 +259,10 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.n_group = config.n_group
         self.topk_group = config.topk_group
-        self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
+        self.linear = nn.Linear(config.hidden_size, self.n_routed_experts, bias=False)
 
     def __call__(self, x):
-        gates = x @ self.weight.T
+        gates = self.linear(x)
         scores = mx.softmax(gates, axis=-1, precise=True)
 
         if self.n_group > 1:
@@ -488,6 +488,27 @@ class Model(nn.Module):
                             weights[
                                 f"{prefix}.mlp.switch_mlp.{m}.{k}"
                             ] = mx.stack(to_join)
+
+            # --- Remap gate.weight → gate.linear.weight ---
+            # If the gate was quantized, dequantize it back to full precision
+            # (~1 MB/layer, negligible) so nn.quantize skips it and routing
+            # stays accurate.
+            for suffix in ("weight", "scales", "biases"):
+                old = f"{prefix}.mlp.gate.{suffix}"
+                if old in weights:
+                    weights[f"{prefix}.mlp.gate.linear.{suffix}"] = weights.pop(old)
+
+            gate_s_key = f"{prefix}.mlp.gate.linear.scales"
+            if gate_s_key in weights:
+                gate_w_key = f"{prefix}.mlp.gate.linear.weight"
+                gate_s = weights.pop(gate_s_key)
+                gate_b = weights.pop(f"{prefix}.mlp.gate.linear.biases")
+                gate_w = weights.pop(gate_w_key)
+                bits = (gate_w.shape[-1] * 32) // self.args.hidden_size
+                group_size = self.args.hidden_size // gate_s.shape[-1]
+                weights[gate_w_key] = mx.dequantize(
+                    gate_w, gate_s, gate_b, bits=bits, group_size=group_size
+                )
 
             # --- Decompose kv_b_proj → embed_q + unembed_out ---
             attn_prefix = f"{prefix}.self_attn"
