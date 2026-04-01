@@ -157,7 +157,8 @@ class GatedDeltaNet(nn.Module):
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+            n_keep = self.conv_kernel_size - 1
+            cache[0] = mx.contiguous(conv_input[:, -n_keep:])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
