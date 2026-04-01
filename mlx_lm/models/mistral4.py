@@ -15,7 +15,7 @@ decompressed keys and values.
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -88,9 +88,10 @@ class Mistral4Attention(nn.Module):
     * ``embed_q``   — absorbs W_UK into the query path
     * ``unembed_out`` — absorbs W_UV into the output path
 
-    The attention computation follows the same pattern as ``deepseek_v3.py``:
-    RoPE scores are pre-computed and passed as an additive mask to the nope
-    SDPA so that we never need to materialise full-rank keys.
+    The nope and rope query/key components are concatenated into a single Q/K
+    so that ``mx.fast.scaled_dot_product_attention`` can use its tiled
+    flash-attention kernel without materialising a full (B, H, L, S) score
+    tensor in RAM.
     """
 
     def __init__(self, config: ModelArgs):
@@ -417,140 +418,14 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        # --- FP8 dequantization (Mistral ships FP8 weights) ---
-        new_weights = {}
-        for k, v in weights.items():
-            if "weight_scale_inv" in k:
-                scale_inv = v
-                wk = k.replace("_scale_inv", "")
-                weight = weights[wk]
-                weight = _dequant_fp8(weight, scale_inv)
-                new_weights[wk] = weight
-            elif "activation_scale" in k:
-                # Skip activation scales (not used in MLX)
-                continue
-            elif k not in new_weights:
-                new_weights[k] = v
-        weights = new_weights
+        weights = _dequant_fp8_weights(weights)
 
-        # --- Stack/split MoE expert weights ---
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
+            _sanitize_experts(weights, prefix, self.args.n_routed_experts)
+            _sanitize_gate(weights, prefix, self.args.hidden_size)
+            _sanitize_kv_b_proj(weights, f"{prefix}.self_attn", self.args)
 
-            # Pre-stacked fused format (original Mistral FP8 checkpoint):
-            # experts.gate_up_proj  (n_experts, 2*moe_intermediate, hidden)
-            # experts.down_proj     (n_experts, hidden, moe_intermediate)
-            gate_up_key = f"{prefix}.mlp.experts.gate_up_proj"
-            if gate_up_key in weights:
-                gate_up = weights.pop(gate_up_key)
-                down = weights.pop(f"{prefix}.mlp.experts.down_proj")
-
-                # FP8 dequant per expert (these keys lack "weight_" so the
-                # first FP8 loop above does not catch them)
-                gate_up_scale_key = f"{gate_up_key}_scale_inv"
-                if gate_up_scale_key in weights:
-                    gu_s = weights.pop(gate_up_scale_key)
-                    d_s = weights.pop(
-                        f"{prefix}.mlp.experts.down_proj_scale_inv"
-                    )
-                    n = self.args.n_routed_experts
-                    gate_up = mx.stack([
-                        _dequant_fp8(
-                            gate_up[e], gu_s[e] if gu_s.ndim > 0 else gu_s
-                        )
-                        for e in range(n)
-                    ])
-                    down = mx.stack([
-                        _dequant_fp8(
-                            down[e], d_s[e] if d_s.ndim > 0 else d_s
-                        )
-                        for e in range(n)
-                    ])
-
-                # Split fused gate_up → gate, up
-                gate, up = mx.split(gate_up, 2, axis=1)
-                weights[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
-                weights[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
-                weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = down
-
-            else:
-                # Per-expert format (pre-quantized MLX checkpoints)
-                for m in ("gate_proj", "down_proj", "up_proj"):
-                    for k in ("weight", "scales", "biases"):
-                        expert_key = f"{prefix}.mlp.experts.0.{m}.{k}"
-                        if expert_key in weights:
-                            to_join = [
-                                weights.pop(
-                                    f"{prefix}.mlp.experts.{e}.{m}.{k}"
-                                )
-                                for e in range(self.args.n_routed_experts)
-                            ]
-                            weights[
-                                f"{prefix}.mlp.switch_mlp.{m}.{k}"
-                            ] = mx.stack(to_join)
-
-            # --- Remap gate.weight → gate.linear.weight ---
-            # If the gate was quantized, dequantize it back to full precision
-            # (~1 MB/layer, negligible) so nn.quantize skips it and routing
-            # stays accurate.
-            for suffix in ("weight", "scales", "biases"):
-                old = f"{prefix}.mlp.gate.{suffix}"
-                if old in weights:
-                    weights[f"{prefix}.mlp.gate.linear.{suffix}"] = weights.pop(old)
-
-            gate_s_key = f"{prefix}.mlp.gate.linear.scales"
-            if gate_s_key in weights:
-                gate_w_key = f"{prefix}.mlp.gate.linear.weight"
-                gate_s = weights.pop(gate_s_key)
-                gate_b = weights.pop(f"{prefix}.mlp.gate.linear.biases")
-                gate_w = weights.pop(gate_w_key)
-                bits = (gate_w.shape[-1] * 32) // self.args.hidden_size
-                group_size = self.args.hidden_size // gate_s.shape[-1]
-                weights[gate_w_key] = mx.dequantize(
-                    gate_w, gate_s, gate_b, bits=bits, group_size=group_size
-                )
-
-            # --- Decompose kv_b_proj → embed_q + unembed_out ---
-            attn_prefix = f"{prefix}.self_attn"
-            bproj_key = f"{attn_prefix}.kv_b_proj.weight"
-            if bproj_key in weights:
-                num_heads = self.args.num_attention_heads
-                d_nope = self.args.qk_nope_head_dim
-                d_v = self.args.v_head_dim
-                kv_lora_rank = self.args.kv_lora_rank
-
-                quantized = f"{attn_prefix}.kv_b_proj.scales" in weights
-                v = weights.pop(bproj_key)
-
-                if quantized:
-                    scales = weights.pop(f"{attn_prefix}.kv_b_proj.scales")
-                    biases = weights.pop(f"{attn_prefix}.kv_b_proj.biases")
-                    bits = (v.shape[-1] * 32) // kv_lora_rank
-                    group_size = kv_lora_rank // scales.shape[-1]
-                    v = mx.dequantize(
-                        v, scales, biases, bits=bits, group_size=group_size
-                    )
-
-                # v shape: (num_heads * (d_nope + d_v), kv_lora_rank)
-                v = v.reshape(num_heads, d_nope + d_v, kv_lora_rank)
-
-                # embed_q weight: (H, kv_lora_rank, d_nope) — W_UK transposed
-                wk = mx.contiguous(v[:, :d_nope, :].swapaxes(-1, -2))
-                # unembed_out weight: (H, d_v, kv_lora_rank) — W_UV
-                wv = mx.contiguous(v[:, d_nope:, :])
-
-                if quantized:
-                    wk, wk_s, wk_b = mx.quantize(wk, bits=bits, group_size=group_size)
-                    wv, wv_s, wv_b = mx.quantize(wv, bits=bits, group_size=group_size)
-                    weights[f"{attn_prefix}.embed_q.scales"] = wk_s
-                    weights[f"{attn_prefix}.embed_q.biases"] = wk_b
-                    weights[f"{attn_prefix}.unembed_out.scales"] = wv_s
-                    weights[f"{attn_prefix}.unembed_out.biases"] = wv_b
-
-                weights[f"{attn_prefix}.embed_q.weight"] = wk
-                weights[f"{attn_prefix}.unembed_out.weight"] = wv
-
-        # Remove any unused keys
         return {
             k: v
             for k, v in weights.items()
@@ -621,6 +496,130 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.pipeline_layers
+
+
+def _dequant_fp8_weights(weights):
+    """Dequantize all FP8 weights in one pass.
+
+    Matches any key ending with ``_scale_inv`` (both ``weight_scale_inv``
+    for regular layers and bare ``_scale_inv`` for expert tensors).
+    Activation scales are dropped.
+    """
+    new = {}
+    scale_inv_keys = {k for k in weights if k.endswith("_scale_inv")}
+    for k, v in weights.items():
+        if k in scale_inv_keys:
+            w_key = k.removesuffix("_scale_inv")
+            if w_key not in new:
+                new[w_key] = _dequant_fp8(weights[w_key], v)
+        elif "activation_scale" in k:
+            continue
+        elif k not in new:
+            new[k] = v
+    return new
+
+
+def _sanitize_experts(weights, prefix, n_experts):
+    """Stack/split MoE expert weights into SwitchGLU format.
+
+    Handles two checkpoint layouts:
+    - Fused pre-stacked (original Mistral): ``experts.gate_up_proj`` split
+      into ``gate_proj`` + ``up_proj``.
+    - Per-expert (pre-quantized MLX): individual ``experts.{i}.{proj}``
+      stacked into ``switch_mlp.{proj}``.
+
+    No-op when experts are already in ``switch_mlp`` format.
+    """
+    gate_up_key = f"{prefix}.mlp.experts.gate_up_proj"
+    if gate_up_key in weights:
+        # Fused pre-stacked format
+        gate_up = weights.pop(gate_up_key)
+        down = weights.pop(f"{prefix}.mlp.experts.down_proj")
+        gate, up = mx.split(gate_up, 2, axis=1)
+        weights[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
+        weights[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
+        weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = down
+        return
+
+    # Per-expert format
+    for proj in ("gate_proj", "down_proj", "up_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            if f"{prefix}.mlp.experts.0.{proj}.{suffix}" in weights:
+                stacked = mx.stack([
+                    weights.pop(f"{prefix}.mlp.experts.{e}.{proj}.{suffix}")
+                    for e in range(n_experts)
+                ])
+                weights[f"{prefix}.mlp.switch_mlp.{proj}.{suffix}"] = stacked
+
+
+def _sanitize_gate(weights, prefix, hidden_size):
+    """Remap ``gate.weight`` → ``gate.linear.weight`` for nn.Linear.
+
+    If the gate was quantized, dequantize it back to full precision
+    (~1 MB/layer) so ``nn.quantize`` skips it and routing stays accurate.
+    """
+    for suffix in ("weight", "scales", "biases"):
+        old = f"{prefix}.mlp.gate.{suffix}"
+        if old in weights:
+            weights[f"{prefix}.mlp.gate.linear.{suffix}"] = weights.pop(old)
+
+    gate_s_key = f"{prefix}.mlp.gate.linear.scales"
+    if gate_s_key in weights:
+        gate_w_key = f"{prefix}.mlp.gate.linear.weight"
+        gate_s = weights.pop(gate_s_key)
+        gate_b = weights.pop(f"{prefix}.mlp.gate.linear.biases")
+        gate_w = weights.pop(gate_w_key)
+        bits = (gate_w.shape[-1] * 32) // hidden_size
+        group_size = hidden_size // gate_s.shape[-1]
+        weights[gate_w_key] = mx.dequantize(
+            gate_w, gate_s, gate_b, bits=bits, group_size=group_size
+        )
+
+
+def _sanitize_kv_b_proj(weights, attn_prefix, args):
+    """Decompose ``kv_b_proj`` into absorbed ``embed_q`` and ``unembed_out``.
+
+    If ``kv_b_proj`` is not present (already decomposed), this is a no-op.
+    Preserves quantization: dequantizes for the reshape, then re-quantizes
+    with the same bit width and group size.
+    """
+    bproj_key = f"{attn_prefix}.kv_b_proj.weight"
+    if bproj_key not in weights:
+        return
+
+    num_heads = args.num_attention_heads
+    d_nope = args.qk_nope_head_dim
+    d_v = args.v_head_dim
+    kv_lora_rank = args.kv_lora_rank
+
+    quantized = f"{attn_prefix}.kv_b_proj.scales" in weights
+    v = weights.pop(bproj_key)
+
+    if quantized:
+        scales = weights.pop(f"{attn_prefix}.kv_b_proj.scales")
+        biases = weights.pop(f"{attn_prefix}.kv_b_proj.biases")
+        bits = (v.shape[-1] * 32) // kv_lora_rank
+        group_size = kv_lora_rank // scales.shape[-1]
+        v = mx.dequantize(v, scales, biases, bits=bits, group_size=group_size)
+
+    # v shape: (num_heads * (d_nope + d_v), kv_lora_rank)
+    v = v.reshape(num_heads, d_nope + d_v, kv_lora_rank)
+
+    # embed_q weight: (H, kv_lora_rank, d_nope) — W_UK transposed
+    wk = mx.contiguous(v[:, :d_nope, :].swapaxes(-1, -2))
+    # unembed_out weight: (H, d_v, kv_lora_rank) — W_UV
+    wv = mx.contiguous(v[:, d_nope:, :])
+
+    if quantized:
+        wk, wk_s, wk_b = mx.quantize(wk, bits=bits, group_size=group_size)
+        wv, wv_s, wv_b = mx.quantize(wv, bits=bits, group_size=group_size)
+        weights[f"{attn_prefix}.embed_q.scales"] = wk_s
+        weights[f"{attn_prefix}.embed_q.biases"] = wk_b
+        weights[f"{attn_prefix}.unembed_out.scales"] = wv_s
+        weights[f"{attn_prefix}.unembed_out.biases"] = wv_b
+
+    weights[f"{attn_prefix}.embed_q.weight"] = wk
+    weights[f"{attn_prefix}.unembed_out.weight"] = wv
 
 
 def _dequant_fp8(weight, scale_inv):
