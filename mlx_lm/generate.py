@@ -361,7 +361,7 @@ def generate_step(
             "Either input_embeddings or prompt (or both) must be provided."
         )
 
-    tokens = None
+    token_list = []
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -390,8 +390,6 @@ def generate_step(
             return model(input_tokens, cache=prompt_cache)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
-        nonlocal tokens
-
         with mx.stream(generation_stream):
             logits = _model_call(
                 input_tokens=input_tokens[None],
@@ -403,11 +401,8 @@ def generate_step(
             logits = logits[:, -1, :]
 
             if logits_processors and len(input_tokens) > 0:
-                tokens = (
-                    mx.concat([tokens, input_tokens])
-                    if tokens is not None
-                    else input_tokens
-                )
+                token_list.append(input_tokens)
+                tokens = mx.concat(token_list)
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
