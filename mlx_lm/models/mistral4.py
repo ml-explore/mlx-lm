@@ -433,18 +433,61 @@ class Model(nn.Module):
                 new_weights[k] = v
         weights = new_weights
 
-        # --- Stack MoE expert weights ---
+        # --- Stack/split MoE expert weights ---
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for m in ("gate_proj", "down_proj", "up_proj"):
-                for k in ("weight", "scales", "biases"):
-                    expert_key = f"{prefix}.mlp.experts.0.{m}.{k}"
-                    if expert_key in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+
+            # Pre-stacked fused format (original Mistral FP8 checkpoint):
+            # experts.gate_up_proj  (n_experts, 2*moe_intermediate, hidden)
+            # experts.down_proj     (n_experts, hidden, moe_intermediate)
+            gate_up_key = f"{prefix}.mlp.experts.gate_up_proj"
+            if gate_up_key in weights:
+                gate_up = weights.pop(gate_up_key)
+                down = weights.pop(f"{prefix}.mlp.experts.down_proj")
+
+                # FP8 dequant per expert (these keys lack "weight_" so the
+                # first FP8 loop above does not catch them)
+                gate_up_scale_key = f"{gate_up_key}_scale_inv"
+                if gate_up_scale_key in weights:
+                    gu_s = weights.pop(gate_up_scale_key)
+                    d_s = weights.pop(
+                        f"{prefix}.mlp.experts.down_proj_scale_inv"
+                    )
+                    n = self.args.n_routed_experts
+                    gate_up = mx.stack([
+                        _dequant_fp8(
+                            gate_up[e], gu_s[e] if gu_s.ndim > 0 else gu_s
+                        )
+                        for e in range(n)
+                    ])
+                    down = mx.stack([
+                        _dequant_fp8(
+                            down[e], d_s[e] if d_s.ndim > 0 else d_s
+                        )
+                        for e in range(n)
+                    ])
+
+                # Split fused gate_up → gate, up
+                gate, up = mx.split(gate_up, 2, axis=1)
+                weights[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
+                weights[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
+                weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = down
+
+            else:
+                # Per-expert format (pre-quantized MLX checkpoints)
+                for m in ("gate_proj", "down_proj", "up_proj"):
+                    for k in ("weight", "scales", "biases"):
+                        expert_key = f"{prefix}.mlp.experts.0.{m}.{k}"
+                        if expert_key in weights:
+                            to_join = [
+                                weights.pop(
+                                    f"{prefix}.mlp.experts.{e}.{m}.{k}"
+                                )
+                                for e in range(self.args.n_routed_experts)
+                            ]
+                            weights[
+                                f"{prefix}.mlp.switch_mlp.{m}.{k}"
+                            ] = mx.stack(to_join)
 
             # --- Decompose kv_b_proj → embed_q + unembed_out ---
             attn_prefix = f"{prefix}.self_attn"
@@ -563,6 +606,8 @@ def _dequant_fp8(weight, scale_inv):
     """Dequantize FP8 block-scaled weights to bfloat16."""
     dtype = mx.bfloat16
     weight = mx.from_fp8(weight, dtype=dtype)
+    if scale_inv.ndim == 0:
+        return (weight * scale_inv).astype(dtype)
     bs = 128  # block size
     m, n = weight.shape
     pad_bottom = (-m) % bs
