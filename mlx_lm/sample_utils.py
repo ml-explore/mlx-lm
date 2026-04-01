@@ -181,22 +181,20 @@ def apply_min_p(
         raise ValueError(
             f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
         )
-    # reference implementation: https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L531-L605
 
-    # Threshold in log space: keep tokens with logprob >= max_logprob + log(min_p)
+    # Mask tokens that have a probability less than the max(p) * min_p
     top_logprobs = mx.max(logprobs, axis=-1, keepdims=True)
     scaled_min_p = top_logprobs + math.log(min_p)
     tokens_to_remove = logprobs < scaled_min_p
 
     # Ensure at least min_tokens_to_keep survive the filter
     if min_tokens_to_keep > 1:
-        top_indices = mx.argpartition(-logprobs, kth=min_tokens_to_keep - 1, axis=-1)[
-            ..., :min_tokens_to_keep
-        ]
+        top_indices = mx.argpartition(logprobs, kth=-min_tokens_to_keep, axis=-1)
+        top_indices = top_indices[..., -min_tokens_to_keep:]
         tokens_to_remove = mx.put_along_axis(
             tokens_to_remove,
             top_indices,
-            mx.array(False),
+            False,
             axis=-1,
         )
 
