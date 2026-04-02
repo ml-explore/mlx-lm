@@ -43,9 +43,13 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        per_layer_inputs: Optional[mx.array] = None,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            per_layer_inputs=per_layer_inputs,
         )
 
     def sanitize(self, weights):
@@ -66,10 +70,14 @@ class Model(nn.Module):
         new_weights.pop("embed_vision", None)
 
         if "language_model" in new_weights:
-            # HF language_model maps to Gemma4TextModel directly (no lm_head wrapper),
-            # but our Model wraps it in self.model, so prepend "model." to each key
+            # Converted MLX weights already use "model.layers.*" while raw HF
+            # checkpoints use "layers.*" under language_model.
             lm_weights = dict(tree_flatten(new_weights["language_model"]))
-            lm_weights = {"model." + k: v for k, v in lm_weights.items()}
+            if not any(
+                k.startswith("model.") or k.startswith("lm_head.")
+                for k in lm_weights
+            ):
+                lm_weights = {"model." + k: v for k, v in lm_weights.items()}
             lm_weights = self.language_model.sanitize(lm_weights)
             new_weights["language_model"] = tree_unflatten(list(lm_weights.items()))
             return dict(tree_flatten(new_weights))
