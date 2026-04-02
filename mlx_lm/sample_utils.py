@@ -73,15 +73,28 @@ def make_logits_processors(
     logit_bias: Optional[Dict[int, float]] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
+    presence_penalty: Optional[float] = None,
+    presence_context_size: Optional[int] = 20,
+    frequency_penalty: Optional[float] = None,
+    frequency_context_size: Optional[int] = 20,
 ):
     """
     Make logits processors for use with ``generate_step``.
 
     Args:
-        repetition_penalty (float, optional): The penalty factor for repeating
-          tokens.
+        repetition_penalty (float, optional): A (sign-aware) multiplicative
+          penalty for repeating tokens.
         repetition_context_size (int, optional): The number of tokens to
           consider for repetition penalty. Default: ``20``.
+        presence_penalty (float, optional): An additive penalty to reduce
+          repeating tokens.
+        presence_context_size (int, optional): The number of tokens to consider
+          for the presence penalty. Default: ``20``.
+        frequency_penalty (float, optional): An additive penalty to reduce
+          repeating tokens. The tokens are penalized proportionally to their
+          frequency.
+        frequency_context_size (int, optional): The number of tokens to consider
+          for the frequency penalty. Default: ``20``.
         logit_bias (dictionary, optional): Additive logit bias.
 
     Returns:
@@ -96,15 +109,20 @@ def make_logits_processors(
         values = mx.array(list(logit_bias.values()))
 
         def logit_bias_processor(_, logits):
-            logits[:, indices] += values
-            return logits
+            return logits.at[:, indices].add(values)
 
         logits_processors.append(logit_bias_processor)
 
-    if repetition_penalty and repetition_penalty != 0.0:
-        logits_processors.append(
-            make_repetition_penalty(repetition_penalty, repetition_context_size)
-        )
+    repetition_penalties = [
+        (make_repetition_penalty, repetition_penalty, repetition_context_size),
+        (make_presence_penalty, presence_penalty, presence_context_size),
+        (make_frequency_penalty, frequency_penalty, frequency_context_size),
+    ]
+
+    for make_penalty, penalty, context_size in repetition_penalties:
+        if penalty is not None and penalty != 0:
+            logits_processors.append(make_penalty(penalty, context_size))
+
     return logits_processors
 
 
@@ -163,39 +181,24 @@ def apply_min_p(
         raise ValueError(
             f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
         )
-    # reference implementation: https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L531-L605
 
-    # Indices sorted in decreasing order
-    sorted_indices = mx.argsort(-logprobs, axis=-1)
-    sorted_logprobs = mx.take_along_axis(logprobs, sorted_indices, axis=-1)
-
-    # Top probability
-    top_logprobs = sorted_logprobs[:, 0:1]
-
-    # Calculate the min_p threshold
+    # Mask tokens that have a probability less than the max(p) * min_p
+    top_logprobs = mx.max(logprobs, axis=-1, keepdims=True)
     scaled_min_p = top_logprobs + math.log(min_p)
+    tokens_to_remove = logprobs < scaled_min_p
 
-    # Mask tokens that have a probability less than the scaled min_p
-    tokens_to_remove = sorted_logprobs < scaled_min_p
-    tokens_to_remove[..., :min_tokens_to_keep] = False
+    # Ensure at least min_tokens_to_keep survive the filter
+    if min_tokens_to_keep > 1:
+        top_indices = mx.argpartition(logprobs, kth=-min_tokens_to_keep, axis=-1)
+        top_indices = top_indices[..., -min_tokens_to_keep:]
+        tokens_to_remove = mx.put_along_axis(
+            tokens_to_remove,
+            top_indices,
+            False,
+            axis=-1,
+        )
 
-    # Create pool of tokens with probability less than scaled min_p
-    selected_logprobs = mx.where(tokens_to_remove, -float("inf"), sorted_logprobs)
-
-    # Create a mapping to rearrange back to original indices
-    inverse_indices = mx.put_along_axis(
-        mx.zeros_like(sorted_indices),
-        sorted_indices,
-        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
-        axis=-1,
-    )
-
-    # Rearrange selected_logprobs back to original order
-    original_order_logprobs = mx.take_along_axis(
-        selected_logprobs, inverse_indices, axis=-1
-    )
-
-    return original_order_logprobs
+    return mx.where(tokens_to_remove, -float("inf"), logprobs)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
@@ -307,3 +310,58 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return repetition_penalty_processor
+
+
+def make_presence_penalty(penalty: float, context_size: int = 20):
+    """
+    Make a presence penalty processor.
+
+    Corresponds to the OpenAI option with the same name. Namely, subtracts
+    ``penalty`` from a logit if the token has occured at least once in the
+    ``context_size`` previous tokens.
+
+    Args:
+        penalty (float): The presence penalty to be applied.
+        context_size (int): The number of previous tokens to use.
+            Default: ``20``.
+
+    Returns:
+        Callable[[mx.array, List[int]], mx.array]
+    """
+
+    def presence_penalty_processor(tokens, logits):
+        if len(tokens) > 0:
+            tokens = tokens[-context_size:]
+            logits[:, tokens] -= penalty
+        return logits
+
+    return presence_penalty_processor
+
+
+def make_frequency_penalty(penalty: float, context_size: int = 20):
+    """
+    Make a frequency penalty processor.
+
+    Corresponds to the OpenAI option with the same name. Namely, subtracts
+    ``penalty`` from a logit for every time that the token has occured in the
+    ``context_size`` previous tokens.
+
+    The difference with the presence penalty is that the more often a token
+    occurs the more it will be penalized.
+
+    Args:
+        penalty (float): The frequency penalty to be applied.
+        context_size (int): The number of previous tokens to use.
+            Default: ``20``.
+
+    Returns:
+        Callable[[mx.array, List[int]], mx.array]
+    """
+
+    def frequency_penalty_processor(tokens, logits):
+        if len(tokens) > 0:
+            tokens = tokens[-context_size:]
+            logits = logits.at[:, tokens].subtract(penalty)
+        return logits
+
+    return frequency_penalty_processor

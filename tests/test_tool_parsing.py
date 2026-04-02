@@ -15,7 +15,6 @@ from mlx_lm.tool_parsers import (
 
 
 class TestToolParsing(unittest.TestCase):
-
     def test_parsers(self):
         test_cases = [
             ("call:multiply{a:12234585,b:48838483920}", function_gemma),
@@ -148,6 +147,49 @@ class TestToolParsing(unittest.TestCase):
                     "arguments": {"location": "London"},
                 }
                 self.assertEqual(tool_call, expected)
+
+    def test_qwen3_coder_single_quoted_params(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filters": {"type": "object"},
+                            "tags": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        # single-quoted dict (python-style, not valid JSON)
+        test_case = (
+            "<function=search>"
+            "<parameter=filters>{'category': 'books', 'in_stock': True}</parameter>"
+            "<parameter=tags>['fiction', 'new']</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "search")
+        self.assertEqual(
+            tool_call["arguments"]["filters"],
+            {"category": "books", "in_stock": True},
+        )
+        self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+        # valid JSON (double-quoted) should still work
+        test_case = (
+            "<function=search>"
+            '<parameter=filters>{"category": "books"}</parameter>'
+            '<parameter=tags>["fiction", "new"]</parameter>'
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
+        self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
     def test_kimi_k2(self):
         # Single tool call
