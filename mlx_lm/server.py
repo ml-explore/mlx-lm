@@ -523,7 +523,9 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
-    def _tokenize_chat(self, tokenizer, messages, tools, role_mapping, extra_args):
+    def _prepare_chat_prompt(
+        self, tokenizer, messages, tools, role_mapping, extra_args
+    ):
         if tokenizer.has_chat_template:
             process_message_content(messages)
             if tools and not tokenizer.has_tool_calling:
