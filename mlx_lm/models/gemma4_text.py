@@ -483,9 +483,7 @@ class Gemma4TextModel(nn.Module):
                 config.vocab_size_per_layer_input,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
             )
-            self.embed_tokens_per_layer_scale = (
-                config.hidden_size_per_layer_input**0.5
-            )
+            self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
             self.per_layer_input_scale = 2.0**-0.5
             self.per_layer_model_projection = ScaledLinear(
                 config.hidden_size,
