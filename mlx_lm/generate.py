@@ -23,7 +23,7 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import ThreadLocalStream, tree_reduce
+from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .models import cache
