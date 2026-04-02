@@ -36,7 +36,6 @@ from ._version import __version__
 from .generate import (
     BatchGenerator,
     SequenceStateMachine,
-    generation_stream,
     stream_generate,
 )
 from .models.cache import (
@@ -251,7 +250,7 @@ def _process_control_tokens(ctx, token_stream):
 
 
 class TimeBudget:
-    def __init__(self, budget=0.5, iterations=25, sync_frequency=10):
+    def __init__(self, budget=0.5, iterations=25, sync_frequency=10, stream=None):
         self._is_distributed = mx.distributed.init().size() > 1
         self._budget = budget
         self._iterations = iterations
@@ -260,6 +259,7 @@ class TimeBudget:
         self._current_iterations = None
         self._loops = 0
         self._time_spent = 0
+        self._stream = stream or mx.default_stream(mx.default_device())
 
     def __iter__(self):
         self._start = time.time()
@@ -279,7 +279,7 @@ class TimeBudget:
         self._loops += 1
         self._time_spent += time.time() - self._start
         if self._loops % self._sync_frequency == 0:
-            with mx.stream(generation_stream):
+            with mx.stream(self._stream):
                 loop_time = mx.distributed.all_sum(self._time_spent).item()
             avg_loop_time = loop_time / (
                 mx.distributed.init().size() * self._sync_frequency
@@ -448,7 +448,8 @@ class ResponseGenerator:
         self.requests = Queue()
         self._state_machine_cache = {}
 
-        self._time_budget = TimeBudget()
+        self._generation_stream = mx.new_stream(mx.default_device())
+        self._time_budget = TimeBudget(stream=self._generation_stream)
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
@@ -489,7 +490,7 @@ class ResponseGenerator:
         if not self._is_distributed:
             return obj
 
-        with mx.stream(generation_stream):
+        with mx.stream(self._generation_stream):
             if self._rank == 0:
                 if obj is None:
                     mx.eval(mx.distributed.all_sum(0))
@@ -820,6 +821,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        stream=self._generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -909,7 +911,7 @@ class ResponseGenerator:
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
-                    with mx.stream(generation_stream):
+                    with mx.stream(self._generation_stream):
                         batch_generator.remove(uids_to_remove)
                         for uid in uids_to_remove:
                             # It may have already been removed during
