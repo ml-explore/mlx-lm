@@ -6,7 +6,6 @@ import copy
 import functools
 import json
 import sys
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass
