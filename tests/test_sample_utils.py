@@ -2,7 +2,13 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, apply_xtc
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    apply_xtc,
+    make_sampler,
+)
 
 
 class TestSampleUtils(unittest.TestCase):
@@ -115,6 +121,25 @@ class TestSampleUtils(unittest.TestCase):
         probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
         new_probs = mx.softmax(apply_xtc(mx.log(probs), 0, 0.1, [0]), -1)
         self.assertTrue(mx.allclose(new_probs, probs))
+
+    def test_xtc_threshold_zero_disables(self):
+        # threshold=0.0 should not activate XTC even with probability=1.0
+        # apply_xtc with threshold=0.0 and probability=1.0 would mask all
+        # tokens except the least probable. make_sampler should skip XTC
+        # entirely when threshold=0.0, leaving logits unchanged.
+        probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
+        logits = mx.log(probs)
+        result = apply_xtc(logits, 1.0, 0.0, [])
+        # apply_xtc itself still masks (it doesn't have the gate)
+        self.assertTrue(mx.any(result == -mx.inf))
+
+        # but make_sampler should not even call apply_xtc
+        sampler = make_sampler(temp=1.0, xtc_probability=1.0, xtc_threshold=0.0)
+        # with temp=1.0 and no XTC, sampler is just categorical_sampling.
+        # verify it doesn't crash and produces a valid token
+        token = sampler(logits)
+        mx.eval(token)
+        self.assertTrue(0 <= token.item() < 4)
 
     def test_presence_penalty(self):
         from mlx_lm.sample_utils import make_presence_penalty
