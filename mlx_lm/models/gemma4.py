@@ -74,7 +74,7 @@ class Model(nn.Module):
             new_weights["language_model"] = tree_unflatten(list(lm_weights.items()))
             return dict(tree_flatten(new_weights))
 
-        return self.language_model.sanitize(dict(tree_flatten(new_weights)))
+        return self.language_model.sanitize(weights)
 
     @property
     def layers(self):
