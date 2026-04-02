@@ -448,20 +448,6 @@ class DecoderLayer(nn.Module):
         return h
 
 
-class ScaledEmbedding(nn.Embedding):
-    """Embedding with output scaling by sqrt(hidden_size)."""
-
-    def __init__(self, num_embeddings: int, dims: int, embed_scale: float = 1.0):
-        super().__init__(num_embeddings, dims)
-        self.embed_scale = embed_scale
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return super().__call__(x) * self.embed_scale
-
-    def as_linear(self, x: mx.array) -> mx.array:
-        return x @ self.weight.T
-
-
 class ScaledLinear(nn.Module):
     """Linear layer with output scaling."""
 
@@ -483,9 +469,8 @@ class Gemma4TextModel(nn.Module):
         self.sliding_window_pattern = config.sliding_window_pattern
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.embed_tokens = ScaledEmbedding(
-            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_scale = config.hidden_size**0.5
         self.layers = [
             DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
         ]
@@ -494,10 +479,12 @@ class Gemma4TextModel(nn.Module):
         # Per-layer input embeddings (2B/4B models)
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.embed_tokens_per_layer = ScaledEmbedding(
+            self.embed_tokens_per_layer = nn.Embedding(
                 config.vocab_size_per_layer_input,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                embed_scale=config.hidden_size_per_layer_input**0.5,
+            )
+            self.embed_tokens_per_layer_scale = (
+                config.hidden_size_per_layer_input**0.5
             )
             self.per_layer_input_scale = 2.0**-0.5
             self.per_layer_model_projection = ScaledLinear(
@@ -515,7 +502,9 @@ class Gemma4TextModel(nn.Module):
             self.per_layer_projection_norm = None
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
-        return self.embed_tokens_per_layer(input_ids).reshape(
+        result = self.embed_tokens_per_layer(input_ids)
+        result = result * self.embed_tokens_per_layer_scale
+        return result.reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,
             self.hidden_size_per_layer_input,
@@ -549,6 +538,8 @@ class Gemma4TextModel(nn.Module):
             h = input_embeddings
         else:
             h = self.embed_tokens(inputs)
+
+        h = h * self.embed_scale
 
         per_layer_inputs = None
         if self.hidden_size_per_layer_input:
