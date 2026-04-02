@@ -236,6 +236,42 @@ class TestGenerationConfig(unittest.TestCase):
             result = utils.load_generation_config(Path(tmpdir))
             self.assertEqual(result["temp"], 0.7)
 
+    def test_load_generation_config_do_sample_true_default_temperature(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(tmpdir, {"do_sample": True, "temperature": 1.0})
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result, {"temp": 0.0})
+
+    def test_load_generation_config_keeps_default_temperature_with_top_p(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(
+                tmpdir,
+                {"do_sample": True, "temperature": 1.0, "top_p": 0.95},
+            )
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result["temp"], 1.0)
+            self.assertEqual(result["top_p"], 0.95)
+
+    def test_load_generation_config_keeps_default_temperature_with_top_k(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(
+                tmpdir,
+                {"do_sample": True, "temperature": 1.0, "top_k": 40},
+            )
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result["temp"], 1.0)
+            self.assertEqual(result["top_k"], 40)
+
+    def test_load_generation_config_keeps_default_temperature_with_min_p(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_config(
+                tmpdir,
+                {"do_sample": True, "temperature": 1.0, "min_p": 0.05},
+            )
+            result = utils.load_generation_config(Path(tmpdir))
+            self.assertEqual(result["temp"], 1.0)
+            self.assertEqual(result["min_p"], 0.05)
+
     def test_load_generation_config_sparse(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_config(tmpdir, {"temperature": 0.8})

@@ -336,18 +336,11 @@ class ModelProvider:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
     def _apply_generation_defaults(self, generation_config):
-        """Store the model's generation_config so it can be consulted at
-        request time.  Does *not* mutate ``cli_args``; the resolution
-        chain (user CLI arg > generation_config > hardcoded default) is
-        evaluated lazily via :meth:`resolve_default`.
-        """
+        """Store the model's generation_config for request-time resolution."""
         self.generation_config = generation_config
 
     def resolve_default(self, key):
-        """Return the effective default for *key*.
-
-        Priority: user-supplied CLI arg > generation_config.json > hardcoded.
-        """
+        """Return the effective default for *key* (CLI > generation_config > hardcoded)."""
         cli_val = getattr(self.cli_args, key, None)
         if cli_val is not None:
             return cli_val

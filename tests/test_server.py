@@ -47,6 +47,7 @@ class DummyModelProvider:
                 "top_k": 0,
                 "min_p": 0.0,
                 "max_tokens": 512,
+                "repetition_penalty": 0.0,
                 "chat_template_args": {},
                 "model": None,
                 "decode_concurrency": 32,
@@ -66,7 +67,7 @@ class DummyModelProvider:
             self.cli_args.draft_model = HF_MODEL_PATH
 
     def resolve_default(self, key):
-        return getattr(self.cli_args, key)
+        return getattr(self.cli_args, key, None)
 
     def load(self, model, adapter=None, draft_model=None):
         assert model in ["default_model", "chat_model"]

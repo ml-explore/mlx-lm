@@ -294,23 +294,10 @@ def _read_generation_config_file(model_path: Path) -> dict:
 
 
 def load_generation_config(model_path: Path, *, _raw: Optional[dict] = None) -> dict:
-    """
-    Load generation defaults from ``generation_config.json`` if present.
+    """Load generation defaults from ``generation_config.json`` if present.
 
-    The returned dictionary uses the parameter names expected by
-    :func:`generate` / :func:`stream_generate` (e.g. ``temp`` instead of
-    ``temperature``).  Only keys that are actually present in the file are
-    included, so callers can treat the result as a sparse set of overrides.
-
-    Args:
-        model_path (Path): The local model directory.
-        _raw (dict, optional): Pre-parsed generation_config.json contents.
-            When provided the file is not read again.  Used internally by
-            :func:`load_config` to avoid a redundant file read.
-
-    Returns:
-        dict: A (possibly empty) mapping of generation parameter names to
-        their default values.
+    Returns a sparse dict using mlx-lm parameter names (e.g. ``temp``
+    instead of ``temperature``).
     """
     if _raw is None:
         _raw = _read_generation_config_file(model_path)
@@ -336,6 +323,14 @@ def load_generation_config(model_path: Path, *, _raw: Optional[dict] = None) -> 
     # When do_sample is explicitly false, force greedy decoding.
     if _raw.get("do_sample") is False:
         config["temp"] = 0.0
+    elif _raw.get("do_sample") is True and config.get("temp") == 1.0:
+        uses_sampling_controls = (
+            config.get("top_p", 1.0) < 1.0
+            or config.get("top_k", 0) > 0
+            or config.get("min_p", 0.0) > 0.0
+        )
+        if not uses_sampling_controls:
+            config["temp"] = 0.0
 
     return config
 

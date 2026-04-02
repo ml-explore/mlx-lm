@@ -112,18 +112,10 @@ def setup_arg_parser():
         default=None,
         help="Maximum number of tokens to generate",
     )
-    parser.add_argument(
-        "--temp", type=float, default=None, help="Sampling temperature"
-    )
-    parser.add_argument(
-        "--top-p", type=float, default=None, help="Sampling top-p"
-    )
-    parser.add_argument(
-        "--min-p", type=float, default=None, help="Sampling min-p"
-    )
-    parser.add_argument(
-        "--top-k", type=int, default=None, help="Sampling top-k"
-    )
+    parser.add_argument("--temp", type=float, default=None, help="Sampling temperature")
+    parser.add_argument("--top-p", type=float, default=None, help="Sampling top-p")
+    parser.add_argument("--min-p", type=float, default=None, help="Sampling min-p")
+    parser.add_argument("--top-k", type=int, default=None, help="Sampling top-k")
     parser.add_argument(
         "--xtc-probability",
         type=float,
