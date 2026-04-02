@@ -538,15 +538,20 @@ class ResponseGenerator:
                 chat_template_args = chat_template_args.copy()
                 chat_template_args.update(extra_args)
 
-            return tokenizer.apply_chat_template(
-                messages,
+            template_kwargs = dict(
                 tools=tools,
-                add_generation_prompt=True,
                 tokenize=True,
                 **chat_template_args,
             )
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                **template_kwargs,
+            )
+            return prompt, template_kwargs
 
-        return tokenizer.encode(convert_chat(messages, role_mapping))
+        prompt = tokenizer.encode(convert_chat(messages, role_mapping))
+        return prompt, None
 
     def _tokenize(self, tokenizer, request, args):
         """Tokenize a request and split the prompt into segments.
@@ -567,31 +572,14 @@ class ResponseGenerator:
             tools = request.tools
             role_mapping = request.role_mapping
 
-            if tokenizer.has_chat_template:
-                process_message_content(messages)
-                if tools and not tokenizer.has_tool_calling:
-                    logging.warning(
-                        "Received tools but model does not support tool calling. "
-                        "If you think this is an error, file an issue here: "
-                        "https://github.com/ml-explore/mlx-lm/issues"
-                    )
-
-                chat_template_args = self.model_provider.cli_args.chat_template_args
-                if args.chat_template_kwargs:
-                    chat_template_args = chat_template_args.copy()
-                    chat_template_args.update(args.chat_template_kwargs)
-                template_kwargs = dict(
-                    tools=tools,
-                    tokenize=True,
-                    **chat_template_args,
-                )
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    **template_kwargs,
-                )
-            else:
-                prompt = tokenizer.encode(convert_chat(messages, role_mapping))
+            prompt, template_kwargs = self._prepare_chat_prompt(
+                tokenizer,
+                messages,
+                tools,
+                role_mapping,
+                args.chat_template_kwargs,
+            )
+            if template_kwargs is None:
                 return prompt, [prompt], ["assistant"], "normal"
         else:
             prompt = tokenizer.encode(request.prompt)
@@ -676,13 +664,13 @@ class ResponseGenerator:
             messages = copy.deepcopy(warmup.messages)
             messages.append({"role": "user", "content": content})
             prompts.append(
-                self._tokenize_chat(
+                self._prepare_chat_prompt(
                     tokenizer,
                     messages,
                     warmup.tools,
                     warmup.role_mapping,
                     warmup.chat_template_kwargs,
-                )
+                )[0]
             )
 
         prompt = shared_prefix(*prompts)
