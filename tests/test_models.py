@@ -1231,6 +1231,53 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gemma4_text(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=10,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=4,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                },
+            },
+        )
+        model = gemma4_text.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
 
@@ -1663,6 +1710,50 @@ class TestModels(unittest.TestCase):
                 "rope_scaling": None,
                 "sliding_window": 8,
                 "sliding_window_pattern": "LLGL",
+            },
+            {
+                "model_type": "gemma4",
+                "num_hidden_layers": 10,
+                "vocab_size": 1000,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 10,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "head_dim": 32,
+                    "global_head_dim": 64,
+                    "rms_norm_eps": 1e-6,
+                    "vocab_size": 1000,
+                    "vocab_size_per_layer_input": 1000,
+                    "num_key_value_heads": 1,
+                    "num_kv_shared_layers": 4,
+                    "hidden_size_per_layer_input": 32,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 5,
+                    "final_logit_softcapping": 30.0,
+                    "layer_types": [
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "partial_rotary_factor": 0.25,
+                            "rope_theta": 1000000.0,
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                        },
+                    },
+                },
             },
             {
                 "model_type": "gemma3n",
