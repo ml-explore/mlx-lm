@@ -223,7 +223,7 @@ def setup_arg_parser():
 
 
 # A stream on the default device just for generation
-generation_stream = ThreadLocalStream()
+generation_stream = mx.ThreadLocalStream(mx.default_device())
 
 
 @contextlib.contextmanager
@@ -396,7 +396,7 @@ def generate_step(
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
 
-        with mx.stream(generation_stream.stream):
+        with mx.stream(generation_stream):
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(
@@ -421,7 +421,7 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream.stream):
+    with mx.stream(generation_stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
@@ -545,7 +545,7 @@ def speculative_generate_step(
         return y, logprobs
 
     def _step(model, cache, y, n_predict=1):
-        with mx.stream(generation_stream.stream):
+        with mx.stream(generation_stream):
             logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
@@ -593,7 +593,7 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
-    with mx.stream(generation_stream.stream):
+    with mx.stream(generation_stream):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
@@ -704,7 +704,7 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    with wired_limit(model, [generation_stream.stream]):
+    with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
@@ -1511,7 +1511,7 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
 
-        self._stream = stream or generation_stream.stream
+        self._stream = stream or generation_stream
 
         self._default_state_machine = SequenceStateMachine(
             {"normal": [(seq, None) for seq in stop_tokens]} if stop_tokens else {},
