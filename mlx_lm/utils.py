@@ -336,6 +336,14 @@ def load_generation_config(model_path: Path, *, _raw: Optional[dict] = None) -> 
     # When do_sample is explicitly false, force greedy decoding.
     if _raw.get("do_sample") is False:
         config["temp"] = 0.0
+    elif _raw.get("do_sample") is True and config.get("temp") == 1.0:
+        uses_sampling_controls = (
+            config.get("top_p", 1.0) < 1.0
+            or config.get("top_k", 0) > 0
+            or config.get("min_p", 0.0) > 0.0
+        )
+        if not uses_sampling_controls:
+            config["temp"] = 0.0
 
     return config
 
