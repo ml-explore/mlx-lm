@@ -6,9 +6,11 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
+from .rope_utils import initialize_rope
 
 
 class _OffsetCache(_BaseCache):
@@ -251,13 +253,12 @@ class Attention(nn.Module):
         layer_key = "sliding_attention" if self.is_sliding else "full_attention"
         rope_params = config.rope_parameters.get(layer_key, {})
         rope_theta = rope_params.get("rope_theta", 10000.0)
-        partial_rotary_factor = rope_params.get("partial_rotary_factor", 1.0)
-        rope_dims = int(self.head_dim * partial_rotary_factor)
-
-        self.rope = nn.RoPE(
-            rope_dims,
+        self.rope = initialize_rope(
+            dims=self.head_dim,
             traditional=config.rope_traditional,
             base=rope_theta,
+            scaling_config=rope_params,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
         # KV sharing (2B/4B models)
@@ -499,7 +500,51 @@ class Gemma4TextModel(nn.Module):
             self.per_layer_model_projection = None
             self.per_layer_projection_norm = None
 
-    def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
+    def get_per_layer_inputs(
+        self,
+        input_ids: Optional[mx.array],
+        input_embeddings: Optional[mx.array] = None,
+    ) -> mx.array:
+        if input_ids is None:
+            if input_embeddings is None:
+                raise RuntimeError(
+                    "input_embeddings must be provided when input_ids are omitted."
+                )
+
+            flat_inputs = input_embeddings.reshape(-1, input_embeddings.shape[-1])
+            resolved = np.full((flat_inputs.shape[0],), -1, dtype=np.int32)
+            match_counts = np.zeros((flat_inputs.shape[0],), dtype=np.int32)
+
+            # Reverse the exact embedding lookup in chunks to avoid allocating
+            # a full [batch, seq, vocab, hidden] comparison tensor.
+            chunk_size = 1024
+            for start in range(0, self.config.vocab_size, chunk_size):
+                end = min(start + chunk_size, self.config.vocab_size)
+                vocab_ids = mx.arange(start, end, dtype=mx.int32)
+                vocab_embeddings = self.embed_tokens(vocab_ids)
+                matches = np.array(
+                    mx.all(
+                        flat_inputs[:, None, :] == vocab_embeddings[None, :, :],
+                        axis=-1,
+                    )
+                )
+                counts = matches.sum(axis=1)
+                matched_rows = counts > 0
+                if matched_rows.any():
+                    resolved[matched_rows] = (
+                        start + matches.argmax(axis=1)[matched_rows]
+                    )
+                match_counts += counts
+
+            if not np.all(match_counts == 1):
+                raise RuntimeError(
+                    "Could not uniquely recover input_ids from input_embeddings."
+                )
+
+            input_ids = mx.array(
+                resolved.reshape(input_embeddings.shape[:2]), dtype=mx.int32
+            )
+
         result = self.embed_tokens_per_layer(input_ids)
         result = result * self.embed_tokens_per_layer_scale
         return result.reshape(
@@ -531,18 +576,20 @@ class Gemma4TextModel(nn.Module):
         inputs: mx.array = None,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        per_layer_inputs: Optional[mx.array] = None,
     ):
         if input_embeddings is not None:
-            h = input_embeddings
+            raw_input_embeddings = input_embeddings
         else:
-            h = self.embed_tokens(inputs)
+            raw_input_embeddings = self.embed_tokens(inputs)
 
+        h = raw_input_embeddings
         h = h * self.embed_scale
-
-        per_layer_inputs = None
         if self.hidden_size_per_layer_input:
-            if inputs is not None:
-                per_layer_inputs = self.get_per_layer_inputs(inputs)
+            if per_layer_inputs is None:
+                per_layer_inputs = self.get_per_layer_inputs(
+                    inputs, raw_input_embeddings
+                )
             per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
         if cache is None:
@@ -619,8 +666,14 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        per_layer_inputs: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        out = self.model(
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            per_layer_inputs=per_layer_inputs,
+        )
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
