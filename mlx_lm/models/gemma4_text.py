@@ -77,9 +77,9 @@ class ModelArgs(BaseModelArgs):
             pattern = ["sliding_attention"] * (self.sliding_window_pattern - 1) + [
                 "full_attention"
             ]
-            self.layer_types = (
-                pattern * (self.num_hidden_layers // len(pattern) + 1)
-            )[: self.num_hidden_layers]
+            self.layer_types = (pattern * (self.num_hidden_layers // len(pattern) + 1))[
+                : self.num_hidden_layers
+            ]
 
 
 class RMSNorm(nn.Module):
