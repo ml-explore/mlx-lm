@@ -267,7 +267,12 @@ class TestModels(unittest.TestCase):
             freqs=expected_freqs,
         )
         expected = mx.concatenate(
-            [expected_rotated[..., :4], x[..., 4:8], expected_rotated[..., 4:], x[..., 12:]],
+            [
+                expected_rotated[..., :4],
+                x[..., 4:8],
+                expected_rotated[..., 4:],
+                x[..., 12:],
+            ],
             axis=-1,
         )
         mx.eval(y, expected)
@@ -682,13 +687,17 @@ class TestModels(unittest.TestCase):
             }
         )
         self.assertIn(mlx_norm_key, converted)
-        self.assertNotIn("language_model.model.model.layers.0.input_layernorm.weight", converted)
+        self.assertNotIn(
+            "language_model.model.model.layers.0.input_layernorm.weight", converted
+        )
         self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
         self.assertFalse(any("vision_tower" in k for k in converted))
 
         loaded = model.sanitize({mlx_norm_key: base})
         self.assertIn(mlx_norm_key, loaded)
-        self.assertNotIn("language_model.model.model.layers.0.input_layernorm.weight", loaded)
+        self.assertNotIn(
+            "language_model.model.model.layers.0.input_layernorm.weight", loaded
+        )
         self.assertTrue(mx.array_equal(loaded[mlx_norm_key], base))
 
     def test_gemma4_raw_hf_language_model_prefixes_model(self):

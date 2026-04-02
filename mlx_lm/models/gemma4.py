@@ -74,8 +74,7 @@ class Model(nn.Module):
             # checkpoints use "layers.*" under language_model.
             lm_weights = dict(tree_flatten(new_weights["language_model"]))
             if not any(
-                k.startswith("model.") or k.startswith("lm_head.")
-                for k in lm_weights
+                k.startswith("model.") or k.startswith("lm_head.") for k in lm_weights
             ):
                 lm_weights = {"model." + k: v for k, v in lm_weights.items()}
             lm_weights = self.language_model.sanitize(lm_weights)

@@ -448,6 +448,7 @@ class DecoderLayer(nn.Module):
 
         return h
 
+
 class ScaledLinear(nn.Module):
     """Linear layer with output scaling."""
 
@@ -530,7 +531,9 @@ class Gemma4TextModel(nn.Module):
                 counts = matches.sum(axis=1)
                 matched_rows = counts > 0
                 if matched_rows.any():
-                    resolved[matched_rows] = start + matches.argmax(axis=1)[matched_rows]
+                    resolved[matched_rows] = (
+                        start + matches.argmax(axis=1)[matched_rows]
+                    )
                 match_counts += counts
 
             if not np.all(match_counts == 1):

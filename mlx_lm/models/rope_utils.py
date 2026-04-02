@@ -248,11 +248,17 @@ class ProportionalRoPE(nn.Module):
         )
 
         left = mx.concatenate(
-            [rotated[..., : self.rotated_dims // 2], left[..., self.rotated_dims // 2 :]],
+            [
+                rotated[..., : self.rotated_dims // 2],
+                left[..., self.rotated_dims // 2 :],
+            ],
             axis=-1,
         )
         right = mx.concatenate(
-            [rotated[..., self.rotated_dims // 2 :], right[..., self.rotated_dims // 2 :]],
+            [
+                rotated[..., self.rotated_dims // 2 :],
+                right[..., self.rotated_dims // 2 :],
+            ],
             axis=-1,
         )
         head = mx.concatenate([left, right], axis=-1)
