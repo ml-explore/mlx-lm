@@ -378,6 +378,7 @@ class ModelProvider:
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
+        self.is_batchable = is_batchable
 
     def load_default(self):
         if self._model_map["default_model"] is not None:
