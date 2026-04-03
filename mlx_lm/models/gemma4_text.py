@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
@@ -99,6 +98,11 @@ class RMSNormNoScale(nn.Module):
 @partial(mx.compile, shapeless=True)
 def logit_softcap(softcap, x):
     return mx.tanh(x / softcap) * softcap
+
+
+@partial(mx.compile, shapeless=True)
+def _complete_square(x2, y2, xy):
+    return x2 + mx.expand_dims(y2, -1) - 2 * xy
 
 
 class MLP(nn.Module):
@@ -489,46 +493,33 @@ class Gemma4TextModel(nn.Module):
                     "input_embeddings must be provided when input_ids are omitted."
                 )
 
-            flat_inputs = input_embeddings.reshape(-1, input_embeddings.shape[-1])
-            resolved = np.full((flat_inputs.shape[0],), -1, dtype=np.int32)
-            match_counts = np.zeros((flat_inputs.shape[0],), dtype=np.int32)
-
-            # Reverse the exact embedding lookup in chunks to avoid allocating
-            # a full [batch, seq, vocab, hidden] comparison tensor.
-            chunk_size = 1024
-            for start in range(0, self.config.vocab_size, chunk_size):
-                end = min(start + chunk_size, self.config.vocab_size)
-                vocab_ids = mx.arange(start, end, dtype=mx.int32)
-                vocab_embeddings = self.embed_tokens(vocab_ids)
-                matches = np.array(
-                    mx.all(
-                        flat_inputs[:, None, :] == vocab_embeddings[None, :, :],
-                        axis=-1,
-                    )
-                )
-                counts = matches.sum(axis=1)
-                matched_rows = counts > 0
-                if matched_rows.any():
-                    resolved[matched_rows] = (
-                        start + matches.argmax(axis=1)[matched_rows]
-                    )
-                match_counts += counts
-
-            if not np.all(match_counts == 1):
-                raise RuntimeError(
-                    "Could not uniquely recover input_ids from input_embeddings."
-                )
-
-            input_ids = mx.array(
-                resolved.reshape(input_embeddings.shape[:2]), dtype=mx.int32
+            # Split the sequence dimension if this still holds too much
+            # memory. 260k vocab means the distance tensor would be ~1GB
+            # per 2k tokens in bf16.
+            #
+            # If the embedding is quantized we have to dequantize it anyway to
+            # perform the match test.
+            norms_embedding = self.embed_tokens.weight.square().sum(-1)
+            norms_input = input_embeddings.square().sum(-1)
+            distance = _complete_square(
+                norms_embedding,
+                norms_input,
+                self.embed_tokens.as_linear(input_embeddings),
             )
+
+            # Checks can be added if needed but they necessarily break the GPU
+            # pipelining and force an eval.
+            #
+            #   match_counts = (distance < eps).sum(-1)
+            #
+            input_ids = mx.argmin(distance, -1)
 
         result = self.embed_tokens_per_layer(input_ids)
         result = result * self.embed_tokens_per_layer_scale
-        return result.reshape(
-            *input_ids.shape,
-            self.config.num_hidden_layers,
-            self.hidden_size_per_layer_input,
+        return mx.unflatten(
+            result,
+            -1,
+            (self.config.num_hidden_layers, self.hidden_size_per_layer_input),
         )
 
     def project_per_layer_inputs(
