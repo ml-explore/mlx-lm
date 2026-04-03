@@ -373,12 +373,6 @@ class ModelProvider:
             self.is_batchable = all(
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
             )
-            # MTP speculative decoding uses single-sequence generation
-            # (draft/verify loop is incompatible with batch generation).
-            # TODO: dynamically switch between MTP (1 request) and
-            # BatchGenerator (>= 2 concurrent requests).
-            if self.cli_args.mtp and hasattr(self.model, "mtp_forward"):
-                self.is_batchable = False
 
         return self.model, self.tokenizer
 
@@ -789,7 +783,14 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    # Prefer single-sequence MTP when the queue is empty;
+                    # fall back to BatchGenerator when requests are queued.
+                    mtp_active = getattr(self.cli_args, "mtp", False) and hasattr(
+                        model, "mtp_forward"
+                    )
+                    if not self._is_batchable(args) or (
+                        mtp_active and self.requests.empty()
+                    ):
                         self._serve_single((rqueue, request, args))
                         continue
 
