@@ -85,16 +85,6 @@ class ModelArgs(BaseModelArgs):
             ]
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def __call__(self, x):
-        return mx.fast.rms_norm(x, self.weight, self.eps)
-
-
 class RMSNormNoScale(nn.Module):
     """RMSNorm without learnable scale."""
 
@@ -104,18 +94,6 @@ class RMSNormNoScale(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return mx.fast.rms_norm(x, None, self.eps)
-
-
-class RMSNormZeroShift(nn.Module):
-    """RMSNorm with scale_shift=0 (used for per-layer projection norm)."""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = mx.ones((dim,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 @partial(mx.compile, shapeless=True)
@@ -245,8 +223,8 @@ class Attention(nn.Module):
             self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
 
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
 
         # RoPE (with partial rotation support)
@@ -345,14 +323,14 @@ class DecoderLayer(nn.Module):
         self.layer_type = config.layer_types[layer_idx]
         self.self_attn = Attention(config, layer_idx)
         self.mlp = MLP(config, layer_idx)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = RMSNorm(
+        self.pre_feedforward_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_feedforward_layernorm = RMSNorm(
+        self.post_feedforward_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -361,13 +339,13 @@ class DecoderLayer(nn.Module):
         if self.enable_moe:
             self.router = Router(config)
             self.experts = Experts(config)
-            self.post_feedforward_layernorm_1 = RMSNorm(
+            self.post_feedforward_layernorm_1 = nn.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-            self.post_feedforward_layernorm_2 = RMSNorm(
+            self.post_feedforward_layernorm_2 = nn.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-            self.pre_feedforward_layernorm_2 = RMSNorm(
+            self.pre_feedforward_layernorm_2 = nn.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
@@ -382,7 +360,7 @@ class DecoderLayer(nn.Module):
             self.per_layer_projection = nn.Linear(
                 self.hidden_size_per_layer_input, config.hidden_size, bias=False
             )
-            self.post_per_layer_input_norm = RMSNorm(
+            self.post_per_layer_input_norm = nn.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
         else:
@@ -475,7 +453,7 @@ class Gemma4TextModel(nn.Module):
         self.layers = [
             DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
         ]
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Per-layer input embeddings (2B/4B models)
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -491,7 +469,7 @@ class Gemma4TextModel(nn.Module):
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
                 scalar=config.hidden_size**-0.5,
             )
-            self.per_layer_projection_norm = RMSNormZeroShift(
+            self.per_layer_projection_norm = nn.RMSNorm(
                 config.hidden_size_per_layer_input, eps=config.rms_norm_eps
             )
         else:
