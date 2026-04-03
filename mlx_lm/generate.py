@@ -712,8 +712,29 @@ def mtp_generate_step(
             for processor in logits_processors:
                 logits = processor(tokens, logits)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        tok = sampler(logprobs)
-        return tok, logprobs
+        return sampler(logprobs), logprobs
+
+    def _clear_rollback():
+        for c in model_cache:
+            if hasattr(c, "rollback_state"):
+                c.rollback_state = None
+
+    def _rollback_draft():
+        """Restore caches to the state after the confirmed token.
+
+        SSM layers (ArraysCache): restore the conv/ssm snapshot saved by
+        GatedDeltaNet after the confirmed token.
+        Attention layers (KVCache): trim the draft-token entry.
+        """
+        for c in model_cache:
+            if hasattr(c, "rollback_state") and c.rollback_state is not None:
+                conv_snap, ssm_snap = c.rollback_state
+                c[0] = conv_snap
+                c[1] = ssm_snap
+                c.rollback_state = None
+            elif c.is_trimmable():
+                c.trim(1)
+        cache.trim_prompt_cache(mtp_cache, 1)
 
     def _step_backbone(y, n_predict=1, n_confirmed=0):
         """Run the backbone on ``y`` and return (tokens, logprobs, hidden)."""
@@ -761,101 +782,65 @@ def mtp_generate_step(
         y = _prefill(y)
 
     ntoks = 0
-    draft_tok = None
-    draft_lp = None
+    draft_tok = draft_lp = None
 
-    try:
-        while True:
-            if draft_tok is None:
-                # No pending draft: run backbone only, then generate first draft.
-                toks, lps, hidden = _step_backbone(y, n_predict=1)
-                mx.eval(toks)
-                main_tok = toks[0]
-                main_lp = lps[0]
+    while ntoks < max_tokens:
+        if draft_tok is None:
+            # No pending draft: run backbone only, then generate first draft.
+            toks, lps, hidden = _step_backbone(y, n_predict=1)
+            mx.eval(toks)
+            main_tok, main_lp = toks[0], lps[0]
+            ntoks += 1
+            yield main_tok.item(), main_lp, False
+            if ntoks >= max_tokens:
+                return
+            draft_tok, draft_lp = _step_mtp(hidden[:, -1:, :], main_tok)
+            mx.eval(draft_tok)
+            y = mx.array([main_tok.item()], mx.uint32)
+        else:
+            # Verify draft: run backbone over [y, draft_tok].
+            # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
+            # after the confirmed token y, enabling exact rollback on rejection.
+            y_with_draft = mx.concatenate([y, mx.array([draft_tok.item()], mx.uint32)])
+            toks, lps, hidden = _step_backbone(y_with_draft, n_predict=2, n_confirmed=1)
+            mx.eval(toks, draft_tok)
 
-                ntoks += 1
-                yield main_tok.item(), main_lp, False
-                if ntoks >= max_tokens:
-                    break
+            verify_pred, bonus_tok = toks[0], toks[1]
+            verify_lp, bonus_lp = lps[0], lps[1]
+            draft_tok_id = draft_tok.item()
 
-                draft_tok, draft_lp = _step_mtp(hidden[:, -1:, :], main_tok)
-                mx.eval(draft_tok)
-                y = mx.array([main_tok.item()], mx.uint32)
+            if _is_greedy:
+                accept = verify_pred.item() == draft_tok_id
             else:
-                # Verify draft: run backbone over [y, draft_tok].
-                # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
-                # after the confirmed token y, enabling exact rollback on rejection.
-                y_with_draft = mx.concatenate(
-                    [y, mx.array([draft_tok.item()], mx.uint32)]
-                )
-                toks, lps, hidden = _step_backbone(
-                    y_with_draft, n_predict=2, n_confirmed=1
-                )
-                mx.eval(toks, draft_tok)
+                # Probabilistic acceptance: min(1, p_target / p_draft).
+                log_accept = (verify_lp[draft_tok_id] - draft_lp[draft_tok_id]).item()
+                accept = log_accept >= 0 or random.random() < math.exp(log_accept)
 
-                verify_pred = toks[0]  # backbone prediction for y, used to verify draft
-                bonus_tok = toks[1]  # backbone prediction after draft_tok
-                verify_lp = lps[0]
-                bonus_lp = lps[1]
-
-                draft_tok_id = draft_tok.item()
-                if _is_greedy:
-                    accept = verify_pred.item() == draft_tok_id
-                else:
-                    # Probabilistic acceptance: min(1, p_target / p_draft).
-                    log_accept = (
-                        verify_lp[draft_tok_id] - draft_lp[draft_tok_id]
-                    ).item()
-                    accept = log_accept >= 0 or random.random() < math.exp(log_accept)
-                if accept:
-                    # Draft accepted: discard rollback snapshots.
-                    for c in model_cache:
-                        if hasattr(c, "rollback_state"):
-                            c.rollback_state = None
-
-                    ntoks += 1
-                    yield draft_tok.item(), draft_lp, True
-                    if ntoks >= max_tokens:
-                        break
-
-                    ntoks += 1
-                    yield bonus_tok.item(), bonus_lp, False
-                    if ntoks >= max_tokens:
-                        break
-
-                    # Next draft from MTP at draft_tok's hidden state
-                    draft_tok, draft_lp = _step_mtp(hidden[:, 1:2, :], bonus_tok)
-                    mx.eval(draft_tok)
-                    y = mx.array([bonus_tok.item()], mx.uint32)
-                else:
-                    # Draft rejected: roll back all caches to the state after y.
-                    # SSM layers (ArraysCache): restore the conv/ssm snapshot saved
-                    # by GatedDeltaNet after the confirmed token.
-                    # Attention layers (KVCache): trim the draft-token entry.
-                    for c in model_cache:
-                        if (
-                            hasattr(c, "rollback_state")
-                            and c.rollback_state is not None
-                        ):
-                            conv_snap, ssm_snap = c.rollback_state
-                            c[0] = conv_snap
-                            c[1] = ssm_snap
-                            c.rollback_state = None
-                        elif c.is_trimmable():
-                            c.trim(1)
-                    cache.trim_prompt_cache(mtp_cache, 1)
-
-                    ntoks += 1
-                    yield verify_pred.item(), verify_lp, False
-                    if ntoks >= max_tokens:
-                        break
-
-                    # Next draft from MTP at y's hidden state
-                    draft_tok, draft_lp = _step_mtp(hidden[:, 0:1, :], verify_pred)
-                    mx.eval(draft_tok)
-                    y = mx.array([verify_pred.item()], mx.uint32)
-    finally:
-        pass
+            if accept:
+                _clear_rollback()
+                ntoks += 1
+                yield draft_tok_id, draft_lp, True
+                if ntoks >= max_tokens:
+                    return
+                ntoks += 1
+                yield bonus_tok.item(), bonus_lp, False
+                if ntoks >= max_tokens:
+                    return
+                # Next draft from MTP at draft_tok's hidden state.
+                draft_tok, draft_lp = _step_mtp(hidden[:, 1:2, :], bonus_tok)
+                mx.eval(draft_tok)
+                y = mx.array([bonus_tok.item()], mx.uint32)
+            else:
+                _rollback_draft()
+                verify_tok_id = verify_pred.item()
+                ntoks += 1
+                yield verify_tok_id, verify_lp, False
+                if ntoks >= max_tokens:
+                    return
+                # Next draft from MTP at y's hidden state.
+                draft_tok, draft_lp = _step_mtp(hidden[:, 0:1, :], verify_pred)
+                mx.eval(draft_tok)
+                y = mx.array([verify_tok_id], mx.uint32)
 
 
 def stream_generate(
@@ -916,18 +901,13 @@ def stream_generate(
         kwargs.pop("prompt_progress_callback", None)
         kwargs.pop("num_draft_tokens", None)
         token_generator = mtp_generate_step(prompt, model, **kwargs)
-    elif mtp:
-        warnings.warn(
-            "--mtp flag ignored: model does not have an MTP head. "
-            "Falling back to standard generation.",
-            stacklevel=2,
-        )
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
     else:
+        if mtp:
+            warnings.warn(
+                "--mtp flag ignored: model does not have an MTP head. "
+                "Falling back to standard generation.",
+                stacklevel=2,
+            )
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
