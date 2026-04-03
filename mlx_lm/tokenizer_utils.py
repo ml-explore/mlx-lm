@@ -475,6 +475,8 @@ def _infer_tool_parser(chat_template):
         return "minimax_m2"
     elif "<start_function_call>" in chat_template:
         return "function_gemma"
+    elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
+        return "function_gemma4"
     elif "<longcat_tool_call>" in chat_template:
         return "longcat"
     elif "<arg_key>" in chat_template:

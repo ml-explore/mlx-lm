@@ -11,6 +11,25 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .cache import KVCache, RotatingKVCache, _BaseCache
 
 
+class _SafeRotatingKVCache(RotatingKVCache):
+    """RotatingKVCache that trims on first insertion.
+
+    Workaround for upstream bug: RotatingKVCache._update_concat doesn't trim
+    on first insertion, so prompts longer than max_size cause shape mismatches
+    in merge(). This subclass trims _temporal_order output to max_size.
+
+    Safe because _temporal_order is only called by merge() and subsequent
+    _update_concat calls — not by the initial update_and_fetch return, so
+    single-prompt attention still sees the full prompt.
+    """
+
+    def _temporal_order(self, v):
+        result = super()._temporal_order(v)
+        if result.shape[2] > self.max_size:
+            return result[..., -self.max_size :, :]
+        return result
+
+
 class _OffsetCache(_BaseCache):
     """Lightweight cache for KV-shared layers that only tracks offset."""
 
@@ -483,7 +502,9 @@ class Gemma4TextModel(nn.Module):
                 config.vocab_size_per_layer_input,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
             )
-            self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
+            self.embed_tokens_per_layer_scale = (
+                config.hidden_size_per_layer_input**0.5
+            )
             self.per_layer_input_scale = 2.0**-0.5
             self.per_layer_model_projection = ScaledLinear(
                 config.hidden_size,
@@ -670,7 +691,7 @@ class Model(nn.Module):
                 caches.append(KVCache())
             else:
                 caches.append(
-                    RotatingKVCache(
+                    _SafeRotatingKVCache(
                         max_size=self.args.sliding_window,
                         keep=0,
                     )

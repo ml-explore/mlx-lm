@@ -137,6 +137,38 @@ class TestModels(unittest.TestCase):
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
 
+    def test_safe_rotating_kv_cache_merge(self):
+        """_SafeRotatingKVCache fixes merge crash when prompt > max_size.
+
+        RotatingKVCache._update_concat doesn't trim on first insertion,
+        so merge() allocates based on size() (capped at max_size) but
+        _temporal_order returns the full untrimmed array → shape mismatch.
+        _SafeRotatingKVCache trims _temporal_order to fix this.
+        """
+        from mlx_lm.models.gemma4_text import _SafeRotatingKVCache
+
+        max_size = 64
+        prompt_len = 100  # > max_size
+        h, d = 4, 32
+
+        cache = _SafeRotatingKVCache(max_size=max_size, keep=0)
+        k = mx.random.uniform(shape=(1, h, prompt_len, d))
+        v = mx.random.uniform(shape=(1, h, prompt_len, d))
+        cache.update_and_fetch(k, v)
+
+        # size() caps at max_size, but without the fix _temporal_order
+        # would return (1, h, prompt_len, d) → merge crash
+        self.assertEqual(cache.size(), max_size)
+
+        # This would raise ValueError with plain RotatingKVCache
+        _SafeRotatingKVCache.merge([cache])
+
+        # Verify generation after oversized prompt still works
+        k2 = mx.random.uniform(shape=(1, h, 1, d))
+        v2 = mx.random.uniform(shape=(1, h, 1, d))
+        k_out, v_out = cache.update_and_fetch(k2, v2)
+        self.assertEqual(k_out.shape[2], max_size)
+
     def test_causal_mask_padding(self):
         right_padding = mx.array([2, 1, 0])
         mask = create_causal_mask(3, right_padding=right_padding)
