@@ -5,6 +5,8 @@ import contextlib
 import copy
 import functools
 import json
+import math
+import random
 import sys
 import time
 import warnings
@@ -693,6 +695,9 @@ def mtp_generate_step(
         model_cache = prompt_cache[:n_main]
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
 
+    # Exact-match acceptance for greedy (sampler=None); probabilistic
+    # acceptance min(1, p_target/p_draft) for stochastic samplers.
+    _is_greedy = sampler is None
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     quantize_cache_fn = functools.partial(
@@ -762,7 +767,7 @@ def mtp_generate_step(
     try:
         while True:
             if draft_tok is None:
-                # No pending draft — run backbone only, then generate first draft
+                # No pending draft: run backbone only, then generate first draft.
                 toks, lps, hidden = _step_backbone(y, n_predict=1)
                 mx.eval(toks)
                 main_tok = toks[0]
@@ -788,13 +793,22 @@ def mtp_generate_step(
                 )
                 mx.eval(toks, draft_tok)
 
-                verify_pred = toks[0]  # backbone prediction after y → verify draft
+                verify_pred = toks[0]  # backbone prediction for y, used to verify draft
                 bonus_tok = toks[1]  # backbone prediction after draft_tok
                 verify_lp = lps[0]
                 bonus_lp = lps[1]
 
-                if verify_pred.item() == draft_tok.item():
-                    # Draft accepted — discard rollback snapshots.
+                draft_tok_id = draft_tok.item()
+                if _is_greedy:
+                    accept = verify_pred.item() == draft_tok_id
+                else:
+                    # Probabilistic acceptance: min(1, p_target / p_draft).
+                    log_accept = (
+                        verify_lp[draft_tok_id] - draft_lp[draft_tok_id]
+                    ).item()
+                    accept = log_accept >= 0 or random.random() < math.exp(log_accept)
+                if accept:
+                    # Draft accepted: discard rollback snapshots.
                     for c in model_cache:
                         if hasattr(c, "rollback_state"):
                             c.rollback_state = None
@@ -814,7 +828,7 @@ def mtp_generate_step(
                     mx.eval(draft_tok)
                     y = mx.array([bonus_tok.item()], mx.uint32)
                 else:
-                    # Draft rejected — roll back all caches to the state after y.
+                    # Draft rejected: roll back all caches to the state after y.
                     # SSM layers (ArraysCache): restore the conv/ssm snapshot saved
                     # by GatedDeltaNet after the confirmed token.
                     # Attention layers (KVCache): trim the draft-token entry.
