@@ -253,7 +253,8 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(isinstance(rope, rope_utils.ProportionalRoPE))
         expected_freqs = 100.0 ** (mx.arange(0, 8, 2, dtype=mx.float32) / 16)
-        self.assertTrue(mx.allclose(rope._freqs, expected_freqs))
+        self.assertTrue(mx.allclose(rope._freqs[:4], expected_freqs))
+        self.assertTrue(mx.all(mx.isinf(rope._freqs[4:])))
 
         x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 1, 16)
         y = rope(x, offset=1)
@@ -677,7 +678,7 @@ class TestModels(unittest.TestCase):
         model = gemma4.Model(args)
 
         base = mx.arange(8, dtype=mx.float32)
-        hf_norm_key = "model.language_model.model.layers.0.input_layernorm.weight"
+        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
         mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
 
         converted = model.sanitize(
@@ -1570,7 +1571,7 @@ class TestModels(unittest.TestCase):
         model = gemma4_text.Model(args)
         tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
         embeddings = model.model.embed_tokens(tokens)
-        per_layer_inputs = model.model.get_per_layer_inputs(tokens)
+        per_layer_inputs = model.model._get_per_layer_inputs(tokens)
 
         direct = model(tokens)
         from_embeddings = model(None, input_embeddings=embeddings)

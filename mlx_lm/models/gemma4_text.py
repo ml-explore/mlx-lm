@@ -553,14 +553,9 @@ class Gemma4TextModel(nn.Module):
 
         # Get the extra inputs per layer if we have per layer embeddings
         if self.hidden_size_per_layer_input:
-            per_layer_inputs = self._project_per_layer_inputs(
-                h,
-                per_layer_inputs
-                or self._get_per_layer_inputs(
-                    inputs,
-                    input_embeddings,
-                ),
-            )
+            if per_layer_inputs is None:
+                per_layer_inputs = self._get_per_layer_inputs(inputs, input_embeddings)
+            per_layer_inputs = self._project_per_layer_inputs(h, per_layer_inputs)
         if per_layer_inputs is not None:
             per_layer_inputs = [
                 per_layer_inputs[:, :, i, :] for i, _ in enumerate(self.layers)
