@@ -71,7 +71,7 @@ class Model(nn.Module):
             ):
                 continue
 
-            if k.startswith("language_model"):
+            if k.startswith("language_model.") and not k.startswith("language_model.model."):
                 k = k.replace("language_model.", "language_model.model.")
 
             new_weights[k] = v

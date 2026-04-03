@@ -1588,6 +1588,179 @@ class TestModels(unittest.TestCase):
             mx.allclose(direct.astype(mx.float32), explicit.astype(mx.float32))
         )
 
+    def test_gemma4_text_moe(self):
+        """Test Gemma 4 MoE variant (26B-A4B style)."""
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=2,
+            head_dim=32,
+            global_head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=0,
+            hidden_size_per_layer_input=0,
+            sliding_window=8,
+            sliding_window_pattern=2,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            enable_moe_block=True,
+            num_experts=4,
+            top_k_experts=2,
+            moe_intermediate_size=64,
+        )
+        model = gemma4_text.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_gemma4_text_k_eq_v(self):
+        """Test Gemma 4 with attention_k_eq_v (31B style)."""
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=2,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            num_kv_shared_layers=0,
+            hidden_size_per_layer_input=0,
+            sliding_window=8,
+            sliding_window_pattern=2,
+            final_logit_softcapping=30.0,
+            attention_k_eq_v=True,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+        model = gemma4_text.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_gemma4_ple_sanitize_split(self):
+        """Test PLE weight splitting: single HF tensor -> per-layer chunks,
+        and already-split weights pass through unchanged."""
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
+
+        from mlx_lm.models import gemma4_text
+
+        n_layers = 4
+        ple_dim = 16
+        vocab = 100
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=64,
+            num_hidden_layers=n_layers,
+            intermediate_size=128,
+            num_attention_heads=2,
+            head_dim=32,
+            global_head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=vocab,
+            vocab_size_per_layer_input=vocab,
+            num_key_value_heads=1,
+            num_kv_shared_layers=1,
+            hidden_size_per_layer_input=ple_dim,
+            sliding_window=8,
+            sliding_window_pattern=3,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+        )
+        model = gemma4_text.Model(args)
+
+        flat_weights = dict(tree_flatten(model.parameters()))
+
+        # Build a single big PLE tensor like HuggingFace stores it
+        big_weight = mx.random.normal((vocab, n_layers * ple_dim))
+        unsplit = dict(flat_weights)
+        for i in range(n_layers):
+            unsplit.pop(f"model.embed_tokens_per_layer.{i}.weight", None)
+        unsplit["model.embed_tokens_per_layer.weight"] = big_weight
+
+        sanitized = model.sanitize(unsplit)
+
+        # Verify: single key is gone, per-layer keys exist with correct shapes
+        self.assertNotIn("model.embed_tokens_per_layer.weight", sanitized)
+        for i in range(n_layers):
+            key = f"model.embed_tokens_per_layer.{i}.weight"
+            self.assertIn(key, sanitized)
+            self.assertEqual(sanitized[key].shape, (vocab, ple_dim))
+            expected = big_weight[:, i * ple_dim : (i + 1) * ple_dim]
+            self.assertTrue(mx.allclose(sanitized[key], expected).item())
+
+        # Already-split weights pass through unchanged
+        sanitized2 = model.sanitize(dict(flat_weights))
+        for i in range(n_layers):
+            key = f"model.embed_tokens_per_layer.{i}.weight"
+            self.assertIn(key, sanitized2)
+
+    def test_gemma4_text_moe_k_eq_v(self):
+        """Test Gemma 4 26B-A4B config: MoE + k_eq_v combined (real model config)."""
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=1,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=3,
+            final_logit_softcapping=30.0,
+            enable_moe_block=True,
+            num_experts=4,
+            top_k_experts=2,
+            moe_intermediate_size=64,
+            attention_k_eq_v=True,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+        )
+        model = gemma4_text.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
 

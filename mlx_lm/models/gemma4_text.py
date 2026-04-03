@@ -435,10 +435,15 @@ class Gemma4TextModel(nn.Module):
         # Per-layer input embeddings (2B/4B models)
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.embed_tokens_per_layer = nn.Embedding(
-                config.vocab_size_per_layer_input,
-                config.num_hidden_layers * config.hidden_size_per_layer_input,
-            )
+            # Use per-layer embeddings to stay under Metal's 4GB buffer limit.
+            # The sanitizer splits HF's combined tensor into per-layer chunks.
+            self.embed_tokens_per_layer = [
+                nn.Embedding(
+                    config.vocab_size_per_layer_input,
+                    config.hidden_size_per_layer_input,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
             self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
             self.per_layer_input_scale = 2.0**-0.5
             self.per_layer_model_projection = ScaledLinear(
@@ -498,13 +503,9 @@ class Gemma4TextModel(nn.Module):
             #
             input_ids = mx.argmin(distance, -1)
 
-        result = self.embed_tokens_per_layer(input_ids)
-        result = result * self.embed_tokens_per_layer_scale
-        return mx.unflatten(
-            result,
-            -1,
-            (self.config.num_hidden_layers, self.hidden_size_per_layer_input),
-        )
+        chunks = [emb(input_ids) for emb in self.embed_tokens_per_layer]
+        result = mx.stack(chunks, axis=-2)  # [B, L, num_layers, ple_dim]
+        return result * self.embed_tokens_per_layer_scale
 
     def _project_per_layer_inputs(
         self,
@@ -664,6 +665,34 @@ class Model(nn.Module):
                 continue
 
             sanitized[k] = v
+
+        # Split HF's combined embed_tokens_per_layer [vocab, num_layers * ple_dim]
+        # into per-layer [vocab, ple_dim] chunks to stay under Metal's 4GB buffer limit.
+        ple_key = "model.embed_tokens_per_layer.weight"
+        if ple_key in sanitized:
+            w = sanitized.pop(ple_key)
+            num_layers = self.args.num_hidden_layers
+            ple_dim = self.args.hidden_size_per_layer_input
+            if w.shape[-1] == num_layers * ple_dim:
+                chunks = mx.split(w, num_layers, axis=-1)
+                for i, chunk in enumerate(chunks):
+                    sanitized[f"model.embed_tokens_per_layer.{i}.weight"] = chunk
+            else:
+                sanitized[ple_key] = w
+
+        # Handle quantized PLE weights (.scales / .biases)
+        for suffix in (".scales", ".biases"):
+            qkey = f"model.embed_tokens_per_layer{suffix}"
+            if qkey in sanitized:
+                w = sanitized.pop(qkey)
+                num_layers = self.args.num_hidden_layers
+                ple_dim = self.args.hidden_size_per_layer_input
+                if w.shape[-1] == num_layers * ple_dim:
+                    chunks = mx.split(w, num_layers, axis=-1)
+                    for i, chunk in enumerate(chunks):
+                        sanitized[f"model.embed_tokens_per_layer.{i}{suffix}"] = chunk
+                else:
+                    sanitized[qkey] = w
 
         return sanitized
 
