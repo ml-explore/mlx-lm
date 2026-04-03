@@ -211,9 +211,7 @@ class Attention(nn.Module):
         self.n_heads = config.num_attention_heads
 
         # K-eq-V for full attention layers (26B/31B models)
-        self.use_k_eq_v = (
-            getattr(config, "attention_k_eq_v", False) and not self.is_sliding
-        )
+        self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
         if self.use_k_eq_v and config.num_global_key_value_heads is not None:
             self.n_kv_heads = config.num_global_key_value_heads
         else:
@@ -243,80 +241,55 @@ class Attention(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
         )
 
-        # KV sharing (2B/4B models)
-        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
-            config, "num_kv_shared_layers", 0
-        )
-        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
-        if self.is_kv_shared_layer:
-            prev_layers = config.layer_types[:first_kv_shared_layer_idx]
-            self.kv_shared_layer_index = (
-                len(prev_layers)
-                - 1
-                - prev_layers[::-1].index(config.layer_types[layer_idx])
-            )
-        else:
-            self.kv_shared_layer_index = None
-
-        if not self.is_kv_shared_layer:
-            prev_layers = config.layer_types[:first_kv_shared_layer_idx]
-            self.store_full_length_kv = layer_idx == len(prev_layers) - 1 - prev_layers[
-                ::-1
-            ].index(config.layer_types[layer_idx])
-        else:
-            self.store_full_length_kv = False
-
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
         queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
         queries = self.q_norm(queries)
 
-        if self.is_kv_shared_layer and shared_kv is not None:
+        if shared_kv is not None:
             keys, values = shared_kv
-            offset = cache.offset if cache is not None else 0
         else:
-            offset = cache.offset if cache is not None else 0
-
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
-
-            # k_eq_v: values from raw k_proj (before k_norm)
-            if self.use_k_eq_v:
-                values = keys
-            else:
+            values = keys
+            if not self.use_k_eq_v:
                 values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            keys = self.k_norm(keys)
-            values = self.v_norm(values)
-            values = values.transpose(0, 2, 1, 3)
+            offset = cache.offset if cache is not None else 0
 
+            keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
             keys = self.rope(keys, offset=offset)
 
+            values = self.v_norm(values)
+            values = values.transpose(0, 2, 1, 3)
+
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
-
-        if self.store_full_length_kv:
-            self._last_kv = (keys, values)
 
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
 
         if mask is not None and isinstance(mask, mx.array):
             if mask.shape[-1] != keys.shape[-2]:
+                import pdb
+
+                pdb.set_trace()
                 mask = mask[..., -keys.shape[-2] :]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+
+        return self.o_proj(output), (keys, values), offset
 
 
 class DecoderLayer(nn.Module):
@@ -382,11 +355,14 @@ class DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
         shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
     ) -> mx.array:
         residual = x
 
         h = self.input_layernorm(x)
-        h = self.self_attn(h, mask, cache, shared_kv=shared_kv)
+        h, shared_kv, offset = self.self_attn(
+            h, mask, cache, shared_kv=shared_kv, offset=offset
+        )
         h = self.post_attention_layernorm(h)
         h = residual + h
 
@@ -428,7 +404,7 @@ class DecoderLayer(nn.Module):
         if self.layer_scalar is not None:
             h = h * self.layer_scalar
 
-        return h
+        return h, shared_kv, offset
 
 
 class ScaledLinear(nn.Module):
@@ -482,7 +458,18 @@ class Gemma4TextModel(nn.Module):
             self.per_layer_model_projection = None
             self.per_layer_projection_norm = None
 
-    def get_per_layer_inputs(
+        # Arrange for shared KVs
+        self.previous_kvs = list(range(len(self.layers)))
+        if config.num_kv_shared_layers > 0:
+            N = len(self.layers)
+            M = N - config.num_kv_shared_layers
+            kvs_by_type = {}
+            for i in range(M):
+                kvs_by_type[self.layers[i].layer_type] = i
+            for j in range(M, N):
+                self.previous_kvs[j] = kvs_by_type[self.layers[j].layer_type]
+
+    def _get_per_layer_inputs(
         self,
         input_ids: Optional[mx.array],
         input_embeddings: Optional[mx.array] = None,
@@ -522,16 +509,16 @@ class Gemma4TextModel(nn.Module):
             (self.config.num_hidden_layers, self.hidden_size_per_layer_input),
         )
 
-    def project_per_layer_inputs(
+    def _project_per_layer_inputs(
         self,
-        inputs_embeds: mx.array,
+        input_embeddings: mx.array,
         per_layer_inputs: Optional[mx.array] = None,
     ) -> mx.array:
-        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
-        per_layer_projection = per_layer_projection.reshape(
-            *inputs_embeds.shape[:-1],
-            self.config.num_hidden_layers,
-            self.hidden_size_per_layer_input,
+        per_layer_projection = self.per_layer_model_projection(input_embeddings)
+        per_layer_projection = mx.unflatten(
+            per_layer_projection,
+            -1,
+            (self.config.num_hidden_layers, self.hidden_size_per_layer_input),
         )
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
 
@@ -540,6 +527,20 @@ class Gemma4TextModel(nn.Module):
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
+    def _make_masks(self, h, cache):
+        mask = {}
+        masks = []
+        for l, c in zip(self.layers, cache):
+            if l.layer_type not in mask:
+                if l.layer_type == "full_attention":
+                    mask["full_attention"] = create_attention_mask(h, c)
+                elif l.layer_type == "sliding_attention":
+                    mask["sliding_attention"] = create_attention_mask(
+                        h, c, window_size=self.window_size
+                    )
+            masks.append(mask[l.layer_type])
+        return masks
+
     def __call__(
         self,
         inputs: mx.array = None,
@@ -547,74 +548,59 @@ class Gemma4TextModel(nn.Module):
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
     ):
-        if input_embeddings is not None:
-            raw_input_embeddings = input_embeddings
-        else:
-            raw_input_embeddings = self.embed_tokens(inputs)
-
-        h = raw_input_embeddings
+        # Make the initial hidden state
+        if input_embeddings is None:
+            input_embeddings = self.embed_tokens(inputs)
+        h = input_embeddings
         h = h * self.embed_scale
-        if self.hidden_size_per_layer_input:
-            if per_layer_inputs is None:
-                per_layer_inputs = self.get_per_layer_inputs(
-                    inputs, raw_input_embeddings
-                )
-            per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
+        # Get the extra inputs per layer if we have per layer embeddings
+        if self.hidden_size_per_layer_input:
+            per_layer_inputs = self._project_per_layer_inputs(
+                h,
+                per_layer_inputs
+                or self._get_per_layer_inputs(
+                    inputs,
+                    input_embeddings,
+                ),
+            )
+        if per_layer_inputs is not None:
+            per_layer_inputs = [
+                per_layer_inputs[:, :, i, :] for i, _ in enumerate(self.layers)
+            ]
+
+        # Make the kv cache list, be sure to append None for all the shared kv
+        # layers
         if cache is None:
             cache = [None] * len(self.layers)
+        else:
+            cache = cache + [None] * (len(self.layers) - len(cache))
 
-        global_cache_idx = None
-        sliding_cache_idx = None
-        for i, layer in enumerate(self.layers):
-            if layer.layer_type == "full_attention" and global_cache_idx is None:
-                global_cache_idx = i
-            elif layer.layer_type == "sliding_attention" and sliding_cache_idx is None:
-                sliding_cache_idx = i
+        # Apply each layer. We save all intermediate kvs and offset and grab
+        # the previous one for the shared kv layers.
+        masks = self._make_masks(h, cache)
+        intermediates = [(None, None)] * len(self.layers)
+        for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
+            zip(
+                self.layers,
+                cache,
+                masks,
+                self.previous_kvs,
+                per_layer_inputs,
+            )
+        ):
+            kvs, offset = intermediates[prev_idx]
 
-        global_mask = create_attention_mask(
-            h, cache[global_cache_idx] if global_cache_idx is not None else None
-        )
-        sliding_window_mask = create_attention_mask(
-            h,
-            cache[sliding_cache_idx] if sliding_cache_idx is not None else None,
-            window_size=self.window_size,
-        )
-
-        shared_kv_store = {}
-
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
-            is_global = layer.layer_type == "full_attention"
-
-            layer_shared_kv = None
-            if (
-                layer.self_attn.is_kv_shared_layer
-                and layer.self_attn.kv_shared_layer_index is not None
-            ):
-                ref_idx = layer.self_attn.kv_shared_layer_index
-                if ref_idx in shared_kv_store:
-                    layer_shared_kv, ref_offset = shared_kv_store[ref_idx]
-                    if c is not None:
-                        c.offset = ref_offset
-
-            mask = global_mask if is_global else sliding_window_mask
-
-            per_layer_input = None
-            if per_layer_inputs is not None:
-                per_layer_input = per_layer_inputs[:, :, i, :]
-
-            pre_offset = c.offset if c is not None else 0
-
-            h = layer(
+            h, kvs, offset = layer(
                 h,
                 mask,
                 c,
                 per_layer_input=per_layer_input,
-                shared_kv=layer_shared_kv,
+                shared_kv=kvs,
+                offset=offset,
             )
 
-            if layer.self_attn.store_full_length_kv:
-                shared_kv_store[i] = (layer.self_attn._last_kv, pre_offset)
+            intermediates[idx] = (kvs, offset)
 
         return self.norm(h)
 
@@ -704,15 +690,10 @@ class Model(nn.Module):
         return self.args.num_key_value_heads
 
     def make_cache(self):
-        first_kv_shared = self.args.num_hidden_layers - getattr(
-            self.args, "num_kv_shared_layers", 0
-        )
+        first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
         caches = []
-        for i in range(self.args.num_hidden_layers):
-            is_shared = i >= first_kv_shared > 0
-            if is_shared:
-                caches.append(_OffsetCache())
-            elif self.args.layer_types[i] == "full_attention":
+        for i in range(first_kv_shared):
+            if self.args.layer_types[i] == "full_attention":
                 caches.append(KVCache())
             else:
                 caches.append(
