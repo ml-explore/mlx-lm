@@ -565,6 +565,8 @@ class Gemma4TextModel(nn.Module):
             per_layer_inputs = [
                 per_layer_inputs[:, :, i, :] for i, _ in enumerate(self.layers)
             ]
+        else:
+            per_layer_inputs = [None] * len(self.layers)
 
         # Make the kv cache list, be sure to append None for all the shared kv
         # layers
