@@ -218,18 +218,6 @@ class TestServer(unittest.TestCase):
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
 
-    def test_sequence_overlap(self):
-        from mlx_lm.server import sequence_overlap
-
-        self.assertTrue(sequence_overlap([1], [1]))
-        self.assertTrue(sequence_overlap([1, 2], [1, 2]))
-        self.assertTrue(sequence_overlap([1, 3], [3, 4]))
-        self.assertTrue(sequence_overlap([1, 2, 3], [2, 3]))
-
-        self.assertFalse(sequence_overlap([1], [2]))
-        self.assertFalse(sequence_overlap([1, 2], [3, 4]))
-        self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
-
 
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
@@ -514,7 +502,7 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(c, [MockCache("test3")])
         self.assertEqual(t, [])
 
-        cache.insert_cache(model, [4, 5], [MockCache("test4")], checkpoint=True)
+        cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
         c, t = cache.fetch_nearest_cache(model, [2, 3])
         self.assertEqual(c, None)
         self.assertEqual(t, [2, 3])
@@ -535,6 +523,41 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
         self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(t, [])
+
+    def test_insert_trimmable_cache_removes_immediate_prefix(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("ab")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 2)
+
+        cache.insert_cache(model, [1, 2, 3], [MockCache("abc")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 3)
+
+    def test_insert_empty_tokens_does_not_self_destruct(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 4)
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNotNone(c)
+        self.assertEqual(t, [])
+
+    def test_fetch_empty_tokens_after_root_eviction(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        cache.insert_cache(model, [1], [MockCache("a")])
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNone(c)
         self.assertEqual(t, [])
 
     def test_lru_bytes(self):
