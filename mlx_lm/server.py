@@ -378,12 +378,6 @@ class ModelProvider:
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
-        # MTP speculative decoding uses single-sequence generation
-        # (draft/verify loop is incompatible with batch generation).
-        # TODO: dynamically switch between MTP (1 request) and
-        # BatchGenerator (>= 2 concurrent requests).
-        if self.cli_args.mtp and hasattr(model, "mtp_forward"):
-            is_batchable = False
         self.is_batchable = is_batchable
 
     def load_default(self):
@@ -816,7 +810,14 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    # Prefer single-sequence MTP when the queue is empty;
+                    # fall back to BatchGenerator when requests are queued.
+                    mtp_active = getattr(self.cli_args, "mtp", False) and hasattr(
+                        model, "mtp_forward"
+                    )
+                    if not self._is_batchable(args) or (
+                        mtp_active and self.requests.empty()
+                    ):
                         self._serve_single((rqueue, request, args))
                         continue
 

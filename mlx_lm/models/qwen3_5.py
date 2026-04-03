@@ -196,13 +196,13 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(inputs)
         a = self.in_proj_a(inputs)
 
-        conv_state = (
-            cache[0]
-            if cache is not None and cache[0] is not None
-            else mx.zeros(
-                (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
+        if cache is not None and cache[0] is not None:
+            conv_state = cache[0]
+        else:
+            conv_state = mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim),
+                dtype=inputs.dtype,
             )
-        )
         ssm_state = cache[1] if cache else None
 
         if mask is not None:
@@ -337,8 +337,6 @@ class MTPModule(nn.Module):
         embed_tokens: nn.Embedding,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        # hidden_states : (B, 1, H)  — backbone hidden at last accepted position
-        # next_token_ids: (B, 1)     — t_main (main model's prediction for t+1)
         embeds = embed_tokens(next_token_ids)  # (B, 1, H)
         e = self.pre_fc_norm_embedding(embeds)
         h = self.pre_fc_norm_hidden(hidden_states)
@@ -385,12 +383,9 @@ class Qwen3_5TextModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            kw = (
-                {"n_confirmed": n_confirmed}
-                if layer.is_linear and n_confirmed > 0
-                else {}
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
             )
-            hidden_states = layer(hidden_states, mask=mask, cache=c, **kw)
 
         return hidden_states
 
@@ -435,12 +430,12 @@ class TextModel(nn.Module):
         """Run the MTP head and apply the shared lm_head.
 
         Args:
-            hidden_states: (B, 1, H) — backbone hidden state at the last position.
-            next_token_ids: (B, 1)   — sampled main token (t_main).
-            mtp_cache: list of KVCache entries for the MTP transformer layer(s).
+            hidden_states: Backbone pre-norm hidden state, shape (B, 1, H).
+            next_token_ids: Sampled main token ids, shape (B, 1).
+            mtp_cache: KVCache entries for the MTP transformer layers.
 
         Returns:
-            logits: (B, 1, vocab_size)
+            logits of shape (B, 1, vocab_size).
         """
         mtp_out = self.mtp(
             hidden_states,
@@ -470,8 +465,8 @@ class TextModel(nn.Module):
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
         # Norm weights need a +1 shift only in raw HF checkpoints (detected via
-        # unsanitized conv1d). Already-converted MLX models (conv1d fixed) must NOT
-        # be shifted again — even when they contain MTP weights.
+        # unsanitized conv1d). Already-converted MLX models must not be shifted
+        # again, even when they contain MTP weights.
         should_shift_norm_weights = has_unsanitized_conv1d
         # Keep MTP weights if this model has an MTP head; drop them otherwise
         if not hasattr(self, "mtp"):
