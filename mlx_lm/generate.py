@@ -299,7 +299,11 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+        if (
+            hasattr(c, "to_quantized")
+            and c.offset >= quantized_kv_start
+            and getattr(c, "quantizable", True)
+        ):
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 

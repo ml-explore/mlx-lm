@@ -12,6 +12,19 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from .base import create_causal_mask
 
 
+def _uses_mla_attention(layer) -> bool:
+    """Check if a layer uses Multi-head Latent Attention (MLA).
+
+    MLA models (DeepSeek V2/V3, Kimi, etc.) store non-standard tensors
+    in the KV cache that cannot be quantized with standard quantization.
+    """
+    for attr in ("self_attn", "attention", "attn"):
+        attn = getattr(layer, attr, None)
+        if attn is not None:
+            return hasattr(attn, "kv_a_proj_with_mqa")
+    return False
+
+
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
@@ -33,11 +46,19 @@ def make_prompt_cache(
 
     num_layers = len(model.layers)
     if max_kv_size is not None:
-        return [
+        caches = [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
         ]
     else:
-        return [KVCache() for _ in range(num_layers)]
+        caches = [KVCache() for _ in range(num_layers)]
+
+    # Mark MLA layers as non-quantizable since they store non-standard
+    # tensors (kv_latent, k_pe) that are accessed directly, not through SDPA
+    for i, layer in enumerate(model.layers):
+        if _uses_mla_attention(layer):
+            caches[i].quantizable = False
+
+    return caches
 
 
 def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
@@ -644,6 +665,12 @@ class ArraysCache(_BaseCache):
         cache.cache = [c[idx : idx + 1] for c in self.cache]
         return cache
 
+    def is_trimmable(self):
+        return False
+
+    def trim(self, n):
+        return 0
+
     def prepare(self, lengths=None, **kwargs):
         self.lengths = mx.array(lengths)
 
@@ -902,10 +929,21 @@ class BatchKVCache(_BaseCache):
         self.keys = None
         self.values = None
         self.left_padding = mx.array(left_padding)
-        self.offset = mx.array([-l for l in left_padding])
+        self._offset = mx.array([-l for l in left_padding])
         self._idx = 0
 
         self._right_padding = None
+
+    @property
+    def offset(self):
+        # Return a copy to prevent in-place mutation from corrupting
+        # references captured before update_and_fetch (e.g. for RoPE).
+        # See: https://github.com/ml-explore/mlx-lm/issues/1097
+        return self._offset + 0
+
+    @offset.setter
+    def offset(self, v):
+        self._offset = v
 
     def update_and_fetch(self, keys, values):
         prev = self._idx
@@ -926,7 +964,7 @@ class BatchKVCache(_BaseCache):
             else:
                 self.keys, self.values = new_k, new_v
 
-        self.offset += keys.shape[2]
+        self._offset = self._offset + keys.shape[2]
         self._idx += keys.shape[2]
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
@@ -940,7 +978,7 @@ class BatchKVCache(_BaseCache):
                 )
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
-            self.offset -= left_padding
+            self._offset = self._offset - left_padding
 
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
@@ -950,7 +988,7 @@ class BatchKVCache(_BaseCache):
             padding = self._right_padding
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
-            self.offset -= padding
+            self._offset = self._offset - padding
             self.left_padding += padding
             self._right_padding = None
 
@@ -960,11 +998,11 @@ class BatchKVCache(_BaseCache):
         if self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
-        return k, v, self.offset, self.left_padding
+        return k, v, self._offset, self.left_padding
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset, self.left_padding = v
+        self.keys, self.values, self._offset, self.left_padding = v
         self._idx = self.keys.shape[2]
 
     def is_trimmable(self):
@@ -973,7 +1011,7 @@ class BatchKVCache(_BaseCache):
     def trim(self, n):
         n = min(self._idx, n)
         self._idx -= n
-        self.offset -= n
+        self._offset = self._offset - n
         return n
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
@@ -988,7 +1026,7 @@ class BatchKVCache(_BaseCache):
         if self.keys is not None:
             self.keys = self.keys[batch_indices]
             self.values = self.values[batch_indices]
-        self.offset = self.offset[batch_indices]
+        self._offset = self._offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
@@ -1006,7 +1044,7 @@ class BatchKVCache(_BaseCache):
         """
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
-            self.offset = mx.concatenate([self.offset, other.offset])
+            self._offset = mx.concatenate([self._offset, other._offset])
             return
 
         max_idx = max(self._idx, other._idx)
@@ -1037,9 +1075,9 @@ class BatchKVCache(_BaseCache):
                 k = mx.pad(k, pad)
                 v = mx.pad(v, pad)
             left_padding = c.left_padding + left
-            return k, v, c.offset, left_padding
+            return k, v, c._offset, left_padding
 
-        self.keys, self.values, self.offset, self.left_padding = map(
+        self.keys, self.values, self._offset, self.left_padding = map(
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx
@@ -1105,12 +1143,23 @@ class BatchRotatingKVCache(_BaseCache):
         self.values = None
 
         self.left_padding = mx.array(left_padding)
-        self.offset = mx.array([-l for l in left_padding])
+        self._batch_offset = mx.array([-l for l in left_padding])
 
         self.max_size = max_size
         self._idx = 0
         self._offset = 0
         self.rotated = False
+
+    @property
+    def offset(self):
+        # Return a copy to prevent in-place mutation from corrupting
+        # references captured before update_and_fetch (e.g. for RoPE).
+        # See: https://github.com/ml-explore/mlx-lm/issues/1097
+        return self._batch_offset + 0
+
+    @offset.setter
+    def offset(self, v):
+        self._batch_offset = v
 
         # Lengths for right_padded inputs to make sure that padding tokens do
         # not evict valid tokens.
