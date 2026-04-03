@@ -30,6 +30,7 @@ from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchQuantizedKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -834,7 +835,7 @@ class BatchStats:
     peak_memory: float = 0
 
 
-def _make_cache(model, left_padding, max_kv_size):
+def _make_cache(model, left_padding, max_kv_size, kv_bits=None, kv_group_size=64):
     """
     Convert a list of regular caches into their corresponding
     batch-aware caches.
@@ -842,7 +843,15 @@ def _make_cache(model, left_padding, max_kv_size):
 
     def to_batch_cache(c):
         if type(c) is KVCache:
+            if kv_bits is not None and getattr(c, "quantizable", True):
+                return BatchQuantizedKVCache(
+                    left_padding, group_size=kv_group_size, bits=kv_bits
+                )
             return BatchKVCache(left_padding)
+        elif type(c) is QuantizedKVCache:
+            return BatchQuantizedKVCache(
+                left_padding, group_size=c.group_size, bits=c.bits
+            )
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -862,6 +871,13 @@ def _make_cache(model, left_padding, max_kv_size):
         if max_kv_size is not None:
             return [
                 BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
+            ]
+        if kv_bits is not None:
+            return [
+                BatchQuantizedKVCache(
+                    left_padding, group_size=kv_group_size, bits=kv_bits
+                )
+                for _ in model.layers
             ]
         return [BatchKVCache(left_padding) for _ in model.layers]
 
