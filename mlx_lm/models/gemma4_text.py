@@ -279,9 +279,6 @@ class Attention(nn.Module):
 
         if mask is not None and isinstance(mask, mx.array):
             if mask.shape[-1] != keys.shape[-2]:
-                import pdb
-
-                pdb.set_trace()
                 mask = mask[..., -keys.shape[-2] :]
 
         output = scaled_dot_product_attention(
