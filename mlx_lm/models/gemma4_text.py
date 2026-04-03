@@ -691,12 +691,41 @@ class Model(nn.Module):
                 s in k for s in ["input_max", "input_min", "output_max", "output_min"]
             ):
                 continue
+            if k.endswith(".experts.gate_up_proj") or k.endswith(
+                ".experts.gate_up_proj.weight"
+            ):
+                base = k.rsplit(".experts.gate_up_proj", 1)[0]
+                if base == k:
+                    base = k.rsplit(".experts.gate_up_proj.weight", 1)[0]
+                split = v.shape[-2] // 2
+                sanitized[f"{base}.experts.switch_glu.gate_proj.weight"] = v[
+                    ..., :split, :
+                ]
+                sanitized[f"{base}.experts.switch_glu.up_proj.weight"] = v[
+                    ..., split:, :
+                ]
+                continue
+            if k.endswith(".experts.down_proj") or k.endswith(".experts.down_proj.weight"):
+                base = k.rsplit(".experts.down_proj", 1)[0]
+                if base == k:
+                    base = k.rsplit(".experts.down_proj.weight", 1)[0]
+                sanitized[f"{base}.experts.switch_glu.down_proj.weight"] = v
+                continue
             sanitized[k] = v
         if "lm_head.weight" not in sanitized:
             self.tie_word_embeddings = True
             if hasattr(self, "lm_head"):
                 self.pop("lm_head")
         return sanitized
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("router.proj"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     @property
     def layers(self):
