@@ -53,35 +53,30 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
-        # HF weights are prefixed with "model." (Gemma4ForConditionalGeneration.model)
-        # Strip it and work with the inner structure
         new_weights = {}
         for k, v in weights.items():
-            if k.startswith("model."):
-                new_weights[k[len("model.") :]] = v
-            else:
+            if not k.startswith("model."):
                 new_weights[k] = v
+                continue
 
-        new_weights = tree_unflatten(list(new_weights.items()))
-        new_weights.pop("vision_tower", None)
-        new_weights.pop("multi_modal_projector", None)
-        new_weights.pop("audio_tower", None)
-        new_weights.pop("embed_audio", None)
-        new_weights.pop("embed_vision", None)
-
-        if "language_model" in new_weights:
-            # Converted MLX weights already use "model.layers.*" while raw HF
-            # checkpoints use "layers.*" under language_model.
-            lm_weights = dict(tree_flatten(new_weights["language_model"]))
-            if not any(
-                k.startswith("model.") or k.startswith("lm_head.") for k in lm_weights
+            k = k.removeprefix("model.")
+            if k.startswith(
+                (
+                    "vision_tower",
+                    "multi_modal_projector",
+                    "audio_tower",
+                    "embed_audio",
+                    "embed_vision",
+                )
             ):
-                lm_weights = {"model." + k: v for k, v in lm_weights.items()}
-            lm_weights = self.language_model.sanitize(lm_weights)
-            new_weights["language_model"] = tree_unflatten(list(lm_weights.items()))
-            return dict(tree_flatten(new_weights))
+                continue
 
-        return self.language_model.sanitize(weights)
+            if k.startswith("language_model"):
+                k = k.replace("language_model.", "language_model.model.")
+
+            new_weights[k] = v
+
+        return self.language_model.sanitize(new_weights)
 
     @property
     def layers(self):

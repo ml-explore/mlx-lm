@@ -11,6 +11,7 @@ import numpy as np
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
 from .rope_utils import initialize_rope
+from .switch_layers import SwitchGLU
 
 
 class _OffsetCache(_BaseCache):
@@ -184,7 +185,6 @@ class Experts(nn.Module):
 
     def __init__(self, config: ModelArgs):
         super().__init__()
-        from .switch_layers import SwitchGLU
 
         self.switch_glu = SwitchGLU(
             input_dims=config.hidden_size,
@@ -685,37 +685,32 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized = {}
         for k, v in weights.items():
-            if "self_attn.rotary_emb" in k:
-                continue
             if any(
-                s in k for s in ["input_max", "input_min", "output_max", "output_min"]
+                s in k
+                for s in (
+                    "self_attn.rotary_emb",
+                    "input_max",
+                    "input_min",
+                    "output_max",
+                    "output_min",
+                )
             ):
                 continue
-            if k.endswith(".experts.gate_up_proj") or k.endswith(
-                ".experts.gate_up_proj.weight"
-            ):
-                base = k.rsplit(".experts.gate_up_proj", 1)[0]
-                if base == k:
-                    base = k.rsplit(".experts.gate_up_proj.weight", 1)[0]
-                split = v.shape[-2] // 2
-                sanitized[f"{base}.experts.switch_glu.gate_proj.weight"] = v[
-                    ..., :split, :
-                ]
-                sanitized[f"{base}.experts.switch_glu.up_proj.weight"] = v[
-                    ..., split:, :
-                ]
+
+            if k.endswith(".experts.gate_up_proj"):
+                base = k.removesuffix(".gate_up_proj")
+                gate, up = map(mx.contiguous, mx.split(v, 2, axis=-2))
+                sanitized[f"{base}.switch_glu.gate_proj.weight"] = gate
+                sanitized[f"{base}.switch_glu.up_proj.weight"] = up
                 continue
-            if k.endswith(".experts.down_proj") or k.endswith(".experts.down_proj.weight"):
-                base = k.rsplit(".experts.down_proj", 1)[0]
-                if base == k:
-                    base = k.rsplit(".experts.down_proj.weight", 1)[0]
-                sanitized[f"{base}.experts.switch_glu.down_proj.weight"] = v
+
+            if k.endswith(".experts.down_proj"):
+                base = k.removesuffix(".down_proj")
+                sanitized[f"{base}.switch_glu.down_proj.weight"] = v
                 continue
+
             sanitized[k] = v
-        if "lm_head.weight" not in sanitized:
-            self.tie_word_embeddings = True
-            if hasattr(self, "lm_head"):
-                self.pop("lm_head")
+
         return sanitized
 
     @property
