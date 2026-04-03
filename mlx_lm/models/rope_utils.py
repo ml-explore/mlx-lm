@@ -200,72 +200,36 @@ class ProportionalRoPE(nn.Module):
     def __init__(
         self,
         dims: int,
+        rotated_dims: int,
         traditional: bool = False,
         base: float = 10000.0,
-        scaling_config: Optional[dict] = None,
+        factor: float = 1.0,
     ):
         super().__init__()
         self.dims = dims
         self.traditional = traditional
 
-        scaling_config = scaling_config or {}
-        factor = scaling_config.get("factor", 1.0)
-        partial_rotary_factor = scaling_config.get("partial_rotary_factor", 1.0)
+        if rotated_dims > dims:
+            raise ValueError("rotated_dims should be smaller than dims")
 
-        rope_angles = int(partial_rotary_factor * dims // 2)
-        self.rotated_dims = 2 * rope_angles
-
-        if self.rotated_dims > 0:
-            exponents = mx.arange(0, self.rotated_dims, 2, dtype=mx.float32) / dims
-            self._freqs = factor * (base**exponents)
-        else:
-            self._freqs = None
+        exponents = mx.arange(0, rotated_dims, 2, dtype=mx.float32) / dims
+        self._freqs = mx.concatenate(
+            [
+                factor * (base**exponents),
+                mx.full(((dims - rotated_dims) // 2,), mx.inf),
+            ]
+        )
 
     def __call__(self, x, offset=0):
-        if self.rotated_dims <= 0:
-            return x
-
-        head = x[..., : self.dims]
-        tail = x[..., self.dims :]
-        half = self.dims // 2
-
-        # Hugging Face proportional RoPE applies rotary embedding to the first
-        # `rope_angles` dimensions of each half, not a contiguous prefix.
-        left = head[..., :half]
-        right = head[..., half:]
-        rotated = mx.concatenate(
-            [left[..., : self.rotated_dims // 2], right[..., : self.rotated_dims // 2]],
-            axis=-1,
-        )
-        rotated = mx.fast.rope(
-            rotated,
-            self.rotated_dims,
+        return mx.fast.rope(
+            x,
+            self.dims,
             traditional=self.traditional,
             base=None,
             scale=1.0,
             offset=offset,
             freqs=self._freqs,
         )
-
-        left = mx.concatenate(
-            [
-                rotated[..., : self.rotated_dims // 2],
-                left[..., self.rotated_dims // 2 :],
-            ],
-            axis=-1,
-        )
-        right = mx.concatenate(
-            [
-                rotated[..., self.rotated_dims // 2 :],
-                right[..., self.rotated_dims // 2 :],
-            ],
-            axis=-1,
-        )
-        head = mx.concatenate([left, right], axis=-1)
-
-        if tail.shape[-1] == 0:
-            return head
-        return mx.concatenate([head, tail], axis=-1)
 
 
 def initialize_rope(
@@ -329,9 +293,10 @@ def initialize_rope(
     elif rope_type == "proportional":
         return ProportionalRoPE(
             dims=dims,
+            rotated_dims=int(dims * scaling_config.get("partial_rotary_factor", 1.0)),
             traditional=traditional,
             base=base,
-            scaling_config=scaling_config,
+            factor=scaling_config.get("factor", 1.0),
         )
     elif rope_type == "mrope":
         mrope_section = scaling_config.get("mrope_section", [])
