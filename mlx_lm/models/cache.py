@@ -1454,7 +1454,20 @@ class BatchRotatingKVCache(_BaseCache):
             )
 
         offsets = [c.offset for c in caches]
-        lengths = [c.size() for c in caches]
+
+        # Pre-compute temporally-ordered tensors so we use actual shapes
+        # for sizing, not c.size() / c._idx which may disagree after
+        # ring buffer wrapping. Fixes #983, #1035.
+        ordered = []
+        for c in caches:
+            if c.keys is not None:
+                ordered.append(
+                    (c._temporal_order(c.keys), c._temporal_order(c.values))
+                )
+            else:
+                ordered.append((None, None))
+
+        lengths = [ok.shape[2] if ok is not None else 0 for ok, _ in ordered]
         max_length = max(lengths)
 
         # No cache has content so make an empty one
@@ -1470,11 +1483,11 @@ class BatchRotatingKVCache(_BaseCache):
 
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
-        for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
-            if c.keys is None:
+        for i, (p, l, (ok, ov)) in enumerate(zip(padding, lengths, ordered)):
+            if ok is None:
                 continue
-            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)
-            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)
+            keys[i : i + 1, :, p : p + l] = ok
+            values[i : i + 1, :, p : p + l] = ov
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
