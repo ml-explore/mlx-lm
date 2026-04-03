@@ -127,24 +127,19 @@ class TestMTP(unittest.TestCase):
         prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
         n_tokens = 10
 
-        def greedy(logprobs):
-            return mx.argmax(logprobs, axis=-1)
-
-        # Standard generation
+        # Standard generation, greedy (default sampler is argmax).
         std_cache = make_prompt_cache(self.model)
         std_tokens = []
         for i, (tok, _) in enumerate(
-            generate_step(prompt, self.model, sampler=greedy, prompt_cache=std_cache)
+            generate_step(prompt, self.model, prompt_cache=std_cache)
         ):
             std_tokens.append(int(tok))
             if i + 1 >= n_tokens:
                 break
 
-        # MTP generation
+        # MTP generation, greedy (sampler=None uses exact-match acceptance).
         mtp_tokens = []
-        for tok, _, _ in mtp_generate_step(
-            prompt, self.model, sampler=greedy, max_tokens=n_tokens
-        ):
+        for tok, _, _ in mtp_generate_step(prompt, self.model, max_tokens=n_tokens):
             mtp_tokens.append(int(tok))
             if len(mtp_tokens) >= n_tokens:
                 break
@@ -155,22 +150,20 @@ class TestMTP(unittest.TestCase):
             f"Token mismatch: std={std_tokens}, mtp={mtp_tokens}",
         )
 
-    def test_mtp_generate_runs(self):
-        """mtp_generate_step should complete without errors.
+    def test_mtp_probabilistic_acceptance_completes(self):
+        """mtp_generate_step should complete without errors with a stochastic sampler.
 
-        Exercises the full end-to-end path: prefill, backbone forward with
-        return_hidden, MTP draft generation, verification with n_confirmed,
-        SSM rollback on rejection, and MTP cache trimming.
+        Exercises the probabilistic acceptance path: min(1, p_target / p_draft).
         """
         prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
         n_tokens = 10
 
-        def greedy(logprobs):
-            return mx.argmax(logprobs, axis=-1)
+        def stochastic(logprobs):
+            return mx.random.categorical(logprobs)
 
         tokens = []
         for tok, _, _ in mtp_generate_step(
-            prompt, self.model, sampler=greedy, max_tokens=n_tokens
+            prompt, self.model, sampler=stochastic, max_tokens=n_tokens
         ):
             tokens.append(int(tok))
             if len(tokens) >= n_tokens:
