@@ -55,9 +55,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         new_weights = {}
         for k, v in weights.items():
-            if not k.startswith("model."):
-                new_weights[k] = v
-                continue
+            starts_w_model = k.startswith("model.")
 
             k = k.removeprefix("model.")
             if k.startswith(
@@ -69,6 +67,10 @@ class Model(nn.Module):
                     "embed_vision",
                 )
             ):
+                continue
+
+            if not starts_w_model:
+                new_weights[k] = v
                 continue
 
             if k.startswith("language_model"):
