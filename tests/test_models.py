@@ -736,6 +736,111 @@ class TestModels(unittest.TestCase):
         self.assertIn(mlx_norm_key, converted)
         self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
 
+    def test_gemma4_raw_hf_moe_expert_weights_split_for_switch_glu(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                    "enable_moe_block": True,
+                    "num_experts": 2,
+                    "top_k_experts": 1,
+                    "moe_intermediate_size": 3,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        gate_up = mx.arange(2 * 6 * 8, dtype=mx.float32).reshape(2, 6, 8)
+        down = mx.arange(2 * 8 * 3, dtype=mx.float32).reshape(2, 8, 3)
+
+        converted = model.sanitize(
+            {
+                "model.language_model.layers.0.experts.gate_up_proj": gate_up,
+                "model.language_model.layers.0.experts.down_proj": down,
+            }
+        )
+
+        gate_key = "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"
+        up_key = "language_model.model.layers.0.experts.switch_glu.up_proj.weight"
+        down_key = "language_model.model.layers.0.experts.switch_glu.down_proj.weight"
+
+        self.assertIn(gate_key, converted)
+        self.assertIn(up_key, converted)
+        self.assertIn(down_key, converted)
+        self.assertTrue(mx.array_equal(converted[gate_key], gate_up[:, :3, :]))
+        self.assertTrue(mx.array_equal(converted[up_key], gate_up[:, 3:, :]))
+        self.assertTrue(mx.array_equal(converted[down_key], down))
+        self.assertFalse(any("gate_up_proj" in k for k in converted))
+
+    def test_gemma4_moe_router_quantizes_to_8bit(self):
+        from mlx_lm.models import gemma4
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_lm.utils import quantize_model
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 64,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 64,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 128,
+                    "moe_intermediate_size": 128,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 64,
+                    "global_head_dim": 64,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                    "enable_moe_block": True,
+                    "num_experts": 8,
+                    "top_k_experts": 2,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+        model, config = quantize_model(
+            model,
+            {"model_type": "gemma4", "text_config": copy.deepcopy(args.text_config)},
+            group_size=64,
+            bits=4,
+        )
+
+        layer = model.language_model.model.layers[0]
+        self.assertIsInstance(layer.router.proj, nn.QuantizedLinear)
+        self.assertEqual(layer.router.proj.bits, 8)
+        self.assertIsInstance(layer.experts.switch_glu.gate_proj, QuantizedSwitchLinear)
+        self.assertEqual(layer.experts.switch_glu.gate_proj.bits, 4)
+        self.assertEqual(
+            config["quantization"]["language_model.model.layers.0.router.proj"]["bits"],
+            8,
+        )
+        self.assertEqual(config["quantization"]["bits"], 4)
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
