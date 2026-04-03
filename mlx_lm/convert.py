@@ -259,6 +259,8 @@ def convert(
             model,
             q_group_size,
         )
+    elif quant_predicate is None:
+        quant_predicate = getattr(model, "quant_predicate", None)
 
     parsed_overrides = None
     if q_overrides:

@@ -437,6 +437,52 @@ class TestConvertOverridePrecedence(unittest.TestCase):
         self.assertEqual(captured["override"]["bits"], 4)
         self.assertEqual(captured["override"]["group_size"], 32)
 
+    def test_q_overrides_preserve_model_quant_predicate_for_other_layers(self):
+        model = _Wrapper()
+        captured = {}
+
+        def predicate(path, _):
+            if path.endswith("gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        model.quant_predicate = predicate
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        def fake_quantize_model(
+            model,
+            config,
+            group_size,
+            bits,
+            mode="affine",
+            quant_predicate=None,
+        ):
+            captured["override"] = quant_predicate("model.lm_head", None)
+            captured["base"] = quant_predicate("model.layers.0.mlp.gate", None)
+            return model, config
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch(
+                    "mlx_lm.convert.quantize_model", side_effect=fake_quantize_model
+                ):
+                    with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            quantize=True,
+                            q_overrides=["lm_head=4"],
+                        )
+
+        self.assertEqual(
+            captured["override"],
+            {"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        self.assertEqual(captured["base"], {"group_size": 64, "bits": 8})
+
 
 if __name__ == "__main__":
     unittest.main()
