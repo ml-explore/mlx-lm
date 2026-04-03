@@ -56,8 +56,8 @@ class Model(Qwen3_5Model):
         # unlike backbone layers which use fused gate_up_proj.
         mtp_num = getattr(self.language_model.args, "mtp_num_hidden_layers", 0)
         num_experts = self.language_model.args.num_experts
-        for l in range(mtp_num):
-            prefix = f"language_model.mtp.layers.{l}.mlp"
+        for layer_idx in range(mtp_num):
+            prefix = f"language_model.mtp.layers.{layer_idx}.mlp"
             test_key = f"{prefix}.experts.0.gate_proj.weight"
             if test_key in new_weights:
                 for n in ["gate_proj", "up_proj", "down_proj"]:
