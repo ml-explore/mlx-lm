@@ -105,6 +105,11 @@ def _complete_square(x2, y2, xy):
     return x2 + mx.expand_dims(y2, -1) - 2 * xy
 
 
+@partial(mx.compile, shapeless=True)
+def geglu(gate, x):
+    return nn.gelu_approx(gate) * x
+
+
 class MLP(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int = 0):
         super().__init__()
@@ -159,7 +164,7 @@ class GeGLU(nn.Module):
     """GELU-gated linear unit activation for SwitchGLU."""
 
     def __call__(self, x, gate):
-        return nn.gelu_approx(gate) * x
+        return geglu(gate, x)
 
 
 class Experts(nn.Module):
@@ -271,11 +276,11 @@ class Attention(nn.Module):
             values = self.v_norm(values)
             values = values.transpose(0, 2, 1, 3)
 
-            if cache is not None:
-                keys, values = cache.update_and_fetch(keys, values)
-
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
 
         if mask is not None and isinstance(mask, mx.array):
             if mask.shape[-1] != keys.shape[-2]:
