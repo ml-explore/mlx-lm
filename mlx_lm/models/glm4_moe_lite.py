@@ -18,7 +18,7 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "glm4_moe_lite"
+    model_type: str
     vocab_size: int = 154880
     hidden_size: int = 2048
     intermediate_size: int = 10240
@@ -44,7 +44,7 @@ class ModelArgs(BaseModelArgs):
     first_k_dense_replace: int = 1
     max_position_embeddings: int = 202752
     rms_norm_eps: float = 1e-5
-    rope_theta: float = 1_000_000.0
+    rope_theta: float = 1000000.0
     rope_scaling: Optional[Dict] = None
     attention_bias: bool = False
     attention_dropout: float = 0.0
@@ -52,6 +52,12 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
     quantization: Optional[Dict[str, Any]] = None
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 class Glm4MoeLiteAttention(nn.Module):

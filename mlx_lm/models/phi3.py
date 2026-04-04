@@ -28,8 +28,14 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
+            self.rope_traditional = self.rope_parameters.get("rope_traditional", False)
+
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 

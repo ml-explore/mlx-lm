@@ -1,8 +1,6 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -49,6 +47,11 @@ class ModelArgs(BaseModelArgs):
     swa_head_dim: int
     swa_v_head_dim: int
     partial_rotary_factor: int
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 class Attention(nn.Module):

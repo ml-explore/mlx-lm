@@ -36,3 +36,9 @@ class ModelArgs(BaseModelArgs):
     topk_group: int = 1
     scoring_func: str = "sigmoid"
     topk_method: str = "noaux_tc"
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters

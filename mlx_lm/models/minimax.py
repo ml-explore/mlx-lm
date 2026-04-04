@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, List, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -32,6 +32,11 @@ class ModelArgs(BaseModelArgs):
     scoring_func: str = "sigmoid"
     head_dim: Optional[int] = None
     use_qk_norm: bool = True
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 @lru_cache

@@ -30,8 +30,12 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         if self.layer_types is None:
