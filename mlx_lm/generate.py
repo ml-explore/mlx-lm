@@ -1643,8 +1643,11 @@ class BatchGenerator:
             return cache.make_prompt_cache(self.model)
 
         return [
-            RotatingKVCache(max_size=self.max_kv_size) if isinstance(ci, KVCache)
-            else ci
+            (
+                RotatingKVCache(max_size=self.max_kv_size)
+                if isinstance(ci, KVCache)
+                else ci
+            )
             for ci in cache.make_prompt_cache(self.model)
         ]
 
