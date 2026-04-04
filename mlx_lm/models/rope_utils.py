@@ -196,6 +196,42 @@ class YarnRoPE(nn.Module):
         )
 
 
+class ProportionalRoPE(nn.Module):
+    def __init__(
+        self,
+        dims: int,
+        rotated_dims: int,
+        traditional: bool = False,
+        base: float = 10000.0,
+        factor: float = 1.0,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+
+        if rotated_dims > dims:
+            raise ValueError("rotated_dims should be smaller than dims")
+
+        exponents = mx.arange(0, rotated_dims, 2, dtype=mx.float32) / dims
+        self._freqs = mx.concatenate(
+            [
+                factor * (base**exponents),
+                mx.full(((dims - rotated_dims) // 2,), mx.inf),
+            ]
+        )
+
+    def __call__(self, x, offset=0):
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=self.traditional,
+            base=None,
+            scale=1.0,
+            offset=offset,
+            freqs=self._freqs,
+        )
+
+
 def initialize_rope(
     dims,
     base,
@@ -253,6 +289,14 @@ def initialize_rope(
             ],
             short_factor=scaling_config["short_factor"],
             long_factor=scaling_config["long_factor"],
+        )
+    elif rope_type == "proportional":
+        return ProportionalRoPE(
+            dims=dims,
+            rotated_dims=int(dims * scaling_config.get("partial_rotary_factor", 1.0)),
+            traditional=traditional,
+            base=base,
+            factor=scaling_config.get("factor", 1.0),
         )
     elif rope_type == "mrope":
         mrope_section = scaling_config.get("mrope_section", [])
