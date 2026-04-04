@@ -23,6 +23,7 @@ from mlx_lm.models.cache import (
     save_prompt_cache,
     trim_prompt_cache,
 )
+from mlx_lm.models.turboquant import TurboQuantKVCache
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
@@ -671,6 +672,132 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+    def test_turboquant_cache_basic(self):
+        """Test TurboQuantKVCache update_and_fetch, offset, shapes."""
+        for bits in [2, 3, 4]:
+            c = TurboQuantKVCache(bits=bits)
+            self.assertTrue(c.empty())
+            self.assertEqual(c.size(), 0)
+
+            # Prefill
+            k = mx.random.uniform(shape=(1, 8, 10, 64))
+            v = mx.random.uniform(shape=(1, 8, 10, 64))
+            dk, dv = c.update_and_fetch(k, v)
+            mx.eval(dk, dv)
+
+            self.assertEqual(c.size(), 10)
+            self.assertFalse(c.empty())
+            self.assertEqual(dk.shape, (1, 8, 10, 64))
+            self.assertEqual(dv.shape, (1, 8, 10, 64))
+
+            # Decode step
+            k2 = mx.random.uniform(shape=(1, 8, 1, 64))
+            v2 = mx.random.uniform(shape=(1, 8, 1, 64))
+            dk2, dv2 = c.update_and_fetch(k2, v2)
+            mx.eval(dk2, dv2)
+
+            self.assertEqual(c.size(), 11)
+            self.assertEqual(dk2.shape, (1, 8, 11, 64))
+
+    def test_turboquant_cache_quality(self):
+        """Test that TurboQuant dequantized output is close to input."""
+        c = TurboQuantKVCache(bits=4)
+        k = mx.random.normal(shape=(1, 8, 32, 128))
+        v = mx.random.normal(shape=(1, 8, 32, 128))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv, k, v)
+
+        # Cosine similarity per vector should be high at 4-bit
+        cos_k = mx.mean(
+            mx.sum(k * dk, axis=-1)
+            / (mx.linalg.norm(k, axis=-1) * mx.linalg.norm(dk, axis=-1) + 1e-8)
+        )
+        mx.eval(cos_k)
+        self.assertGreater(float(cos_k), 0.95)
+
+    def test_turboquant_cache_trim(self):
+        """Test TurboQuantKVCache trim."""
+        c = TurboQuantKVCache(bits=3)
+        k = mx.random.uniform(shape=(1, 4, 8, 64))
+        c.update_and_fetch(k, k)
+        self.assertEqual(c.size(), 8)
+        self.assertTrue(c.is_trimmable())
+
+        trimmed = c.trim(3)
+        self.assertEqual(trimmed, 3)
+        self.assertEqual(c.size(), 5)
+
+    def test_turboquant_save_load(self):
+        """Test TurboQuantKVCache save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "turbo_cache.safetensors")
+
+        cache = [TurboQuantKVCache(bits=3) for _ in range(4)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 10, 64))
+            c.update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self.assertEqual(len(cache), len(loaded_cache))
+
+        for c, lc in zip(cache, loaded_cache):
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c.turbo_bits, lc.turbo_bits)
+
+    def test_turboquant_to_turboquant(self):
+        """Test KVCache.to_turboquant conversion."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turboquant(bits=4)
+        self.assertEqual(tq_cache.size(), 16)
+        self.assertFalse(tq_cache.empty())
+
+    def test_turboquant_with_model(self):
+        """Test TurboQuantKVCache with actual model generation."""
+        num_layers = len(self.model.layers)
+        args = self.model.args
+        head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
+
+        # FP16 baseline
+        fp16_cache = [KVCache() for _ in range(num_layers)]
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        logits_fp16 = self.model(prompt, cache=fp16_cache)
+        mx.eval(logits_fp16)
+
+        # TurboQuant
+        tq_cache = [TurboQuantKVCache(bits=4) for _ in range(num_layers)]
+        logits_tq = self.model(prompt, cache=tq_cache)
+        mx.eval(logits_tq)
+
+        self.assertEqual(logits_fp16.shape, logits_tq.shape)
+
+        # Logit cosine similarity should be reasonable
+        l1 = logits_fp16[0, -1].astype(mx.float32)
+        l2 = logits_tq[0, -1].astype(mx.float32)
+        cos = float(
+            mx.sum(l1 * l2) / (mx.linalg.norm(l1) * mx.linalg.norm(l2) + 1e-8)
+        )
+        self.assertGreater(cos, 0.9)
+
+    def test_turboquant_nbytes(self):
+        """Test TurboQuantKVCache memory is less than FP16."""
+        kv = KVCache()
+        tq = TurboQuantKVCache(bits=3)
+
+        k = mx.random.uniform(shape=(1, 8, 256, 128))
+        v = mx.random.uniform(shape=(1, 8, 256, 128))
+
+        kv.update_and_fetch(k, v)
+        tq.update_and_fetch(k, v)
+        mx.eval(kv.keys, tq._k_indices)
+
+        self.assertLess(tq.nbytes, kv.nbytes)
 
 
 if __name__ == "__main__":
