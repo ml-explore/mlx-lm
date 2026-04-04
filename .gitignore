@@ -9,6 +9,17 @@ __pycache__/
 # Vim
 *.swp
 
+ckpt-*/*
+
+sov-30b-fp8/*
+sov-30b-bf16/*
+sarvam_moe-mxfp4/*
+Qwen3-30B-A3B-DWQ/*
+sarvam_moe-DWQ/*
+chat_template.jinja
+tokenizer_config.json
+tokenizer.json
+
 # Distribution / packaging
 .Python
 build/
@@ -137,3 +148,7 @@ dmypy.json
 
 # .DS_Store files
 .DS_Store
+mlx_model/config.json
+mlx_model/generation_config.json
+mlx_model/model.safetensors.index.json
+mlx_model/model.safetensors
