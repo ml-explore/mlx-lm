@@ -507,6 +507,8 @@ def sharded_load(
     pipeline_group: Optional[mx.distributed.Group] = None,
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
+    *,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -571,7 +573,7 @@ def sharded_load(
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
-        {"trust_remote_code": True},
+        tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)

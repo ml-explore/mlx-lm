@@ -222,7 +222,7 @@ def setup_arg_parser():
 
 
 # A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+generation_stream = mx.ThreadLocalStream(mx.default_device())
 
 
 @contextlib.contextmanager
@@ -1489,6 +1489,7 @@ class BatchGenerator:
     def __init__(
         self,
         model: nn.Module,
+        *,
         max_tokens: int = 128,
         stop_tokens: Optional[Sequence[Sequence[int]]] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -1498,6 +1499,7 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        stream=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1507,6 +1509,8 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+
+        self._stream = stream or generation_stream
 
         self._default_state_machine = SequenceStateMachine(
             {"normal": [(seq, None) for seq in stop_tokens]} if stop_tokens else {},
@@ -1534,9 +1538,13 @@ class BatchGenerator:
         else:
             self._old_wired_limit = None
 
+    @property
+    def stream(self):
+        return self._stream
+
     def close(self):
         if self._old_wired_limit is not None:
-            mx.synchronize(generation_stream)
+            mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -1820,7 +1828,7 @@ class BatchGenerator:
         Returns:
             Tuple of prompt processing responses and generation responses.
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             return self._next()
 
     def next_generated(self):
@@ -1830,7 +1838,7 @@ class BatchGenerator:
         Returns:
             List of GenerationBatch.Response objects
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             while True:
                 prompt_responses, generation_responses = self._next()
                 if not generation_responses and prompt_responses:
