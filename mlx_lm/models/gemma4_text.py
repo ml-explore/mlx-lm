@@ -113,13 +113,11 @@ def geglu(gate, x):
 class MLP(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int = 0):
         super().__init__()
-        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
-            config, "num_kv_shared_layers", 0
+        first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
         )
         is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
-        use_double_wide = (
-            getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
-        )
+        use_double_wide = config.use_double_wide_mlp and is_kv_shared_layer
         intermediate_size = config.intermediate_size * (2 if use_double_wide else 1)
 
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
@@ -136,16 +134,14 @@ class Router(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
-        self.norm = RMSNormNoScale(config.hidden_size, eps=config.rms_norm_eps)
+        self.eps = config.rms_norm_eps
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.scale = mx.ones((config.hidden_size,))
         self.per_expert_scale = mx.ones((config.num_experts,))
         self._root_size = config.hidden_size**-0.5
 
     def __call__(self, x: mx.array):
-        x = self.norm(x)
-        x = x * self._root_size
-        x = x * self.scale
+        x = mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
 
         expert_scores = self.proj(x)
         router_probs = mx.softmax(expert_scores, axis=-1)
@@ -314,7 +310,7 @@ class DecoderLayer(nn.Module):
         )
 
         # MoE (26B model)
-        self.enable_moe = getattr(config, "enable_moe_block", False)
+        self.enable_moe = config.enable_moe_block
         if self.enable_moe:
             self.router = Router(config)
             self.experts = Experts(config)
@@ -329,9 +325,7 @@ class DecoderLayer(nn.Module):
             )
 
         # Per-layer input gating (2B/4B models)
-        self.hidden_size_per_layer_input = getattr(
-            config, "hidden_size_per_layer_input", 0
-        )
+        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
             self.per_layer_input_gate = nn.Linear(
                 config.hidden_size, self.hidden_size_per_layer_input, bias=False
@@ -610,8 +604,8 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = Gemma4TextModel(args)
-        self.final_logit_softcapping = getattr(args, "final_logit_softcapping", None)
-        self.tie_word_embeddings = getattr(args, "tie_word_embeddings", True)
+        self.final_logit_softcapping = args.final_logit_softcapping
+        self.tie_word_embeddings = args.tie_word_embeddings
         if not self.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
