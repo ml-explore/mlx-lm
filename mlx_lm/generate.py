@@ -671,7 +671,7 @@ def mtp_generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
-    prefill_step_size: int = 512,
+    prefill_step_size: int = 2048,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
@@ -778,11 +778,14 @@ def mtp_generate_step(
         return draft_tok, draft_lp
 
     def _prefill(y):
-        while y.size > prefill_step_size:
-            model(y[:prefill_step_size][None], cache=model_cache)
+        # Leave exactly 1 token for _step_backbone: return_hidden=True keeps
+        # the hidden state [1, N, d_model] live, so N must be 1.
+        while y.size > 1:
+            n = min(prefill_step_size, y.size - 1)
+            model(y[:n][None], cache=model_cache)
             quantize_cache_fn(model_cache)
             mx.eval([c.state for c in model_cache if hasattr(c, "state")])
-            y = y[prefill_step_size:]
+            y = y[n:]
             mx.clear_cache()
         return y
 
