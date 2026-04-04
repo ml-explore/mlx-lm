@@ -298,6 +298,8 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for name, param in weights.items():
+            if name == "lm_head.weight":
+                continue
             if "conv.weight" in name:
                 if param.shape[-1] > param.shape[1]:
                     param = param.transpose(0, 2, 1)
