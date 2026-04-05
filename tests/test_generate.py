@@ -15,7 +15,7 @@ from mlx_lm.generate import (
     generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -718,6 +718,57 @@ class TestGenerate(unittest.TestCase):
         while responses := gen.next_generated():
             if all(r.finish_reason is not None for r in responses):
                 break
+
+    def test_batch_max_kv_size_creates_rotating_cache(self):
+        max_kv_size = 256
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            max_kv_size=max_kv_size,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertIsInstance(cache, RotatingKVCache)
+                    self.assertEqual(cache.max_size, max_kv_size)
+
+    def test_batch_max_kv_size_limits_cache_growth(self):
+        max_kv_size = 5
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=10,
+            max_kv_size=max_kv_size,
+            prefill_batch_size=1,
+            prefill_step_size=128,
+            completion_batch_size=1,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertLessEqual(cache.keys.shape[2], max_kv_size)
+
+    def test_batch_max_kv_size_none_creates_regular_cache(self):
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            max_kv_size=None,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertIsInstance(cache, KVCache)
 
 
 if __name__ == "__main__":
