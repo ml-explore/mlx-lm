@@ -163,13 +163,9 @@ class TestUtils(unittest.TestCase):
             bits=4,
         )
 
-        config["quantization"] = {
+        config["quantization"]["language_model.model.per_layer_model_projection"] = {
             "group_size": 32,
             "bits": 4,
-            "language_model.model.per_layer_model_projection": {
-                "group_size": 32,
-                "bits": 4,
-            },
         }
 
         with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
