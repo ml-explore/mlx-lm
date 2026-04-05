@@ -1336,7 +1336,7 @@ class GenerationBatch:
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
                 for processor in self.logits_processors[e]:
-                    sample_logits = processor(self.tokens[e], sample_logits)
+                    sample_logits = processor(self._token_context[e], sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -1876,7 +1876,12 @@ def batch_generate(
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     return_prompt_caches: bool = False,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    logits_processors: Optional[
+        Union[
+            List[Callable[[mx.array, mx.array], mx.array]],
+            List[List[Callable[[mx.array, mx.array], mx.array]]],
+        ]
+    ] = None,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1895,8 +1900,11 @@ def batch_generate(
           can be per prompt if a list is provided.
        return_prompt_caches (bool): Return the prompt caches in the batch
           responses. Default: ``False``.
-       logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
-          A list of functions that take tokens and logits and return the processed logits. Default: ``None``.
+       logits_processors
+          Either a shared list of processors applied to every prompt or a
+          per-prompt list of processor lists. Each processor takes the token
+          history and current logits and returns the processed logits.
+          Default: ``None``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
@@ -1914,7 +1922,15 @@ def batch_generate(
     if isinstance(max_tokens, int):
         max_tokens = [max_tokens] * len(prompts)
 
-    uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
+    if logits_processors and all(callable(processor) for processor in logits_processors):
+        logits_processors = [logits_processors] * len(prompts)
+
+    uids = gen.insert(
+        prompts,
+        max_tokens,
+        caches=prompt_caches,
+        logits_processors=logits_processors,
+    )
     results = {uid: [] for uid in uids}
     prompt_caches = {}
     with gen.stats() as stats:
