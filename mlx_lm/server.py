@@ -1531,12 +1531,13 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
-            choice[key_name] = {
-                "role": "assistant",
-                "content": text,
-                "reasoning": reasoning_text,
-                "tool_calls": tool_calls,
-            }
+            choice[key_name] = {"role": "assistant"}
+            if text:
+                choice[key_name]["content"] = text
+            if reasoning_text:
+                choice[key_name]["reasoning"] = reasoning_text
+            if tool_calls:
+                choice[key_name]["tool_calls"] = tool_calls
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:

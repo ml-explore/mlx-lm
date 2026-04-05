@@ -3,6 +3,7 @@ from pathlib import Path
 
 from mlx_lm.tool_parsers import (
     function_gemma,
+    gemma4,
     glm47,
     json_tools,
     kimi_k2,
@@ -18,6 +19,7 @@ class TestToolParsing(unittest.TestCase):
     def test_parsers(self):
         test_cases = [
             ("call:multiply{a:12234585,b:48838483920}", function_gemma),
+            ("call:multiply{a:12234585,b:48838483920}", gemma4),
             (
                 '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
                 glm47,
@@ -88,6 +90,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 "call:get_current_temperature{location:<escape>London<escape>}",
                 function_gemma,
+            ),
+            (
+                'call:get_current_temperature{location:<|"|>London<|"|>}',
+                gemma4,
             ),
             (
                 'get_current_temperature<arg_key>location</arg_key><arg_value>"London"</arg_value>',
@@ -190,6 +196,31 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+    def test_gemma4(self):
+        # Nested object
+        test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "configure")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"settings": {"enabled": True, "name": "test"}},
+        )
+
+        # Array of strings
+        test_case = 'call:tag{items:[<|"|>foo<|"|>,<|"|>bar<|"|>]}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "tag")
+        self.assertEqual(tool_call["arguments"], {"items": ["foo", "bar"]})
+
+        # Mixed types
+        test_case = 'call:search{query:<|"|>hello world<|"|>,limit:10,verbose:false}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "search")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"query": "hello world", "limit": 10, "verbose": False},
+        )
 
     def test_kimi_k2(self):
         # Single tool call
