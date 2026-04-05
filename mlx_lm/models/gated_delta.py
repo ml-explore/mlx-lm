@@ -81,6 +81,8 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
             if (thread_index_in_simdgroup == 0) {{
               y[dv_idx] = static_cast<InT>(out);
             }}
+          }} else {{
+            y[dv_idx] = static_cast<InT>(0);
           }}
           // Increment data pointers to next time step
           q_ += Hk * Dk;

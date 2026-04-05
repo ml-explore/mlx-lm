@@ -242,6 +242,43 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
 
+        rope = rope_utils.initialize_rope(
+            16,
+            base=100.0,
+            traditional=False,
+            scaling_config={
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.5,
+            },
+        )
+        self.assertTrue(isinstance(rope, rope_utils.ProportionalRoPE))
+        expected_freqs = 100.0 ** (mx.arange(0, 8, 2, dtype=mx.float32) / 16)
+        self.assertTrue(mx.allclose(rope._freqs[:4], expected_freqs))
+        self.assertTrue(mx.all(mx.isinf(rope._freqs[4:])))
+
+        x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 1, 16)
+        y = rope(x, offset=1)
+        expected_rotated = mx.fast.rope(
+            mx.concatenate([x[..., :4], x[..., 8:12]], axis=-1),
+            8,
+            traditional=False,
+            base=None,
+            scale=1.0,
+            offset=1,
+            freqs=expected_freqs,
+        )
+        expected = mx.concatenate(
+            [
+                expected_rotated[..., :4],
+                x[..., 4:8],
+                expected_rotated[..., 4:],
+                x[..., 12:],
+            ],
+            axis=-1,
+        )
+        mx.eval(y, expected)
+        self.assertTrue(mx.allclose(y, expected))
+
     def test_su_scaled_rope_no_mutation(self):
         rope = rope_utils.SuScaledRoPE(
             dims=8,
@@ -611,6 +648,199 @@ class TestModels(unittest.TestCase):
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
+
+    def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        base = mx.arange(8, dtype=mx.float32)
+        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+
+        converted = model.sanitize(
+            {
+                hf_norm_key: base,
+                "model.vision_tower.stub": mx.zeros((1,), dtype=mx.float32),
+            }
+        )
+        self.assertIn(mlx_norm_key, converted)
+        self.assertNotIn(
+            "language_model.model.model.layers.0.input_layernorm.weight", converted
+        )
+        self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
+        self.assertFalse(any("vision_tower" in k for k in converted))
+
+        loaded = model.sanitize({mlx_norm_key: base})
+        self.assertIn(mlx_norm_key, loaded)
+        self.assertNotIn(
+            "language_model.model.model.layers.0.input_layernorm.weight", loaded
+        )
+        self.assertTrue(mx.array_equal(loaded[mlx_norm_key], base))
+
+    def test_gemma4_raw_hf_language_model_prefixes_model(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        base = mx.arange(8, dtype=mx.float32)
+        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+
+        converted = model.sanitize({hf_norm_key: base})
+        self.assertIn(mlx_norm_key, converted)
+        self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
+
+    def test_gemma4_raw_hf_moe_expert_weights_split_for_switch_glu(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                    "enable_moe_block": True,
+                    "num_experts": 2,
+                    "top_k_experts": 1,
+                    "moe_intermediate_size": 3,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        gate_up = mx.arange(2 * 6 * 8, dtype=mx.float32).reshape(2, 6, 8)
+        down = mx.arange(2 * 8 * 3, dtype=mx.float32).reshape(2, 8, 3)
+
+        converted = model.sanitize(
+            {
+                "model.language_model.layers.0.experts.gate_up_proj": gate_up,
+                "model.language_model.layers.0.experts.down_proj": down,
+            }
+        )
+
+        gate_key = "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"
+        up_key = "language_model.model.layers.0.experts.switch_glu.up_proj.weight"
+        down_key = "language_model.model.layers.0.experts.switch_glu.down_proj.weight"
+
+        self.assertIn(gate_key, converted)
+        self.assertIn(up_key, converted)
+        self.assertIn(down_key, converted)
+        self.assertTrue(mx.array_equal(converted[gate_key], gate_up[:, :3, :]))
+        self.assertTrue(mx.array_equal(converted[up_key], gate_up[:, 3:, :]))
+        self.assertTrue(mx.array_equal(converted[down_key], down))
+        self.assertFalse(any("gate_up_proj" in k for k in converted))
+
+    def test_gemma4_moe_router_quantizes_to_8bit(self):
+        from mlx_lm.models import gemma4
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_lm.utils import quantize_model
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 64,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 64,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 128,
+                    "moe_intermediate_size": 128,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 64,
+                    "global_head_dim": 64,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                    "enable_moe_block": True,
+                    "num_experts": 8,
+                    "top_k_experts": 2,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+        model, config = quantize_model(
+            model,
+            {"model_type": "gemma4", "text_config": copy.deepcopy(args.text_config)},
+            group_size=64,
+            bits=4,
+        )
+
+        layer = model.language_model.model.layers[0]
+        self.assertIsInstance(layer.router.proj, nn.QuantizedLinear)
+        self.assertEqual(layer.router.proj.bits, 8)
+        self.assertIsInstance(layer.experts.switch_glu.gate_proj, QuantizedSwitchLinear)
+        self.assertEqual(layer.experts.switch_glu.gate_proj.bits, 4)
+        self.assertEqual(
+            config["quantization"]["language_model.model.layers.0.router.proj"]["bits"],
+            8,
+        )
+        self.assertEqual(config["quantization"]["bits"], 4)
 
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
@@ -1231,6 +1461,134 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gemma4_text(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=10,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=4,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                },
+            },
+        )
+        model = gemma4_text.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_gemma4_quantized_embedding_preserves_lookup_scale(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            sliding_window=8,
+            sliding_window_pattern=1,
+            layer_types=["full_attention"],
+            hidden_size_per_layer_input=0,
+            vocab_size=4,
+            num_kv_shared_layers=0,
+        )
+        model = gemma4_text.Gemma4TextModel(args)
+        model.embed_tokens.weight = mx.ones((4, 32), dtype=mx.float32)
+        model.embed_tokens = model.embed_tokens.to_quantized(group_size=32, bits=8)
+
+        token_ids = mx.array([[0, 1]], dtype=mx.int32)
+        lookup = model.embed_tokens(token_ids) * model.embed_scale
+        logits = model.embed_tokens.as_linear(mx.ones((1, 1, 32), dtype=mx.float32))
+        mx.eval(lookup, logits)
+
+        self.assertTrue(
+            mx.allclose(
+                lookup,
+                mx.ones((1, 2, 32), dtype=mx.float32) * (32.0**0.5),
+            )
+        )
+        self.assertTrue(
+            mx.allclose(logits, mx.ones((1, 1, 4), dtype=mx.float32) * 32.0)
+        )
+
+    def test_gemma4_input_embeddings_reconstruct_per_layer_inputs(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            sliding_window=8,
+            sliding_window_pattern=1,
+            layer_types=["full_attention", "full_attention"],
+            hidden_size_per_layer_input=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            num_kv_shared_layers=0,
+        )
+        model = gemma4_text.Model(args)
+        tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+        embeddings = model.model.embed_tokens(tokens)
+        per_layer_inputs = model.model._get_per_layer_inputs(tokens)
+
+        direct = model(tokens)
+        from_embeddings = model(None, input_embeddings=embeddings)
+        explicit = model(
+            None,
+            input_embeddings=embeddings,
+            per_layer_inputs=per_layer_inputs,
+        )
+        mx.eval(direct, from_embeddings, explicit)
+
+        self.assertTrue(
+            mx.allclose(direct.astype(mx.float32), from_embeddings.astype(mx.float32))
+        )
+        self.assertTrue(
+            mx.allclose(direct.astype(mx.float32), explicit.astype(mx.float32))
+        )
+
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
 
@@ -1663,6 +2021,50 @@ class TestModels(unittest.TestCase):
                 "rope_scaling": None,
                 "sliding_window": 8,
                 "sliding_window_pattern": "LLGL",
+            },
+            {
+                "model_type": "gemma4",
+                "num_hidden_layers": 10,
+                "vocab_size": 1000,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 10,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "head_dim": 32,
+                    "global_head_dim": 64,
+                    "rms_norm_eps": 1e-6,
+                    "vocab_size": 1000,
+                    "vocab_size_per_layer_input": 1000,
+                    "num_key_value_heads": 1,
+                    "num_kv_shared_layers": 4,
+                    "hidden_size_per_layer_input": 32,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 5,
+                    "final_logit_softcapping": 30.0,
+                    "layer_types": [
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "partial_rotary_factor": 0.25,
+                            "rope_theta": 1000000.0,
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                        },
+                    },
+                },
             },
             {
                 "model_type": "gemma3n",

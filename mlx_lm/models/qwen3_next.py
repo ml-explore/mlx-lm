@@ -266,7 +266,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
                 cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
             else:
-                cache[0] = conv_input[:, -n_keep:, :]
+                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
 
         conv_out = nn.silu(self.conv1d(conv_input))
 
