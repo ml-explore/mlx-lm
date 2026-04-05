@@ -125,8 +125,8 @@ def gptq_quantize(
 
                 W[..., k : k + j] -= e @ Hinv[k : k + 1, k : k + j]
                 err[..., k : k + 1] = e
-                mx.eval(err, W)
 
+            mx.eval(err, W)
             W[..., j:] -= err @ Hinv[i:j, j:]
 
         # Quantize with the given scales and biases
