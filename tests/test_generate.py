@@ -9,12 +9,13 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
+    SequenceStateMachine,
     batch_generate,
     generate,
     generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -199,7 +200,7 @@ class TestGenerate(unittest.TestCase):
             self.model, stop_tokens=self.tokenizer.eos_token_ids, max_tokens=1
         )
         uids = gen.insert(prompts)
-        batch_responses = {r.uid: r for r in gen.next()}
+        batch_responses = {r.uid: r for r in gen.next_generated()}
 
         # Do a test for each prompt the logits are close
         for e, prompt in enumerate(prompts):
@@ -241,7 +242,7 @@ class TestGenerate(unittest.TestCase):
         batch_responses = {}
         not_in = True
         iters = 0
-        while responses := gen.next():
+        while responses := gen.next_generated():
             for r in responses:
                 not_in &= r.uid not in batch_responses
                 batch_responses[r.uid] = r
@@ -289,7 +290,7 @@ class TestGenerate(unittest.TestCase):
         num_toks = [2, 3, 4, 5]
         uids = gen.insert(prompts, max_tokens=num_toks)
         batch_responses = {uid: [] for uid in uids}
-        while responses := gen.next():
+        while responses := gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.token)
 
@@ -337,7 +338,7 @@ class TestGenerate(unittest.TestCase):
         )
         uids = batch_gen.insert(prompts)
         batch_responses = {uid: [] for uid in uids}
-        while responses := batch_gen.next():
+        while responses := batch_gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.logprobs)
 
@@ -370,7 +371,7 @@ class TestGenerate(unittest.TestCase):
         )
         prompt = self.tokenizer.encode("hello")
         uids = batch_gen.insert([prompt])
-        response = batch_gen.next()[0]
+        response = batch_gen.next_generated()[0]
         logprobs = response.logprobs
         self.assertEqual(logprobs[0].item(), 0.0)
         self.assertEqual(logprobs.argmin().item(), 1)
@@ -395,7 +396,7 @@ class TestGenerate(unittest.TestCase):
         processors = make_logits_processors(logit_bias)
         (uid2,) = batch_gen.insert([prompt], logits_processors=[processors])
 
-        responses = batch_gen.next()
+        responses = batch_gen.next_generated()
         responses = {response.uid: response for response in responses}
         self.assertEqual(responses[uid0].logprobs[0].item(), 0.0)
         self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
@@ -410,7 +411,7 @@ class TestGenerate(unittest.TestCase):
         )
         prompt = self.tokenizer.encode("hello")
         uids = batch_gen.insert([prompt])
-        response = batch_gen.next()[0]
+        response = batch_gen.next_generated()[0]
         self.assertEqual(response.token, 1)
 
         del batch_gen
@@ -427,11 +428,46 @@ class TestGenerate(unittest.TestCase):
             samplers=[lambda _: mx.array([2]), lambda _: mx.array([3])],
         )
 
-        responses = batch_gen.next()
+        responses = batch_gen.next_generated()
         responses = {response.uid: response for response in responses}
         self.assertEqual(responses[uid0].token, 1)
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
+
+    def test_batch_generate_with_state_machines(self):
+        """Test that batch_generate with per-sequence state_machines stops on different tokens."""
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=10,
+        )
+        prompt = self.tokenizer.encode("hello")
+
+        sm_0 = SequenceStateMachine({"normal": [([0], None)]}, initial="normal")
+        sm_1 = SequenceStateMachine({"normal": [([1], None)]}, initial="normal")
+        sm_2 = SequenceStateMachine({"normal": [([2], None)]}, initial="normal")
+
+        processor_0 = make_logits_processors({0: 2000.0})
+        processor_1 = make_logits_processors({1: 2000.0})
+        processor_2 = make_logits_processors({2: 2000.0})
+
+        uid0, uid1, uid2 = batch_gen.insert(
+            [prompt, prompt, prompt],
+            logits_processors=[processor_0, processor_1, processor_2],
+            state_machines=[sm_0, sm_1, sm_2],
+        )
+
+        responses = batch_gen.next_generated()
+        responses = {response.uid: response for response in responses}
+
+        self.assertEqual(responses[uid0].token, 0)
+        self.assertEqual(responses[uid1].token, 1)
+        self.assertEqual(responses[uid2].token, 2)
+        self.assertEqual(responses[uid0].finish_reason, "stop")
+        self.assertEqual(responses[uid1].finish_reason, "stop")
+        self.assertEqual(responses[uid2].finish_reason, "stop")
+        self.assertEqual(responses[uid0].match_sequence, (0,))
+        self.assertEqual(responses[uid1].match_sequence, (1,))
+        self.assertEqual(responses[uid2].match_sequence, (2,))
 
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
@@ -481,7 +517,7 @@ class TestGenerate(unittest.TestCase):
             )
             uids = batch_gen.insert(prompts_a)
             caches = {uid: None for uid in uids}
-            while responses := batch_gen.next():
+            while responses := batch_gen.next_generated():
                 for r in responses:
                     if r.finish_reason is not None:
                         caches[r.uid] = r.prompt_cache
@@ -490,7 +526,7 @@ class TestGenerate(unittest.TestCase):
             # Generate the 2nd time
             uids = batch_gen.insert(prompts_b, caches=caches)
             batch_responses = {uid: [] for uid in uids}
-            while responses := batch_gen.next():
+            while responses := batch_gen.next_generated():
                 for r in responses:
                     batch_responses[r.uid].append(r.logprobs)
 
@@ -543,7 +579,7 @@ class TestGenerate(unittest.TestCase):
 
         uids = batch_gen.insert(prompts_a)
         caches = {uid: None for uid in uids}
-        while responses := batch_gen.next():
+        while responses := batch_gen.next_generated():
             for r in responses:
                 if r.finish_reason is not None:
                     caches[r.uid] = r.prompt_cache
@@ -553,7 +589,7 @@ class TestGenerate(unittest.TestCase):
         # Generate the 2nd time
         uids = batch_gen.insert(prompts_b, caches=caches)
         batch_responses = {uid: [] for uid in uids}
-        while responses := batch_gen.next():
+        while responses := batch_gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.logprobs)
 
@@ -631,6 +667,108 @@ class TestGenerate(unittest.TestCase):
         )
         model = qwen3_next.Model(args)
         self._continued_generation_test_helper(model)
+
+    def test_extend_cache_with_empty(self):
+        from mlx_lm.generate import _extend_cache
+        from mlx_lm.models.cache import make_prompt_cache
+
+        cache_a = make_prompt_cache(self.model)
+
+        prompt = mx.array([[1, 2, 3]])
+        self.model(prompt, cache=cache_a)
+        mx.eval([c.state for c in cache_a])
+
+        result = _extend_cache(cache_a, [])
+        self.assertEqual(len(result), len(cache_a))
+        for c in result:
+            self.assertGreater(c.offset, 0)
+
+        result = _extend_cache([], cache_a)
+        self.assertEqual(len(result), len(cache_a))
+        for c in result:
+            self.assertGreater(c.offset, 0)
+
+    def test_remove_prompt_batch_updates_currently_processing(self):
+        prompt_a = self.tokenizer.encode("Write a long story about a cat")
+        prompt_b = self.tokenizer.encode("Write a long story about a dog")
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=5,
+            prefill_batch_size=2,
+            prefill_step_size=4,
+            completion_batch_size=4,
+        )
+        uid_a, uid_b = gen.insert([prompt_a, prompt_b])
+
+        gen.next()
+
+        found = gen._find_uids([uid_a, uid_b])
+        for uid in [uid_a, uid_b]:
+            self.assertIn(uid, found)
+            self.assertEqual(found[uid][0], 1)
+
+        gen.remove([uid_a])
+
+        self.assertEqual(len(gen._currently_processing), len(gen._prompt_batch))
+
+        found = gen._find_uids([uid_b])
+        self.assertIn(uid_b, found)
+
+        while responses := gen.next_generated():
+            if all(r.finish_reason is not None for r in responses):
+                break
+
+    def test_batch_max_kv_size_creates_rotating_cache(self):
+        max_kv_size = 256
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            max_kv_size=max_kv_size,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertIsInstance(cache, RotatingKVCache)
+                    self.assertEqual(cache.max_size, max_kv_size)
+
+    def test_batch_max_kv_size_limits_cache_growth(self):
+        max_kv_size = 5
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=10,
+            max_kv_size=max_kv_size,
+            prefill_batch_size=1,
+            prefill_step_size=128,
+            completion_batch_size=1,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertLessEqual(cache.keys.shape[2], max_kv_size)
+
+    def test_batch_max_kv_size_none_creates_regular_cache(self):
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            max_kv_size=None,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertIsInstance(cache, KVCache)
 
 
 if __name__ == "__main__":

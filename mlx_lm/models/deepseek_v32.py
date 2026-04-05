@@ -87,19 +87,15 @@ class Indexer(nn.Module):
         b, s, _ = x.shape
         q = self.wq_b(qr)
         q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
-        q_pe, q_nope = mx.split(q, [self.rope_head_dim], axis=-1)
-
-        offset = cache.offset if cache is not None else 0
-
-        q_pe = self.rope(q_pe, offset=offset)
-        q = mx.concatenate([q_pe, q_nope], axis=-1)
-
         k = self.wk(x)
         k = self.k_norm(k)
         k = mx.reshape(k, (b, 1, s, self.head_dim))
-        k_pe, k_nope = mx.split(k, [self.rope_head_dim], axis=-1)
-        k_pe = self.rope(k_pe, offset=offset)
-        k = mx.concatenate([k_pe, k_nope], axis=-1)
+
+        offset = cache.offset if cache is not None else 0
+
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+
         if cache is not None:
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
@@ -221,7 +217,8 @@ class DeepseekV32Attention(nn.Module):
                     mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
                     axis=2,
                 )
-                mask = None
+                if mask is not None:
+                    mask = mx.take_along_axis(mask, topk_indices, axis=-1)
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
