@@ -1498,6 +1498,7 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        max_kv_size: Optional[int] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1507,6 +1508,7 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        self.max_kv_size = max_kv_size
 
         self._default_state_machine = SequenceStateMachine(
             {"normal": [(seq, None) for seq in stop_tokens]} if stop_tokens else {},
@@ -1613,7 +1615,7 @@ class BatchGenerator:
         caches = caches or [None] * len(segments)
         for i in range(len(segments)):
             if caches[i] is None:
-                caches[i] = cache.make_prompt_cache(self.model)
+                caches[i] = self._make_new_cache()
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
@@ -1635,6 +1637,19 @@ class BatchGenerator:
             self._uid_count += 1
 
         return uids
+
+    def _make_new_cache(self):
+        if self.max_kv_size is None:
+            return cache.make_prompt_cache(self.model)
+
+        return [
+            (
+                RotatingKVCache(max_size=self.max_kv_size)
+                if isinstance(ci, KVCache)
+                else ci
+            )
+            for ci in cache.make_prompt_cache(self.model)
+        ]
 
     def _find_uids(self, uids):
         uids = set(uids)
