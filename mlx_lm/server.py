@@ -790,7 +790,14 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    # Prefer single-sequence MTP when the queue is empty;
+                    # fall back to BatchGenerator when requests are queued.
+                    mtp_active = getattr(self.cli_args, "mtp", False) and hasattr(
+                        model, "mtp_forward"
+                    )
+                    if not self._is_batchable(args) or (
+                        mtp_active and self.requests.empty()
+                    ):
                         self._serve_single((rqueue, request, args))
                         continue
 
@@ -965,6 +972,7 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                mtp=getattr(self.cli_args, "mtp", False),
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1877,6 +1885,12 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. Qwen3.5).",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
