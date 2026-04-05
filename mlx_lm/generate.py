@@ -30,6 +30,7 @@ from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchQuantizedKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -205,6 +206,13 @@ def setup_arg_parser():
         "from this step onwards.",
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
+    )
+    parser.add_argument(
+        "--auto-config",
+        action="store_true",
+        help="Automatically configure KV cache settings based on available memory. "
+        "Overrides --kv-bits and --max-kv-size if set.",
+        default=False,
     )
     parser.add_argument(
         "--draft-model",
@@ -827,7 +835,7 @@ class BatchStats:
     peak_memory: float = 0
 
 
-def _make_cache(model, left_padding, max_kv_size):
+def _make_cache(model, left_padding, max_kv_size, kv_bits=None, kv_group_size=64):
     """
     Convert a list of regular caches into their corresponding
     batch-aware caches.
@@ -835,7 +843,15 @@ def _make_cache(model, left_padding, max_kv_size):
 
     def to_batch_cache(c):
         if type(c) is KVCache:
+            if kv_bits is not None and getattr(c, "quantizable", True):
+                return BatchQuantizedKVCache(
+                    left_padding, group_size=kv_group_size, bits=kv_bits
+                )
             return BatchKVCache(left_padding)
+        elif type(c) is QuantizedKVCache:
+            return BatchQuantizedKVCache(
+                left_padding, group_size=c.group_size, bits=c.bits
+            )
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -855,6 +871,13 @@ def _make_cache(model, left_padding, max_kv_size):
         if max_kv_size is not None:
             return [
                 BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
+            ]
+        if kv_bits is not None:
+            return [
+                BatchQuantizedKVCache(
+                    left_padding, group_size=kv_group_size, bits=kv_bits
+                )
+                for _ in model.layers
             ]
         return [BatchKVCache(left_padding) for _ in model.layers]
 
@@ -2056,6 +2079,24 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
+    # Apply auto-config if requested
+    kv_bits = args.kv_bits
+    kv_group_size = args.kv_group_size
+    max_kv_size = args.max_kv_size
+    quantized_kv_start = args.quantized_kv_start
+
+    if getattr(args, "auto_config", False):
+        from .memory_config import auto_configure, describe_config
+
+        config = auto_configure(model)
+        if config.kv_bits is not None:
+            kv_bits = config.kv_bits
+            kv_group_size = config.kv_group_size
+        if config.max_kv_size is not None:
+            max_kv_size = config.max_kv_size
+        if args.verbose:
+            print(f"[auto-config] {describe_config(config)}")
+
     response = generate(
         model,
         tokenizer,
@@ -2063,11 +2104,11 @@ def main():
         max_tokens=args.max_tokens,
         verbose=args.verbose,
         sampler=sampler,
-        max_kv_size=args.max_kv_size,
+        max_kv_size=max_kv_size,
         prompt_cache=prompt_cache if using_cache else None,
-        kv_bits=args.kv_bits,
-        kv_group_size=args.kv_group_size,
-        quantized_kv_start=args.quantized_kv_start,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
