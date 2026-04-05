@@ -414,6 +414,66 @@ class ScaledLinear(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         return (x @ self.weight.T) * self.scalar
 
+    def to_quantized(
+        self,
+        group_size: Optional[int] = None,
+        bits: Optional[int] = None,
+        mode: str = "affine",
+    ):
+        return QuantizedScaledLinear.from_scaled_linear(self, group_size, bits, mode)
+
+
+class QuantizedScaledLinear(nn.QuantizedLinear):
+    """Quantized ScaledLinear that preserves the fixed output scalar."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        scalar: float,
+        group_size: Optional[int] = None,
+        bits: Optional[int] = None,
+        mode: str = "affine",
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bias=False,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+        self.scalar = scalar
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return super().__call__(x) * self.scalar
+
+    @classmethod
+    def from_scaled_linear(
+        cls,
+        linear_layer: ScaledLinear,
+        group_size: Optional[int] = None,
+        bits: Optional[int] = None,
+        mode: str = "affine",
+    ):
+        out_features, in_features = linear_layer.weight.shape
+        ql = cls(
+            in_features,
+            out_features,
+            linear_layer.scalar,
+            group_size,
+            bits,
+            mode,
+        )
+        ql.weight, ql.scales, *biases = mx.quantize(
+            linear_layer.weight,
+            group_size,
+            bits,
+            mode=mode,
+        )
+        ql.biases = biases[0] if biases else None
+        return ql
+
 
 class Gemma4TextModel(nn.Module):
     def __init__(self, config: ModelArgs):

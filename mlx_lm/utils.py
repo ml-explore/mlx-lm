@@ -858,12 +858,16 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
+    from .models.gemma4_text import QuantizedScaledLinear, ScaledLinear
     from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 
     dequantize_layers = []
     for name, module in model.named_modules():
         bias = "bias" in module
-        if isinstance(module, nn.QuantizedLinear):
+        if isinstance(module, QuantizedScaledLinear):
+            cls = ScaledLinear
+            kwargs = {"scalar": module.scalar}
+        elif isinstance(module, nn.QuantizedLinear):
             cls = nn.Linear
             kwargs = {"bias": bias}
         elif isinstance(module, nn.QuantizedEmbedding):
