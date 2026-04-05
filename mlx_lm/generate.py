@@ -578,9 +578,72 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
+    # Detect hybrid models (e.g. Qwen3.5) that mix linear attention layers
+    # (ArraysCache) with standard full attention (KVCache). ArraysCache stores
+    # recurrent hidden state that cannot be trimmed like KVCache — calling
+    # trim_prompt_cache on it is a no-op, so rejected draft tokens corrupt
+    # subsequent predictions (issue #846).
+    #
+    # Fix: on rejection, recover ArraysCache via a targeted recovery pass:
+    #   1. Before verification, snapshot ArraysCache state and KVCache offsets.
+    #   2. Run batched verification as normal (unchanged hot path).
+    #   3. On rejection at position n:
+    #      a. Trim KVCache as usual (offset → P + n + 1).
+    #      b. Reset KVCache offsets to pre-verify position P. The KV pairs
+    #         at positions P..P+n are still physically present in the arrays.
+    #      c. Restore ArraysCache to pre-verify state.
+    #      d. Re-run the accepted tokens. Each token's KV pair depends only
+    #         on its own embedding and RoPE position, so the re-written values
+    #         are identical to the originals; KVCache offset returns to P+n+1.
+    #         ArraysCache advances to the correct state.
+    #   Full-acceptance rounds (n == num_draft) incur zero recovery overhead.
+    has_arrays_cache = any(isinstance(c, ArraysCache) for c in model_cache)
+
+    # Mutable per-round state; updated before each verification pass.
+    _hybrid_state: dict = {"arrays": {}, "kv_offsets": {}, "verify_input": None}
+
+    def _save_hybrid_state(verify_input: mx.array) -> None:
+        _hybrid_state["verify_input"] = verify_input
+        _hybrid_state["arrays"] = {
+            i: list(c.cache)
+            for i, c in enumerate(model_cache)
+            if isinstance(c, ArraysCache)
+        }
+        _hybrid_state["kv_offsets"] = {
+            i: c.offset
+            for i, c in enumerate(model_cache)
+            if isinstance(c, KVCache)
+        }
+
     def _rewind_cache(num_draft, num_accept):
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        if not (has_arrays_cache and num_draft > num_accept):
+            return
+        saved_arrays = _hybrid_state["arrays"]
+        saved_kv_offsets = _hybrid_state["kv_offsets"]
+        verify_input = _hybrid_state["verify_input"]
+        if not saved_arrays or verify_input is None:
+            return
+        # Reset KVCache offsets to pre-verify position P. This does not
+        # erase the KV pairs already written; the recovery pass will
+        # re-write identical values at positions P..P+num_accept.
+        for i, c in enumerate(model_cache):
+            if isinstance(c, KVCache) and i in saved_kv_offsets:
+                c.offset = saved_kv_offsets[i]
+        # Restore ArraysCache to pre-verify state.
+        for i, c in enumerate(model_cache):
+            if isinstance(c, ArraysCache) and i in saved_arrays:
+                c.cache = list(saved_arrays[i])
+        # Re-run accepted tokens to advance both caches to P + num_accept + 1.
+        # `verify_input` may contain a prefill remainder prepended to draft
+        # tokens (first iteration only). Remove only the rejected draft tokens
+        # from the tail; keep everything else so caches reach the correct state.
+        rejected = num_draft - num_accept
+        accepted = verify_input[:-rejected]  # shape: [len(y) - rejected]
+        with mx.stream(generation_stream):
+            model(accepted[None], cache=model_cache)
+            mx.eval([c.state for c in model_cache if isinstance(c, ArraysCache)])
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -607,7 +670,10 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
+            if has_arrays_cache:
+                _save_hybrid_state(y)
             tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
