@@ -364,6 +364,7 @@ class Griffin(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        self.args = config
         self.config = config
         self.embed_tokens = nn.Embedding(
             config.vocab_size,

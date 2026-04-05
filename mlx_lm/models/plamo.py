@@ -164,6 +164,7 @@ class PlamoDecoder(nn.Module):
 class PlamoModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
+        self.args = config
         self.config = config
         self.vocab_size = config.vocab_size
 

@@ -379,6 +379,7 @@ def logit_softcap(softcap, x):
 class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
+        self.args = config
         self.config = config
         self.hidden_size = config.hidden_size
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -418,12 +419,12 @@ class LanguageModel(nn.Module):
 
         self.altup_projections = [
             nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-            for _ in range(1, self.config.altup_num_inputs)
+            for _ in range(1, self.args.altup_num_inputs)
         ]
 
         self.altup_unembed_projections = [
             nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-            for _ in range(1, self.config.altup_num_inputs)
+            for _ in range(1, self.args.altup_num_inputs)
         ]
 
         self.norm = nn.RMSNorm(
@@ -444,7 +445,7 @@ class LanguageModel(nn.Module):
         )
 
         self.layer_idx_to_cache_idx = []
-        for i, layer_type in enumerate(self.config.layer_types):
+        for i, layer_type in enumerate(self.args.layer_types):
             if i < self.first_kv_shared_layer_idx:
                 self.layer_idx_to_cache_idx.append(i)
             else:
@@ -494,7 +495,7 @@ class LanguageModel(nn.Module):
         for i, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
-            is_global = self.config.layer_types[i] == "full_attention"
+            is_global = self.args.layer_types[i] == "full_attention"
 
             if is_global:
                 mask = global_mask
@@ -545,20 +546,20 @@ class LanguageModel(nn.Module):
         )
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1],
-            self.config.num_hidden_layers,
-            self.config.hidden_size_per_layer_input,
+            self.args.num_hidden_layers,
+            self.args.hidden_size_per_layer_input,
         )
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
         return (per_layer_projection + per_layer_inputs) * (2.0**-0.5)
 
     def make_cache(self):
         caches = []
-        for layer_type in self.config.layer_types[: self.first_kv_shared_layer_idx]:
+        for layer_type in self.args.layer_types[: self.first_kv_shared_layer_idx]:
             if layer_type == "full_attention":
                 caches.append(KVCache())
             elif layer_type == "sliding_attention":
                 caches.append(
-                    RotatingKVCache(max_size=self.config.sliding_window, keep=0)
+                    RotatingKVCache(max_size=self.args.sliding_window, keep=0)
                 )
             else:
                 raise NotImplementedError(f"Unknown layer type: {layer_type}")

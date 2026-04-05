@@ -182,6 +182,7 @@ class YoutuLLMDecoderLayer(nn.Module):
 class YoutuLLMModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
+        self.args = config
         self.config = config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
