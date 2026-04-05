@@ -525,6 +525,12 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
+    if not cache.can_trim_prompt_cache(model_cache):
+        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+        raise ValueError(
+            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+        )
+
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     quantize_cache_fn = functools.partial(
@@ -570,11 +576,12 @@ def speculative_generate_step(
                 return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
-        while y.size > prefill_step_size:
-            model(y[:prefill_step_size][None], cache=cache)
+        while y.size > 1:
+            n_to_process = min(prefill_step_size, y.size - 1)
+            model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
             mx.eval([c.state for c in cache])
-            y = y[prefill_step_size:]
+            y = y[n_to_process:]
             mx.clear_cache()
         return y
 
