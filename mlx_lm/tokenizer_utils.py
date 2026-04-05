@@ -253,6 +253,37 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         cls._byte_decoder = char_to_bytes
 
 
+def _infer_thinking(tokenizer):
+    vocab = tokenizer.get_vocab()
+    THINK_TOKENS = [
+        ("<think>", "</think>"),
+        ("<longcat_think>", "</longcat_think>"),
+    ]
+
+    # Single token thinking modes
+    for think_start, think_end in THINK_TOKENS:
+        if think_start in vocab and think_end in vocab:
+            return (
+                think_start,
+                think_end,
+                (vocab[think_start],),
+                (vocab[think_end],),
+            )
+
+    # Multi token thinking modes
+    if "<|channel>" in vocab and "<channel|>" in vocab:
+        think_start = "<|channel>thought\n"
+        think_end = "<channel|>"
+        return (
+            think_start,
+            think_end,
+            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+        )
+
+    return (None, None, None, None)
+
+
 class TokenizerWrapper:
     """A wrapper that combines an HF tokenizer and a detokenizer.
 
@@ -277,10 +308,12 @@ class TokenizerWrapper:
             if eos_token_ids is not None
             else {tokenizer.eos_token_id}
         )
-        self._think_start = None
-        self._think_end = None
-        self._think_start_id = None
-        self._think_end_id = None
+        (
+            self._think_start,
+            self._think_end,
+            self._think_start_tokens,
+            self._think_end_tokens,
+        ) = _infer_thinking(tokenizer)
 
         self._chat_template = chat_template
         self.has_chat_template = (
@@ -289,27 +322,6 @@ class TokenizerWrapper:
         self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
-
-        vocab = tokenizer.get_vocab()
-        THINK_TOKENS = [
-            ("<think>", "</think>"),
-            ("<longcat_think>", "</longcat_think>"),
-        ]
-        for think_start, think_end in THINK_TOKENS:
-            if think_start in vocab and think_end in vocab:
-                self._think_start = think_start
-                self._think_end = think_end
-                self._think_start_id = vocab[think_start]
-                self._think_end_id = vocab[think_end]
-                break
-
-        # Disable tool calling if tool call tokens aren't in vocab
-        if (tool_call_start and tool_call_start not in vocab) or (
-            tool_call_end and tool_call_end not in vocab
-        ):
-            self._tool_call_start = None
-            self._tool_call_end = None
-            self._tool_parser = None
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
@@ -343,7 +355,9 @@ class TokenizerWrapper:
 
     @property
     def think_start_id(self):
-        return self._think_start_id
+        if len(self._think_start_tokens) > 1:
+            raise ValueError("The start thinking sequence is more than 1 token")
+        return self._think_start_tokens[0]
 
     @property
     def think_end(self):
@@ -351,7 +365,9 @@ class TokenizerWrapper:
 
     @property
     def think_end_id(self):
-        return self._think_end_id
+        if len(self._think_end_tokens) > 1:
+            raise ValueError("The end thinking sequence is more than 1 token")
+        return self._think_end_tokens[0]
 
     @property
     def has_tool_calling(self):
