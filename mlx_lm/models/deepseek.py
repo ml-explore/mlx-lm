@@ -200,6 +200,7 @@ class DeepseekDecoderLayer(nn.Module):
 class DeepseekModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
+        self.args = config
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [

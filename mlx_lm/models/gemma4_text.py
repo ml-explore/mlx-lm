@@ -418,7 +418,8 @@ class ScaledLinear(nn.Module):
 class Gemma4TextModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.config = config
+        self.args = config
+        self.config = config  # backward compat
         self.vocab_size = config.vocab_size
         self.window_size = config.sliding_window
         self.sliding_window_pattern = config.sliding_window_pattern
@@ -502,7 +503,7 @@ class Gemma4TextModel(nn.Module):
         return mx.unflatten(
             result,
             -1,
-            (self.config.num_hidden_layers, self.hidden_size_per_layer_input),
+            (self.args.num_hidden_layers, self.hidden_size_per_layer_input),
         )
 
     def _project_per_layer_inputs(
@@ -514,7 +515,7 @@ class Gemma4TextModel(nn.Module):
         per_layer_projection = mx.unflatten(
             per_layer_projection,
             -1,
-            (self.config.num_hidden_layers, self.hidden_size_per_layer_input),
+            (self.args.num_hidden_layers, self.hidden_size_per_layer_input),
         )
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
 
