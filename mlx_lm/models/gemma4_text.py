@@ -403,78 +403,6 @@ class DecoderLayer(nn.Module):
         return h, shared_kv, offset
 
 
-class ScaledLinear(nn.Module):
-    """Linear layer with output scaling."""
-
-    def __init__(self, in_features: int, out_features: int, scalar: float):
-        super().__init__()
-        self.weight = mx.zeros((out_features, in_features))
-        self.scalar = scalar
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return (x @ self.weight.T) * self.scalar
-
-    def to_quantized(
-        self,
-        group_size: Optional[int] = None,
-        bits: Optional[int] = None,
-        mode: str = "affine",
-    ):
-        return QuantizedScaledLinear.from_scaled_linear(self, group_size, bits, mode)
-
-
-class QuantizedScaledLinear(nn.QuantizedLinear):
-    """Quantized ScaledLinear that preserves the fixed output scalar."""
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        scalar: float,
-        group_size: Optional[int] = None,
-        bits: Optional[int] = None,
-        mode: str = "affine",
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            bias=False,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-        )
-        self.scalar = scalar
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return super().__call__(x) * self.scalar
-
-    @classmethod
-    def from_scaled_linear(
-        cls,
-        linear_layer: ScaledLinear,
-        group_size: Optional[int] = None,
-        bits: Optional[int] = None,
-        mode: str = "affine",
-    ):
-        out_features, in_features = linear_layer.weight.shape
-        ql = cls(
-            in_features,
-            out_features,
-            linear_layer.scalar,
-            group_size,
-            bits,
-            mode,
-        )
-        ql.weight, ql.scales, *biases = mx.quantize(
-            linear_layer.weight,
-            group_size,
-            bits,
-            mode=mode,
-        )
-        ql.biases = biases[0] if biases else None
-        return ql
-
-
 class Gemma4TextModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -500,10 +428,11 @@ class Gemma4TextModel(nn.Module):
             )
             self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
             self.per_layer_input_scale = 2.0**-0.5
-            self.per_layer_model_projection = ScaledLinear(
+            self.per_layer_projection_scale = config.hidden_size**-0.5
+            self.per_layer_model_projection = nn.Linear(
                 config.hidden_size,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                scalar=config.hidden_size**-0.5,
+                bias=False,
             )
             self.per_layer_projection_norm = nn.RMSNorm(
                 config.hidden_size_per_layer_input, eps=config.rms_norm_eps
@@ -511,6 +440,7 @@ class Gemma4TextModel(nn.Module):
         else:
             self.embed_tokens_per_layer = None
             self.per_layer_input_scale = None
+            self.per_layer_projection_scale = None
             self.per_layer_model_projection = None
             self.per_layer_projection_norm = None
 
@@ -571,6 +501,7 @@ class Gemma4TextModel(nn.Module):
         per_layer_inputs: Optional[mx.array] = None,
     ) -> mx.array:
         per_layer_projection = self.per_layer_model_projection(input_embeddings)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale
         per_layer_projection = mx.unflatten(
             per_layer_projection,
             -1,
