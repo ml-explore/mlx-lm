@@ -272,7 +272,7 @@ def _infer_thinking(tokenizer):
 
     # Multi token thinking modes
     if "<|channel>" in vocab and "<channel|>" in vocab:
-        think_start = "<|channel>thought\n"
+        think_start = "<|channel>thought"
         think_end = "<channel|>"
         return (
             think_start,
