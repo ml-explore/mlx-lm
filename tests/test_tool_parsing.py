@@ -222,6 +222,38 @@ class TestToolParsing(unittest.TestCase):
             {"query": "hello world", "limit": 10, "verbose": False},
         )
 
+        # Multiple tool calls in a single block (no delimiter between them)
+        test_case = (
+            'call:glob{pattern:<|"|>README*.md<|"|>}'
+            'call:glob{pattern:<|"|>CONTRIBUTING.md<|"|>}'
+        )
+        tool_calls = gemma4.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "glob")
+        self.assertEqual(tool_calls[0]["arguments"], {"pattern": "README*.md"})
+        self.assertEqual(tool_calls[1]["name"], "glob")
+        self.assertEqual(tool_calls[1]["arguments"], {"pattern": "CONTRIBUTING.md"})
+
+        # Multiple tool calls with nested args
+        test_case = (
+            'call:search{query:<|"|>weather<|"|>,limit:5}'
+            'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
+        )
+        tool_calls = gemma4.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "search")
+        self.assertEqual(
+            tool_calls[0]["arguments"],
+            {"query": "weather", "limit": 5},
+        )
+        self.assertEqual(tool_calls[1]["name"], "configure")
+        self.assertEqual(
+            tool_calls[1]["arguments"],
+            {"settings": {"enabled": True, "name": "test"}},
+        )
+
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
