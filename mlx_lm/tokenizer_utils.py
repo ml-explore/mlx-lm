@@ -322,6 +322,15 @@ class TokenizerWrapper:
         self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
+        self._tool_call_start_tokens = None
+        self._tool_call_end_tokens = None
+        if tool_call_start is not None:
+            self._tool_call_start_tokens = tuple(
+                tokenizer.encode(tool_call_start, add_special_tokens=False)
+            )
+            self._tool_call_end_tokens = tuple(
+                tokenizer.encode(tool_call_end, add_special_tokens=False)
+            )
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if "enable_thinking" not in kwargs:
@@ -393,6 +402,10 @@ class TokenizerWrapper:
         return self._think_start_tokens[0]
 
     @property
+    def think_start_tokens(self):
+        return self._think_start_tokens
+
+    @property
     def think_end(self):
         return self._think_end
 
@@ -403,6 +416,10 @@ class TokenizerWrapper:
         return self._think_end_tokens[0]
 
     @property
+    def think_end_tokens(self):
+        return self._think_end_tokens
+
+    @property
     def has_tool_calling(self):
         return self._tool_call_start is not None
 
@@ -411,8 +428,16 @@ class TokenizerWrapper:
         return self._tool_call_start
 
     @property
+    def tool_call_start_tokens(self):
+        return self._tool_call_start_tokens
+
+    @property
     def tool_call_end(self):
         return self._tool_call_end
+
+    @property
+    def tool_call_end_tokens(self):
+        return self._tool_call_end_tokens
 
     @property
     def tool_parser(self):

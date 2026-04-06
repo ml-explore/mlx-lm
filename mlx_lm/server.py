@@ -638,22 +638,18 @@ class ResponseGenerator:
 
         # Reasoning related transitions
         if tokenizer.has_thinking:
-            ts = tokenizer.think_start_id
-            te = tokenizer.think_end_id
-            transitions["normal"].append(((ts,), "reasoning"))
-            transitions["reasoning"] = [((te,), "normal")]
+            ts = tokenizer.think_start_tokens
+            te = tokenizer.think_end_tokens
+            transitions["normal"].append((ts, "reasoning"))
+            transitions["reasoning"] = [(te, "normal")]
             transitions["reasoning"].extend(common_stops)
-            sequences[(ts,)] = tokenizer.convert_ids_to_tokens(ts)
-            sequences[(te,)] = tokenizer.convert_ids_to_tokens(te)
+            sequences[ts] = tokenizer.think_start
+            sequences[te] = tokenizer.think_end
 
         # Tool calling relating transitions
         if tokenizer.has_tool_calling:
-            ts = tuple(
-                tokenizer.encode(tokenizer.tool_call_start, add_special_tokens=False)
-            )
-            te = tuple(
-                tokenizer.encode(tokenizer.tool_call_end, add_special_tokens=False)
-            )
+            ts = tokenizer.tool_call_start_tokens
+            te = tokenizer.tool_call_end_tokens
             transitions["normal"].append((ts, "tool"))
             transitions["tool"] = [(te, "normal")]
             transitions["tool"].extend(common_stops)
