@@ -1335,12 +1335,8 @@ class GenerationBatch:
             processed_logits = []
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
-                processor_tokens = mx.array(self.tokens[e], dtype=inputs.dtype)
-                processor_tokens = mx.concatenate(
-                    [processor_tokens, inputs[e : e + 1]]
-                )
                 for processor in self.logits_processors[e]:
-                    sample_logits = processor(processor_tokens, sample_logits)
+                    sample_logits = processor(self._token_context[e], sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
