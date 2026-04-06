@@ -1381,9 +1381,10 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset = max(self._offset, other._offset)
 
     def extract(self, idx):
+        mx.eval(self.left_padding, self.offset)
         cache = RotatingKVCache(self.max_size)
-        padding = self.left_padding[idx].item()
-        offset = self.offset[idx].item()
+        padding = max(0, self.left_padding.tolist()[idx])
+        offset = self.offset.tolist()[idx]
         cache.keys = self.keys[idx : idx + 1]
         cache.values = self.values[idx : idx + 1]
         cache._idx = self._idx

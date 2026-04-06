@@ -13,20 +13,6 @@ from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
-class _OffsetCache(_BaseCache):
-    """Lightweight cache for KV-shared layers that only tracks offset."""
-
-    def __init__(self):
-        self.offset = 0
-
-    @property
-    def nbytes(self):
-        return 0
-
-    def empty(self):
-        return True
-
-
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "gemma4_text"
@@ -65,7 +51,7 @@ class ModelArgs(BaseModelArgs):
         if self.rope_parameters is None:
             self.rope_parameters = {
                 "full_attention": {
-                    "partial_rotary_factor": 1.0,
+                    "partial_rotary_factor": 0.25,
                     "rope_theta": 1000000.0,
                     "rope_type": "proportional",
                 },
@@ -263,7 +249,7 @@ class Attention(nn.Module):
             if not self.use_k_eq_v:
                 values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            offset = cache.offset if cache is not None else 0
+            offset = mx.array(cache.offset) if cache is not None else 0
 
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
