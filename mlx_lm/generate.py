@@ -1883,7 +1883,6 @@ def batch_generate(
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     return_prompt_caches: bool = False,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1902,8 +1901,6 @@ def batch_generate(
           can be per prompt if a list is provided.
        return_prompt_caches (bool): Return the prompt caches in the batch
           responses. Default: ``False``.
-       logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
-          A list of functions that take tokens and logits and return the processed logits. Default: ``None``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
