@@ -403,18 +403,6 @@ class DecoderLayer(nn.Module):
         return h, shared_kv, offset
 
 
-class ScaledLinear(nn.Module):
-    """Linear layer with output scaling."""
-
-    def __init__(self, in_features: int, out_features: int, scalar: float):
-        super().__init__()
-        self.weight = mx.zeros((out_features, in_features))
-        self.scalar = scalar
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return (x @ self.weight.T) * self.scalar
-
-
 class Gemma4TextModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -440,10 +428,11 @@ class Gemma4TextModel(nn.Module):
             )
             self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
             self.per_layer_input_scale = 2.0**-0.5
-            self.per_layer_model_projection = ScaledLinear(
+            self.per_layer_projection_scale = config.hidden_size**-0.5
+            self.per_layer_model_projection = nn.Linear(
                 config.hidden_size,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                scalar=config.hidden_size**-0.5,
+                bias=False,
             )
             self.per_layer_projection_norm = nn.RMSNorm(
                 config.hidden_size_per_layer_input, eps=config.rms_norm_eps
@@ -451,6 +440,7 @@ class Gemma4TextModel(nn.Module):
         else:
             self.embed_tokens_per_layer = None
             self.per_layer_input_scale = None
+            self.per_layer_projection_scale = None
             self.per_layer_model_projection = None
             self.per_layer_projection_norm = None
 
@@ -511,6 +501,7 @@ class Gemma4TextModel(nn.Module):
         per_layer_inputs: Optional[mx.array] = None,
     ) -> mx.array:
         per_layer_projection = self.per_layer_model_projection(input_embeddings)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale
         per_layer_projection = mx.unflatten(
             per_layer_projection,
             -1,
