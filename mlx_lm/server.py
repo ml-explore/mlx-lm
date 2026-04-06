@@ -550,12 +550,10 @@ class ResponseGenerator:
         # Choose the initial state among only reasoning or normal
         initial_state = "normal"
         if tokenizer.has_thinking:
-            for i in range(-1, -len(prompt), -1):
-                if prompt[i] == tokenizer.think_start_id:
-                    initial_state = "reasoning"
-                    break
-                if prompt[i] == tokenizer.think_end_id:
-                    break
+            think_start = tokenizer.rfind_think_start(prompt)
+            think_end = tokenizer.rfind_think_end(prompt)
+            if think_start > think_end:
+                initial_state = "reasoning"
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
@@ -590,10 +588,9 @@ class ResponseGenerator:
         # tokens)
         tail_start = len(prompt)
         if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt) - sys_end), 1):
-                if prompt[-i] == tokenizer.think_start_id:
-                    tail_start = len(prompt) - i
-                    break
+            think_start = tokenizer.rfind_think_start(prompt, start=tail_start - 11)
+            if think_start >= 0:
+                tail_start = think_start
 
         # Finalize the segments and return
         if sys_end < tail_start:

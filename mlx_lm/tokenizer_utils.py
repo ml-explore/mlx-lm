@@ -324,6 +324,9 @@ class TokenizerWrapper:
         self._tool_call_end = tool_call_end
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
+        if "enable_thinking" not in kwargs:
+            kwargs["enable_thinking"] = self.has_thinking
+
         if self._chat_template is not None:
             out = self._chat_template(*args, **kwargs)
             if tokenize:
@@ -344,6 +347,36 @@ class TokenizerWrapper:
             raise ValueError(f"'{token}' is not a token for this tokenizer")
 
         self._eos_token_ids.add(token_id)
+
+    def _find(self, tokens, sequence, start=None, end=None, reverse=False):
+        start = start or 0
+        end = end or len(tokenlist)
+        outer_loop = (
+            range(end - len(sequence), start - 1, -1)
+            if reverse
+            else range(start, end - len(sequence) + 1)
+        )
+        for i in outer_loop:
+            if tokens[i] == sequence[0]:
+                if all(tokens[i + j] == sequence[j] for j in range(1, len(sequence))):
+                    return i
+        return -1
+
+    def find_think_start(self, tokens, start=None, end=None):
+        return self._find(tokens, self._think_start_tokens, start=start, end=end)
+
+    def rfind_think_start(self, tokens, start=None, end=None):
+        return self._find(
+            tokens, self._think_start_tokens, start=start, end=end, reverse=True
+        )
+
+    def find_think_end(self, tokens, start=None, end=None):
+        return self._find(tokens, self._think_end_tokens, start=start, end=end)
+
+    def rfind_think_end(self, tokens, start=None, end=None):
+        return self._find(
+            tokens, self._think_end_tokens, start=start, end=end, reverse=True
+        )
 
     @property
     def has_thinking(self):
