@@ -359,7 +359,7 @@ class TokenizerWrapper:
 
     def _find(self, tokens, sequence, start=None, end=None, reverse=False):
         start = start or 0
-        end = end or len(tokenlist)
+        end = end or len(tokens)
         outer_loop = (
             range(end - len(sequence), start - 1, -1)
             if reverse
