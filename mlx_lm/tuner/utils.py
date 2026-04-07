@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 import json
+import re
 import types
 from pathlib import Path
 from typing import Dict
@@ -110,31 +111,159 @@ def linear_to_lora_layers(
         model.update_modules(tree_unflatten(lora_modules))
 
 
+_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def _is_peft_config(raw_config: dict) -> bool:
+    """Return True if the config dict is in PEFT/Hugging Face format."""
+    return "peft_type" in raw_config
+
+
+def _convert_peft_config(
+    peft_config: dict, adapter_path: Path
+) -> types.SimpleNamespace:
+    """
+    Convert a PEFT adapter_config dict into an MLX-compatible config namespace.
+
+    Args:
+        peft_config: Raw dict loaded from PEFT's adapter_config.json.
+        adapter_path: Path to the adapter directory (used to inspect weight keys).
+
+    Returns:
+        types.SimpleNamespace with fields: fine_tune_type, num_layers, lora_parameters.
+
+    Raises:
+        ValueError: If peft_type is not "LORA", or required fields are missing.
+        FileNotFoundError: If adapter_model.safetensors is not present.
+    """
+    peft_type = peft_config.get("peft_type", "").upper()
+    if peft_type != "LORA":
+        raise ValueError(
+            f"Only PEFT peft_type='LORA' is supported, got '{peft_type}'. "
+            "DoRA and AdaLoRA are not currently supported via this path."
+        )
+
+    weight_file = adapter_path / "adapter_model.safetensors"
+    if not weight_file.exists():
+        raise FileNotFoundError(
+            f"Expected PEFT weight file not found: {weight_file}"
+        )
+
+    raw_weights = mx.load(str(weight_file))
+    layer_indices = [
+        int(m.group(1))
+        for key in raw_weights.keys()
+        if (m := _LAYER_RE.search(key))
+    ]
+    if not layer_indices:
+        raise ValueError(
+            "Could not determine num_layers: no layer index found in weight keys. "
+            f"Sample keys: {list(raw_weights.keys())[:5]}"
+        )
+    num_layers = max(layer_indices) + 1
+
+    r = peft_config.get("r")
+    if r is None:
+        raise ValueError("PEFT config missing required field 'r' (rank).")
+    lora_alpha = peft_config.get("lora_alpha", r)
+    dropout = peft_config.get("lora_dropout", 0.0)
+
+    return types.SimpleNamespace(
+        fine_tune_type="lora",
+        num_layers=num_layers,
+        lora_parameters={"rank": r, "scale": lora_alpha / r, "dropout": dropout},
+    )
+
+
+def _remap_peft_weights(weights: dict) -> dict:
+    """
+    Remap PEFT weight keys and shapes to MLX LoRA conventions.
+
+    PEFT stores lora_A as (rank, in_features) and lora_B as (out_features, rank).
+    MLX expects lora_a as (in_features, rank) and lora_b as (rank, out_features).
+    Both matrices require transposing.
+
+    Args:
+        weights: Dict mapping PEFT weight key strings to mx.array values.
+
+    Returns:
+        Dict mapping MLX weight key strings to correctly-shaped mx.array values.
+        Keys that are not recognizable LoRA adapter weights are silently dropped.
+    """
+    remapped = {}
+    for key, value in weights.items():
+        if not key.startswith("base_model.model."):
+            continue
+        stripped = key[len("base_model.model."):]
+
+        if stripped.endswith(".lora_A.weight"):
+            mlx_key = stripped[: -len(".lora_A.weight")] + ".lora_a"
+            remapped[mlx_key] = mx.transpose(value)  # (rank, in) → (in, rank)
+        elif stripped.endswith(".lora_B.weight"):
+            mlx_key = stripped[: -len(".lora_B.weight")] + ".lora_b"
+            remapped[mlx_key] = mx.transpose(value)  # (out, rank) → (rank, out)
+        # Other keys (base model weights, scaling vectors, etc.) are silently skipped.
+
+    return remapped
+
+
 def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     """
-    Load any fine-tuned adapters / layers.
+    Load fine-tuned adapters / layers, supporting both mlx-lm native format
+    and PEFT/Unsloth LoRA adapter format.
+
+    For native mlx-lm adapters, the adapter directory must contain:
+        - adapter_config.json  (with fine_tune_type, num_layers, lora_parameters)
+        - adapters.safetensors
+
+    For PEFT/Unsloth adapters, the adapter directory must contain:
+        - adapter_config.json  (with peft_type, r, lora_alpha, ...)
+        - adapter_model.safetensors
 
     Args:
         model (nn.Module): The neural network model.
-        adapter_path (str): Path to the adapter configuration file.
+        adapter_path (str): Path to the adapter directory.
 
     Returns:
-        nn.Module: The updated model with LoRA layers applied.
+        nn.Module: The updated model with LoRA layers applied and weights loaded.
     """
     adapter_path = Path(adapter_path)
     if not adapter_path.exists():
         raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
+
     with open(adapter_path / "adapter_config.json", "r") as fid:
-        config = types.SimpleNamespace(**json.load(fid))
-    fine_tune_type = getattr(config, "fine_tune_type", "lora")
-    if fine_tune_type != "full":
+        raw_config = json.load(fid)
+
+    if _is_peft_config(raw_config):
+        # --- PEFT / Unsloth path ---
+        config = _convert_peft_config(raw_config, adapter_path)
         linear_to_lora_layers(
             model,
             config.num_layers,
             config.lora_parameters,
-            use_dora=(fine_tune_type == "dora"),
+            use_dora=False,
         )
-    model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+        raw_weights = mx.load(str(adapter_path / "adapter_model.safetensors"))
+        remapped = _remap_peft_weights(raw_weights)
+        if not remapped:
+            raise ValueError(
+                "No LoRA weights found after remapping PEFT adapter. "
+                "Ensure adapter_model.safetensors contains lora_A/lora_B weights."
+            )
+        model.load_weights(list(remapped.items()), strict=False)
+    else:
+        # --- Native mlx-lm path (unchanged) ---
+        config = types.SimpleNamespace(**raw_config)
+        fine_tune_type = getattr(config, "fine_tune_type", "lora")
+        if fine_tune_type != "full":
+            linear_to_lora_layers(
+                model,
+                config.num_layers,
+                config.lora_parameters,
+                use_dora=(fine_tune_type == "dora"),
+            )
+        model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+
     return model
 
 
