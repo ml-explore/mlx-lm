@@ -550,12 +550,10 @@ class ResponseGenerator:
         # Choose the initial state among only reasoning or normal
         initial_state = "normal"
         if tokenizer.has_thinking:
-            for i in range(-1, -len(prompt), -1):
-                if prompt[i] == tokenizer.think_start_id:
-                    initial_state = "reasoning"
-                    break
-                if prompt[i] == tokenizer.think_end_id:
-                    break
+            think_start = tokenizer.rfind_think_start(prompt)
+            think_end = tokenizer.rfind_think_end(prompt)
+            if think_start > think_end:
+                initial_state = "reasoning"
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
@@ -590,10 +588,9 @@ class ResponseGenerator:
         # tokens)
         tail_start = len(prompt)
         if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt) - sys_end), 1):
-                if prompt[-i] == tokenizer.think_start_id:
-                    tail_start = len(prompt) - i
-                    break
+            think_start = tokenizer.rfind_think_start(prompt, start=tail_start - 11)
+            if think_start >= 0:
+                tail_start = think_start
 
         # Finalize the segments and return
         if sys_end < tail_start:
@@ -641,22 +638,18 @@ class ResponseGenerator:
 
         # Reasoning related transitions
         if tokenizer.has_thinking:
-            ts = tokenizer.think_start_id
-            te = tokenizer.think_end_id
-            transitions["normal"].append(((ts,), "reasoning"))
-            transitions["reasoning"] = [((te,), "normal")]
+            ts = tokenizer.think_start_tokens
+            te = tokenizer.think_end_tokens
+            transitions["normal"].append((ts, "reasoning"))
+            transitions["reasoning"] = [(te, "normal")]
             transitions["reasoning"].extend(common_stops)
-            sequences[(ts,)] = tokenizer.convert_ids_to_tokens(ts)
-            sequences[(te,)] = tokenizer.convert_ids_to_tokens(te)
+            sequences[ts] = tokenizer.think_start
+            sequences[te] = tokenizer.think_end
 
         # Tool calling relating transitions
         if tokenizer.has_tool_calling:
-            ts = tuple(
-                tokenizer.encode(tokenizer.tool_call_start, add_special_tokens=False)
-            )
-            te = tuple(
-                tokenizer.encode(tokenizer.tool_call_end, add_special_tokens=False)
-            )
+            ts = tokenizer.tool_call_start_tokens
+            te = tokenizer.tool_call_end_tokens
             transitions["normal"].append((ts, "tool"))
             transitions["tool"] = [(te, "normal")]
             transitions["tool"].extend(common_stops)

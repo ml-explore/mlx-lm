@@ -13,20 +13,6 @@ from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
-class _OffsetCache(_BaseCache):
-    """Lightweight cache for KV-shared layers that only tracks offset."""
-
-    def __init__(self):
-        self.offset = 0
-
-    @property
-    def nbytes(self):
-        return 0
-
-    def empty(self):
-        return True
-
-
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "gemma4_text"
@@ -65,7 +51,7 @@ class ModelArgs(BaseModelArgs):
         if self.rope_parameters is None:
             self.rope_parameters = {
                 "full_attention": {
-                    "partial_rotary_factor": 1.0,
+                    "partial_rotary_factor": 0.25,
                     "rope_theta": 1000000.0,
                     "rope_type": "proportional",
                 },
@@ -125,7 +111,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(geglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Router(nn.Module):
@@ -144,15 +130,16 @@ class Router(nn.Module):
         x = mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
 
         expert_scores = self.proj(x)
-        router_probs = mx.softmax(expert_scores, axis=-1)
 
         top_k_indices = mx.argpartition(
-            -expert_scores, kth=self.config.top_k_experts - 1, axis=-1
-        )[..., : self.config.top_k_experts]
+            expert_scores, kth=-self.config.top_k_experts, axis=-1
+        )
+        top_k_indices = top_k_indices[..., -self.config.top_k_experts :]
 
-        top_k_weights = mx.take_along_axis(router_probs, top_k_indices, axis=-1)
-        top_k_weights = top_k_weights / mx.sum(top_k_weights, axis=-1, keepdims=True)
+        top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
+        top_k_weights = mx.softmax(top_k_weights, axis=-1)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
+
         return top_k_indices, top_k_weights
 
 
@@ -180,16 +167,10 @@ class Experts(nn.Module):
     def __call__(
         self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
     ) -> mx.array:
-        B, S, H = x.shape
-        K = top_k_indices.shape[-1]
+        w = mx.expand_dims(top_k_weights, -1)
+        y = self.switch_glu(x, top_k_indices)
 
-        x_flat = x.reshape(B * S, H)
-        indices_flat = top_k_indices.reshape(B * S, K)
-
-        expert_out = self.switch_glu(x_flat, indices_flat)
-
-        weights = top_k_weights.reshape(B * S, K)[..., None]
-        return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
+        return (w * y).sum(-2)
 
 
 class Attention(nn.Module):
@@ -263,7 +244,7 @@ class Attention(nn.Module):
             if not self.use_k_eq_v:
                 values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            offset = cache.offset if cache is not None else 0
+            offset = mx.array(cache.offset) if cache is not None else 0
 
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
@@ -277,10 +258,6 @@ class Attention(nn.Module):
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
-
-        if mask is not None and isinstance(mask, mx.array):
-            if mask.shape[-1] != keys.shape[-2]:
-                mask = mask[..., -keys.shape[-2] :]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask

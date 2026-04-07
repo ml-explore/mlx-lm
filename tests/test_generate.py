@@ -402,6 +402,23 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
         self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
 
+    def test_batch_generate_function_with_logits_processors(self):
+        """Test that batch_generate function with logits_processors produces correct results."""
+        logit_bias = {0: 2000.0, 1: -2000.0}
+        processors = make_logits_processors(logit_bias)
+
+        prompts = [self.tokenizer.encode("hello")]
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+        self.assertEqual(len(response.texts), 1)
+        generated_token = self.tokenizer.encode(response.texts[0])[0]
+        self.assertEqual(generated_token, 0)
+
     def test_batch_generate_with_samplers(self):
         """Test that batch_generate with logits_processors produces correct results."""
         batch_gen = BatchGenerator(
