@@ -1425,8 +1425,17 @@ class BatchRotatingKVCache(_BaseCache):
         for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
             if c.keys is None:
                 continue
-            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)[..., -l:, :]
-            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)[..., -l:, :]
+            ordered_k = c._temporal_order(c.keys)
+            ordered_v = c._temporal_order(c.values)
+            # Use explicit dimension arithmetic to extract exactly l tokens.
+            # _temporal_order may return more elements than size() when the
+            # buffer is overallocated or has wrapped, so negative indexing
+            # like [... , -l:, :] can produce shape mismatches when merging
+            # caches with different fill levels.
+            seq_len = ordered_k.shape[2]
+            start = max(seq_len - l, 0)
+            keys[i : i + 1, :, p : p + l] = ordered_k[..., start : start + l, :]
+            values[i : i + 1, :, p : p + l] = ordered_v[..., start : start + l, :]
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
