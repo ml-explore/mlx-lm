@@ -596,10 +596,12 @@ class ArraysCache(_BaseCache):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
+        instance._batch_size = 1
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
+        self._batch_size = 1
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
@@ -622,26 +624,45 @@ class ArraysCache(_BaseCache):
         In-place filter to keep just the given indices in the cache.
         """
         self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
+        self._batch_size = len(batch_indices)
         if self.lengths is not None:
             self.lengths = self.lengths[batch_indices]
 
     def extend(self, other):
         """
         In-place extend this cache with the other cache.
+
+        When one side has no state yet (None) and the other does, the missing
+        side is zero-initialised rather than dropped. Without this, hybrid
+        models (Mamba, RWKV7, Qwen3.5, Falcon-H1, …) crash with a shape
+        mismatch in their linear-attention / SSM state once a second sequence
+        is added to an in-flight generation batch.
         """
 
         def cat(a, b):
+            if a is None and b is None:
+                return None
             if a is None:
-                return b
+                # self had no state for these sequences; zero-init then concat
+                zeros = mx.zeros(
+                    (self._batch_size, *b.shape[1:]), dtype=b.dtype
+                )
+                return mx.concatenate([zeros, b], axis=0)
             if b is None:
-                return a
-            return mx.concatenate([a, b])
+                # other has no state yet; zero-init for the new sequences
+                zeros = mx.zeros(
+                    (other._batch_size, *a.shape[1:]), dtype=a.dtype
+                )
+                return mx.concatenate([a, zeros], axis=0)
+            return mx.concatenate([a, b], axis=0)
 
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
+        self._batch_size += other._batch_size
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
         cache.cache = [c[idx : idx + 1] for c in self.cache]
+        # _batch_size is already 1 from __init__
         return cache
 
     def prepare(self, lengths=None, **kwargs):
@@ -672,6 +693,7 @@ class ArraysCache(_BaseCache):
         n_state = len(caches[0].cache)
         B = len(caches)
         cache = cls(n_state)
+        cache._batch_size = B
 
         # All caches are empty so return early
         if all(c.empty() for c in caches):
