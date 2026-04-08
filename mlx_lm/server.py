@@ -369,6 +369,15 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
+        # Quantize draft model if requested
+        if (
+            self.draft_model is not None
+            and getattr(self.cli_args, "quantize_draft", False)
+        ):
+            import mlx.nn as nn
+            nn.quantize(self.draft_model, group_size=64, bits=4)
+            logger.info("Quantized draft model to 4-bit")
+
         if self.draft_model is None:
             self.is_batchable = all(
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
@@ -1776,6 +1785,11 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--quantize-draft",
+        action="store_true",
+        help="Quantize the draft model to 4-bit after loading for faster inference.",
     )
     parser.add_argument(
         "--trust-remote-code",

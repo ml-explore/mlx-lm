@@ -14,7 +14,8 @@ from .base import (
     create_ssm_mask,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .speculative_cache import SpeculativeArraysCache
+from .gated_delta import compute_g, gated_delta_update
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -161,9 +162,21 @@ class GatedDeltaNet(nn.Module):
             if cache.lengths is not None:
                 ends = mx.clip(cache.lengths, 0, S)
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                new_cache_0 = mx.take_along_axis(conv_input, positions, axis=1)
+                cache[0] = new_cache_0
             else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+                new_cache_0 = mx.contiguous(conv_input[:, -n_keep:, :])
+                import os
+                if os.environ.get('DEBUG_CACHE'):
+                    print(f"DEBUG: conv_input.shape={conv_input.shape}, n_keep={n_keep}")
+                    print(f"DEBUG: new_cache_0.shape={new_cache_0.shape}")
+                    print(f"DEBUG: cache[0].shape BEFORE={cache.cache[0].shape if cache.cache[0] is not None else None}")
+                cache[0] = new_cache_0
+                if os.environ.get('DEBUG_CACHE'):
+                    print(f"DEBUG: cache[0].shape AFTER={cache.cache[0].shape if cache.cache[0] is not None else None}")
+            # Save conv_input for speculative decoding state restoration
+            if hasattr(cache, '_recording') and cache._recording:
+                cache._conv_input = conv_input
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -179,6 +192,14 @@ class GatedDeltaNet(nn.Module):
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        # Save q, k, v, g, beta for speculative decoding replay.
+        # This allows restoring the recurrent state to any position without
+        # a full model rebuild — just replay the cheap state update loop.
+        if cache is not None and hasattr(cache, '_recording') and cache._recording:
+            beta = mx.sigmoid(b)
+            g = compute_g(self.A_log, a, self.dt_bias)
+            cache._verify_qkvgb = (q, k, v, g, beta)
 
         out, state = gated_delta_update(
             q,
@@ -304,6 +325,25 @@ class TextModel(nn.Module):
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
+    def make_speculative_cache(self, max_size: int = 8192):
+        """Create cache for speculative decoding with checkpoint/rollback support.
+
+        This creates SpeculativeArraysCache for linear attention layers, which
+        supports checkpoint/rollback operations needed for speculative decoding.
+
+        Args:
+            max_size: Maximum sequence length for cache pre-allocation
+
+        Returns:
+            List of cache objects (SpeculativeArraysCache for linear layers, KVCache for others)
+        """
+        return [
+            SpeculativeArraysCache(size=2, conv_kernel_size=4, max_size=max_size)
+            if l.is_linear
+            else KVCache()
+            for l in self.layers
+        ]
+
     def sanitize(self, weights):
         has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
@@ -358,7 +398,7 @@ class ModelArgs(BaseModelArgs):
     text_config: dict
 
     @classmethod
-    def from_dict(cls, params):
+    def from_dict(cls, params, weights=None):
         if "text_config" not in params:
             return cls(model_type=params["model_type"], text_config=params)
         return super().from_dict(params)
@@ -521,6 +561,9 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def make_speculative_cache(self, max_size: int = 8192):
+        return self.language_model.make_speculative_cache(max_size)
 
     @property
     def quant_predicate(self):

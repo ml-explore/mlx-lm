@@ -183,6 +183,13 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
+
+    # Check if this is a DFlash draft model
+    is_dflash = "dflash_config" in config
+    if is_dflash:
+        arch = importlib.import_module("mlx_lm.models.dflash_v2")
+        return arch.Model, arch.ModelArgs
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")

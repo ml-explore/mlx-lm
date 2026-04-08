@@ -219,6 +219,7 @@ def gated_delta_ops(
     beta: mx.array,
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
+    state_recorder: Optional[list] = None,
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
@@ -255,6 +256,8 @@ def gated_delta_ops(
             None if mask is None else mask[:, t],
         )
         ys.append(y)
+        if state_recorder is not None:
+            state_recorder.append(state)
     y = mx.stack(ys, axis=1)
     return y, state
 
@@ -270,6 +273,7 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    state_recorder: Optional[list] = None,
 ) -> Tuple[mx.array, mx.array]:
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
@@ -278,6 +282,7 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return gated_delta_ops(q, k, v, g, beta, state, mask)
+    # Use ops path when recording states (kernel doesn't support it)
+    if state_recorder is not None or not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return gated_delta_ops(q, k, v, g, beta, state, mask, state_recorder)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)

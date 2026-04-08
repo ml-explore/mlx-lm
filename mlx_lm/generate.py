@@ -214,10 +214,22 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--quantize-draft",
+        action="store_true",
+        help="Quantize the draft model to 4-bit for faster inference.",
+    )
+    parser.add_argument(
         "--num-draft-tokens",
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        help="Block size for DFlash speculative decoding.",
+        default=None,
+        choices=[4, 8, 16, 32],
     )
     return parser
 
@@ -706,11 +718,32 @@ def stream_generate(
             (token, logprobs, False) for token, logprobs in token_generator
         )
     else:
+        # Check if draft_model is a DFlash model
+        is_dflash = (
+            hasattr(draft_model, "block_size")
+            and hasattr(draft_model, "mask_token_id")
+            and draft_model.mask_token_id is not None
+        )
+
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
+
+        if is_dflash:
+            # Use DFlash block diffusion generation (v2 - reference port)
+            from .generate_dflash_v2 import block_diffusion_generate_step
+            # Pop kwargs not supported by DFlash
+            kwargs.pop("num_draft_tokens", None)
+            kwargs.pop("prompt_cache", None)
+            kwargs.pop("logits_processors", None)
+            kwargs.pop("prefill_step_size", None)
+            token_generator = block_diffusion_generate_step(
+                prompt, model, draft_model, tokenizer, **kwargs
+            )
+        else:
+            # Use standard speculative decoding
+            token_generator = speculative_generate_step(
+                prompt, model, draft_model, **kwargs
+            )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
@@ -2047,8 +2080,14 @@ def main():
 
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
-        if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+        # DFlash draft models may have different vocab_size due to broken configs
+        # Skip check for DFlash models (detected by block_size)
+        is_dflash = args.block_size is not None and hasattr(draft_model, 'block_size')
+        if not is_dflash and draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
+        if args.quantize_draft:
+            import mlx.nn as nn
+            nn.quantize(draft_model, group_size=64, bits=4)
     else:
         draft_model = None
     sampler = make_sampler(
@@ -2075,6 +2114,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        block_size=args.block_size,
     )
     if not args.verbose:
         print(response)
