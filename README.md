@@ -89,6 +89,9 @@ to see how to use the API in more detail. Check out the [batch generation
 example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
 to see how to efficiently generate continuations for a batch of prompts.
 
+Check out the [RAG example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/rag.py)
+to see how to use retrieval-augmented generation to ground LLM responses in external documents.
+
 The `mlx-lm` package also comes with functionality to quantize and optionally
 upload models to the Hugging Face Hub.
 
