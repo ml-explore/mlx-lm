@@ -254,6 +254,25 @@ class TestToolParsing(unittest.TestCase):
             {"settings": {"enabled": True, "name": "test"}},
         )
 
+    def test_gemma4_unbalanced_braces_in_strings(self):
+        # Unbalanced opening brace inside a string argument
+        test_case = 'call:write_file{content:<|"|>if (x) { console.log(y)<|"|>}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "write_file")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"content": "if (x) { console.log(y)"},
+        )
+
+        # Unbalanced closing brace inside a string argument
+        test_case = 'call:write_file{content:<|"|>test } only<|"|>}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "write_file")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"content": "test } only"},
+        )
+
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
