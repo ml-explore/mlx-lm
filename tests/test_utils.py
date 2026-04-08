@@ -243,6 +243,65 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(mx.allclose(loaded["proj.scales"], weights["proj.scales"]))
         self.assertTrue(mx.allclose(loaded["proj.biases"], weights["proj.biases"]))
 
+    def test_load_model_gemma4_with_per_layer_projection_quantization(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 32,
+                    "num_hidden_layers": 2,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 16,
+                    "global_head_dim": 16,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention", "full_attention"],
+                    "hidden_size_per_layer_input": 32,
+                    "vocab_size_per_layer_input": 32,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+        model, config = utils.quantize_model(
+            model,
+            {
+                "model_type": "gemma4",
+                "vocab_size": args.vocab_size,
+                "text_config": args.text_config,
+            },
+            group_size=32,
+            bits=4,
+        )
+
+        config["quantization"]["language_model.model.per_layer_model_projection"] = {
+            "group_size": 32,
+            "bits": 4,
+        }
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+
+            loaded, loaded_config = utils.load_model(Path(mlx_path))
+
+            self.assertIn(
+                "language_model.model.per_layer_model_projection",
+                loaded_config["quantization"],
+            )
+
+            logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+            mx.eval(logits)
+            self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
 
 if __name__ == "__main__":
     unittest.main()
