@@ -932,8 +932,12 @@ class BatchKVCache(_BaseCache):
     def update_and_fetch(self, keys, values):
         prev = self._idx
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = keys.shape
-            v_head_dim = values.shape[3]
+            if self.keys is not None:
+                B, n_kv_heads, _, k_head_dim = self.keys.shape
+                v_head_dim = self.values.shape[3]
+            else:
+                B, n_kv_heads, _, k_head_dim = keys.shape
+                v_head_dim = values.shape[3]
             n_steps = (self.step + keys.shape[2] - 1) // self.step
             k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
             v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
