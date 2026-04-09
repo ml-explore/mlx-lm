@@ -32,6 +32,7 @@ class PipelineMixin:
 
         layer_counts = self._compute_layer_split(n_layers, group)
 
+
         # Pipeline assigns in reverse: rank 0 = last layers, rank N = first
         start = sum(
             layer_counts[i]
@@ -47,8 +48,13 @@ class PipelineMixin:
     def _compute_layer_split(self, n_layers, group):
         """Determine how many layers each rank should get."""
         try:
-            return self._memory_proportional_split(n_layers, group)
-        except Exception:
+            result = self._memory_proportional_split(n_layers, group)
+            import sys
+            print(f"[pipeline rank={self.pipeline_rank}] proportional split: {result}", file=sys.stderr, flush=True)
+            return result
+        except Exception as e:
+            import sys
+            print(f"[pipeline rank={self.pipeline_rank}] proportional split FAILED: {e}, using equal", file=sys.stderr, flush=True)
             return self._equal_split(n_layers)
 
     def _equal_split(self, n_layers):
@@ -73,11 +79,22 @@ class PipelineMixin:
         else:
             local_ws = psutil.virtual_memory().total * 0.94
 
-        total_model_bytes = sum(
+        local_model_bytes = sum(
             p.nbytes
             for _, p in tree_flatten(self.parameters())
             if isinstance(p, mx.array)
         )
+        # Share model bytes across ranks — on lazy-loaded models, each rank
+        # may report different sizes depending on which weight files exist locally.
+        # Use the max across ranks as the authoritative total.
+        all_bytes = mx.distributed.all_gather(
+            mx.array([float(local_model_bytes)], dtype=mx.float32), group=group
+        )
+        mx.eval(all_bytes)
+        # On lazy-loaded models, ranks may report different parameter sizes
+        # depending on which weight files exist locally. Broadcast rank 0's
+        # value as the reference since it always has full model access.
+        total_model_bytes = float(all_bytes[0].item())
         bytes_per_layer = total_model_bytes / n_layers if n_layers > 0 else 1
 
         # Per-layer compute overhead covers KV cache, attention scores,
@@ -95,9 +112,17 @@ class PipelineMixin:
         all_cap = mx.distributed.all_gather(
             mx.array([local_capacity], dtype=mx.float32), group=group
         )
-        # Materialize the lazy MLX array (required for distributed ops)
+        # Materialize distributed gather (mx.eval is MLX graph materializer)
         mx.eval(all_cap)
         capacities = [float(all_cap[i].item()) for i in range(self.pipeline_size)]
+        import sys
+        print(
+            f"[pipeline rank={self.pipeline_rank}] "
+            f"local_cap={local_capacity/1e9:.1f}GB "
+            f"all_cap={[round(c/1e9, 1) for c in capacities]} "
+            f"bpl={bytes_per_layer/1e9:.2f}GB",
+            file=sys.stderr, flush=True,
+        )
         total_cap = sum(capacities)
 
         # Compute per-node max layers
