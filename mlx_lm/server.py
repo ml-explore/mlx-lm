@@ -289,6 +289,9 @@ class ModelProvider:
         self.default_model_map = {}
         if self.cli_args.model is not None:
             self.default_model_map[self.cli_args.model] = "default_model"
+            # Map the base name (short name) so API calls match properly
+            short_name = Path(self.cli_args.model).name
+            self.default_model_map[short_name] = "default_model"
             self.load(self.cli_args.model, draft_model_path="default_model")
 
     # Added in adapter_path to load dynamically
