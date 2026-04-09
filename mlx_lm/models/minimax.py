@@ -265,7 +265,7 @@ class MiniMaxModel(PipelineMixin, nn.Module):
         from .cache import KVCache
 
         return [
-            KVCache(self.args.head_dim, self.args.num_key_value_heads)
+            KVCache()
             for _ in self.pipeline_layers
         ]
 
@@ -391,6 +391,12 @@ class Model(nn.Module):
                 group=group,
             )
             layer.block_sparse_moe.sharding_group = group
+
+    def make_cache(self):
+        if hasattr(self.model, "make_cache"):
+            return self.model.make_cache()
+        from .cache import KVCache
+        return [KVCache() for _ in self.model.layers]
 
     @property
     def layers(self):
