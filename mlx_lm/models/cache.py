@@ -1024,8 +1024,9 @@ class BatchKVCache(_BaseCache):
         def pad(c):
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+                v = mx.array([]).reshape(Bc, H, 0, M)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -1360,8 +1361,9 @@ class BatchRotatingKVCache(_BaseCache):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+                v = mx.array([]).reshape(Bc, H, 0, M)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
