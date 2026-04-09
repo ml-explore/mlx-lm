@@ -932,12 +932,8 @@ class BatchKVCache(_BaseCache):
     def update_and_fetch(self, keys, values):
         prev = self._idx
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            if self.keys is not None:
-                B, n_kv_heads, _, k_head_dim = self.keys.shape
-                v_head_dim = self.values.shape[3]
-            else:
-                B, n_kv_heads, _, k_head_dim = keys.shape
-                v_head_dim = values.shape[3]
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
             n_steps = (self.step + keys.shape[2] - 1) // self.step
             k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
             v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
@@ -1050,8 +1046,11 @@ class BatchKVCache(_BaseCache):
         def pad(c):
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                # Use the true per-cache batch size from left_padding, not the
+                # outer-scope B which may belong to the other cache in the pair.
+                b = c.left_padding.shape[0]
+                k = mx.array([]).reshape(b, H, 0, D)
+                v = mx.array([]).reshape(b, H, 0, M)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -1386,8 +1385,11 @@ class BatchRotatingKVCache(_BaseCache):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                # Use the true per-cache batch size from left_padding, not the
+                # outer-scope B which may belong to the other cache in the pair.
+                b = c.left_padding.shape[0]
+                k = mx.array([]).reshape(b, H, 0, D)
+                v = mx.array([]).reshape(b, H, 0, M)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
