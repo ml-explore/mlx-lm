@@ -9,6 +9,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -221,9 +222,10 @@ class MiniMaxDecoderLayer(nn.Module):
         return r
 
 
-class MiniMaxModel(nn.Module):
+class MiniMaxModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
         self.layers = [
@@ -241,14 +243,31 @@ class MiniMaxModel(nn.Module):
         h = self.embed_tokens(inputs)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        if self.pipeline_rank < self.pipeline_size - 1:
+            h = mx.distributed.recv_like(h, self.pipeline_rank + 1)
+
+        for layer, c in zip(self.pipeline_layers, cache):
             h = layer(h, mask, c)
 
+        if self.pipeline_rank != 0:
+            h = mx.distributed.send(h, (self.pipeline_rank - 1) % self.pipeline_size)
+
+        if self.pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
+
         return self.norm(h)
+
+    def make_cache(self):
+        from .cache import KVCache
+
+        return [
+            KVCache(self.args.head_dim, self.args.num_key_value_heads)
+            for _ in self.pipeline_layers
+        ]
 
 
 class Model(nn.Module):

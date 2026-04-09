@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -171,7 +172,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return out
 
 
-class Qwen3MoeModel(nn.Module):
+class Qwen3MoeModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -197,14 +198,36 @@ class Qwen3MoeModel(nn.Module):
             h = self.embed_tokens(inputs)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(h, cache[0], return_array=True)
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+        # In pipeline parallel, receive hidden state from the next rank
+        # (which processed earlier layers)
+        if self.pipeline_rank < self.pipeline_size - 1:
+            h = mx.distributed.recv_like(h, self.pipeline_rank + 1)
+
+        for layer, c in zip(self.pipeline_layers, cache):
+            h = layer(h, mask, cache=c)
+
+        # Send hidden state to the previous rank (which has later layers)
+        if self.pipeline_rank != 0:
+            h = mx.distributed.send(h, (self.pipeline_rank - 1) % self.pipeline_size)
+
+        # All ranks need the final output for lm_head
+        if self.pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
+
+    def make_cache(self):
+        """Return KV cache entries only for this rank's layers."""
+        from .cache import KVCache
+
+        return [
+            KVCache(self.args.head_dim, self.args.num_key_value_heads)
+            for _ in self.pipeline_layers
+        ]
 
 
 class Model(nn.Module):
