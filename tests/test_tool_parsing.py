@@ -254,6 +254,13 @@ class TestToolParsing(unittest.TestCase):
             {"settings": {"enabled": True, "name": "test"}},
         )
 
+        # Empty match — plain-text reply with no `call:name{...}` pattern.
+        # This fires on every tool-capable request where the model answers
+        # in natural language, so it must return `[]` rather than raising
+        # (see #1125).
+        self.assertEqual(gemma4.parse_tool_call("", None), [])
+        self.assertEqual(gemma4.parse_tool_call("Sure, I will do that.", None), [])
+
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
