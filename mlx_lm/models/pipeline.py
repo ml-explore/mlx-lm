@@ -45,6 +45,61 @@ class PipelineMixin:
         self.layers = self.layers[: self.end_idx]
         self.layers[: self.start_idx] = [None] * self.start_idx
 
+    def pipeline_warmup(self):
+        """Compile Metal shaders incrementally to avoid command buffer timeout.
+
+        The first cold forward pass builds a compute graph spanning all local
+        layers plus distributed ops whose shader compilation can exceed
+        Metal's command buffer timeout.  This runs the layers in small
+        batches first — each batch compiles only a few shaders, staying
+        well within the timeout.
+        """
+        import sys
+        from .base import create_attention_mask
+
+        if self.pipeline_size <= 1:
+            return
+
+        pr = self.pipeline_rank
+        ps = self.pipeline_size
+        n = len(self.pipeline_layers)
+        tokens = mx.array([[1, 2, 3]])
+
+        print(f"[pipeline rank={pr}] warmup: {n} layers...",
+              file=sys.stderr, flush=True)
+
+        # Phase 1: Compile layer shaders locally (no distributed ops).
+        # Each rank runs its own layers in chunks of 5 with independent
+        # evals — no recv/send, so no cross-rank dependencies.
+        h = self.embed_tokens(tokens)
+        mask = create_attention_mask(h, None, return_array=True)
+        mx.eval(h)
+        for start in range(0, n, 5):
+            h_local = self.embed_tokens(tokens)
+            for i in range(start, min(start + 5, n)):
+                h_local = self.pipeline_layers[i](h_local, mask, cache=None)
+            mx.eval(h_local)
+
+        # Phase 2: Sync all ranks, then run a full pipeline forward pass.
+        # Shaders are compiled from Phase 1, so the graph executes fast
+        # even though it spans all layers + recv/send/all_gather.
+        mx.eval(mx.distributed.all_sum(mx.zeros(1)))
+        h = self.embed_tokens(tokens)
+        mask = create_attention_mask(h, None, return_array=True)
+        if pr < ps - 1:
+            h = mx.distributed.recv_like(h, pr + 1)
+        for i in range(n):
+            h = self.pipeline_layers[i](h, mask, cache=None)
+        if pr != 0:
+            h = mx.distributed.send(h, (pr - 1) % ps)
+        if ps > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
+        h = self.norm(h)
+        mx.eval(h, mx.distributed.all_sum(mx.zeros(1)))
+
+        print(f"[pipeline rank={pr}] warmup: done",
+              file=sys.stderr, flush=True)
+
     def _compute_layer_split(self, n_layers, group):
         """Determine how many layers each rank should get."""
         try:
