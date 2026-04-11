@@ -450,6 +450,18 @@ class ResponseGenerator:
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
             )
 
+    def _has_thinking(self, tokenizer, args):
+        """Resolve effective thinking state for this request.
+
+        Priority: per-request kwargs > CLI args > tokenizer default.
+        """
+        if args.chat_template_kwargs and "enable_thinking" in args.chat_template_kwargs:
+            return args.chat_template_kwargs["enable_thinking"]
+        cli_args = self.model_provider.cli_args.chat_template_args
+        if "enable_thinking" in cli_args:
+            return cli_args["enable_thinking"]
+        return tokenizer.has_thinking
+
     def _next_request(self, timeout=None):
         request = None
         if not self._is_distributed or self._rank == 0:
@@ -548,8 +560,9 @@ class ResponseGenerator:
         # for segments for better cache management.
 
         # Choose the initial state among only reasoning or normal
+        has_thinking = self._has_thinking(tokenizer, args)
         initial_state = "normal"
-        if tokenizer.has_thinking:
+        if has_thinking:
             think_start = tokenizer.rfind_think_start(prompt)
             think_end = tokenizer.rfind_think_end(prompt)
             if think_start > think_end:
@@ -587,7 +600,7 @@ class ResponseGenerator:
         # Find a tail segment that contains thinking tokens (small up to 11
         # tokens)
         tail_start = len(prompt)
-        if tokenizer.has_thinking:
+        if has_thinking:
             think_start = tokenizer.rfind_think_start(prompt, start=tail_start - 11)
             if think_start >= 0:
                 tail_start = think_start
@@ -606,14 +619,21 @@ class ResponseGenerator:
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(
-        self, model_key, tokenizer, stop_words, initial_state="normal"
+        self,
+        model_key,
+        tokenizer,
+        stop_words,
+        initial_state="normal",
+        has_thinking=None,
     ):
         """Make a new SequenceStateMachine or fetch it if we 've made it before.
 
         Return also a dictionary that maps the token sequences in the state
         machine to their strings.
         """
-        cache_key = (model_key, tuple(stop_words), initial_state)
+        if has_thinking is None:
+            has_thinking = tokenizer.has_thinking
+        cache_key = (model_key, tuple(stop_words), initial_state, has_thinking)
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
@@ -637,7 +657,7 @@ class ResponseGenerator:
         transitions["normal"] = list(common_stops)
 
         # Reasoning related transitions
-        if tokenizer.has_thinking:
+        if has_thinking:
             ts = tokenizer.think_start_tokens
             te = tokenizer.think_end_tokens
             transitions["normal"].append((ts, "reasoning"))
@@ -715,11 +735,13 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
+                    has_thinking = self._has_thinking(tokenizer, args)
                     sm, sequences = self._make_state_machine(
                         self.model_provider.model_key,
                         tokenizer,
                         args.stop_words,
                         initial_state,
+                        has_thinking=has_thinking,
                     )
 
                     self._log_cache_stats()
@@ -738,7 +760,7 @@ class ResponseGenerator:
 
                     ctx = GenerationContext(
                         has_tool_calling=tokenizer.has_tool_calling,
-                        has_thinking=tokenizer.has_thinking,
+                        has_thinking=has_thinking,
                         tool_parser=tokenizer.tool_parser,
                         sequences=sequences,
                         prompt=prompt,
@@ -906,18 +928,20 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
+            has_thinking = self._has_thinking(tokenizer, args)
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
                 initial_state=initial_state,
+                has_thinking=has_thinking,
             )
             sm_state = sm.make_state()
 
             # Start the generation context
             ctx = GenerationContext(
-                has_thinking=tokenizer.has_thinking,
+                has_thinking=has_thinking,
                 has_tool_calling=tokenizer.has_tool_calling,
                 tool_parser=tokenizer.tool_parser,
                 sequences=sequences,
