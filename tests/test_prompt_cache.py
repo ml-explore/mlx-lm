@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    TurboQuantKVCache,
     load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
@@ -671,6 +672,96 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+    def test_turboquant_kv_cache_update_and_fetch(self):
+        B, H, S, D = 1, 2, 16, 128
+        for bits in (2, 3, 4):
+            c = TurboQuantKVCache(bits=bits, k_head_dim=D)
+            k = mx.random.normal(shape=(B, H, S, D))
+            v = mx.random.normal(shape=(B, H, S, D))
+            dk, dv = c.update_and_fetch(k, v)
+            self.assertEqual(dk.shape, (B, H, S, D))
+            self.assertEqual(dv.shape, (B, H, S, D))
+            self.assertEqual(c.offset, S)
+
+    def test_turboquant_kv_cache_rejects_unsupported_bits(self):
+        for bad in (1, 5, 8):
+            with self.assertRaises(ValueError):
+                TurboQuantKVCache(bits=bad, k_head_dim=64)
+
+    def test_turboquant_kv_cache_quality(self):
+        # Dequantized K/V should retain high cosine similarity with inputs.
+        mx.random.seed(0)
+        B, H, S, D = 1, 4, 64, 128
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+
+        def cos(a, b):
+            a, b = a.flatten(), b.flatten()
+            return float((a * b).sum() / (mx.linalg.norm(a) * mx.linalg.norm(b)))
+
+        c4 = TurboQuantKVCache(bits=4, k_head_dim=D)
+        dk4, dv4 = c4.update_and_fetch(k, v)
+        self.assertGreater(cos(k, dk4), 0.99)
+        self.assertGreater(cos(v, dv4), 0.99)
+
+        c3 = TurboQuantKVCache(bits=3, k_head_dim=D)
+        dk3, dv3 = c3.update_and_fetch(k, v)
+        self.assertGreater(cos(k, dk3), 0.97)
+
+    def test_turboquant_kv_cache_trim_and_streaming(self):
+        B, H, D = 1, 2, 64
+        c = TurboQuantKVCache(bits=3, k_head_dim=D)
+        for _ in range(5):
+            k = mx.random.normal(shape=(B, H, 13, D))
+            v = mx.random.normal(shape=(B, H, 13, D))
+            dk, _ = c.update_and_fetch(k, v)
+        self.assertEqual(c.offset, 65)
+        self.assertEqual(dk.shape, (B, H, 65, D))
+        self.assertTrue(c.is_trimmable())
+        self.assertEqual(c.trim(10), 10)
+        self.assertEqual(c.offset, 55)
+
+    def test_turboquant_kv_cache_asymmetric_head_dims(self):
+        # Gemma 4 global layers have K and V with the same global_head_dim;
+        # make sure K and V can also have different dims in principle.
+        B, H, S = 1, 2, 8
+        c = TurboQuantKVCache(bits=4, k_head_dim=128, v_head_dim=64)
+        k = mx.random.normal(shape=(B, H, S, 128))
+        v = mx.random.normal(shape=(B, H, S, 64))
+        dk, dv = c.update_and_fetch(k, v)
+        self.assertEqual(dk.shape, (B, H, S, 128))
+        self.assertEqual(dv.shape, (B, H, S, 64))
+
+    def test_save_load_turboquant_cache(self):
+        B, H, S, D = 1, 2, 10, 64
+        cache = [TurboQuantKVCache(bits=3, k_head_dim=D) for _ in range(3)]
+        for c in cache:
+            k = mx.random.normal(shape=(B, H, S, D))
+            v = mx.random.normal(shape=(B, H, S, D))
+            c.update_and_fetch(k, v)
+        cache_file = os.path.join(self.test_dir, "turboquant_cache.safetensors")
+        save_prompt_cache(cache_file, cache)
+        loaded = load_prompt_cache(cache_file)
+        self.assertEqual(len(loaded), len(cache))
+        for c, lc in zip(cache, loaded):
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c.bits, lc.bits)
+            self.assertEqual(c.k_head_dim, lc.k_head_dim)
+            for a, b in zip(c.state, lc.state):
+                self.assertTrue(mx.array_equal(a, b))
+
+    def test_kvcache_to_turboquant(self):
+        B, H, S, D = 1, 2, 32, 128
+        fp = KVCache()
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        fp.update_and_fetch(k, v)
+        tq = fp.to_turboquant(bits=4)
+        self.assertIsInstance(tq, TurboQuantKVCache)
+        self.assertEqual(tq.offset, S)
+        self.assertEqual(tq.bits, 4)
+        self.assertEqual(tq.k_head_dim, D)
 
 
 if __name__ == "__main__":
