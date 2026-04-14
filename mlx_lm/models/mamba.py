@@ -9,6 +9,8 @@ import mlx.nn as nn
 from .activations import swiglu
 from .base import BaseModelArgs
 from .cache import ArraysCache
+from .mamba_selective_state_update import selective_state_update
+from .ssm_selective_scan import selective_scan_fwd_with_state
 
 
 @dataclass
@@ -133,13 +135,86 @@ class MambaBlock(nn.Module):
         conv_out = self.conv1d(x_full)
         new_conv_cache = x_full[:, -(K - 1) :, :]
         x = nn.silu(conv_out)
-        A = -mx.exp(self.A_log)
-        current_state = state_cache
-        y = []
-        for t in range(T):
-            y_t, current_state = self.ssm_step(x[:, t], A, current_state)
-            y.append(y_t)
-        y = mx.stack(y, axis=1)
+
+        can_use_prefill_kernel = (
+            T > 1
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+            and self.ssm_state_size <= 256
+        )
+        if can_use_prefill_kernel:
+            deltaBC = self.x_proj(x)
+            delta, B_mix, C_mix = mx.split(
+                deltaBC,
+                [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
+                axis=-1,
+            )
+            if self.use_bcdt_rms:
+                delta, B_mix, C_mix = map(self.mixer_norm, (delta, B_mix, C_mix))
+
+            delta = self.dt_proj(delta)
+            u = x.transpose(0, 2, 1)
+            delta = delta.transpose(0, 2, 1)
+            A = -mx.exp(self.A_log.astype(mx.float32))
+            B_kernel = B_mix.transpose(0, 2, 1)
+            C_kernel = C_mix.transpose(0, 2, 1)
+            D_skip = self.D.astype(mx.float32)
+            initial_state = state_cache
+
+            y, current_state = selective_scan_fwd_with_state(
+                u=u,
+                delta=delta,
+                A=A,
+                B=B_kernel,
+                C=C_kernel,
+                D=D_skip,
+                delta_bias=None,
+                initial_state=initial_state,
+                delta_softplus=True,
+            )
+            current_state = current_state.astype(x.dtype)
+            y = y.transpose(0, 2, 1)
+        else:
+            A = -mx.exp(self.A_log)
+            current_state = state_cache
+            can_use_decode_kernel = (
+                T == 1
+                and current_state is not None
+                and mx.default_device() == mx.gpu
+                and mx.metal.is_available()
+                and self.ssm_state_size <= 256
+            )
+            if can_use_decode_kernel:
+                x_t = x[:, 0]
+                deltaBC = self.x_proj(x_t)
+                delta, B_mix, C_mix = mx.split(
+                    deltaBC,
+                    [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
+                    axis=-1,
+                )
+                if self.use_bcdt_rms:
+                    delta, B_mix, C_mix = map(self.mixer_norm, (delta, B_mix, C_mix))
+
+                dt_raw = self.dt_proj(delta)
+                y_t, current_state = selective_state_update(
+                    state=current_state,
+                    x=x_t,
+                    dt=dt_raw,
+                    A=A.astype(mx.float32),
+                    B=B_mix,
+                    C=C_mix,
+                    D=self.D,
+                    dt_bias=self.dt_proj.bias,
+                    dt_softplus=True,
+                )
+                y = mx.expand_dims(y_t, axis=1)
+            else:
+                y = []
+                for t in range(T):
+                    y_t, current_state = self.ssm_step(x[:, t], A, current_state)
+                    y.append(y_t)
+                y = mx.stack(y, axis=1)
+
         z = self.out_proj(swiglu(z, y))
         return z, (new_conv_cache, current_state)
 
