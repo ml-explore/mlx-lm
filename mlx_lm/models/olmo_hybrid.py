@@ -41,7 +41,7 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
     layer_types: Optional[List[str]] = None
     rope_parameters: Optional[Dict] = None
-    rope_theta: Optional[float] = None
+    rope_theta: Optional[float] = 10000.0
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
