@@ -651,10 +651,11 @@ class ResponseGenerator:
             ts = tokenizer.tool_call_start_tokens
             te = tokenizer.tool_call_end_tokens
             transitions["normal"].append((ts, "tool"))
-            transitions["tool"] = [(te, "normal")]
+            transitions["tool"] = [(te, "normal")] if te else []
             transitions["tool"].extend(common_stops)
             sequences[ts] = tokenizer.tool_call_start
-            sequences[te] = tokenizer.tool_call_end
+            if te:
+                sequences[te] = tokenizer.tool_call_end
 
         sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
