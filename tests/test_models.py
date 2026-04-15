@@ -1777,6 +1777,40 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_olmo_hybrid(self):
+        from mlx_lm.models import olmo_hybrid
+
+        args = olmo_hybrid.ModelArgs(
+            model_type="olmo_hybrid",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-4,
+            vocab_size=1000,
+            max_position_embeddings=128,
+            linear_num_key_heads=1,
+            linear_num_value_heads=2,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=3,
+            linear_allow_neg_eigval=False,
+            tie_word_embeddings=False,
+            attention_bias=False,
+            rope_theta=1000,
+            layer_types=[
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+        )
+        model = olmo_hybrid.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_exaone(self):
         from mlx_lm.models import exaone
 
