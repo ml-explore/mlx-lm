@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import mlx.core as mx
+
 from .base import BaseModelArgs
 from .qwen3_5 import Model as Qwen3_5Model
 
@@ -48,5 +50,21 @@ class Model(Qwen3_5Model):
                 new_weights[f"{prefix}.switch_mlp.down_proj.weight"] = new_weights.pop(
                     f"{prefix}.experts.down_proj"
                 )
+
+        # Stack per-expert MTP weights into switch_mlp format.
+        # MTP layers use unfused per-expert weights (experts.{i}.gate_proj etc)
+        # unlike backbone layers which use fused gate_up_proj.
+        mtp_num = getattr(self.language_model.args, "mtp_num_hidden_layers", 0)
+        num_experts = self.language_model.args.num_experts
+        for layer_idx in range(mtp_num):
+            prefix = f"language_model.mtp.layers.{layer_idx}.mlp"
+            test_key = f"{prefix}.experts.0.gate_proj.weight"
+            if test_key in new_weights:
+                for n in ["gate_proj", "up_proj", "down_proj"]:
+                    to_join = [
+                        new_weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+                        for e in range(num_experts)
+                    ]
+                    new_weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
 
         return self.language_model.sanitize(new_weights)
