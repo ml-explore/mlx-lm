@@ -173,6 +173,58 @@ mlx_lm.fuse \
 This will save the GGUF model in `fused_model/ggml-model-f16.gguf`. You
 can specify the file name with `--gguf-path`.
 
+## Loading PEFT / Unsloth Adapters
+
+If you have trained a LoRA adapter using [PEFT](https://github.com/huggingface/peft)
+or [Unsloth](https://github.com/unslothai/unsloth) on a CUDA GPU, you can load it
+directly on Apple Silicon without any manual conversion.
+
+Detection is automatic: if `adapter_config.json` contains a `"peft_type"` key,
+mlx-lm treats the directory as a PEFT adapter.
+
+### Supported formats
+
+| Field | PEFT (auto-detected) | mlx-lm native |
+|---|---|---|
+| Config file | `adapter_config.json` with `"peft_type"` | `adapter_config.json` with `"fine_tune_type"` |
+| Weight file | `adapter_model.safetensors` | `adapters.safetensors` |
+| Supported type | `"LORA"` | `"lora"`, `"dora"`, `"full"` |
+
+### Usage
+
+No change to your existing commands — use the PEFT adapter directory directly:
+
+```shell
+mlx_lm.generate \
+    --model <path_to_base_model> \
+    --adapter-path <path_to_peft_adapter_dir> \
+    --prompt "<your_prompt>"
+```
+
+Or in Python:
+
+```python
+from mlx_lm import load, generate
+
+model, tokenizer = load(
+    "<path_to_base_model>",
+    adapter_path="<path_to_peft_adapter_dir>",
+)
+response = generate(model, tokenizer, prompt="Hello!", max_tokens=100)
+```
+
+### Scale conversion
+
+PEFT's `lora_alpha` and `r` are automatically converted to mlx-lm's `scale`
+parameter as `scale = lora_alpha / r`, which matches PEFT's own effective scaling
+of the LoRA update.
+
+### Limitations
+
+- Only `peft_type: "LORA"` is supported. `"DORA"`, `"ADALORA"`, and `"IA3"` are
+  not yet supported via this path.
+- The `mlx_lm.fuse` command works with PEFT adapters loaded this way.
+
 ## Data
 
 The LoRA command expects you to provide a dataset with `--data`. The MLX
