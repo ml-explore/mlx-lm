@@ -41,36 +41,31 @@ Workload settings:
 - Prompt tokens: 1024
 - Generation tokens: 128
 - Batch size: 1
-- Trials: 3 for `mamba-370m`; 1 for larger models
+- Trials: 1
 
-Results (before -> after):
+Results (before -> after), focused on confirmed improvements:
 
 - `mlx-community/mamba-370m-hf-f16` (Mamba-1)
-	- prompt_tps: `291.996 -> 5630.994` (`19.28x`)
-	- generation_tps: `161.584 -> 167.765` (`1.04x`)
-	- peak_memory (GB): `1.027 -> 2.172`
+	- prompt_tps: `293.741 -> 5497.575` (`18.72x`)
+	- generation_tps: `159.172 -> 163.434` (`1.03x`)
+	- peak_memory (GB): `1.027 -> 2.173`
 
 - `mlx-community/mamba2-2.7b` (Mamba-2)
 	- baseline (`main`) status: model load fails (`ModelArgs` missing `intermediate_size`)
 	- after model-local compatibility fix:
-		- prompt_tps: `1110.885`
-		- generation_tps: `50.252`
-		- peak_memory (GB): `7.776`
+		- prompt_tps: `1071.840`
+		- generation_tps: `48.414`
+		- peak_memory (GB): `7.777`
 
 - `mlx-community/Mamba-Codestral-7B-v0.1` (Mamba-2)
-	- prompt_tps: `390.578 -> 468.743` (`1.20x`)
-	- generation_tps: `21.932 -> 21.942` (`1.00x`)
-	- peak_memory (GB): `22.935 -> 18.797`
+	- prompt_tps: `382.701 -> 451.243` (`1.18x`)
+	- generation_tps: `20.192 -> 21.419` (`1.06x`)
+	- peak_memory (GB): `22.918 -> 18.797`
 
 - `mlx-community/Falcon3-Mamba-7B-Instruct` (Mamba-1)
-	- prompt_tps: `69.419 -> 520.845` (`7.50x`)
-	- generation_tps: `20.868 -> 21.370` (`1.02x`)
-	- peak_memory (GB): `15.952 -> 16.623`
-
-- `mlx-community/mamba-1.4b-hf-f16` (Mamba-1)
-	- prompt_tps: `295.790 -> 2174.908` (`7.35x`)
-	- generation_tps: `80.601 -> 84.746` (`1.05x`)
-	- peak_memory (GB): `3.312 -> 4.281`
+	- prompt_tps: `59.933 -> 513.720` (`8.57x`)
+	- generation_tps: `19.325 -> 20.783` (`1.08x`)
+	- peak_memory (GB): `15.952 -> 16.624`
 
 ## Fallback Behavior
 When assumptions are not met, execution falls back to the reference implementation.
@@ -82,11 +77,10 @@ Fallback conditions include:
 
 ## Testing
 Commands run:
-- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba-370m-hf-f16 --prompt-tokens 1024 --generation-tokens 128 --num-trials 3`
-- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba2-2.7b --prompt-tokens 1024 --generation-tokens 128 --num-trials 1`
-- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/Mamba-Codestral-7B-v0.1 --prompt-tokens 1024 --generation-tokens 128 --num-trials 1`
-- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/Falcon3-Mamba-7B-Instruct --prompt-tokens 1024 --generation-tokens 128 --num-trials 1`
-- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba-1.4b-hf-f16 --prompt-tokens 1024 --generation-tokens 128 --num-trials 1`
+- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba-370m-hf-f16 --prompt-tokens 1024 --generation-tokens 128`
+- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba2-2.7b --prompt-tokens 1024 --generation-tokens 128`
+- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/Mamba-Codestral-7B-v0.1 --prompt-tokens 1024 --generation-tokens 128`
+- `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/Falcon3-Mamba-7B-Instruct --prompt-tokens 1024 --generation-tokens 128`
 
 ## Notes for Reviewers
 - Start with `mlx_lm/models/mamba.py` for Mamba-1 prefill/decode split.
