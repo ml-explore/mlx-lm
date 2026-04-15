@@ -6,6 +6,8 @@ I have an existing MLX Mamba kernel implementation with strong performance resul
 
 This issue proposes integrating kernel-level optimizations for SSM/Mamba paths used in inference, while preserving current behavior and adding safe fallbacks.
 
+Type: enhancement/performance proposal (not a bug report).
+
 ## Motivation
 Current Mamba/SSM paths are correct and portable, but there is still meaningful room for Apple Silicon-specific speedups in decode and/or prefill.
 
@@ -31,6 +33,17 @@ I will report:
 - Decode tokens/s and latency
 - End-to-end generation latency on representative prompts
 
+## Reproducible Baseline
+These commands reproduce current baseline behavior in `main` and establish a comparison point for the PR:
+
+```bash
+PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba-370m-hf-f16 --prompt-tokens 1024 --generation-tokens 128
+PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/Mamba-Codestral-7B-v0.1 --prompt-tokens 1024 --generation-tokens 128
+PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/Falcon3-Mamba-7B-Instruct --prompt-tokens 1024 --generation-tokens 128
+```
+
+For `mlx-community/mamba2-2.7b`, baseline currently fails to load due to missing `intermediate_size`; this will be documented explicitly in the PR with compatibility handling and before/after numbers where applicable.
+
 Hardware/software matrix (to be filled):
 - Device: M-series
 - macOS:
@@ -49,3 +62,4 @@ I will open a PR linked to this issue with:
 - Tests
 - Benchmarks
 - Notes on fallback behavior
+- Explicit `pre-commit` output summary and commands used

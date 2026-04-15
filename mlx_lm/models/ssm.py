@@ -372,9 +372,7 @@ def ssm_update(
     lengths: Optional[mx.array] = None,
 ):
     seq_len = hidden_states.shape[1]
-    if seq_len > 1 and _can_use_prefill_kernel(
-        hidden_states, B, C, mask, lengths
-    ):
+    if seq_len > 1 and _can_use_prefill_kernel(hidden_states, B, C, mask, lengths):
         return ssm_prefill_kernel(
             hidden_states,
             A_log,

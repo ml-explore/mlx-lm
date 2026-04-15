@@ -41,7 +41,9 @@ def run(
         batch, seqlen, K = a.shape
         ngroups = 1
 
-    assert a.shape == b.shape, f"a and b must have the same shape, got {a.shape} vs {b.shape}"
+    assert (
+        a.shape == b.shape
+    ), f"a and b must have the same shape, got {a.shape} vs {b.shape}"
 
     nchunks = math.ceil(seqlen / chunk_size)
 

@@ -48,8 +48,16 @@ def run(
     # Pad sequence if needed
     if seqlen < nchunks * chunk_size:
         pad_len = nchunks * chunk_size - seqlen
-        x = mx.concatenate([x, mx.zeros((batch, pad_len, nheads, headdim), dtype=x.dtype)], axis=1)
-        B_expanded = mx.concatenate([B_expanded, mx.zeros((batch, pad_len, nheads, dstate), dtype=B_expanded.dtype)], axis=1)
+        x = mx.concatenate(
+            [x, mx.zeros((batch, pad_len, nheads, headdim), dtype=x.dtype)], axis=1
+        )
+        B_expanded = mx.concatenate(
+            [
+                B_expanded,
+                mx.zeros((batch, pad_len, nheads, dstate), dtype=B_expanded.dtype),
+            ],
+            axis=1,
+        )
 
     # Reshape into chunks
     # x: (batch, nchunks, chunk_size, nheads, headdim)
@@ -60,7 +68,9 @@ def run(
     # decay_states = exp(dA_cumsum[:, :, :, -1:] - dA_cumsum) * dt
     # dA_cumsum: (batch, nheads, nchunks, chunk_size)
     dA_cumsum_last = dA_cumsum[:, :, :, -1:]  # (batch, nheads, nchunks, 1)
-    decay_states = mx.exp(dA_cumsum_last - dA_cumsum)  # (batch, nheads, nchunks, chunk_size)
+    decay_states = mx.exp(
+        dA_cumsum_last - dA_cumsum
+    )  # (batch, nheads, nchunks, chunk_size)
 
     # einsum: bclhn, bhcl, bhcl, bclhp -> bchpn
     # where:

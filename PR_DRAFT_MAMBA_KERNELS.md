@@ -1,6 +1,8 @@
 ## Summary
 Integrate optimized Mamba/SSM kernels for Apple Silicon in `mlx-lm` with correctness-preserving fallbacks.
 
+Closes: #<issue-number>
+
 ## What Changed
 - Added optimized Mamba-1 prefill path using selective-scan kernel.
 - Added optimized Mamba-1 decode path using fused selective state-update kernel.
@@ -27,6 +29,13 @@ Validation included:
 Tolerance used:
 - `rtol`: 1e-3
 - `atol`: 1e-3
+
+## Contributing Checklist
+- [x] Formatting/linting run with `pre-commit run --all-files`
+- [x] Existing behavior preserved with guarded fallbacks
+- [x] Tests/validation commands included below
+- [ ] At least one maintainer review
+- [ ] CI green on pull request
 
 ## Benchmarks
 Environment:
@@ -77,6 +86,8 @@ Fallback conditions include:
 
 ## Testing
 Commands run:
+- `pre-commit run --all-files`
+- `python -m unittest discover tests/`
 - `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba-370m-hf-f16 --prompt-tokens 1024 --generation-tokens 128`
 - `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/mamba2-2.7b --prompt-tokens 1024 --generation-tokens 128`
 - `PYTHONPATH=. python -m mlx_lm.benchmark --model mlx-community/Mamba-Codestral-7B-v0.1 --prompt-tokens 1024 --generation-tokens 128`

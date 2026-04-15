@@ -1,8 +1,11 @@
 import mlx.core as mx
 
-def run(states: mx.array, dA_chunk_cumsum: mx.array, initial_states: mx.array | None = None) -> tuple[mx.array, mx.array]:
+
+def run(
+    states: mx.array, dA_chunk_cumsum: mx.array, initial_states: mx.array | None = None
+) -> tuple[mx.array, mx.array]:
     batch, nchunks, nheads, dim = states.shape
-    
+
     if initial_states is None:
         has_initial = 0
         # Must be large enough that MLX passes it as a device buffer, not constant

@@ -1,5 +1,6 @@
 import mlx.core as mx
 
+
 def run(
     B: mx.array,
     C: mx.array,
@@ -19,15 +20,15 @@ def run(
     C_f = C.astype(mx.float32)
     B_expanded = mx.repeat(B_f, nheads // ngroups, axis=2)
     C_expanded = mx.repeat(C_f, nheads // ngroups, axis=2)
-    
+
     B_c = B_expanded.reshape(batch, nchunks, chunk_size, nheads, dstate)
     C_c = C_expanded.reshape(batch, nchunks, chunk_size, nheads, dstate)
-    
+
     C_ct = mx.transpose(C_c, (0, 1, 3, 2, 4))
     B_ct = mx.transpose(B_c, (0, 1, 3, 2, 4))
-    
+
     CB = C_ct @ mx.transpose(B_ct, (0, 1, 2, 4, 3))
-    
+
     prev_states_f = prev_states.astype(mx.float32)
     prev_st_t = mx.transpose(prev_states_f, (0, 1, 2, 4, 3))
     out_prev = C_ct @ prev_st_t
