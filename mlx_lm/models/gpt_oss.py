@@ -247,11 +247,15 @@ class Model(nn.Module):
         new_weights = {}
         for k, v in weights.items():
             if "gate_up_proj" in k and "bias" not in k:
+                is_prequantized = "_blocks" in k or "_scales" in k
                 if "_blocks" in k:
                     v = v.view(mx.uint32).flatten(-2)
                     k = k.replace("_blocks", ".weight")
                 if "_scales" in k:
                     k = k.replace("_scales", ".scales")
+                if not is_prequantized and "experts" in k:
+                    k = k + ".weight"
+                    v = v.swapaxes(-1, -2)
                 new_weights[k.replace("gate_up_proj", "gate_proj")] = mx.contiguous(
                     v[..., ::2, :]
                 )
@@ -259,11 +263,15 @@ class Model(nn.Module):
                     v[..., 1::2, :]
                 )
             elif "down_proj" in k and "bias" not in k:
+                is_prequantized = "_blocks" in k or "_scales" in k
                 if "_blocks" in k:
                     v = v.view(mx.uint32).flatten(-2)
                     k = k.replace("_blocks", ".weight")
                 if "_scales" in k:
                     k = k.replace("_scales", ".scales")
+                if not is_prequantized and "experts" in k:
+                    k = k + ".weight"
+                    v = v.swapaxes(-1, -2)
                 new_weights[k] = v
             elif "gate_up_proj_bias" in k:
                 new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = (
