@@ -412,6 +412,7 @@ def generate_step(
                     if tokens is not None
                     else input_tokens
                 )
+                mx.eval(tokens)
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
@@ -543,6 +544,7 @@ def speculative_generate_step(
 
     def _process_and_sample(tokens, logits):
         if logits_processors:
+            mx.eval(tokens)
             for processor in logits_processors:
                 logits = processor(tokens, logits)
 
@@ -1340,6 +1342,7 @@ class GenerationBatch:
                 tc.update_and_fetch(inputs[i : i + 1])
                 for i, tc in enumerate(self._token_context)
             ]
+            mx.eval(token_context)
             processed_logits = []
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
