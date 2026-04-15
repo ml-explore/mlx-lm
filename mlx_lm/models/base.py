@@ -69,7 +69,15 @@ def quantized_scaled_dot_product_attention(
     mask: Optional[mx.array],
     group_size: int = 64,
     bits: int = 8,
+    value_group_size: Optional[int] = None,
+    value_bits: Optional[int] = None,
 ) -> mx.array:
+    # Default value params to key params for backward compat
+    if value_group_size is None:
+        value_group_size = group_size
+    if value_bits is None:
+        value_bits = bits
+
     B, n_q_heads, L, D = queries.shape
     n_kv_heads = q_keys[0].shape[-3]
     n_repeats = n_q_heads // n_kv_heads
@@ -96,7 +104,11 @@ def quantized_scaled_dot_product_attention(
             scores += mask
     scores = mx.softmax(scores, axis=-1, precise=True)
     out = mx.quantized_matmul(
-        scores, *q_values, transpose=False, group_size=group_size, bits=bits
+        scores,
+        *q_values,
+        transpose=False,
+        group_size=value_group_size,
+        bits=value_bits,
     )
 
     if n_repeats > 1:
@@ -123,8 +135,10 @@ def scaled_dot_product_attention(
             values,
             scale=scale,
             mask=mask,
-            group_size=cache.group_size,
-            bits=cache.bits,
+            group_size=getattr(cache, "key_group_size", cache.group_size),
+            bits=getattr(cache, "key_bits", cache.bits),
+            value_group_size=getattr(cache, "value_group_size", cache.group_size),
+            value_bits=getattr(cache, "value_bits", cache.bits),
         )
     else:
         return mx.fast.scaled_dot_product_attention(
