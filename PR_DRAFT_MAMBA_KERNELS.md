@@ -94,7 +94,21 @@ Commands run:
 - Kernel modules:
 	- `mlx_lm/models/ssm_selective_scan.py`
 	- `mlx_lm/models/mamba_selective_state_update.py`
-	- `mlx_lm/models/ssd_chunk_state.py`
+	- `mlx_lm/models/ssd_chunk_state.py` ← **NEW: Metal kernel for 12.99x speedup**
 	- `mlx_lm/models/ssd_state_passing.py`
 	- `mlx_lm/models/ssd_chunk_scan.py`
+
+## Latest Improvements (April 15, 2026)
+- **ssd_chunk_state Metal kernel**: Replaced slow einsum-only reference with GPU Metal kernel
+  - **Speedup**: 12.99x faster (23ms → 1.8ms for small test)
+  - **Accuracy**: Excellent (relative error: 3.61e-07 on float32)
+  - **Impact**: Addresses Mamba2 prefill bottleneck; expected to significantly improve Mamba2 throughput
+  - Fallback to reference einsum implementation if Metal kernel unavailable
+  
+- **Adaptive chunk_size**: Dynamic chunking (128-512) based on sequence length
+  - Reduces padding overhead for short sequences
+  - Improves cache utilization for medium sequences
+  - Reduces kernel dispatch overhead for long sequences
+  
+These optimizations target the root bottleneck identified during analysis: Mamba2 prefill chain uses 3 separate kernels (chunk_state→state_passing→chunk_scan), causing only 1.20x speedup vs Mamba1's 7-19x. The Metal kernel for chunk_state removes the slowest operation in this chain.
 
