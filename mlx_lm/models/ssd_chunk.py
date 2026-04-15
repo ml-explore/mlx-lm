@@ -19,7 +19,14 @@ def ssd_prefill_kernel(
     batch, seq_len, nheads, headdim = hidden_states.shape
     _, _, ngroups, dstate = B.shape
     
-    chunk_size = 256 # arbitrary size, ideally configurable, but 256 is common. Wait, mamba_mlx uses cfg.chunk_size. Let's use 256.
+    # Adaptive chunk size based on sequence length for better GPU utilization
+    # For longer sequences, larger chunks reduce overhead; for shorter, smaller chunks improve cache locality
+    if seq_len <= 256:
+        chunk_size = min(128, seq_len)  # Smaller chunks for short sequences
+    elif seq_len <= 1024:
+        chunk_size = 256  # Standard size for medium sequences
+    else:
+        chunk_size = 512  # Larger chunks for long sequences reduce kernel dispatch overhead
 
     # Pad sequence to multiple of chunk_size
     pad_len = 0
