@@ -438,6 +438,50 @@ class TestGenerate(unittest.TestCase):
         generated_token = self.tokenizer.encode(response.texts[0])[0]
         self.assertEqual(generated_token, 0)
 
+    def test_stateful_processor_sees_materialized_tokens(self):
+        """Stateful processors must see correct (materialized) token values.
+
+        Regression test: lazy mx.concat inside mx.stream caused processors
+        to see stale prompt tokens instead of the most recently generated
+        token. Stateful processors like Outlines FSM depend on tokens[-1]
+        being the actual last generated token.
+        """
+        prompt = self.tokenizer.encode("hello")
+        last_tokens_seen = []
+
+        def stateful_processor(tokens, logits):
+            # Capture the last token the processor sees on each call.
+            # After materialization fix, this must be the actual generated
+            # token, not a stale prompt token.
+            mx.eval(tokens)
+            last_tokens_seen.append(tokens[-1].item())
+            return logits
+
+        generate(
+            self.model,
+            self.tokenizer,
+            "hello",
+            max_tokens=3,
+            verbose=False,
+            logits_processors=[stateful_processor],
+        )
+
+        # First call: last token is the last prompt token (correct — no
+        # generated tokens yet). Subsequent calls: last token must differ
+        # from the prompt's last token (it's a generated token).
+        self.assertEqual(len(last_tokens_seen), len(prompt) + 3)
+        # The generated tokens (after prompt) should be actual model output,
+        # not repeated copies of the last prompt token.
+        prompt_last = prompt[-1]
+        generated_last_tokens = last_tokens_seen[len(prompt) :]
+        # At least one of the generated tokens should differ from the
+        # last prompt token (statistical near-certainty with 3 tokens).
+        self.assertTrue(
+            any(t != prompt_last for t in generated_last_tokens),
+            f"All generated tokens matched last prompt token {prompt_last}, "
+            f"suggesting stale/lazy data: {generated_last_tokens}",
+        )
+
     def test_batch_generate_with_samplers(self):
         """Test that batch_generate with logits_processors produces correct results."""
         batch_gen = BatchGenerator(
