@@ -81,7 +81,9 @@ By default, the adapter config and learned weights are saved in `adapters/`.
 You can specify the output location with `--adapter-path`.
 
 You can resume fine-tuning with an existing adapter with
-`--resume-adapter-file <path_to_adapters.safetensors>`.
+`--resume-adapter-file <path_to_adapters.safetensors>`. When you resume, the
+trainer looks at the existing numbered checkpoint files so that new
+checkpoints pick up exactly where the previous run left off.
 
 #### Logging
 
