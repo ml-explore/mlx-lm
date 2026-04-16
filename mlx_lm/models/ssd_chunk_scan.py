@@ -12,6 +12,8 @@ def run(
     z: mx.array | None = None,
 ) -> mx.array:
     batch, seqlen, nheads, headdim = x.shape
+    if headdim % 4 != 0:
+        raise ValueError("ssd_chunk_scan requires headdim to be divisible by 4")
     _, _, ngroups, dstate = B.shape
     _, _, nchunks, chunk_size = dt.shape
 

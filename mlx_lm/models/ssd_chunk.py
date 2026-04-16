@@ -58,12 +58,14 @@ def ssd_prefill_kernel(
 
     if state is not None:
         # User initial state is (B, nheads, headdim, dstate)
-        initial_state_flat = state.reshape(batch, nheads, headdim * dstate)
-        passed_states, final_states = ssd_state_passing(
+        initial_state_flat = state.astype(mx.float32).reshape(
+            batch, nheads, headdim * dstate
+        )
+        passed_states, _final_states = ssd_state_passing(
             states_flat, dA_chunk_last, initial_state_flat
         )
     else:
-        passed_states, final_states = ssd_state_passing(states_flat, dA_chunk_last)
+        passed_states, _final_states = ssd_state_passing(states_flat, dA_chunk_last)
 
     prev_states = passed_states.reshape(batch, nchunks, nheads, headdim, dstate)
 
@@ -75,10 +77,12 @@ def ssd_prefill_kernel(
 
     out = out.astype(hidden_states.dtype)
 
-    # Final state
-    last_chunk_state = states[:, -1, :, :, :]
-    last_prev = prev_states[:, -1, :, :, :]
-    last_decay = mx.exp(dA_cumsum[:, :, -1, -1])
+    # Final state uses the real final token position (not padded tail indices).
+    last_chunk_idx = (seq_len - 1) // chunk_size
+    last_pos_idx = (seq_len - 1) % chunk_size
+    last_chunk_state = states[:, last_chunk_idx, :, :, :]
+    last_prev = prev_states[:, last_chunk_idx, :, :, :]
+    last_decay = mx.exp(dA_cumsum[:, :, last_chunk_idx, last_pos_idx])
     final_ssm_state = last_decay[:, :, None, None] * last_prev + last_chunk_state
     final_ssm_state = final_ssm_state.astype(hidden_states.dtype)
 

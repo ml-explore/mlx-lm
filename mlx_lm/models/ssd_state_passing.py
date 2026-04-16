@@ -5,6 +5,8 @@ def run(
     states: mx.array, dA_chunk_cumsum: mx.array, initial_states: mx.array | None = None
 ) -> tuple[mx.array, mx.array]:
     batch, nchunks, nheads, dim = states.shape
+    if dim % 4 != 0:
+        raise ValueError("ssd_state_passing requires dim to be divisible by 4")
 
     if initial_states is None:
         has_initial = 0
@@ -12,6 +14,7 @@ def run(
         initial_states = mx.zeros((batch, nheads, dim), dtype=mx.float32)
     else:
         has_initial = 1
+        initial_states = initial_states.astype(mx.float32)
 
     VEC_SIZE = 4
     dim_vec = dim // VEC_SIZE

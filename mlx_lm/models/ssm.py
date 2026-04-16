@@ -151,6 +151,10 @@ def _can_use_prefill_kernel(
     dstate = B.shape[-1]
     if h % ngroups != 0:
         return False
+    if dh % 4 != 0:
+        return False
+    if (dh * dstate) % 4 != 0:
+        return False
     if dstate > 256:
         return False
     return True
