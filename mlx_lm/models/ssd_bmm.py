@@ -1,8 +1,4 @@
-"""Naive MLX batched matmul within chunks — correct but slow reference implementation.
-
-Port of ``_bmm_chunk_fwd`` from the Mamba-2 / SSD repository
-(mamba_ssm/ops/triton/ssd_bmm.py) translated to MLX array ops.
-
+"""
 Supports:
   - a, b with shape (batch, seqlen, ngroups, K) or (batch, seqlen, K).
   - Optional causal masking (zero out upper-triangle per chunk).
