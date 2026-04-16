@@ -161,7 +161,7 @@ class CacheDataset:
         self._proc_data = [None] * len(data)
 
     def itemlen(self, idx: int):
-        return len(self._data[idx])
+        return len(self[idx][0])
 
     def __getitem__(self, idx: int):
         if self._proc_data[idx] is None:
