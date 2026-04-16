@@ -107,6 +107,10 @@ def iterate_batches(
     seed=None,
     comm_group=None,
 ):
+    # Wrap in CacheDataset if not already wrapped
+    if not isinstance(dataset, CacheDataset) and hasattr(dataset, "process"):
+        dataset = CacheDataset(dataset)
+
     # Sort by length:
     if isinstance(dataset, CacheDataset):
         len_fn = lambda idx: dataset.itemlen(idx)
