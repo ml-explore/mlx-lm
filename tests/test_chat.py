@@ -145,7 +145,7 @@ class TestChat(unittest.TestCase):
         mock_input.side_effect = ["What is the weather?", "q"]
 
         # Test without system prompt
-        with patch("sys.argv", ["chat.py"]):
+        with patch("sys.argv", ["chat.py", "--no-system-prompt"]):
             try:
                 main()
             except SystemExit:
