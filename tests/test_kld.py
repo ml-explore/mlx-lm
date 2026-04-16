@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
+from safetensors.numpy import save_file
 
 from mlx_lm import kld
 
@@ -60,11 +61,19 @@ class TestKld(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp) / "baseline-cache"
+            model_dir = Path(tmp) / "baseline-model"
+            model_dir.mkdir()
+            save_file(
+                {"weight": np.zeros((1,), dtype=np.float32)},
+                str(model_dir / "model.safetensors"),
+                metadata={"format": "mlx"},
+            )
 
             with (
                 patch("mlx_lm.kld.derive_cache_dir", return_value=cache_dir),
                 patch("mlx_lm.kld.load", side_effect=fake_load) as mock_load,
                 patch("mlx_lm.kld.load_eval_tokens", return_value=tokens),
+                patch("mlx_lm.kld._download", return_value=model_dir),
             ):
                 summary = json.loads(
                     run_main(
@@ -100,11 +109,19 @@ class TestKld(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp) / "baseline-cache"
+            model_dir = Path(tmp) / "baseline-model"
+            model_dir.mkdir()
+            save_file(
+                {"weight": np.zeros((1,), dtype=np.float32)},
+                str(model_dir / "model.safetensors"),
+                metadata={"format": "mlx"},
+            )
 
             with (
                 patch("mlx_lm.kld.derive_cache_dir", return_value=cache_dir),
                 patch("mlx_lm.kld.load", side_effect=fake_load),
                 patch("mlx_lm.kld.load_eval_tokens", return_value=tokens),
+                patch("mlx_lm.kld._download", return_value=model_dir),
             ):
                 run_main(
                     [

@@ -13,8 +13,9 @@ from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from safetensors import safe_open
 
-from mlx_lm.utils import load, load_eval_tokens
+from mlx_lm.utils import _download, load, load_eval_tokens
 
 CACHE_DIR = Path("kld_cache")
 CACHE_KEY_FIELDS = (
@@ -296,6 +297,21 @@ def resolve_cache(args) -> BaselineCache:
     cache_dir = derive_cache_dir(manifest)
     if cache_dir.exists():
         return BaselineCache.open(cache_dir)
+
+    model_path = _download(args.baseline_model)
+    weight_file = next(model_path.glob("model*.safetensors"), None)
+    metadata = (
+        {}
+        if weight_file is None
+        else safe_open(str(weight_file), framework="np").metadata() or {}
+    )
+    if metadata.get("format") != "mlx":
+        raise ValueError(
+            f"Failed to load baseline model from {args.baseline_model}. "
+            "kld requires MLX-converted weights saved by mlx-lm "
+            "(expected safetensors metadata format='mlx')."
+        )
+
     return build_baseline_cache(args, cache_dir)
 
 
