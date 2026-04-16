@@ -97,6 +97,4 @@ def run(
     # B_f32:    (b, c, l, h, n)
     # result:   (b, c, h, p, n)
     states = mx.einsum("bclhp,bclhn->bchpn", x_scaled, B_f32)
-
-    mx.eval(states)
     return states

@@ -6,9 +6,9 @@ _kernel_cache = {}
 
 
 def _kernel_key(
-    batch: int, dim: int, dstate: int, has_d: bool, has_dt_bias: bool, dt_softplus: bool
+    dim: int, dstate: int, has_d: bool, has_dt_bias: bool, dt_softplus: bool
 ):
-    return (batch, dim, dstate, has_d, has_dt_bias, dt_softplus)
+    return (dim, dstate, has_d, has_dt_bias, dt_softplus)
 
 
 def selective_state_update(
@@ -51,14 +51,13 @@ def selective_state_update(
     else:
         state_f32 = state.astype(mx.float32)
 
-    key = _kernel_key(batch, dim, dstate, has_d, has_dt_bias, dt_softplus)
+    key = _kernel_key(dim, dstate, has_d, has_dt_bias, dt_softplus)
 
     block_size = 64
     grid_x = (dim + block_size - 1) // block_size
 
     if key not in _kernel_cache:
         header = f"""
-        #define BATCH {batch}
         #define DIM {dim}
         #define DSTATE {dstate}
         #define BLOCK_SIZE {block_size}

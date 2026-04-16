@@ -65,6 +65,7 @@ class MambaBlock(nn.Module):
         self.time_step_rank = int(args.time_step_rank)
         self.use_conv_bias = args.use_conv_bias
         self.use_bcdt_rms = args.use_bcdt_rms
+        self._metal_available = mx.metal.is_available()
         if self.use_bcdt_rms:
             self.mixer_norm = lambda x: mx.fast.rms_norm(
                 x, mx.ones(x.shape[-1], x.dtype), eps=args.mixer_rms_eps
@@ -139,7 +140,7 @@ class MambaBlock(nn.Module):
         can_use_prefill_kernel = (
             T > 1
             and mx.default_device() == mx.gpu
-            and mx.metal.is_available()
+            and self._metal_available
             and self.ssm_state_size <= 256
         )
         if can_use_prefill_kernel:
@@ -181,7 +182,7 @@ class MambaBlock(nn.Module):
                 T == 1
                 and current_state is not None
                 and mx.default_device() == mx.gpu
-                and mx.metal.is_available()
+                and self._metal_available
                 and self.ssm_state_size <= 256
             )
             if can_use_decode_kernel:

@@ -79,6 +79,4 @@ def run(
         col_idx = mx.arange(chunk_size).reshape(1, chunk_size)
         mask = row_idx >= col_idx  # lower triangular (including diagonal)
         out = mx.where(mask, out, mx.array(0.0, dtype=out.dtype))
-
-    mx.eval(out)
     return out
