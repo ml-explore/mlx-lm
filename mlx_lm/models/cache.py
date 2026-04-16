@@ -1024,8 +1024,9 @@ class BatchKVCache(_BaseCache):
         def pad(c):
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+                v = mx.array([]).reshape(Bc, H, 0, M)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -1360,8 +1361,9 @@ class BatchRotatingKVCache(_BaseCache):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+                v = mx.array([]).reshape(Bc, H, 0, M)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
@@ -1381,9 +1383,10 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset = max(self._offset, other._offset)
 
     def extract(self, idx):
+        mx.eval(self.left_padding, self.offset)
         cache = RotatingKVCache(self.max_size)
-        padding = self.left_padding[idx].item()
-        offset = self.offset[idx].item()
+        padding = max(0, self.left_padding.tolist()[idx])
+        offset = self.offset.tolist()[idx]
         cache.keys = self.keys[idx : idx + 1]
         cache.values = self.values[idx : idx + 1]
         cache._idx = self._idx
@@ -1447,6 +1450,42 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class TokenBuffer:
+    """A simple token buffer that can be efficiently appended to in a similar
+    fashion to the KVCache.
+
+    Perhaps these could share some logic in the future.
+    """
+
+    step = 256
+
+    def __init__(self, tokens=[]):
+        self._buffer = mx.array(tokens, dtype=mx.int32)
+        self._size = len(tokens)
+
+    def update_and_fetch(self, tokens):
+        start = self._size
+        end = start + len(tokens)
+
+        new_size = ((end + self.step - 1) // self.step) * self.step
+        if new_size > self._buffer.size:
+            self._buffer = mx.concatenate(
+                [self._buffer, mx.zeros(new_size - self._buffer.size, dtype=mx.int32)]
+            )
+        self._buffer[start:end] = tokens
+        self._size = end
+
+        return self._buffer[:end]
+
+    @property
+    def state(self):
+        return self._buffer
+
+    @property
+    def tokens(self):
+        return self._buffer[: self._size]
 
 
 @dataclass
