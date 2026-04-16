@@ -31,6 +31,7 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "json-repair>=0.58.7",
     ],
     packages=[
         "mlx_lm",
