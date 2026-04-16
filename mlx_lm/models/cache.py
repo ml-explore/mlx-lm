@@ -1684,13 +1684,20 @@ class LRUPromptCache:
             self._lru.remove(model, tokens)
         self._lru.push(model, tokens, cache_type)
 
-        # If it is a trimmable cache remove all prefixes cause they just take
-        # space
-        if can_trim_prompt_cache(prompt_cache):
-            for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
-                self._n_bytes -= entry.nbytes
-                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-                self._lru.remove(model, tokens[:prefix_len])
+        # Remove all strict-prefix entries for this key. Any stored entry
+        # whose key is a strict prefix of ``tokens`` has been superseded:
+        # fetch_nearest_cache always prefers the longest (deepest-in-trie)
+        # match, so shorter entries are unreachable dead weight.
+        #
+        # This was previously gated on ``can_trim_prompt_cache(prompt_cache)``
+        # which is False for models with sliding-window attention
+        # (RotatingKVCache). That caused every turn's cache entry to
+        # accumulate without eviction, leaking memory until Metal OOM on
+        # long multi-turn conversations with Gemma 4, Mistral, etc.
+        for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
+            self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            self._lru.remove(model, tokens[:prefix_len])
 
         # Ensure we match the constraints
         if len(self._lru) > self.max_size:
