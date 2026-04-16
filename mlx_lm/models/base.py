@@ -2,7 +2,7 @@
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 from mlx.utils import tree_map

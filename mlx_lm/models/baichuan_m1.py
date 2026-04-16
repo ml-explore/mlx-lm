@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,6 +13,7 @@ from .cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
 @dataclass
 class ModelArgs(BaseModelArgs):
+    model_type: str
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -24,10 +25,14 @@ class ModelArgs(BaseModelArgs):
     sliding_window_layers: List[int]
     conv_window: int
     rms_norm_eps: float
-    model_type: str = "baichuan_m1"
     num_swa_attention_heads: Optional[int] = None
     num_swa_key_value_heads: Optional[int] = None
     tie_word_embeddings: bool = False
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class Attention(nn.Module):

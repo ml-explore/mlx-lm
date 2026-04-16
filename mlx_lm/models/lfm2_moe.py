@@ -41,8 +41,8 @@ class ModelArgs(BaseModelArgs):
     layer_types: Optional[List[str]] = None
 
     def __post_init__(self):
-        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
-            self.rope_theta = self.rope_parameters["rope_theta"]
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
         if self.full_attn_idxs is None:
             self.full_attn_idxs = [
                 i

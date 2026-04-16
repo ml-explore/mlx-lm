@@ -20,6 +20,7 @@ from .ssm import ssm_update
 
 @dataclass
 class ModelArgs(BaseModelArgs):
+    model_type: str
     attention_bias: bool = False
     attention_in_multiplier: float = 1.0
     attention_out_multiplier: float = 0.9375
@@ -49,7 +50,6 @@ class ModelArgs(BaseModelArgs):
     mlp_multipliers: List[float] = field(
         default_factory=lambda: [0.8838834764831844, 0.5859375]
     )
-    model_type: str = "falcon_h1"
     num_attention_heads: int = 8
     num_hidden_layers: int = 36
     num_key_value_heads: int = 2

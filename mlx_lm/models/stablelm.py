@@ -1,7 +1,8 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 import math
 from dataclasses import dataclass
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,6 +26,11 @@ class ModelArgs(BaseModelArgs):
     layer_norm_eps: float
     use_parallel_residual: bool = False
     qk_layernorm: bool = False
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
 
 
 class LayerNormPerHead(nn.Module):

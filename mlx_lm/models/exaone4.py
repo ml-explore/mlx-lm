@@ -29,6 +29,12 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Dict[str, Union[float, str]]
     sliding_window: Optional[int]
     sliding_window_pattern: Optional[str]
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 class Attention(nn.Module):

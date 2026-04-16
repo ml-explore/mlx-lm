@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
