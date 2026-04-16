@@ -34,6 +34,16 @@ class ModelArgs(BaseModelArgs):
     ssm_state_size: Optional[int] = None
     max_position_embeddings: int = 2056
 
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params)
+        if "intermediate_size" not in params:
+            hidden_size = params.get("hidden_size", params.get("d_model"))
+            expand = params.get("expand")
+            if hidden_size is not None and expand is not None:
+                params["intermediate_size"] = int(hidden_size * expand)
+        return super().from_dict(params)
+
     def __post_init__(self):
         if self.time_step_rank == "auto":
             self.time_step_rank = math.ceil(self.hidden_size / 16)
