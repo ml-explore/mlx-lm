@@ -264,17 +264,73 @@ def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
         config = json.load(f)
 
-    generation_config_file = model_path / "generation_config.json"
-    if generation_config_file.exists():
-        generation_config = {}
-        try:
-            with open(generation_config_file, "r") as f:
-                generation_config = json.load(f)
-        except json.JSONDecodeError:
-            pass
+    raw_generation = _read_generation_config_file(model_path)
 
-        if eos_token_id := generation_config.get("eos_token_id", False):
-            config["eos_token_id"] = eos_token_id
+    if eos_token_id := raw_generation.get("eos_token_id", False):
+        config["eos_token_id"] = eos_token_id
+
+    config["generation_config"] = load_generation_config(
+        model_path, _raw=raw_generation
+    )
+
+    return config
+
+
+def _read_generation_config_file(model_path: Path) -> dict:
+    """Read and parse ``generation_config.json`` from *model_path*.
+
+    Returns the raw parsed dict, or an empty dict if the file is missing or
+    malformed.
+    """
+    generation_config_file = model_path / "generation_config.json"
+    if not generation_config_file.exists():
+        return {}
+
+    try:
+        with open(generation_config_file, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def load_generation_config(model_path: Path, *, _raw: Optional[dict] = None) -> dict:
+    """Load generation defaults from ``generation_config.json`` if present.
+
+    Returns a sparse dict using mlx-lm parameter names (e.g. ``temp``
+    instead of ``temperature``).
+    """
+    if _raw is None:
+        _raw = _read_generation_config_file(model_path)
+
+    if not _raw:
+        return {}
+
+    # Map HuggingFace generation_config keys to mlx-lm parameter names.
+    key_map = {
+        "temperature": "temp",
+        "top_p": "top_p",
+        "top_k": "top_k",
+        "min_p": "min_p",
+        "max_new_tokens": "max_tokens",
+        "repetition_penalty": "repetition_penalty",
+    }
+
+    config = {}
+    for hf_key, mlx_key in key_map.items():
+        if hf_key in _raw:
+            config[mlx_key] = _raw[hf_key]
+
+    # When do_sample is explicitly false, force greedy decoding.
+    if _raw.get("do_sample") is False:
+        config["temp"] = 0.0
+    elif _raw.get("do_sample") is True and config.get("temp") == 1.0:
+        uses_sampling_controls = (
+            config.get("top_p", 1.0) < 1.0
+            or config.get("top_k", 0) > 0
+            or config.get("min_p", 0.0) > 0.0
+        )
+        if not uses_sampling_controls:
+            config["temp"] = 0.0
 
     return config
 
