@@ -289,9 +289,9 @@ class ModelProvider:
         self.default_model_map = {}
         if self.cli_args.model is not None:
             self.default_model_map[self.cli_args.model] = "default_model"
-            # Map the base name (short name) so API calls match properly
-            short_name = Path(self.cli_args.model).name
-            self.default_model_map[short_name] = "default_model"
+            # Map path base or alias from args as default model name
+            alias = self.cli_args.model_alias or Path(self.cli_args.model).name
+            self.default_model_map[alias] = "default_model"
             self.load(self.cli_args.model, draft_model_path="default_model")
 
     # Added in adapter_path to load dynamically
@@ -1744,6 +1744,11 @@ def main():
         "--model",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
+    )
+    parser.add_argument(
+        "--model-alias",
+        type=str,
+        help="Optional alias of the served model.",
     )
     parser.add_argument(
         "--adapter-path",
