@@ -65,47 +65,49 @@ class MixedQuantKVCache:
         return tuple(expand(x) for x in quant_tuple)
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        B, n_kv_heads, num_steps, k_dim = keys.shape
-        v_dim = values.shape[-1]
         prev = self.offset
+        num_steps = keys.shape[2]
 
-        # Allocate or expand buffers
-        if self.keys is None or (prev + num_steps) > self.keys[0].shape[2]:
-            new_steps = (self.step + num_steps - 1) // self.step * self.step
+        # Expand pre-allocated buffers only when crossing a step boundary.
+        # Hot path (decode, num_steps=1) skips all allocation logic.
+        need_alloc = self.keys is None or (prev + num_steps) > self.keys[0].shape[2]
+        if need_alloc:
+            B, n_kv_heads = keys.shape[:2]
+            k_dim, v_dim = keys.shape[-1], values.shape[-1]
+            n = (self.step + num_steps - 1) // self.step * self.step
             if self.keys is not None:
                 if prev % self.step != 0:
                     self.keys = tuple(x[..., :prev, :] for x in self.keys)
                     self.values = tuple(x[..., :prev, :] for x in self.values)
-                self.keys = self._expand_quant(
-                    self.keys, B, n_kv_heads, new_steps
-                )
-                self.values = self._expand_quant(
-                    self.values, B, n_kv_heads, new_steps
-                )
+                self.keys = self._expand_quant(self.keys, B, n_kv_heads, n)
+                self.values = self._expand_quant(self.values, B, n_kv_heads, n)
             else:
                 self.keys = self._init_quant(
-                    B, n_kv_heads, new_steps, k_dim,
+                    B, n_kv_heads, n, k_dim,
                     self.k_group_size, self.k_bits, keys.dtype,
                 )
                 self.values = self._init_quant(
-                    B, n_kv_heads, new_steps, v_dim,
+                    B, n_kv_heads, n, v_dim,
                     self.v_group_size, self.v_bits, values.dtype,
                 )
 
-        self.offset += num_steps
+        self.offset = prev + num_steps
 
-        # Quantize new slice and write into pre-allocated buffer
+        # Quantize + write (hot path: no allocation, just 2 quantize + 6 writes)
         k_q = mx.quantize(keys, group_size=self.k_group_size, bits=self.k_bits)
-        v_q = mx.quantize(
-            values, group_size=self.v_group_size, bits=self.v_bits
-        )
-        for i in range(3):
-            self.keys[i][..., prev : self.offset, :] = k_q[i]
-            self.values[i][..., prev : self.offset, :] = v_q[i]
+        v_q = mx.quantize(values, group_size=self.v_group_size, bits=self.v_bits)
+        self.keys[0][..., prev:self.offset, :] = k_q[0]
+        self.keys[1][..., prev:self.offset, :] = k_q[1]
+        self.keys[2][..., prev:self.offset, :] = k_q[2]
+        self.values[0][..., prev:self.offset, :] = v_q[0]
+        self.values[1][..., prev:self.offset, :] = v_q[1]
+        self.values[2][..., prev:self.offset, :] = v_q[2]
 
+        # Return views — no copy, no tuple() overhead
+        off = self.offset
         return (
-            tuple(x[..., : self.offset, :] for x in self.keys),
-            tuple(x[..., : self.offset, :] for x in self.values),
+            (self.keys[0][..., :off, :], self.keys[1][..., :off, :], self.keys[2][..., :off, :]),
+            (self.values[0][..., :off, :], self.values[1][..., :off, :], self.values[2][..., :off, :]),
         )
 
     @property
