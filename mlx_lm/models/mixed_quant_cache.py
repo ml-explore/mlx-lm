@@ -116,6 +116,16 @@ class MixedQuantKVCache:
             return []
         return [x[..., : self.offset, :] for x in self.keys + self.values]
 
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        total = 0
+        for arrays in (self.keys, self.values):
+            for x in arrays:
+                total += x[..., : self.offset, :].nbytes
+        return total
+
     def make_mask(self, N, return_array=False, window_size=None):
         from .base import create_causal_mask
         if N == 1:
@@ -125,6 +135,26 @@ class MixedQuantKVCache:
                 N, offset=self.offset, window_size=window_size
             )
         return "causal"
+
+    def empty(self):
+        return self.keys is None
+
+    def to_kvcache(self):
+        """Dequantize back to a standard KVCache for batch merge compatibility."""
+        from .cache import KVCache
+        kv = KVCache()
+        if self.keys is not None:
+            off = self.offset
+            k_fp = mx.dequantize(
+                *[x[..., :off, :] for x in self.keys],
+                group_size=self.k_group_size, bits=self.k_bits,
+            )
+            v_fp = mx.dequantize(
+                *[x[..., :off, :] for x in self.values],
+                group_size=self.v_group_size, bits=self.v_bits,
+            )
+            kv.update_and_fetch(k_fp, v_fp)
+        return kv
 
     def is_trimmable(self):
         return False
