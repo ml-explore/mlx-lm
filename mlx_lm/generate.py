@@ -208,6 +208,20 @@ def setup_arg_parser():
         default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        help="TurboQuant KV cache compression bits (1-4). "
+        "3-bit gives 4.6x compression. Default: no compression.",
+        default=None,
+    )
+    parser.add_argument(
+        "--turbo-fp16-layers",
+        type=int,
+        help="Number of first/last layers to keep in FP16 "
+        "when using --turbo-kv-bits. Default: 1.",
+        default=1,
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -304,6 +318,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -317,6 +332,8 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    turbo_kv_bits: Optional[int] = None,
+    turbo_fp16_layers: int = 1,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -343,6 +360,11 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        turbo_kv_bits (int, optional): TurboQuant KV cache compression bits (1-4).
+          Uses PolarQuant with Hadamard rotation. 3-bit gives 4.6x compression.
+          None implies no TurboQuant. Default: ``None``.
+        turbo_fp16_layers (int): Number of first/last layers to keep in FP16 when
+          using TurboQuant. Default: ``1``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -372,6 +394,8 @@ def generate_step(
         prompt_cache = cache.make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
+            turbo_kv_bits=turbo_kv_bits,
+            turbo_fp16_layers=turbo_fp16_layers,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -2073,6 +2097,8 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        turbo_kv_bits=args.turbo_kv_bits,
+        turbo_fp16_layers=args.turbo_fp16_layers,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
