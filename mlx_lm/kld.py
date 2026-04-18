@@ -347,6 +347,7 @@ def build_summary(args, cache: BaselineCache, stats: Dict, elapsed: float) -> Di
         "median_kl_per_token": stats["median_kl_per_token"],
         "model": args.model,
         "num_samples": cache.manifest["num_samples"],
+        "p95_kl_per_token": stats["p95_kl_per_token"],
         "sequence_length": cache.manifest["sequence_length"],
         "stderr": stats["stderr"],
         "tokens_per_second": total_positions / elapsed if elapsed > 0 else 0.0,
@@ -489,6 +490,7 @@ def _summarize_kl(all_kl) -> dict:
         "max_kl_per_token": float(np.max(np_values)),
         "mean_kl_per_token": mean,
         "median_kl_per_token": float(np.median(np_values)),
+        "p95_kl_per_token": float(np.percentile(np_values, 95)),
         "stderr": stderr,
         "total_positions": count,
     }
