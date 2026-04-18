@@ -98,6 +98,9 @@ class TestKld(unittest.TestCase):
             self.assertEqual(summary["baseline_model"], "baseline-model")
             self.assertEqual(summary["top_k"], 1)
             self.assertEqual(summary["baseline_cache"], str(cache_dir.resolve()))
+            self.assertIn("mean_kl_per_token", summary)
+            self.assertIn("median_kl_per_token", summary)
+            self.assertIn("max_kl_per_token", summary)
 
             manifest = kld.load_manifest(cache_dir.resolve())
             self.assertEqual(manifest["top_k"], 1)

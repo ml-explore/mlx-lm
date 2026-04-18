@@ -13,6 +13,7 @@ from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from safetensors import safe_open
 
 from mlx_lm.utils import _download, load, load_eval_tokens
@@ -341,16 +342,15 @@ def build_summary(args, cache: BaselineCache, stats: Dict, elapsed: float) -> Di
     return {
         "baseline_cache": str(cache.path),
         "baseline_model": cache.manifest["baseline_model"],
-        "elapsed_seconds": elapsed,
+        "max_kl_per_token": stats["max_kl_per_token"],
         "mean_kl_per_token": stats["mean_kl_per_token"],
-        "metric": "KL(baseline || model)",
+        "median_kl_per_token": stats["median_kl_per_token"],
         "model": args.model,
         "num_samples": cache.manifest["num_samples"],
         "sequence_length": cache.manifest["sequence_length"],
         "stderr": stats["stderr"],
         "tokens_per_second": total_positions / elapsed if elapsed > 0 else 0.0,
         "top_k": cache.manifest["top_k"],
-        "total_positions": total_positions,
     }
 
 
@@ -478,14 +478,17 @@ def kl_from_cached_batch(model_logprobs, cached_batch):
 def _summarize_kl(all_kl) -> dict:
     values = all_kl[0] if len(all_kl) == 1 else mx.concatenate(all_kl)
     mean = values.mean().item()
-    count = int(values.size)
+    np_values = np.array(values)
+    count = int(np_values.size)
     if count > 1:
         variance = mx.var(values, ddof=1).item()
         stderr = math.sqrt(max(variance, 0.0)) / math.sqrt(count)
     else:
         stderr = 0.0
     return {
+        "max_kl_per_token": float(np.max(np_values)),
         "mean_kl_per_token": mean,
+        "median_kl_per_token": float(np.median(np_values)),
         "stderr": stderr,
         "total_positions": count,
     }
