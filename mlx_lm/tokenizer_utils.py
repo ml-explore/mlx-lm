@@ -284,6 +284,38 @@ def _infer_thinking(tokenizer):
     return (None, None, None, None)
 
 
+def _infer_markers_from_config(tokenizer):
+    """Discover tool-call markers from tokenizer config fields.
+
+    Some models (e.g. Gemma 4) publish structured token fields in
+    ``tokenizer_config.json`` that HuggingFace's ``AutoTokenizer`` exposes
+    as attributes (via ``_special_tokens_map``).  This function checks for
+    those fields and returns any markers found.
+
+    Currently recognises:
+
+    * ``stc_token`` / ``etc_token`` – start / end of **tool call**
+      (Gemma 4 convention, see
+      https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4).
+
+    Returns:
+        dict with ``"tool_call_start"`` and ``"tool_call_end"`` (str or None).
+    """
+    result = {
+        "tool_call_start": None,
+        "tool_call_end": None,
+    }
+
+    # stc_token / etc_token = start / end of tool call (Gemma 4 convention)
+    stc = getattr(tokenizer, "stc_token", None)
+    etc_tok = getattr(tokenizer, "etc_token", None)
+    if stc is not None and etc_tok is not None:
+        result["tool_call_start"] = stc
+        result["tool_call_end"] = etc_tok
+
+    return result
+
+
 class TokenizerWrapper:
     """A wrapper that combines an HF tokenizer and a detokenizer.
 
@@ -300,6 +332,8 @@ class TokenizerWrapper:
         tool_call_start=None,
         tool_call_end=None,
         tool_parser=None,
+        think_start=None,
+        think_end=None,
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
@@ -308,12 +342,22 @@ class TokenizerWrapper:
             if eos_token_ids is not None
             else {tokenizer.eos_token_id}
         )
-        (
-            self._think_start,
-            self._think_end,
-            self._think_start_tokens,
-            self._think_end_tokens,
-        ) = _infer_thinking(tokenizer)
+        if think_start is not None and think_end is not None:
+            self._think_start = think_start
+            self._think_end = think_end
+            self._think_start_tokens = tuple(
+                tokenizer.encode(think_start, add_special_tokens=False)
+            )
+            self._think_end_tokens = tuple(
+                tokenizer.encode(think_end, add_special_tokens=False)
+            )
+        else:
+            (
+                self._think_start,
+                self._think_end,
+                self._think_start_tokens,
+                self._think_end_tokens,
+            ) = _infer_thinking(tokenizer)
 
         self._chat_template = chat_template
         self.has_chat_template = (
@@ -613,6 +657,9 @@ def load(
 
     tokenizer_config = tokenizer.init_kwargs
 
+    # Auto-discover markers from tokenizer config fields (e.g. Gemma 4)
+    config_markers = _infer_markers_from_config(tokenizer)
+
     if chat_template_type := tokenizer_config.get("chat_template_type", False):
         chat_template = importlib.import_module(
             f"mlx_lm.chat_templates.{chat_template_type}"
@@ -623,11 +670,18 @@ def load(
     )
 
     if tool_parser_type is not None:
+        # Parser module knows the exact markers it expects
         tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
         tool_parser = tool_module.parse_tool_call
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end
         tokenizer_config["tool_parser_type"] = tool_parser_type
+    elif config_markers["tool_call_start"] is not None:
+        # Config provided tool markers but no parser was matched.
+        # Set markers for state-machine streaming; parser stays None.
+        tool_parser = None
+        tool_call_start = config_markers["tool_call_start"]
+        tool_call_end = config_markers["tool_call_end"]
     else:
         tool_parser = None
         tool_call_start = None
