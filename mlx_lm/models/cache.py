@@ -629,11 +629,22 @@ class ArraysCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
+        # When all of other's states are None (e.g. a freshly-merged cache
+        # for new sequences joining a batch), we still need to know its
+        # batch size to zero-pad self's populated states so the batch
+        # dimension grows correctly.
+        n_other = next(
+            (o.shape[0] for o in other.cache if o is not None),
+            getattr(other, "_n_seqs", None),
+        )
 
         def cat(a, b):
             if a is None:
                 return b
             if b is None:
+                if n_other is not None:
+                    pad = mx.zeros((n_other,) + a.shape[1:], dtype=a.dtype)
+                    return mx.concatenate([a, pad])
                 return a
             return mx.concatenate([a, b])
 
@@ -675,6 +686,7 @@ class ArraysCache(_BaseCache):
 
         # All caches are empty so return early
         if all(c.empty() for c in caches):
+            cache._n_seqs = B
             return cache
 
         for e in range(n_state):
