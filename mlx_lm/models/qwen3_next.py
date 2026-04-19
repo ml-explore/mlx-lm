@@ -19,6 +19,13 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+
+# Prefer the Metal-accelerated VJP when available (≈10× faster, ≈2× less
+# memory than the pure-Python fallback); otherwise use the Python reference.
+try:
+    from .gated_delta_vjp_metal import gated_delta_update_vjp_metal as gated_delta_update_vjp
+except ImportError:
+    from .gated_delta_vjp import gated_delta_update_vjp
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -266,7 +273,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
                 cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
             else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+                cache[0] = conv_input[:, -n_keep:, :]
 
         conv_out = nn.silu(self.conv1d(conv_input))
 
@@ -284,18 +291,25 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        if self.training and mask is None:
+            # Memory-efficient VJP path — gradients flow through every layer
+            # without the O(T) graph footprint of the ops-based fallback.
+            out, state = gated_delta_update_vjp(
+                q, k, v, a, b, self.A_log, self.dt_bias, state
+            )
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
 
         if cache is not None:
             cache[1] = state

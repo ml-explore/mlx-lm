@@ -15,6 +15,12 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+
+# Kimi-Linear uses per-channel (vectorized) gating, which the current
+# Metal VJP kernel does not handle yet. Use the pure-Python VJP — still
+# better than ops-path OOM at training-scale T, at the cost of some
+# speed vs the Metal path available to Qwen3.5 / Qwen3-Next.
+from .gated_delta_vjp import gated_delta_update_vjp
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
 
@@ -267,7 +273,7 @@ class ShortConv1d(nn.Module):
             positions = (ends[:, None] + mx.arange(n_keep))[..., None]
             new_state = mx.take_along_axis(conv_input, positions, axis=1)
         else:
-            new_state = mx.contiguous(conv_input[:, -n_keep:, :])
+            new_state = conv_input[:, -n_keep:, :]
 
         return out, new_state
 
@@ -358,18 +364,33 @@ class KimiDeltaAttention(nn.Module):
         )
         b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
 
-        out, ssm_state = gated_delta_update(
-            q,
-            k,
-            v,
-            a_logits,
-            b_logits,
-            self.A_log.reshape(self.num_heads, 1),
-            self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=ssm_state,
-            mask=mask,
-            use_kernel=not self.training,
-        )
+        if self.training:
+            # VJP path — works with both ``mask=None`` and masked inputs,
+            # and the per-channel (vectorized) gating used by Kimi-Linear.
+            out, ssm_state = gated_delta_update_vjp(
+                q,
+                k,
+                v,
+                a_logits,
+                b_logits,
+                self.A_log.reshape(self.num_heads, 1),
+                self.dt_bias.reshape(self.num_heads, self.head_dim),
+                state=ssm_state,
+                mask=mask,
+            )
+        else:
+            out, ssm_state = gated_delta_update(
+                q,
+                k,
+                v,
+                a_logits,
+                b_logits,
+                self.A_log.reshape(self.num_heads, 1),
+                self.dt_bias.reshape(self.num_heads, self.head_dim),
+                state=ssm_state,
+                mask=mask,
+                use_kernel=not self.training,
+            )
 
         if cache is not None:
             cache[3] = ssm_state
