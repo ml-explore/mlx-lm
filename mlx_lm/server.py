@@ -650,6 +650,9 @@ class ResponseGenerator:
                 rs = batch_results[uid]
                 if not rs["checkpoint"]:
                     continue
+                # Skip if any cache layer is not yet populated (mid-prefill)
+                if any(c.empty() for c in cache):
+                    continue
                 self._store_cache(
                     current_model_key,
                     rs["cache_key"][:-prompt_end],
