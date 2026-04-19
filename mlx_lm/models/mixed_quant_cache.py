@@ -116,6 +116,40 @@ class MixedQuantKVCache:
             return []
         return [x[..., : self.offset, :] for x in self.keys + self.values]
 
+    @state.setter
+    def state(self, v):
+        if not v:
+            return
+        # 6 arrays: k_data, k_scales, k_biases, v_data, v_scales, v_biases
+        if len(v) == 6:
+            self.keys = (v[0], v[1], v[2])
+            self.values = (v[3], v[4], v[5])
+            self.offset = v[0].shape[2]
+
+    @property
+    def meta_state(self):
+        return f"{self.k_bits},{self.v_bits},{self.k_group_size},{self.v_group_size}"
+
+    @meta_state.setter
+    def meta_state(self, v):
+        parts = v.split(",")
+        self.k_bits = int(parts[0])
+        self.v_bits = int(parts[1])
+        self.k_group_size = int(parts[2])
+        self.v_group_size = int(parts[3])
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        parts = meta_state.split(",")
+        obj = cls(
+            k_bits=int(parts[0]),
+            v_bits=int(parts[1]),
+            k_group_size=int(parts[2]),
+            v_group_size=int(parts[3]),
+        )
+        obj.state = state
+        return obj
+
     @property
     def nbytes(self):
         if self.keys is None:
