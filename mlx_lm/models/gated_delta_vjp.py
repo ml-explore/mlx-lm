@@ -20,7 +20,6 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-
 CHUNK_SIZE = 64  # Timesteps per gradient-checkpointed block.
 
 # Lower bound for the log-domain argument of the decay ``exp`` so that very
@@ -38,11 +37,11 @@ def _compute_g(A_log: mx.array, a: mx.array, dt_bias: mx.array) -> mx.array:
 
 
 def _chunk_forward(
-    q_c: mx.array,      # [B, T_c, Hv, Dk]
-    k_c: mx.array,      # [B, T_c, Hv, Dk]
-    v_c: mx.array,      # [B, T_c, Hv, Dv]
-    g_c: mx.array,      # [B, T_c, Hv] (scalar) or [B, T_c, Hv, Dk] (vectorized)
-    beta_c: mx.array,   # [B, T_c, Hv]
+    q_c: mx.array,  # [B, T_c, Hv, Dk]
+    k_c: mx.array,  # [B, T_c, Hv, Dk]
+    v_c: mx.array,  # [B, T_c, Hv, Dv]
+    g_c: mx.array,  # [B, T_c, Hv] (scalar) or [B, T_c, Hv, Dk] (vectorized)
+    beta_c: mx.array,  # [B, T_c, Hv]
     S_start: mx.array,  # [B, Hv, Dv, Dk]
 ) -> Tuple[mx.array, mx.array]:
     """Recurrent forward over a single unmasked chunk of ``T_c`` timesteps.
@@ -78,7 +77,7 @@ def _chunk_forward_masked(
     g_c: mx.array,
     beta_c: mx.array,
     S_start: mx.array,
-    mask_c: mx.array,   # [B, T_c] (bool/int, broadcast to state shape)
+    mask_c: mx.array,  # [B, T_c] (bool/int, broadcast to state shape)
 ) -> Tuple[mx.array, mx.array]:
     """Masked variant: when ``mask_c[b, t] == False`` the state is carried
     over unchanged from the previous step (matching the reference ops path).
@@ -115,13 +114,13 @@ _chunk_forward_masked_ckpt = mx.checkpoint(_chunk_forward_masked)
 
 
 def gated_delta_update_vjp(
-    q: mx.array,           # [B, T, Hk, Dk]
-    k: mx.array,           # [B, T, Hk, Dk]
-    v: mx.array,           # [B, T, Hv, Dv]
-    a: mx.array,           # [B, T, Hv]
-    b: mx.array,           # [B, T, Hv]
-    A_log: mx.array,       # [Hv]
-    dt_bias: mx.array,     # [Hv]
+    q: mx.array,  # [B, T, Hk, Dk]
+    k: mx.array,  # [B, T, Hk, Dk]
+    v: mx.array,  # [B, T, Hv, Dv]
+    a: mx.array,  # [B, T, Hv]
+    b: mx.array,  # [B, T, Hv]
+    A_log: mx.array,  # [Hv]
+    dt_bias: mx.array,  # [Hv]
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:

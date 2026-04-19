@@ -23,7 +23,7 @@ def _gram_schmidt(X: mx.array) -> mx.array:
     r = X.shape[-1]
     cols = []
     for i in range(r):
-        col = X[..., :, i:i + 1]
+        col = X[..., :, i : i + 1]
         for prev in cols:
             proj = (prev * col).sum(axis=-2, keepdims=True)
             col = col - proj * prev
@@ -108,7 +108,5 @@ def maybe_expand(state, bits: int = 8, group_size: int = 64):
             return U @ V
         if len(state) == 3:
             w, scales, biases = state
-            return mx.dequantize(
-                w, scales, biases, group_size=group_size, bits=bits
-            )
+            return mx.dequantize(w, scales, biases, group_size=group_size, bits=bits)
     return state

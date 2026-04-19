@@ -137,8 +137,8 @@ def gated_delta_kernel_fused(
     q: mx.array,
     k: mx.array,
     v: mx.array,
-    a: mx.array,           # raw, will compute g inline: g = exp(-exp(A_log)·softplus(a+dt_bias))
-    b: mx.array,           # raw, will compute beta inline: beta = sigmoid(b)
+    a: mx.array,  # raw, will compute g inline: g = exp(-exp(A_log)·softplus(a+dt_bias))
+    b: mx.array,  # raw, will compute beta inline: beta = sigmoid(b)
     A_log: mx.array,
     dt_bias: mx.array,
     state: mx.array,

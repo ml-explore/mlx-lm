@@ -23,7 +23,9 @@ from .gated_delta import gated_delta_update
 # Prefer the Metal-accelerated VJP when available (≈10× faster, ≈2× less
 # memory than the pure-Python fallback); otherwise use the Python reference.
 try:
-    from .gated_delta_vjp_metal import gated_delta_update_vjp_metal as gated_delta_update_vjp
+    from .gated_delta_vjp_metal import (
+        gated_delta_update_vjp_metal as gated_delta_update_vjp,
+    )
 except ImportError:
     from .gated_delta_vjp import gated_delta_update_vjp
 from .rope_utils import initialize_rope

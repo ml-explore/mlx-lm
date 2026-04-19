@@ -121,13 +121,13 @@ _factored_step_kernel = _make_factored_step_kernel()
 
 
 def gated_delta_factored_step_metal(
-    U: mx.array,      # [B, Hv, Dv, R]    bf16
-    V: mx.array,      # [B, Hv, R, Dk]    bf16
-    q: mx.array,      # [B, 1, Hv, Dk]    bf16 (single token, T=1)
-    k: mx.array,      # [B, 1, Hv, Dk]    bf16
-    v: mx.array,      # [B, 1, Hv, Dv]    bf16
-    g: mx.array,      # [B, 1, Hv]        bf16
-    beta: mx.array,   # [B, 1, Hv]        bf16
+    U: mx.array,  # [B, Hv, Dv, R]    bf16
+    V: mx.array,  # [B, Hv, R, Dk]    bf16
+    q: mx.array,  # [B, 1, Hv, Dk]    bf16 (single token, T=1)
+    k: mx.array,  # [B, 1, Hv, Dk]    bf16
+    v: mx.array,  # [B, 1, Hv, Dv]    bf16
+    g: mx.array,  # [B, 1, Hv]        bf16
+    beta: mx.array,  # [B, 1, Hv]        bf16
 ) -> Tuple[mx.array, mx.array, mx.array]:
     """Metal kernel wrapper for T=1 factored step.
 
@@ -146,10 +146,10 @@ def gated_delta_factored_step_metal(
     dtype = U.dtype
 
     # Squeeze T=1.
-    q_flat = q[:, 0]           # [B, Hv, Dk]
+    q_flat = q[:, 0]  # [B, Hv, Dk]
     k_flat = k[:, 0]
     v_flat = v[:, 0]
-    g_flat = g[:, 0]           # [B, Hv]
+    g_flat = g[:, 0]  # [B, Hv]
     beta_flat = beta[:, 0]
 
     y_out, U_new, V_new = _factored_step_kernel(

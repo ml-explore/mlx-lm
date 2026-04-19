@@ -122,8 +122,7 @@ def estimate_rank(
         )
 
     linear_layer_indices = [
-        i for i, L in enumerate(layers)
-        if getattr(L, "is_linear", False)
+        i for i, L in enumerate(layers) if getattr(L, "is_linear", False)
     ]
     if len(linear_layer_indices) > layers_to_probe:
         step = len(linear_layer_indices) // layers_to_probe
@@ -133,12 +132,15 @@ def estimate_rank(
         for idx in linear_layer_indices:
             L = layers[idx]
             orig = L.linear_attn.in_proj_qkv
+
             def make_hook(orig_fn, proj_idx):
                 def hook(x):
                     out = orig_fn(x)
                     captured[proj_idx] = out
                     return out
+
                 return hook
+
             L.linear_attn.in_proj_qkv = make_hook(orig, idx)
 
     caches = model.language_model.make_cache()
@@ -166,9 +168,9 @@ def estimate_rank(
             key_dim = mod.key_dim
             num_k = mod.num_k_heads
             head_k_dim = mod.head_k_dim
-            k_block = qkv[:, :, key_dim:2 * key_dim]
+            k_block = qkv[:, :, key_dim : 2 * key_dim]
             k_heads = k_block.reshape(1, T, num_k, head_k_dim)
-            inv_scale = head_k_dim ** -0.5
+            inv_scale = head_k_dim**-0.5
             k_norm = inv_scale * mx.fast.rms_norm(k_heads, None, 1e-6)
             k0 = k_norm[0, :, 0, :].astype(mx.float32)
             measurements.append(_stable_rank_matrix(k0))

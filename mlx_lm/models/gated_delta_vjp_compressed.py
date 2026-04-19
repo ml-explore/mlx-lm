@@ -46,7 +46,6 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-
 CHUNK_SIZE = 64
 DEFAULT_RANK = 16
 DEFAULT_POWER_ITERS = 6
@@ -122,7 +121,7 @@ def _gram_schmidt(X: mx.array) -> mx.array:
     r = X.shape[-1]
     cols = []
     for i in range(r):
-        col = X[..., :, i:i + 1]
+        col = X[..., :, i : i + 1]
         for prev in cols:
             proj = (prev * col).sum(axis=-2, keepdims=True)
             col = col - proj * prev
@@ -155,7 +154,7 @@ def _power_iter_truncate(
     U = mx.stop_gradient(X)  # [..., Dv, r]
 
     UtS = mx.swapaxes(U, -1, -2) @ S32  # [..., r, Dk]
-    recon = U @ UtS                      # [..., Dv, Dk]
+    recon = U @ UtS  # [..., Dv, Dk]
     return recon.astype(out_dtype)
 
 

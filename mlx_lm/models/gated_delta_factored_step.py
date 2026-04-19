@@ -21,16 +21,20 @@ FMAs per step. Rank growth over 100 tokens: final r=116. Break-even
 point where dense is faster: r ≈ 128 (step 112 for starting r=16).
 """
 
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 import mlx.core as mx
 
 
 @mx.compile
 def factored_step_compiled(
-    U: mx.array, V: mx.array,
-    q: mx.array, k: mx.array, v: mx.array,
-    g: mx.array, beta: mx.array,
+    U: mx.array,
+    V: mx.array,
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
 ) -> Tuple[mx.array, mx.array, mx.array]:
     """One factored DeltaNet step. Per-head layout:
 
@@ -73,7 +77,10 @@ def factored_step_batched(
     """Batched version across heads and batch."""
     # V' = g · V - g·β·(V·k)·k^T
     Vk = (V * k[..., None, :]).sum(axis=-1)  # [B, Hv, r]
-    V_prime = g[..., None, None] * V - (g * beta)[..., None, None] * Vk[..., None] * k[..., None, :]
+    V_prime = (
+        g[..., None, None] * V
+        - (g * beta)[..., None, None] * Vk[..., None] * k[..., None, :]
+    )
 
     # y = U @ (V'·q) + β · v · (k·q)
     Vq = (V_prime * q[..., None, :]).sum(axis=-1)  # [B, Hv, r]
@@ -87,7 +94,9 @@ def factored_step_batched(
     return y, U_new, V_new
 
 
-def rank_truncate(U: mx.array, V: mx.array, target_rank: int) -> Tuple[mx.array, mx.array]:
+def rank_truncate(
+    U: mx.array, V: mx.array, target_rank: int
+) -> Tuple[mx.array, mx.array]:
     """Truncate factored state (U, V) down to target_rank.
 
     Uses QR of U, small SVD of R·V, then reassembly. O(r²·(Dv+Dk)) cost.
@@ -116,7 +125,12 @@ def rank_truncate(U: mx.array, V: mx.array, target_rank: int) -> Tuple[mx.array,
 
 
 def initial_factored_state(
-    B: int, Hv: int, Dv: int, Dk: int, rank: int, dtype=mx.bfloat16,
+    B: int,
+    Hv: int,
+    Dv: int,
+    Dk: int,
+    rank: int,
+    dtype=mx.bfloat16,
 ) -> Tuple[mx.array, mx.array]:
     """Zero initial state in factored form (rank 0 logically)."""
     # Use rank=1 dummy with zero singular value so shapes match future

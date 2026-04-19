@@ -27,7 +27,6 @@ import mlx.nn as nn
 
 from .gated_delta import gated_delta_kernel
 
-
 CHUNK_SIZE = 64
 
 
@@ -44,6 +43,7 @@ def _compute_g(A_log: mx.array, a: mx.array, dt_bias: mx.array) -> mx.array:
 
 
 # -- Metal kernels -----------------------------------------------------------
+
 
 def _make_fwd_save_kernel(vectorized: bool = False):
     """Forward recurrence that also persists the state history for backward.
@@ -345,11 +345,24 @@ def _make_bwd_kernel():
     return mx.fast.metal_kernel(
         name="gated_delta_bwd",
         input_names=[
-            "q", "k", "v", "g", "beta",
-            "state_initial", "state_history", "dy", "dS_final", "T",
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "state_initial",
+            "state_history",
+            "dy",
+            "dS_final",
+            "T",
         ],
         output_names=[
-            "dq", "dk_out", "dv_out", "dg", "dbeta", "dS_initial",
+            "dq",
+            "dk_out",
+            "dv_out",
+            "dg",
+            "dbeta",
+            "dS_initial",
         ],
         source=source,
     )
@@ -556,11 +569,24 @@ def _make_bwd_kernel_vec():
     return mx.fast.metal_kernel(
         name="gated_delta_bwd_vec",
         input_names=[
-            "q", "k", "v", "g", "beta",
-            "state_initial", "state_history", "dy", "dS_final", "T",
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "state_initial",
+            "state_history",
+            "dy",
+            "dS_final",
+            "T",
         ],
         output_names=[
-            "dq", "dk_out", "dv_out", "dg", "dbeta", "dS_initial",
+            "dq",
+            "dk_out",
+            "dv_out",
+            "dg",
+            "dbeta",
+            "dS_initial",
         ],
         source=source,
     )
@@ -574,6 +600,7 @@ _bwd_kernel_vec = _make_bwd_kernel_vec()
 
 # -- Python-level wrappers ---------------------------------------------------
 
+
 def _fwd_save(q, k, v, g, beta, state_in):
     """Metal forward over full T. Routes to the scalar or vectorised
     kernel based on ``g.ndim`` (3 = scalar, 4 = per-Dk vectorised).
@@ -586,14 +613,17 @@ def _fwd_save(q, k, v, g, beta, state_in):
         inputs=[q, k, v, g, beta, state_in, T],
         template=[
             ("InT", input_type),
-            ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
         ],
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
         output_shapes=[
-            (B, T, Hv, Dv),              # y
-            state_in.shape,              # state_out
-            (B, Hv, T, Dv, Dk),          # state_history
+            (B, T, Hv, Dv),  # y
+            state_in.shape,  # state_out
+            (B, Hv, T, Dv, Dk),  # state_history
         ],
         output_dtypes=[input_type, input_type, input_type],
     )
@@ -616,27 +646,42 @@ def _bwd(q, k, v, g, beta, state_initial, state_history, dy, dS_final):
         dg_shape = (B, T, Hv, Dv // 4)
     return kernel(
         inputs=[
-            q, k, v, g, beta,
-            state_initial, state_history, dy, dS_final, T,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state_initial,
+            state_history,
+            dy,
+            dS_final,
+            T,
         ],
         template=[
             ("InT", input_type),
             ("OutT", out_type),
-            ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
         ],
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
         output_shapes=[
             (B, T, Hv, Dv // 4, Dk),  # dq per threadgroup-y
             (B, T, Hv, Dv // 4, Dk),  # dk per threadgroup-y
-            (B, T, Hv, Dv),           # dv
-            dg_shape,                  # dg (scalar) or per-Dk (vectorised)
-            (B, T, Hv, Dv // 4),      # dbeta per threadgroup-y
-            state_initial.shape,      # dS_initial
+            (B, T, Hv, Dv),  # dv
+            dg_shape,  # dg (scalar) or per-Dk (vectorised)
+            (B, T, Hv, Dv // 4),  # dbeta per threadgroup-y
+            state_initial.shape,  # dS_initial
         ],
         output_dtypes=[
-            out_type, out_type, input_type,
-            out_type, out_type, input_type,
+            out_type,
+            out_type,
+            input_type,
+            out_type,
+            out_type,
+            input_type,
         ],
     )
 
@@ -661,14 +706,15 @@ def _gated_delta_core_vjp(primals, cotangents, outputs):
     )
     # Deterministic reduction over the Dv axis (added by the kernel to
     # avoid ``atomic_fetch_add`` ordering noise).
-    dq = dq_dv.sum(axis=3).astype(q.dtype)         # [B, T, Hv, Dk]
-    dk_ = dk_dv.sum(axis=3).astype(k.dtype)        # [B, T, Hv, Dk]
-    dg = dg_dv.sum(axis=3).astype(g.dtype)         # [B, T, Hv]
+    dq = dq_dv.sum(axis=3).astype(q.dtype)  # [B, T, Hv, Dk]
+    dk_ = dk_dv.sum(axis=3).astype(k.dtype)  # [B, T, Hv, Dk]
+    dg = dg_dv.sum(axis=3).astype(g.dtype)  # [B, T, Hv]
     dbeta = dbeta_dv.sum(axis=3).astype(beta.dtype)  # [B, T, Hv]
     return dq, dk_, dv_, dg, dbeta, dS_init
 
 
 # -- Public drop-in replacement ----------------------------------------------
+
 
 def gated_delta_update_vjp_metal(
     q: mx.array,

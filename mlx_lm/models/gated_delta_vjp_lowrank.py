@@ -23,7 +23,6 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-
 CHUNK_SIZE = 64
 DEFAULT_RANK = 16
 _LOG_DECAY_CLAMP = -20.0
@@ -65,10 +64,10 @@ def _svd_truncate(S: mx.array, rank: int) -> mx.array:
     out_dtype = S.dtype
     S32 = S.astype(mx.float32)
     U, sigma, Vt = mx.linalg.svd(S32, stream=mx.cpu)
-    U = U[..., :rank]                   # [B, Hv, Dv, r]
-    sigma = sigma[..., :rank]           # [B, Hv, r]
-    Vt = Vt[..., :rank, :]              # [B, Hv, r, Dk]
-    recon = mx.einsum('bhvr,bhr,bhrk->bhvk', U, sigma, Vt)
+    U = U[..., :rank]  # [B, Hv, Dv, r]
+    sigma = sigma[..., :rank]  # [B, Hv, r]
+    Vt = Vt[..., :rank, :]  # [B, Hv, r, Dk]
+    recon = mx.einsum("bhvr,bhr,bhrk->bhvk", U, sigma, Vt)
     return recon.astype(out_dtype)
 
 
@@ -77,7 +76,7 @@ def _gram_schmidt(X: mx.array) -> mx.array:
     r = X.shape[-1]
     cols = []
     for i in range(r):
-        col = X[..., :, i:i + 1]
+        col = X[..., :, i : i + 1]
         for prev in cols:
             proj = (prev * col).sum(axis=-2, keepdims=True)
             col = col - proj * prev
@@ -110,11 +109,11 @@ def _power_iter_truncate(S: mx.array, rank: int, n_iter: int = 10) -> mx.array:
     for _ in range(n_iter):
         X = SST @ X
         X = _gram_schmidt(X)
-    U = mx.stop_gradient(X)                                # [..., Dv, r]
+    U = mx.stop_gradient(X)  # [..., Dv, r]
 
     # Rank-r projection of the live S: U · U^T · S.
-    UtS = mx.swapaxes(U, -1, -2) @ S32                     # [..., r, Dk]
-    recon = U @ UtS                                          # [..., Dv, Dk]
+    UtS = mx.swapaxes(U, -1, -2) @ S32  # [..., r, Dk]
+    recon = U @ UtS  # [..., Dv, Dk]
     return recon.astype(out_dtype)
 
 
@@ -129,7 +128,7 @@ def gated_delta_update_vjp_lowrank(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     rank: int = DEFAULT_RANK,
-    method: str = "svd",      # "svd" (CPU, exact) or "power" (GPU, iterative)
+    method: str = "svd",  # "svd" (CPU, exact) or "power" (GPU, iterative)
     power_iters: int = 10,
 ) -> Tuple[mx.array, mx.array]:
     """Low-rank state drop-in for :func:`gated_delta_update`.

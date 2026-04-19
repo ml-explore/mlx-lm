@@ -34,7 +34,9 @@ def test_apply_A():
     out = _apply_A(M, g, k, beta)
     # Check manually: g · M · (I - β kk^T)
     Mk = (M * k[..., None, :]).sum(axis=-1)
-    expected = g[..., None, None] * (M - beta[..., None, None] * Mk[..., None] * k[..., None, :])
+    expected = g[..., None, None] * (
+        M - beta[..., None, None] * Mk[..., None] * k[..., None, :]
+    )
     diff = float(mx.abs(out - expected).max().item())
     assert diff < 1e-5, f"_apply_A off by {diff}"
     return True
@@ -90,17 +92,17 @@ def test_sequential_matches_reference():
     y_ref, S_ref = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias)
     mx.eval(y_ref, S_ref)
 
-    y_scan, S_scan = gated_delta_update_prefix_scan(
-        q, k, v, a, b, A_log, dt_bias
-    )
+    y_scan, S_scan = gated_delta_update_prefix_scan(q, k, v, a, b, A_log, dt_bias)
     mx.eval(y_scan, S_scan)
 
     y_diff = float(mx.abs(y_ref - y_scan).max().item())
     S_diff = float(mx.abs(S_ref - S_scan).max().item())
     rel_y = y_diff / max(float(mx.abs(y_ref).max().item()), 1e-8)
     rel_S = S_diff / max(float(mx.abs(S_ref).max().item()), 1e-8)
-    print(f"  prefix-scan vs VJP reference: max|y_diff|={y_diff:.2e} "
-          f"(rel {rel_y:.1e}); max|S_diff|={S_diff:.2e} (rel {rel_S:.1e})")
+    print(
+        f"  prefix-scan vs VJP reference: max|y_diff|={y_diff:.2e} "
+        f"(rel {rel_y:.1e}); max|S_diff|={S_diff:.2e} (rel {rel_S:.1e})"
+    )
     # Relative tolerance 1e-3 — small numerical-accumulation errors over
     # T=16 steps in fp32 are expected, not a semantic disagreement.
     assert rel_y < 1e-3, f"rel y diff {rel_y}"

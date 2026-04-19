@@ -2,6 +2,7 @@
 
 import sys
 import time
+
 import mlx.core as mx
 
 from mlx_lm.models.gated_delta import compute_g, gated_delta_kernel
@@ -39,7 +40,9 @@ def test_correctness():
     mx.eval(y_fused, state_fused)
 
     y_diff = float(mx.abs(y_ref.astype(mx.float32) - y_fused.astype(mx.float32)).max())
-    s_diff = float(mx.abs(state_ref.astype(mx.float32) - state_fused.astype(mx.float32)).max())
+    s_diff = float(
+        mx.abs(state_ref.astype(mx.float32) - state_fused.astype(mx.float32)).max()
+    )
     print(f"y_diff: {y_diff:.6f}, state_diff: {s_diff:.6f}")
     assert y_diff < 5e-3, f"y disagree: {y_diff}"
     assert s_diff < 5e-3, f"state disagree: {s_diff}"

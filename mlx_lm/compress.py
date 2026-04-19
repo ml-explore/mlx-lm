@@ -36,7 +36,7 @@ Full proof and derivations in the project's research notes
 (THEOREM_MAIN.md, to be published as an arXiv preprint).
 """
 
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 from .models.gated_delta_rank_estimator import estimate_rank  # noqa: F401
 
@@ -67,8 +67,7 @@ def estimate_rank_per_layer(
             "The empirical study of trained state-space models has "
             "revealed a surprising structural property: the recurrent "
             "state occupies only a tiny subspace regardless of "
-            "sequence length. This reflects training dynamics. "
-            * 50
+            "sequence length. This reflects training dynamics. " * 50
         )
     ids = mx.array(tokenizer.encode(calibration_text))[None, ...]
     T = ids.shape[1]
@@ -82,9 +81,7 @@ def estimate_rank_per_layer(
             "hybrid model exposing model.language_model.model.layers"
         )
 
-    linear_indices = [
-        i for i, L in enumerate(layers) if getattr(L, "is_linear", False)
-    ]
+    linear_indices = [i for i, L in enumerate(layers) if getattr(L, "is_linear", False)]
     captured: Dict[int, mx.array] = {}
     for idx in linear_indices:
         L = layers[idx]
@@ -95,6 +92,7 @@ def estimate_rank_per_layer(
                 out = orig_fn(x)
                 captured[proj_idx] = out
                 return out
+
             return hook
 
         L.linear_attn.in_proj_qkv = make_hook(orig, idx)
@@ -123,9 +121,9 @@ def estimate_rank_per_layer(
         key_dim = mod.key_dim
         num_k = mod.num_k_heads
         head_k_dim = mod.head_k_dim
-        k_block = qkv[:, :, key_dim:2 * key_dim]
+        k_block = qkv[:, :, key_dim : 2 * key_dim]
         k_heads = k_block.reshape(1, T, num_k, head_k_dim)
-        inv_scale = head_k_dim ** -0.5
+        inv_scale = head_k_dim**-0.5
         k_norm = inv_scale * mx.fast.rms_norm(k_heads, None, 1e-6)
         k0 = k_norm[0, :, 0, :].astype(mx.float32)
 
@@ -133,7 +131,7 @@ def estimate_rank_per_layer(
         for W in windows:
             if W > T:
                 continue
-            K_W = k0[T - W:T]
+            K_W = k0[T - W : T]
             sr = stable_rank_mx(K_W)
             if sr > max_sr:
                 max_sr = sr

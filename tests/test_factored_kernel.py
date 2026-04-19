@@ -1,6 +1,7 @@
 """Correctness test: Metal MSL factored kernel vs pure-Python reference."""
 
 import sys
+
 import mlx.core as mx
 
 from mlx_lm.models.gated_delta_factored_kernel import gated_delta_factored_step_metal

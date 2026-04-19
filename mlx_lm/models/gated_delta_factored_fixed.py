@@ -127,14 +127,14 @@ _fixed_kernel = _make_fixed_step_kernel()
 
 
 def factored_step_fixed(
-    U: mx.array,      # [B, Hv, Dv, R]
-    V: mx.array,      # [B, Hv, R, Dk]
-    q: mx.array,      # [B, Hv, Dk]
-    k: mx.array,      # [B, Hv, Dk]
-    v: mx.array,      # [B, Hv, Dv]
-    g: mx.array,      # [B, Hv]
-    beta: mx.array,   # [B, Hv]
-    slot_idx: int,    # which slot to replace this step (compile-time)
+    U: mx.array,  # [B, Hv, Dv, R]
+    V: mx.array,  # [B, Hv, R, Dk]
+    q: mx.array,  # [B, Hv, Dk]
+    k: mx.array,  # [B, Hv, Dk]
+    v: mx.array,  # [B, Hv, Dv]
+    g: mx.array,  # [B, Hv]
+    beta: mx.array,  # [B, Hv]
+    slot_idx: int,  # which slot to replace this step (compile-time)
 ) -> Tuple[mx.array, mx.array, mx.array]:
     """Fixed-rank factored step. Output (U, V) shape = input.
 
@@ -152,8 +152,11 @@ def factored_step_fixed(
     y, U_new, V_new = _fixed_kernel(
         inputs=[U, V, q, k, v, g, beta],
         template=[
-            ("InT", dtype), ("Dk", Dk), ("Dv", Dv),
-            ("R", R), ("SLOT", slot_idx),
+            ("InT", dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("R", R),
+            ("SLOT", slot_idx),
         ],
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 1, 1),

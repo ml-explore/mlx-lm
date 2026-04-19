@@ -16,11 +16,10 @@ import mlx.nn as nn
 from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
 from mlx_lm.models.gated_delta_vjp_metal import gated_delta_update_vjp_metal
 
-
 B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 16, 8
 SEED = 42
 EPS = 1e-3
-TOL_FP32 = 1e-3   # rel.err
+TOL_FP32 = 1e-3  # rel.err
 ATOL_FP32 = 1e-4
 
 
@@ -51,11 +50,13 @@ def fd_grad_elem(loss_callable, x, idx, eps=EPS):
     e_plus = mx.zeros((n,), dtype=x.dtype)
     e_minus = mx.zeros((n,), dtype=x.dtype)
     # MLX has no scatter-update by index; build the perturbation via concat.
-    e = mx.concatenate([
-        mx.zeros((idx,), dtype=x.dtype),
-        mx.array([eps], dtype=x.dtype),
-        mx.zeros((n - idx - 1,), dtype=x.dtype),
-    ])
+    e = mx.concatenate(
+        [
+            mx.zeros((idx,), dtype=x.dtype),
+            mx.array([eps], dtype=x.dtype),
+            mx.zeros((n - idx - 1,), dtype=x.dtype),
+        ]
+    )
     e = e.reshape(x.shape)
     l_plus = loss_callable(x + e)
     l_minus = loss_callable(x - e)
@@ -113,10 +114,12 @@ def run_one_config(label: str, mask: Optional[mx.array] = None):
 
     ok_all = True
     for i, (name, val, gr) in enumerate(zip(names, args, grads)):
+
         def lo(x, i=i):
             a = list(args)
             a[i] = x
             return loss_full(*a)
+
         ok = check_grad_for_arg(name, val, lo, gr)
         ok_all = ok_all and ok
     return ok_all
@@ -132,8 +135,10 @@ def run_mask_equivalence():
     diff_y = float(mx.abs(y_u - y_m).max().item())
     diff_s = float(mx.abs(s_u - s_m).max().item())
     ok = diff_y < 1e-5 and diff_s < 1e-5
-    print(f"  max|y_diff|={diff_y:.3e}  max|S_diff|={diff_s:.3e}  "
-          f"[{'PASS' if ok else 'FAIL'}]")
+    print(
+        f"  max|y_diff|={diff_y:.3e}  max|S_diff|={diff_s:.3e}  "
+        f"[{'PASS' if ok else 'FAIL'}]"
+    )
     return ok
 
 
@@ -156,8 +161,10 @@ def run_metal_forward_equivalence():
     diff_y = float(mx.abs(y_py - y_mt).max().item())
     diff_s = float(mx.abs(s_py - s_mt).max().item())
     ok = diff_y < 1e-5 and diff_s < 1e-5
-    print(f"  max|y_diff|={diff_y:.3e}  max|S_diff|={diff_s:.3e}  "
-          f"[{'PASS' if ok else 'FAIL'}]")
+    print(
+        f"  max|y_diff|={diff_y:.3e}  max|S_diff|={diff_s:.3e}  "
+        f"[{'PASS' if ok else 'FAIL'}]"
+    )
     return ok
 
 
@@ -181,10 +188,12 @@ def run_metal_gradient_equivalence():
         y, s = fn(*args)
         return (y * cot_y).sum() + (s * cot_s).sum()
 
-    grad_py = mx.grad(lambda *xs: loss(gated_delta_update_vjp, *xs),
-                      argnums=(0, 1, 2, 3, 4))(q, k, v, a, b, A_log, dt_bias, S0)
-    grad_mt = mx.grad(lambda *xs: loss(gated_delta_update_vjp_metal, *xs),
-                      argnums=(0, 1, 2, 3, 4))(q, k, v, a, b, A_log, dt_bias, S0)
+    grad_py = mx.grad(
+        lambda *xs: loss(gated_delta_update_vjp, *xs), argnums=(0, 1, 2, 3, 4)
+    )(q, k, v, a, b, A_log, dt_bias, S0)
+    grad_mt = mx.grad(
+        lambda *xs: loss(gated_delta_update_vjp_metal, *xs), argnums=(0, 1, 2, 3, 4)
+    )(q, k, v, a, b, A_log, dt_bias, S0)
 
     ok_all = True
     for name, gp, gm in zip(["q", "k", "v", "a", "b"], grad_py, grad_mt):
@@ -193,8 +202,10 @@ def run_metal_gradient_equivalence():
         rel = diff / scale
         ok = rel < 1e-5
         ok_all = ok_all and ok
-        print(f"  {name:3s}: max|diff|={diff:.3e}  rel={rel:.3e}  "
-              f"[{'PASS' if ok else 'FAIL'}]")
+        print(
+            f"  {name:3s}: max|diff|={diff:.3e}  rel={rel:.3e}  "
+            f"[{'PASS' if ok else 'FAIL'}]"
+        )
     return ok_all
 
 
@@ -206,6 +217,7 @@ def run_forward_equivalence():
     different mask handling for padded positions).
     """
     from mlx_lm.models.gated_delta import gated_delta_update as ref_fn
+
     print("\n--- Forward equivalence vs gated_delta_update (use_kernel=False) ---")
     q, k, v, a, b, A_log, dt_bias, S0 = make_inputs()
     # Reference works with repeat-head-expanded q/k like our wrapper does.
@@ -214,8 +226,10 @@ def run_forward_equivalence():
     diff_y = float(mx.abs(y_ref - y_vjp).max().item())
     diff_s = float(mx.abs(s_ref - s_vjp).max().item())
     ok = diff_y < 1e-4 and diff_s < 1e-4
-    print(f"  max|y_diff|={diff_y:.3e}  max|S_diff|={diff_s:.3e}  "
-          f"[{'PASS' if ok else 'FAIL'}]")
+    print(
+        f"  max|y_diff|={diff_y:.3e}  max|S_diff|={diff_s:.3e}  "
+        f"[{'PASS' if ok else 'FAIL'}]"
+    )
     return ok
 
 
@@ -240,13 +254,13 @@ def run_edge_case_lengths():
         y_vjp, s_vjp = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, S0)
         diff_y = float(mx.abs(y_ref - y_vjp).max().item())
         diff_s = float(mx.abs(s_ref - s_vjp).max().item())
-        any_nan = any(
-            bool(mx.isnan(t).any().item()) for t in (y_vjp, s_vjp)
-        )
+        any_nan = any(bool(mx.isnan(t).any().item()) for t in (y_vjp, s_vjp))
         ok = not any_nan and diff_y < 1e-4 and diff_s < 1e-4
         ok_all = ok_all and ok
-        print(f"  T={T_edge:3d}  max|y|={diff_y:.2e}  max|S|={diff_s:.2e}  "
-              f"nan={any_nan}  [{'PASS' if ok else 'FAIL'}]")
+        print(
+            f"  T={T_edge:3d}  max|y|={diff_y:.2e}  max|S|={diff_s:.2e}  "
+            f"nan={any_nan}  [{'PASS' if ok else 'FAIL'}]"
+        )
     return ok_all
 
 
@@ -257,9 +271,9 @@ def run_extreme_clamp():
     q = mx.random.normal((B, T, Hk, Dk)) * 0.3
     k = mx.random.normal((B, T, Hk, Dk)) * 0.3
     v = mx.random.normal((B, T, Hv, Dv)) * 0.3
-    a = mx.full((B, T, Hv), 15.0)   # softplus(16) ~ 16
+    a = mx.full((B, T, Hv), 15.0)  # softplus(16) ~ 16
     b = mx.zeros((B, T, Hv))
-    A_log = mx.full((Hv,), 5.0)     # exp(5) ≈ 148, combined arg ≈ -2370
+    A_log = mx.full((Hv,), 5.0)  # exp(5) ≈ 148, combined arg ≈ -2370
     dt_bias = mx.ones((Hv,))
     S0 = mx.zeros((B, Hv, Dv, Dk))
     y, s = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, S0)
@@ -275,16 +289,25 @@ def run_mask_state_carryover():
     the first four unmasked steps."""
     print("\n--- Masked state-carryover (first half True, second half False) ---")
     q, k, v, a, b, A_log, dt_bias, S0 = make_inputs()
-    mask_half = mx.concatenate([
-        mx.ones((B, T // 2), dtype=mx.bool_),
-        mx.zeros((B, T - T // 2), dtype=mx.bool_),
-    ], axis=1)
+    mask_half = mx.concatenate(
+        [
+            mx.ones((B, T // 2), dtype=mx.bool_),
+            mx.zeros((B, T - T // 2), dtype=mx.bool_),
+        ],
+        axis=1,
+    )
     _, s_full = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, S0, mask_half)
     # Reference: run only the first T//2 steps unmasked.
     half = T // 2
     _, s_ref = gated_delta_update_vjp(
-        q[:, :half], k[:, :half], v[:, :half],
-        a[:, :half], b[:, :half], A_log, dt_bias, S0,
+        q[:, :half],
+        k[:, :half],
+        v[:, :half],
+        a[:, :half],
+        b[:, :half],
+        A_log,
+        dt_bias,
+        S0,
     )
     diff = float(mx.abs(s_full - s_ref).max().item())
     ok = diff < 1e-5
@@ -338,10 +361,13 @@ def main():
 
     try:
         # FD grads through masked path (half-mask, non-trivial).
-        half_mask = mx.concatenate([
-            mx.ones((B, T // 2), dtype=mx.bool_),
-            mx.zeros((B, T - T // 2), dtype=mx.bool_),
-        ], axis=1)
+        half_mask = mx.concatenate(
+            [
+                mx.ones((B, T // 2), dtype=mx.bool_),
+                mx.zeros((B, T - T // 2), dtype=mx.bool_),
+            ],
+            axis=1,
+        )
         results["masked_fd"] = run_one_config(
             "Masked gating FD (half True / half False)", mask=half_mask
         )

@@ -27,15 +27,14 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .gated_delta_vjp_metal import _gated_delta_core as _metal_core
 from .gated_delta_vjp_compressed import (
+    _LOG_DECAY_CLAMP,
+    DEFAULT_POWER_ITERS,
+    DEFAULT_RANK,
     _gram_schmidt,
     _power_iter_truncate,
-    DEFAULT_RANK,
-    DEFAULT_POWER_ITERS,
-    _LOG_DECAY_CLAMP,
 )
-
+from .gated_delta_vjp_metal import _gated_delta_core as _metal_core
 
 CHUNK_SIZE = 64
 

@@ -38,7 +38,6 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-
 CHUNK_SIZE = 64
 _LOG_DECAY_CLAMP = -20.0
 
@@ -63,22 +62,22 @@ def _chunk_parallel_forward(q, k, v, g, beta, S_start):
     B, T, Hv, Dk = q.shape
     Dv = v.shape[-1]
 
-    log_g = mx.log(g + 1e-30)                              # [B, T, Hv]
-    log_G = mx.cumsum(log_g, axis=1)                       # log G_{0..t}
+    log_g = mx.log(g + 1e-30)  # [B, T, Hv]
+    log_G = mx.cumsum(log_g, axis=1)  # log G_{0..t}
     # Pairwise: log G_{j+1..t} = log_G[t] − log_G[j]
     log_pair = log_G[:, :, None, :] - log_G[:, None, :, :]  # [B, T, T, Hv]
     G_mat = mx.exp(log_pair)
-    G_full = mx.exp(log_G)                                  # [B, T, Hv]
+    G_full = mx.exp(log_G)  # [B, T, Hv]
 
     strict_lower = mx.tril(mx.ones((T, T), dtype=q.dtype), k=-1)
     causal = mx.tril(mx.ones((T, T), dtype=q.dtype))
 
     # v'[t] = v[t] − G_{0..t} · (S_start @ k[t])
-    S0_k = mx.einsum('bhvk,bthk->bthv', S_start, k)         # [B, T, Hv, Dv]
+    S0_k = mx.einsum("bhvk,bthk->bthv", S_start, k)  # [B, T, Hv, Dv]
     v_prime = v - G_full[..., None] * S0_k
 
     # A[t, j] = G_{j+1..t} · β_j · ⟨k_j, k_t⟩  strictly lower
-    k_dot = mx.einsum('bihk,bjhk->bijh', k, k)             # [B, T, T, Hv]
+    k_dot = mx.einsum("bihk,bjhk->bijh", k, k)  # [B, T, T, Hv]
     A = G_mat * beta[:, None, :, :] * k_dot
     A = A * strict_lower[None, :, :, None]
 
@@ -88,25 +87,26 @@ def _chunk_parallel_forward(q, k, v, g, beta, S_start):
         if t == 0:
             d = v_prime[:, t]
         else:
-            A_row = A[:, t, :t, :]                          # [B, t, Hv]
-            prev = mx.stack(delta_list, axis=1)             # [B, t, Hv, Dv]
+            A_row = A[:, t, :t, :]  # [B, t, Hv]
+            prev = mx.stack(delta_list, axis=1)  # [B, t, Hv, Dv]
             d = v_prime[:, t] - (A_row[..., None] * prev).sum(axis=1)
         delta_list.append(d)
-    delta = mx.stack(delta_list, axis=1)                    # [B, T, Hv, Dv]
+    delta = mx.stack(delta_list, axis=1)  # [B, T, Hv, Dv]
 
     # y[t] = G_{0..t} · (S_start · q_t) + Σ_{j≤t} G_{j+1..t} · β_j · δ_j · ⟨k_j, q_t⟩
-    S0_q = mx.einsum('bhvk,bthk->bthv', S_start, q)
+    S0_q = mx.einsum("bhvk,bthk->bthv", S_start, q)
     y_inter = G_full[..., None] * S0_q
-    kq_dot = mx.einsum('bjhk,bihk->bijh', k, q)             # [B, T_i, T_j, Hv]
+    kq_dot = mx.einsum("bjhk,bihk->bijh", k, q)  # [B, T_i, T_j, Hv]
     M = G_mat * beta[:, None, :, :] * kq_dot * causal[None, :, :, None]
-    y_intra = mx.einsum('bijh,bjhv->bihv', M, delta)
+    y_intra = mx.einsum("bijh,bjhv->bihv", M, delta)
     y = y_inter + y_intra
 
     # Final state.
-    last_G_scalar = G_full[:, -1, :]                        # [B, Hv]
-    carry_G = mx.exp(log_G[:, -1:, :] - log_G)              # [B, T, Hv]
-    S_final = last_G_scalar[:, :, None, None] * S_start \
-            + mx.einsum('bth,bthv,bthk->bhvk', carry_G * beta, delta, k)
+    last_G_scalar = G_full[:, -1, :]  # [B, Hv]
+    carry_G = mx.exp(log_G[:, -1:, :] - log_G)  # [B, T, Hv]
+    S_final = last_G_scalar[:, :, None, None] * S_start + mx.einsum(
+        "bth,bthv,bthk->bhvk", carry_G * beta, delta, k
+    )
     return y, S_final
 
 

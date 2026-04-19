@@ -20,7 +20,6 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-
 _LOG_DECAY_CLAMP = -20.0
 
 
@@ -90,8 +89,11 @@ def _compose_pair(p_left, p_right):
 
 
 def _sequential_scan(
-    q: mx.array, k: mx.array, v: mx.array,
-    g: mx.array, beta: mx.array,
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
     state: Optional[mx.array] = None,
 ):
     """Reference sequential scan: for each t, S_t = A_t(S_{t-1}) + B_t.

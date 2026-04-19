@@ -118,7 +118,16 @@ def _make_t1_kernel():
 
     return mx.fast.metal_kernel(
         name="gated_delta_t1_rms",
-        input_names=["q_in", "k_in", "v", "a_raw", "b_raw", "A_log", "dt_bias", "state_in"],
+        input_names=[
+            "q_in",
+            "k_in",
+            "v",
+            "a_raw",
+            "b_raw",
+            "A_log",
+            "dt_bias",
+            "state_in",
+        ],
         output_names=["y", "state_out"],
         source=source,
     )
@@ -168,7 +177,9 @@ def gated_delta_kernel_t1(
     y, state_new = _t1_kernel(
         inputs=[q_f, k_f, v_f, a_f, b_f, A_log, dt_bias, state],
         template=[
-            ("InT", dtype), ("Dk", Dk), ("Dv", Dv),
+            ("InT", dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
             ("Hk", Hv),  # q/k are already expanded to Hv
             ("Hv", Hv),
         ],

@@ -83,7 +83,9 @@ def tree_speculative_generate_step(
 
     def _step(model_local, cache_local, y_local):
         with mx.stream(generation_stream):
-            logits = model_local(y_local[None] if y_local.ndim == 1 else y_local, cache=cache_local)
+            logits = model_local(
+                y_local[None] if y_local.ndim == 1 else y_local, cache=cache_local
+            )
             logits = logits[:, -1, :]
             quantize_cache_fn(cache_local)
             tok, lp = _sample(logits.squeeze(0) if logits.shape[0] == 1 else logits)
@@ -132,8 +134,8 @@ def tree_speculative_generate_step(
     ntoks = 0
     num_draft = 0
     n = 0
-    tree_uses = 0     # counter: how often tree branch_b helped
-    tree_wins = 0     # counter: how often branch_b extended accepted length
+    tree_uses = 0  # counter: how often tree branch_b helped
+    tree_wins = 0  # counter: how often branch_b extended accepted length
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
@@ -200,7 +202,9 @@ def tree_speculative_generate_step(
                     quantize_cache_fn(draft_cache)
                     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
                     top1 = int(mx.argmax(logprobs).item())
-                    masked = logprobs - 1e30 * (mx.arange(logprobs.shape[-1]) == top1).astype(logprobs.dtype)
+                    masked = logprobs - 1e30 * (
+                        mx.arange(logprobs.shape[-1]) == top1
+                    ).astype(logprobs.dtype)
                     top2 = int(mx.argmax(masked).item())
 
                 # Check if top-2 matches verifier's prediction at n_a.
@@ -227,9 +231,7 @@ def tree_speculative_generate_step(
                     # da[n_a], then forward with top2 + branch_b_tail.
                     cache.trim_prompt_cache(model_cache, num_draft - n_a)
                     # Now main cache at accepted prefix position.
-                    inp_b = mx.concatenate([
-                        mx.array([top2], mx.uint32), branch_b_tail
-                    ])
+                    inp_b = mx.concatenate([mx.array([top2], mx.uint32), branch_b_tail])
                     with mx.stream(generation_stream):
                         logits_b = model(inp_b[None], cache=model_cache)
                         n_predict = inp_b.size + 1
@@ -260,9 +262,7 @@ def tree_speculative_generate_step(
                     # Total accepted: n_a (from branch_a) + 1 (top2 match) + n_b_tail.
                     total_accepted = n_a + 1 + n_b_tail
                     accept_tokens = (
-                        list(pa[:n_a])
-                        + [top2]
-                        + list(predicted_b[:n_b_tail + 1])
+                        list(pa[:n_a]) + [top2] + list(predicted_b[: n_b_tail + 1])
                     )
                     # logprobs: concat lps_a[:n_a] + logprobs_b[0] + logprobs_b[1..n_b_tail+1]
                     # For simplicity emit lps_a for first n_a, logprobs_b for the rest.
@@ -305,7 +305,9 @@ def tree_speculative_generate_step(
                     if ntoks == max_tokens:
                         return
                 # Final verifier token (last position).
-                yield accept_tokens[n_a + 1 + n_b_tail], accept_lps_branch_b[n_b_tail + 1], False
+                yield accept_tokens[n_a + 1 + n_b_tail], accept_lps_branch_b[
+                    n_b_tail + 1
+                ], False
                 ntoks += 1
                 if ntoks == max_tokens:
                     break
