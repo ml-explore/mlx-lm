@@ -12,7 +12,7 @@ in one dispatch = 1 kernel per layer per step.
 Savings per token (Qwen3.5-9B, 24 DeltaNet layers):
   24 × (2 extra launches saved) × 5 μs ≈ 240 μs/token
   Baseline 15.4 ms/token → 15.16 ms/token
-  ≈ 1.5% end-to-end speedup (real, measurable, ships во framework).
+  ≈ 1.5% end-to-end speedup (real, measurable, ships in framework).
 """
 
 from typing import Optional, Tuple
@@ -26,7 +26,7 @@ def _make_fused_kernel(has_mask: bool = False):
 
     mask_source = "mask[b_idx * T + t]" if has_mask else "true"
 
-    # Inline compute_g and sigmoid(b) в MSL:
+    # Inline compute_g and sigmoid(b) in MSL:
     #   g = exp(-exp(A_log) * softplus(a + dt_bias))
     #   beta = 1 / (1 + exp(-b))  (sigmoid)
     # Both scalar per (batch, head) for T=1 step; loaded per-step inside loop.

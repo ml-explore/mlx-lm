@@ -2,11 +2,12 @@
 
 Generation does one token at a time. Generic kernel has outer ``for
 (int t = 0; t < T; ++t)`` loop that compiler can unroll for T=1 but
-still keeps full template machinery. A specialized kernel без loop +
-tighter scheduling saves launch overhead и kernel compile time.
+still keeps full template machinery. A specialized kernel without
+the loop plus tighter scheduling saves launch overhead and kernel
+compile time.
 
 Framework contribution: new mlx_lm/models/gated_delta_t1.py. Used via
-auto-switch в gated_delta_kernel wrapper when T=1 detected.
+auto-switch in the gated_delta_kernel wrapper when T=1 is detected.
 """
 
 from typing import Optional, Tuple
@@ -40,7 +41,7 @@ def _make_t1_kernel():
         auto i_state = state_in  + (n * Dv + dv_idx) * Dk;
         auto o_state = state_out + (n * Dv + dv_idx) * Dk;
 
-        // --- RMS norm q и k inline, with inv_scale baked in ---
+        // --- RMS norm q and k inline, with inv_scale baked in ---
         // q = inv_scale^2 * rms_norm(q_raw)
         // k = inv_scale   * rms_norm(k_raw)
         // rms_norm(x) = x / sqrt(mean(x^2) + eps)

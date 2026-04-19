@@ -14,7 +14,7 @@ subspace via power iteration. Backward flows through the projection
 (U treated as stop_gradient basis; gradient flows through U·U^T·S).
 
 Result: training compresses at boundary points → 5× memory savings at
-backward, while forward/backward inner loop runs на Metal (8-11× faster
+backward, while forward/backward inner loop runs on Metal (8-11× faster
 than Python VJP).
 
 Activation: MLX_DELTANET_VJP=compress with MLX_DELTANET_COMPRESS_METAL=1
@@ -62,7 +62,7 @@ def gated_delta_update_vjp_metal_compressed(
     """Metal VJP + compression-aware truncation.
 
     Drop-in for gated_delta_update_vjp_compressed but backward runs
-    на Metal kernel. Expected ~8× faster than pure-Python compressed.
+    on the Metal kernel. Expected ~8× faster than pure-Python compressed.
 
     mask path: falls back to non-Metal (masked-Metal bwd not implemented).
     """
@@ -93,7 +93,7 @@ def gated_delta_update_vjp_metal_compressed(
     S = state
     for start in range(0, T, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, T)
-        # Metal forward+save, backward через custom_function.vjp.
+        # Metal forward+save, backward via custom_function.vjp.
         y_c, S = _metal_core(
             q[:, start:end],
             k[:, start:end],

@@ -1,7 +1,7 @@
-"""Tree speculative decoding — production с optimizations.
+"""Tree speculative decoding — production with optimizations.
 
 Optimizations vs naive tree spec:
-  1. **Early exit**: run linear branch_a first. Если fully accepted
+  1. **Early exit**: run linear branch_a first. If fully accepted
      (majority case), skip branch_b entirely. Same cost as linear in
      the happy path.
   2. **Batched draft at fork**: for branch_b, use batched B=2 draft
@@ -9,11 +9,11 @@ Optimizations vs naive tree spec:
   3. **Temperature sampling** (optional via sampler arg): better
      accept rate for stochastic generation.
 
-Tree win happens только при partial reject of branch_a: we then
-generate branch_b + do B=2 batched verifier. In fast path we match
-linear speculative exactly — no overhead.
+Tree win happens only on partial reject of branch_a: we then generate
+branch_b and do a B=2 batched verifier forward. In the fast path we
+match linear speculative exactly — no overhead.
 
-Framework support: mlx_lm/models/cache.py уже extended с
+Framework support: mlx_lm/models/cache.py is extended with
   KVCache.filter(batch_indices), KVCache.expand_batch(n),
   ArraysCache.filter/expand_batch.
 """
@@ -43,19 +43,19 @@ def tree_speculative_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
-    """Tree speculative с fast path fallback к linear spec.
+    """Tree speculative with a fast path that falls back to linear spec.
 
     Algorithm:
       1. Draft branch_a linearly (N greedy tokens).
-      2. Main verifier forward на branch_a (B=1, N+1 positions).
+      2. Main verifier forward on branch_a (B=1, N+1 positions).
       3. Count accepted_a. If == N: yield + continue (linear path).
       4. If < N: generate branch_b = top-2 choice at position
-         accepted_a (where branch_a диверthese). Verify branch_b
+         accepted_a (where branch_a diverged). Verify branch_b
          via ONE additional B=1 forward (main cache filtered).
       5. Pick longest path, collapse caches.
 
-    Branch_b draft runs только when main rejects branch_a — minimal
-    waste in happy path.
+    Branch_b draft runs only when main rejects branch_a — minimal
+    waste in the happy path.
     """
     if tree_branches != 2:
         raise NotImplementedError("Only K=2 implemented")
@@ -181,15 +181,15 @@ def tree_speculative_generate_step(
                 # new additions. To fork from position n_a, rewind back to
                 # before drafting branch_a's position n_a.
                 # Draft advance during _draft_linear = num_draft steps. Trim
-                # by (num_draft - n_a) to back к right before position n_a.
+                # by (num_draft - n_a) to land right before position n_a.
                 cache.trim_prompt_cache(draft_cache, num_draft - n_a)
 
                 # Now get top-2 at position n_a by re-running draft step with
                 # the accepted prefix tokens.
                 # Verified prefix tokens 0..n_a-1 same as da. We need draft
                 # to predict at pos n_a. Draft cache already includes these.
-                # Next forward on da[n_a-1 если n_a>0 else y last]  — but
-                # position already there. Just query top-2 без advancing.
+                # Next forward on da[n_a-1 if n_a>0 else y last]  — but
+                # position is already there. Just query top-2 without advancing.
                 # Simpler: run draft forward to re-generate logits at current
                 # position.
                 with mx.stream(generation_stream):
@@ -227,8 +227,8 @@ def tree_speculative_generate_step(
                     # Verify branch_b continuation: need main forward on
                     # [branch_a[:n_a] accepted prefix, top2, branch_b_tail].
                     # Main cache already has accepted prefix + da[n_a] (was
-                    # in the batched original forward). Trim main к before
-                    # da[n_a], then forward with top2 + branch_b_tail.
+                    # in the batched original forward). Trim main back to
+                    # before da[n_a], then forward with top2 + branch_b_tail.
                     cache.trim_prompt_cache(model_cache, num_draft - n_a)
                     # Now main cache at accepted prefix position.
                     inp_b = mx.concatenate([mx.array([top2], mx.uint32), branch_b_tail])
@@ -243,7 +243,7 @@ def tree_speculative_generate_step(
                         predicted_b = mx.argmax(logprobs_b, axis=-1).tolist()
                         mx.eval(predicted_b)
 
-                    # Count accept для branch_b tail (first token of inp_b=top2
+                    # Count accept for branch_b tail (first token of inp_b=top2
                     # already accepted since it equals pa[n_a]).
                     # Predicted_b[0] is verifier's choice given top2 — used for
                     # branch_b_tail[0] comparison.
@@ -275,7 +275,7 @@ def tree_speculative_generate_step(
                     # branch_b doesn't match either — tree didn't help.
                     # Fall back to linear accept.
                     # Main cache already advanced by num_draft+1 (during verify).
-                    # Need to trim к accept_a position = n_a tokens after y +
+                    # Need to trim to accept_a position = n_a tokens after y +
                     # 1 verifier token.
                     accept_tokens = pa[: n_a + 1]
                     n = n_a
@@ -327,8 +327,9 @@ def tree_speculative_generate_step(
 
             # Draft cache management:
             # After full accept (n_a == num_draft): draft advanced num_draft
-            # steps. Linear spec feeds last_draft_token на next round, so
-            # draft_cache needs 1 less рewind. We do same by не trimming.
+            # steps. Linear spec feeds last_draft_token on the next round,
+            # so draft_cache needs one fewer rewind. Do the same by not
+            # trimming.
             # After partial accept: draft already trimmed above to n_a
             # position. Now we advanced 1 more step during top-2 probe, and
             # possibly more during branch_b_tail. Trim accordingly.
@@ -336,7 +337,7 @@ def tree_speculative_generate_step(
                 # Linear fast path — keep all N draft advancements.
                 pass
             elif best_branch_used == "a_partial":
-                # Draft was trimmed к n_a + 1 (top-2 probe). Keep that.
+                # Draft was trimmed to n_a + 1 (top-2 probe). Keep that.
                 pass
             else:  # tree
                 # Draft advanced: n_a tokens (from branch_a up to rewind) +

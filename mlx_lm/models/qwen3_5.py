@@ -25,8 +25,8 @@ except Exception:
     _gd_fused_kernel = None
 
 # Mega-fused T=1 kernel: rms_norm(q/k) + inv_scale + compute_g + sigmoid
-# + gated_delta, все в одном dispatch. 1.24× per-call, ~4.5% end-to-end
-# theoretical savings.
+# + gated_delta, all in a single dispatch. 1.24× per-call, ~4.5%
+# end-to-end theoretical savings.
 try:
     from .gated_delta_t1 import gated_delta_kernel_t1 as _gd_t1_kernel
 except Exception:
@@ -45,7 +45,7 @@ except Exception:
 #   If > 0, DeltaNet state stored as factored (U, V) with rank r in the
 #   inference cache. Memory savings = (Dv·Dk) / (r·(Dv+Dk)), e.g. 4× at
 #   r=16 for Qwen3.5-9B shapes. Enables higher multi-session concurrency
-#   на Apple Silicon with unified memory.
+#   on Apple Silicon with unified memory.
 #
 # MLX_DELTANET_FACTORED_R (int):
 #   If > 0, use fixed-rank factored MSL kernel for T=1 generation steps
@@ -159,7 +159,7 @@ elif (
     # Prefer Metal-accelerated compressed VJP (8-11× faster backward
     # than pure-Python compressed, same compression behavior).
     # Fall back to Python compressed if Metal unavailable OR mask path
-    # requested (Metal compressed не supports mask yet).
+    # requested (Metal compressed does not support mask yet).
     _COMPRESS_METAL = _env("COMPRESS_METAL", "1") == "1"
     _metal_compressed_fn = None
     if _COMPRESS_METAL:
@@ -410,8 +410,8 @@ class GatedDeltaNet(nn.Module):
             bits = int(_INFER_QUANT) if _INFER_QUANT != "none" else 8
             state = _infer_maybe_expand(state, bits=bits)
 
-        # Decide inference path ДО rms_norm: mega-fused includes rms_norm
-        # inside kernel, others need it externally.
+        # Decide inference path BEFORE rms_norm: mega-fused includes rms_norm
+        # inside the kernel, others need it externally.
         T_dim = inputs.shape[1]
         use_factored = (
             _FACTORED_R > 0 and not self.training and T_dim == 1 and cache is not None
@@ -465,7 +465,7 @@ class GatedDeltaNet(nn.Module):
                 )
         elif use_mega_t1:
             # Mega-fused T=1 kernel: rms_norm + compute_g + sigmoid +
-            # gated_delta в single Metal dispatch. Takes raw q, k.
+            # gated_delta in a single Metal dispatch. Takes raw q, k.
             rf = self.num_v_heads // self.num_k_heads
             q_exp = mx.repeat(q, rf, axis=-2) if rf > 1 else q
             k_exp = mx.repeat(k, rf, axis=-2) if rf > 1 else k
