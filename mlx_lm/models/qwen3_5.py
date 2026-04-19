@@ -15,6 +15,170 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+# Fused compute_g + sigmoid(b) + gated_delta_kernel: saves 2 kernel
+# launches per DeltaNet layer per step. Used for T=1 inference only
+# (training uses VJP backends; prefill keeps original path).
+try:
+    from .gated_delta_fused import gated_delta_kernel_fused as _gd_fused_kernel
+except Exception:
+    _gd_fused_kernel = None
+
+# Mega-fused T=1 kernel: rms_norm(q/k) + inv_scale + compute_g + sigmoid
+# + gated_delta, все в одном dispatch. 1.24× per-call, ~4.5% end-to-end
+# theoretical savings.
+try:
+    from .gated_delta_t1 import gated_delta_kernel_t1 as _gd_t1_kernel
+except Exception:
+    _gd_t1_kernel = None
+
+# GatedDeltaNet training VJP backend selection (runtime, via env vars).
+#
+# MLX_DELTANET_VJP:
+#   "metal"    (default) — Metal kernel backward (fastest, lowest memory)
+#   "python"   — pure-Python chunked VJP (reference)
+#   "lowrank"  — power-iter rank-r state compression (research prototype)
+#   "compress" — compression-aware training: power-iter truncation at chunk
+#                boundaries
+#
+# MLX_DELTANET_INFER_RANK (int):
+#   If > 0, DeltaNet state stored as factored (U, V) with rank r in the
+#   inference cache. Memory savings = (Dv·Dk) / (r·(Dv+Dk)), e.g. 4× at
+#   r=16 for Qwen3.5-9B shapes. Enables higher multi-session concurrency
+#   на Apple Silicon with unified memory.
+#
+# MLX_DELTANET_FACTORED_R (int):
+#   If > 0, use fixed-rank factored MSL kernel for T=1 generation steps
+#   (round-robin slot replacement). R=8-16 gives 1.4-1.6× speedup per
+#   step in standalone benchmark; real end-to-end depends on kernel
+#   launch overhead.
+#
+# MLX_DELTANET_COMPRESS_RANK (int):
+#   0 (default) — no compression; use MLX_DELTANET_VJP backend as-is.
+#   N > 0       — enable compression at uniform rank N (e.g. 16, 8).
+#
+# MLX_DELTANET_COMPRESS_RANK_PER_LAYER (path to JSON):
+#   If set, overrides uniform rank with a per-layer dict
+#   {"0": 8, "1": 8, "4": 16, ...}  (layer_idx → rank).
+#   Generate with mlx_lm.compress.estimate_rank(probe_state=True).
+#   See DELTANET_COMPRESSION.md for the rank-choice background.
+import os as _os
+
+
+def _env(name: str, default: str = "") -> str:
+    """Look up env var under MLX_DELTANET_*."""
+    return _os.environ.get(f"MLX_DELTANET_{name}", default)
+
+
+_VJP_BACKEND = _env("VJP", "metal")
+_COMPRESS_RANK = int(_env("COMPRESS_RANK", "0"))
+_INFER_RANK = int(_env("INFER_RANK", "0"))
+# MLX_DELTANET_INFER_QUANT: int8 / int4 state cache quantization.
+# "none" | "8" | "4".  8-bit: 2× memory, minimal overhead.
+# 4-bit: 4× memory, slightly more overhead.
+_INFER_QUANT = _env("INFER_QUANT", "none")
+# MLX_DELTANET_FACTORED_R: use factored MSL kernel for T=1 generation.
+_FACTORED_R = int(_env("FACTORED_R", "0"))
+if _FACTORED_R > 0:
+    from .gated_delta_factored_fixed import factored_step_fixed as _factored_step_fixed
+    import math as _math
+    def _svd_factorize_dense(S: mx.array, rank: int):
+        """Factor dense state [B, Hv, Dv, Dk] to (U, V) via truncated SVD.
+        Batched SVD crashes in MLX 0.31 — loop over heads on CPU.
+        Called once after prefill (one-off, slowness OK)."""
+        B, Hv, Dv, Dk = S.shape
+        S32 = S.astype(mx.float32)
+        U_rows, V_rows = [], []
+        for b in range(B):
+            U_per_head, V_per_head = [], []
+            for h in range(Hv):
+                s_bh = S32[b, h]
+                U_full, sigma, Vt_full = mx.linalg.svd(s_bh, stream=mx.cpu)
+                U_per_head.append(U_full[:, :rank] * sigma[None, :rank])
+                V_per_head.append(Vt_full[:rank, :])
+            U_rows.append(mx.stack(U_per_head, axis=0))
+            V_rows.append(mx.stack(V_per_head, axis=0))
+        U_out = mx.stack(U_rows, axis=0).astype(S.dtype)
+        V_out = mx.stack(V_rows, axis=0).astype(S.dtype)
+        return U_out, V_out
+if _INFER_RANK > 0 or _INFER_QUANT != "none":
+    from .gated_delta_inference_compressed import (
+        factor_state as _infer_factor_state,
+        quantize_state as _infer_quantize_state,
+        maybe_expand as _infer_maybe_expand,
+    )
+
+if _VJP_BACKEND == "scan":
+    # Associative prefix-scan backend (see THEOREM_ASSOCIATIVITY.md).
+    # Reference/research path — autodiff-compatible (VJP via MLX autodiff
+    # through the scan loop). On single-device, slower than Metal; main
+    # value is as a correctness reference and a building block for
+    # multi-device Blelloch parallelism.
+    from .gated_delta_prefix_scan import gated_delta_update_prefix_scan
+
+    def gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, layer_idx=None):
+        return gated_delta_update_prefix_scan(q, k, v, a, b, A_log, dt_bias, state, mask)
+elif _VJP_BACKEND == "lowrank":
+    from .gated_delta_vjp_lowrank import gated_delta_update_vjp_lowrank
+    _LOWRANK_R = int(_env("VJP_RANK", "8"))
+    _LOWRANK_ITERS = int(_env("VJP_ITERS", "10"))
+
+    def gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, layer_idx=None):
+        return gated_delta_update_vjp_lowrank(
+            q, k, v, a, b, A_log, dt_bias, state, mask,
+            rank=_LOWRANK_R, method="power", power_iters=_LOWRANK_ITERS,
+        )
+elif _VJP_BACKEND == "compress" or _COMPRESS_RANK > 0 or _env("COMPRESS_RANK_PER_LAYER"):
+    import json as _json
+    # Prefer Metal-accelerated compressed VJP (8-11× faster backward
+    # than pure-Python compressed, same compression behavior).
+    # Fall back to Python compressed if Metal unavailable OR mask path
+    # requested (Metal compressed не supports mask yet).
+    _COMPRESS_METAL = _env("COMPRESS_METAL", "1") == "1"
+    _metal_compressed_fn = None
+    if _COMPRESS_METAL:
+        try:
+            from .gated_delta_vjp_metal_compressed import (
+                gated_delta_update_vjp_metal_compressed as _metal_compressed_fn,
+            )
+        except ImportError:
+            _metal_compressed_fn = None
+    from .gated_delta_vjp_compressed import gated_delta_update_vjp_compressed
+    _COMPRESS_R = _COMPRESS_RANK if _COMPRESS_RANK > 0 else int(_env("COMPRESS_RANK", "16"))
+    _COMPRESS_ITERS = int(_env("COMPRESS_ITERS", "6"))
+
+    _per_layer_path = _env("COMPRESS_RANK_PER_LAYER", "")
+    _PER_LAYER_RANKS: dict = {}
+    if _per_layer_path:
+        try:
+            _PER_LAYER_RANKS = {int(k): int(v) for k, v in _json.load(open(_per_layer_path)).items()}
+            print(f"[mlx_lm.deltanet] Loaded per-layer compression ranks for "
+                  f"{len(_PER_LAYER_RANKS)} layers from {_per_layer_path} "
+                  f"(backend: {'Metal' if _metal_compressed_fn else 'Python'} compressed)")
+        except Exception as e:
+            print(f"[mlx_lm.deltanet] WARNING: failed to load {_per_layer_path}: {e}")
+            _PER_LAYER_RANKS = {}
+
+    def gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, layer_idx=None):
+        rank = _PER_LAYER_RANKS.get(layer_idx, _COMPRESS_R) if _PER_LAYER_RANKS else _COMPRESS_R
+        # Metal path when available and no mask; else Python fallback.
+        if _metal_compressed_fn is not None and mask is None:
+            return _metal_compressed_fn(
+                q, k, v, a, b, A_log, dt_bias, state, mask,
+                rank=rank, power_iters=_COMPRESS_ITERS,
+            )
+        return gated_delta_update_vjp_compressed(
+            q, k, v, a, b, A_log, dt_bias, state, mask,
+            rank=rank, power_iters=_COMPRESS_ITERS,
+        )
+else:
+    try:
+        from .gated_delta_vjp_metal import gated_delta_update_vjp_metal as _gated_delta_update_vjp_core
+    except ImportError:
+        from .gated_delta_vjp import gated_delta_update_vjp as _gated_delta_update_vjp_core
+
+    def gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, layer_idx=None):
+        # Metal backend does not use layer_idx; keep signature uniform.
+        return _gated_delta_update_vjp_core(q, k, v, a, b, A_log, dt_bias, state, mask)
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -84,8 +248,12 @@ class TextModelArgs(BaseModelArgs):
 
 
 class GatedDeltaNet(nn.Module):
-    def __init__(self, config: TextModelArgs):
+    def __init__(self, config: TextModelArgs, layer_idx: int = -1):
         super().__init__()
+        # layer_idx is used by the compression-aware VJP to pick a per-layer
+        # rank from MLX_DELTANET_COMPRESS_RANK_PER_LAYER dict (see
+        # DELTANET_COMPRESSION.md for the rank-choice background).
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -157,13 +325,7 @@ class GatedDeltaNet(nn.Module):
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -176,26 +338,165 @@ class GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # Factored or quantized state inference: expand if needed.
+        if (_INFER_RANK > 0 or _INFER_QUANT != "none") and state is not None:
+            bits = int(_INFER_QUANT) if _INFER_QUANT != "none" else 8
+            state = _infer_maybe_expand(state, bits=bits)
 
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
+        # Decide inference path ДО rms_norm: mega-fused includes rms_norm
+        # inside kernel, others need it externally.
+        T_dim = inputs.shape[1]
+        use_factored = (
+            _FACTORED_R > 0 and not self.training and T_dim == 1
+            and cache is not None
+        )
+        use_mega_t1 = (
+            _gd_t1_kernel is not None
+            and not self.training
+            and T_dim == 1
+            and mask is None
+            and not use_factored
+            and _INFER_RANK == 0
+            and _INFER_QUANT == "none"
         )
 
+        inv_scale = k.shape[-1] ** -0.5
+        if not use_mega_t1:
+            q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+            k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # Fused compute_g + gated_delta path (fallback, handles T>1).
+        use_fused = (
+            not use_mega_t1
+            and _gd_fused_kernel is not None
+            and not self.training
+            and T_dim == 1
+            and mask is None
+            and not use_factored
+            and _INFER_RANK == 0
+            and _INFER_QUANT == "none"
+        )
+
+        if self.training and mask is None:
+            # Memory-efficient VJP path: the recurrence is chunked and
+            # gradient-checkpointed, so backward flows through every layer
+            # without the O(T) graph footprint of the ops-based fallback.
+            try:
+                out, state = gated_delta_update_vjp(
+                    q, k, v, a, b, self.A_log, self.dt_bias, state,
+                    layer_idx=self.layer_idx,
+                )
+            except TypeError:
+                # Older VJP backends do not accept layer_idx.
+                out, state = gated_delta_update_vjp(
+                    q, k, v, a, b, self.A_log, self.dt_bias, state
+                )
+        elif use_mega_t1:
+            # Mega-fused T=1 kernel: rms_norm + compute_g + sigmoid +
+            # gated_delta в single Metal dispatch. Takes raw q, k.
+            rf = self.num_v_heads // self.num_k_heads
+            q_exp = mx.repeat(q, rf, axis=-2) if rf > 1 else q
+            k_exp = mx.repeat(k, rf, axis=-2) if rf > 1 else k
+            if state is None:
+                state = mx.zeros(
+                    (inputs.shape[0], self.num_v_heads,
+                     self.head_v_dim, self.head_k_dim),
+                    dtype=inputs.dtype,
+                )
+            out, state = _gd_t1_kernel(
+                q_exp, k_exp, v, a, b, self.A_log, self.dt_bias, state
+            )
+            if cache is not None:
+                cache[1] = state
+        elif use_fused:
+            # Fused kernel path: compute_g + sigmoid(b) + gated_delta in
+            # single Metal dispatch. Expand q, k for GQA first.
+            rf = self.num_v_heads // self.num_k_heads
+            q_exp = mx.repeat(q, rf, axis=-2) if rf > 1 else q
+            k_exp = mx.repeat(k, rf, axis=-2) if rf > 1 else k
+            if state is None:
+                state = mx.zeros(
+                    (inputs.shape[0], self.num_v_heads,
+                     self.head_v_dim, self.head_k_dim),
+                    dtype=inputs.dtype,
+                )
+            out, state = _gd_fused_kernel(
+                q_exp, k_exp, v, a, b, self.A_log, self.dt_bias, state
+            )
+            if cache is not None:
+                cache[1] = state
+        elif use_factored:
+            # Factored fast path: need current (U, V, slot_idx) in cache.
+            factored = cache[1] if isinstance(cache[1], (tuple, list)) and len(cache[1]) == 3 and not isinstance(cache[1], mx.array) else None
+            import mlx.nn as _nn
+            beta_val = mx.sigmoid(b)  # [B, 1, Hv]
+            # g = exp(-exp(A_log) · softplus(a + dt_bias))
+            g_arg = -mx.exp(self.A_log.astype(mx.float32)) * _nn.softplus(a + self.dt_bias)
+            g_arg = mx.maximum(g_arg, -20.0)
+            g_val = mx.exp(g_arg).astype(a.dtype)
+            # Expand q, k from Hk heads to Hv if needed.
+            rf = self.num_v_heads // self.num_k_heads
+            q_exp = mx.repeat(q, rf, axis=-2) if rf > 1 else q
+            k_exp = mx.repeat(k, rf, axis=-2) if rf > 1 else k
+            if factored is None:
+                # First generate step: initialize ZERO factored state.
+                # This discards prefill DeltaNet state contribution, which
+                # is acceptable approximation — prefill state is heavily
+                # decayed in steady-state anyway. First R generate steps
+                # populate factored state, then round-robin replaces.
+                B_ = inputs.shape[0]
+                U_curr = mx.zeros(
+                    (B_, self.num_v_heads, self.head_v_dim, _FACTORED_R),
+                    dtype=inputs.dtype,
+                )
+                V_curr = mx.zeros(
+                    (B_, self.num_v_heads, _FACTORED_R, self.head_k_dim),
+                    dtype=inputs.dtype,
+                )
+                slot_idx = 0
+            else:
+                U_curr, V_curr, slot_idx = factored
+            # Single-token factored step.
+            y_flat, U_new, V_new = _factored_step_fixed(
+                U_curr, V_curr,
+                q_exp[:, 0], k_exp[:, 0], v[:, 0],
+                g_val[:, 0], beta_val[:, 0],
+                slot_idx=int(slot_idx) % _FACTORED_R,
+            )
+            out = y_flat[:, None, :, :]  # [B, 1, Hv, Dv]
+            # Store factored state in cache (no dense reconstruction needed).
+            cache[1] = (U_new, V_new, (int(slot_idx) + 1) % _FACTORED_R)
+            # Skip the "cache[1] = state" branch below.
+            # out = ... norm/out_proj below.
+            if self.sharding_group is not None:
+                out = mx.distributed.all_sum(out, group=self.sharding_group)
+            out = self.norm(out, z)
+            out = self.out_proj(out.reshape(B, S, -1))
+            return out
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+
         if cache is not None:
-            cache[1] = state
-            cache.advance(S)
+            if _INFER_RANK > 0 and not self.training:
+                # Factored storage: save state as (U, V) to shrink cache.
+                U, V = _infer_factor_state(state, rank=_INFER_RANK)
+                cache[1] = (U, V)
+            elif _INFER_QUANT != "none" and not self.training:
+                # Quantized storage: save state as (w, scales, biases).
+                bits = int(_INFER_QUANT)
+                cache[1] = _infer_quantize_state(state, group_size=64, bits=bits)
+            else:
+                cache[1] = state
 
         out = self.norm(out, z)
         out = self.out_proj(out.reshape(B, S, -1))
@@ -211,7 +512,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
         if self.is_linear:
-            self.linear_attn = GatedDeltaNet(args)
+            self.linear_attn = GatedDeltaNet(args, layer_idx=layer_idx)
         else:
             self.self_attn = Attention(args)
 
