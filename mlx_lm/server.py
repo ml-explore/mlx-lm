@@ -10,7 +10,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -225,6 +225,22 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+
+
+def _process_control_tokens(ctx, token_stream):
+    buffer_size = max(len(s) for s in ctx.sequences)
+    buffered_stream = deque()
+
+    for tok in token_stream:
+        buffered_stream.append(tok)
+        if tok.match is not None:
+            popped = [buffered_stream.pop() for _ in tok.match]
+            for t in reversed(popped):
+                buffered_stream.append(replace(t, text=""))
+        if len(buffered_stream) >= buffer_size:
+            yield buffered_stream.popleft()
+    while len(buffered_stream) > 0:
+        yield buffered_stream.popleft()
 
 
 class TimeBudget:
@@ -1017,20 +1033,6 @@ class ResponseGenerator:
                         progress_callback(*response)
                     continue
                 yield response
-
-        def _process_control_tokens(ctx, token_stream):
-            buffer_size = max(len(s) for s in ctx.sequences)
-            buffered_stream = deque()
-
-            for tok in token_stream:
-                buffered_stream.append(tok)
-                if tok.match is not None:
-                    for _ in tok.match:
-                        buffered_stream.pop()
-                if len(buffered_stream) >= buffer_size:
-                    yield buffered_stream.popleft()
-            while len(buffered_stream) > 0:
-                yield buffered_stream.popleft()
 
         ctx = response_queue.get()
         if isinstance(ctx, Exception):
