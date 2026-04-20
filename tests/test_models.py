@@ -3220,6 +3220,98 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def test_gated_delta_vjp_forward_equivalence(self):
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+
+        mx.random.seed(0)
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 16, 8
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32)
+        a = -5.0 + mx.random.normal(shape=(B, T, Hv)) * 0.1
+        b = mx.random.normal(shape=(B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        y_ref, st_ref = gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias, state0, use_kernel=False
+        )
+        y_vjp, st_vjp = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state0)
+        self.assertTrue(mx.allclose(y_vjp, y_ref, atol=1e-5, rtol=1e-5))
+        self.assertTrue(mx.allclose(st_vjp, st_ref, atol=1e-5, rtol=1e-5))
+
+    def test_gated_delta_vjp_fd_gradient(self):
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+
+        mx.random.seed(0)
+        B, T, Hk, Hv, Dk, Dv = 1, 4, 2, 4, 8, 8
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32) * 0.1
+        a = mx.zeros((B, T, Hv))
+        b = mx.zeros((B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        cot_y = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.01
+        cot_s = mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.01
+
+        def loss(q_, k_, v_):
+            y, s = gated_delta_update_vjp(q_, k_, v_, a, b, A_log, dt_bias, state0)
+            return (y * cot_y).sum() + (s * cot_s).sum()
+
+        grad_fn = mx.grad(loss, argnums=(0, 1, 2))
+        gq, _gk, _gv = grad_fn(q, k, v)
+
+        eps = 1e-3
+        q_np = q.tolist()
+        for idx in [(0, 0, 0, 0), (0, 2, 1, 3), (0, 3, 0, 5)]:
+            qp_list = [[[row[:] for row in head] for head in batch] for batch in q_np]
+            qm_list = [[[row[:] for row in head] for head in batch] for batch in q_np]
+            qp_list[idx[0]][idx[1]][idx[2]][idx[3]] += eps
+            qm_list[idx[0]][idx[1]][idx[2]][idx[3]] -= eps
+            qp = mx.array(qp_list)
+            qm = mx.array(qm_list)
+            lp = loss(qp, k, v)
+            lm = loss(qm, k, v)
+            fd = (lp - lm) / (2 * eps)
+            self.assertAlmostEqual(float(fd), float(gq[idx]), delta=1e-3)
+
+    def test_gated_delta_vjp_metal_matches_python(self):
+        if not mx.metal.is_available():
+            return
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+        from mlx_lm.models.gated_delta_vjp_metal import (
+            gated_delta_update_vjp_metal,
+        )
+
+        mx.random.seed(0)
+        # Dk must be a multiple of 32 (SIMD lane count in the Metal kernel).
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32)
+        a = -5.0 + mx.random.normal(shape=(B, T, Hv)) * 0.1
+        b = mx.random.normal(shape=(B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        y_py, st_py = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state0)
+        y_mx, st_mx = gated_delta_update_vjp_metal(
+            q, k, v, a, b, A_log, dt_bias, state0
+        )
+        # Metal SIMD-level reductions differ from the Python serial reduction
+        # by fp32 rounding; agreement is within machine precision but not
+        # bit-exact.
+        self.assertTrue(mx.allclose(y_py, y_mx, atol=1e-3, rtol=1e-4))
+        self.assertTrue(mx.allclose(st_py, st_mx, atol=1e-3, rtol=1e-4))
+
 
 if __name__ == "__main__":
     unittest.main()

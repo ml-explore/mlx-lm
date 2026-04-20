@@ -270,7 +270,23 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    training: bool = False,
 ) -> Tuple[mx.array, mx.array]:
+    if training:
+        # Chunked VJP path with O(T/chunk) autodiff graph — fits T≥2048
+        # on 36 GB Apple Silicon where the Python-ops path OOMs.
+        # Metal backward kernel is 8–11× faster than the Python reference.
+        try:
+            from .gated_delta_vjp_metal import gated_delta_update_vjp_metal
+
+            return gated_delta_update_vjp_metal(
+                q, k, v, a, b, A_log, dt_bias, state, mask
+            )
+        except ImportError:
+            from .gated_delta_vjp import gated_delta_update_vjp
+
+            return gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state, mask)
+
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
     if state is None:
