@@ -223,7 +223,7 @@ def setup_arg_parser():
 
 
 # A stream on the default device just for generation
-generation_stream = mx.ThreadLocalStream(mx.default_device())
+generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 @contextlib.contextmanager
