@@ -4,13 +4,20 @@ import http
 import io
 import json
 import threading
+import types
 import unittest
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+    _process_control_tokens,
+)
 from mlx_lm.utils import load
 
 
@@ -80,6 +87,71 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class TestProcessControlTokens(unittest.TestCase):
+    @staticmethod
+    def _r(text, state, match=None):
+        return Response(text, 0, state, match, 0.0, None, ())
+
+    def test_single_tool_call_passes_body_with_open_and_close_crossings(self):
+        r = self._r
+        stream = [
+            r("hi ", "normal"),
+            r("<tool_call>", "tool", match=(0,)),
+            r("body", "tool"),
+            r("</tool_call>", "normal", match=(1,)),
+            r(" bye", "normal"),
+        ]
+        ctx = types.SimpleNamespace(
+            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
+        )
+        out = list(_process_control_tokens(ctx, iter(stream)))
+
+        self.assertEqual("".join(t.text for t in out), "hi body bye")
+        states = [t.state for t in out]
+        self.assertEqual(sum(1 for a, b in zip(states, states[1:]) if a != b), 2)
+
+    def test_back_to_back_tool_calls_emit_state_crossings(self):
+        r = self._r
+        stream = [
+            r("<tool_call>", "tool", match=(0,)),
+            r("call1_body", "tool"),
+            r("</tool_call>", "normal", match=(1,)),
+            r("<tool_call>", "tool", match=(0,)),
+            r("call2_body", "tool"),
+            r("</tool_call>", "normal", match=(1,)),
+        ]
+        ctx = types.SimpleNamespace(
+            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
+        )
+        out = list(_process_control_tokens(ctx, iter(stream)))
+
+        self.assertEqual("".join(t.text for t in out), "call1_bodycall2_body")
+        states = [t.state for t in out]
+        crossings = sum(
+            1 for a, b in zip(states, states[1:]) if a == "tool" and b == "normal"
+        )
+        self.assertEqual(crossings, 2)
+
+    def test_multi_token_match_preserves_order(self):
+        r = self._r
+        match = (10, 11, 12)
+        stream = [
+            r("body", "tool"),
+            r("</", "tool"),
+            r("tool", "tool"),
+            r("_call>", "normal", match=match),
+            r(" ok", "normal"),
+        ]
+        ctx = types.SimpleNamespace(sequences={match: "</tool_call>"})
+        out = list(_process_control_tokens(ctx, iter(stream)))
+
+        self.assertEqual([t.text for t in out], ["body", "", "", "", " ok"])
+        self.assertEqual(
+            [t.state for t in out],
+            ["tool", "tool", "tool", "normal", "normal"],
+        )
 
 
 class TestServer(unittest.TestCase):
