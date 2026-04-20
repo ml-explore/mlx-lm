@@ -713,7 +713,7 @@ class ResponseGenerator:
                         current_model_key, prompt
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
-                    if cache is None:
+                    if cache is None or not cache:
                         cache = make_prompt_cache(self.model_provider.model)
                     elif self._kv_quant_config is not None:
                         # Dequantize for batch merge compatibility

@@ -146,7 +146,11 @@ class DiskBackedPromptCache(LRUPromptCache):
                         "tokens": meta["tokens"],
                     }
                 except Exception:
-                    pass
+                    shutil.rmtree(entry_dir, ignore_errors=True)
+            elif entry_dir.is_dir():
+                # Old format or incomplete entry — clean up
+                shutil.rmtree(entry_dir, ignore_errors=True)
+                logger.info(f"Removed incompatible cache entry: {entry_dir.name}")
         logger.info(f"Disk cache index: {len(self._disk_index)} entries")
 
     def insert_cache(
