@@ -3,10 +3,12 @@
 import copy
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from .base import create_causal_mask
@@ -322,6 +324,387 @@ class QuantizedKVCache(_BaseCache):
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
+# -----------------------------------------------------------------------------
+# TurboQuant (PolarQuant) KV cache
+#
+# Data-oblivious KV cache compression based on PolarQuant (Google, ICLR 2026:
+# arxiv 2504.19874). For each K/V vector:
+#
+#   1. Store its L2 norm, normalize to the unit sphere.
+#   2. Apply a fixed random orthogonal rotation (Haar-distributed, generated
+#      via QR of a Gaussian matrix — one per head_dim, cached).
+#   3. After rotation, each coordinate is approximately distributed N(0, 1/dim),
+#      so a single Lloyd-Max optimal scalar quantizer (precomputed for N(0,1)
+#      and rescaled by 1/sqrt(dim)) achieves near information-theoretic-optimal
+#      distortion with no calibration data.
+#   4. Indices are bit-packed into uint32 for real memory savings.
+#
+# Dequantize-on-fetch: indices are unpacked, centroids are looked up, and the
+# inverse rotation is applied before the result is returned to standard SDPA —
+# no model-specific or attention-kernel changes are required.
+# -----------------------------------------------------------------------------
+
+# Lloyd-Max centroids and decision boundaries for N(0, 1), precomputed via
+# iterative k-means on 10M Gaussian samples. Scaled at runtime by 1/sqrt(dim)
+# to match the ~N(0, 1/dim) distribution of rotated unit-vector coordinates.
+# Outer boundaries at +/-5.0 are sentinels; values beyond are clipped to the
+# extreme centroid.
+_TURBOQUANT_CODEBOOKS = {
+    2: {
+        "centroids": (-1.5104048, -0.45277697, 0.45277697, 1.5104048),
+        "boundaries": (-5.0, -0.98159087, 0.0, 0.98159087, 5.0),
+    },
+    3: {
+        "centroids": (
+            -2.1518872,
+            -1.3438829,
+            -0.75599235,
+            -0.24509022,
+            0.24509022,
+            0.75599235,
+            1.3438829,
+            2.1518872,
+        ),
+        "boundaries": (
+            -5.0,
+            -1.747885,
+            -1.0499376,
+            -0.50054127,
+            0.0,
+            0.50054127,
+            1.0499376,
+            1.747885,
+            5.0,
+        ),
+    },
+    4: {
+        "centroids": (
+            -2.7331262,
+            -2.0697927,
+            -1.6188906,
+            -1.2570497,
+            -0.94305915,
+            -0.6573181,
+            -0.38840252,
+            -0.1285163,
+            0.1285163,
+            0.38840252,
+            0.6573181,
+            0.94305915,
+            1.2570497,
+            1.6188906,
+            2.0697927,
+            2.7331262,
+        ),
+        "boundaries": (
+            -5.0,
+            -2.4014595,
+            -1.8443416,
+            -1.4379702,
+            -1.1000544,
+            -0.80018866,
+            -0.52286035,
+            -0.25845942,
+            0.0,
+            0.25845942,
+            0.52286035,
+            0.80018866,
+            1.1000544,
+            1.4379702,
+            1.8443416,
+            2.4014595,
+            5.0,
+        ),
+    },
+}
+
+
+@lru_cache(maxsize=32)
+def _turboquant_codebook(bits: int, dim: int):
+    """Return (centroids, inner_boundaries) mx.arrays scaled for this dim.
+
+    Inner boundaries exclude the +/-5.0 sentinels — they're the `n_levels - 1`
+    thresholds used for digitization.
+    """
+    if bits not in _TURBOQUANT_CODEBOOKS:
+        raise ValueError(f"TurboQuantKVCache supports bits in {{2, 3, 4}}, got {bits}.")
+    cb = _TURBOQUANT_CODEBOOKS[bits]
+    scale = 1.0 / np.sqrt(dim)
+    centroids = mx.array(np.asarray(cb["centroids"], dtype=np.float32) * scale)
+    inner = mx.array(np.asarray(cb["boundaries"][1:-1], dtype=np.float32) * scale)
+    return centroids, inner
+
+
+@lru_cache(maxsize=16)
+def _turboquant_rotation(dim: int, seed: int):
+    """Fixed Haar-distributed orthogonal matrix (cached per (dim, seed))."""
+    rng = np.random.RandomState(seed)
+    g = rng.randn(dim, dim).astype(np.float32)
+    q, r = np.linalg.qr(g)
+    # Sign-fix for determinism across NumPy versions.
+    q = q * np.sign(np.diag(r))[np.newaxis, :]
+    return mx.array(q)
+
+
+def _turboquant_pack(indices: mx.array, bits: int) -> mx.array:
+    """Pack low-bit uint8 indices into uint32 along the last axis."""
+    shape = indices.shape
+    dim = shape[-1]
+    vals_per_int = 32 // bits
+    n_packed = (dim + vals_per_int - 1) // vals_per_int
+    pad = n_packed * vals_per_int - dim
+    if pad > 0:
+        indices = mx.concatenate(
+            [indices, mx.zeros((*shape[:-1], pad), dtype=indices.dtype)], axis=-1
+        )
+    reshaped = indices.reshape(*shape[:-1], n_packed, vals_per_int).astype(mx.uint32)
+    shifts = mx.arange(vals_per_int).astype(mx.uint32) * bits
+    packed = reshaped << shifts
+    out = packed[..., 0]
+    for i in range(1, vals_per_int):
+        out = out | packed[..., i]
+    return out
+
+
+def _turboquant_unpack(packed: mx.array, bits: int, dim: int) -> mx.array:
+    """Unpack uint32 back into uint8 indices (dim values along last axis)."""
+    vals_per_int = 32 // bits
+    mask = mx.array((1 << bits) - 1, dtype=mx.uint32)
+    shifts = mx.arange(vals_per_int).astype(mx.uint32) * bits
+    extracted = (mx.expand_dims(packed, axis=-1) >> shifts) & mask
+    full = extracted.reshape(*packed.shape[:-1], packed.shape[-1] * vals_per_int)
+    return full[..., :dim].astype(mx.uint8)
+
+
+class TurboQuantKVCache(_BaseCache):
+    """PolarQuant KV cache — data-oblivious, 2-4 bit compression.
+
+    Drop-in replacement for ``KVCache``. No calibration data, no model-specific
+    changes — compression happens at the cache boundary and dequantized
+    tensors are returned for standard SDPA.
+
+    Args:
+        bits: Bits per coordinate. Must be 2, 3, or 4.
+        k_head_dim: Key head dimension (required — rotation/codebooks are
+            dim-specific).
+        v_head_dim: Value head dimension. Defaults to ``k_head_dim``.
+        key_seed: RNG seed for the key rotation matrix.
+        value_seed: RNG seed for the value rotation matrix.
+
+    Memory at full capacity ≈ ``bits * (k_head_dim + v_head_dim) / 8`` bytes
+    per token per head, plus one fp16/fp32 norm per vector — roughly 4x
+    smaller than fp16 at 4 bits.
+    """
+
+    step = 256
+
+    def __init__(
+        self,
+        bits: int = 4,
+        k_head_dim: int = 128,
+        v_head_dim: Optional[int] = None,
+        key_seed: int = 42,
+        value_seed: int = 43,
+    ):
+        if bits not in (2, 3, 4):
+            raise ValueError(
+                f"TurboQuantKVCache supports bits in {{2, 3, 4}}, got {bits}."
+            )
+        self.bits = bits
+        self.k_head_dim = k_head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else k_head_dim
+        self.key_seed = key_seed
+        self.value_seed = value_seed
+        self.offset = 0
+
+        self._k_rot = _turboquant_rotation(self.k_head_dim, key_seed)
+        self._k_rot_t = self._k_rot.T
+        self._v_rot = _turboquant_rotation(self.v_head_dim, value_seed)
+        self._v_rot_t = self._v_rot.T
+        self._k_centroids, self._k_inner = _turboquant_codebook(bits, self.k_head_dim)
+        self._v_centroids, self._v_inner = _turboquant_codebook(bits, self.v_head_dim)
+
+        # Compressed storage, allocated lazily on first update.
+        self._k_indices = None
+        self._k_norms = None
+        self._v_indices = None
+        self._v_norms = None
+        self._capacity = 0
+
+    # ------------------------------------------------------------------ core
+    def _quantize(self, x, rot_t, inner_bounds):
+        """Compress ``x`` (..., dim) -> (indices uint8, norms (..., 1))."""
+        norms = mx.linalg.norm(x, axis=-1, keepdims=True)
+        unit = x / mx.maximum(norms, 1e-8)
+        rotated = unit @ rot_t
+        # Digitize: count how many inner boundaries each coord exceeds.
+        indices = mx.zeros(rotated.shape, dtype=mx.uint8)
+        for i in range(inner_bounds.shape[0]):
+            indices = indices + (rotated > inner_bounds[i]).astype(mx.uint8)
+        return indices, norms
+
+    def _dequantize(self, indices, norms, centroids, rot):
+        return (centroids[indices] @ rot) * norms
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        B, n_kv_heads, S, D_k = keys.shape
+        D_v = values.shape[-1]
+        prev = self.offset
+
+        # Grow storage to fit new tokens.
+        if self._k_indices is None or (prev + S) > self._capacity:
+            alloc = ((self.step + S - 1) // self.step) * self.step
+            new_cap = (self._capacity if self._k_indices is not None else 0) + alloc
+            vals_per_int = 32 // self.bits
+            k_packed = (D_k + vals_per_int - 1) // vals_per_int
+            v_packed = (D_v + vals_per_int - 1) // vals_per_int
+            shape = (B, n_kv_heads, new_cap)
+            if self._k_indices is None:
+                self._k_indices = mx.zeros((*shape, k_packed), dtype=mx.uint32)
+                self._v_indices = mx.zeros((*shape, v_packed), dtype=mx.uint32)
+                self._k_norms = mx.zeros((*shape, 1), dtype=keys.dtype)
+                self._v_norms = mx.zeros((*shape, 1), dtype=values.dtype)
+            else:
+                grow = new_cap - self._capacity
+                grow_shape = (B, n_kv_heads, grow)
+                self._k_indices = mx.concatenate(
+                    [
+                        self._k_indices[..., :prev, :],
+                        mx.zeros((*grow_shape, k_packed), dtype=mx.uint32),
+                    ],
+                    axis=2,
+                )
+                self._v_indices = mx.concatenate(
+                    [
+                        self._v_indices[..., :prev, :],
+                        mx.zeros((*grow_shape, v_packed), dtype=mx.uint32),
+                    ],
+                    axis=2,
+                )
+                self._k_norms = mx.concatenate(
+                    [
+                        self._k_norms[..., :prev, :],
+                        mx.zeros((*grow_shape, 1), dtype=keys.dtype),
+                    ],
+                    axis=2,
+                )
+                self._v_norms = mx.concatenate(
+                    [
+                        self._v_norms[..., :prev, :],
+                        mx.zeros((*grow_shape, 1), dtype=values.dtype),
+                    ],
+                    axis=2,
+                )
+            self._capacity = new_cap
+
+        # Compress and store.
+        k_idx, k_norms = self._quantize(keys, self._k_rot_t, self._k_inner)
+        v_idx, v_norms = self._quantize(values, self._v_rot_t, self._v_inner)
+        self._k_indices[..., prev : prev + S, :] = _turboquant_pack(k_idx, self.bits)
+        self._v_indices[..., prev : prev + S, :] = _turboquant_pack(v_idx, self.bits)
+        self._k_norms[..., prev : prev + S, :] = k_norms
+        self._v_norms[..., prev : prev + S, :] = v_norms
+        self.offset += S
+
+        # Fetch: unpack + dequantize the populated range.
+        k_unpacked = _turboquant_unpack(
+            self._k_indices[..., : self.offset, :], self.bits, self.k_head_dim
+        )
+        v_unpacked = _turboquant_unpack(
+            self._v_indices[..., : self.offset, :], self.bits, self.v_head_dim
+        )
+        deq_k = self._dequantize(
+            k_unpacked,
+            self._k_norms[..., : self.offset, :],
+            self._k_centroids,
+            self._k_rot,
+        )
+        deq_v = self._dequantize(
+            v_unpacked,
+            self._v_norms[..., : self.offset, :],
+            self._v_centroids,
+            self._v_rot,
+        )
+        return deq_k, deq_v
+
+    # -------------------------------------------------------------- interface
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def empty(self):
+        return self._k_indices is None
+
+    @property
+    def state(self):
+        if self._k_indices is None:
+            return []
+        return [
+            self._k_indices[..., : self.offset, :],
+            self._k_norms[..., : self.offset, :],
+            self._v_indices[..., : self.offset, :],
+            self._v_norms[..., : self.offset, :],
+        ]
+
+    @state.setter
+    def state(self, v):
+        if v is not None and v:
+            self._k_indices, self._k_norms, self._v_indices, self._v_norms = v
+            self.offset = self._k_indices.shape[2]
+            self._capacity = self.offset
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.offset,
+                    self.bits,
+                    self.k_head_dim,
+                    self.v_head_dim,
+                    self.key_seed,
+                    self.value_seed,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        offset, bits, k_head_dim, v_head_dim, key_seed, value_seed = map(int, v)
+        self.offset = offset
+        self.bits = bits
+        self.k_head_dim = k_head_dim
+        self.v_head_dim = v_head_dim
+        self.key_seed = key_seed
+        self.value_seed = value_seed
+        # Rebuild dim-specific lookup tables.
+        self._k_rot = _turboquant_rotation(k_head_dim, key_seed)
+        self._k_rot_t = self._k_rot.T
+        self._v_rot = _turboquant_rotation(v_head_dim, value_seed)
+        self._v_rot_t = self._v_rot.T
+        self._k_centroids, self._k_inner = _turboquant_codebook(bits, k_head_dim)
+        self._v_centroids, self._v_inner = _turboquant_codebook(bits, v_head_dim)
+
+    @property
+    def nbytes(self):
+        if self._k_indices is None:
+            return 0
+        return (
+            self._k_indices[..., : self.offset, :].nbytes
+            + self._v_indices[..., : self.offset, :].nbytes
+            + self._k_norms[..., : self.offset, :].nbytes
+            + self._v_norms[..., : self.offset, :].nbytes
+        )
+
+
 class KVCache(_BaseCache):
     step = 256
 
@@ -389,6 +772,24 @@ class KVCache(_BaseCache):
                 self.values, group_size=group_size, bits=bits
             )
         return quant_cache
+
+    def to_turboquant(self, bits: int = 4) -> "TurboQuantKVCache":
+        """Convert an in-flight KVCache to a TurboQuantKVCache.
+
+        Compresses the current populated range through TurboQuant and
+        returns a new cache ready for continued generation at reduced
+        memory footprint.
+        """
+        if self.keys is None:
+            return TurboQuantKVCache(bits=bits)
+        k_head_dim = self.keys.shape[-1]
+        v_head_dim = self.values.shape[-1]
+        tq = TurboQuantKVCache(bits=bits, k_head_dim=k_head_dim, v_head_dim=v_head_dim)
+        tq.update_and_fetch(
+            self.keys[..., : self.offset, :],
+            self.values[..., : self.offset, :],
+        )
+        return tq
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
