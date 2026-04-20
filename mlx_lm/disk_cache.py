@@ -43,7 +43,12 @@ def _cache_key_hash(model: Any, tokens: List[int]) -> str:
 
 def _save_to_disk(cache_dir: Path, model: Any, tokens: List[int],
                    prompt_cache: List[Any], cache_type: str = "assistant"):
-    """Save a prompt cache entry to disk atomically."""
+    """Save a prompt cache entry to disk atomically.
+
+    Handles empty arrays (from uninitialized MoE sub-caches) by saving
+    them separately in empty.json, since safetensors cannot serialize
+    size-0 arrays.
+    """
     if cache_dir is None:
         return
     h = _cache_key_hash(model, tokens)
@@ -55,7 +60,6 @@ def _save_to_disk(cache_dir: Path, model: Any, tokens: List[int],
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Save token metadata
         meta = {
             "model": str(model),
             "tokens": tokens,
@@ -64,10 +68,47 @@ def _save_to_disk(cache_dir: Path, model: Any, tokens: List[int],
         with open(tmp_dir / "meta.json", "w") as f:
             json.dump(meta, f)
 
-        # Save cache data using mlx-lm's own serialization
-        save_prompt_cache(str(tmp_dir / "cache.safetensors"), prompt_cache)
+        # Collect cache state via mlx-lm's tree_flatten
+        from mlx.utils import tree_flatten
+        cache_data = [c.state for c in prompt_cache]
+        cache_info = [c.meta_state for c in prompt_cache]
+        cache_data_flat = dict(tree_flatten(cache_data))
+        cache_classes = [type(c).__name__ for c in prompt_cache]
 
-        # Atomic swap
+        # Extract empty arrays (safetensors can't serialize size=0)
+        empty_arrays = {}
+        for k, v in list(cache_data_flat.items()):
+            if v.size == 0:
+                empty_arrays[k] = {
+                    "shape": [int(s) for s in v.shape],
+                    "dtype": str(v.dtype).split(".")[-1],
+                }
+                del cache_data_flat[k]
+
+        # Skip saving if no actual data (all empty or uninitialized)
+        if not cache_data_flat and not empty_arrays:
+            logger.warning(
+                f"Skipping disk save: cache has no data "
+                f"({len(prompt_cache)} layers, "
+                f"{len(cache_classes)} classes: {set(cache_classes)})"
+            )
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+
+        if empty_arrays:
+            with open(tmp_dir / "empty.json", "w") as f:
+                json.dump(empty_arrays, f)
+
+        # Save via safetensors (now free of empty arrays)
+        cache_metadata = [cache_info, {}, cache_classes]
+        cache_metadata_flat = dict(tree_flatten(cache_metadata))
+        import mlx.core as mx
+        mx.save_safetensors(
+            str(tmp_dir / "cache.safetensors"),
+            cache_data_flat,
+            cache_metadata_flat,
+        )
+
         if entry_dir.exists():
             shutil.rmtree(entry_dir, ignore_errors=True)
         os.rename(str(tmp_dir), str(entry_dir))
@@ -77,7 +118,11 @@ def _save_to_disk(cache_dir: Path, model: Any, tokens: List[int],
 
 
 def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
-    """Load a prompt cache entry from disk."""
+    """Load a prompt cache entry from disk.
+
+    Re-inserts empty arrays from empty.json before reconstructing
+    the cache (reverses the save-side workaround for safetensors).
+    """
     entry_dir = cache_dir / h
     meta_path = entry_dir / "meta.json"
     cache_path = entry_dir / "cache.safetensors"
@@ -88,7 +133,52 @@ def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
     with open(meta_path) as f:
         meta = json.load(f)
 
-    prompt_cache = load_prompt_cache(str(cache_path))
+    # Load arrays + metadata from safetensors
+    import mlx.core as mx
+    from mlx.utils import tree_unflatten
+    arrays, cache_metadata = mx.load(str(cache_path), return_metadata=True)
+
+    # Re-insert empty arrays saved separately
+    empty_path = entry_dir / "empty.json"
+    if empty_path.exists():
+        with open(empty_path) as f:
+            empty_arrays = json.load(f)
+        for k, info in empty_arrays.items():
+            dtype = getattr(mx, info["dtype"], mx.float32)
+            arrays[k] = mx.zeros(info["shape"], dtype=dtype)
+
+    arrays = tree_unflatten(list(arrays.items()))
+    cache_metadata = tree_unflatten(list(cache_metadata.items()))
+    if not cache_metadata or len(cache_metadata) < 3:
+        raise ValueError(
+            f"Corrupt cache metadata: expected 3 elements, got {len(cache_metadata) if cache_metadata else 0}"
+        )
+    info, metadata, classes = cache_metadata
+
+    # Inject cache classes into cache.py's globals so CacheList.from_state
+    # can resolve sub-cache types (it uses its own module globals)
+    # Ensure custom cache classes are in cache.py's globals so
+    # CacheList.from_state can resolve sub-cache types. Injected
+    # unconditionally because sub-cache class names are buried
+    # inside CacheList.meta_state, not in the top-level classes list.
+    import mlx_lm.models.cache as _cache_mod
+    try:
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+        _cache_mod.__dict__.setdefault("TurboQuantKVCache", TurboQuantKVCache)
+    except ImportError:
+        pass
+    try:
+        from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+        _cache_mod.__dict__.setdefault("MixedQuantKVCache", MixedQuantKVCache)
+    except ImportError:
+        pass
+
+    local_globals = _cache_mod.__dict__
+
+    prompt_cache = [
+        local_globals[c].from_state(state, meta_state)
+        for c, state, meta_state in zip(classes, arrays, info)
+    ]
     return {"meta": meta, "prompt_cache": prompt_cache}
 
 
@@ -138,6 +228,11 @@ class DiskBackedPromptCache(LRUPromptCache):
             meta_path = entry_dir / "meta.json"
             cache_path = entry_dir / "cache.safetensors"
             if meta_path.exists() and cache_path.exists():
+                # Reject empty safetensors (header-only, no data)
+                if cache_path.stat().st_size < 64:
+                    shutil.rmtree(entry_dir, ignore_errors=True)
+                    logger.info(f"Removed empty cache entry: {entry_dir.name}")
+                    continue
                 try:
                     with open(meta_path) as f:
                         meta = json.load(f)

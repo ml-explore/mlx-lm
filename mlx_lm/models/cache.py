@@ -107,16 +107,22 @@ def load_prompt_cache(file_name, return_metadata=False):
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
 
-    # Ensure external cache classes are in globals for deserialization
-    if "TurboQuantKVCache" in classes and "TurboQuantKVCache" not in globals():
-        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+    # Ensure external cache classes are in globals for deserialization.
+    # Imported unconditionally because sub-cache class names inside
+    # CacheList.meta_state don't appear in the top-level classes list.
+    if "TurboQuantKVCache" not in globals():
+        try:
+            from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+            globals()["TurboQuantKVCache"] = TurboQuantKVCache
+        except ImportError:
+            pass
 
-        globals()["TurboQuantKVCache"] = TurboQuantKVCache
-
-    if "MixedQuantKVCache" in classes and "MixedQuantKVCache" not in globals():
-        from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
-
-        globals()["MixedQuantKVCache"] = MixedQuantKVCache
+    if "MixedQuantKVCache" not in globals():
+        try:
+            from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+            globals()["MixedQuantKVCache"] = MixedQuantKVCache
+        except ImportError:
+            pass
 
     cache = [
         globals()[c].from_state(state, meta_state)

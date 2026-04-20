@@ -44,38 +44,56 @@ from .utils import _parse_size, load, sharded_load
 
 
 def _maybe_dequantize_cache(cache):
-    """Convert MixedQuantKVCache entries back to KVCache for batch merge."""
+    """Convert MixedQuantKVCache entries back to KVCache for batch merge.
+
+    Handles both top-level and sub-caches inside CacheList.
+    """
+    from .models.cache import CacheList
     from .models.mixed_quant_cache import MixedQuantKVCache
     for i, c in enumerate(cache):
         if isinstance(c, MixedQuantKVCache):
             cache[i] = c.to_kvcache()
+        elif isinstance(c, CacheList):
+            new_subs = list(c.caches)
+            changed = False
+            for j, sub in enumerate(new_subs):
+                if isinstance(sub, MixedQuantKVCache):
+                    new_subs[j] = sub.to_kvcache()
+                    changed = True
+            if changed:
+                c.caches = tuple(new_subs)
     return cache
 
 
 def _maybe_quantize_cache(cache, kv_quant_config, min_tokens=0):
-    """Convert a list of KVCache to MixedQuantKVCache for LRU storage.
+    """Convert KVCache entries to MixedQuantKVCache for LRU storage.
 
-    Args:
-        cache: list of cache objects (KVCache, QuantizedKVCache, etc.)
-        kv_quant_config: (k_bits, v_bits) tuple, or None to skip.
-        min_tokens: only quantize caches with at least this many tokens.
-
-    Returns:
-        The cache list, with eligible KVCache entries converted in-place.
+    Handles both top-level KVCache and KVCache sub-caches inside CacheList
+    (used by MoE models like GLM-5.1).
     """
     if kv_quant_config is None:
         return cache
     k_bits, v_bits = kv_quant_config
-    from .models.cache import KVCache
+    from .models.cache import KVCache, CacheList
     from .models.mixed_quant_cache import MixedQuantKVCache
     for i, c in enumerate(cache):
-        # Skip entries that are already quantized (re-stored after batch extract)
         if isinstance(c, MixedQuantKVCache):
             continue
         if isinstance(c, KVCache) and c.offset >= max(min_tokens, 1):
             cache[i] = MixedQuantKVCache.from_kvcache(
                 c, k_bits=k_bits, v_bits=v_bits
             )
+        elif isinstance(c, CacheList):
+            new_subs = list(c.caches)
+            changed = False
+            for j, sub in enumerate(new_subs):
+                if isinstance(sub, KVCache) and sub.offset >= max(min_tokens, 1):
+                    new_subs[j] = MixedQuantKVCache.from_kvcache(
+                        sub, k_bits=k_bits, v_bits=v_bits
+                    )
+                    changed = True
+            if changed:
+                c.caches = tuple(new_subs)
     return cache
 
 
