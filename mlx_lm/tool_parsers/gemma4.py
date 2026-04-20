@@ -46,7 +46,12 @@ def _parse_single(match: re.Match) -> dict:
 def parse_tool_call(text: str, _: Optional[Any] = None):
     matches = list(_tool_call_regex.finditer(text))
     if not matches:
-        raise ValueError("No function provided.")
+        # No `call:name{...}` pattern in the output — this happens on every
+        # plain-text reply when the request had `tools=[...]` attached.
+        # Return an empty list instead of raising so the HTTP server path
+        # can emit a normal chat-completion response rather than a dropped
+        # stream (see #1125).
+        return []
     if len(matches) == 1:
         return _parse_single(matches[0])
     return [_parse_single(m) for m in matches]
