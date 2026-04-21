@@ -27,6 +27,7 @@ class DummyModelProvider:
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
+        self.default_model_map = {}
 
         # Add draft model support
         self.draft_model = None
@@ -48,6 +49,7 @@ class DummyModelProvider:
                 "max_tokens": 512,
                 "chat_template_args": {},
                 "model": None,
+                "served_model_name": None,
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
@@ -65,6 +67,7 @@ class DummyModelProvider:
             self.cli_args.draft_model = HF_MODEL_PATH
 
     def load(self, model, adapter=None, draft_model=None):
+        model = self.default_model_map.get(model, model)
         assert model in ["default_model", "chat_model"]
         return self.model, self.tokenizer
 
@@ -436,6 +439,66 @@ class TestServerWithDraftModel(unittest.TestCase):
         # Ensure both generated content
         self.assertIsNotNone(first_response_body["choices"][0]["message"]["content"])
         self.assertIsNotNone(second_response_body["choices"][0]["message"]["content"])
+
+
+class TestServedModelName(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        provider = DummyModelProvider()
+        provider.cli_args.served_model_name = "my-custom-model"
+        provider.default_model_map["my-custom-model"] = "default_model"
+        cls.response_generator = ResponseGenerator(provider, LRUPromptCache())
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def test_models_endpoint_lists_served_name(self):
+        url = f"http://localhost:{self.port}/v1/models"
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        model_ids = [m["id"] for m in response_body["data"]]
+        self.assertIn("my-custom-model", model_ids)
+
+    def test_completions_with_served_name(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        post_data = {
+            "model": "my-custom-model",
+            "prompt": "Once upon a time",
+            "max_tokens": 5,
+            "temperature": 0.0,
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["model"], "my-custom-model")
+        self.assertIn("choices", response_body)
+
+    def test_default_model_still_works(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        post_data = {
+            "model": "default_model",
+            "prompt": "Hello",
+            "max_tokens": 5,
+            "temperature": 0.0,
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["model"], "default_model")
 
 
 class TestKeepalive(unittest.TestCase):
