@@ -78,7 +78,14 @@ class ToolCallFormatter:
 
         result = []
         for tool_text in tool_calls:
-            parsed = self._tool_parser(tool_text, self._tools)
+            try:
+                parsed = self._tool_parser(tool_text, self._tools)
+            except (ValueError, json.JSONDecodeError) as e:
+                logging.warning(
+                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
+                    f"tool text was likely truncated mid-generation."
+                )
+                continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
