@@ -292,6 +292,22 @@ class TestToolParsing(unittest.TestCase):
         ]
         self.assertEqual(tool_calls, expected)
 
+    def test_minimax_m2(self):
+        test_case = (
+            '<invoke name="search">\n'
+            '<parameter name="query">weather</parameter>\n'
+            "</invoke>\n"
+            '<invoke name="read_file">\n'
+            '<parameter name="path">/tmp/test.txt</parameter>\n'
+            "</invoke>"
+        )
+        expected = [
+            {"name": "search", "arguments": {"query": "weather"}},
+            {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+        ]
+        tool_calls = minimax_m2.parse_tool_call(test_case, None)
+        self.assertEqual(expected, tool_calls)
+
 
 if __name__ == "__main__":
     unittest.main()
