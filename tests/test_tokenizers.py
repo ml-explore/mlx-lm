@@ -101,20 +101,13 @@ class TestTokenizers(unittest.TestCase):
         self.assertEqual(tokenizer.think_start, "<think>")
         self.assertEqual(tokenizer.think_end, "</think>")
 
-    def test_no_think_tokens_safe_access(self):
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
         tokenizer = load_tokenizer(tokenizer_repo)
-        
         self.assertFalse(tokenizer.has_thinking)
-        
         self.assertIsNone(tokenizer.think_start)
         self.assertIsNone(tokenizer.think_end)
-        
-        try:
-            self.assertIsNone(tokenizer.think_start_id, "think_start_id should be None")
-            self.assertIsNone(tokenizer.think_end_id, "think_end_id should be None")
-        except (TypeError, AttributeError) as e:
-            self.fail(f"Accessing think_id properties raised an exception: {e}")
+        self.assertIsNone(tokenizer.think_start_id)
+        self.assertIsNone(tokenizer.think_end_id)
 
 if __name__ == "__main__":
     unittest.main()
