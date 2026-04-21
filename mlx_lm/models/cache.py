@@ -644,6 +644,9 @@ class ArraysCache(_BaseCache):
         In-place extend this cache with the other cache.
         """
 
+        a_batch = self.batch_size
+        b_batch = other.batch_size
+
         def cat(a, b):
             shape = dtype = None
             if a is not None:
@@ -657,9 +660,9 @@ class ArraysCache(_BaseCache):
                 return None
 
             if a is None:
-                a = mx.zeros((self.batch_size,) + shape[1:], dtype=dtype)
+                a = mx.zeros((a_batch,) + shape[1:], dtype=dtype)
             if b is None:
-                b = mx.zeros((other.batch_size,) + shape[1:], dtype=dtype)
+                b = mx.zeros((b_batch,) + shape[1:], dtype=dtype)
 
             return mx.concatenate([a, b])
 

@@ -743,6 +743,14 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(empty2[0].shape, (4, 4, 8))
         self.assertEqual(empty2[1].shape, (4, 4))
 
+        # Extend content with empty
+        content = ArraysCache.merge((c1, c2))
+        empty2 = ArraysCache.merge((ArraysCache(2), ArraysCache(2)))
+        content.extend(empty2)
+        self.assertEqual(content[0].shape, (4, 4, 8))
+        self.assertEqual(content[1].shape, (4, 4))
+        self.assertEqual(content.make_mask(10).shape, (4, 10))
+
         # multiple empty extensions accumulate correctly
         stepwise = ArraysCache.merge((c1,))
         stepwise.extend(ArraysCache(2))
