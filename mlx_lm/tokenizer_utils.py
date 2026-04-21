@@ -612,7 +612,7 @@ def load(
     chat_template = None
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
+        model_path, fix_mistral_regex=True, **(tokenizer_config_extra or {})
     )
 
     tokenizer_config = tokenizer.init_kwargs
