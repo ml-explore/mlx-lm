@@ -180,7 +180,7 @@ class Attention(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == "sliding_attention"
-        self.has_kv = layer_idx < config.num_hidden_layers - config.num_kv_shared_layers 
+        self.has_kv = layer_idx < config.num_hidden_layers - config.num_kv_shared_layers
 
         self.head_dim = (
             config.global_head_dim
