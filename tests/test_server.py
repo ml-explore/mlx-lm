@@ -277,6 +277,33 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_make_state_machine_empty_tool_call_end(self):
+        class FakeTokenizer:
+            has_thinking = False
+            has_tool_calling = True
+            tool_call_start = "[TOOL_CALLS]"
+            tool_call_end = ""
+            tool_call_start_tokens = (100,)
+            tool_call_end_tokens = ()
+            eos_token_ids = [2]
+
+            def convert_ids_to_tokens(self, t):
+                return f"<eos{t}>"
+
+        sm, _ = self.response_generator._make_state_machine(
+            ("fake-empty-end", None, None),
+            FakeTokenizer(),
+            stop_words=[],
+        )
+        state = sm.make_state()
+        state, _, s = sm.match(state, 100)
+        self.assertEqual(s, "tool")
+        for tok in [42, 43, 44]:
+            state, _, s = sm.match(state, tok)
+            self.assertEqual(s, "tool")
+        state, _, s = sm.match(state, 2)
+        self.assertIsNone(s)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)
