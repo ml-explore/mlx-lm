@@ -31,6 +31,10 @@ class TestParseOverrides(unittest.TestCase):
             result = parse_overrides([f"embed_tokens={dtype}"])
             self.assertEqual(result[0][1], dtype)
 
+    def test_int_value_with_group_size(self):
+        result = parse_overrides(["lm_head=8,32"])
+        self.assertEqual(result[0][1], (8, 32))
+
     def test_multiple_overrides(self):
         result = parse_overrides(["lm_head=8", "embed_tokens=float16"])
         self.assertEqual(len(result), 2)
@@ -54,6 +58,12 @@ class TestParseOverrides(unittest.TestCase):
         for mode in ("mxfp4", "nvfp4", "mxfp8"):
             result = parse_overrides([f"down_proj={mode}"])
             self.assertEqual(result[0][1], mode)
+
+    def test_non_int_value_with_group_size_rejected(self):
+        for entry in ("down_proj=mxfp4,32", "embed_tokens=float16,32"):
+            with self.subTest(entry=entry):
+                with self.assertRaises(ValueError):
+                    parse_overrides([entry])
 
     def test_invalid_value(self):
         with self.assertRaises(ValueError):
@@ -119,6 +129,12 @@ class _Wrapper(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = nn.Linear(64, 64)
+
+
+class _SmallWrapper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(48, 64)
 
 
 class TestApplyFloatOverrides(unittest.TestCase):
@@ -482,6 +498,68 @@ class TestConvertOverridePrecedence(unittest.TestCase):
             {"group_size": 64, "bits": 4, "mode": "affine"},
         )
         self.assertEqual(captured["base"], {"group_size": 64, "bits": 8})
+
+    def test_int_override_with_group_size_uses_override_value(self):
+        model = _Wrapper()
+        captured = {}
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        def fake_quantize_model(
+            model,
+            config,
+            group_size,
+            bits,
+            mode="affine",
+            quant_predicate=None,
+        ):
+            captured["override"] = quant_predicate("model.linear", None)
+            return model, config
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                with patch(
+                    "mlx_lm.convert.quantize_model", side_effect=fake_quantize_model
+                ):
+                    with patch("mlx_lm.convert.save", side_effect=lambda *_args: None):
+                        convert(
+                            "stub/repo",
+                            mlx_path=mlx_path,
+                            quantize=True,
+                            q_overrides=["linear=8,32"],
+                        )
+
+        self.assertEqual(
+            captured["override"],
+            {"group_size": 32, "bits": 8, "mode": "affine"},
+        )
+
+    def test_override_group_size_errors_before_quantize(self):
+        model = _SmallWrapper()
+
+        def fake_load(*_args, **_kwargs):
+            return model, object(), {"torch_dtype": "float16"}
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            mlx_path = f"{test_dir}/mlx_model"
+            with patch("mlx_lm.convert.load", side_effect=fake_load):
+                for override, group_size in (("linear=8,64", 64), ("linear=mxfp4", 32)):
+                    with self.subTest(override=override):
+                        with patch(
+                            "mlx_lm.convert.quantize_model",
+                            side_effect=AssertionError("quantize_model should not run"),
+                        ):
+                            with self.assertRaisesRegex(
+                                ValueError, f"not divisible by group_size {group_size}"
+                            ):
+                                convert(
+                                    "stub/repo",
+                                    mlx_path=mlx_path,
+                                    quantize=True,
+                                    q_overrides=[override],
+                                )
 
 
 if __name__ == "__main__":
