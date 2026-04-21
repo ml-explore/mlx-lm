@@ -180,6 +180,7 @@ class Attention(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == "sliding_attention"
+        self.has_kv = layer_idx < config.num_hidden_layers - config.num_kv_shared_layers 
 
         self.head_dim = (
             config.global_head_dim
@@ -201,14 +202,8 @@ class Attention(nn.Module):
 
         self.scale = 1.0
 
-        # Determine if this layer shares KV from an earlier layer
-        first_kv_shared_layer_idx = (
-            config.num_hidden_layers - config.num_kv_shared_layers
-        )
-        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
-
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
-        if not self.is_kv_shared_layer:
+        if self.has_kv:
             self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
             if not self.use_k_eq_v:
                 self.v_proj = nn.Linear(
@@ -217,7 +212,7 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
 
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        if not self.is_kv_shared_layer:
+        if self.has_kv:
             self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
 
@@ -248,7 +243,7 @@ class Attention(nn.Module):
 
         if shared_kv is not None:
             keys, values = shared_kv
-        elif self.is_kv_shared_layer:
+        elif not self.has_kv:
             raise ValueError(
                 f"Layer {self.layer_idx} is a KV-shared layer but received no shared_kv"
             )
