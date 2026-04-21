@@ -1597,14 +1597,14 @@ class TestModels(unittest.TestCase):
         # Non-shared layers (0-5) should have KV projections
         for i in range(6):
             attn = model.model.layers[i].self_attn
-            self.assertFalse(attn.is_kv_shared_layer)
+            self.assertTrue(attn.has_kv)
             self.assertTrue(hasattr(attn, "k_proj"))
             self.assertTrue(hasattr(attn, "k_norm"))
 
         # Shared layers (6-9) should NOT have KV projections
         for i in range(6, 10):
             attn = model.model.layers[i].self_attn
-            self.assertTrue(attn.is_kv_shared_layer)
+            self.assertFalse(attn.has_kv)
             self.assertFalse(hasattr(attn, "k_proj"))
             self.assertFalse(hasattr(attn, "k_norm"))
             self.assertFalse(hasattr(attn, "v_proj"))
@@ -1617,7 +1617,7 @@ class TestModels(unittest.TestCase):
         for k in kv_keys:
             # All KV keys should belong to non-shared layers (0-5)
             layer_idx = int(k.split("layers.")[1].split(".")[0])
-            self.assertLess(layer_idx, 6, f"Shared layer has KV param: {k}")
+            self.assertLess(layer_idx, 6)
 
     def test_gemma4_input_embeddings_reconstruct_per_layer_inputs(self):
         from mlx_lm.models import gemma4_text
