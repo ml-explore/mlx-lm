@@ -101,6 +101,14 @@ class TestTokenizers(unittest.TestCase):
         self.assertEqual(tokenizer.think_start, "<think>")
         self.assertEqual(tokenizer.think_end, "</think>")
 
+        tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        tokenizer = load_tokenizer(tokenizer_repo)
+        self.assertFalse(tokenizer.has_thinking)
+        self.assertIsNone(tokenizer.think_start)
+        self.assertIsNone(tokenizer.think_end)
+        self.assertIsNone(tokenizer.think_start_id)
+        self.assertIsNone(tokenizer.think_end_id)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -397,6 +397,8 @@ class TokenizerWrapper:
 
     @property
     def think_start_id(self):
+        if self._think_start_tokens is None:
+            return None
         if len(self._think_start_tokens) > 1:
             raise ValueError("The start thinking sequence is more than 1 token")
         return self._think_start_tokens[0]
@@ -411,6 +413,8 @@ class TokenizerWrapper:
 
     @property
     def think_end_id(self):
+        if self._think_end_tokens is None:
+            return None
         if len(self._think_end_tokens) > 1:
             raise ValueError("The end thinking sequence is more than 1 token")
         return self._think_end_tokens[0]
