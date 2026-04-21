@@ -718,17 +718,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(batch_full.offset.shape[0], 5)
 
     def test_arrays_cache_extend_with_empty(self):
-        """ArraysCache.extend() should grow self's batch dimension by the
-        correct amount when other's states are all None (e.g. a freshly
-        merged cache for new sequences joining a batch mid-prefill).
-
-        Without the fix, ``cat(a, None)`` returned ``a`` unchanged, leaving
-        the batch dim too small for the downstream ``filter()`` call. On
-        Metal, the resulting out-of-bounds index silently wraps (index 1
-        modulo size 1 = 0), so new sequences received another sequence's
-        state instead of fresh zeros, producing garbage output.
-        """
-        # non-empty extended by empty merge-result (2 + 1 = 3)
+        # test simple merge
         c1 = ArraysCache(2)
         c2 = ArraysCache(2)
         c1[0] = mx.zeros((1, 4, 8))
@@ -738,24 +728,25 @@ class TestPromptCache(unittest.TestCase):
         full = ArraysCache.merge((c1, c2))
         self.assertEqual(full[0].shape, (2, 4, 8))
 
-        empty = ArraysCache.merge((ArraysCache(2),))  # B=1, all states None
+        # extend with empty
+        empty = ArraysCache.merge((ArraysCache(2),))
         full.extend(empty)
         self.assertEqual(full[0].shape, (3, 4, 8))
         self.assertEqual(full[1].shape, (3, 4))
-        # The appended rows must be fresh zeros, not a copy of existing state.
-        self.assertTrue(mx.all(full[0][2:] == 0).item())
+        self.assertTrue(mx.all(full[0][2:] == 0))
 
-        # empty extended by non-empty (already worked, but guard it)
+        # making an empty cache with 2 sequences and merging it with
+        # another one with 2 sequences
         empty2 = ArraysCache.merge((ArraysCache(2), ArraysCache(2)))
         content = ArraysCache.merge((c1, c2))
         empty2.extend(content)
-        self.assertEqual(empty2[0].shape, (2, 4, 8))
-        self.assertEqual(empty2[1].shape, (2, 4))
+        self.assertEqual(empty2[0].shape, (4, 4, 8))
+        self.assertEqual(empty2[1].shape, (4, 4))
 
         # multiple empty extensions accumulate correctly
-        stepwise = ArraysCache.merge((c1,))  # B=1
-        stepwise.extend(ArraysCache.merge((ArraysCache(2),)))  # +1 -> 2
-        stepwise.extend(ArraysCache.merge((ArraysCache(2), ArraysCache(2))))  # +2 -> 4
+        stepwise = ArraysCache.merge((c1,))
+        stepwise.extend(ArraysCache(2))
+        stepwise.extend(ArraysCache.merge((ArraysCache(2), ArraysCache(2))))
         self.assertEqual(stepwise[0].shape, (4, 4, 8))
         self.assertEqual(stepwise[1].shape, (4, 4))
 
