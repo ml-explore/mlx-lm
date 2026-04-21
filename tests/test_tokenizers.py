@@ -109,5 +109,6 @@ class TestTokenizers(unittest.TestCase):
         self.assertIsNone(tokenizer.think_start_id)
         self.assertIsNone(tokenizer.think_end_id)
 
+
 if __name__ == "__main__":
     unittest.main()
