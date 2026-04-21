@@ -603,6 +603,18 @@ class ArraysCache(_BaseCache):
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
+    @property
+    def batch_size(self):
+        for c in self.cache:
+            if c is not None:
+                return c.shape[0]
+        if self.left_padding is not None:
+            return self.left_padding.size
+        elif self.lengths is not None:
+            return self.lengths.size
+        else:
+            return 1
+
     def __setitem__(self, idx, value):
         self.cache[idx] = value
 
@@ -622,6 +634,8 @@ class ArraysCache(_BaseCache):
         In-place filter to keep just the given indices in the cache.
         """
         self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
+        if self.left_padding is not None:
+            self.left_padding = self.left_padding[batch_indices]
         if self.lengths is not None:
             self.lengths = self.lengths[batch_indices]
 
@@ -631,13 +645,27 @@ class ArraysCache(_BaseCache):
         """
 
         def cat(a, b):
+            shape = dtype = None
+            if a is not None:
+                shape = a.shape
+                dtype = a.dtype
+            if b is not None:
+                shape = b.shape
+                dtype = b.dtype
+
+            if shape is None:
+                return None
+
             if a is None:
-                return b
+                a = mx.zeros((self.batch_size,) + shape[1:], dtype=dtype)
             if b is None:
-                return a
+                b = mx.zeros((other.batch_size,) + shape[1:], dtype=dtype)
+
             return mx.concatenate([a, b])
 
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
+        self.left_padding = cat(self.left_padding, other.left_padding)
+        self.lengths = cat(self.lengths, other.lengths)
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -675,6 +703,7 @@ class ArraysCache(_BaseCache):
 
         # All caches are empty so return early
         if all(c.empty() for c in caches):
+            cache.left_padding = mx.array([0] * B)
             return cache
 
         for e in range(n_state):
