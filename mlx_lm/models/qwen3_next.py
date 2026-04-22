@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from .activations import swiglu
+from .activations import precise_swiglu, swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -55,13 +54,6 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
 
 
-@partial(mx.compile, shapeless=True)
-def _precise_swiglu(h, gate, x):
-    gate = nn.silu(gate.astype(mx.float32))
-    x = x.astype(mx.float32)
-    return (gate * x).astype(h.dtype)
-
-
 class Qwen3NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -73,7 +65,7 @@ class Qwen3NextRMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            return _precise_swiglu(hidden_states, gate, x)
+            return precise_swiglu(hidden_states, gate, x)
         else:
             return x.astype(hidden_states.dtype)
 
