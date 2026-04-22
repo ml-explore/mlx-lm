@@ -155,6 +155,13 @@ def _transform_awq_weights(
             new_weights[f"{prefix}.biases"] = biases.astype(scales.dtype)
             model_dtype = scales.dtype
 
+            # Materialize results and release source weights per layer
+            mx.eval(weight, scales, new_weights[f"{prefix}.biases"])
+            del weights[f"{prefix}.qweight"]
+            if qzeros_key in weights:
+                del weights[qzeros_key]
+            del weights[scales_key]
+
         elif not any(
             key.endswith(suffix) for suffix in [".qweight", ".qzeros", ".scales"]
         ):
