@@ -76,8 +76,18 @@ def load_prompt_cache(file_name, return_metadata=False):
     arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
+    def _resolve_cache_class(name):
+        if name in globals():
+            return globals()[name]
+        # Lazy-load experimental cache types
+        if name == "TurboQuantKVCache":
+            from .turboquant import TurboQuantKVCache
+
+            return TurboQuantKVCache
+        raise KeyError(f"Unknown cache class: {name}")
+
     cache = [
-        globals()[c].from_state(state, meta_state)
+        _resolve_cache_class(c).from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
     ]
     if return_metadata:
@@ -389,6 +399,25 @@ class KVCache(_BaseCache):
                 self.values, group_size=group_size, bits=bits
             )
         return quant_cache
+
+    def to_turboquant(self, bits: int = 4):
+        """Convert to TurboQuant compressed cache (experimental).
+
+        Uses PolarQuant for data-oblivious KV cache compression at 2-4 bits.
+        See :class:`~mlx_lm.models.turboquant.TurboQuantKVCache` for details.
+
+        Args:
+            bits (int): Quantization bits per coordinate (2-4). Default: ``4``.
+        """
+        from .turboquant import TurboQuantKVCache
+
+        tq_cache = TurboQuantKVCache(bits=bits)
+        if self.keys is not None:
+            tq_cache.update_and_fetch(
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        return tq_cache
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
