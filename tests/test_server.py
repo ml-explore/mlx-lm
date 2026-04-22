@@ -683,5 +683,43 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [3, 4])
 
 
+class TestHasThinking(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rg = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.rg.stop_and_join()
+
+    def _make_args(self, chat_template_kwargs=None):
+        return type("Args", (), {"chat_template_kwargs": chat_template_kwargs})()
+
+    def _make_tokenizer(self, has_thinking):
+        return type("Tok", (), {"has_thinking": has_thinking})()
+
+    def test_per_request_overrides_tokenizer(self):
+        tok = self._make_tokenizer(True)
+        args = self._make_args({"enable_thinking": False})
+        self.assertFalse(self.rg._has_thinking(tok, args))
+
+    def test_cli_overrides_tokenizer(self):
+        tok = self._make_tokenizer(True)
+        args = self._make_args()
+        self.rg.model_provider.cli_args.chat_template_args = {"enable_thinking": False}
+        try:
+            self.assertFalse(self.rg._has_thinking(tok, args))
+        finally:
+            self.rg.model_provider.cli_args.chat_template_args = {}
+
+    def test_tokenizer_default_when_no_override(self):
+        tok = self._make_tokenizer(True)
+        args = self._make_args()
+        self.assertTrue(self.rg._has_thinking(tok, args))
+
+        tok = self._make_tokenizer(False)
+        self.assertFalse(self.rg._has_thinking(tok, args))
+
+
 if __name__ == "__main__":
     unittest.main()
