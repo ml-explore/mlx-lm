@@ -505,6 +505,48 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].match_sequence, (1,))
         self.assertEqual(responses[uid2].match_sequence, (2,))
 
+    def test_state_machine_reasoning_to_tool_transition(self):
+        """Thinking models can transition reasoning -> tool on the tool start token."""
+        think_start = (100,)
+        think_end = (101,)
+        tool_start = (200,)
+        tool_end = (201,)
+        eos = (0,)
+
+        transitions = {
+            "normal": [
+                (think_start, "reasoning"),
+                (tool_start, "tool"),
+                (eos, None),
+            ],
+            "reasoning": [
+                (think_end, "normal"),
+                (tool_start, "tool"),
+                (eos, None),
+            ],
+            "tool": [
+                (tool_end, "normal"),
+                (eos, None),
+            ],
+        }
+
+        sm = SequenceStateMachine(transitions, initial="reasoning")
+        state = sm.make_state()
+
+        for tok in [50, 51, 52]:
+            state, _, current = sm.match(state, tok)
+            self.assertEqual(current, "reasoning")
+
+        state, _, current = sm.match(state, 200)
+        self.assertEqual(current, "tool")
+
+        for tok in [60, 61]:
+            state, _, current = sm.match(state, tok)
+            self.assertEqual(current, "tool")
+
+        state, _, current = sm.match(state, 201)
+        self.assertEqual(current, "normal")
+
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
             if rotating:

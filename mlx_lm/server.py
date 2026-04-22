@@ -675,6 +675,12 @@ class ResponseGenerator:
             if te:
                 sequences[te] = tokenizer.tool_call_end
 
+            # Allow reasoning -> tool transitions for thinking models that
+            # emit tool calls without first closing the think block
+            # (e.g. Kimi K2.5).
+            if tokenizer.has_thinking:
+                transitions["reasoning"].append((ts, "tool"))
+
         sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
