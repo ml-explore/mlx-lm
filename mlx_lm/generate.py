@@ -1537,11 +1537,6 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
-        # Create a thread-local generation stream so that BatchGenerator
-        # works when instantiated on a worker thread (e.g. mlx_lm.server).
-        # The module-level `generation_stream` is created at import time on
-        # the main thread and, since mlx 0.31.2, streams are thread-local
-        # and cannot be used across threads.
         mx.default_stream(mx.default_device())
         self._generation_stream = mx.new_stream(mx.default_device())
 
