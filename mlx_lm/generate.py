@@ -1537,6 +1537,14 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
+        # Create a thread-local generation stream so that BatchGenerator
+        # works when instantiated on a worker thread (e.g. mlx_lm.server).
+        # The module-level `generation_stream` is created at import time on
+        # the main thread and, since mlx 0.31.2, streams are thread-local
+        # and cannot be used across threads.
+        mx.default_stream(mx.default_device())
+        self._generation_stream = mx.new_stream(mx.default_device())
+
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
@@ -1546,7 +1554,7 @@ class BatchGenerator:
 
     def close(self):
         if self._old_wired_limit is not None:
-            mx.synchronize(generation_stream)
+            mx.synchronize(self._generation_stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -1843,7 +1851,7 @@ class BatchGenerator:
         Returns:
             Tuple of prompt processing responses and generation responses.
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._generation_stream):
             return self._next()
 
     def next_generated(self):
@@ -1853,7 +1861,7 @@ class BatchGenerator:
         Returns:
             List of GenerationBatch.Response objects
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._generation_stream):
             while True:
                 prompt_responses, generation_responses = self._next()
                 if not generation_responses and prompt_responses:
