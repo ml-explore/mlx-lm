@@ -769,6 +769,16 @@ def save_model(
         )
 
 
+def _eval_quantized_per_layer(model: nn.Module):
+    """Materialize quantized weights layer by layer to reduce peak memory."""
+    inner = getattr(model, "model", model)
+    layers = getattr(inner, "layers", None)
+    if layers is not None:
+        for layer in layers:
+            mx.eval(layer.parameters())
+    mx.eval(model.parameters())
+
+
 def quantize_model(
     model: nn.Module,
     config: dict,
@@ -839,6 +849,10 @@ def quantize_model(
         mode=mode,
         class_predicate=wrapped_predicate,
     )
+
+    # Materialize quantized weights per layer to bound peak memory
+    _eval_quantized_per_layer(model)
+
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
 
