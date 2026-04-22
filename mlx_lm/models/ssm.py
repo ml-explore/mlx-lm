@@ -3,6 +3,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .ssd_chunk import ssd_prefill_kernel
+
 
 @mx.compile
 def compute_dt(dt, dt_bias, time_step_limit):
@@ -18,7 +20,7 @@ def make_ssm_kernel():
         auto n = thread_position_in_grid.z;
         auto h_idx = n % H;
         auto g_idx = n / G;
-        constexpr int n_per_t = Ds / 32;
+        auto lane = thread_index_in_simdgroup;
 
         auto x = X + n * Dh;
         out += n * Dh;
@@ -30,8 +32,10 @@ def make_ssm_kernel():
         auto C_ = C + g_idx * Ds;
         auto B_ = B + g_idx * Ds;
 
-        auto ds_idx = thread_position_in_threadgroup.x;
         auto d_idx = thread_position_in_grid.y;
+        if (d_idx >= Dh) {
+            return;
+        }
 
         auto dt_ = static_cast<float>(dt[n]);
         auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
@@ -40,8 +44,7 @@ def make_ssm_kernel():
         float acc = 0.0;
         auto x_ = static_cast<float>(x[d_idx]);
 
-        for (int i = 0; i < n_per_t; ++i) {
-            auto s_idx = n_per_t * ds_idx + i;
+        for (int s_idx = lane; s_idx < Ds; s_idx += 32) {
             auto idx = d_idx * Ds + s_idx;
             auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
             auto state = dA * i_state[idx] + dB_by_x;
@@ -61,7 +64,124 @@ def make_ssm_kernel():
     )
 
 
+def make_ssm_kernel_fused_dt():
+    if not mx.metal.is_available():
+        return None
+    source = """
+        auto n = thread_position_in_grid.z;
+        auto h_idx = n % H;
+        auto g_idx = n / G;
+        auto lane = thread_index_in_simdgroup;
+
+        auto x = X + n * Dh;
+        out += n * Dh;
+        auto i_state = state_in + n * Dh * Ds;
+        auto o_state = state_out + n * Dh * Ds;
+
+        // C and B have shape [batch, group, state_dim]
+        // C and B need to be offset by group size
+        auto C_ = C + g_idx * Ds;
+        auto B_ = B + g_idx * Ds;
+
+        auto d_idx = thread_position_in_grid.y;
+        if (d_idx >= Dh) {
+            return;
+        }
+
+        auto dt_ = static_cast<float>(dt_raw[n]) + static_cast<float>(dt_bias[h_idx]);
+        dt_ = dt_ <= 20.0f ? log(1.0f + exp(dt_)) : dt_;
+        dt_ = clamp(dt_, static_cast<float>(dt_min), static_cast<float>(dt_max));
+
+        auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+        auto dA = fast::exp(A * dt_);
+
+        float acc = 0.0;
+        auto x_ = static_cast<float>(x[d_idx]);
+
+        for (int s_idx = lane; s_idx < Ds; s_idx += 32) {
+            auto idx = d_idx * Ds + s_idx;
+            auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+            auto state = dA * i_state[idx] + dB_by_x;
+            o_state[idx] = static_cast<U>(state);
+            acc += state * C_[s_idx];
+        }
+        acc = simd_sum(acc);
+        if (thread_index_in_simdgroup == 0) {
+            out[d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="ssm_kernel_fused_dt",
+        input_names=[
+            "X",
+            "A_log",
+            "B",
+            "C",
+            "D",
+            "dt_raw",
+            "dt_bias",
+            "dt_min",
+            "dt_max",
+            "state_in",
+        ],
+        output_names=["out", "state_out"],
+        source=source,
+    )
+
+
 _ssm_kernel = make_ssm_kernel()
+_ssm_kernel_fused_dt = make_ssm_kernel_fused_dt()
+
+
+def _can_use_prefill_kernel(
+    hidden_states: mx.array,
+    B: mx.array,
+    C: mx.array,
+    mask: Optional[mx.array],
+    lengths: Optional[mx.array],
+):
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return False
+    if mask is not None or lengths is not None:
+        return False
+    if B.ndim != 4 or C.ndim != 4:
+        return False
+    _, _, h, dh = hidden_states.shape
+    ngroups = B.shape[2]
+    dstate = B.shape[-1]
+    if h % ngroups != 0:
+        return False
+    if dh % 4 != 0:
+        return False
+    if (dh * dstate) % 4 != 0:
+        return False
+    if dstate > 256:
+        return False
+    return True
+
+
+def ssm_prefill_kernel(
+    hidden_states: mx.array,
+    A_log: mx.array,
+    B: mx.array,
+    C: mx.array,
+    D: mx.array,
+    dt: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array],
+    time_step_limit: Tuple[float, float],
+):
+    return ssd_prefill_kernel(
+        hidden_states,
+        A_log,
+        B,
+        C,
+        D,
+        dt,
+        dt_bias,
+        state,
+        time_step_limit,
+    )
 
 
 def ssm_update_kernel(
@@ -79,9 +199,37 @@ def ssm_update_kernel(
     input_type = hidden_states.dtype
     state_type = state.dtype
     hb, ds = B.shape[-2:]
-    dt = compute_dt(dt, dt_bias, time_step_limit)
-    return _ssm_kernel(
-        inputs=[hidden_states, A_log, B, C, D, dt, state],
+    if _ssm_kernel_fused_dt is None:
+        dt = compute_dt(dt, dt_bias, time_step_limit)
+        return _ssm_kernel(
+            inputs=[hidden_states, A_log, B, C, D, dt, state],
+            template=[
+                ("T", input_type),
+                ("U", state_type),
+                ("Dh", d),
+                ("Ds", ds),
+                ("H", h),
+                ("G", h // hb),
+            ],
+            grid=(32, d, h * n),
+            threadgroup=(32, 8, 1),
+            output_shapes=[(n, 1, h, d), state.shape],
+            output_dtypes=[input_type, state_type],
+        )
+
+    return _ssm_kernel_fused_dt(
+        inputs=[
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            float(time_step_limit[0]),
+            float(time_step_limit[1]),
+            state,
+        ],
         template=[
             ("T", input_type),
             ("U", state_type),
@@ -228,6 +376,19 @@ def ssm_update(
     lengths: Optional[mx.array] = None,
 ):
     seq_len = hidden_states.shape[1]
+    if seq_len > 1 and _can_use_prefill_kernel(hidden_states, B, C, mask, lengths):
+        return ssm_prefill_kernel(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            time_step_limit,
+        )
+
     if (
         seq_len > 1
         or state is None
