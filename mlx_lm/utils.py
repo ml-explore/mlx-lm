@@ -215,6 +215,65 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
+def load_eval_tokens(
+    tokenizer,
+    data_path: str,
+    num_samples: int,
+    sequence_length: int,
+    seed: Optional[int] = None,
+) -> mx.array:
+    import types
+
+    import numpy as np
+
+    from .tuner.datasets import load_dataset
+
+    rng = np.random.default_rng(seed)
+
+    path = Path(data_path).expanduser()
+    if path.exists():
+        args = types.SimpleNamespace(data=str(path), train=True, test=False)
+    else:
+        args = types.SimpleNamespace(
+            hf_dataset={
+                "path": data_path,
+                "train_split": "train",
+                "valid_split": "train[:1]",
+            },
+            train=True,
+            test=False,
+        )
+
+    dataset = load_dataset(args, tokenizer)[0]
+    token_stream = []
+
+    if num_samples > 0:
+        total_tokens = num_samples * sequence_length
+        sample_order = []
+        order_idx = 0
+
+        while len(token_stream) < total_tokens:
+            if order_idx >= len(sample_order):
+                sample_order = rng.permutation(len(dataset)).tolist()
+                order_idx = 0
+            tokens, _ = dataset.process(dataset[sample_order[order_idx]])
+            order_idx += 1
+            token_stream.extend(tokens)
+    else:
+        sample_order = rng.permutation(len(dataset)).tolist()
+        for order_idx in sample_order:
+            tokens, _ = dataset.process(dataset[order_idx])
+            token_stream.extend(tokens)
+
+    token_stream = token_stream[
+        : (len(token_stream) // sequence_length) * sequence_length
+    ]
+    tokens = mx.array(token_stream, dtype=mx.int32).reshape(-1, sequence_length)
+    if num_samples > 0:
+        tokens = tokens[:num_samples]
+    return tokens
+
+
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,

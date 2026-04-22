@@ -6,48 +6,11 @@ Evaluate perplexity (PPL) of MLX models.
 import argparse
 import math
 import time
-import types
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
-from mlx_lm.tuner.datasets import load_dataset
-from mlx_lm.utils import get_total_parameters, load
-
-
-def load_data(
-    tokenizer,
-    data_path: str,
-    num_samples: int,
-    sequence_length: int,
-):
-    args = types.SimpleNamespace(
-        hf_dataset={
-            "path": data_path,
-            "train_split": "train",
-            "valid_split": "train[:1]",
-        },
-        train=True,
-        test=False,
-    )
-    dataset = load_dataset(args, tokenizer)[0]
-
-    perm = np.random.permutation(len(dataset)).tolist()
-
-    num_tokens = sequence_length * num_samples if num_samples > 0 else float("inf")
-    data = []
-    i = 0
-    while len(data) < num_tokens:
-        tokens, _ = dataset.process(dataset[perm[i]])
-        i += 1
-        data.extend(tokens)
-
-    data = mx.array(data[: (len(data) // sequence_length) * sequence_length])
-    data = data.reshape(-1, sequence_length)
-    if num_samples > 0:
-        data = data[:num_samples]
-    return data
+from mlx_lm.utils import get_total_parameters, load, load_eval_tokens
 
 
 def eval_ppl(model, data, batch_size=8):
@@ -138,10 +101,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Set random seed
-    np.random.seed(args.seed)
-    mx.random.seed(args.seed)
-
     # Load model
     print(f"Loading model from {args.model}...")
     tokenizer_config = {"trust_remote_code": True if args.trust_remote_code else None}
@@ -155,11 +114,12 @@ def main():
     print(f"\nLoading dataset...")
     print(f"  Sequence length: {args.sequence_length}")
 
-    data = load_data(
+    data = load_eval_tokens(
         tokenizer,
         args.data_path,
         num_samples=args.num_samples,
         sequence_length=args.sequence_length,
+        seed=args.seed,
     )
 
     print(f"  Loaded {len(data)} samples")
