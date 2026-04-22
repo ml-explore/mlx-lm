@@ -412,6 +412,19 @@ def load_model(
         model.update_modules(leaves)
 
     model.eval()
+    expected_keys = {key for key, _ in tree_flatten(model.parameters())}
+    unknown_keys = [key for key in weights if key not in expected_keys]
+    if unknown_keys:
+        sample_keys = sorted(unknown_keys)[:3]
+        sample = ", ".join(sample_keys)
+        if len(unknown_keys) > 3:
+            sample = f"{sample}, ..."
+        print(
+            "[INFO] Dropping weights not present in the instantiated model: "
+            f"count={len(unknown_keys)} sample=[{sample}]"
+        )
+        weights = {key: value for key, value in weights.items() if key in expected_keys}
+
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
