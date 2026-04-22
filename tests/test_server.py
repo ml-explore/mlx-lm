@@ -68,6 +68,9 @@ class DummyModelProvider:
         assert model in ["default_model", "chat_model"]
         return self.model, self.tokenizer
 
+    def load_default(self):
+        return self.load("default_model", None, "default_model")
+
 
 class MockCache:
     def __init__(self, value, is_trimmable: bool = True):
