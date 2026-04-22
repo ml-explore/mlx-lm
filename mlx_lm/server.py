@@ -397,6 +397,11 @@ class ModelProvider:
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
             )
 
+            # Pipeline parallel requires single-request generation path;
+            # BatchGenerator does not include the pipeline sync collectives.
+            if self.pipeline_group is not None:
+                self.is_batchable = False
+
         return self.model, self.tokenizer
 
 

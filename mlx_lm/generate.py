@@ -43,6 +43,23 @@ from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
 DEFAULT_PROMPT = "hello"
+
+
+def _pipeline_sync():
+    """Return a collective op that forces all pipeline ranks to eval together.
+
+    In pipeline parallel, each rank only runs a subset of layers. The model's
+    forward pass contains distributed send/recv ops that are lazy graph nodes.
+    Without a collective sync, ``mx.eval`` on rank 0 may not trigger the
+    send/recv ops needed by other ranks, causing a deadlock.
+
+    Returns ``None`` when not running in a distributed context.
+    """
+    group = mx.distributed.init()
+    if group.size() > 1:
+        return mx.distributed.all_sum(mx.zeros(1))
+    return None
+
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
@@ -430,7 +447,7 @@ def generate_step(
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
-            _model_call(
+            _prefill_logits = _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
                     input_embeddings[:n_to_process][None]
@@ -439,7 +456,15 @@ def generate_step(
                 ),
             )
             quantize_cache_fn(prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
+            # Pipeline parallel: logits contain distributed send/recv ops
+            # in the compute graph; evaluating them (not just cache states)
+            # ensures all ranks participate. mx.eval here is MLX's lazy
+            # graph materializer, not Python's eval builtin.
+            _sync = _pipeline_sync()
+            if _sync is not None:
+                mx.eval(_prefill_logits, _sync)
+            else:
+                mx.eval([c.state for c in prompt_cache])
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
@@ -452,12 +477,20 @@ def generate_step(
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
-    mx.async_eval(y, logprobs)
+    _sync = _pipeline_sync()
+    if _sync is not None:
+        mx.eval(y, logprobs, _sync)
+    else:
+        mx.async_eval(y, logprobs)
     n = 0
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
+            if _sync is not None:
+                _sync = _pipeline_sync()
+                mx.eval(next_y, next_logprobs, _sync)
+            else:
+                mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)

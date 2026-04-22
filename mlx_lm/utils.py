@@ -583,6 +583,13 @@ def sharded_load(
 
     # Synchronize processes to avoid timeout
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+
+    # Warm up Metal shaders for pipeline models to avoid GPU timeout
+    # on the first forward pass (large asymmetric splits compile too
+    # many shaders in one command buffer otherwise).
+    if pipeline_group is not None and hasattr(model.model, "pipeline_warmup"):
+        model.model.pipeline_warmup()
+
     if return_config:
         return model, tokenizer, config
     else:
