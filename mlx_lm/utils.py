@@ -346,24 +346,134 @@ def load_model(
         weights = model.sanitize(weights)
 
     def _quantize(quantization):
+        quantization = dict(quantization or {})
+
+        def _candidate_prefixes(p):
+            cands = [p]
+            if not p.startswith("model."):
+                cands.append(f"model.{p}")
+            else:
+                cands.append(p[len("model."):])
+            if not p.startswith("language_model."):
+                cands.append(f"language_model.{p}")
+                cands.append(f"language_model.model.{p}")
+            # de-dup preserve order
+            seen = set()
+            out = []
+            for x in cands:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+
+        def _find_quant_prefix_for_path(p):
+            # Exact candidates first
+            for pref in _candidate_prefixes(p):
+                if (
+                    f"{pref}.weight" in weights
+                    and f"{pref}.scales" in weights
+                    and f"{pref}.biases" in weights
+                ):
+                    return pref
+
+            # Suffix fallback (handles path prefix mismatches)
+            suffix = f"{p}.scales"
+            matches = [k[:-7] for k in weights.keys() if k.endswith(suffix)]
+            matches = [
+                m for m in matches
+                if f"{m}.weight" in weights and f"{m}.biases" in weights
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            return None
+
+        def _infer_params_for_module(p, m):
+            pref = _find_quant_prefix_for_path(p)
+            if pref is None:
+                return None
+
+            q_w = weights[f"{pref}.weight"]
+            scales = weights[f"{pref}.scales"]
+
+            if not hasattr(m, "weight"):
+                return None
+
+            in_features = int(m.weight.shape[-1])
+            packed_in = int(q_w.shape[-1])
+
+            # infer bits from packed weight shape
+            if in_features <= 0 or packed_in <= 0:
+                return None
+            bits = int(round((32.0 * packed_in) / in_features))
+            if bits not in (2, 3, 4, 6, 8):
+                # fallback to config default if present
+                bits = quantization.get("bits", 4)
+
+            # infer group size from scales shape
+            scale_groups = int(scales.shape[-1])
+            if scale_groups <= 0:
+                return None
+            group_size = int(round(in_features / scale_groups))
+            if group_size <= 0:
+                group_size = quantization.get("group_size", 64)
+
+            mode = quantization.get("mode", "affine")
+            return {"group_size": group_size, "bits": bits, "mode": mode}
+
+        # Build per-layer quant config from config overrides + checkpoint keys
+        per_layer = {}
+
+        leaf_modules = tree_flatten(
+            model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+        )
+        for p, m in leaf_modules:
+            if not hasattr(m, "to_quantized"):
+                continue
+
+            # explicit per-layer override from config takes precedence
+            if p in quantization:
+                qcfg = quantization[p]
+                if qcfg is False:
+                    continue
+                if isinstance(qcfg, dict):
+                    per_layer[p] = qcfg
+                    continue
+
+            # otherwise infer from weights
+            inferred = _infer_params_for_module(p, m)
+            if inferred is not None:
+                per_layer[p] = inferred
+
+        if not per_layer:
+            return
+
+        # defaults required by nn.quantize API
+        first = next(iter(per_layer.values()))
+        default_group_size = quantization.get("group_size", first["group_size"])
+        default_bits = quantization.get("bits", first["bits"])
+        default_mode = quantization.get("mode", first.get("mode", "affine"))
+
         def class_predicate(p, m):
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if p in quantization and quantization[p] is False:
+                return False
+            return per_layer.get(p, False)
 
         nn.quantize(
             model,
-            group_size=quantization["group_size"],
-            bits=quantization["bits"],
-            mode=quantization.get("mode", "affine"),
+            group_size=default_group_size,
+            bits=default_bits,
+            mode=default_mode,
             class_predicate=class_predicate,
         )
 
     if (quantization := config.get("quantization", None)) is not None:
         _quantize(quantization)
+    elif any(k.endswith(".scales") for k in weights.keys()):
+        # allow loading mixed/per-layer quantized checkpoints
+        # even when config has no global quantization block
+        _quantize({})
 
     elif quantization_config := config.get("quantization_config", False):
         # Handle legacy quantization config
