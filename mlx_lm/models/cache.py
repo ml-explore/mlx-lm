@@ -236,8 +236,42 @@ class QuantizedKVCache(_BaseCache):
         self.keys = None
         self.values = None
         self.offset = 0
-        self.group_size = group_size
-        self.bits = bits
+        # Support KVSplit: bits/group_size may be (key, value) tuples
+        if isinstance(bits, (tuple, list)):
+            self.key_bits, self.value_bits = bits
+        else:
+            self.key_bits = self.value_bits = bits
+        if isinstance(group_size, (tuple, list)):
+            self.key_group_size, self.value_group_size = group_size
+        else:
+            self.key_group_size = self.value_group_size = group_size
+
+    # Backward-compatible properties
+    @property
+    def bits(self):
+        if self.key_bits == self.value_bits:
+            return self.key_bits
+        return (self.key_bits, self.value_bits)
+
+    @bits.setter
+    def bits(self, v):
+        if isinstance(v, (tuple, list)):
+            self.key_bits, self.value_bits = v
+        else:
+            self.key_bits = self.value_bits = v
+
+    @property
+    def group_size(self):
+        if self.key_group_size == self.value_group_size:
+            return self.key_group_size
+        return (self.key_group_size, self.value_group_size)
+
+    @group_size.setter
+    def group_size(self, v):
+        if isinstance(v, (tuple, list)):
+            self.key_group_size, self.value_group_size = v
+        else:
+            self.key_group_size = self.value_group_size = v
 
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
@@ -245,15 +279,15 @@ class QuantizedKVCache(_BaseCache):
         prev = self.offset
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
-            el_per_int = 8 * mx.uint32.size // self.bits
             new_steps = (self.step + num_steps - 1) // self.step * self.step
             shape = (B, n_kv_heads, new_steps)
 
-            def init_quant(dim):
+            def init_quant(dim, bits, gs):
+                el_per_int = 8 * mx.uint32.size // bits
                 return (
                     mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
-                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
-                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // gs), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // gs), dtype=keys.dtype),
                 )
 
             def expand_quant(x):
@@ -270,12 +304,19 @@ class QuantizedKVCache(_BaseCache):
                     expand_quant, (self.keys, self.values)
                 )
             else:
-                self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+                self.keys = init_quant(k_head_dim, self.key_bits, self.key_group_size)
+                self.values = init_quant(
+                    v_head_dim, self.value_bits, self.value_group_size
+                )
 
         self.offset += num_steps
 
-        keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
-        values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        keys = mx.quantize(
+            keys, group_size=self.key_group_size, bits=self.key_bits
+        )
+        values = mx.quantize(
+            values, group_size=self.value_group_size, bits=self.value_bits
+        )
         for i in range(len(self.keys)):
             self.keys[i][..., prev : self.offset, :] = keys[i]
             self.values[i][..., prev : self.offset, :] = values[i]
@@ -297,11 +338,34 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.group_size, self.bits)))
+        return tuple(
+            map(
+                str,
+                (
+                    self.offset,
+                    self.key_group_size,
+                    self.key_bits,
+                    self.value_group_size,
+                    self.value_bits,
+                ),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset, self.group_size, self.bits = map(int, v)
+        if len(v) == 3:
+            # Backward compat: old format (offset, group_size, bits)
+            self.offset = int(v[0])
+            self.key_group_size = self.value_group_size = int(v[1])
+            self.key_bits = self.value_bits = int(v[2])
+        else:
+            (
+                self.offset,
+                self.key_group_size,
+                self.key_bits,
+                self.value_group_size,
+                self.value_bits,
+            ) = map(int, v)
 
     def is_trimmable(self):
         return True
@@ -380,13 +444,19 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+    def to_quantized(self, group_size=64, bits=4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
         if self.keys is not None:
-            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+            quant_cache.keys = mx.quantize(
+                self.keys,
+                group_size=quant_cache.key_group_size,
+                bits=quant_cache.key_bits,
+            )
             quant_cache.values = mx.quantize(
-                self.values, group_size=group_size, bits=bits
+                self.values,
+                group_size=quant_cache.value_group_size,
+                bits=quant_cache.value_bits,
             )
         return quant_cache
 
@@ -548,8 +618,31 @@ class RotatingKVCache(_BaseCache):
         self._idx -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
-        raise NotImplementedError("RotatingKVCache Quantization NYI")
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4
+    ) -> "QuantizedRotatingKVCache":
+        qcache = QuantizedRotatingKVCache(
+            max_size=self.max_size, keep=self.keep, group_size=group_size, bits=bits
+        )
+        qcache.offset = self.offset
+        qcache._idx = self._idx
+        if self.keys is not None:
+            S = self.keys.shape[2]
+            qcache.keys = list(
+                mx.quantize(
+                    self.keys,
+                    group_size=qcache.key_group_size,
+                    bits=qcache.key_bits,
+                )
+            )
+            qcache.values = list(
+                mx.quantize(
+                    self.values,
+                    group_size=qcache.value_group_size,
+                    bits=qcache.value_bits,
+                )
+            )
+        return qcache
 
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
@@ -589,6 +682,280 @@ class RotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class QuantizedRotatingKVCache(RotatingKVCache):
+    """A rotating KV cache that stores quantized (data, scales, biases) tuples.
+
+    Supports KVSplit: bits/group_size may be (key, value) tuples for
+    asymmetric quantization of keys and values.
+    """
+
+    step = 256
+
+    def __init__(self, max_size, keep=0, group_size: int = 64, bits: int = 8):
+        super().__init__(max_size=max_size, keep=keep)
+        # Support KVSplit: bits/group_size may be (key, value) tuples
+        if isinstance(bits, (tuple, list)):
+            self.key_bits, self.value_bits = bits
+        else:
+            self.key_bits = self.value_bits = bits
+        if isinstance(group_size, (tuple, list)):
+            self.key_group_size, self.value_group_size = group_size
+        else:
+            self.key_group_size = self.value_group_size = group_size
+
+    # Backward-compatible properties
+    @property
+    def bits(self):
+        if self.key_bits == self.value_bits:
+            return self.key_bits
+        return (self.key_bits, self.value_bits)
+
+    @bits.setter
+    def bits(self, v):
+        if isinstance(v, (tuple, list)):
+            self.key_bits, self.value_bits = v
+        else:
+            self.key_bits = self.value_bits = v
+
+    @property
+    def group_size(self):
+        if self.key_group_size == self.value_group_size:
+            return self.key_group_size
+        return (self.key_group_size, self.value_group_size)
+
+    @group_size.setter
+    def group_size(self, v):
+        if isinstance(v, (tuple, list)):
+            self.key_group_size, self.value_group_size = v
+        else:
+            self.key_group_size = self.value_group_size = v
+
+    @staticmethod
+    def _is_quantized(v):
+        """Check if a value is a quantized tuple/list (data, scales, biases)."""
+        return isinstance(v, (tuple, list))
+
+    def _seq_len(self):
+        """Return the current sequence length in the buffer."""
+        if self.keys is None:
+            return 0
+        if self._is_quantized(self.keys):
+            return self.keys[0].shape[2]
+        return self.keys.shape[2]
+
+    def _trim(self, trim_size, v, append=None):
+        if self._is_quantized(v):
+            parts = []
+            if trim_size > 0:
+                parts = [
+                    tree_map(lambda x: x[..., : self.keep, :], v),
+                    tree_map(lambda x: x[..., trim_size + self.keep :, :], v),
+                ]
+            else:
+                parts = [v]
+            if append is not None:
+                parts.append(append)
+            if len(parts) == 1:
+                return parts[0]
+            result = tree_map(
+                lambda *arrs: mx.concatenate(arrs, axis=2), *parts
+            )
+            return result
+        # Unquantized fallback (should not happen after first quantize)
+        return super()._trim(trim_size, v, append)
+
+    def _temporal_order(self, v):
+        """Rearrange the cache into temporal order, slicing off the end if unused."""
+        if self._is_quantized(v):
+            seq_len = v[0].shape[2]
+            if self._idx == seq_len:
+                return v
+            elif self._idx < self.offset:
+                return tree_map(
+                    lambda x: mx.concatenate(
+                        [
+                            x[..., : self.keep, :],
+                            x[..., self._idx :, :],
+                            x[..., self.keep : self._idx, :],
+                        ],
+                        axis=2,
+                    ),
+                    v,
+                )
+            else:
+                return tree_map(lambda x: x[..., : self._idx, :], v)
+        return super()._temporal_order(v)
+
+    def _update_concat(self, keys, values):
+        # Quantize the incoming keys/values
+        q_keys = list(
+            mx.quantize(keys, group_size=self.key_group_size, bits=self.key_bits)
+        )
+        q_values = list(
+            mx.quantize(
+                values, group_size=self.value_group_size, bits=self.value_bits
+            )
+        )
+
+        if self.keys is None:
+            self.keys = q_keys
+            self.values = q_values
+        else:
+            self.keys = self._temporal_order(self.keys)
+            self.values = self._temporal_order(self.values)
+            self._idx = self._seq_len()
+
+            trim_size = self._idx - self.max_size + 1
+            self.keys = self._trim(trim_size, self.keys, q_keys)
+            self.values = self._trim(trim_size, self.values, q_values)
+
+        self.offset += keys.shape[2]
+        self._idx = self._seq_len()
+        return self.keys, self.values
+
+    def _update_in_place(self, keys, values):
+        B, n_kv_heads, S, k_head_dim = keys.shape
+        v_head_dim = values.shape[3]
+        prev = self.offset
+
+        if self.keys is None or (
+            prev >= self._seq_len() and self._seq_len() < self.max_size
+        ):
+            new_size = min(self.step, self.max_size - prev)
+            shape = (B, n_kv_heads, new_size)
+
+            def _init_quant(dim, bits, gs):
+                el_per_int = 8 * mx.uint32.size // bits
+                return [
+                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, dim // gs), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // gs), dtype=keys.dtype),
+                ]
+
+            if self.keys is not None:
+                new_k = _init_quant(k_head_dim, self.key_bits, self.key_group_size)
+                new_v = _init_quant(
+                    v_head_dim, self.value_bits, self.value_group_size
+                )
+                self.keys = tree_map(
+                    lambda a, b: mx.concatenate([a, b], axis=2),
+                    self.keys,
+                    new_k,
+                )
+                self.values = tree_map(
+                    lambda a, b: mx.concatenate([a, b], axis=2),
+                    self.values,
+                    new_v,
+                )
+            else:
+                self.keys = _init_quant(
+                    k_head_dim, self.key_bits, self.key_group_size
+                )
+                self.values = _init_quant(
+                    v_head_dim, self.value_bits, self.value_group_size
+                )
+            self._idx = prev
+
+        # Trim if needed
+        trim_size = self._seq_len() - self.max_size
+        if trim_size > 0:
+            self.keys = self._trim(trim_size, self.keys)
+            self.values = self._trim(trim_size, self.values)
+            self._idx = self.max_size
+
+        # Rotate
+        if self._idx == self.max_size:
+            self._idx = self.keep
+
+        # Quantize and assign
+        q_keys = mx.quantize(
+            keys, group_size=self.key_group_size, bits=self.key_bits
+        )
+        q_values = mx.quantize(
+            values, group_size=self.value_group_size, bits=self.value_bits
+        )
+        for i in range(len(self.keys)):
+            self.keys[i][..., self._idx : self._idx + S, :] = q_keys[i]
+            self.values[i][..., self._idx : self._idx + S, :] = q_values[i]
+
+        self.offset += S
+        self._idx += S
+
+        # If the buffer is not full, slice off the end
+        if self.offset < self.max_size:
+            return (
+                tree_map(lambda x: x[..., : self.offset, :], self.keys),
+                tree_map(lambda x: x[..., : self.offset, :], self.values),
+            )
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return []
+        seq_len = self._seq_len()
+        if self.offset < seq_len:
+            return (
+                tree_map(lambda x: x[..., : self.offset, :], self.keys),
+                tree_map(lambda x: x[..., : self.offset, :], self.values),
+            )
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        if v is not None and v:
+            self.keys, self.values = v
+        else:
+            self.keys = None
+            self.values = None
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.keep,
+                    self.max_size,
+                    self.offset,
+                    self._idx,
+                    self.key_group_size,
+                    self.key_bits,
+                    self.value_group_size,
+                    self.value_bits,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        if len(v) == 4:
+            # Backward compat: old RotatingKVCache format
+            self.keep, self.max_size, self.offset, self._idx = map(int, v)
+        else:
+            (
+                self.keep,
+                self.max_size,
+                self.offset,
+                self._idx,
+                self.key_group_size,
+                self.key_bits,
+                self.value_group_size,
+                self.value_bits,
+            ) = map(int, v)
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4
+    ) -> "QuantizedRotatingKVCache":
+        return self
 
 
 class ArraysCache(_BaseCache):
