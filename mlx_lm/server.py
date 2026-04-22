@@ -404,10 +404,7 @@ def _make_sampler(args, tokenizer):
         min_p=args.sampling.min_p,
         xtc_probability=args.sampling.xtc_probability,
         xtc_threshold=args.sampling.xtc_threshold,
-        xtc_special_tokens=[
-            tokenizer.eos_token_id,
-            tokenizer.encode("\n"),
-        ],
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
 
 
