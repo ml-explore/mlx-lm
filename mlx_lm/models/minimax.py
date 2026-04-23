@@ -22,7 +22,6 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int
     num_experts_per_tok: int
     num_local_experts: int
-    shared_intermediate_size: int
     num_hidden_layers: int
     rms_norm_eps: float
     rope_theta: float
@@ -275,6 +274,30 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         """Dequantize FP8 weights and restructure MoE experts."""
+        # Validate that ModelArgs.head_dim matches the checkpoint. The
+        # `args.head_dim or hidden_size // num_attention_heads` fallback in
+        # MiniMaxAttention silently defaults to hidden_size//num_heads=64,
+        # which sizes q_proj wrong against the released M2 checkpoint
+        # (head_dim=128, so q_proj is 48×128=6144-wide, not 3072). If any
+        # config sanitizer strips the head_dim field we want the load to
+        # fail loudly with this message instead of a cryptic shape error.
+        q_key = "model.layers.0.self_attn.q_proj.weight"
+        if q_key in weights:
+            effective_head_dim = (
+                self.args.head_dim
+                or self.args.hidden_size // self.args.num_attention_heads
+            )
+            expected_out = effective_head_dim * self.args.num_attention_heads
+            actual_out = weights[q_key].shape[0]
+            if actual_out != expected_out:
+                raise ValueError(
+                    f"MiniMax q_proj weight shape mismatch: expected "
+                    f"out_dim={expected_out} from head_dim="
+                    f"{effective_head_dim} × num_heads="
+                    f"{self.args.num_attention_heads}, but checkpoint has "
+                    f"out_dim={actual_out}. Set head_dim explicitly in "
+                    f"config.json to match the checkpoint."
+                )
 
         def dequant(weight, scale_inv):
             dtype = mx.bfloat16
