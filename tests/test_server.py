@@ -3,9 +3,11 @@
 import http
 import io
 import json
+import tempfile
 import threading
 import types
 import unittest
+from pathlib import Path
 
 import mlx.core as mx
 import requests
@@ -16,6 +18,8 @@ from mlx_lm.server import (
     LRUPromptCache,
     Response,
     ResponseGenerator,
+    _find_repo_config_path,
+    _get_context_length,
     _process_control_tokens,
 )
 from mlx_lm.utils import load
@@ -90,6 +94,123 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class TestGetContextLength(unittest.TestCase):
+    def _write_config(self, dirpath, payload):
+        path = dirpath / "config.json"
+        with open(path, "w") as f:
+            json.dump(payload, f)
+        return path
+
+    def test_reads_max_position_embeddings(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_config(Path(d), {"max_position_embeddings": 32768})
+            self.assertEqual(_get_context_length(path), 32768)
+
+    def test_prefers_max_position_embeddings_over_fallbacks(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_config(
+                Path(d),
+                {
+                    "max_position_embeddings": 32768,
+                    "n_positions": 2048,
+                    "max_sequence_length": 4096,
+                },
+            )
+            self.assertEqual(_get_context_length(path), 32768)
+
+    def test_falls_back_to_n_positions(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_config(Path(d), {"n_positions": 2048})
+            self.assertEqual(_get_context_length(path), 2048)
+
+    def test_falls_back_to_max_sequence_length(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_config(Path(d), {"max_sequence_length": 4096})
+            self.assertEqual(_get_context_length(path), 4096)
+
+    def test_returns_none_when_field_missing(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_config(Path(d), {"model_type": "llama"})
+            self.assertIsNone(_get_context_length(path))
+
+    def test_returns_none_for_non_positive_values(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_config(
+                Path(d), {"max_position_embeddings": 0, "n_positions": -1}
+            )
+            self.assertIsNone(_get_context_length(path))
+
+    def test_returns_none_for_non_int_values(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            # HF configs occasionally stash strings or floats here
+            path = self._write_config(Path(d), {"max_position_embeddings": "32768"})
+            self.assertIsNone(_get_context_length(path))
+
+    def test_returns_none_for_bool_values(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_config(Path(d), {"max_position_embeddings": True})
+            self.assertIsNone(_get_context_length(path))
+
+    def test_returns_none_for_missing_file(self):
+
+        self.assertIsNone(_get_context_length(Path("/nonexistent/path/config.json")))
+
+    def test_returns_none_for_malformed_json(self):
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_text("{not valid json")
+            self.assertIsNone(_get_context_length(path))
+
+    def test_returns_none_for_none_path(self):
+        self.assertIsNone(_get_context_length(None))
+
+
+class TestFindRepoConfigPath(unittest.TestCase):
+    def test_prefers_top_level_config_json(self):
+        snapshot_path = Path("/tmp/snapshot")
+        repo = types.SimpleNamespace(
+            refs={
+                "main": types.SimpleNamespace(
+                    snapshot_path=snapshot_path,
+                    files=[
+                        types.SimpleNamespace(
+                            file_path=snapshot_path / "subdir" / "config.json"
+                        ),
+                        types.SimpleNamespace(file_path=snapshot_path / "config.json"),
+                    ],
+                )
+            }
+        )
+
+        self.assertEqual(_find_repo_config_path(repo), snapshot_path / "config.json")
+
+    def test_returns_none_when_top_level_config_missing(self):
+        snapshot_path = Path("/tmp/snapshot")
+        repo = types.SimpleNamespace(
+            refs={
+                "main": types.SimpleNamespace(
+                    snapshot_path=snapshot_path,
+                    files=[
+                        types.SimpleNamespace(
+                            file_path=snapshot_path / "subdir" / "config.json"
+                        ),
+                    ],
+                )
+            }
+        )
+
+        self.assertIsNone(_find_repo_config_path(repo))
 
 
 class TestProcessControlTokens(unittest.TestCase):
@@ -319,6 +440,12 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+        # context_length must be present on every entry; None is allowed
+        # when a config.json cannot be read or has no recognized field.
+        for entry in response_body["data"]:
+            self.assertIn("context_length", entry)
+            ctx = entry["context_length"]
+            self.assertTrue(ctx is None or (isinstance(ctx, int) and ctx > 0))
 
 
 class TestServerWithDraftModel(unittest.TestCase):

@@ -51,6 +51,55 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
+# Fields in config.json, in priority order, that carry the maximum context
+# length a model supports. Different model families use different conventions.
+_CONTEXT_LENGTH_FIELDS = (
+    "max_position_embeddings",
+    "n_positions",
+    "max_sequence_length",
+    "seq_length",
+)
+
+
+def _find_repo_config_path(repo):
+    """Return the top-level config.json path for a cached repo, if present."""
+    snapshot_path = repo.refs["main"].snapshot_path
+    for f in repo.refs["main"].files:
+        try:
+            relative_path = f.file_path.relative_to(snapshot_path)
+        except ValueError:
+            continue
+        if relative_path == Path("config.json"):
+            return f.file_path
+    return None
+
+
+def _get_context_length(config_path):
+    """
+    Read a model's ``config.json`` and return the maximum context length
+    it declares, or ``None`` if the file is missing, unreadable, or does
+    not declare a known context-length field.
+
+    Args:
+        config_path: Path to the model's ``config.json`` file, or ``None``.
+
+    Returns:
+        The declared context length as an ``int``, or ``None``.
+    """
+    if config_path is None:
+        return None
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for field in _CONTEXT_LENGTH_FIELDS:
+        value = config.get(field)
+        if type(value) is int and value > 0:
+            return value
+    return None
+
+
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
         self._idx = 0
@@ -1676,6 +1725,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "id": repo.repo_id,
                 "object": "model",
                 "created": self.created,
+                "context_length": _get_context_length(_find_repo_config_path(repo)),
             }
             for repo in downloaded_models
         ]
@@ -1689,6 +1739,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         "id": model_id,
                         "object": "model",
                         "created": self.created,
+                        "context_length": _get_context_length(
+                            model_path / "config.json"
+                        ),
                     }
                 )
 
