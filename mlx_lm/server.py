@@ -449,7 +449,7 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
-        if self.draft_model is None:
+        if self.draft_model is None and not getattr(cli_args, "no_batch", False):
             self.is_batchable = all(
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
             )
@@ -1909,6 +1909,11 @@ def main():
         type=int,
         default=8,
         help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--no-batch",
+        action="store_true",
+        help="Disable batch processing, use single-serve mode for all requests",
     )
     parser.add_argument(
         "--prefill-step-size",
