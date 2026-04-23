@@ -1686,6 +1686,14 @@ class LRUPromptCache:
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
+            elif result.common_prefix > 0:
+                # For hybrid models (e.g., Qwen3.5 with SSM/Mamba layers),
+                # non-trimmable caches can't be trimmed to a shorter prefix.
+                # However, we can still reuse the cache by processing tokens
+                # after the common prefix. The non-trimmable caches (ArraysCache)
+                # will naturally handle this since they store fixed-size buffers.
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                return cache, tokens[result.common_prefix:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
