@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -26,6 +26,12 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     rope_traditional: bool = True
     max_position_embeddings: int = 32768
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_traditional = self.rope_parameters.get("rope_traditional", False)
 
 
 class Glm4MLP(nn.Module):

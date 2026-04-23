@@ -43,6 +43,12 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool = False
     router_bias: bool = False
     rope_scaling: Optional[Dict] = None
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
 
 
 class LongcatFlashMLA(nn.Module):

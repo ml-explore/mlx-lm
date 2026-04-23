@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,6 +12,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 
 @dataclass
 class ModelArgs(BaseModelArgs):
+    model_type: str
     hidden_size: int
     num_hidden_layers: int
     intermediate_size: int
@@ -23,9 +24,13 @@ class ModelArgs(BaseModelArgs):
     head_dim: int
     max_position_embeddings: int
     mlp_bias: bool
-    model_type: str
     rope_theta: float
     tie_word_embeddings: bool
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 10000.0)
 
 
 class HeliumAttention(nn.Module):

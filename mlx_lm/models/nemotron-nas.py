@@ -114,8 +114,13 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 131072
     tie_word_embeddings: bool = False
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
+
         # Automatically parse block_configs if they are loaded as dicts
         if self.block_configs and isinstance(self.block_configs[0], dict):
             self.block_configs = [

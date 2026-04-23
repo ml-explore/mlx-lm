@@ -2,7 +2,7 @@
 
 import sys
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,7 +13,7 @@ from .base import BaseModelArgs, create_attention_mask
 try:
     import hf_olmo
 except ImportError:
-    print("To run olmo install ai2-olmo: pip install ai2-olmo")
+    print("To run olmo install ai2-olmo: `pip install ai2-olmo`")
     sys.exit(1)
 
 
@@ -30,8 +30,13 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     mlp_ratio: int = 4
     weight_tying: bool = False
+    rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_traditional = self.rope_parameters.get("rope_traditional", False)
+
         self.mlp_hidden_size = (
             self.mlp_hidden_size
             if self.mlp_hidden_size is not None

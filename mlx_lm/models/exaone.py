@@ -29,6 +29,13 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = True
     attention_bias: bool = False
     mlp_bias: bool = False
+    rope_parameters: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None:
+            self.rope_theta = self.rope_parameters.get("rope_theta", 100000.0)
+            self.rope_scaling = self.rope_parameters
+            self.rope_traditional = self.rope_parameters.get("rope_traditional", False)
 
 
 class AttentionModule(nn.Module):
