@@ -285,6 +285,8 @@ def load_model(
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    config: Optional[dict] = None,
+    weights: Optional[Dict[str, mx.array]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -301,6 +303,14 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
+        config (dict, optional): If provided, use this config dict instead of
+            loading from ``model_path/config.json``. Must include
+            ``model_type`` unless ``model_file`` or a custom
+            ``get_model_classes`` is used. Note that this dict may be
+            modified in-place during model construction (e.g. quantization
+            config keys are added). Default: ``None``
+        weights (dict, optional): If provided, use this weight dict instead of
+            loading from safetensors files on disk. Default: ``None``
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
@@ -309,18 +319,20 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-    config = load_config(model_path)
+    if config is None:
+        config = load_config(model_path)
     if model_config is not None:
         config.update(model_config)
 
-    weight_files = glob.glob(str(model_path / "model*.safetensors"))
+    if weights is None:
+        weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
-    if not weight_files and strict:
-        raise FileNotFoundError(f"No safetensors found in {model_path}")
+        if not weight_files and strict:
+            raise FileNotFoundError(f"No safetensors found in {model_path}")
 
-    weights = {}
-    for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights = {}
+        for wf in weight_files:
+            weights.update(mx.load(wf))
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
@@ -930,7 +942,6 @@ def save(
     config: Dict[str, Any],
     donate_model: bool = True,
 ):
-
     src_path = Path(src_path_or_repo)
     if not src_path.exists():
         hf_repo = src_path_or_repo
