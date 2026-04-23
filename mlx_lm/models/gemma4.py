@@ -5,7 +5,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
 
 from . import gemma4_text
 from .base import BaseModelArgs
@@ -90,3 +89,6 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        self.language_model.shard(group)

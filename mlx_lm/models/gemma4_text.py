@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
@@ -164,13 +165,23 @@ class Experts(nn.Module):
             bias=False,
         )
 
+        self.sharding_group = None
+
     def __call__(
         self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
     ) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         w = mx.expand_dims(top_k_weights, -1)
         y = self.switch_glu(x, top_k_indices)
 
-        return (w * y).sum(-2)
+        y = (w * y).sum(-2)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
 
 
 class Attention(nn.Module):
@@ -673,3 +684,45 @@ class Model(nn.Module):
                     )
                 )
         return caches
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        for layer in self.model.layers:
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            if hasattr(layer.self_attn, "v_proj"):
+                layer.self_attn.v_proj = shard_linear(
+                    layer.self_attn.v_proj, "all-to-sharded", group=group
+                )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
+
+            if layer.enable_moe:
+                layer.experts.sharding_group = group
+                shard_inplace(
+                    layer.experts.switch_glu.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.experts.switch_glu.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.experts.switch_glu.up_proj, "all-to-sharded", group=group
+                )
