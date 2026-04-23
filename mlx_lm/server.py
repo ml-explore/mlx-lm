@@ -449,7 +449,7 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
-        if self.draft_model is None and not getattr(cli_args, "no_batch", False):
+        if self.draft_model is None and not getattr(self.cli_args, "no_batch", False):
             self.is_batchable = all(
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
             )
