@@ -1680,10 +1680,12 @@ class TestModels(unittest.TestCase):
             {
                 "layers.0.attn.wkv.weight": weight,
                 "layers.0.attn.wkv.scale": mx.full((1, 1), 127, dtype=mx.uint8),
+                "norm.weight": mx.ones((32,), dtype=mx.float32),
             }
         )
         key = "model.layers.0.attn.wkv.weight"
         self.assertIn(key, converted)
+        self.assertIn("model.norm.weight", converted)
         self.assertTrue(
             mx.allclose(
                 converted[key].astype(mx.float32),

@@ -849,6 +849,7 @@ class Model(nn.Module):
         # 3) Remap top-level names to our module structure
         top_remap = {
             "embed.weight":    "model.embed_tokens.weight",
+            "norm.weight":     "model.norm.weight",
             "head.weight":     "lm_head.weight",
             "hc_head_fn":      "model.hc_head.fn",
             "hc_head_base":    "model.hc_head.base",
