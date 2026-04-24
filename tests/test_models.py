@@ -1422,10 +1422,11 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
-    def test_deepseek_v4_rope(self):
-        from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
+    def test_deepseek_v4(self):
+        from mlx_lm.models import deepseek_v4
 
-        rope = DeepseekV4RoPE(4, 10000)
+        # RoPE test
+        rope = deepseek_v4.DeepseekV4RoPE(4, 10000)
         x = mx.random.uniform(shape=(1, 2, 3, 4))
         y = rope(x, offset=1)
 
@@ -1448,9 +1449,7 @@ class TestModels(unittest.TestCase):
         expected = expected.reshape(*expected.shape[:-2], 4)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
-    def test_deepseek_v4(self):
-        from mlx_lm.models import deepseek_v4
-
+        # Model test
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",
             vocab_size=128,
@@ -1483,6 +1482,7 @@ class TestModels(unittest.TestCase):
         mx.eval(outputs)
         self.assertEqual(outputs.shape, (1, 5, args.vocab_size))
 
+        # Cache test
         cache = model.make_cache()
         self.assertIsInstance(cache[0], RotatingKVCache)
         self.assertIsInstance(cache[2], deepseek_v4.DeepseekV4Cache)
