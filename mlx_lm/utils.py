@@ -57,6 +57,9 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
+
+
 
 def _parse_size(x):
     sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
@@ -280,11 +283,11 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
-def _load_safetensors(path: str, allow_unsupported_dtypes: bool = False) -> dict:
+def _load_safetensors(path: str) -> dict:
     try:
         return mx.load(path)
     except RuntimeError as e:
-        if "F8_E8M0" not in str(e) or not allow_unsupported_dtypes:
+        if not any(dtype in str(e) for dtype in SAFETENSORS_DTYPE_FALLBACKS):
             raise
         load_error = e
 
@@ -295,8 +298,11 @@ def _load_safetensors(path: str, allow_unsupported_dtypes: bool = False) -> dict
         changed = False
 
         for tensor_info in header.values():
-            if isinstance(tensor_info, dict) and tensor_info.get("dtype") == "F8_E8M0":
-                tensor_info["dtype"] = "U8"
+            if not isinstance(tensor_info, dict):
+                continue
+            dtype = tensor_info.get("dtype")
+            if dtype in SAFETENSORS_DTYPE_FALLBACKS:
+                tensor_info["dtype"] = SAFETENSORS_DTYPE_FALLBACKS[dtype]
                 changed = True
 
         if not changed:
@@ -305,7 +311,7 @@ def _load_safetensors(path: str, allow_unsupported_dtypes: bool = False) -> dict
         patched_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
         if len(patched_header) > header_len:
             raise RuntimeError(
-                f"Cannot reinterpret F8_E8M0 safetensors header in {path}: "
+                f"Cannot reinterpret unsupported safetensors dtype in {path}: "
                 "patched header is larger than the original header."
             )
 
@@ -361,13 +367,8 @@ def load_model(
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
-    allow_unsupported_dtypes = config.get("model_type") == "deepseek_v4"
     for wf in weight_files:
-        weights.update(
-            _load_safetensors(
-                wf, allow_unsupported_dtypes=allow_unsupported_dtypes
-            )
-        )
+        weights.update(_load_safetensors(wf))
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
