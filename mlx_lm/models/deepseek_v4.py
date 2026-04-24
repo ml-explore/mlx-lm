@@ -240,11 +240,9 @@ def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
         uint n = thread_position_in_grid.x;
         if (n >= n_tokens[0]) return;
 
-        const device float *src = comb_log + n * {n_elem};
-        device float *dst = comb + n * {n_elem};
-
+        uint base = n * {n_elem};
         float m[{n_elem}];
-{chr(10).join(f"        m[{i}] = src[{i}];" for i in range(n_elem))}
+{chr(10).join(f"        m[{i}] = comb_log[base + {i}];" for i in range(n_elem))}
 
         // Row softmax
 {row_softmax()}
@@ -258,7 +256,7 @@ def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
         // Remaining (iters - 1) rounds of (row_norm, col_norm)
 {inner_iters}
 
-{chr(10).join(f"        dst[{i}] = m[{i}];" for i in range(n_elem))}
+{chr(10).join(f"        comb[base + {i}] = m[{i}];" for i in range(n_elem))}
     """
 
     kernel = mx.fast.metal_kernel(
@@ -391,7 +389,7 @@ class HyperConnection(nn.Module):
         # post.unsqueeze(-1) * f_out.unsqueeze(-2)  -> [B,S,hc,D]
         term_new = post[..., None] * f_out[:, :, None, :].astype(mx.float32)
         # comb @ residual: [B,S,hc,hc] @ [B,S,hc,D] -> [B,S,hc,D]
-        term_res = mx.einsum("bsij,bsjd->bsid", comb.astype(mx.float32), residual.astype(mx.float32))
+        term_res = comb.astype(mx.float32) @ residual.astype(mx.float32)
         y = term_new + term_res
         return y.astype(dtype)
 
@@ -712,15 +710,14 @@ class V4Attention(nn.Module):
     def __call__(self, x: mx.array, mask=None, cache=None):
         B, S, _ = x.shape
 
-        # --- Q ---
+        # --- Q (shared intermediate reused by indexer) ---
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        # RMS-normalize each head independently (matches ref: q *= rsqrt(mean(q^2)+eps))
         q = q * mx.rsqrt(q.square().mean(axis=-1, keepdims=True) + self.eps)
 
         # --- K = V (shared single-head) ---
         kv = self.kv_norm(self.wkv(x))
-        kv = kv.reshape(B, S, 1, self.head_dim).transpose(0, 2, 1, 3)   # [B, 1, S, head_dim]
+        kv = kv.reshape(B, S, 1, self.head_dim).transpose(0, 2, 1, 3)
 
         offset = cache.offset if cache is not None else 0
 
@@ -732,11 +729,37 @@ class V4Attention(nn.Module):
         q = mx.concatenate([q_nope, q_pe], axis=-1)
         k = v = mx.concatenate([k_nope, k_pe], axis=-1)
 
+        # --- Compressed sparse attention (ratio-4 layers with indexer) ---
+        compressed_k = compressed_v = None
+        if self.compress_ratio and S > 1:
+            ckv = self.compressor(x)
+            if ckv.shape[1] > 0:
+                if hasattr(self, "indexer") and ckv.shape[1] > self.args.index_topk:
+                    topk_idx = self.indexer(x, qr)
+                    if topk_idx is not None:
+                        idx = mx.broadcast_to(
+                            topk_idx[:, :, None],
+                            (B, topk_idx.shape[1], self.head_dim),
+                        )
+                        ckv = mx.take_along_axis(ckv, idx, axis=1)
+                compressed_k = ckv[:, None, :, :]
+                compressed_v = compressed_k
+
         # Update KV cache
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
 
-        # Standard SDPA (compressed KV + topk deferred to v0.2)
+        # Prepend compressed KV to cached KV for sparse attention
+        if compressed_k is not None:
+            k = mx.concatenate([compressed_k, k], axis=2)
+            v = mx.concatenate([compressed_v, v], axis=2)
+            n_comp = compressed_k.shape[2]
+            if mask is not None:
+                comp_shape = list(mask.shape)
+                comp_shape[-1] = n_comp
+                comp_mask = mx.zeros(comp_shape, dtype=mask.dtype)
+                mask = mx.concatenate([comp_mask, mask], axis=-1)
+
         out = scaled_dot_product_attention(
             q,
             k,
@@ -758,9 +781,19 @@ class V4Attention(nn.Module):
 
 
 class Indexer(nn.Module):
-    """Top-k selector over compressed KV rows. For MVP we instantiate to preserve
-    checkpoint parameter names; the actual topk gather path is not yet used in
-    the forward pass (we attend to all compressed rows in v0.1)."""
+    """Top-k selector over compressed KV rows for ratio-4 sparse attention.
+
+    Two-pass design: this module uses a lightweight compressor (index_head_dim,
+    typically 128) to score all compressed rows cheaply, then returns topk
+    indices used to gather from the main attention compressor's output
+    (head_dim, typically 512). This reduces per-layer attention from O(S/4)
+    to O(topk) compressed rows — 500x at 1M context with topk=512.
+
+    Checkpoint params:
+        wq_b: [q_lora_rank, n_heads * index_head_dim]
+        weights_proj: [hidden_size, n_heads]
+        compressor.{wkv, wgate, ape, norm}
+    """
 
     def __init__(self, args: ModelArgs, compress_ratio: int):
         super().__init__()
@@ -769,9 +802,47 @@ class Indexer(nn.Module):
         self.head_dim = args.index_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
+        self.scale = args.index_head_dim ** -0.5
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.compressor = Compressor(args, compress_ratio, self.head_dim)
+
+    def __call__(
+        self,
+        x: mx.array,
+        q_intermediate: mx.array,
+    ) -> Optional[mx.array]:
+        """Score compressed rows and return topk indices.
+
+        Args:
+            x: [B, S, D] hidden state (fed to the lightweight compressor).
+            q_intermediate: [B, S, q_lora_rank] post wq_a+q_norm (shared with main attn).
+
+        Returns:
+            topk_indices [B, topk] or None when there are too few compressed rows.
+            Indices are shared across heads (head-weighted scores are aggregated).
+        """
+        B, S, _ = x.shape
+
+        ck = self.compressor(x)
+        n_compressed = ck.shape[1]
+        if n_compressed == 0:
+            return None
+
+        q = self.wq_b(q_intermediate)
+        q = q.reshape(B, S, self.n_heads, self.head_dim)
+        q = q.transpose(0, 2, 1, 3)
+
+        scores = (q @ ck[:, None].transpose(0, 1, 3, 2)) * self.scale
+
+        hw = mx.sigmoid(self.weights_proj(x))
+        hw = hw.transpose(0, 2, 1)[..., None]
+        scores = scores * hw
+
+        agg = scores.sum(axis=2).mean(axis=1)
+
+        topk = min(self.index_topk, n_compressed)
+        return mx.argpartition(-agg, kth=topk - 1, axis=-1)[:, :topk]
 
 
 # --------------------------------------------------------------------------- #
