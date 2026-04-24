@@ -1539,7 +1539,7 @@ class TestModels(unittest.TestCase):
 
             cache = model.make_cache()
             self.assertIsInstance(cache[0], RotatingKVCache)
-            self.assertIsInstance(cache[2], KVCache)
+            self.assertIsInstance(cache[2], deepseek_v4.CompressedKVCache)
             outputs = model(inputs[:, :3], cache=cache)
             self.assertEqual(outputs.shape, (1, 3, args.vocab_size))
             self.assertEqual(outputs.dtype, dtype)

@@ -542,6 +542,108 @@ class DeepseekV4MoE(nn.Module):
 # Attention: MLA (num_kv_heads=1) + sliding window + optional compressed KV   #
 # --------------------------------------------------------------------------- #
 
+class CompressedKVCache:
+    """Cache for compressed-attention layers: sliding-window local cache + compressed KV pool.
+
+    During prefill, the compressor produces all compressed rows at once.
+    During decode, tokens accumulate in a buffer; every `ratio` tokens the
+    buffer is compressed and the result is appended to the pool.
+    """
+
+    def __init__(self, max_size: int = 128):
+        self.local = RotatingKVCache(max_size=max_size, keep=0)
+        self._pool = None
+        self._buf = None
+        self._buf_count = 0
+
+    @property
+    def offset(self):
+        return self.local.offset
+
+    @property
+    def keys(self):
+        return self.local.keys
+
+    @keys.setter
+    def keys(self, value):
+        self.local.keys = value
+
+    @property
+    def pool(self):
+        return self._pool
+
+    def update_and_fetch(self, keys, values):
+        return self.local.update_and_fetch(keys, values)
+
+    @property
+    def state(self):
+        return self.local.state
+
+    @state.setter
+    def state(self, value):
+        self.local.state = value
+
+    @property
+    def meta_state(self):
+        return self.local.meta_state
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.local.meta_state = value
+
+    def is_trimmable(self):
+        return self.local.is_trimmable()
+
+    def trim(self, n):
+        return self.local.trim(n)
+
+    def accumulate(self, x: mx.array, compressor: 'Compressor') -> Optional[mx.array]:
+        """Buffer tokens and compress when a full window is ready.
+
+        Args:
+            x: [B, S, D] hidden states for current step(s)
+            compressor: the Compressor module to apply
+
+        Returns:
+            The full compressed pool [B, N_compressed, head_dim], or None if empty.
+        """
+        B, S, D = x.shape
+        r = compressor.ratio
+
+        if S > 1:
+            ckv = compressor(x)
+            if ckv.shape[1] > 0:
+                self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
+            remainder = S % r
+            if remainder > 0:
+                self._buf = x[:, -remainder:]
+                self._buf_count = remainder
+            else:
+                self._buf = None
+                self._buf_count = 0
+            return self._pool
+
+        if self._buf is None:
+            self._buf = x
+            self._buf_count = 1
+        else:
+            self._buf = mx.concatenate([self._buf, x], axis=1)
+            self._buf_count += 1
+
+        if self._buf_count >= r:
+            ckv = compressor(self._buf[:, :r])
+            if ckv.shape[1] > 0:
+                self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
+            if self._buf_count > r:
+                self._buf = self._buf[:, r:]
+                self._buf_count -= r
+            else:
+                self._buf = None
+                self._buf_count = 0
+
+        return self._pool
+
+
 class Compressor(nn.Module):
     """Learned gated pooling over `ratio` consecutive tokens for KV compression.
 
@@ -729,11 +831,20 @@ class V4Attention(nn.Module):
         q = mx.concatenate([q_nope, q_pe], axis=-1)
         k = v = mx.concatenate([k_nope, k_pe], axis=-1)
 
-        # --- Compressed sparse attention (ratio-4 layers with indexer) ---
+        # --- Compressed sparse attention ---
         compressed_k = compressed_v = None
-        if self.compress_ratio and S > 1:
-            ckv = self.compressor(x)
-            if ckv.shape[1] > 0:
+        if self.compress_ratio:
+            comp_cache = cache if isinstance(cache, CompressedKVCache) else None
+            if comp_cache is not None:
+                pool = comp_cache.accumulate(x, self.compressor)
+            elif S > 1:
+                pool = self.compressor(x)
+                pool = pool if pool.shape[1] > 0 else None
+            else:
+                pool = None
+
+            if pool is not None:
+                ckv = pool
                 if hasattr(self, "indexer") and ckv.shape[1] > self.args.index_topk:
                     topk_idx = self.indexer(x, qr)
                     if topk_idx is not None:
@@ -922,7 +1033,9 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
             cache = [None] * self.num_layers
 
         first_cache = cache[0]
-        if isinstance(first_cache, (list, tuple)):
+        if isinstance(first_cache, CompressedKVCache):
+            first_cache = first_cache.local
+        elif isinstance(first_cache, (list, tuple)):
             first_cache = first_cache[0]
         mask = create_attention_mask(
             h[:, :, 0, :],
@@ -940,8 +1053,11 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
-            if cache[-1] is not None:
-                cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
+            last_cache = cache[-1]
+            if last_cache is not None:
+                lc = last_cache.local if isinstance(last_cache, CompressedKVCache) else last_cache
+                if hasattr(lc, 'keys') and lc.keys is not None:
+                    lc.keys = mx.depends(lc.keys, h)
 
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
@@ -982,10 +1098,8 @@ class Model(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.attn.compress_ratio:
-                # Full cache for compressed-attention layers (MVP: no topk selection)
-                caches.append(KVCache())
+                caches.append(CompressedKVCache(max_size=self.args.sliding_window))
             else:
-                # Sliding-window cache for pure local-attention layers
                 caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches
 
