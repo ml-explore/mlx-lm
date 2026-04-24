@@ -1476,25 +1476,12 @@ class TestModels(unittest.TestCase):
             hc_sinkhorn_iters=2,
         )
         model = deepseek_v4.Model(args)
-        inputs = mx.array([[0, 1, 2, 3, 4]], dtype=mx.int32)
 
-        outputs = model(inputs)
-        mx.eval(outputs)
-        self.assertEqual(outputs.shape, (1, 5, args.vocab_size))
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
 
-        # Cache test
-        cache = model.make_cache()
-        self.assertIsInstance(cache[0], RotatingKVCache)
-        self.assertIsInstance(cache[2], deepseek_v4.DeepseekV4Cache)
-        outputs = model(inputs[:, :3], cache=cache)
-        mx.eval(outputs)
-        self.assertEqual(outputs.shape, (1, 3, args.vocab_size))
-        mx.eval([c.state for c in cache])
-        outputs = model(inputs[:, 3:4], cache=cache)
-        mx.eval(outputs)
-        self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
-        mx.eval([c.state for c in cache])
-
+        # Sanitize test
         weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
         converted = model.sanitize(
             {

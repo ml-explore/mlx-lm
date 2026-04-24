@@ -332,6 +332,9 @@ class MoEGate(nn.Module):
         if self.scoring_func != "softmax" and self.norm_topk_prob:
             weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
         weights = weights * self.routed_scaling_factor
+        route_shape = (*x.shape[:-1], self.top_k)
+        inds = inds.reshape(route_shape)
+        weights = weights.reshape(route_shape)
         return inds, weights
 
 
