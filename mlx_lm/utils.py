@@ -56,6 +56,70 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+# Safetensors dtype string → numpy dtype for the manual fallback loader.
+# F8_E4M3 and F8_E5M2 are loaded as uint8 because MLX treats fp8 as uint8.
+_ST_NUMPY_DTYPE = {
+    "F64": "float64",
+    "F32": "float32",
+    "F16": "float16",
+    "I64": "int64",
+    "I32": "int32",
+    "I16": "int16",
+    "I8": "int8",
+    "U8": "uint8",
+    "BOOL": "bool",
+    "F8_E4M3": "uint8",
+    "F8_E5M2": "uint8",
+}
+
+
+def _load_weights_file(wf: str) -> dict:
+    """Load a safetensors weight file.
+
+    Falls back to a manual parser when mx.load encounters an unsupported dtype
+    such as F8_E8M0, which is used as a block-wise FP8 scale format in some
+    MoE models (e.g. DeepSeek-V4-Flash).
+    """
+    try:
+        return mx.load(wf)
+    except RuntimeError as e:
+        if "F8_E8M0" not in str(e):
+            raise
+
+    import struct
+
+    import numpy as np
+
+    with open(wf, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+        data = f.read()
+
+    weights = {}
+    for key, info in header.items():
+        if key == "__metadata__":
+            continue
+        dtype_str = info["dtype"]
+        shape = tuple(info["shape"])
+        s, e_off = info["data_offsets"]
+        raw = data[s:e_off]
+
+        if dtype_str == "F8_E8M0":
+            # F8_E8M0: 8 exponent bits, 0 mantissa bits, bias=127, unsigned.
+            # Represents powers of two: value = 2^(byte - 127).
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(shape)
+            weights[key] = mx.array(np.exp2(arr.astype(np.float32) - 127.0))
+        elif dtype_str == "BF16":
+            arr = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
+            weights[key] = mx.array(arr).view(mx.bfloat16)
+        elif dtype_str in _ST_NUMPY_DTYPE:
+            arr = np.frombuffer(raw, dtype=_ST_NUMPY_DTYPE[dtype_str]).reshape(shape)
+            weights[key] = mx.array(arr)
+        else:
+            raise RuntimeError(f"[mlx_lm] Unsupported safetensors dtype: {dtype_str}")
+
+    return weights
+
 
 def _parse_size(x):
     sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
@@ -320,7 +384,7 @@ def load_model(
 
     weights = {}
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(_load_weights_file(wf))
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
