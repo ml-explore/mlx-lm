@@ -61,9 +61,11 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if not self.compress_ratios:
             n = self.num_hidden_layers
-            self.compress_ratios = [0] + [
-                4 if i % 2 else 128 for i in range(max(n - 2, 0))
-            ] + ([0] if n >= 2 else [])
+            self.compress_ratios = (
+                [0]
+                + [4 if i % 2 else 128 for i in range(max(n - 2, 0))]
+                + ([0] if n >= 2 else [])
+            )
         self.compress_ratios = list(self.compress_ratios[: self.num_hidden_layers])
         if len(self.compress_ratios) != self.num_hidden_layers:
             raise ValueError(
@@ -129,8 +131,7 @@ class DeepseekV4RoPE(nn.Module):
                 return (
                     dims
                     * math.log(
-                        original_max_position_embeddings
-                        / (num_rotations * 2 * math.pi)
+                        original_max_position_embeddings / (num_rotations * 2 * math.pi)
                     )
                     / (2 * math.log(base))
                 )
@@ -213,14 +214,11 @@ def hc_split_sinkhorn(
 
     pre = mx.sigmoid(mixes[..., :hc_mult] * pre_scale + base[:hc_mult]) + eps
     post = 2 * mx.sigmoid(
-        mixes[..., hc_mult : 2 * hc_mult] * post_scale
-        + base[hc_mult : 2 * hc_mult]
+        mixes[..., hc_mult : 2 * hc_mult] * post_scale + base[hc_mult : 2 * hc_mult]
     )
-    comb = (
-        mixes[..., 2 * hc_mult :].reshape(*mixes.shape[:-1], hc_mult, hc_mult)
-        * comb_scale
-        + base[2 * hc_mult :].reshape(hc_mult, hc_mult)
-    )
+    comb = mixes[..., 2 * hc_mult :].reshape(
+        *mixes.shape[:-1], hc_mult, hc_mult
+    ) * comb_scale + base[2 * hc_mult :].reshape(hc_mult, hc_mult)
     comb = mx.softmax(comb, axis=-1, precise=True) + eps
     comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
     for _ in range(max(sinkhorn_iters - 1, 0)):
@@ -412,8 +410,12 @@ class DeepseekV4Cache:
         local_state = None if self.local.empty() else self.local.state
         return (
             local_state,
-            tuple(self.compressor_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")),
-            tuple(self.indexer_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")),
+            tuple(
+                self.compressor_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")
+            ),
+            tuple(
+                self.indexer_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")
+            ),
         )
 
     @state.setter
@@ -467,7 +469,11 @@ class DeepseekV4Cache:
         return total
 
     def _branch_state(self, state_key: str):
-        return self.indexer_state if state_key == "indexer_state" else self.compressor_state
+        return (
+            self.indexer_state
+            if state_key == "indexer_state"
+            else self.compressor_state
+        )
 
     def accumulate_windows(
         self,
@@ -492,10 +498,16 @@ class DeepseekV4Cache:
         state = self._branch_state(state_key)
         pool = state["pooled"]
         if new_pooled.shape[1] > 0:
-            pool = new_pooled if pool is None else mx.concatenate([pool, new_pooled], axis=1)
+            pool = (
+                new_pooled
+                if pool is None
+                else mx.concatenate([pool, new_pooled], axis=1)
+            )
             state["pooled"] = pool
         if pool is None:
-            pool = mx.zeros((new_pooled.shape[0], 0, new_pooled.shape[-1]), new_pooled.dtype)
+            pool = mx.zeros(
+                (new_pooled.shape[0], 0, new_pooled.shape[-1]), new_pooled.dtype
+            )
         return pool
 
 
@@ -544,14 +556,15 @@ class Compressor(nn.Module):
         else:
             W = ready_kv.shape[1] // self.compress_ratio
             kv = ready_kv.reshape(B, W, self.compress_ratio, self.out_dim)
-            gate = (
-                ready_gate.reshape(B, W, self.compress_ratio, self.out_dim)
-                + self.ape.astype(ready_gate.dtype)
-            )
+            gate = ready_gate.reshape(
+                B, W, self.compress_ratio, self.out_dim
+            ) + self.ape.astype(ready_gate.dtype)
             if self.overlap:
                 kv = self._overlap_transform(kv, 0.0)
                 gate = self._overlap_transform(gate, -float("inf"))
-            weights = mx.softmax(gate.astype(mx.float32), axis=2, precise=True).astype(kv.dtype)
+            weights = mx.softmax(gate.astype(mx.float32), axis=2, precise=True).astype(
+                kv.dtype
+            )
             new_pooled = (kv * weights).sum(axis=2)
             new_pooled = self.norm(new_pooled.astype(x.dtype))
             positions = (
@@ -590,9 +603,7 @@ class Indexer(nn.Module):
         start_pos: int,
     ):
         B, L, _ = x.shape
-        pooled = self.compressor(
-            x, rope, cache, start_pos, state_key="indexer_state"
-        )
+        pooled = self.compressor(x, rope, cache, start_pos, state_key="indexer_state")
         if pooled.shape[1] == 0:
             return None
 
@@ -601,7 +612,9 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = _apply_partial_rope(q, position_rope, offset)
 
-        scores = (q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(mx.float32))
+        scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
+            mx.float32
+        )
         scores = mx.maximum(scores, 0) * self.scale
         weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
         scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
@@ -643,7 +656,9 @@ class V4Attention(nn.Module):
         )
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
 
-        rope_theta = config.compress_rope_theta if self.compress_ratio else config.rope_theta
+        rope_theta = (
+            config.compress_rope_theta if self.compress_ratio else config.rope_theta
+        )
         rope_scaling = config.rope_scaling if self.compress_ratio else None
         self.rope = DeepseekV4RoPE(
             config.qk_rope_head_dim,
@@ -669,7 +684,9 @@ class V4Attention(nn.Module):
                     group_idx * self.o_lora_rank,
                     (group_idx + 1) * self.o_lora_rank,
                 )
-                biases = self.wo_a.biases[rows] if self.wo_a.biases is not None else None
+                biases = (
+                    self.wo_a.biases[rows] if self.wo_a.biases is not None else None
+                )
                 y = mx.quantized_matmul(
                     out[:, :, group_idx, :],
                     self.wo_a.weight[rows],
@@ -706,7 +723,10 @@ class V4Attention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        q = q * mx.rsqrt((q.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True) + self.config.rms_norm_eps)
+        q = q * mx.rsqrt(
+            (q.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True)
+            + self.config.rms_norm_eps
+        )
         q = q.astype(x.dtype)
         q = q.transpose(0, 2, 1, 3)
         kv = self.kv_norm(self.wkv(x)).reshape(B, L, 1, self.head_dim)
@@ -744,7 +764,9 @@ class V4Attention(nn.Module):
             full_kv = mx.concatenate([full_kv, pooled], axis=2)
 
         if mask is not None and full_kv.shape[2] > mask.shape[-1]:
-            pad = mx.ones(mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],), dtype=mask.dtype)
+            pad = mx.ones(
+                mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],), dtype=mask.dtype
+            )
             mask = mx.concatenate([mask, pad], axis=-1)
 
         out = scaled_dot_product_attention(
@@ -817,7 +839,11 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             cache = [None] * len(self.pipeline_layers)
 
         first_cache = cache[0]
-        mask_cache = first_cache.local if isinstance(first_cache, DeepseekV4Cache) else first_cache
+        mask_cache = (
+            first_cache.local
+            if isinstance(first_cache, DeepseekV4Cache)
+            else first_cache
+        )
         mask = create_attention_mask(
             h[:, :, 0, :],
             mask_cache,
@@ -870,6 +896,15 @@ class Model(nn.Module):
                 or ".ffn_hc." in k
                 or ".hc_head." in k
             )
+
+        return predicate
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if ".ffn.switch_mlp." in path:
+                return {"group_size": 32, "bits": 4}
+            return True
 
         return predicate
 
@@ -1013,9 +1048,9 @@ class Model(nn.Module):
                         weights.pop(f"{prefix}.{e}.{src}.weight")
                         for e in range(self.args.n_routed_experts)
                     ]
-                    weights[
-                        f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.weight"
-                    ] = mx.stack(stacked)
+                    weights[f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.weight"] = (
+                        mx.stack(stacked)
+                    )
 
         return weights
 
@@ -1042,7 +1077,5 @@ class Model(nn.Module):
                 layer.ffn.shared_experts.up_proj, "all-to-sharded", group=group
             )
             shard_inplace(layer.ffn.switch_mlp.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(
-                layer.ffn.switch_mlp.down_proj, "sharded-to-all", group=group
-            )
+            shard_inplace(layer.ffn.switch_mlp.down_proj, "sharded-to-all", group=group)
             shard_inplace(layer.ffn.switch_mlp.up_proj, "all-to-sharded", group=group)
