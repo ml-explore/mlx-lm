@@ -379,7 +379,7 @@ class DeepseekV4MoE(nn.Module):
 
         inds, scores = self.gate(x, input_ids)
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).reshape(x.shape)
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype).reshape(x.shape)
         y = y + self.shared_experts(x)
 
         if self.sharding_group is not None:
