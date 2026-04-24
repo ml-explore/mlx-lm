@@ -1693,6 +1693,54 @@ class TestModels(unittest.TestCase):
             )
         )
 
+    def test_deepseek_v4_loads_e8m0_scales_as_uint8(self):
+        try:
+            import tempfile
+            from pathlib import Path
+
+            import torch
+            from safetensors.torch import save_file
+        except ImportError:
+            self.skipTest("torch and safetensors are required for this test")
+
+        if not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"):
+            self.skipTest("torch build does not expose required float8 dtypes")
+
+        from mlx_lm.utils import _load_safetensors
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "model.safetensors"
+            save_file(
+                {
+                    "weight": torch.tensor([1.0, -2.0], dtype=torch.float32).to(
+                        torch.float8_e4m3fn
+                    ),
+                    "scale": torch.tensor([[1.0, 2.0]], dtype=torch.float32).to(
+                        torch.float8_e8m0fnu
+                    ),
+                },
+                str(path),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "F8_E8M0"):
+                mx.load(str(path))
+
+            loaded = _load_safetensors(str(path), allow_e8m0_uint8=True)
+            self.assertEqual(loaded["scale"].dtype, mx.uint8)
+            self.assertEqual(loaded["weight"].dtype, mx.uint8)
+            self.assertTrue(
+                mx.array_equal(
+                    loaded["scale"],
+                    mx.array([[127, 128]], dtype=mx.uint8),
+                )
+            )
+            self.assertTrue(
+                mx.allclose(
+                    mx.from_fp8(loaded["weight"], dtype=mx.float32),
+                    mx.array([1.0, -2.0], dtype=mx.float32),
+                )
+            )
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
