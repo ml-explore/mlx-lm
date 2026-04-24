@@ -1422,6 +1422,99 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_deepseek_v4(self):
+        from mlx_lm.models import deepseek_v4
+
+        # RoPE test
+        rope = deepseek_v4.DeepseekV4RoPE(4, 10000)
+        x = mx.random.uniform(shape=(1, 2, 3, 4))
+        y = rope(x, offset=1)
+
+        inv_freq = 1.0 / (10000 ** (mx.arange(0, 4, 2, dtype=mx.float32) / 4))
+        freqs = mx.arange(1, 4, dtype=mx.float32)[:, None] * inv_freq[None, :]
+        cos = mx.cos(freqs).reshape(1, 1, 3, 2)
+        sin = mx.sin(freqs).reshape(1, 1, 3, 2)
+        pairs = x.reshape(*x.shape[:-1], 2, 2)
+        x0, x1 = pairs[..., 0], pairs[..., 1]
+        expected = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+        expected = expected.reshape(*expected.shape[:-2], 4)
+        self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
+
+        positions = mx.array([1, 5, 9], dtype=mx.float32)
+        y = rope(x, positions=positions)
+        freqs = positions[:, None] * inv_freq[None, :]
+        cos = mx.cos(freqs).reshape(1, 1, 3, 2)
+        sin = mx.sin(freqs).reshape(1, 1, 3, 2)
+        expected = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+        expected = expected.reshape(*expected.shape[:-2], 4)
+        self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
+
+        # HyperConnection Sinkhorn test
+        for hc_mult in (2, 4):
+            mix = (2 + hc_mult) * hc_mult
+            mixes = mx.random.normal((2, 3, mix), dtype=mx.float32)
+            scale = mx.array([1.2, 0.7, 1.1], dtype=mx.float32)
+            base = mx.random.normal((mix,), dtype=mx.float32)
+            expected = deepseek_v4._hc_split_sinkhorn_ops(
+                mixes, scale, base, hc_mult, 20, 1e-6
+            )
+            actual = deepseek_v4.hc_split_sinkhorn(
+                mixes, scale, base, hc_mult, 20, 1e-6
+            )
+            for x, y in zip(expected, actual):
+                self.assertTrue(mx.allclose(x, y, rtol=1e-5, atol=1e-5))
+
+        # Model test
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Sanitize test
+        weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
+        converted = model.sanitize(
+            {
+                "layers.0.attn.wkv.weight": weight,
+                "layers.0.attn.wkv.scale": mx.full((1, 1), 127, dtype=mx.uint8),
+            }
+        )
+        key = "model.layers.0.attn.wkv.weight"
+        self.assertIn(key, converted)
+        self.assertTrue(
+            mx.allclose(
+                converted[key].astype(mx.float32),
+                mx.ones((128, 128), dtype=mx.float32),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        )
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 

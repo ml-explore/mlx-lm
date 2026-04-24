@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+import struct
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -55,6 +56,8 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
+
+SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 
 def _parse_size(x):
@@ -279,6 +282,50 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _load_safetensors(path: str) -> dict:
+    try:
+        return mx.load(path)
+    except RuntimeError as e:
+        if not any(dtype in str(e) for dtype in SAFETENSORS_DTYPE_FALLBACKS):
+            raise
+        load_error = e
+
+    with open(path, "r+b") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        original_header = f.read(header_len)
+        header = json.loads(original_header)
+        changed = False
+
+        for tensor_info in header.values():
+            if not isinstance(tensor_info, dict):
+                continue
+            dtype = tensor_info.get("dtype")
+            if dtype in SAFETENSORS_DTYPE_FALLBACKS:
+                tensor_info["dtype"] = SAFETENSORS_DTYPE_FALLBACKS[dtype]
+                changed = True
+
+        if not changed:
+            raise load_error
+
+        patched_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        if len(patched_header) > header_len:
+            raise RuntimeError(
+                f"Cannot reinterpret unsupported safetensors dtype in {path}: "
+                "patched header is larger than the original header."
+            )
+
+        try:
+            f.seek(8)
+            f.write(patched_header)
+            f.write(b" " * (header_len - len(patched_header)))
+            f.flush()
+            return mx.load(path)
+        finally:
+            f.seek(8)
+            f.write(original_header)
+            f.flush()
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -320,7 +367,7 @@ def load_model(
 
     weights = {}
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(_load_safetensors(wf))
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
@@ -345,14 +392,23 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    if (
+        config.get("quantization", None) is None
+        and getattr(model_args, "quantization", None) is not None
+        and any(k.endswith(".scales") for k in weights)
+    ):
+        config["quantization"] = model_args.quantization
+
     def _quantize(quantization):
         def class_predicate(p, m):
+            if not hasattr(m, "to_quantized"):
+                return False
+            if f"{p}.scales" not in weights:
+                return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            return f"{p}.scales" in weights
+            return True
 
         nn.quantize(
             model,
@@ -816,6 +872,7 @@ def quantize_model(
         # If the model is already partially quantized, return params so that
         # the config is set on a per-layer basis
         fine_grained_config = True
+        quantized_config["quantization"].update(quant_params)
     else:
         fine_grained_config = False
         quantized_config["quantization"] = quant_params
