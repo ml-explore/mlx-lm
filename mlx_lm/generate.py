@@ -35,6 +35,7 @@ from .models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    TokenBuffer,
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
@@ -222,7 +223,7 @@ def setup_arg_parser():
 
 
 # A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 @contextlib.contextmanager
@@ -525,6 +526,12 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
+    if not cache.can_trim_prompt_cache(model_cache):
+        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+        raise ValueError(
+            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+        )
+
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     quantize_cache_fn = functools.partial(
@@ -570,11 +577,12 @@ def speculative_generate_step(
                 return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
-        while y.size > prefill_step_size:
-            model(y[:prefill_step_size][None], cache=cache)
+        while y.size > 1:
+            n_to_process = min(prefill_step_size, y.size - 1)
+            model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
             mx.eval([c.state for c in cache])
-            y = y[prefill_step_size:]
+            y = y[n_to_process:]
             mx.clear_cache()
         return y
 
@@ -1272,7 +1280,7 @@ class GenerationBatch:
         self._current_logprobs = []
         self._next_tokens = inputs
         self._next_logprobs = []
-        self._token_context = [mx.array(t[-256:]) for t in tokens]
+        self._token_context = [TokenBuffer(t) for t in tokens]
         self._num_tokens = [0] * len(self.uids)
         self._matcher_states = [m.make_state() for m in state_machines]
 
@@ -1320,23 +1328,23 @@ class GenerationBatch:
         self._current_logprobs = self._next_logprobs
         inputs = self._current_tokens
 
-        # Update the token context that will be used by the logits processors
-        for i, ti in enumerate(self._token_context):
-            self._token_context[i] = mx.concatenate(
-                [ti[1:] if len(ti) == 256 else ti, inputs[i : i + 1]]
-            )
-
         # Forward pass
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
 
         # Logits processors
+        token_context = []
         if any(self.logits_processors):
+            # Update the token context that will be used by the logits processors
+            token_context = [
+                tc.update_and_fetch(inputs[i : i + 1])
+                for i, tc in enumerate(self._token_context)
+            ]
             processed_logits = []
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
                 for processor in self.logits_processors[e]:
-                    sample_logits = processor(self.tokens[e], sample_logits)
+                    sample_logits = processor(token_context[e], sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -1358,7 +1366,7 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
-        mx.async_eval(self._next_tokens, self._next_logprobs, self._token_context)
+        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
@@ -1489,6 +1497,7 @@ class BatchGenerator:
     def __init__(
         self,
         model: nn.Module,
+        *,
         max_tokens: int = 128,
         stop_tokens: Optional[Sequence[Sequence[int]]] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -1498,6 +1507,8 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        max_kv_size: Optional[int] = None,
+        stream=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1507,6 +1518,9 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        self.max_kv_size = max_kv_size
+
+        self._stream = stream or generation_stream
 
         self._default_state_machine = SequenceStateMachine(
             {"normal": [(seq, None) for seq in stop_tokens]} if stop_tokens else {},
@@ -1534,9 +1548,13 @@ class BatchGenerator:
         else:
             self._old_wired_limit = None
 
+    @property
+    def stream(self):
+        return self._stream
+
     def close(self):
         if self._old_wired_limit is not None:
-            mx.synchronize(generation_stream)
+            mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -1613,7 +1631,7 @@ class BatchGenerator:
         caches = caches or [None] * len(segments)
         for i in range(len(segments)):
             if caches[i] is None:
-                caches[i] = cache.make_prompt_cache(self.model)
+                caches[i] = self._make_new_cache()
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
@@ -1635,6 +1653,19 @@ class BatchGenerator:
             self._uid_count += 1
 
         return uids
+
+    def _make_new_cache(self):
+        if self.max_kv_size is None:
+            return cache.make_prompt_cache(self.model)
+
+        return [
+            (
+                RotatingKVCache(max_size=self.max_kv_size)
+                if isinstance(ci, KVCache)
+                else ci
+            )
+            for ci in cache.make_prompt_cache(self.model)
+        ]
 
     def _find_uids(self, uids):
         uids = set(uids)
@@ -1820,7 +1851,7 @@ class BatchGenerator:
         Returns:
             Tuple of prompt processing responses and generation responses.
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             return self._next()
 
     def next_generated(self):
@@ -1830,7 +1861,7 @@ class BatchGenerator:
         Returns:
             List of GenerationBatch.Response objects
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             while True:
                 prompt_responses, generation_responses = self._next()
                 if not generation_responses and prompt_responses:
@@ -1861,7 +1892,6 @@ def batch_generate(
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     return_prompt_caches: bool = False,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1880,8 +1910,6 @@ def batch_generate(
           can be per prompt if a list is provided.
        return_prompt_caches (bool): Return the prompt caches in the batch
           responses. Default: ``False``.
-       logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
-          A list of functions that take tokens and logits and return the processed logits. Default: ``None``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
 
@@ -603,6 +603,18 @@ class ArraysCache(_BaseCache):
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
+    @property
+    def batch_size(self):
+        for c in self.cache:
+            if c is not None:
+                return c.shape[0]
+        if self.left_padding is not None:
+            return self.left_padding.size
+        elif self.lengths is not None:
+            return self.lengths.size
+        else:
+            return 1
+
     def __setitem__(self, idx, value):
         self.cache[idx] = value
 
@@ -622,6 +634,8 @@ class ArraysCache(_BaseCache):
         In-place filter to keep just the given indices in the cache.
         """
         self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
+        if self.left_padding is not None:
+            self.left_padding = self.left_padding[batch_indices]
         if self.lengths is not None:
             self.lengths = self.lengths[batch_indices]
 
@@ -630,14 +644,31 @@ class ArraysCache(_BaseCache):
         In-place extend this cache with the other cache.
         """
 
+        a_batch = self.batch_size
+        b_batch = other.batch_size
+
         def cat(a, b):
+            shape = dtype = None
+            if a is not None:
+                shape = a.shape
+                dtype = a.dtype
+            if b is not None:
+                shape = b.shape
+                dtype = b.dtype
+
+            if shape is None:
+                return None
+
             if a is None:
-                return b
+                a = mx.zeros((a_batch,) + shape[1:], dtype=dtype)
             if b is None:
-                return a
+                b = mx.zeros((b_batch,) + shape[1:], dtype=dtype)
+
             return mx.concatenate([a, b])
 
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
+        self.left_padding = cat(self.left_padding, other.left_padding)
+        self.lengths = cat(self.lengths, other.lengths)
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -675,6 +706,7 @@ class ArraysCache(_BaseCache):
 
         # All caches are empty so return early
         if all(c.empty() for c in caches):
+            cache.left_padding = mx.array([0] * B)
             return cache
 
         for e in range(n_state):
@@ -1024,8 +1056,9 @@ class BatchKVCache(_BaseCache):
         def pad(c):
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+                v = mx.array([]).reshape(Bc, H, 0, M)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -1360,8 +1393,9 @@ class BatchRotatingKVCache(_BaseCache):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
-                k = mx.array([]).reshape(B, H, 0, D)
-                v = mx.array([]).reshape(B, H, 0, M)
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+                v = mx.array([]).reshape(Bc, H, 0, M)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
@@ -1381,9 +1415,10 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset = max(self._offset, other._offset)
 
     def extract(self, idx):
+        mx.eval(self.left_padding, self.offset)
         cache = RotatingKVCache(self.max_size)
-        padding = self.left_padding[idx].item()
-        offset = self.offset[idx].item()
+        padding = max(0, self.left_padding.tolist()[idx])
+        offset = self.offset.tolist()[idx]
         cache.keys = self.keys[idx : idx + 1]
         cache.values = self.values[idx : idx + 1]
         cache._idx = self._idx
@@ -1424,8 +1459,8 @@ class BatchRotatingKVCache(_BaseCache):
         for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
             if c.keys is None:
                 continue
-            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)
-            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)
+            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)[..., -l:, :]
+            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)[..., -l:, :]
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
@@ -1447,6 +1482,42 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class TokenBuffer:
+    """A simple token buffer that can be efficiently appended to in a similar
+    fashion to the KVCache.
+
+    Perhaps these could share some logic in the future.
+    """
+
+    step = 256
+
+    def __init__(self, tokens=[]):
+        self._buffer = mx.array(tokens, dtype=mx.int32)
+        self._size = len(tokens)
+
+    def update_and_fetch(self, tokens):
+        start = self._size
+        end = start + len(tokens)
+
+        new_size = ((end + self.step - 1) // self.step) * self.step
+        if new_size > self._buffer.size:
+            self._buffer = mx.concatenate(
+                [self._buffer, mx.zeros(new_size - self._buffer.size, dtype=mx.int32)]
+            )
+        self._buffer[start:end] = tokens
+        self._size = end
+
+        return self._buffer[:end]
+
+    @property
+    def state(self):
+        return self._buffer
+
+    @property
+    def tokens(self):
+        return self._buffer[: self._size]
 
 
 @dataclass

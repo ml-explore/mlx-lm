@@ -15,7 +15,7 @@ from mlx_lm.generate import (
     generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -402,6 +402,42 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
         self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
 
+    def test_batch_generate_processor_tokens_match_prompt_on_first_step(self):
+        prompt = self.tokenizer.encode("hello")
+        seen = []
+
+        def processor(tokens, logits):
+            seen.append(tokens)
+            return logits
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=[processor],
+        )
+        batch_gen.insert([prompt])
+        batch_gen.next_generated()
+
+        self.assertTrue(hasattr(seen[0], "shape"))
+        self.assertEqual(seen[0].tolist(), prompt)
+
+    def test_batch_generate_function_with_logits_processors(self):
+        """Test that batch_generate function with logits_processors produces correct results."""
+        logit_bias = {0: 2000.0, 1: -2000.0}
+        processors = make_logits_processors(logit_bias)
+
+        prompts = [self.tokenizer.encode("hello")]
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+        self.assertEqual(len(response.texts), 1)
+        generated_token = self.tokenizer.encode(response.texts[0])[0]
+        self.assertEqual(generated_token, 0)
+
     def test_batch_generate_with_samplers(self):
         """Test that batch_generate with logits_processors produces correct results."""
         batch_gen = BatchGenerator(
@@ -718,6 +754,57 @@ class TestGenerate(unittest.TestCase):
         while responses := gen.next_generated():
             if all(r.finish_reason is not None for r in responses):
                 break
+
+    def test_batch_max_kv_size_creates_rotating_cache(self):
+        max_kv_size = 256
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            max_kv_size=max_kv_size,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertIsInstance(cache, RotatingKVCache)
+                    self.assertEqual(cache.max_size, max_kv_size)
+
+    def test_batch_max_kv_size_limits_cache_growth(self):
+        max_kv_size = 5
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=10,
+            max_kv_size=max_kv_size,
+            prefill_batch_size=1,
+            prefill_step_size=128,
+            completion_batch_size=1,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertLessEqual(cache.keys.shape[2], max_kv_size)
+
+    def test_batch_max_kv_size_none_creates_regular_cache(self):
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            max_kv_size=None,
+        )
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        gen.insert([prompt])
+
+        for r in gen.next_generated():
+            if r.finish_reason is not None:
+                for cache in r.prompt_cache:
+                    self.assertIsInstance(cache, KVCache)
 
 
 if __name__ == "__main__":
