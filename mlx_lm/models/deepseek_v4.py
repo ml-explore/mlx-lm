@@ -8,6 +8,7 @@
 #
 # Reference: deepseek-ai/DeepSeek-V4 (Apr 2026). mHC: arXiv:2512.24880.
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -18,7 +19,6 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
-from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -79,6 +79,89 @@ class ModelArgs(BaseModelArgs):
 
     # Quantization (FP8 block)
     quantization_config: Optional[Dict] = None
+
+
+class DeepseekV4RoPE(nn.Module):
+    """DeepSeek-V4 rotary embedding.
+
+    The reference implementation applies RoPE to the KV tensor before attention
+    and applies the conjugate rotation to the attention output. The generic MLX
+    RoPE layers do not expose an inverse path, so keep the small DeepSeek-specific
+    implementation here.
+    """
+
+    def __init__(
+        self,
+        dims: int,
+        base: float,
+        scaling_config: Optional[Dict] = None,
+    ):
+        super().__init__()
+        self.dims = dims
+
+        inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
+        rope_type = None
+        if scaling_config is not None:
+            rope_type = scaling_config.get("type") or scaling_config.get("rope_type")
+
+        if rope_type in ("yarn", "deepseek_yarn"):
+            factor = scaling_config["factor"]
+            original_max_position_embeddings = scaling_config[
+                "original_max_position_embeddings"
+            ]
+            beta_fast = scaling_config.get("beta_fast", 32)
+            beta_slow = scaling_config.get("beta_slow", 1)
+
+            def correction_dim(num_rotations):
+                return (
+                    dims
+                    * math.log(
+                        original_max_position_embeddings
+                        / (num_rotations * 2 * math.pi)
+                    )
+                    / (2 * math.log(base))
+                )
+
+            low = math.floor(correction_dim(beta_fast))
+            high = math.ceil(correction_dim(beta_slow))
+            low = max(low, 0)
+            high = min(high, dims - 1)
+            if low == high:
+                high += 0.001
+
+            ramp = (mx.arange(dims // 2, dtype=mx.float32) - low) / (high - low)
+            smooth = 1 - mx.clip(ramp, 0, 1)
+            inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
+        elif rope_type not in (None, "default", "linear"):
+            raise ValueError(f"Unsupported DeepSeek-V4 RoPE type {rope_type}")
+
+        # This is derived from config, not a checkpoint parameter.
+        self._inv_freq = (inv_freq,)
+
+    @property
+    def inv_freq(self):
+        return self._inv_freq[0]
+
+    def __call__(self, x: mx.array, offset: int = 0, inverse: bool = False):
+        dtype = x.dtype
+        T = x.shape[-2]
+        pos = mx.arange(offset, offset + T, dtype=mx.float32)
+        theta = pos[:, None] * self.inv_freq[None, :]
+        if inverse:
+            theta = -theta
+
+        broadcast_shape = (1,) * (x.ndim - 2) + theta.shape
+        cos = mx.cos(theta).reshape(broadcast_shape).astype(dtype)
+        sin = mx.sin(theta).reshape(broadcast_shape).astype(dtype)
+
+        rot = x[..., : self.dims].reshape(*x.shape[:-1], self.dims // 2, 2)
+        x0 = rot[..., 0]
+        x1 = rot[..., 1]
+        y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
+        y = y.reshape(*x.shape[:-1], self.dims)
+        if x.shape[-1] == self.dims:
+            return y
+        return mx.concatenate([y, x[..., self.dims :]], axis=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -476,14 +559,23 @@ class Compressor(nn.Module):
         self.rope_head_dim = args.qk_rope_head_dim
         self.ratio = compress_ratio
         self.overlap = compress_ratio == 4
-        coff = 1 + int(self.overlap)
-        self.wkv   = nn.Linear(self.dim, coff * head_dim, bias=False)
-        self.wgate = nn.Linear(self.dim, coff * head_dim, bias=False)
-        self.ape   = mx.zeros((compress_ratio, coff * head_dim), dtype=mx.float32)
+        out_dim = head_dim * (2 if self.overlap else 1)
+        self.wkv = nn.Linear(self.dim, out_dim, bias=False)
+        self.wgate = nn.Linear(self.dim, out_dim, bias=False)
+        self.ape = mx.zeros((compress_ratio, out_dim), dtype=mx.float32)
         self.norm  = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
+    def _overlap_transform(self, tensor: mx.array, value: float) -> mx.array:
+        B, S, R, _ = tensor.shape
+        D = self.head_dim
+        out = mx.full((B, S, 2 * R, D), value, dtype=tensor.dtype)
+        out[:, :, R:] = tensor[:, :, :, D:]
+        out[:, 1:, :R] = tensor[:, :-1, :, :D]
+        return out
+
     def __call__(self, x: mx.array) -> mx.array:
-        # Prefill-only MVP: chunk x into non-overlapping windows of `ratio` tokens.
+        # Prefill-only MVP: chunk x into windows of `ratio` tokens. Ratio-4
+        # layers use the overlapping layout from the reference implementation.
         # Returns compressed KV: [B, S//ratio, head_dim] (bf16).
         B, S, _ = x.shape
         r = self.ratio
@@ -491,8 +583,11 @@ class Compressor(nn.Module):
         if keep == 0:
             return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
         xf = x[:, :keep].astype(mx.float32)
-        kv    = self.wkv(xf).reshape(B, keep // r, r, self.head_dim)
-        score = self.wgate(xf).reshape(B, keep // r, r, self.head_dim) + self.ape
+        kv = self.wkv(xf).reshape(B, keep // r, r, -1)
+        score = self.wgate(xf).reshape(B, keep // r, r, -1) + self.ape
+        if self.overlap:
+            kv = self._overlap_transform(kv, 0.0)
+            score = self._overlap_transform(score, float("-inf"))
         weights = mx.softmax(score, axis=2, precise=True)
         kv = (kv * weights).sum(axis=2)
         return self.norm(kv.astype(x.dtype))
@@ -555,26 +650,64 @@ class V4Attention(nn.Module):
         self.wo_a = nn.Linear(group_feat, self.n_groups * self.o_lora_rank, bias=False)
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=args.attention_bias)
 
-        # rope (sliding layers use base theta; compressed layers use YaRN + compress_rope_theta)
+        # RoPE: sliding layers use base theta; compressed layers use YaRN with
+        # compress_rope_theta. DeepSeek-V4 also inverse-rotates the attention
+        # output rope dims after sparse attention.
         if self.compress_ratio:
             base = args.compress_rope_theta
             scaling = args.rope_scaling
         else:
             base = args.rope_theta
             scaling = None
-        self.rope = initialize_rope(
-            dims=self.rope_head_dim,
-            base=base,
-            traditional=True,
-            max_position_embeddings=args.max_position_embeddings,
-            scaling_config=scaling,
-        )
+        self.rope = DeepseekV4RoPE(self.rope_head_dim, base, scaling)
 
         # Compressor / Indexer — present only when compress_ratio > 0
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio)
+
+    def _grouped_output_projection(self, out: mx.array) -> mx.array:
+        # DeepSeek-V4 stores wo_a as grouped low-rank blocks. QuantizedLinear
+        # packs the per-group input dimension, so grouped slicing happens on
+        # output rows while each group uses the full packed input row.
+        B, S = out.shape[:2]
+        group_feat = (self.n_heads * self.head_dim) // self.n_groups
+        out = out.reshape(B, S, self.n_groups, group_feat)
+
+        if isinstance(self.wo_a, nn.QuantizedLinear):
+            pieces = []
+            for group_idx in range(self.n_groups):
+                rows = slice(
+                    group_idx * self.o_lora_rank,
+                    (group_idx + 1) * self.o_lora_rank,
+                )
+                biases = (
+                    self.wo_a.biases[rows]
+                    if self.wo_a.biases is not None
+                    else None
+                )
+                y = mx.quantized_matmul(
+                    out[:, :, group_idx, :],
+                    self.wo_a.weight[rows],
+                    scales=self.wo_a.scales[rows],
+                    biases=biases,
+                    transpose=True,
+                    group_size=self.wo_a.group_size,
+                    bits=self.wo_a.bits,
+                    mode=self.wo_a.mode,
+                )
+                if "bias" in self.wo_a:
+                    y = y + self.wo_a.bias[rows]
+                pieces.append(y)
+            return mx.concatenate(pieces, axis=-1)
+
+        wa = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, group_feat)
+        out = mx.einsum("bsgd,grd->bsgr", out, wa)
+        out = out.reshape(B, S, self.n_groups * self.o_lora_rank)
+        if "bias" in self.wo_a:
+            out = out + self.wo_a.bias
+        return out
 
     def __call__(self, x: mx.array, mask=None, cache=None):
         B, S, _ = x.shape
@@ -605,27 +738,22 @@ class V4Attention(nn.Module):
 
         # Standard SDPA (compressed KV + topk deferred to v0.2)
         out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask,
+            q,
+            k,
+            v,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attn_sink.astype(q.dtype),
         )
+
+        out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
+        out_pe = self.rope(out_pe, offset=offset, inverse=True)
+        out = mx.concatenate([out_nope, out_pe], axis=-1)
 
         # Grouped low-rank projection: [B, n_heads, S, head_dim] -> [B, S, n_heads*head_dim]
         out = out.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * self.head_dim)
-        # Split into o_groups along the head_dim*n_heads axis; apply per-group wo_a via einsum.
-        out = out.reshape(B, S, self.n_groups, -1)
-        # wo_a is stored as nn.Linear(group_feat, n_groups*o_lora_rank). Logical weight shape is
-        # [n_groups*o_lora_rank, group_feat]; we reshape to [n_groups, o_lora_rank, group_feat]
-        # for a block-diagonal projection. For quantized models, .weight is packed int4 — must
-        # dequantize first.
-        if hasattr(self.wo_a, "scales"):
-            full_w = mx.dequantize(
-                self.wo_a.weight, self.wo_a.scales, self.wo_a.biases,
-                self.wo_a.group_size, self.wo_a.bits,
-            )
-        else:
-            full_w = self.wo_a.weight
-        wa = full_w.reshape(self.n_groups, self.o_lora_rank, -1)
-        out = mx.einsum("bsgd,grd->bsgr", out, wa)                 # [B,S,n_groups,o_lora_rank]
-        out = out.reshape(B, S, self.n_groups * self.o_lora_rank)
+        out = self._grouped_output_projection(out)
         return self.wo_b(out)
 
 
@@ -829,9 +957,18 @@ class Model(nn.Module):
             new[k] = v
         weights = new
 
-        # 2) FP8 block dequant: `X.weight` + `X.scale` -> dequantized bf16 `X.weight`
+        def _scale_to_float(scale: mx.array) -> mx.array:
+            if scale.dtype == mx.uint8:
+                return mx.exp((scale.astype(mx.float32) - 127.0) * math.log(2.0))
+            return scale.astype(mx.float32)
+
+        # 2) FP8/FP4 block dequant:
+        #    `X.weight` + `X.scale` -> dequantized bf16 `X.weight`
+        #    Routed experts in Flash are FP4-packed int8; other scaled matrices
+        #    are FP8 e4m3 with 128x128 block scales.
         def _dequant_fp8_block(weight: mx.array, scale: mx.array, bs: int = 128) -> mx.array:
             weight = mx.from_fp8(weight, dtype=mx.bfloat16)
+            scale = _scale_to_float(scale)
             m, n = weight.shape
             pad_b = (-m) % bs
             pad_s = (-n) % bs
@@ -840,11 +977,36 @@ class Model(nn.Module):
             weight = (weight * scale[:, None, :, None]).reshape(m + pad_b, n + pad_s)
             return weight[:m, :n].astype(mx.bfloat16)
 
+        def _dequant_fp4_block(weight: mx.array, scale: mx.array, bs: int = 32) -> mx.array:
+            table = mx.array(
+                [
+                    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+                ],
+                dtype=mx.float32,
+            )
+            packed = weight.astype(mx.uint8)
+            low = packed & 0x0F
+            high = (packed >> 4) & 0x0F
+            unpacked = mx.stack([mx.take(table, low), mx.take(table, high)], axis=-1)
+            unpacked = unpacked.reshape(weight.shape[0], weight.shape[1] * 2)
+            scale = mx.repeat(_scale_to_float(scale), bs, axis=-1)
+            return (unpacked * scale).astype(mx.bfloat16)
+
         new = {}
         for k, v in weights.items():
             if k.endswith(".scale"):
                 wk = k[:-len(".scale")] + ".weight"
-                if wk in weights and weights[wk].dtype in (mx.uint8,):
+                weight = weights.get(wk)
+                if (
+                    weight is not None
+                    and ".ffn.experts." in wk
+                    and "shared_experts" not in wk
+                    and weight.dtype in (mx.int8, mx.uint8)
+                    and v.shape[-1] * 16 == weight.shape[-1]
+                ):
+                    new[wk] = _dequant_fp4_block(weight, v)
+                elif weight is not None and weight.dtype in (mx.uint8,):
                     new[wk] = _dequant_fp8_block(weights[wk], v)
                 else:
                     new[k] = v
@@ -855,6 +1017,7 @@ class Model(nn.Module):
         # 3) Remap top-level names to our module structure
         top_remap = {
             "embed.weight":    "model.embed_tokens.weight",
+            "norm.weight":     "model.norm.weight",
             "head.weight":     "lm_head.weight",
             "norm.weight":     "model.norm.weight",
             "hc_head_fn":      "model.hc_head.fn",

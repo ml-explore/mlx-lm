@@ -8,6 +8,8 @@ import json
 import os
 import resource
 import shutil
+import struct
+import warnings
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -279,6 +281,62 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _reinterpret_safetensor_e8m0_scales_as_uint8(path: str) -> bool:
+    """Rewrite safetensors E8M0 scale metadata to U8 in-place.
+
+    DeepSeek-V4 stores FP8/FP4 block scales as float8_e8m0fnu. The payload is
+    one byte per element, and the model sanitizer decodes those exponent bytes.
+    MLX currently rejects the safetensors dtype before the sanitizer can run, so
+    reinterpret the header as uint8 while leaving tensor bytes untouched.
+    """
+    with open(path, "r+b") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = f.read(header_len)
+        metadata = json.loads(header)
+
+        changed = False
+        for tensor_metadata in metadata.values():
+            if (
+                isinstance(tensor_metadata, dict)
+                and tensor_metadata.get("dtype") == "F8_E8M0"
+            ):
+                tensor_metadata["dtype"] = "U8"
+                changed = True
+
+        if not changed:
+            return False
+
+        new_header = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+        if len(new_header) > header_len:
+            raise RuntimeError(
+                f"Cannot reinterpret F8_E8M0 safetensors header in {path}: "
+                "rewritten header is larger than original header."
+            )
+
+        f.seek(8)
+        f.write(new_header)
+        f.write(b" " * (header_len - len(new_header)))
+
+    return True
+
+
+def _load_safetensors(path: str, *, allow_e8m0_uint8: bool = False) -> dict:
+    try:
+        return mx.load(path)
+    except RuntimeError as e:
+        if "F8_E8M0" not in str(e) or not allow_e8m0_uint8:
+            raise
+
+        if _reinterpret_safetensor_e8m0_scales_as_uint8(path):
+            warnings.warn(
+                f"Reinterpreted F8_E8M0 scale metadata as uint8 in {path}. "
+                "Tensor bytes were not changed.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return mx.load(path)
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -319,8 +377,9 @@ def load_model(
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
+    allow_e8m0_uint8 = config.get("model_type") == "deepseek_v4"
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(_load_safetensors(wf, allow_e8m0_uint8=allow_e8m0_uint8))
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
