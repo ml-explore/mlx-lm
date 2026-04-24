@@ -695,29 +695,36 @@ class V4Attention(nn.Module):
         out = out.reshape(B, L, self.o_groups, group_feat)
 
         if isinstance(self.wo_a, nn.QuantizedLinear):
-            pieces = []
-            for group_idx in range(self.o_groups):
-                rows = slice(
-                    group_idx * self.o_lora_rank,
-                    (group_idx + 1) * self.o_lora_rank,
-                )
-                biases = (
-                    self.wo_a.biases[rows] if self.wo_a.biases is not None else None
-                )
-                y = mx.quantized_matmul(
-                    out[:, :, group_idx, :],
-                    self.wo_a.weight[rows],
-                    scales=self.wo_a.scales[rows],
-                    biases=biases,
-                    transpose=True,
-                    group_size=self.wo_a.group_size,
-                    bits=self.wo_a.bits,
-                    mode=self.wo_a.mode,
-                )
-                if "bias" in self.wo_a:
-                    y = y + self.wo_a.bias[rows]
-                pieces.append(y)
-            return mx.concatenate(pieces, axis=-1)
+            out = out.transpose(2, 0, 1, 3)
+            weight = self.wo_a.weight.reshape(self.o_groups, self.o_lora_rank, -1)[
+                :, None
+            ]
+            scales = self.wo_a.scales.reshape(self.o_groups, self.o_lora_rank, -1)[
+                :, None
+            ]
+            biases = (
+                None
+                if self.wo_a.biases is None
+                else self.wo_a.biases.reshape(self.o_groups, self.o_lora_rank, -1)[
+                    :, None
+                ]
+            )
+            out = mx.quantized_matmul(
+                out,
+                weight,
+                scales=scales,
+                biases=biases,
+                transpose=True,
+                group_size=self.wo_a.group_size,
+                bits=self.wo_a.bits,
+                mode=self.wo_a.mode,
+            )
+            out = out.transpose(1, 2, 0, 3).reshape(
+                B, L, self.o_groups * self.o_lora_rank
+            )
+            if "bias" in self.wo_a:
+                out = out + self.wo_a.bias
+            return out
 
         weight = self.wo_a.weight.reshape(self.o_groups, self.o_lora_rank, group_feat)
         out = mx.einsum("bsgd,grd->bsgr", out, weight)
