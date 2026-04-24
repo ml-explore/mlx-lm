@@ -263,6 +263,10 @@ class MoEGate(nn.Module):
             ids = input_ids.reshape(-1)
             inds = self.tid2eid[ids].astype(mx.int32)
             weights = mx.take_along_axis(scores, inds, axis=-1)
+            # Reshape inds/weights back to match x's leading dims so SwitchGLU
+            # can broadcast against x: [B, S, top_k] (mirrors non-hash branch).
+            inds = inds.reshape(*x.shape[:-1], self.top_k)
+            weights = weights.reshape(*x.shape[:-1], self.top_k)
         else:
             scores = x.astype(mx.float32) @ self.weight.T.astype(mx.float32)
             scores = _score_func(scores, self.score_func)
@@ -349,9 +353,11 @@ class Compressor(nn.Module):
         self.head_dim = head_dim
         self.rope_head_dim = args.qk_rope_head_dim
         self.ratio = compress_ratio
-        self.wkv   = nn.Linear(self.dim, head_dim, bias=False)
-        self.wgate = nn.Linear(self.dim, head_dim, bias=False)
-        self.ape   = mx.zeros((compress_ratio, head_dim), dtype=mx.float32)
+        self.overlap = compress_ratio == 4
+        coff = 1 + int(self.overlap)
+        self.wkv   = nn.Linear(self.dim, coff * head_dim, bias=False)
+        self.wgate = nn.Linear(self.dim, coff * head_dim, bias=False)
+        self.ape   = mx.zeros((compress_ratio, coff * head_dim), dtype=mx.float32)
         self.norm  = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -484,8 +490,18 @@ class V4Attention(nn.Module):
         out = out.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * self.head_dim)
         # Split into o_groups along the head_dim*n_heads axis; apply per-group wo_a via einsum.
         out = out.reshape(B, S, self.n_groups, -1)
-        # wo_a.weight shape is [n_groups * o_lora_rank, group_feat]; reshape to [n_groups, o_lora_rank, group_feat]
-        wa = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
+        # wo_a is stored as nn.Linear(group_feat, n_groups*o_lora_rank). Logical weight shape is
+        # [n_groups*o_lora_rank, group_feat]; we reshape to [n_groups, o_lora_rank, group_feat]
+        # for a block-diagonal projection. For quantized models, .weight is packed int4 — must
+        # dequantize first.
+        if hasattr(self.wo_a, "scales"):
+            full_w = mx.dequantize(
+                self.wo_a.weight, self.wo_a.scales, self.wo_a.biases,
+                self.wo_a.group_size, self.wo_a.bits,
+            )
+        else:
+            full_w = self.wo_a.weight
+        wa = full_w.reshape(self.n_groups, self.o_lora_rank, -1)
         out = mx.einsum("bsgd,grd->bsgr", out, wa)                 # [B,S,n_groups,o_lora_rank]
         out = out.reshape(B, S, self.n_groups * self.o_lora_rank)
         return self.wo_b(out)
@@ -718,6 +734,7 @@ class Model(nn.Module):
         top_remap = {
             "embed.weight":    "model.embed_tokens.weight",
             "head.weight":     "lm_head.weight",
+            "norm.weight":     "model.norm.weight",
             "hc_head_fn":      "model.hc_head.fn",
             "hc_head_base":    "model.hc_head.base",
             "hc_head_scale":   "model.hc_head.scale",
