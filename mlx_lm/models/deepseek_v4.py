@@ -541,6 +541,48 @@ class V4Attention(nn.Module):
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio)
 
+    def _grouped_output_projection(self, out: mx.array) -> mx.array:
+        # DeepSeek-V4 stores wo_a as grouped low-rank blocks. QuantizedLinear
+        # packs the per-group input dimension, so grouped slicing happens on
+        # output rows while each group uses the full packed input row.
+        B, S = out.shape[:2]
+        group_feat = (self.n_heads * self.head_dim) // self.n_groups
+        out = out.reshape(B, S, self.n_groups, group_feat)
+
+        if isinstance(self.wo_a, nn.QuantizedLinear):
+            pieces = []
+            for group_idx in range(self.n_groups):
+                rows = slice(
+                    group_idx * self.o_lora_rank,
+                    (group_idx + 1) * self.o_lora_rank,
+                )
+                biases = (
+                    self.wo_a.biases[rows]
+                    if self.wo_a.biases is not None
+                    else None
+                )
+                y = mx.quantized_matmul(
+                    out[:, :, group_idx, :],
+                    self.wo_a.weight[rows],
+                    scales=self.wo_a.scales[rows],
+                    biases=biases,
+                    transpose=True,
+                    group_size=self.wo_a.group_size,
+                    bits=self.wo_a.bits,
+                    mode=self.wo_a.mode,
+                )
+                if "bias" in self.wo_a:
+                    y = y + self.wo_a.bias[rows]
+                pieces.append(y)
+            return mx.concatenate(pieces, axis=-1)
+
+        wa = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, group_feat)
+        out = mx.einsum("bsgd,grd->bsgr", out, wa)
+        out = out.reshape(B, S, self.n_groups * self.o_lora_rank)
+        if "bias" in self.wo_a:
+            out = out + self.wo_a.bias
+        return out
+
     def __call__(self, x: mx.array, mask=None, cache=None):
         B, S, _ = x.shape
 
@@ -585,12 +627,7 @@ class V4Attention(nn.Module):
 
         # Grouped low-rank projection: [B, n_heads, S, head_dim] -> [B, S, n_heads*head_dim]
         out = out.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * self.head_dim)
-        # Split into o_groups along the head_dim*n_heads axis; apply per-group wo_a via einsum.
-        out = out.reshape(B, S, self.n_groups, -1)
-        # wo_a.weight shape is [n_groups * o_lora_rank, group_feat]; reshape to [n_groups, o_lora_rank, group_feat]
-        wa = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
-        out = mx.einsum("bsgd,grd->bsgr", out, wa)                 # [B,S,n_groups,o_lora_rank]
-        out = out.reshape(B, S, self.n_groups * self.o_lora_rank)
+        out = self._grouped_output_projection(out)
         return self.wo_b(out)
 
 

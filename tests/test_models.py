@@ -1603,6 +1603,43 @@ class TestModels(unittest.TestCase):
             low,
         )
 
+    def test_deepseek_v4_quantized_grouped_output_projection(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0],
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        attn = deepseek_v4.V4Attention(args, layer_idx=0)
+        attn.wo_a = nn.QuantizedLinear.from_linear(
+            attn.wo_a,
+            group_size=32,
+            bits=6,
+            mode="affine",
+        )
+
+        out = mx.random.uniform(shape=(1, 3, args.num_attention_heads * args.head_dim))
+        y = attn._grouped_output_projection(out)
+        mx.eval(y)
+        self.assertEqual(y.shape, (1, 3, args.o_groups * args.o_lora_rank))
+
     def test_deepseek_v4_sanitize_unpacks_fp4_experts(self):
         from mlx_lm.models import deepseek_v4
 
