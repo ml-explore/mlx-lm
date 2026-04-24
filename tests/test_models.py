@@ -1520,7 +1520,7 @@ class TestModels(unittest.TestCase):
             (2 * args.index_head_dim, args.hidden_size),
         )
 
-        for dtype in [mx.float32, mx.float16]:
+        for dtype in [mx.float32, mx.float16, mx.bfloat16]:
             model.update(
                 tree_map(
                     lambda p: p.astype(dtype)
@@ -1529,6 +1529,8 @@ class TestModels(unittest.TestCase):
                     model.parameters(),
                 )
             )
+            for layer in model.model.layers:
+                layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
 
             inputs = mx.array([[0, 1, 2, 3, 4]], dtype=mx.int32)
             outputs = model(inputs)

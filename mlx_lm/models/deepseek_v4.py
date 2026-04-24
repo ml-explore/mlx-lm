@@ -576,7 +576,7 @@ class V4Attention(nn.Module):
             cache=cache,
             scale=self.scale,
             mask=mask,
-            sinks=self.attn_sink,
+            sinks=self.attn_sink.astype(q.dtype),
         )
 
         out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
