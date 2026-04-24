@@ -86,7 +86,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
         return mx.sqrt(nn.softplus(scores))
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
-
+@mx.compile
 def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     if limit and limit > 0:
         gate = mx.minimum(gate, limit)
@@ -197,7 +197,6 @@ def _apply_partial_rope(
     nope, pe = mx.split(x, [x.shape[-1] - rope_dim], axis=-1)
     pe = rope(pe, offset=offset, inverse=inverse, positions=positions)
     return mx.concatenate([nope, pe], axis=-1)
-
 
 @mx.compile
 def hc_split_sinkhorn(
@@ -906,8 +905,14 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            if ".ffn.switch_mlp." in path:
-                return {"group_size": 32, "bits": 4}
+            if path.endswith(
+                (
+                    ".ffn.switch_mlp.gate_proj",
+                    ".ffn.switch_mlp.up_proj",
+                    ".ffn.switch_mlp.down_proj",
+                )
+            ):
+                return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             return True
 
         return predicate
