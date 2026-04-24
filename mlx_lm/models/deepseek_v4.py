@@ -199,6 +199,7 @@ def _apply_partial_rope(
     return mx.concatenate([nope, pe], axis=-1)
 
 
+@mx.compile
 def hc_split_sinkhorn(
     mixes: mx.array,
     scale: mx.array,
