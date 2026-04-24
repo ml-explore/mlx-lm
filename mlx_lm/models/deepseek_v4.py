@@ -81,6 +81,26 @@ class ModelArgs(BaseModelArgs):
     # Quantization (FP8 block)
     quantization_config: Optional[Dict] = None
 
+    def __post_init__(self):
+        # Auto-fill compress_ratios with V4 defaults if not specified, and
+        # validate length / values. Adapted from @eauchs c6a7828 (#1192).
+        if not self.compress_ratios:
+            n = self.num_hidden_layers
+            self.compress_ratios = (
+                [0]
+                + [4 if i % 2 else 128 for i in range(max(n - 2, 0))]
+                + ([0] if n >= 2 else [])
+            )
+        self.compress_ratios = list(self.compress_ratios[: self.num_hidden_layers])
+        if len(self.compress_ratios) != self.num_hidden_layers:
+            raise ValueError(
+                "`compress_ratios` must have one entry per hidden layer, "
+                f"got {len(self.compress_ratios)} for {self.num_hidden_layers} layers."
+            )
+        bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
+        if bad:
+            raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
+
 
 class DeepseekV4RoPE(nn.Module):
     """DeepSeek-V4 rotary embedding.
