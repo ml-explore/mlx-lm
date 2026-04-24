@@ -413,11 +413,7 @@ class HyperConnection(nn.Module):
         comb: mx.array,
     ):
         y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
-        y = y + mx.einsum(
-            "bsij,bsjd->bsid",
-            comb.astype(mx.float32),
-            residual.astype(mx.float32),
-        )
+        y = y + mx.matmul(comb.astype(mx.float32), residual.astype(mx.float32))
         return y.astype(block_out.dtype)
 
 
