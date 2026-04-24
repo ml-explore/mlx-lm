@@ -392,14 +392,23 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    if (
+        config.get("quantization", None) is None
+        and getattr(model_args, "quantization", None) is not None
+        and any(k.endswith(".scales") for k in weights)
+    ):
+        config["quantization"] = model_args.quantization
+
     def _quantize(quantization):
         def class_predicate(p, m):
+            if not hasattr(m, "to_quantized"):
+                return False
+            if f"{p}.scales" not in weights:
+                return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            return f"{p}.scales" in weights
+            return True
 
         nn.quantize(
             model,
@@ -863,6 +872,7 @@ def quantize_model(
         # If the model is already partially quantized, return params so that
         # the config is set on a per-layer basis
         fine_grained_config = True
+        quantized_config["quantization"].update(quant_params)
     else:
         fine_grained_config = False
         quantized_config["quantization"] = quant_params
