@@ -1513,7 +1513,6 @@ class TestModels(unittest.TestCase):
             )
         )
 
-
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 

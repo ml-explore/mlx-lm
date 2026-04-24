@@ -60,7 +60,6 @@ MAX_FILE_SIZE_GB = 5
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 
-
 def _parse_size(x):
     sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
     split = 0
