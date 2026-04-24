@@ -1631,9 +1631,9 @@ class TestModels(unittest.TestCase):
         )
         weights = {
             "layers.0.ffn.experts.0.w1.weight": packed,
-            "layers.0.ffn.experts.0.w1.scale": mx.ones((2, 1), dtype=mx.float32),
+            "layers.0.ffn.experts.0.w1.scale": mx.full((2, 1), 127, dtype=mx.uint8),
             "layers.0.ffn.experts.1.w1.weight": packed,
-            "layers.0.ffn.experts.1.w1.scale": mx.ones((2, 1), dtype=mx.float32),
+            "layers.0.ffn.experts.1.w1.scale": mx.full((2, 1), 127, dtype=mx.uint8),
         }
 
         converted = model.sanitize(weights)

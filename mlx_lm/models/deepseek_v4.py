@@ -791,7 +791,7 @@ class Model(nn.Module):
 
         def _scale_to_float(scale: mx.array) -> mx.array:
             if scale.dtype == mx.uint8:
-                return mx.exp2(scale.astype(mx.float32) - 127.0)
+                return mx.exp((scale.astype(mx.float32) - 127.0) * math.log(2.0))
             return scale.astype(mx.float32)
 
         # 2) FP8/FP4 block dequant:
