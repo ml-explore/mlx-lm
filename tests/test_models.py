@@ -1422,6 +1422,55 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_deepseek_v4(self):
+        from mlx_lm.models import deepseek_v4
+
+        # Tiny dims that respect V4 invariants:
+        #   n_heads * head_dim must be divisible by o_groups
+        #   head_dim > qk_rope_head_dim (nope_head_dim = head_dim - rope > 0)
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=1024,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            q_lora_rank=16,
+            o_lora_rank=16,
+            o_groups=4,
+            attention_bias=False,
+            sliding_window=64,
+            compress_ratios=[],
+            index_n_heads=2,
+            index_head_dim=16,
+            index_topk=8,
+            compress_rope_theta=160000.0,
+            moe_intermediate_size=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=2,
+            scoring_func="sqrtsoftplus",
+            topk_method="noaux_tc",
+            norm_topk_prob=True,
+            routed_scaling_factor=1.5,
+            swiglu_limit=10.0,
+            hc_mult=4,
+            hc_sinkhorn_iters=4,
+            hc_eps=1e-6,
+            num_nextn_predict_layers=0,
+            max_position_embeddings=128,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            rms_norm_eps=1e-6,
+        )
+        model = deepseek_v4.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
