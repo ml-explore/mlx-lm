@@ -8,6 +8,7 @@
 #
 # Reference: deepseek-ai/DeepSeek-V4 (Apr 2026). mHC: arXiv:2512.24880.
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -18,7 +19,6 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
-from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -79,6 +79,84 @@ class ModelArgs(BaseModelArgs):
 
     # Quantization (FP8 block)
     quantization_config: Optional[Dict] = None
+
+
+class DeepseekV4RoPE(nn.Module):
+    """DeepSeek-V4 rotary embedding.
+
+    The reference implementation applies RoPE to the KV tensor before attention
+    and applies the conjugate rotation to the attention output. The generic MLX
+    RoPE layers do not expose an inverse path, so keep the small DeepSeek-specific
+    implementation here.
+    """
+
+    def __init__(
+        self,
+        dims: int,
+        base: float,
+        scaling_config: Optional[Dict] = None,
+    ):
+        super().__init__()
+        self.dims = dims
+
+        inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
+        rope_type = None
+        if scaling_config is not None:
+            rope_type = scaling_config.get("type") or scaling_config.get("rope_type")
+
+        if rope_type in ("yarn", "deepseek_yarn"):
+            factor = scaling_config["factor"]
+            original_max_position_embeddings = scaling_config[
+                "original_max_position_embeddings"
+            ]
+            beta_fast = scaling_config.get("beta_fast", 32)
+            beta_slow = scaling_config.get("beta_slow", 1)
+
+            def correction_dim(num_rotations):
+                return (
+                    dims
+                    * math.log(
+                        original_max_position_embeddings
+                        / (num_rotations * 2 * math.pi)
+                    )
+                    / (2 * math.log(base))
+                )
+
+            low = math.floor(correction_dim(beta_fast))
+            high = math.ceil(correction_dim(beta_slow))
+            low = max(low, 0)
+            high = min(high, dims - 1)
+            if low == high:
+                high += 0.001
+
+            ramp = (mx.arange(dims // 2, dtype=mx.float32) - low) / (high - low)
+            smooth = 1 - mx.clip(ramp, 0, 1)
+            inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
+        elif rope_type not in (None, "default", "linear"):
+            raise ValueError(f"Unsupported DeepSeek-V4 RoPE type {rope_type}")
+
+        self.inv_freq = inv_freq
+
+    def __call__(self, x: mx.array, offset: int = 0, inverse: bool = False):
+        dtype = x.dtype
+        T = x.shape[-2]
+        pos = mx.arange(offset, offset + T, dtype=mx.float32)
+        theta = pos[:, None] * self.inv_freq[None, :]
+        if inverse:
+            theta = -theta
+
+        broadcast_shape = (1,) * (x.ndim - 2) + theta.shape
+        cos = mx.cos(theta).reshape(broadcast_shape).astype(dtype)
+        sin = mx.sin(theta).reshape(broadcast_shape).astype(dtype)
+
+        rot = x[..., : self.dims].reshape(*x.shape[:-1], self.dims // 2, 2)
+        x0 = rot[..., 0]
+        x1 = rot[..., 1]
+        y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
+        y = y.reshape(*x.shape[:-1], self.dims)
+        if x.shape[-1] == self.dims:
+            return y
+        return mx.concatenate([y, x[..., self.dims :]], axis=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -349,13 +427,24 @@ class Compressor(nn.Module):
         self.head_dim = head_dim
         self.rope_head_dim = args.qk_rope_head_dim
         self.ratio = compress_ratio
-        self.wkv   = nn.Linear(self.dim, head_dim, bias=False)
-        self.wgate = nn.Linear(self.dim, head_dim, bias=False)
-        self.ape   = mx.zeros((compress_ratio, head_dim), dtype=mx.float32)
+        self.overlap = compress_ratio == 4
+        out_dim = head_dim * (2 if self.overlap else 1)
+        self.wkv = nn.Linear(self.dim, out_dim, bias=False)
+        self.wgate = nn.Linear(self.dim, out_dim, bias=False)
+        self.ape = mx.zeros((compress_ratio, out_dim), dtype=mx.float32)
         self.norm  = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
+    def _overlap_transform(self, tensor: mx.array, value: float) -> mx.array:
+        B, S, R, _ = tensor.shape
+        D = self.head_dim
+        out = mx.full((B, S, 2 * R, D), value, dtype=tensor.dtype)
+        out[:, :, R:] = tensor[:, :, :, D:]
+        out[:, 1:, :R] = tensor[:, :-1, :, :D]
+        return out
+
     def __call__(self, x: mx.array) -> mx.array:
-        # Prefill-only MVP: chunk x into non-overlapping windows of `ratio` tokens.
+        # Prefill-only MVP: chunk x into windows of `ratio` tokens. Ratio-4
+        # layers use the overlapping layout from the reference implementation.
         # Returns compressed KV: [B, S//ratio, head_dim] (bf16).
         B, S, _ = x.shape
         r = self.ratio
@@ -363,8 +452,11 @@ class Compressor(nn.Module):
         if keep == 0:
             return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
         xf = x[:, :keep].astype(mx.float32)
-        kv    = self.wkv(xf).reshape(B, keep // r, r, self.head_dim)
-        score = self.wgate(xf).reshape(B, keep // r, r, self.head_dim) + self.ape
+        kv = self.wkv(xf).reshape(B, keep // r, r, -1)
+        score = self.wgate(xf).reshape(B, keep // r, r, -1) + self.ape
+        if self.overlap:
+            kv = self._overlap_transform(kv, 0.0)
+            score = self._overlap_transform(score, float("-inf"))
         weights = mx.softmax(score, axis=2, precise=True)
         kv = (kv * weights).sum(axis=2)
         return self.norm(kv.astype(x.dtype))
@@ -427,20 +519,16 @@ class V4Attention(nn.Module):
         self.wo_a = nn.Linear(group_feat, self.n_groups * self.o_lora_rank, bias=False)
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=args.attention_bias)
 
-        # rope (sliding layers use base theta; compressed layers use YaRN + compress_rope_theta)
+        # RoPE: sliding layers use base theta; compressed layers use YaRN with
+        # compress_rope_theta. DeepSeek-V4 also inverse-rotates the attention
+        # output rope dims after sparse attention.
         if self.compress_ratio:
             base = args.compress_rope_theta
             scaling = args.rope_scaling
         else:
             base = args.rope_theta
             scaling = None
-        self.rope = initialize_rope(
-            dims=self.rope_head_dim,
-            base=base,
-            traditional=True,
-            max_position_embeddings=args.max_position_embeddings,
-            scaling_config=scaling,
-        )
+        self.rope = DeepseekV4RoPE(self.rope_head_dim, base, scaling)
 
         # Compressor / Indexer — present only when compress_ratio > 0
         if self.compress_ratio:
@@ -477,8 +565,18 @@ class V4Attention(nn.Module):
 
         # Standard SDPA (compressed KV + topk deferred to v0.2)
         out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask,
+            q,
+            k,
+            v,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attn_sink,
         )
+
+        out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
+        out_pe = self.rope(out_pe, offset=offset, inverse=True)
+        out = mx.concatenate([out_nope, out_pe], axis=-1)
 
         # Grouped low-rank projection: [B, n_heads, S, head_dim] -> [B, S, n_heads*head_dim]
         out = out.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * self.head_dim)
@@ -691,9 +789,18 @@ class Model(nn.Module):
             new[k] = v
         weights = new
 
-        # 2) FP8 block dequant: `X.weight` + `X.scale` -> dequantized bf16 `X.weight`
+        def _scale_to_float(scale: mx.array) -> mx.array:
+            if scale.dtype == mx.uint8:
+                return mx.exp2(scale.astype(mx.float32) - 127.0)
+            return scale.astype(mx.float32)
+
+        # 2) FP8/FP4 block dequant:
+        #    `X.weight` + `X.scale` -> dequantized bf16 `X.weight`
+        #    Routed experts in Flash are FP4-packed int8; other scaled matrices
+        #    are FP8 e4m3 with 128x128 block scales.
         def _dequant_fp8_block(weight: mx.array, scale: mx.array, bs: int = 128) -> mx.array:
             weight = mx.from_fp8(weight, dtype=mx.bfloat16)
+            scale = _scale_to_float(scale)
             m, n = weight.shape
             pad_b = (-m) % bs
             pad_s = (-n) % bs
@@ -702,11 +809,36 @@ class Model(nn.Module):
             weight = (weight * scale[:, None, :, None]).reshape(m + pad_b, n + pad_s)
             return weight[:m, :n].astype(mx.bfloat16)
 
+        def _dequant_fp4_block(weight: mx.array, scale: mx.array, bs: int = 32) -> mx.array:
+            table = mx.array(
+                [
+                    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+                ],
+                dtype=mx.float32,
+            )
+            packed = weight.astype(mx.uint8)
+            low = packed & 0x0F
+            high = (packed >> 4) & 0x0F
+            unpacked = mx.stack([mx.take(table, low), mx.take(table, high)], axis=-1)
+            unpacked = unpacked.reshape(weight.shape[0], weight.shape[1] * 2)
+            scale = mx.repeat(_scale_to_float(scale), bs, axis=-1)
+            return (unpacked * scale).astype(mx.bfloat16)
+
         new = {}
         for k, v in weights.items():
             if k.endswith(".scale"):
                 wk = k[:-len(".scale")] + ".weight"
-                if wk in weights and weights[wk].dtype in (mx.uint8,):
+                weight = weights.get(wk)
+                if (
+                    weight is not None
+                    and ".ffn.experts." in wk
+                    and "shared_experts" not in wk
+                    and weight.dtype in (mx.int8, mx.uint8)
+                    and v.shape[-1] * 16 == weight.shape[-1]
+                ):
+                    new[wk] = _dequant_fp4_block(weight, v)
+                elif weight is not None and weight.dtype in (mx.uint8,):
                     new[wk] = _dequant_fp8_block(weights[wk], v)
                 else:
                     new[k] = v
