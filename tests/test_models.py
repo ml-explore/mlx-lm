@@ -1431,32 +1431,21 @@ class TestModels(unittest.TestCase):
 
         inv_freq = 1.0 / (10000 ** (mx.arange(0, 4, 2, dtype=mx.float32) / 4))
         freqs = mx.arange(1, 4, dtype=mx.float32)[:, None] * inv_freq[None, :]
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb).reshape(1, 1, 3, 4)
-        sin = mx.sin(emb).reshape(1, 1, 3, 4)
-        x1, x2 = mx.split(x, [2], axis=-1)
-        expected = mx.concatenate(
-            [
-                x1 * cos[..., :2] - x2 * sin[..., :2],
-                x2 * cos[..., 2:] + x1 * sin[..., 2:],
-            ],
-            axis=-1,
-        )
+        cos = mx.cos(freqs).reshape(1, 1, 3, 2)
+        sin = mx.sin(freqs).reshape(1, 1, 3, 2)
+        pairs = x.reshape(*x.shape[:-1], 2, 2)
+        x0, x1 = pairs[..., 0], pairs[..., 1]
+        expected = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+        expected = expected.reshape(*expected.shape[:-2], 4)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
         positions = mx.array([1, 5, 9], dtype=mx.float32)
         y = rope(x, positions=positions)
         freqs = positions[:, None] * inv_freq[None, :]
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb).reshape(1, 1, 3, 4)
-        sin = mx.sin(emb).reshape(1, 1, 3, 4)
-        expected = mx.concatenate(
-            [
-                x1 * cos[..., :2] - x2 * sin[..., :2],
-                x2 * cos[..., 2:] + x1 * sin[..., 2:],
-            ],
-            axis=-1,
-        )
+        cos = mx.cos(freqs).reshape(1, 1, 3, 2)
+        sin = mx.sin(freqs).reshape(1, 1, 3, 2)
+        expected = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+        expected = expected.reshape(*expected.shape[:-2], 4)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
     def test_deepseek_v4(self):
@@ -1500,9 +1489,11 @@ class TestModels(unittest.TestCase):
         outputs = model(inputs[:, :3], cache=cache)
         mx.eval(outputs)
         self.assertEqual(outputs.shape, (1, 3, args.vocab_size))
+        mx.eval([c.state for c in cache])
         outputs = model(inputs[:, 3:4], cache=cache)
         mx.eval(outputs)
         self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
+        mx.eval([c.state for c in cache])
 
     def test_deepseek_v4_sanitize_dequantizes_fp8_blocks(self):
         from mlx_lm.models import deepseek_v4

@@ -111,7 +111,6 @@ class DeepseekV4RoPE(nn.Module):
     ):
         super().__init__()
         self.dims = dims
-        self.attention_scaling = 1.0
 
         inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
         rope_type = None
@@ -145,11 +144,6 @@ class DeepseekV4RoPE(nn.Module):
             smooth = 1 - mx.clip(ramp, 0, 1)
             inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
 
-            attention_factor = scaling_config.get("attention_factor")
-            if attention_factor is None:
-                factor = factor or max_position_embeddings / original_max_position_embeddings
-                attention_factor = 1.0 if factor <= 1 else 0.1 * math.log(factor) + 1.0
-            self.attention_scaling = attention_factor
         elif rope_type not in (None, "default"):
             raise ValueError(f"Unsupported DeepSeek-V4 RoPE type: {rope_type}")
 
@@ -174,9 +168,8 @@ class DeepseekV4RoPE(nn.Module):
             else positions.astype(mx.float32)
         )
         freqs = pos[:, None] * self.inv_freq[None, :]
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
+        cos = mx.cos(freqs)
+        sin = mx.sin(freqs)
         if inverse:
             sin = -sin
 
@@ -184,15 +177,10 @@ class DeepseekV4RoPE(nn.Module):
         cos = cos.reshape(broadcast_shape).astype(dtype)
         sin = sin.reshape(broadcast_shape).astype(dtype)
 
-        x1, x2 = mx.split(x, [x.shape[-1] // 2], axis=-1)
-        return mx.concatenate(
-            [
-                x1 * cos[..., : x1.shape[-1]] - x2 * sin[..., : x2.shape[-1]],
-                x2 * cos[..., x1.shape[-1] :]
-                + x1 * sin[..., x1.shape[-1] :],
-            ],
-            axis=-1,
-        )
+        x = x.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
+        x0, x1 = x[..., 0], x[..., 1]
+        out = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+        return out.reshape(*out.shape[:-2], out.shape[-2] * 2)
 
 
 def _apply_partial_rope(
@@ -224,22 +212,18 @@ def hc_split_sinkhorn(
     pre_scale, post_scale, comb_scale = scale[0], scale[1], scale[2]
 
     pre = mx.sigmoid(mixes[..., :hc_mult] * pre_scale + base[:hc_mult]) + eps
-    post = (
-        mx.sigmoid(
-            mixes[..., hc_mult : 2 * hc_mult] * post_scale
-            + base[hc_mult : 2 * hc_mult]
-        )
-        + eps
+    post = 2 * mx.sigmoid(
+        mixes[..., hc_mult : 2 * hc_mult] * post_scale
+        + base[hc_mult : 2 * hc_mult]
     )
     comb = (
-        mx.sigmoid(
-            mixes[..., 2 * hc_mult :].reshape(*mixes.shape[:-1], hc_mult, hc_mult)
-            * comb_scale
-            + base[2 * hc_mult :].reshape(hc_mult, hc_mult)
-        )
-        + eps
+        mixes[..., 2 * hc_mult :].reshape(*mixes.shape[:-1], hc_mult, hc_mult)
+        * comb_scale
+        + base[2 * hc_mult :].reshape(hc_mult, hc_mult)
     )
-    for _ in range(sinkhorn_iters):
+    comb = mx.softmax(comb, axis=-1, precise=True) + eps
+    comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
+    for _ in range(max(sinkhorn_iters - 1, 0)):
         comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
         comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
     return pre, post, comb
@@ -422,6 +406,38 @@ class DeepseekV4Cache:
     @keys.setter
     def keys(self, value):
         self.local.keys = value
+
+    @property
+    def state(self):
+        local_state = None if self.local.empty() else self.local.state
+        return (
+            local_state,
+            tuple(self.compressor_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")),
+            tuple(self.indexer_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")),
+        )
+
+    @state.setter
+    def state(self, value):
+        local_state, compressor_state, indexer_state = value
+        if local_state is None:
+            self.local.keys = None
+            self.local.values = None
+        else:
+            self.local.state = local_state
+        self.compressor_state = dict(
+            zip(("buffer_kv", "buffer_gate", "pooled"), compressor_state)
+        )
+        self.indexer_state = dict(
+            zip(("buffer_kv", "buffer_gate", "pooled"), indexer_state)
+        )
+
+    @property
+    def meta_state(self):
+        return self.local.meta_state
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.local.meta_state = value
 
     def update_and_fetch(self, keys, values):
         return self.local.update_and_fetch(keys, values)
@@ -627,18 +643,15 @@ class V4Attention(nn.Module):
         )
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
 
+        rope_theta = config.compress_rope_theta if self.compress_ratio else config.rope_theta
+        rope_scaling = config.rope_scaling if self.compress_ratio else None
         self.rope = DeepseekV4RoPE(
             config.qk_rope_head_dim,
-            config.rope_theta,
-            config.rope_scaling,
+            rope_theta,
+            rope_scaling,
             config.max_position_embeddings,
         )
-        self.compress_rope = DeepseekV4RoPE(
-            config.qk_rope_head_dim,
-            config.compress_rope_theta,
-            config.rope_scaling,
-            config.max_position_embeddings,
-        )
+        self.compress_rope = self.rope
         if self.compress_ratio:
             self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
@@ -693,6 +706,8 @@ class V4Attention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
+        q = q * mx.rsqrt((q.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True) + self.config.rms_norm_eps)
+        q = q.astype(x.dtype)
         q = q.transpose(0, 2, 1, 3)
         kv = self.kv_norm(self.wkv(x)).reshape(B, L, 1, self.head_dim)
         kv = kv.transpose(0, 2, 1, 3)
