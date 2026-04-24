@@ -1509,6 +1509,8 @@ class TestModels(unittest.TestCase):
         model = deepseek_v4.Model(args)
         self.assertEqual(len(model.layers), args.num_hidden_layers)
         self.assertEqual(model.model_type, args.model_type)
+        parameter_names = {name for name, _ in tree_flatten(model.parameters())}
+        self.assertNotIn("model.layers.0.attn.rope.inv_freq", parameter_names)
         self.assertEqual(
             model.layers[2].attn.compressor.wkv.weight.shape,
             (2 * args.head_dim, args.hidden_size),

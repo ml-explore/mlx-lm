@@ -135,7 +135,12 @@ class DeepseekV4RoPE(nn.Module):
         elif rope_type not in (None, "default", "linear"):
             raise ValueError(f"Unsupported DeepSeek-V4 RoPE type {rope_type}")
 
-        self.inv_freq = inv_freq
+        # This is derived from config, not a checkpoint parameter.
+        self._inv_freq = (inv_freq,)
+
+    @property
+    def inv_freq(self):
+        return self._inv_freq[0]
 
     def __call__(self, x: mx.array, offset: int = 0, inverse: bool = False):
         dtype = x.dtype
