@@ -361,14 +361,16 @@ class HyperConnection(nn.Module):
         self.fn = mx.zeros((mix_hc, hc_dim), dtype=mx.float32)
         self.base = mx.zeros((mix_hc,), dtype=mx.float32)
         self.scale = mx.zeros((3,), dtype=mx.float32)
+        self._fn_t = None  # lazy transpose cache (avoids 86 .T calls/token)
 
     def hc_pre(self, x: mx.array):
-        # x: [B, S, hc, D] -> reduce to [B, S, D] via `pre`; return (y, post, comb) for hc_post.
         B, S, hc, D = x.shape
         dtype = x.dtype
         xf = x.reshape(B, S, hc * D).astype(mx.float32)
         inv = mx.rsqrt((xf * xf).mean(axis=-1, keepdims=True) + self.norm_eps)
-        mixes = (xf @ self.fn.T) * inv                     # [B,S,mix_hc]
+        if self._fn_t is None:
+            self._fn_t = self.fn.T
+        mixes = (xf @ self._fn_t) * inv
         mixes = mixes.reshape(B * S, -1)
         pre, post, comb = hc_split_sinkhorn(
             mixes, self.scale, self.base, hc, self.sinkhorn_iters, self.hc_eps
@@ -376,7 +378,7 @@ class HyperConnection(nn.Module):
         pre  = pre.reshape(B, S, hc)
         post = post.reshape(B, S, hc)
         comb = comb.reshape(B, S, hc, hc)
-        y = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)   # [B,S,D]
+        y = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)
         return y.astype(dtype), post, comb
 
     def hc_post(self, f_out: mx.array, residual: mx.array, post: mx.array, comb: mx.array):
@@ -408,13 +410,16 @@ class HyperHead(nn.Module):
         self.fn = mx.zeros((hc_mult, hc_mult * dim), dtype=mx.float32)
         self.base = mx.zeros((hc_mult,), dtype=mx.float32)
         self.scale = mx.zeros((1,), dtype=mx.float32)
+        self._fn_t = None  # lazy transpose cache
 
     def __call__(self, x: mx.array):
         B, S, hc, D = x.shape
         dtype = x.dtype
         xf = x.reshape(B, S, hc * D).astype(mx.float32)
         inv = mx.rsqrt((xf * xf).mean(axis=-1, keepdims=True) + self.norm_eps)
-        mixes = (xf @ self.fn.T) * inv                      # [B,S,hc]
+        if self._fn_t is None:
+            self._fn_t = self.fn.T
+        mixes = (xf @ self._fn_t) * inv                     # [B,S,hc]
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         y = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)
         return y.astype(dtype)
@@ -424,13 +429,18 @@ class HyperHead(nn.Module):
 # Gate (hash + score-based)                                                   #
 # --------------------------------------------------------------------------- #
 
+# Pre-allocated scalar zero for sqrtsoftplus: avoids mx.zeros_like() allocation per call.
+_SCORE_ZERO = mx.array(0.0)
+
+
 def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "softmax":
         return mx.softmax(scores, axis=-1, precise=True)
     if func == "sigmoid":
         return mx.sigmoid(scores)
     # sqrtsoftplus: sqrt(softplus(x))  — used by V4
-    return mx.sqrt(mx.logaddexp(scores, mx.zeros_like(scores)))
+    # Scalar broadcast avoids allocating a zeros tensor every call.
+    return mx.sqrt(mx.logaddexp(scores, _SCORE_ZERO))
 
 
 class MoEGate(nn.Module):
@@ -450,18 +460,26 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = args.norm_topk_prob
 
         self.weight = mx.zeros((self.n_routed, args.hidden_size))
+        # Cache transposed weight to avoid recomputing .T every forward call.
+        self._weight_t = None
         if self.hash:
             # tid2eid: [vocab, top_k] int32 — predetermined expert routing per token id
             self.tid2eid = mx.zeros((args.vocab_size, self.top_k), dtype=mx.int32)
         else:
             self.e_score_correction_bias = mx.zeros((self.n_routed,), dtype=mx.float32)
 
+    @property
+    def weight_t(self):
+        if self._weight_t is None:
+            self._weight_t = self.weight.T
+        return self._weight_t
+
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         # x: [B, S, D] or [N, D]
         if self.hash:
             # x shape -> [B*S, D]; input_ids -> [B, S] flattened to [B*S]
             flat = x.reshape(-1, x.shape[-1])
-            scores = flat.astype(mx.float32) @ self.weight.T.astype(mx.float32)
+            scores = flat.astype(mx.float32) @ self.weight_t.astype(mx.float32)
             scores = _score_func(scores, self.score_func)
             ids = input_ids.reshape(-1)
             inds = self.tid2eid[ids].astype(mx.int32)
@@ -471,7 +489,7 @@ class MoEGate(nn.Module):
             inds = inds.reshape(*x.shape[:-1], self.top_k)
             weights = weights.reshape(*x.shape[:-1], self.top_k)
         else:
-            scores = x.astype(mx.float32) @ self.weight.T.astype(mx.float32)
+            scores = x.astype(mx.float32) @ self.weight_t.astype(mx.float32)
             scores = _score_func(scores, self.score_func)
             orig = scores
             biased = scores + self.e_score_correction_bias
@@ -529,10 +547,13 @@ class DeepseekV4MoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
         inds, weights = self.gate(x, input_ids)
+        # Compute shared_experts before switch_mlp so MLX can overlap both
+        # on the GPU — shared_experts doesn't depend on routing results.
+        shared_y = self.shared_experts(x) if hasattr(self, "shared_experts") else None
         y = self.switch_mlp(x, inds)
         y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
-        if hasattr(self, "shared_experts"):
-            y = y + self.shared_experts(x)
+        if shared_y is not None:
+            y = y + shared_y
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
@@ -768,9 +789,6 @@ class V4Attention(nn.Module):
                 self.indexer = Indexer(args, self.compress_ratio)
 
     def _grouped_output_projection(self, out: mx.array) -> mx.array:
-        # DeepSeek-V4 stores wo_a as grouped low-rank blocks. QuantizedLinear
-        # packs the per-group input dimension, so grouped slicing happens on
-        # output rows while each group uses the full packed input row.
         B, S = out.shape[:2]
         group_feat = (self.n_heads * self.head_dim) // self.n_groups
         out = out.reshape(B, S, self.n_groups, group_feat)
@@ -815,11 +833,11 @@ class V4Attention(nn.Module):
         # --- Q (shared intermediate reused by indexer) ---
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = q * mx.rsqrt(q.square().mean(axis=-1, keepdims=True) + self.eps)
+        q = mx.fast.rms_norm(q, weight=None, eps=self.eps)
 
         # --- K = V (shared single-head) ---
         kv = self.kv_norm(self.wkv(x))
-        kv = kv.reshape(B, S, 1, self.head_dim).transpose(0, 2, 1, 3)
+        kv = kv.reshape(B, 1, S, self.head_dim)
 
         offset = cache.offset if cache is not None else 0
 
