@@ -611,9 +611,31 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
+    except (ValueError, AttributeError, KeyError):
+        from transformers import PreTrainedTokenizerFast, AddedToken
+        tok_kwargs = dict(tokenizer_config_extra or {})
+        if (model_path / "tokenizer_config.json").exists():
+            import json as _json
+            with open(model_path / "tokenizer_config.json") as _f:
+                cfg = _json.load(_f)
+            for k in ("bos_token", "eos_token", "pad_token", "unk_token"):
+                if k in cfg and k not in tok_kwargs:
+                    v = cfg[k]
+                    if isinstance(v, dict):
+                        tok_kwargs[k] = AddedToken(**{kk: vv for kk, vv in v.items() if kk in ("content","lstrip","rstrip","normalized","single_word","special")})
+                    else:
+                        tok_kwargs[k] = v
+            for k in ("chat_template", "model_max_length"):
+                if k in cfg and k not in tok_kwargs:
+                    tok_kwargs[k] = cfg[k]
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=str(model_path / "tokenizer.json"),
+            **tok_kwargs,
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 
