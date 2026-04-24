@@ -1422,6 +1422,248 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_deepseek_v4_rope(self):
+        from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
+
+        rope = DeepseekV4RoPE(4, 10000)
+        x = mx.random.uniform(shape=(1, 2, 3, 4))
+        y = rope(x, offset=1)
+
+        inv_freq = 1.0 / (10000 ** (mx.arange(0, 4, 2, dtype=mx.float32) / 4))
+        freqs = mx.arange(1, 4, dtype=mx.float32)[:, None] * inv_freq[None, :]
+        emb = mx.concatenate([freqs, freqs], axis=-1)
+        cos = mx.cos(emb).reshape(1, 1, 3, 4)
+        sin = mx.sin(emb).reshape(1, 1, 3, 4)
+        x1, x2 = mx.split(x, [2], axis=-1)
+        expected = mx.concatenate(
+            [
+                x1 * cos[..., :2] - x2 * sin[..., :2],
+                x2 * cos[..., 2:] + x1 * sin[..., 2:],
+            ],
+            axis=-1,
+        )
+        self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
+
+        positions = mx.array([1, 5, 9], dtype=mx.float32)
+        y = rope(x, positions=positions)
+        freqs = positions[:, None] * inv_freq[None, :]
+        emb = mx.concatenate([freqs, freqs], axis=-1)
+        cos = mx.cos(emb).reshape(1, 1, 3, 4)
+        sin = mx.sin(emb).reshape(1, 1, 3, 4)
+        expected = mx.concatenate(
+            [
+                x1 * cos[..., :2] - x2 * sin[..., :2],
+                x2 * cos[..., 2:] + x1 * sin[..., 2:],
+            ],
+            axis=-1,
+        )
+        self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
+
+    def test_deepseek_v4(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+        inputs = mx.array([[0, 1, 2, 3, 4]], dtype=mx.int32)
+
+        outputs = model(inputs)
+        mx.eval(outputs)
+        self.assertEqual(outputs.shape, (1, 5, args.vocab_size))
+
+        cache = model.make_cache()
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[2], deepseek_v4.DeepseekV4Cache)
+        outputs = model(inputs[:, :3], cache=cache)
+        mx.eval(outputs)
+        self.assertEqual(outputs.shape, (1, 3, args.vocab_size))
+        outputs = model(inputs[:, 3:4], cache=cache)
+        mx.eval(outputs)
+        self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
+
+    def test_deepseek_v4_sanitize_dequantizes_fp8_blocks(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            moe_intermediate_size=2,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            compress_ratios=[0],
+        )
+        model = deepseek_v4.Model(args)
+        weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
+        converted = model.sanitize(
+            {
+                "layers.0.attn.wkv.weight": weight,
+                "layers.0.attn.wkv.scale": mx.full((1, 1), 127, dtype=mx.uint8),
+            }
+        )
+        key = "model.layers.0.attn.wkv.weight"
+        self.assertIn(key, converted)
+        self.assertTrue(
+            mx.allclose(
+                converted[key].astype(mx.float32),
+                mx.ones((128, 128), dtype=mx.float32),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        )
+
+    def test_deepseek_v4_load_model_supports_e8m0_scales(self):
+        try:
+            import json
+            import tempfile
+            from pathlib import Path
+
+            import torch
+            from safetensors.torch import save_file
+        except ImportError:
+            self.skipTest("torch and safetensors are required for this test")
+
+        if not hasattr(torch, "float8_e4m3fn") or not hasattr(
+            torch, "float8_e8m0fnu"
+        ):
+            self.skipTest("torch build does not expose required float8 dtypes")
+
+        from mlx_lm.utils import load_model
+
+        config = {
+            "model_type": "deepseek_v4",
+            "vocab_size": 128,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "q_lora_rank": 16,
+            "o_lora_rank": 8,
+            "o_groups": 2,
+            "head_dim": 16,
+            "qk_rope_head_dim": 4,
+            "moe_intermediate_size": 2,
+            "n_routed_experts": 2,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 1,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 2,
+            "compress_ratios": [0],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            with open(path / "config.json", "w") as f:
+                json.dump(config, f)
+            save_file(
+                {
+                    "layers.0.attn.wkv.weight": torch.ones(
+                        (16, 32), dtype=torch.float32
+                    ).to(torch.float8_e4m3fn),
+                    "layers.0.attn.wkv.scale": torch.ones(
+                        (1, 1), dtype=torch.float32
+                    ).to(torch.float8_e8m0fnu),
+                },
+                str(path / "model.safetensors"),
+            )
+
+            model, _ = load_model(path, lazy=True, strict=False)
+            loaded = model.parameters()["model"]["layers"][0]["attn"]["wkv"][
+                "weight"
+            ]
+            self.assertTrue(
+                mx.allclose(
+                    loaded.astype(mx.float32),
+                    mx.ones((16, 32), dtype=mx.float32),
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+            )
+
+    def test_deepseek_v4_sanitize_unpacks_fp4_experts(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            moe_intermediate_size=2,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            compress_ratios=[0],
+        )
+        model = deepseek_v4.Model(args)
+        packed = mx.array([[0x21] * 16, [0xFE] * 16], dtype=mx.uint8)
+        converted = model.sanitize(
+            {
+                "layers.0.ffn.experts.0.w1.weight": packed,
+                "layers.0.ffn.experts.0.w1.scale": mx.full(
+                    (2, 1), 127, dtype=mx.uint8
+                ),
+                "layers.0.ffn.experts.1.w1.weight": packed,
+                "layers.0.ffn.experts.1.w1.scale": mx.full(
+                    (2, 1), 127, dtype=mx.uint8
+                ),
+            }
+        )
+        key = "model.layers.0.ffn.switch_mlp.gate_proj.weight"
+        self.assertIn(key, converted)
+        self.assertEqual(converted[key].shape, (2, 2, 32))
+        self.assertTrue(
+            mx.array_equal(
+                converted[key][0, 0, :4].astype(mx.float32),
+                mx.array([0.5, 1.0, 0.5, 1.0], dtype=mx.float32),
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                converted[key][0, 1, :4].astype(mx.float32),
+                mx.array([-4.0, -6.0, -4.0, -6.0], dtype=mx.float32),
+            )
+        )
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 

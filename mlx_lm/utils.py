@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+import struct
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -279,6 +280,47 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _load_safetensors(path: str, allow_unsupported_dtypes: bool = False) -> dict:
+    try:
+        return mx.load(path)
+    except RuntimeError as e:
+        if "F8_E8M0" not in str(e) or not allow_unsupported_dtypes:
+            raise
+        load_error = e
+
+    with open(path, "r+b") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        original_header = f.read(header_len)
+        header = json.loads(original_header)
+        changed = False
+
+        for tensor_info in header.values():
+            if isinstance(tensor_info, dict) and tensor_info.get("dtype") == "F8_E8M0":
+                tensor_info["dtype"] = "U8"
+                changed = True
+
+        if not changed:
+            raise load_error
+
+        patched_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        if len(patched_header) > header_len:
+            raise RuntimeError(
+                f"Cannot reinterpret F8_E8M0 safetensors header in {path}: "
+                "patched header is larger than the original header."
+            )
+
+        try:
+            f.seek(8)
+            f.write(patched_header)
+            f.write(b" " * (header_len - len(patched_header)))
+            f.flush()
+            return mx.load(path)
+        finally:
+            f.seek(8)
+            f.write(original_header)
+            f.flush()
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -319,8 +361,13 @@ def load_model(
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
+    allow_unsupported_dtypes = config.get("model_type") == "deepseek_v4"
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(
+            _load_safetensors(
+                wf, allow_unsupported_dtypes=allow_unsupported_dtypes
+            )
+        )
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
