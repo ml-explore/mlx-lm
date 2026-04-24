@@ -1653,6 +1653,46 @@ class TestModels(unittest.TestCase):
             )
         )
 
+    def test_deepseek_v4_sanitize_dequantizes_fp8_blocks(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            moe_intermediate_size=2,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+        weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
+        converted = model.sanitize(
+            {
+                "layers.0.attn.wkv.weight": weight,
+                "layers.0.attn.wkv.scale": mx.full((1, 1), 127, dtype=mx.uint8),
+            }
+        )
+        key = "model.layers.0.attn.wkv.weight"
+        self.assertIn(key, converted)
+        self.assertTrue(
+            mx.allclose(
+                converted[key].astype(mx.float32),
+                mx.ones((128, 128), dtype=mx.float32),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        )
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
