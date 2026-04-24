@@ -100,6 +100,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
         return mx.sqrt(nn.softplus(scores))
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
+
 @mx.compile
 def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     if limit and limit > 0:
@@ -212,6 +213,7 @@ def _apply_partial_rope(
     pe = rope(pe, offset=offset, inverse=inverse, positions=positions)
     return mx.concatenate([nope, pe], axis=-1)
 
+
 @mx.compile
 def _hc_split_sinkhorn_ops(
     mixes: mx.array,
@@ -289,9 +291,10 @@ def _make_hc_split_sinkhorn_kernel():
                 c[cidx] = v;
                 row_sum += v;
             }
+            float inv_sum = 1.0f / row_sum;
             for (int j = 0; j < HC; ++j) {
                 int cidx = i * HC + j;
-                c[cidx] = c[cidx] / row_sum + epsv;
+                c[cidx] = c[cidx] * inv_sum + epsv;
             }
         }
 
@@ -300,9 +303,9 @@ def _make_hc_split_sinkhorn_kernel():
             for (int i = 0; i < HC; ++i) {
                 col_sum += c[i * HC + j];
             }
-            float denom = col_sum + epsv;
+            float inv_denom = 1.0f / (col_sum + epsv);
             for (int i = 0; i < HC; ++i) {
-                c[i * HC + j] = c[i * HC + j] / denom;
+                c[i * HC + j] *= inv_denom;
             }
         }
 
@@ -312,9 +315,9 @@ def _make_hc_split_sinkhorn_kernel():
                 for (int j = 0; j < HC; ++j) {
                     row_sum += c[i * HC + j];
                 }
-                float denom = row_sum + epsv;
+                float inv_denom = 1.0f / (row_sum + epsv);
                 for (int j = 0; j < HC; ++j) {
-                    c[i * HC + j] = c[i * HC + j] / denom;
+                    c[i * HC + j] *= inv_denom;
                 }
             }
             for (int j = 0; j < HC; ++j) {
@@ -322,9 +325,9 @@ def _make_hc_split_sinkhorn_kernel():
                 for (int i = 0; i < HC; ++i) {
                     col_sum += c[i * HC + j];
                 }
-                float denom = col_sum + epsv;
+                float inv_denom = 1.0f / (col_sum + epsv);
                 for (int i = 0; i < HC; ++i) {
-                    c[i * HC + j] = c[i * HC + j] / denom;
+                    c[i * HC + j] *= inv_denom;
                 }
             }
         }
