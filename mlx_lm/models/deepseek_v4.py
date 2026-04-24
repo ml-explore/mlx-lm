@@ -657,22 +657,32 @@ class Model(nn.Module):
     # ------------------------------------------------------------------- #
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        """Handle DeepSeek-V4 checkpoint conversion:
-           1) Drop MTP layer weights (`model.layers.{N+}.*`) — not used at inference.
-           2) FP8 block dequantization: 128x128 blocks with ue8m0 scales -> bf16.
-           3) Stack expert weights into SwitchGLU layout.
-           4) Remap V4 param names (wq_a, wkv, wo_a, wo_b, attn_sink, hc_*) onto our modules.
-           5) Drop compressor/indexer weights we don't yet wire in forward (kept as dead params)."""
+        """Handle DeepSeek-V4 checkpoint conversion.
+
+        Checkpoint naming (from HF):
+            layers.N.attn.{wq_a,wq_b,wkv,wo_a,wo_b}.{weight,scale}
+            layers.N.attn.{q_norm,kv_norm,attn_sink}
+            layers.N.attn.compressor.{wkv,wgate,ape,norm}
+            layers.N.attn.indexer.{wq_b,weights_proj,compressor.*}
+            layers.N.ffn.gate.{weight,bias,tid2eid}
+            layers.N.ffn.experts.E.w{1,2,3}.{weight,scale}
+            layers.N.ffn.shared_experts.w{1,2,3}.{weight,scale}
+            layers.N.{attn_norm,ffn_norm}.weight
+            layers.N.hc_{attn,ffn}_{fn,base,scale}
+            embed.weight, head.weight, hc_head_{fn,base,scale}
+            mtp.0.* (dropped)
+        """
         n_layers = self.args.num_hidden_layers
 
-        # 1) Drop MTP layers (indices >= n_layers)
+        # 1) Drop MTP + any layers beyond n_layers
         new = {}
         for k, v in weights.items():
+            if k.startswith("mtp."):
+                continue
             parts = k.split(".")
-            # Checkpoint uses `model.layers.{i}.*` style names
-            if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+            if len(parts) >= 2 and parts[0] == "layers":
                 try:
-                    idx = int(parts[2])
+                    idx = int(parts[1])
                 except ValueError:
                     new[k] = v
                     continue
@@ -681,86 +691,69 @@ class Model(nn.Module):
             new[k] = v
         weights = new
 
-        # 2) FP8 block dequant (weight_scale_inv entries present when checkpoint is FP8).
-        def _dequant_fp8_block(weight: mx.array, scale_inv: mx.array, bs: int = 128) -> mx.array:
+        # 2) FP8 block dequant: `X.weight` + `X.scale` -> dequantized bf16 `X.weight`
+        def _dequant_fp8_block(weight: mx.array, scale: mx.array, bs: int = 128) -> mx.array:
             weight = mx.from_fp8(weight, dtype=mx.bfloat16)
             m, n = weight.shape
             pad_b = (-m) % bs
             pad_s = (-n) % bs
             weight = mx.pad(weight, ((0, pad_b), (0, pad_s)))
             weight = weight.reshape(((m + pad_b) // bs, bs, (n + pad_s) // bs, bs))
-            weight = (weight * scale_inv[:, None, :, None]).reshape(m + pad_b, n + pad_s)
+            weight = (weight * scale[:, None, :, None]).reshape(m + pad_b, n + pad_s)
             return weight[:m, :n].astype(mx.bfloat16)
 
         new = {}
         for k, v in weights.items():
-            if k.endswith("_scale_inv"):
-                wk = k[: -len("_scale_inv")]
-                if wk in weights:
+            if k.endswith(".scale"):
+                wk = k[:-len(".scale")] + ".weight"
+                if wk in weights and weights[wk].dtype in (mx.uint8,):
                     new[wk] = _dequant_fp8_block(weights[wk], v)
-                # scale_inv itself is dropped; the dequant produced the bf16 weight
+                else:
+                    new[k] = v
             elif k not in new:
                 new[k] = v
         weights = new
 
-        # 3) Remap V4 attention / block names -> our module names.
-        #    Checkpoint (V4 ref): model.layers.{L}.{attn,ffn}.<wq_a|q_norm|wq_b|wkv|kv_norm|wo_a|wo_b|attn_sink|compressor.*|indexer.*>
-        #    Also: model.layers.{L}.{attn_norm,ffn_norm}, model.layers.{L}.hc_{attn,ffn}_{fn,base,scale}.
-        remap_suffix = {
-            # attention block
-            "attn.wq_a.weight":  "attn.wq_a.weight",
-            "attn.q_norm.weight": "attn.q_norm.weight",
-            "attn.wq_b.weight":  "attn.wq_b.weight",
-            "attn.wkv.weight":   "attn.wkv.weight",
-            "attn.kv_norm.weight": "attn.kv_norm.weight",
-            "attn.wo_a.weight":  "attn.wo_a.weight",
-            "attn.wo_b.weight":  "attn.wo_b.weight",
-            "attn.attn_sink":    "attn.attn_sink",
-            # block norms
-            "attn_norm.weight":  "attn_norm.weight",
-            "ffn_norm.weight":   "ffn_norm.weight",
-            # mHC params
-            "hc_attn_fn":        "hc_attn.fn",
-            "hc_attn_base":      "hc_attn.base",
-            "hc_attn_scale":     "hc_attn.scale",
-            "hc_ffn_fn":         "hc_ffn.fn",
-            "hc_ffn_base":       "hc_ffn.base",
-            "hc_ffn_scale":      "hc_ffn.scale",
-            # compressor / indexer (attention)
-            "attn.compressor.wkv.weight":   "attn.compressor.wkv.weight",
-            "attn.compressor.wgate.weight": "attn.compressor.wgate.weight",
-            "attn.compressor.ape":          "attn.compressor.ape",
-            "attn.compressor.norm.weight":  "attn.compressor.norm.weight",
-            "attn.indexer.wq_b.weight":     "attn.indexer.wq_b.weight",
-            "attn.indexer.weights_proj.weight": "attn.indexer.weights_proj.weight",
-            "attn.indexer.compressor.wkv.weight":   "attn.indexer.compressor.wkv.weight",
-            "attn.indexer.compressor.wgate.weight": "attn.indexer.compressor.wgate.weight",
-            "attn.indexer.compressor.ape":          "attn.indexer.compressor.ape",
-            "attn.indexer.compressor.norm.weight":  "attn.indexer.compressor.norm.weight",
-            # moe (ffn) gate
-            "ffn.gate.weight":                "ffn.gate.weight",
-            "ffn.gate.e_score_correction_bias": "ffn.gate.e_score_correction_bias",
-            "ffn.gate.tid2eid":               "ffn.gate.tid2eid",
-            # shared expert
-            "ffn.shared_experts.gate_proj.weight": "ffn.shared_experts.gate_proj.weight",
-            "ffn.shared_experts.up_proj.weight":   "ffn.shared_experts.up_proj.weight",
-            "ffn.shared_experts.down_proj.weight": "ffn.shared_experts.down_proj.weight",
+        # 3) Remap top-level names to our module structure
+        top_remap = {
+            "embed.weight":    "model.embed_tokens.weight",
+            "head.weight":     "lm_head.weight",
+            "hc_head_fn":      "model.hc_head.fn",
+            "hc_head_base":    "model.hc_head.base",
+            "hc_head_scale":   "model.hc_head.scale",
         }
+        for old, new_key in top_remap.items():
+            if old in weights:
+                weights[new_key] = weights.pop(old)
+
+        # 4) Remap layer-level names: layers.N.X -> model.layers.N.X
+        #    Also remap gate.bias -> gate.e_score_correction_bias,
+        #    hc_{attn,ffn}_{fn,base,scale} -> hc_{attn,ffn}.{fn,base,scale},
+        #    shared_experts.w{1,2,3} -> shared_experts.{gate,down,up}_proj
         new = {}
+        w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
         for k, v in weights.items():
-            moved = False
-            for old, newk in remap_suffix.items():
-                needle = f".{old}"
-                if k.endswith(needle):
-                    prefix = k[: -len(needle)]
-                    new[f"{prefix}.{newk}"] = v
-                    moved = True
-                    break
-            if not moved:
-                new[k] = v
+            nk = k
+            # Add model. prefix for layers
+            if nk.startswith("layers."):
+                nk = "model." + nk
+
+            # gate.bias -> gate.e_score_correction_bias
+            nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
+
+            # hc_attn_fn -> hc_attn.fn (etc.)
+            for sub in ("attn", "ffn"):
+                for param in ("fn", "base", "scale"):
+                    nk = nk.replace(f".hc_{sub}_{param}", f".hc_{sub}.{param}")
+
+            # shared_experts.w1 -> shared_experts.gate_proj (etc.)
+            for w_old, w_new in w_remap.items():
+                nk = nk.replace(f".shared_experts.{w_old}.", f".shared_experts.{w_new}.")
+
+            new[nk] = v
         weights = new
 
-        # 4) Stack expert weights: ffn.experts.{e}.{w1,w2,w3}.weight -> switch_mlp.{gate,down,up}_proj.weight
+        # 5) Stack expert weights: experts.E.w{1,2,3}.weight -> switch_mlp.{gate,down,up}_proj.weight
         for l in range(n_layers):
             prefix = f"model.layers.{l}.ffn.experts"
             for src, dst in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
@@ -769,19 +762,6 @@ class Model(nn.Module):
                     stack = [weights.pop(f"{prefix}.{e}.{src}.weight")
                              for e in range(self.args.n_routed_experts)]
                     weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.weight"] = mx.stack(stack)
-
-        # 5) Top-level head / embed / norm / hc_head remapping.
-        head_remap = {
-            "hc_head_fn":    "model.hc_head.fn",
-            "hc_head_base":  "model.hc_head.base",
-            "hc_head_scale": "model.hc_head.scale",
-            "model.norm.weight": "model.norm.weight",
-            "model.embed_tokens.weight": "model.embed_tokens.weight",
-            "lm_head.weight": "lm_head.weight",
-        }
-        for old, new_key in head_remap.items():
-            if old in weights and new_key != old:
-                weights[new_key] = weights.pop(old)
 
         return weights
 
