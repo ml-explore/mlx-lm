@@ -97,7 +97,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "sigmoid":
         return mx.sigmoid(scores)
     if func == "sqrtsoftplus":
-        return mx.sqrt(nn.softplus(scores))
+        return mx.sqrt(mx.logaddexp(scores, mx.zeros_like(scores)))
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
@@ -920,7 +920,7 @@ class V4Attention(nn.Module):
             full_kv = mx.concatenate([full_kv, pooled], axis=2)
 
         if mask is not None and full_kv.shape[2] > mask.shape[-1]:
-            pad = mx.ones(
+            pad = mx.zeros(
                 mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],), dtype=mask.dtype
             )
             mask = mx.concatenate([mask, pad], axis=-1)
