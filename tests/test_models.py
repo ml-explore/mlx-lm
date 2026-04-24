@@ -1449,6 +1449,21 @@ class TestModels(unittest.TestCase):
         expected = expected.reshape(*expected.shape[:-2], 4)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
+        # HyperConnection Sinkhorn test
+        for hc_mult in (2, 4):
+            mix = (2 + hc_mult) * hc_mult
+            mixes = mx.random.normal((2, 3, mix), dtype=mx.float32)
+            scale = mx.array([1.2, 0.7, 1.1], dtype=mx.float32)
+            base = mx.random.normal((mix,), dtype=mx.float32)
+            expected = deepseek_v4._hc_split_sinkhorn_ops(
+                mixes, scale, base, hc_mult, 20, 1e-6
+            )
+            actual = deepseek_v4.hc_split_sinkhorn(
+                mixes, scale, base, hc_mult, 20, 1e-6
+            )
+            for x, y in zip(expected, actual):
+                self.assertTrue(mx.allclose(x, y, rtol=1e-5, atol=1e-5))
+
         # Model test
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",

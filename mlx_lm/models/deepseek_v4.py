@@ -213,7 +213,7 @@ def _apply_partial_rope(
     return mx.concatenate([nope, pe], axis=-1)
 
 @mx.compile
-def hc_split_sinkhorn(
+def _hc_split_sinkhorn_ops(
     mixes: mx.array,
     scale: mx.array,
     base: mx.array,
@@ -241,12 +241,144 @@ def hc_split_sinkhorn(
     return pre, post, comb
 
 
+def _make_hc_split_sinkhorn_kernel():
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint idx = thread_position_in_grid.x;
+        constexpr int MIX = (2 + HC) * HC;
+        float epsv = static_cast<float>(eps[0]);
+
+        auto mix = mixes + idx * MIX;
+        auto pre_out = pre + idx * HC;
+        auto post_out = post + idx * HC;
+        auto comb_out = comb + idx * HC * HC;
+
+        float pre_scale = static_cast<float>(scale[0]);
+        float post_scale = static_cast<float>(scale[1]);
+        float comb_scale = static_cast<float>(scale[2]);
+
+        for (int i = 0; i < HC; ++i) {
+            float z = static_cast<float>(mix[i]) * pre_scale
+                + static_cast<float>(base[i]);
+            pre_out[i] = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
+        }
+        for (int i = 0; i < HC; ++i) {
+            int off = HC + i;
+            float z = static_cast<float>(mix[off]) * post_scale
+                + static_cast<float>(base[off]);
+            post_out[i] = 2.0f / (1.0f + metal::fast::exp(-z));
+        }
+
+        float c[HC * HC];
+        for (int i = 0; i < HC; ++i) {
+            float row_max = -INFINITY;
+            for (int j = 0; j < HC; ++j) {
+                int cidx = i * HC + j;
+                int off = 2 * HC + cidx;
+                float v = static_cast<float>(mix[off]) * comb_scale
+                    + static_cast<float>(base[off]);
+                c[cidx] = v;
+                row_max = metal::max(row_max, v);
+            }
+            float row_sum = 0.0f;
+            for (int j = 0; j < HC; ++j) {
+                int cidx = i * HC + j;
+                float v = metal::fast::exp(c[cidx] - row_max);
+                c[cidx] = v;
+                row_sum += v;
+            }
+            for (int j = 0; j < HC; ++j) {
+                int cidx = i * HC + j;
+                c[cidx] = c[cidx] / row_sum + epsv;
+            }
+        }
+
+        for (int j = 0; j < HC; ++j) {
+            float col_sum = 0.0f;
+            for (int i = 0; i < HC; ++i) {
+                col_sum += c[i * HC + j];
+            }
+            float denom = col_sum + epsv;
+            for (int i = 0; i < HC; ++i) {
+                c[i * HC + j] = c[i * HC + j] / denom;
+            }
+        }
+
+        for (int iter = 1; iter < ITERS; ++iter) {
+            for (int i = 0; i < HC; ++i) {
+                float row_sum = 0.0f;
+                for (int j = 0; j < HC; ++j) {
+                    row_sum += c[i * HC + j];
+                }
+                float denom = row_sum + epsv;
+                for (int j = 0; j < HC; ++j) {
+                    c[i * HC + j] = c[i * HC + j] / denom;
+                }
+            }
+            for (int j = 0; j < HC; ++j) {
+                float col_sum = 0.0f;
+                for (int i = 0; i < HC; ++i) {
+                    col_sum += c[i * HC + j];
+                }
+                float denom = col_sum + epsv;
+                for (int i = 0; i < HC; ++i) {
+                    c[i * HC + j] = c[i * HC + j] / denom;
+                }
+            }
+        }
+
+        for (int i = 0; i < HC * HC; ++i) {
+            comb_out[i] = c[i];
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="deepseek_v4_hc_split_sinkhorn",
+        input_names=["mixes", "scale", "base", "eps"],
+        output_names=["pre", "post", "comb"],
+        source=source,
+    )
+
+
+_hc_split_sinkhorn_kernel = _make_hc_split_sinkhorn_kernel()
+
+
+def hc_split_sinkhorn(
+    mixes: mx.array,
+    scale: mx.array,
+    base: mx.array,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> Tuple[mx.array, mx.array, mx.array]:
+    if _hc_split_sinkhorn_kernel is None:
+        return _hc_split_sinkhorn_ops(mixes, scale, base, hc_mult, sinkhorn_iters, eps)
+
+    if not isinstance(eps, mx.array):
+        eps = mx.array([eps], dtype=mx.float32)
+    return _hc_split_sinkhorn_kernel(
+        inputs=[mixes, scale, base, eps],
+        template=[("HC", hc_mult), ("ITERS", sinkhorn_iters)],
+        grid=(mixes.size // ((2 + hc_mult) * hc_mult), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[
+            (*mixes.shape[:-1], hc_mult),
+            (*mixes.shape[:-1], hc_mult),
+            (*mixes.shape[:-1], hc_mult, hc_mult),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+
+
 class HyperConnection(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.hc_mult = config.hc_mult
         self.sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
+        self._hc_eps = (mx.array([config.hc_eps], dtype=mx.float32),)
         self.norm_eps = config.rms_norm_eps
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size), dtype=mx.float32)
@@ -258,13 +390,14 @@ class HyperConnection(nn.Module):
         flat = x.reshape(B, L, H * D).astype(mx.float32)
         rsqrt = mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + self.norm_eps)
         mixes = (flat @ self.fn.T) * rsqrt
-        return hc_split_sinkhorn(
+        split_sinkhorn = _hc_split_sinkhorn_ops if self.training else hc_split_sinkhorn
+        return split_sinkhorn(
             mixes,
             self.scale,
             self.base,
             self.hc_mult,
             self.sinkhorn_iters,
-            self.hc_eps,
+            self.hc_eps if self.training else self._hc_eps[0],
         )
 
     def collapse(self, x: mx.array):
