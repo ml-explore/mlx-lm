@@ -386,6 +386,26 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
     return frequency_penalty_processor
 
 
+_DEFAULT_EARLY_STOP_MESSAGE = (
+    "\n\nI need to provide my answer now based on my reasoning so far.\n"
+)
+
+
+def build_early_stop_tokens(
+    tokenizer,
+    think_end_tokens: tuple,
+    message: Optional[str] = None,
+) -> mx.array:
+    """Build the early-stopping injection token sequence.
+
+    Tokenizes the transition message and appends the think-end tokens.
+    """
+    if message is None:
+        message = _DEFAULT_EARLY_STOP_MESSAGE
+    msg_tokens = tokenizer.encode(message, add_special_tokens=False)
+    return mx.array(list(msg_tokens) + list(think_end_tokens))
+
+
 def make_thinking_budget_processor(
     think_start_tokens: tuple,
     think_end_tokens: tuple,
