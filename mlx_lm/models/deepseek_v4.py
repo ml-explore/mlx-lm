@@ -97,7 +97,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "sigmoid":
         return mx.sigmoid(scores)
     if func == "sqrtsoftplus":
-        return mx.sqrt(mx.logaddexp(scores, mx.zeros_like(scores)))
+        return mx.sqrt(mx.logaddexp(scores, 0))
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
@@ -176,27 +176,46 @@ class DeepseekV4RoPE(nn.Module):
         inverse: bool = False,
         positions: Optional[mx.array] = None,
     ):
-        dtype = x.dtype
         L = x.shape[-2]
         pos = (
             mx.arange(offset, offset + L, dtype=mx.float32)
             if positions is None
             else positions.astype(mx.float32)
         )
-        freqs = pos[:, None] * self.inv_freq[None, :]
-        cos = mx.cos(freqs)
-        sin = mx.sin(freqs)
-        if inverse:
-            sin = -sin
+        return _rope_full(x, self.inv_freq, pos, inverse, 0)
 
-        broadcast_shape = (1,) * (x.ndim - 2) + cos.shape
-        cos = cos.reshape(broadcast_shape).astype(dtype)
-        sin = sin.reshape(broadcast_shape).astype(dtype)
 
-        x = x.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
-        x0, x1 = x[..., 0], x[..., 1]
-        out = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
-        return out.reshape(*out.shape[:-2], out.shape[-2] * 2)
+@mx.compile
+def _rope_full(
+    x: mx.array,
+    inv_freq: mx.array,
+    pos: mx.array,
+    inverse: bool,
+    nope_dim: int,
+) -> mx.array:
+    freqs = pos[:, None] * inv_freq[None, :]
+    cos = mx.cos(freqs)
+    sin = mx.sin(freqs)
+    if inverse:
+        sin = -sin
+
+    if nope_dim > 0:
+        pe = x[..., nope_dim:]
+    else:
+        pe = x
+
+    broadcast_shape = (1,) * (pe.ndim - 2) + cos.shape
+    cos = cos.reshape(broadcast_shape).astype(pe.dtype)
+    sin = sin.reshape(broadcast_shape).astype(pe.dtype)
+
+    pe = pe.reshape(*pe.shape[:-1], pe.shape[-1] // 2, 2)
+    x0, x1 = pe[..., 0], pe[..., 1]
+    out = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+    pe_out = out.reshape(*out.shape[:-2], out.shape[-2] * 2)
+
+    if nope_dim > 0:
+        return mx.concatenate([x[..., :nope_dim], pe_out], axis=-1)
+    return pe_out
 
 
 def _apply_partial_rope(
@@ -206,12 +225,14 @@ def _apply_partial_rope(
     inverse: bool = False,
     positions: Optional[mx.array] = None,
 ) -> mx.array:
-    rope_dim = rope.dims
-    if x.shape[-1] == rope_dim:
-        return rope(x, offset=offset, inverse=inverse, positions=positions)
-    nope, pe = mx.split(x, [x.shape[-1] - rope_dim], axis=-1)
-    pe = rope(pe, offset=offset, inverse=inverse, positions=positions)
-    return mx.concatenate([nope, pe], axis=-1)
+    nope_dim = x.shape[-1] - rope.dims if x.shape[-1] != rope.dims else 0
+    L = x.shape[-2]
+    pos = (
+        mx.arange(offset, offset + L, dtype=mx.float32)
+        if positions is None
+        else positions.astype(mx.float32)
+    )
+    return _rope_full(x, rope.inv_freq, pos, inverse, nope_dim)
 
 
 @mx.compile
@@ -375,6 +396,28 @@ def hc_split_sinkhorn(
     )
 
 
+@mx.compile
+def _hc_collapse_op(pre: mx.array, x: mx.array) -> mx.array:
+    return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
+
+
+@mx.compile
+def _hc_expand_op(
+    post: mx.array,
+    block_out: mx.array,
+    comb: mx.array,
+    residual: mx.array,
+) -> mx.array:
+    y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+    y = y + mx.matmul(comb, residual.astype(mx.float32))
+    return y.astype(block_out.dtype)
+
+
+@mx.compile
+def _rms_rsqrt(flat: mx.array, eps: float) -> mx.array:
+    return mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + eps)
+
+
 class HyperConnection(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -391,7 +434,7 @@ class HyperConnection(nn.Module):
     def compute_weights(self, x: mx.array):
         B, L, H, D = x.shape
         flat = x.reshape(B, L, H * D).astype(mx.float32)
-        rsqrt = mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + self.norm_eps)
+        rsqrt = _rms_rsqrt(flat, self.norm_eps)
         mixes = (flat @ self.fn.T) * rsqrt
         split_sinkhorn = _hc_split_sinkhorn_ops if self.training else hc_split_sinkhorn
         return split_sinkhorn(
@@ -405,8 +448,7 @@ class HyperConnection(nn.Module):
 
     def collapse(self, x: mx.array):
         pre, post, comb = self.compute_weights(x)
-        collapsed = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)
-        return collapsed.astype(x.dtype), post, comb
+        return _hc_collapse_op(pre, x), post, comb
 
     def expand(
         self,
@@ -415,9 +457,7 @@ class HyperConnection(nn.Module):
         post: mx.array,
         comb: mx.array,
     ):
-        y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
-        y = y + mx.matmul(comb.astype(mx.float32), residual.astype(mx.float32))
-        return y.astype(block_out.dtype)
+        return _hc_expand_op(post, block_out, comb, residual)
 
 
 class HyperHead(nn.Module):
@@ -435,7 +475,7 @@ class HyperHead(nn.Module):
     def __call__(self, x: mx.array):
         B, L, H, D = x.shape
         flat = x.reshape(B, L, H * D).astype(mx.float32)
-        rsqrt = mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + self.norm_eps)
+        rsqrt = _rms_rsqrt(flat, self.norm_eps)
         mixes = (flat @ self.fn.T) * rsqrt
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
@@ -804,6 +844,7 @@ class V4Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+        self._q_l2_norm_weight = (mx.ones((self.head_dim,)),)
 
         rope_theta = (
             config.compress_rope_theta if self.compress_ratio else config.rope_theta
@@ -879,11 +920,9 @@ class V4Attention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        q = q * mx.rsqrt(
-            (q.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True)
-            + self.config.rms_norm_eps
+        q = mx.fast.rms_norm(
+            q, self._q_l2_norm_weight[0].astype(q.dtype), self.config.rms_norm_eps
         )
-        q = q.astype(x.dtype)
         q = q.transpose(0, 2, 1, 3)
         kv = self.kv_norm(self.wkv(x)).reshape(B, L, 1, self.head_dim)
         kv = kv.transpose(0, 2, 1, 3)
