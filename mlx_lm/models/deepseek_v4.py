@@ -56,7 +56,6 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 1
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
-    quantization_config: Optional[Dict] = None
 
     def __post_init__(self):
         if not self.compress_ratios:
