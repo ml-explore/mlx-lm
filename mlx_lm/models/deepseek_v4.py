@@ -9,9 +9,9 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import RotatingKVCache
+from .cache import BatchRotatingKVCache, RotatingKVCache
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
 
 
 def _default_quantization() -> Dict:
@@ -118,6 +118,33 @@ class LimitedSwiGLU(nn.Module):
         return _limited_swiglu(gate, x, self.limit)
 
 
+class DeepseekV4SwitchGLU(SwitchGLU):
+    sort_threshold = 8
+
+    def __call__(self, x, indices) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+
+        do_sort = indices.size >= self.sort_threshold
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        x = self.down_proj(
+            self.activation(x_up, x_gate),
+            idx,
+            sorted_indices=do_sort,
+        )
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)
+
+
 class DeepseekV4RoPE(nn.Module):
     def __init__(
         self,
@@ -172,16 +199,20 @@ class DeepseekV4RoPE(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        offset: int = 0,
+        offset: Any = 0,
         inverse: bool = False,
         positions: Optional[mx.array] = None,
     ):
         L = x.shape[-2]
-        pos = (
-            mx.arange(offset, offset + L, dtype=mx.float32)
-            if positions is None
-            else positions.astype(mx.float32)
-        )
+        if positions is None:
+            pos = mx.arange(L, dtype=mx.float32)
+            if isinstance(offset, mx.array):
+                offset = offset.astype(mx.float32)
+                if offset.ndim > 0:
+                    offset = offset[..., None]
+            pos = pos + offset
+        else:
+            pos = positions.astype(mx.float32)
         return _rope_full(x, self.inv_freq, pos, inverse, 0)
 
 
@@ -193,7 +224,7 @@ def _rope_full(
     inverse: bool,
     nope_dim: int,
 ) -> mx.array:
-    freqs = pos[:, None] * inv_freq[None, :]
+    freqs = pos[..., None] * inv_freq
     cos = mx.cos(freqs)
     sin = mx.sin(freqs)
     if inverse:
@@ -204,7 +235,12 @@ def _rope_full(
     else:
         pe = x
 
-    broadcast_shape = (1,) * (pe.ndim - 2) + cos.shape
+    if pos.ndim == 1:
+        broadcast_shape = (1,) * (pe.ndim - 2) + cos.shape
+    else:
+        broadcast_shape = (
+            pos.shape[:-1] + (1,) * (pe.ndim - pos.ndim - 1) + cos.shape[-2:]
+        )
     cos = cos.reshape(broadcast_shape).astype(pe.dtype)
     sin = sin.reshape(broadcast_shape).astype(pe.dtype)
 
@@ -221,19 +257,22 @@ def _rope_full(
 def _apply_partial_rope(
     x: mx.array,
     rope: DeepseekV4RoPE,
-    offset: int = 0,
+    offset: Any = 0,
     inverse: bool = False,
     positions: Optional[mx.array] = None,
 ) -> mx.array:
     nope_dim = x.shape[-1] - rope.dims if x.shape[-1] != rope.dims else 0
     L = x.shape[-2]
-    pos = (
-        mx.arange(offset, offset + L, dtype=mx.float32)
-        if positions is None
-        else positions.astype(mx.float32)
-    )
+    if positions is None:
+        pos = mx.arange(L, dtype=mx.float32)
+        if isinstance(offset, mx.array):
+            offset = offset.astype(mx.float32)
+            if offset.ndim > 0:
+                offset = offset[..., None]
+        pos = pos + offset
+    else:
+        pos = positions.astype(mx.float32)
     return _rope_full(x, rope.inv_freq, pos, inverse, nope_dim)
-
 
 @mx.compile
 def _hc_split_sinkhorn_ops(
@@ -550,7 +589,7 @@ class DeepseekV4MoE(nn.Module):
         super().__init__()
         self.config = config
         self.gate = MoEGate(config, layer_idx)
-        self.switch_mlp = SwitchGLU(
+        self.switch_mlp = DeepseekV4SwitchGLU(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -577,6 +616,8 @@ class DeepseekV4MoE(nn.Module):
 
 
 class DeepseekV4Cache:
+    _state_keys = ("buffer_kv", "buffer_gate", "pooled")
+
     def __init__(self, sliding_window: int):
         self.local = RotatingKVCache(max_size=sliding_window, keep=0)
         self.compressor_state = {"buffer_kv": None, "buffer_gate": None, "pooled": None}
@@ -680,7 +721,11 @@ class DeepseekV4Cache:
         usable = (kv.shape[1] // ratio) * ratio
         state["buffer_kv"] = kv[:, usable:]
         state["buffer_gate"] = gate[:, usable:]
-        pool_base = max(0, start_pos) - (buf_kv.shape[1] if buf_kv is not None else 0)
+        if isinstance(start_pos, mx.array):
+            pool_base = mx.maximum(start_pos, 0)
+        else:
+            pool_base = max(0, start_pos)
+        pool_base = pool_base - (buf_kv.shape[1] if buf_kv is not None else 0)
         return kv[:, :usable], gate[:, :usable], pool_base
 
     def update_pool(self, new_pooled: mx.array, state_key: str) -> mx.array:
@@ -698,6 +743,216 @@ class DeepseekV4Cache:
                 (new_pooled.shape[0], 0, new_pooled.shape[-1]), new_pooled.dtype
             )
         return pool
+
+    def prepare(self, *args, **kwargs):
+        if hasattr(self.local, "prepare"):
+            self.local.prepare(*args, **kwargs)
+            return
+
+        left_padding = kwargs.get("left_padding")
+        right_padding = kwargs.get("right_padding")
+        if left_padding is not None or (
+            right_padding is not None and max(right_padding) > 0
+        ):
+            batch_size = (
+                len(left_padding)
+                if left_padding is not None
+                else len(kwargs.get("lengths"))
+            )
+            self.local = BatchRotatingKVCache(self.local.max_size, [0] * batch_size)
+            self.local.prepare(*args, **kwargs)
+
+    def finalize(self):
+        if hasattr(self.local, "finalize"):
+            self.local.finalize()
+
+    def filter(self, batch_indices):
+        if hasattr(self.local, "filter"):
+            self.local.filter(batch_indices)
+        elif self.local.keys is not None:
+            self.local.keys = self.local.keys[batch_indices]
+            self.local.values = self.local.values[batch_indices]
+        for state in (self.compressor_state, self.indexer_state):
+            for key, value in state.items():
+                if value is not None:
+                    state[key] = value[batch_indices]
+
+    def extend(self, other):
+        self_batch = self._cache_batch_size(self.local)
+        other_batch = self._cache_batch_size(other.local)
+        if hasattr(self.local, "extend"):
+            other_local = other.local
+            if not hasattr(other_local, "filter"):
+                other_local = self._batch_rotating_from_local(other_local)
+            self.local.extend(other_local)
+        elif (
+            not hasattr(other.local, "filter")
+            and self.local.offset == other.local.offset
+            and self.local._idx == other.local._idx
+        ):
+            if self.local.keys is not None or other.local.keys is not None:
+                self.local.keys = self._concat_optional_local(
+                    self.local.keys, other.local.keys
+                )
+                self.local.values = self._concat_optional_local(
+                    self.local.values, other.local.values
+                )
+        else:
+            self.local = self._batch_rotating_from_local(self.local)
+            other_local = (
+                other.local
+                if hasattr(other.local, "filter")
+                else self._batch_rotating_from_local(other.local)
+            )
+            self.local.extend(other_local)
+        for self_state, other_state in (
+            (self.compressor_state, other.compressor_state),
+            (self.indexer_state, other.indexer_state),
+        ):
+            for key in self._state_keys:
+                self_state[key] = self._concat_batch_state(
+                    self_state[key], other_state[key], self_batch, other_batch
+                )
+
+    def extract(self, idx):
+        cache = DeepseekV4Cache(self.local.max_size)
+        cache.local = (
+            self.local.extract(idx)
+            if hasattr(self.local, "extract")
+            else self._extract_local(self.local, idx)
+        )
+        for cache_state, self_state in (
+            (cache.compressor_state, self.compressor_state),
+            (cache.indexer_state, self.indexer_state),
+        ):
+            for key, value in self_state.items():
+                cache_state[key] = (
+                    None if value is None else mx.contiguous(value[idx : idx + 1])
+                )
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        if not all(c.local.max_size == caches[0].local.max_size for c in caches):
+            raise ValueError(
+                "DeepseekV4Cache can only merge caches with the same sliding window"
+            )
+
+        cache = cls(caches[0].local.max_size)
+        cache.local = cls._merge_local([c.local for c in caches])
+        for cache_state, state_name in (
+            (cache.compressor_state, "compressor_state"),
+            (cache.indexer_state, "indexer_state"),
+        ):
+            for key in cls._state_keys:
+                cache_state[key] = cls._merge_batch_state(
+                    [getattr(c, state_name)[key] for c in caches]
+                )
+        return cache
+
+    @staticmethod
+    def _cache_batch_size(cache):
+        offset = getattr(cache, "offset", 0)
+        if isinstance(offset, mx.array) and offset.ndim:
+            return offset.shape[0]
+        if cache.keys is not None:
+            return cache.keys.shape[0]
+        return 1
+
+    @staticmethod
+    def _extract_local(local, idx):
+        cache = RotatingKVCache(local.max_size, keep=getattr(local, "keep", 0))
+        if local.keys is not None:
+            keys = local._temporal_order(local.keys)
+            values = local._temporal_order(local.values)
+            cache.keys = mx.contiguous(keys[idx : idx + 1])
+            cache.values = mx.contiguous(values[idx : idx + 1])
+            cache._idx = cache.keys.shape[2]
+        cache.offset = local.offset
+        return cache
+
+    @classmethod
+    def _batch_rotating_from_local(cls, local):
+        batch_size = cls._cache_batch_size(local)
+        return BatchRotatingKVCache.merge(
+            [cls._extract_local(local, idx) for idx in range(batch_size)]
+        )
+
+    @staticmethod
+    def _concat_optional_local(a: Optional[mx.array], b: Optional[mx.array]):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return mx.concatenate([a, b], axis=0)
+
+    @classmethod
+    def _merge_local(cls, locals):
+        offsets = [local.offset for local in locals]
+        sizes = [local.size() for local in locals]
+        use_fast_local = (
+            all(not isinstance(offset, mx.array) for offset in offsets)
+            and all(offset == offsets[0] for offset in offsets)
+            and all(size == sizes[0] for size in sizes)
+        )
+        if not use_fast_local:
+            if hasattr(locals[0], "merge"):
+                return locals[0].merge(locals)
+            return BatchRotatingKVCache.merge(locals)
+
+        cache = RotatingKVCache(locals[0].max_size, keep=getattr(locals[0], "keep", 0))
+        cache.offset = offsets[0]
+        if sizes[0] == 0:
+            return cache
+
+        cache.keys = mx.concatenate(
+            [local._temporal_order(local.keys) for local in locals], axis=0
+        )
+        cache.values = mx.concatenate(
+            [local._temporal_order(local.values) for local in locals], axis=0
+        )
+        cache._idx = cache.keys.shape[2]
+        return cache
+
+    @staticmethod
+    def _concat_batch_state(
+        a: Optional[mx.array],
+        b: Optional[mx.array],
+        a_batch: int,
+        b_batch: int,
+    ):
+        if a is None and b is None:
+            return None
+        if a is None:
+            shape = (a_batch, *b.shape[1:])
+            a = mx.zeros(shape, dtype=b.dtype)
+        if b is None:
+            shape = (b_batch, *a.shape[1:])
+            b = mx.zeros(shape, dtype=a.dtype)
+        if a.shape[1:] != b.shape[1:]:
+            raise ValueError(
+                "Cannot extend DeepseekV4Cache entries with different state shapes"
+            )
+        return mx.concatenate([a, b], axis=0)
+
+    @staticmethod
+    def _merge_batch_state(values: List[Optional[mx.array]]):
+        present = [v for v in values if v is not None]
+        if not present:
+            return None
+        if not all(v.shape[1:] == present[0].shape[1:] for v in present):
+            raise ValueError(
+                "Cannot batch DeepseekV4Cache entries with different state shapes"
+            )
+        shape = present[0].shape
+        dtype = present[0].dtype
+        merged = []
+        for value in values:
+            if value is None:
+                merged.append(mx.zeros((1, *shape[1:]), dtype=dtype))
+            else:
+                merged.append(value)
+        return mx.concatenate(merged, axis=0)
 
 
 class Compressor(nn.Module):
@@ -756,10 +1011,11 @@ class Compressor(nn.Module):
             )
             new_pooled = (kv * weights).sum(axis=2)
             new_pooled = self.norm(new_pooled.astype(x.dtype))
-            positions = (
-                mx.arange(new_pooled.shape[1], dtype=mx.float32) * self.compress_ratio
-                + pool_base
-            )
+            positions = mx.arange(new_pooled.shape[1], dtype=mx.float32)
+            positions = positions * self.compress_ratio
+            if isinstance(pool_base, mx.array) and pool_base.ndim > 0:
+                pool_base = pool_base[:, None]
+            positions = positions + pool_base
             new_pooled = _apply_partial_rope(
                 new_pooled[:, None], rope, positions=positions
             ).squeeze(1)
