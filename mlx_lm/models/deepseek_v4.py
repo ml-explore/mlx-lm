@@ -1327,18 +1327,17 @@ class V4Attention(nn.Module):
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
         self._q_l2_norm_weight = (mx.ones((self.head_dim,)),)
 
+        rope_theta = (
+            config.compress_rope_theta if self.compress_ratio else config.rope_theta
+        )
+        rope_scaling = config.rope_scaling if self.compress_ratio else None
         self.rope = DeepseekV4RoPE(
             config.qk_rope_head_dim,
-            config.rope_theta,
-            config.rope_scaling,
+            rope_theta,
+            rope_scaling,
             config.max_position_embeddings,
         )
-        self.compress_rope = DeepseekV4RoPE(
-            config.qk_rope_head_dim,
-            config.compress_rope_theta,
-            config.rope_scaling,
-            config.max_position_embeddings,
-        )
+        self.compress_rope = self.rope
         if self.compress_ratio:
             self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
