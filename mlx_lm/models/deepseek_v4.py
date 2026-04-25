@@ -1099,6 +1099,9 @@ class Model(nn.Module):
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         """Handle DeepSeek-V4 checkpoint conversion.
 
+        Supports both raw HF checkpoints (FP8/FP4 block scales) and
+        pre-quantized MLX checkpoints (e.g. mlx-community 8-bit).
+
         Checkpoint naming (from HF):
             layers.N.attn.{wq_a,wq_b,wkv,wo_a,wo_b}.{weight,scale}
             layers.N.attn.{q_norm,kv_norm,attn_sink}
@@ -1111,6 +1114,11 @@ class Model(nn.Module):
             layers.N.hc_{attn,ffn}_{fn,base,scale}
             embed.weight, head.weight, hc_head_{fn,base,scale}
             mtp.0.* (dropped)
+
+        MLX-quantized naming (community 8-bit):
+            embed.{weight,biases,scales}, head.{weight,biases,scales}
+            layers.N.attn.wo_a.G.{weight,biases,scales} (per-group)
+            layers.N.ffn.experts.w{1,2,3}.{weight,biases,scales} (pre-stacked)
         """
         n_layers = self.args.num_hidden_layers
 
@@ -1189,18 +1197,29 @@ class Model(nn.Module):
         weights = new
 
         # 3) Remap top-level names to our module structure
-        top_remap = {
-            "embed.weight":    "model.embed_tokens.weight",
-            "norm.weight":     "model.norm.weight",
-            "head.weight":     "lm_head.weight",
+        #    Prefix-based remap handles both raw (.weight) and quantized
+        #    (.weight, .biases, .scales) checkpoints.
+        top_prefix_remap = {
+            "embed.":      "model.embed_tokens.",
+            "head.":       "lm_head.",
+        }
+        top_exact_remap = {
             "norm.weight":     "model.norm.weight",
             "hc_head_fn":      "model.hc_head.fn",
             "hc_head_base":    "model.hc_head.base",
             "hc_head_scale":   "model.hc_head.scale",
         }
-        for old, new_key in top_remap.items():
-            if old in weights:
-                weights[new_key] = weights.pop(old)
+        new = {}
+        for k, v in weights.items():
+            nk = k
+            for old_pfx, new_pfx in top_prefix_remap.items():
+                if nk.startswith(old_pfx):
+                    nk = new_pfx + nk[len(old_pfx):]
+                    break
+            if nk in top_exact_remap:
+                nk = top_exact_remap[nk]
+            new[nk] = v
+        weights = new
 
         # 4) Remap layer-level names: layers.N.X -> model.layers.N.X
         #    Also remap gate.bias -> gate.e_score_correction_bias,
@@ -1230,14 +1249,37 @@ class Model(nn.Module):
         weights = new
 
         # 5) Stack expert weights: experts.E.w{1,2,3}.weight -> switch_mlp.{gate,down,up}_proj.weight
+        #    Also handle pre-stacked experts (community quants): experts.w{1,2,3}.X -> switch_mlp.{proj}.X
+        expert_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
         for l in range(n_layers):
             prefix = f"model.layers.{l}.ffn.experts"
-            for src, dst in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for src, dst in expert_remap.items():
+                # Case A: per-expert weights need stacking (raw HF checkpoint)
                 key0 = f"{prefix}.0.{src}.weight"
                 if key0 in weights:
                     stack = [weights.pop(f"{prefix}.{e}.{src}.weight")
                              for e in range(self.args.n_routed_experts)]
                     weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.weight"] = mx.stack(stack)
+                # Case B: already-stacked (community quant) — rename experts.w1.X -> switch_mlp.gate_proj.X
+                for suffix in ("weight", "biases", "scales"):
+                    old = f"{prefix}.{src}.{suffix}"
+                    if old in weights:
+                        weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.{suffix}"] = weights.pop(old)
+
+        # 6) Fuse split wo_a: community quants store wo_a.G.{weight,biases,scales}
+        #    per-group; our model uses a single QuantizedLinear with grouped dequant.
+        n_groups = self.args.o_groups
+        for l in range(n_layers):
+            prefix = f"model.layers.{l}.attn.wo_a"
+            if f"{prefix}.0.weight" in weights:
+                for suffix in ("weight", "biases", "scales"):
+                    parts = []
+                    for g in range(n_groups):
+                        key = f"{prefix}.{g}.{suffix}"
+                        if key in weights:
+                            parts.append(weights.pop(key))
+                    if parts:
+                        weights[f"{prefix}.{suffix}"] = mx.concatenate(parts, axis=0)
 
         return weights
 
