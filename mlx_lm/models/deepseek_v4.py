@@ -1609,21 +1609,6 @@ class Model(nn.Module):
 
         return predicate
 
-    @property
-    def quant_predicate(self):
-        def predicate(path, _):
-            if path.endswith(
-                (
-                    ".ffn.switch_mlp.gate_proj",
-                    ".ffn.switch_mlp.up_proj",
-                    ".ffn.switch_mlp.down_proj",
-                )
-            ):
-                return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            return True
-
-        return predicate
-
     def make_cache(self):
         caches = []
         for layer in self.layers:
