@@ -367,6 +367,15 @@ class CompressedKVCache:
         self.local.state = value
 
     @property
+    def nbytes(self):
+        n = self.local.nbytes
+        if self._pool is not None:
+            n += self._pool.nbytes
+        if self._buf is not None:
+            n += self._buf.nbytes
+        return n
+
+    @property
     def meta_state(self):
         return self.local.meta_state
 
