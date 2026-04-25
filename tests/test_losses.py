@@ -49,6 +49,32 @@ class TestLosses(unittest.TestCase):
 
         self.assertTrue(mx.allclose(vjp_q, expected))
 
+    def test_kl_div_loss_mlx_implementation(self):
+        mx.random.seed(0)
+
+        logits_q = mx.random.normal((2, 4, 128))
+        logits_p = mx.random.normal((2, 4, 128))
+
+        kl = kl_div_loss(logits_q, logits_p, implementation="mlx")
+
+        self.assertEqual(kl.shape, logits_q.shape[:-1])
+        self.assertTrue(mx.all(mx.isfinite(kl)).item())
+
+    def test_kl_div_loss_auto_large_bfloat16_vocab(self):
+        logits_q = mx.zeros((1, 248320), dtype=mx.bfloat16)
+        logits_p = mx.zeros((1, 248320), dtype=mx.bfloat16)
+
+        kl = kl_div_loss(logits_q, logits_p, implementation="auto")
+
+        self.assertEqual(kl.shape, logits_q.shape[:-1])
+        self.assertTrue(mx.all(mx.isfinite(kl)).item())
+
+    def test_kl_div_loss_rejects_unknown_implementation(self):
+        logits = mx.zeros((1, 4))
+
+        with self.assertRaisesRegex(ValueError, "auto.*metal.*mlx"):
+            kl_div_loss(logits, logits, implementation="fastest")
+
     def test_js_div_loss_vjp(self):
         self.assertTrue(can_run_metal())
         mx.random.seed(0)
