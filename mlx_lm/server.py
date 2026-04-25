@@ -642,6 +642,13 @@ class ResponseGenerator:
         return True
 
     def _generate(self):
+        # Recreate the generation stream in this thread.
+        # MLX streams are thread-local; the module-level stream was
+        # created in the main thread and is not available here.
+        import mlx_lm.generate as _gen_mod
+
+        _gen_mod.generation_stream = mx.new_stream(mx.default_device())
+
         current_model = None
         current_sampling = None
         current_tokenizer = None
