@@ -274,6 +274,7 @@ def _apply_partial_rope(
         pos = positions.astype(mx.float32)
     return _rope_full(x, rope.inv_freq, pos, inverse, nope_dim)
 
+
 @mx.compile
 def _hc_split_sinkhorn_ops(
     mixes: mx.array,
@@ -617,11 +618,13 @@ class DeepseekV4MoE(nn.Module):
 
 class DeepseekV4Cache:
     _state_keys = ("buffer_kv", "buffer_gate", "pooled")
+    _length_keys = ("buffer_lengths", "pooled_lengths")
 
     def __init__(self, sliding_window: int):
         self.local = RotatingKVCache(max_size=sliding_window, keep=0)
-        self.compressor_state = {"buffer_kv": None, "buffer_gate": None, "pooled": None}
-        self.indexer_state = {"buffer_kv": None, "buffer_gate": None, "pooled": None}
+        self.compressor_state = self._new_branch_state()
+        self.indexer_state = self._new_branch_state()
+        self._pending_lengths = None
 
     @property
     def offset(self):
@@ -640,12 +643,8 @@ class DeepseekV4Cache:
         local_state = None if self.local.empty() else self.local.state
         return (
             local_state,
-            tuple(
-                self.compressor_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")
-            ),
-            tuple(
-                self.indexer_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")
-            ),
+            self._branch_state_tuple(self.compressor_state),
+            self._branch_state_tuple(self.indexer_state),
         )
 
     @state.setter
@@ -656,12 +655,8 @@ class DeepseekV4Cache:
             self.local.values = None
         else:
             self.local.state = local_state
-        self.compressor_state = dict(
-            zip(("buffer_kv", "buffer_gate", "pooled"), compressor_state)
-        )
-        self.indexer_state = dict(
-            zip(("buffer_kv", "buffer_gate", "pooled"), indexer_state)
-        )
+        self.compressor_state = self._state_from_tuple(compressor_state)
+        self.indexer_state = self._state_from_tuple(indexer_state)
 
     @property
     def meta_state(self):
@@ -694,7 +689,7 @@ class DeepseekV4Cache:
         total = self.local.nbytes
         for state in (self.compressor_state, self.indexer_state):
             for value in state.values():
-                if value is not None:
+                if value is not None and hasattr(value, "nbytes"):
                     total += value.nbytes
         return total
 
@@ -704,6 +699,43 @@ class DeepseekV4Cache:
             if state_key == "indexer_state"
             else self.compressor_state
         )
+
+    @classmethod
+    def _new_branch_state(cls):
+        return {key: None for key in cls._state_keys + cls._length_keys}
+
+    @classmethod
+    def _branch_state_tuple(cls, state):
+        return tuple(state[k] for k in cls._state_keys + cls._length_keys)
+
+    @classmethod
+    def _state_from_tuple(cls, values):
+        keys = cls._state_keys + cls._length_keys
+        state = cls._new_branch_state()
+        state.update(zip(keys, values))
+        return state
+
+    @staticmethod
+    def _lengths_list(lengths, batch_size: int, default: Optional[int] = None):
+        if lengths is None:
+            if default is None:
+                return None
+            return [default] * batch_size
+        if isinstance(lengths, mx.array):
+            lengths = lengths.tolist()
+        return [int(length) for length in lengths]
+
+    @staticmethod
+    def _filter_lengths(lengths, batch_indices):
+        if lengths is None:
+            return None
+        if isinstance(lengths, mx.array):
+            lengths = lengths.tolist()
+        if isinstance(batch_indices, mx.array):
+            batch_indices = batch_indices.tolist()
+        if len(lengths) == 1 and any(idx != 0 for idx in batch_indices):
+            lengths = lengths * (max(batch_indices) + 1)
+        return [int(lengths[idx]) for idx in batch_indices]
 
     def accumulate_windows(
         self,
@@ -715,22 +747,130 @@ class DeepseekV4Cache:
     ):
         state = self._branch_state(state_key)
         buf_kv, buf_gate = state["buffer_kv"], state["buffer_gate"]
-        if buf_kv is not None and buf_kv.shape[1]:
-            kv = mx.concatenate([buf_kv, kv], axis=1)
-            gate = mx.concatenate([buf_gate, gate], axis=1)
-        usable = (kv.shape[1] // ratio) * ratio
-        state["buffer_kv"] = kv[:, usable:]
-        state["buffer_gate"] = gate[:, usable:]
+        B, L = kv.shape[:2]
+        buf_lengths = self._lengths_list(state["buffer_lengths"], B)
+        chunk_lengths = self._pending_lengths
+        if buf_lengths is None and chunk_lengths is None:
+            if buf_kv is not None and buf_kv.shape[1]:
+                kv = mx.concatenate([buf_kv, kv], axis=1)
+                gate = mx.concatenate([buf_gate, gate], axis=1)
+            usable = (kv.shape[1] // ratio) * ratio
+            state["buffer_kv"] = kv[:, usable:]
+            state["buffer_gate"] = gate[:, usable:]
+            state["buffer_lengths"] = None
+            state["_new_pooled_lengths"] = None
+            if isinstance(start_pos, mx.array):
+                pool_base = mx.maximum(start_pos, 0)
+            else:
+                pool_base = max(0, start_pos)
+            pool_base = pool_base - (buf_kv.shape[1] if buf_kv is not None else 0)
+            return kv[:, :usable], gate[:, :usable], pool_base
+
+        buf_lengths = self._lengths_list(
+            state["buffer_lengths"],
+            B,
+            0 if buf_kv is None else buf_kv.shape[1],
+        )
+        chunk_lengths = self._lengths_list(chunk_lengths, B, L)
+        total_lengths = [
+            buf_length + min(chunk_length, L)
+            for buf_length, chunk_length in zip(buf_lengths, chunk_lengths)
+        ]
+        usable_lengths = [(length // ratio) * ratio for length in total_lengths]
+        buffer_lengths = [
+            length - usable for length, usable in zip(total_lengths, usable_lengths)
+        ]
+        max_total = max(total_lengths, default=0)
+        max_usable = max(usable_lengths, default=0)
+        max_buffer = max(buffer_lengths, default=0)
+
+        combined_kv = mx.zeros((B, max_total, kv.shape[-1]), dtype=kv.dtype)
+        combined_gate = mx.zeros((B, max_total, gate.shape[-1]), dtype=gate.dtype)
+        for i, (buf_length, chunk_length, total_length) in enumerate(
+            zip(buf_lengths, chunk_lengths, total_lengths)
+        ):
+            parts_kv = []
+            parts_gate = []
+            if buf_length:
+                parts_kv.append(buf_kv[i : i + 1, :buf_length])
+                parts_gate.append(buf_gate[i : i + 1, :buf_length])
+            if chunk_length:
+                parts_kv.append(kv[i : i + 1, : min(chunk_length, L)])
+                parts_gate.append(gate[i : i + 1, : min(chunk_length, L)])
+            if parts_kv:
+                row_kv = (
+                    parts_kv[0]
+                    if len(parts_kv) == 1
+                    else mx.concatenate(parts_kv, axis=1)
+                )
+                row_gate = (
+                    parts_gate[0]
+                    if len(parts_gate) == 1
+                    else mx.concatenate(parts_gate, axis=1)
+                )
+                combined_kv[i : i + 1, :total_length] = row_kv
+                combined_gate[i : i + 1, :total_length] = row_gate
+
+        ready_kv = combined_kv[:, :max_usable]
+        ready_gate = combined_gate[:, :max_usable]
+        state["buffer_kv"] = mx.zeros((B, max_buffer, kv.shape[-1]), dtype=kv.dtype)
+        state["buffer_gate"] = mx.zeros(
+            (B, max_buffer, gate.shape[-1]), dtype=gate.dtype
+        )
+        for i, (usable, buffer_length) in enumerate(
+            zip(usable_lengths, buffer_lengths)
+        ):
+            if buffer_length:
+                state["buffer_kv"][i : i + 1, :buffer_length] = combined_kv[
+                    i : i + 1, usable : usable + buffer_length
+                ]
+                state["buffer_gate"][i : i + 1, :buffer_length] = combined_gate[
+                    i : i + 1, usable : usable + buffer_length
+                ]
+        state["buffer_lengths"] = buffer_lengths
+        state["_new_pooled_lengths"] = [
+            usable // ratio for usable in usable_lengths
+        ]
+
+        prev_lengths = mx.array(buf_lengths, dtype=mx.float32)
         if isinstance(start_pos, mx.array):
-            pool_base = mx.maximum(start_pos, 0)
+            pool_base = mx.maximum(start_pos, 0).astype(mx.float32)
         else:
-            pool_base = max(0, start_pos)
-        pool_base = pool_base - (buf_kv.shape[1] if buf_kv is not None else 0)
-        return kv[:, :usable], gate[:, :usable], pool_base
+            pool_base = mx.full((B,), max(0, start_pos), dtype=mx.float32)
+        return ready_kv, ready_gate, pool_base - prev_lengths
 
     def update_pool(self, new_pooled: mx.array, state_key: str) -> mx.array:
         state = self._branch_state(state_key)
+        new_lengths = state.pop("_new_pooled_lengths", None)
         pool = state["pooled"]
+        if new_lengths is not None:
+            B = new_pooled.shape[0]
+            pool_lengths = self._lengths_list(
+                state["pooled_lengths"],
+                B,
+                0 if pool is None else pool.shape[1],
+            )
+            total_lengths = [
+                pool_length + new_length
+                for pool_length, new_length in zip(pool_lengths, new_lengths)
+            ]
+            max_total = max(total_lengths, default=0)
+            merged = mx.zeros(
+                (B, max_total, new_pooled.shape[-1]), dtype=new_pooled.dtype
+            )
+            for i, (pool_length, new_length) in enumerate(
+                zip(pool_lengths, new_lengths)
+            ):
+                if pool is not None and pool_length:
+                    merged[i : i + 1, :pool_length] = pool[i : i + 1, :pool_length]
+                if new_length:
+                    merged[
+                        i : i + 1, pool_length : pool_length + new_length
+                    ] = new_pooled[i : i + 1, :new_length]
+            state["pooled"] = merged
+            state["pooled_lengths"] = total_lengths
+            return merged
+
         if new_pooled.shape[1] > 0:
             pool = (
                 new_pooled
@@ -738,19 +878,29 @@ class DeepseekV4Cache:
                 else mx.concatenate([pool, new_pooled], axis=1)
             )
             state["pooled"] = pool
+            state["pooled_lengths"] = None
         if pool is None:
             pool = mx.zeros(
                 (new_pooled.shape[0], 0, new_pooled.shape[-1]), new_pooled.dtype
             )
         return pool
 
+    def pooled_lengths(self, state_key: str):
+        return self._branch_state(state_key)["pooled_lengths"]
+
     def prepare(self, *args, **kwargs):
+        lengths = kwargs.get("lengths")
+        right_padding = kwargs.get("right_padding")
+        self._pending_lengths = (
+            list(lengths)
+            if right_padding is not None and max(right_padding) > 0
+            else None
+        )
         if hasattr(self.local, "prepare"):
             self.local.prepare(*args, **kwargs)
             return
 
         left_padding = kwargs.get("left_padding")
-        right_padding = kwargs.get("right_padding")
         if left_padding is not None or (
             right_padding is not None and max(right_padding) > 0
         ):
@@ -765,6 +915,7 @@ class DeepseekV4Cache:
     def finalize(self):
         if hasattr(self.local, "finalize"):
             self.local.finalize()
+        self._pending_lengths = None
 
     def filter(self, batch_indices):
         if hasattr(self.local, "filter"):
@@ -773,9 +924,12 @@ class DeepseekV4Cache:
             self.local.keys = self.local.keys[batch_indices]
             self.local.values = self.local.values[batch_indices]
         for state in (self.compressor_state, self.indexer_state):
-            for key, value in state.items():
+            for key in self._state_keys:
+                value = state[key]
                 if value is not None:
                     state[key] = value[batch_indices]
+            for key in self._length_keys:
+                state[key] = self._filter_lengths(state[key], batch_indices)
 
     def extend(self, other):
         self_batch = self._cache_batch_size(self.local)
@@ -809,9 +963,20 @@ class DeepseekV4Cache:
             (self.compressor_state, other.compressor_state),
             (self.indexer_state, other.indexer_state),
         ):
+            self_tensors = {key: self_state[key] for key in self._state_keys}
+            other_tensors = {key: other_state[key] for key in self._state_keys}
             for key in self._state_keys:
                 self_state[key] = self._concat_batch_state(
                     self_state[key], other_state[key], self_batch, other_batch
+                )
+            for key in self._length_keys:
+                self_state[key] = self._concat_lengths(
+                    self_state[key],
+                    other_state[key],
+                    self_tensors["pooled" if key.startswith("pooled") else "buffer_kv"],
+                    other_tensors["pooled" if key.startswith("pooled") else "buffer_kv"],
+                    self_batch,
+                    other_batch,
                 )
 
     def extract(self, idx):
@@ -825,10 +990,19 @@ class DeepseekV4Cache:
             (cache.compressor_state, self.compressor_state),
             (cache.indexer_state, self.indexer_state),
         ):
-            for key, value in self_state.items():
+            for key in self._state_keys:
+                value = self_state[key]
                 cache_state[key] = (
                     None if value is None else mx.contiguous(value[idx : idx + 1])
                 )
+            for key in self._length_keys:
+                lengths = self_state[key]
+                if lengths is None:
+                    cache_state[key] = None
+                elif isinstance(lengths, mx.array):
+                    cache_state[key] = [int(lengths.tolist()[idx])]
+                else:
+                    cache_state[key] = [int(lengths[idx])]
         return cache
 
     @classmethod
@@ -847,6 +1021,12 @@ class DeepseekV4Cache:
             for key in cls._state_keys:
                 cache_state[key] = cls._merge_batch_state(
                     [getattr(c, state_name)[key] for c in caches]
+                )
+            for key in cls._length_keys:
+                tensor_key = "pooled" if key.startswith("pooled") else "buffer_kv"
+                cache_state[key] = cls._merge_lengths(
+                    [getattr(c, state_name)[key] for c in caches],
+                    [getattr(c, state_name)[tensor_key] for c in caches],
                 )
         return cache
 
@@ -929,28 +1109,83 @@ class DeepseekV4Cache:
         if b is None:
             shape = (b_batch, *a.shape[1:])
             b = mx.zeros(shape, dtype=a.dtype)
-        if a.shape[1:] != b.shape[1:]:
+        if a.shape[2:] != b.shape[2:]:
             raise ValueError(
                 "Cannot extend DeepseekV4Cache entries with different state shapes"
             )
+        if a.shape[1] != b.shape[1]:
+            seq_len = max(a.shape[1], b.shape[1])
+            if a.shape[1] != seq_len:
+                padded = mx.zeros((a.shape[0], seq_len, *a.shape[2:]), dtype=a.dtype)
+                padded[:, : a.shape[1]] = a
+                a = padded
+            if b.shape[1] != seq_len:
+                padded = mx.zeros((b.shape[0], seq_len, *b.shape[2:]), dtype=b.dtype)
+                padded[:, : b.shape[1]] = b
+                b = padded
         return mx.concatenate([a, b], axis=0)
+
+    @staticmethod
+    def _full_lengths(lengths, value: Optional[mx.array], batch_size: int):
+        if lengths is not None:
+            if isinstance(lengths, mx.array):
+                lengths = lengths.tolist()
+            return [int(length) for length in lengths]
+        length = 0 if value is None else value.shape[1]
+        return [length] * batch_size
+
+    @classmethod
+    def _concat_lengths(
+        cls,
+        a_lengths,
+        b_lengths,
+        a_value: Optional[mx.array],
+        b_value: Optional[mx.array],
+        a_batch: int,
+        b_batch: int,
+    ):
+        a_lengths = cls._full_lengths(a_lengths, a_value, a_batch)
+        b_lengths = cls._full_lengths(b_lengths, b_value, b_batch)
+        lengths = a_lengths + b_lengths
+        max_length = max(lengths, default=0)
+        return None if all(length == max_length for length in lengths) else lengths
+
+    @classmethod
+    def _merge_lengths(cls, lengths, values):
+        batch_lengths = [
+            cls._full_lengths(length, value, 1)[0]
+            for length, value in zip(lengths, values)
+        ]
+        max_length = max(batch_lengths, default=0)
+        return (
+            None
+            if all(length == max_length for length in batch_lengths)
+            else batch_lengths
+        )
 
     @staticmethod
     def _merge_batch_state(values: List[Optional[mx.array]]):
         present = [v for v in values if v is not None]
         if not present:
             return None
-        if not all(v.shape[1:] == present[0].shape[1:] for v in present):
+        if not all(v.shape[2:] == present[0].shape[2:] for v in present):
             raise ValueError(
                 "Cannot batch DeepseekV4Cache entries with different state shapes"
             )
+        seq_len = max(v.shape[1] for v in present)
         shape = present[0].shape
         dtype = present[0].dtype
         merged = []
         for value in values:
             if value is None:
-                merged.append(mx.zeros((1, *shape[1:]), dtype=dtype))
+                merged.append(mx.zeros((1, seq_len, *shape[2:]), dtype=dtype))
             else:
+                if value.shape[1] != seq_len:
+                    padded = mx.zeros(
+                        (value.shape[0], seq_len, *value.shape[2:]), dtype=value.dtype
+                    )
+                    padded[:, : value.shape[1]] = value
+                    value = padded
                 merged.append(value)
         return mx.concatenate(merged, axis=0)
 
@@ -1063,6 +1298,11 @@ class Indexer(nn.Module):
         scores = mx.maximum(scores, 0) * self.scale
         weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
         scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+        lengths = cache.pooled_lengths("indexer_state") if cache is not None else None
+        if lengths is not None:
+            lengths = mx.array(lengths)
+            valid = mx.arange(pooled.shape[1]) < lengths[:, None]
+            scores = mx.where(valid[:, None], scores, mx.finfo(scores.dtype).min)
         k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
@@ -1174,6 +1414,8 @@ class V4Attention(nn.Module):
             local_cache = cache
 
         offset = local_cache.offset if local_cache is not None else 0
+        if isinstance(offset, mx.array):
+            offset = offset + 0
         q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(
@@ -1193,11 +1435,22 @@ class V4Attention(nn.Module):
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
+            pooled_mask = None
             if hasattr(self, "indexer") and pooled.shape[1] > 0:
                 topk = self.indexer(
                     x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                 )
                 if topk is not None:
+                    lengths = (
+                        v4_cache.pooled_lengths("compressor_state")
+                        if v4_cache is not None
+                        else None
+                    )
+                    if lengths is not None:
+                        lengths = mx.array(lengths)
+                        pooled_mask = (topk < lengths[:, None, None]).reshape(
+                            B, 1, 1, -1
+                        )
                     expanded = mx.broadcast_to(
                         pooled[:, None, None, :, :],
                         (B, 1, L, pooled.shape[1], self.head_dim),
@@ -1211,13 +1464,33 @@ class V4Attention(nn.Module):
                 else:
                     pooled = pooled[:, None]
             else:
+                lengths = (
+                    v4_cache.pooled_lengths("compressor_state")
+                    if v4_cache is not None
+                    else None
+                )
+                if lengths is not None:
+                    lengths = mx.array(lengths)
+                    pooled_mask = (
+                        mx.arange(pooled.shape[1]) < lengths[:, None]
+                    ).reshape(B, 1, 1, -1)
                 pooled = pooled[:, None]
             full_kv = mx.concatenate([full_kv, pooled], axis=2)
 
         if mask is not None and full_kv.shape[2] > mask.shape[-1]:
-            pad = mx.zeros(
-                mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],), dtype=mask.dtype
-            )
+            pad_shape = mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],)
+            if mask.dtype == mx.bool_:
+                pad = mx.ones(pad_shape, dtype=mask.dtype)
+                if pooled_mask is not None:
+                    pad = pad & pooled_mask
+            else:
+                pad = mx.zeros(pad_shape, dtype=mask.dtype)
+                if pooled_mask is not None:
+                    pad = mx.where(
+                        pooled_mask,
+                        pad,
+                        mx.full(pad_shape, mx.finfo(mask.dtype).min, dtype=mask.dtype),
+                    )
             mask = mx.concatenate([mask, pad], axis=-1)
 
         out = scaled_dot_product_attention(
