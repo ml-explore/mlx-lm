@@ -658,10 +658,29 @@ class DeepseekV4Cache:
         return self.local.make_mask(*args, **kwargs)
 
     def is_trimmable(self):
-        return self.local.is_trimmable()
+        if not self.local.is_trimmable():
+            return False
+        for state in (self.compressor_state, self.indexer_state):
+            pooled = state["pooled"]
+            if pooled is not None and pooled.shape[1] > 0:
+                return False
+        return True
 
     def trim(self, n):
-        return self.local.trim(n)
+        trimmed = self.local.trim(n)
+        batch_size = self._cache_batch_size(self.local)
+        for state in (self.compressor_state, self.indexer_state):
+            for key in ("buffer_kv", "buffer_gate"):
+                value = state[key]
+                if value is not None:
+                    state[key] = value[:, : max(value.shape[1] - trimmed, 0)]
+            lengths = state["buffer_lengths"]
+            if lengths is not None:
+                state["buffer_lengths"] = [
+                    max(length - trimmed, 0)
+                    for length in self._lengths_list(lengths, batch_size, 0)
+                ]
+        return trimmed
 
     def size(self):
         return self.local.size()
@@ -1416,21 +1435,32 @@ class V4Attention(nn.Module):
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, kv)
         full_kv = kv
+        local_kv_len = kv.shape[2]
 
+        pooled_mask = None
+        pooled_bias = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
-            pooled_mask = None
-            if hasattr(self, "indexer") and pooled.shape[1] > 0:
+            lengths = (
+                v4_cache.pooled_lengths("compressor_state")
+                if v4_cache is not None
+                else None
+            )
+            use_indexer = hasattr(self, "indexer") and pooled.shape[1] > 0
+            select_all = (
+                use_indexer
+                and lengths is None
+                and pooled.shape[1] <= self.indexer.index_topk
+            )
+            if select_all:
+                pooled = pooled[:, None]
+                pooled_bias = math.log(L)
+            elif use_indexer:
                 topk = self.indexer(
                     x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                 )
                 if topk is not None:
-                    lengths = (
-                        v4_cache.pooled_lengths("compressor_state")
-                        if v4_cache is not None
-                        else None
-                    )
                     if lengths is not None:
                         lengths = mx.array(lengths)
                         pooled_mask = (topk < lengths[:, None, None]).reshape(
@@ -1449,11 +1479,6 @@ class V4Attention(nn.Module):
                 else:
                     pooled = pooled[:, None]
             else:
-                lengths = (
-                    v4_cache.pooled_lengths("compressor_state")
-                    if v4_cache is not None
-                    else None
-                )
                 if lengths is not None:
                     lengths = mx.array(lengths)
                     pooled_mask = (
@@ -1462,17 +1487,32 @@ class V4Attention(nn.Module):
                 pooled = pooled[:, None]
             full_kv = mx.concatenate([full_kv, pooled], axis=2)
 
+        if mask is not None and mask.shape[-1] > local_kv_len:
+            mask = mask[..., -local_kv_len:]
+
         if mask is not None and full_kv.shape[2] > mask.shape[-1]:
             pad_shape = mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],)
-            if mask.dtype == mx.bool_:
+            pad_pooled_mask = pooled_mask
+            if pad_pooled_mask is not None and pad_pooled_mask.shape[-1] != pad_shape[-1]:
+                pad_pooled_mask = pad_pooled_mask[..., -pad_shape[-1] :]
+            if pooled_bias is not None:
+                dtype = q.dtype
+                if mask.dtype == mx.bool_:
+                    mask = mx.where(
+                        mask,
+                        mx.array(0, dtype=dtype),
+                        mx.full((), mx.finfo(dtype).min, dtype=dtype),
+                    )
+                pad = mx.full(pad_shape, pooled_bias, dtype=mask.dtype)
+            elif mask.dtype == mx.bool_:
                 pad = mx.ones(pad_shape, dtype=mask.dtype)
-                if pooled_mask is not None:
-                    pad = pad & pooled_mask
+                if pad_pooled_mask is not None:
+                    pad = pad & pad_pooled_mask
             else:
                 pad = mx.zeros(pad_shape, dtype=mask.dtype)
-                if pooled_mask is not None:
+                if pad_pooled_mask is not None:
                     pad = mx.where(
-                        pooled_mask,
+                        pad_pooled_mask,
                         pad,
                         mx.full(pad_shape, mx.finfo(mask.dtype).min, dtype=mask.dtype),
                     )
