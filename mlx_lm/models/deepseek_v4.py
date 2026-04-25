@@ -18,8 +18,8 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .hyper_connection import HyperConnection, HyperHead
 from .pipeline import PipelineMixin
-from .sinkhorn import hc_split_sinkhorn
 from .switch_layers import SwitchGLU
 
 
@@ -185,102 +185,6 @@ class DeepseekV4RoPE(nn.Module):
         if x.shape[-1] == self.dims:
             return y
         return mx.concatenate([y, x[..., self.dims :]], axis=-1)
-
-
-# --------------------------------------------------------------------------- #
-# mHC (Manifold-constrained Hyper-Connections)                                #
-# --------------------------------------------------------------------------- #
-
-
-
-class HyperConnection(nn.Module):
-    """Per-block mHC parameters: projects x -> (pre, post, comb) used in hc_pre/hc_post.
-
-    Paper/ref stores the weights as:
-        hc_fn    : [(2+hc)*hc, hc*dim]
-        hc_scale : [3]
-        hc_base  : [(2+hc)*hc]
-
-    hc_pre reduces `hc_mult` parallel hidden states to 1 via `pre`.
-    Block F is applied to the reduced state. hc_post expands 1 -> hc via `post` (the new
-    contribution) added to `comb @ residual` (where `comb` is a doubly-stochastic mix
-    that recombines the input `hc_mult` copies to stay on the Birkhoff manifold).
-    """
-
-    def __init__(self, dim: int, hc_mult: int, norm_eps: float, sinkhorn_iters: int, hc_eps: float):
-        super().__init__()
-        self.dim = dim
-        self.hc_mult = hc_mult
-        self.norm_eps = norm_eps
-        self.sinkhorn_iters = sinkhorn_iters
-        self.hc_eps = hc_eps
-        mix_hc = (2 + hc_mult) * hc_mult
-        hc_dim = hc_mult * dim
-        # All mHC params are fp32 in the checkpoint.
-        self.fn = mx.zeros((mix_hc, hc_dim), dtype=mx.float32)
-        self.base = mx.zeros((mix_hc,), dtype=mx.float32)
-        self.scale = mx.zeros((3,), dtype=mx.float32)
-        self._fn_t = None  # lazy transpose cache (avoids 86 .T calls/token)
-
-    def hc_pre(self, x: mx.array):
-        B, S, hc, D = x.shape
-        dtype = x.dtype
-        xf = x.reshape(B, S, hc * D).astype(mx.float32)
-        xf_norm = mx.fast.rms_norm(xf, weight=None, eps=self.norm_eps)
-        if self._fn_t is None:
-            self._fn_t = self.fn.T
-        mixes = (xf_norm @ self._fn_t).reshape(B * S, -1)
-        pre, post, comb = hc_split_sinkhorn(
-            mixes, self.scale, self.base, hc, self.sinkhorn_iters, self.hc_eps
-        )
-        pre  = pre.reshape(B, S, hc)
-        post = post.reshape(B, S, hc)
-        comb = comb.reshape(B, S, hc, hc)
-        y = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)
-        return y.astype(dtype), post, comb
-
-    def hc_post(self, f_out: mx.array, residual: mx.array, post: mx.array, comb: mx.array):
-        # f_out    [B,S,D] (block output, reduced state)
-        # residual [B,S,hc,D] (input to hc_pre)
-        # post     [B,S,hc]
-        # comb     [B,S,hc,hc]
-        # returns  [B,S,hc,D]
-        dtype = f_out.dtype
-        # post.unsqueeze(-1) * f_out.unsqueeze(-2)  -> [B,S,hc,D]
-        term_new = post[..., None] * f_out[:, :, None, :].astype(mx.float32)
-        # comb @ residual: [B,S,hc,hc] @ [B,S,hc,D] -> [B,S,hc,D]
-        term_res = comb.astype(mx.float32) @ residual.astype(mx.float32)
-        y = term_new + term_res
-        return y.astype(dtype)
-
-
-class HyperHead(nn.Module):
-    """Final (head) mHC projection: reduces [B,S,hc,D] -> [B,S,D] via sigmoid-weighted sum.
-    No Sinkhorn here — this is the simpler head variant from `ParallelHead.hc_head`.
-    """
-
-    def __init__(self, dim: int, hc_mult: int, norm_eps: float, hc_eps: float):
-        super().__init__()
-        self.dim = dim
-        self.hc_mult = hc_mult
-        self.norm_eps = norm_eps
-        self.hc_eps = hc_eps
-        self.fn = mx.zeros((hc_mult, hc_mult * dim), dtype=mx.float32)
-        self.base = mx.zeros((hc_mult,), dtype=mx.float32)
-        self.scale = mx.zeros((1,), dtype=mx.float32)
-        self._fn_t = None  # lazy transpose cache
-
-    def __call__(self, x: mx.array):
-        B, S, hc, D = x.shape
-        dtype = x.dtype
-        xf = x.reshape(B, S, hc * D).astype(mx.float32)
-        inv = mx.rsqrt((xf * xf).mean(axis=-1, keepdims=True) + self.norm_eps)
-        if self._fn_t is None:
-            self._fn_t = self.fn.T
-        mixes = (xf @ self._fn_t) * inv                     # [B,S,hc]
-        pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
-        y = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)
-        return y.astype(dtype)
 
 
 # --------------------------------------------------------------------------- #

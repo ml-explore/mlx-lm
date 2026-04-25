@@ -281,6 +281,8 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+# TODO(mlx#3448): drop this helper once https://github.com/ml-explore/mlx/pull/3448
+# lands and MLX's safetensors loader recognizes F8_E8M0 natively.
 def _reinterpret_safetensor_e8m0_scales_as_uint8(path: str) -> bool:
     """Rewrite safetensors E8M0 scale metadata to U8 in-place.
 
