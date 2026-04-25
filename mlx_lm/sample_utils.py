@@ -365,3 +365,111 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return frequency_penalty_processor
+
+
+def make_thinking_budget_processor(
+    think_start_tokens: tuple,
+    think_end_tokens: tuple,
+    budget: int,
+    early_stop_tokens: mx.array,
+) -> Callable[[mx.array, mx.array], mx.array]:
+    """
+    Make a logits processor that enforces a thinking token budget.
+
+    Tracks the thinking state by watching for ``think_start_tokens`` /
+    ``think_end_tokens`` in the generated sequence.  When the number of
+    thinking tokens exceeds ``budget``, the processor injects
+    ``early_stop_tokens`` one token at a time by forcing each token's logit
+    to ``0.0`` and setting all other logits to ``-inf``.  After the full
+    injection sequence has been forced the processor returns to passthrough
+    mode.
+
+    Args:
+        think_start_tokens (tuple): Token IDs that mark the start of a
+            thinking block (e.g. the tokenization of ``<think>``).
+        think_end_tokens (tuple): Token IDs that mark the end of a thinking
+            block (e.g. the tokenization of ``</think>``).
+        budget (int): Maximum number of thinking tokens allowed before
+            early-stop injection begins.  Must be >= 0.
+        early_stop_tokens (mx.array): 1-D array of token IDs to inject when
+            the budget is exceeded.
+
+    Returns:
+        Callable[[mx.array, mx.array], mx.array]:
+            A stateful logits processor with signature
+            ``(tokens, logits) -> logits``.
+    """
+    if budget < 0:
+        raise ValueError(f"budget must be >= 0, got {budget}")
+
+    state = {
+        "in_thinking": False,
+        "thinking_count": 0,
+        "forcing": False,
+        "force_idx": 0,
+        "prev_len": 0,
+    }
+
+    start = list(think_start_tokens)
+    end = list(think_end_tokens)
+    stop = early_stop_tokens.tolist()
+
+    vocab_size = early_stop_tokens.shape[0] if early_stop_tokens.ndim == 1 else None
+
+    def _force_logits(logits, forced_id):
+        """Return logits with forced_id set to 0.0 and all others to -inf."""
+        indices = mx.arange(logits.shape[-1])
+        return mx.where(indices == forced_id, 0.0, float("-inf"))[None]
+
+    def _ends_with(seq, pattern):
+        """Return True if seq ends with pattern."""
+        n = len(pattern)
+        return len(seq) >= n and seq[-n:] == pattern
+
+    def thinking_budget_processor(tokens, logits):
+        token_list = tokens.tolist()
+        prev_len = state["prev_len"]
+        new_tokens = token_list[prev_len:]
+        state["prev_len"] = len(token_list)
+
+        # If currently forcing injection, continue regardless of new tokens.
+        if state["forcing"]:
+            forced_id = stop[state["force_idx"]]
+            state["force_idx"] += 1
+            if state["force_idx"] >= len(stop):
+                # Injection complete; reset to not-thinking.
+                state["forcing"] = False
+                state["force_idx"] = 0
+                state["in_thinking"] = False
+                state["thinking_count"] = 0
+            return _force_logits(logits, forced_id)
+
+        # Process each new token to update thinking state.
+        # Walk new_tokens by position to avoid index(tok) ambiguity.
+        for pos, tok in enumerate(new_tokens, start=prev_len):
+            prefix = token_list[: pos + 1]
+            if not state["in_thinking"]:
+                if _ends_with(prefix, start):
+                    state["in_thinking"] = True
+                    state["thinking_count"] = 0
+            else:
+                if _ends_with(prefix, end):
+                    state["in_thinking"] = False
+                    state["thinking_count"] = 0
+                else:
+                    state["thinking_count"] += 1
+                    if state["thinking_count"] >= budget:
+                        state["forcing"] = True
+                        state["force_idx"] = 0
+                        forced_id = stop[state["force_idx"]]
+                        state["force_idx"] += 1
+                        if state["force_idx"] >= len(stop):
+                            state["forcing"] = False
+                            state["force_idx"] = 0
+                            state["in_thinking"] = False
+                            state["thinking_count"] = 0
+                        return _force_logits(logits, forced_id)
+
+        return logits
+
+    return thinking_budget_processor
