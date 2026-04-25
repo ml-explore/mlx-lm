@@ -127,6 +127,7 @@ def load_prompt_cache(file_name, return_metadata=False):
     _ALLOWED_CACHE_CLASSES = {
         "KVCache", "QuantizedKVCache", "RotatingKVCache",
         "CacheList", "BatchKVCache", "BatchRotatingKVCache",
+        "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
         "TurboQuantKVCache", "MixedQuantKVCache",
     }
     for c in classes:

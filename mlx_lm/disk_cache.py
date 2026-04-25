@@ -187,6 +187,7 @@ def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
     _ALLOWED_CACHE_CLASSES = {
         "KVCache", "QuantizedKVCache", "RotatingKVCache",
         "CacheList", "BatchKVCache", "BatchRotatingKVCache",
+        "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
         "TurboQuantKVCache", "MixedQuantKVCache",
     }
     for c in classes:
