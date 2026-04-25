@@ -63,6 +63,24 @@ def mixed_quant_predicate_builder(
             or index >= 7 * num_layers // 8
             or (index - num_layers // 8) % 3 == 2
         )
+        # DeepSeek-V4 (and similarly sensitive MLA + compressed-KV paths) keep
+        # their low-rank projections and auxiliary modules at high bits.
+        dsv4_sensitive = any(
+            s in path
+            for s in (
+                "wq_a",
+                "wq_b",
+                "wqkv_a",
+                "wkv",
+                "wo_a",
+                "wo_b",
+                "compressor",
+                "indexer",
+                "shared_experts",
+            )
+        )
+        if dsv4_sensitive:
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if (
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
@@ -162,6 +180,9 @@ def convert(
         config.pop("quantization", None)
         config.pop("quantization_config", None)
         model = dequantize_model(model)
+
+    if config.get("model_type") == "deepseek_v4":
+        tokenizer.init_kwargs["chat_template_type"] = "deepseek_v4"
 
     save(
         mlx_path,

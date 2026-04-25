@@ -611,9 +611,47 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    tokenizer_config_extra = tokenizer_config_extra or {}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **tokenizer_config_extra
+        )
+    # TODO: Remove this once transformers upstream adds DSV4
+    except (AttributeError, ValueError) as e:
+        if "config" in tokenizer_config_extra:
+            raise
+        from transformers import PretrainedConfig
+
+        stub_kwargs: Dict[str, Any] = {}
+        model_config_file = model_path / "config.json"
+        if model_config_file.exists():
+            try:
+                with open(model_config_file, "r") as f:
+                    raw = json.load(f)
+                for key in (
+                    "model_type",
+                    "max_position_embeddings",
+                    "vocab_size",
+                    "bos_token_id",
+                    "eos_token_id",
+                    "pad_token_id",
+                ):
+                    if key in raw:
+                        stub_kwargs[key] = raw[key]
+            except (OSError, JSONDecodeError):
+                pass
+
+        warnings.warn(
+            "Falling back to a generic tokenizer because Transformers does "
+            f"not recognize this model config yet: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            config=PretrainedConfig(**stub_kwargs),
+            **tokenizer_config_extra,
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 

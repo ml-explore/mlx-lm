@@ -672,7 +672,9 @@ class ArraysCache(_BaseCache):
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
-        cache.cache = [c[idx : idx + 1] for c in self.cache]
+        cache.cache = [
+            None if c is None else c[idx : idx + 1] for c in self.cache
+        ]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
@@ -703,21 +705,19 @@ class ArraysCache(_BaseCache):
         n_state = len(caches[0].cache)
         B = len(caches)
         cache = cls(n_state)
-
-        # All caches are empty so return early
-        if all(c.empty() for c in caches):
-            cache.left_padding = mx.array([0] * B)
-            return cache
+        cache.left_padding = mx.array([0] * B)
 
         for e in range(n_state):
-            c_init = next(iter(c[e] for c in caches if c[e] is not None))
+            non_none = [(i, c[e]) for i, c in enumerate(caches) if c[e] is not None]
+            if not non_none:
+                # Slot is None across every batch item; keep it None in the merged cache.
+                continue
+            c_init = non_none[0][1]
             shape = list(c_init.shape)
             shape[0] = B
             cache[e] = mx.zeros(shape, c_init.dtype)
-            for i in range(B):
-                if caches[i][e] is None:
-                    continue
-                cache[e][i : i + 1] = caches[i][e]
+            for i, v in non_none:
+                cache[e][i : i + 1] = v
         return cache
 
     def empty(self):
