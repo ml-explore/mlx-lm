@@ -1236,10 +1236,17 @@ class Model(nn.Module):
             # gate.bias -> gate.e_score_correction_bias
             nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
 
-            # hc_attn_fn -> hc_attn.fn (etc.)
+            # hc_attn_fn -> hc_attn.fn (etc.) — raw HF checkpoint underscores
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".hc_{sub}.{param}")
+
+            # attn_hc.X -> hc_attn.X (mlx-community/DeepSeek-V4-Flash-8bit
+            # naming order: per-layer hyper-connections stored as <sub>_hc.<param>
+            # rather than hc_<sub>.<param>). Apply after the underscore rename so
+            # both naming orders converge to the model's hc_<sub>.<param> layout.
+            for sub in ("attn", "ffn"):
+                nk = nk.replace(f".{sub}_hc.", f".hc_{sub}.")
 
             # shared_experts.w1 -> shared_experts.gate_proj (etc.)
             for w_old, w_new in w_remap.items():

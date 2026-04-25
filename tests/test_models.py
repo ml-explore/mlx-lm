@@ -1849,6 +1849,51 @@ class TestModels(unittest.TestCase):
                 )
             )
 
+    def test_deepseek_v4_sanitize_renames_attn_hc_order(self):
+        """Community quants (mlx-community/DeepSeek-V4-Flash-8bit) store the
+        per-layer hyper-connections as `attn_hc.X` / `ffn_hc.X` rather than the
+        `hc_attn.X` / `hc_ffn.X` order used by the raw HF checkpoint and our
+        model. The sanitizer must converge both to the model's order."""
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            moe_intermediate_size=2,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+
+        weights = {
+            # community-quant order: <sub>_hc.<param>
+            "layers.0.attn_hc.fn":    mx.zeros((4,), dtype=mx.float32),
+            "layers.0.attn_hc.base":  mx.zeros((6,), dtype=mx.float32),
+            "layers.0.attn_hc.scale": mx.ones((3,), dtype=mx.float32),
+            "layers.0.ffn_hc.fn":    mx.zeros((4,), dtype=mx.float32),
+            "layers.0.ffn_hc.base":  mx.zeros((6,), dtype=mx.float32),
+            "layers.0.ffn_hc.scale": mx.ones((3,), dtype=mx.float32),
+        }
+
+        converted = model.sanitize(weights)
+
+        # Verify every input key has been renamed to the model's order.
+        for sub in ("attn", "ffn"):
+            for param in ("fn", "base", "scale"):
+                self.assertIn(f"model.layers.0.hc_{sub}.{param}", converted)
+                self.assertNotIn(f"model.layers.0.{sub}_hc.{param}", converted)
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
