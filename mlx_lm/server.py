@@ -651,7 +651,6 @@ class ResponseGenerator:
         import mlx_lm.generate as _gen_mod
 
         new_stream = mx.new_stream(mx.default_device())
-        mx.set_default_stream(new_stream)
         generation_stream = new_stream         # server.py's reference
         _gen_mod.generation_stream = new_stream  # generate.py's reference
 
@@ -685,7 +684,8 @@ class ResponseGenerator:
                 # extract() can crash on uninitialized sub-caches
                 try:
                     cache = list(cache)
-                except TypeError:
+                except (TypeError, AttributeError) as e:
+                    logging.debug(f"Skipping checkpoint: {e}")
                     continue
                 if any(c.empty() for c in cache):
                     continue
@@ -1982,7 +1982,14 @@ def main():
         parts = args.kv_cache_quantization.split(",")
         if len(parts) != 2:
             parser.error("--kv-cache-quantization must be K_BITS,V_BITS (e.g. '8,4')")
-        args.kv_quant_config = (int(parts[0]), int(parts[1]))
+        try:
+            k_bits, v_bits = int(parts[0]), int(parts[1])
+        except ValueError:
+            parser.error("--kv-cache-quantization values must be integers")
+        valid_bits = {2, 4, 8}
+        if k_bits not in valid_bits or v_bits not in valid_bits:
+            parser.error(f"--kv-cache-quantization bits must be one of {valid_bits}")
+        args.kv_quant_config = (k_bits, v_bits)
     else:
         args.kv_quant_config = None
 

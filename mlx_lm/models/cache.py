@@ -124,6 +124,15 @@ def load_prompt_cache(file_name, return_metadata=False):
         except ImportError:
             pass
 
+    _ALLOWED_CACHE_CLASSES = {
+        "KVCache", "QuantizedKVCache", "RotatingKVCache",
+        "CacheList", "BatchKVCache", "BatchRotatingKVCache",
+        "TurboQuantKVCache", "MixedQuantKVCache",
+    }
+    for c in classes:
+        if c not in _ALLOWED_CACHE_CLASSES:
+            raise ValueError(f"Untrusted cache class '{c}' in prompt cache file.")
+
     cache = [
         globals()[c].from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)

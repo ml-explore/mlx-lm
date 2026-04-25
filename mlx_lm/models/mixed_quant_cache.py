@@ -133,10 +133,16 @@ class MixedQuantKVCache:
     @meta_state.setter
     def meta_state(self, v):
         parts = v.split(",")
+        if len(parts) != 4:
+            raise ValueError(f"Invalid MixedQuantKVCache meta_state: {v}")
         self.k_bits = int(parts[0])
         self.v_bits = int(parts[1])
         self.k_group_size = int(parts[2])
         self.v_group_size = int(parts[3])
+        if self.k_bits <= 0 or self.v_bits <= 0:
+            raise ValueError(f"Invalid bits: k={self.k_bits}, v={self.v_bits}")
+        if self.k_group_size <= 0 or self.v_group_size <= 0:
+            raise ValueError(f"Invalid group_size: k={self.k_group_size}, v={self.v_group_size}")
 
     @classmethod
     def from_state(cls, state, meta_state):

@@ -68,6 +68,13 @@ def _save_to_disk(cache_dir: Path, model: Any, tokens: List[int],
         with open(tmp_dir / "meta.json", "w") as f:
             json.dump(meta, f)
 
+        # Skip if any cache layer is uninitialized (keys=None).
+        # KVCache.state crashes on empty caches.
+        if any(c.empty() for c in prompt_cache):
+            logger.warning("Skipping disk save: cache has uninitialized layers")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+
         # Collect cache state via mlx-lm's tree_flatten
         from mlx.utils import tree_flatten
         cache_data = [c.state for c in prompt_cache]
@@ -175,6 +182,20 @@ def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
 
     local_globals = _cache_mod.__dict__
 
+    # Allowlist: only permit known cache classes from cache.py to prevent
+    # arbitrary class instantiation from crafted safetensors files.
+    _ALLOWED_CACHE_CLASSES = {
+        "KVCache", "QuantizedKVCache", "RotatingKVCache",
+        "CacheList", "BatchKVCache", "BatchRotatingKVCache",
+        "TurboQuantKVCache", "MixedQuantKVCache",
+    }
+    for c in classes:
+        if c not in _ALLOWED_CACHE_CLASSES:
+            raise ValueError(
+                f"Untrusted cache class '{c}' in disk cache. "
+                f"Allowed: {_ALLOWED_CACHE_CLASSES}"
+            )
+
     prompt_cache = [
         local_globals[c].from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
@@ -190,9 +211,9 @@ class DiskBackedPromptCache(LRUPromptCache):
     Disk entries capped at 2x max_size by mtime.
     """
 
-    def __init__(self, max_size: int = 10, cache_dir: str = "/tmp/mlx_kv_cache"):
+    def __init__(self, max_size: int = 10, cache_dir: str = "~/.cache/mlx_kv_cache"):
         super().__init__(max_size=max_size)
-        self._cache_dir = Path(cache_dir)
+        self._cache_dir = Path(cache_dir).expanduser()
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
