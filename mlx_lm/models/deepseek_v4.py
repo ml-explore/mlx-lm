@@ -145,6 +145,28 @@ class DeepseekV4RoPE(nn.Module):
     def __call__(self, x: mx.array, offset: int = 0, inverse: bool = False):
         dtype = x.dtype
         T = x.shape[-2]
+        if isinstance(offset, mx.array):
+            if offset.size == 1:
+                offset = offset.item()
+            else:
+                B = offset.shape[0]
+                pos = offset[:, None] + mx.arange(T, dtype=mx.float32)[None, :]
+                theta = pos[..., None] * self.inv_freq[None, None, :]
+                if inverse:
+                    theta = -theta
+                # theta: [B, T, dims//2]. Reshape for x dims: [B,H,T,D] or [B,1,T,D]
+                target_shape = (B,) + (1,) * (x.ndim - 3) + (T, self.dims // 2)
+                cos = mx.cos(theta).reshape(target_shape).astype(dtype)
+                sin = mx.sin(theta).reshape(target_shape).astype(dtype)
+                rot = x[..., : self.dims].reshape(*x.shape[:-1], self.dims // 2, 2)
+                x0 = rot[..., 0]
+                x1 = rot[..., 1]
+                r0 = x0 * cos - x1 * sin
+                r1 = x0 * sin + x1 * cos
+                rotated = mx.stack([r0, r1], axis=-1).reshape(*x.shape[:-1], self.dims)
+                if self.dims < x.shape[-1]:
+                    return mx.concatenate([rotated, x[..., self.dims:]], axis=-1)
+                return rotated
         pos = mx.arange(offset, offset + T, dtype=mx.float32)
         theta = pos[:, None] * self.inv_freq[None, :]
         if inverse:
@@ -617,6 +639,119 @@ class CompressedKVCache:
 
     def trim(self, n):
         return self.local.trim(n)
+
+    @classmethod
+    def merge(cls, caches):
+        """Merge multiple CompressedKVCaches into a single batched cache."""
+        merged = cls.__new__(cls)
+
+        # Merge local rotating caches (delegates to BatchRotatingKVCache)
+        merged.local = caches[0].local.merge([c.local for c in caches])
+
+        # Merge compressed pools: pad to max length, stack along B
+        pools = [c._pool for c in caches]
+        if all(p is None for p in pools):
+            merged._pool = None
+        else:
+            head_dim = next(p.shape[-1] for p in pools if p is not None)
+            dtype = next(p.dtype for p in pools if p is not None)
+            max_len = max(p.shape[1] if p is not None else 0 for p in pools)
+            padded = []
+            for p in pools:
+                if p is None:
+                    padded.append(mx.zeros((1, max_len, head_dim), dtype=dtype))
+                elif p.shape[1] < max_len:
+                    pad = mx.zeros((1, max_len - p.shape[1], head_dim), dtype=dtype)
+                    padded.append(mx.concatenate([p, pad], axis=1))
+                else:
+                    padded.append(p)
+            merged._pool = mx.concatenate(padded, axis=0)
+
+        # Merge buffers: pad to max buf_count, stack along B
+        bufs = [c._buf for c in caches]
+        buf_counts = [c._buf_count for c in caches]
+        if all(b is None for b in bufs):
+            merged._buf = None
+            merged._buf_count = 0
+        else:
+            D = next(b.shape[-1] for b in bufs if b is not None)
+            dtype = next(b.dtype for b in bufs if b is not None)
+            max_bc = max(buf_counts)
+            padded = []
+            for b, bc in zip(bufs, buf_counts):
+                if b is None:
+                    padded.append(mx.zeros((1, max_bc, D), dtype=dtype))
+                elif b.shape[1] < max_bc:
+                    pad = mx.zeros((1, max_bc - b.shape[1], D), dtype=dtype)
+                    padded.append(mx.concatenate([b, pad], axis=1))
+                else:
+                    padded.append(b)
+            merged._buf = mx.concatenate(padded, axis=0)
+            merged._buf_count = max_bc
+
+        return merged
+
+    def filter(self, batch_indices):
+        if hasattr(self.local, 'filter'):
+            self.local.filter(batch_indices)
+        if self._pool is not None:
+            self._pool = self._pool[batch_indices]
+        if self._buf is not None:
+            self._buf = self._buf[batch_indices]
+
+    def extend(self, other):
+        if hasattr(self.local, 'extend'):
+            self.local.extend(other.local)
+        # Extend pools
+        if self._pool is None and other._pool is None:
+            pass
+        elif self._pool is None:
+            self._pool = other._pool
+        elif other._pool is None:
+            pass
+        else:
+            max_len = max(self._pool.shape[1], other._pool.shape[1])
+            def pad_pool(p, target):
+                if p.shape[1] < target:
+                    pad = mx.zeros((p.shape[0], target - p.shape[1], p.shape[2]), dtype=p.dtype)
+                    return mx.concatenate([p, pad], axis=1)
+                return p
+            self._pool = mx.concatenate([pad_pool(self._pool, max_len), pad_pool(other._pool, max_len)], axis=0)
+        # Extend buffers
+        if self._buf is None and other._buf is None:
+            pass
+        elif self._buf is None:
+            self._buf = other._buf
+            self._buf_count = other._buf_count
+        elif other._buf is None:
+            pass
+        else:
+            max_bc = max(self._buf.shape[1], other._buf.shape[1])
+            def pad_buf(b, target):
+                if b.shape[1] < target:
+                    pad = mx.zeros((b.shape[0], target - b.shape[1], b.shape[2]), dtype=b.dtype)
+                    return mx.concatenate([b, pad], axis=1)
+                return b
+            self._buf = mx.concatenate([pad_buf(self._buf, max_bc), pad_buf(other._buf, max_bc)], axis=0)
+            self._buf_count = max_bc
+
+    def finalize(self):
+        if hasattr(self.local, 'finalize'):
+            self.local.finalize()
+
+    def extract(self, idx):
+        extracted = CompressedKVCache.__new__(CompressedKVCache)
+        extracted.local = self.local.extract(idx) if hasattr(self.local, 'extract') else self.local
+        extracted._pool = self._pool[idx:idx+1] if self._pool is not None else None
+        extracted._buf = self._buf[idx:idx+1] if self._buf is not None else None
+        extracted._buf_count = self._buf_count
+        return extracted
+
+    @property
+    def batch_size(self):
+        if hasattr(self.local, 'batch_size'):
+            return self.local.batch_size
+        return 1
 
     def accumulate(self, x: mx.array, compressor: 'Compressor') -> Optional[mx.array]:
         """Buffer tokens and compress when a full window is ready.
