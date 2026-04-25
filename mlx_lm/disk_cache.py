@@ -363,19 +363,27 @@ class DiskBackedPromptCache(LRUPromptCache):
         return None, tokens
 
     def trim_to(self, *, n_sequences=None, n_bytes=None):
-        """Trim LRU and remove evicted entries from disk."""
-        n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
-        n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
+        """Trim LRU and remove evicted entries from disk.
 
-        while len(self._lru) > n_sequences:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._delete_disk_entry(model, tokens)
-        while self._n_bytes > n_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
+        Delegates to parent's trim logic and tracks which entries get
+        evicted so we can also clean them from disk. This avoids
+        duplicating the parent's eviction algorithm.
+        """
+        evicted = []
+        original_pop = self._lru.pop
+
+        def tracking_pop():
+            result = original_pop()
+            evicted.append(result)
+            return result
+
+        self._lru.pop = tracking_pop
+        try:
+            super().trim_to(n_sequences=n_sequences, n_bytes=n_bytes)
+        finally:
+            self._lru.pop = original_pop
+
+        for model, tokens in evicted:
             self._delete_disk_entry(model, tokens)
 
     def _delete_disk_entry(self, model, tokens):
