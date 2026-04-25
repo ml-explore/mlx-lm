@@ -744,15 +744,14 @@ def mtp_generate_step(
                 c.trim(1)
         cache.trim_prompt_cache(mtp_cache, 1)
 
-    def _step_backbone(y, n_predict=1, n_confirmed=0):
-        """Run the backbone on ``y`` and return (tokens, logprobs, hidden)."""
+    def _step_backbone(y, prev_tokens, n_predict=1, n_confirmed=0):
+        """Run the backbone on ``y`` and return (tokens, logprobs, hidden, prev_tokens)."""
         with mx.stream(generation_stream):
             logits, hidden = model(
                 y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed
             )
             logits = logits[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
-            nonlocal prev_tokens
             toks, lps = [], []
             for i in range(n_predict):
                 if logits_processors:
@@ -764,9 +763,9 @@ def mtp_generate_step(
                 tok, lp = _process_and_sample(prev_tokens, logits[:, i, :].squeeze(0))
                 toks.append(tok)
                 lps.append(lp)
-            return mx.stack(toks), mx.stack(lps), hidden
+            return mx.stack(toks), mx.stack(lps), hidden, prev_tokens
 
-    def _step_mtp(hidden_last, main_tok):
+    def _step_mtp(hidden_last, main_tok, prev_tokens):
         """Run the MTP head and return (draft_token, draft_logprobs)."""
         next_ids = main_tok.reshape(1, 1)
         with mx.stream(generation_stream):
@@ -805,14 +804,15 @@ def mtp_generate_step(
     while ntoks < max_tokens:
         if draft_tok is None:
             # No pending draft: run backbone only, then generate first draft.
-            toks, lps, hidden = _step_backbone(y, n_predict=1)
+            toks, lps, hidden, prev_tokens = _step_backbone(y, prev_tokens, n_predict=1)
             mx.eval(toks)
             main_tok, main_lp = toks[0], lps[0]
             ntoks += 1
             yield main_tok.item(), main_lp, False
             if ntoks >= max_tokens:
                 return
-            draft_tok, draft_lp = _step_mtp(hidden[:, -1:, :], main_tok)
+            hidden_at_main = hidden[:, -1:, :]
+            draft_tok, draft_lp = _step_mtp(hidden_at_main, main_tok, prev_tokens)
             mx.eval(draft_tok)
             y = mx.array([main_tok.item()], mx.uint32)
         else:
@@ -820,7 +820,9 @@ def mtp_generate_step(
             # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
             # after the confirmed token y, enabling exact rollback on rejection.
             y_with_draft = mx.concatenate([y, mx.array([draft_tok.item()], mx.uint32)])
-            toks, lps, hidden = _step_backbone(y_with_draft, n_predict=2, n_confirmed=1)
+            toks, lps, hidden, prev_tokens = _step_backbone(
+                y_with_draft, prev_tokens, n_predict=2, n_confirmed=1
+            )
             mx.eval(toks, draft_tok)
 
             verify_pred, bonus_tok = toks[0], toks[1]
@@ -834,6 +836,9 @@ def mtp_generate_step(
                 log_accept = (verify_lp[draft_tok_id] - draft_lp[draft_tok_id]).item()
                 accept = log_accept >= 0 or random.random() < math.exp(log_accept)
 
+            hidden_at_confirmed = hidden[:, 0:1, :]
+            hidden_at_draft = hidden[:, 1:2, :]
+
             if accept:
                 _clear_rollback()
                 ntoks += 1
@@ -845,7 +850,7 @@ def mtp_generate_step(
                 if ntoks >= max_tokens:
                     return
                 # Next draft from MTP at draft_tok's hidden state.
-                draft_tok, draft_lp = _step_mtp(hidden[:, 1:2, :], bonus_tok)
+                draft_tok, draft_lp = _step_mtp(hidden_at_draft, bonus_tok, prev_tokens)
                 mx.eval(draft_tok)
                 y = mx.array([bonus_tok.item()], mx.uint32)
             else:
@@ -858,7 +863,9 @@ def mtp_generate_step(
                 if ntoks >= max_tokens:
                     return
                 # Next draft from MTP at y's hidden state.
-                draft_tok, draft_lp = _step_mtp(hidden[:, 0:1, :], verify_pred)
+                draft_tok, draft_lp = _step_mtp(
+                    hidden_at_confirmed, verify_pred, prev_tokens
+                )
                 mx.eval(draft_tok)
                 y = mx.array([verify_tok_id], mx.uint32)
 
