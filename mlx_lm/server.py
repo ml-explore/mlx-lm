@@ -193,6 +193,9 @@ class GenerationArguments:
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
 
+    thinking_budget: Optional[int] = None
+    thinking_budget_message: Optional[str] = None
+
 
 @dataclass
 class CompletionRequest:
@@ -411,16 +414,37 @@ def _make_sampler(args, tokenizer):
     )
 
 
-def _make_logits_processors(args):
-    return make_logits_processors(
-        args.logits.logit_bias,
-        args.logits.repetition_penalty,
-        args.logits.repetition_context_size,
-        args.logits.presence_penalty,
-        args.logits.presence_context_size,
-        args.logits.frequency_penalty,
-        args.logits.frequency_context_size,
+def _make_logits_processors(args, tokenizer=None):
+    kwargs = dict(
+        logit_bias=args.logits.logit_bias,
+        repetition_penalty=args.logits.repetition_penalty,
+        repetition_context_size=args.logits.repetition_context_size,
+        presence_penalty=args.logits.presence_penalty,
+        presence_context_size=args.logits.presence_context_size,
+        frequency_penalty=args.logits.frequency_penalty,
+        frequency_context_size=args.logits.frequency_context_size,
     )
+    thinking_budget = getattr(args, "thinking_budget", None)
+    if thinking_budget is not None and tokenizer is not None and tokenizer.has_thinking:
+        from mlx_lm.sample_utils import build_early_stop_tokens
+
+        kwargs["thinking_budget"] = thinking_budget
+        kwargs["think_start_tokens"] = tokenizer.think_start_tokens
+        kwargs["think_end_tokens"] = tokenizer.think_end_tokens
+        kwargs["early_stop_tokens"] = build_early_stop_tokens(
+            tokenizer,
+            tokenizer.think_end_tokens,
+            getattr(args, "thinking_budget_message", None),
+        )
+        # Detect if the prompt already opened a thinking block (e.g. chat
+        # template with enable_thinking=True adds <think> to the prompt).
+        prompt_tokens = getattr(args, "prompt_tokens", None)
+        if prompt_tokens is not None:
+            think_start = tokenizer.rfind_think_start(prompt_tokens)
+            think_end = tokenizer.rfind_think_end(prompt_tokens)
+            if think_start > think_end:
+                kwargs["initial_thinking"] = True
+    return make_logits_processors(**kwargs)
 
 
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
@@ -779,7 +803,7 @@ class ResponseGenerator:
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[_make_logits_processors(args, tokenizer)],
                         state_machines=[sm],
                     )
                     batch_results[uid] = {
@@ -958,7 +982,7 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _make_logits_processors(args, tokenizer)
 
             # Load the KV cache
             self._log_cache_stats()
@@ -1190,6 +1214,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        self.thinking_budget = self.body.get("thinking_budget", None)
+        self.thinking_budget_message = self.body.get("thinking_budget_message", None)
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1403,6 +1429,8 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            thinking_budget=self.thinking_budget,
+            thinking_budget_message=self.thinking_budget_message,
         )
 
         # Keep connection allive during long prompt processing (and also log
