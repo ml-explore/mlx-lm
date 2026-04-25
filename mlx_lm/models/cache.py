@@ -915,6 +915,15 @@ class CacheList(_BaseCache):
 
     @classmethod
     def from_state(cls, state, meta_state):
+        _ALLOWED = {
+            "KVCache", "QuantizedKVCache", "RotatingKVCache",
+            "CacheList", "BatchKVCache", "BatchRotatingKVCache",
+            "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
+            "TurboQuantKVCache", "MixedQuantKVCache",
+        }
+        for c in meta_state[0]:
+            if c not in _ALLOWED:
+                raise ValueError(f"Untrusted sub-cache class '{c}' in CacheList")
         obj = cls.__new__(cls)
         obj.caches = [
             globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)

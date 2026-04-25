@@ -121,10 +121,13 @@ class MixedQuantKVCache:
         if not v:
             return
         # 6 arrays: k_data, k_scales, k_biases, v_data, v_scales, v_biases
-        if len(v) == 6:
-            self.keys = (v[0], v[1], v[2])
-            self.values = (v[3], v[4], v[5])
-            self.offset = v[0].shape[2]
+        if len(v) != 6:
+            raise ValueError(
+                f"MixedQuantKVCache state expects 6 arrays, got {len(v)}"
+            )
+        self.keys = (v[0], v[1], v[2])
+        self.values = (v[3], v[4], v[5])
+        self.offset = v[0].shape[2]
 
     @property
     def meta_state(self):
