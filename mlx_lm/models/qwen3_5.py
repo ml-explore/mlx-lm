@@ -322,6 +322,17 @@ class TextModel(nn.Module):
             ".q_norm.weight",
             ".k_norm.weight",
         )
+
+        # Check if norm weights are already shifted.  Zero-centered weights
+        # (from HuggingFace checkpoints) have mean near 0; converted MLX
+        # checkpoints have already been shifted to mean near 1.  Applying
+        # +1.0 twice corrupts every norm layer in the model.
+        if should_shift_norm_weights:
+            for k, v in weights.items():
+                if v.ndim == 1 and any(k.endswith(sfx) for sfx in norm_keys):
+                    should_shift_norm_weights = mx.abs(mx.mean(v)).item() < 0.5
+                    break
+
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
