@@ -1449,6 +1449,17 @@ class TestModels(unittest.TestCase):
         expected = expected.reshape(*expected.shape[:-2], 4)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
+        # Compressed layers use a separate RoPE base only for the pooled branch.
+        compress_layer = model.model.layers[2].attn
+        freq_dims = mx.arange(0, args.qk_rope_head_dim, 2, dtype=mx.float32)
+        freq_dims = freq_dims / args.qk_rope_head_dim
+        main_expected = 1.0 / (args.rope_theta**freq_dims)
+        compress_expected = 1.0 / (args.compress_rope_theta**freq_dims)
+        self.assertTrue(mx.allclose(compress_layer.rope.inv_freq, main_expected))
+        self.assertTrue(
+            mx.allclose(compress_layer.compress_rope.inv_freq, compress_expected)
+        )
+
         # HyperConnection Sinkhorn test
         for hc_mult in (2, 4):
             mix = (2 + hc_mult) * hc_mult
