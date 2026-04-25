@@ -11,7 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import BatchRotatingKVCache, RotatingKVCache
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
+from .switch_layers import SwitchGLU, _scatter_unsort
 
 
 @dataclass
@@ -106,28 +106,33 @@ class LimitedSwiGLU(nn.Module):
 class DeepseekV4SwitchGLU(SwitchGLU):
     sort_threshold = 8
 
-    def __call__(self, x, indices) -> mx.array:
+    def __call__(self, x, indices, scores) -> mx.array:
+        out_shape = x.shape
+        route_shape = indices.shape
         x = mx.expand_dims(x, (-2, -3))
 
         do_sort = indices.size >= self.sort_threshold
-        idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            flat_indices = indices.flatten()
+            order = mx.argsort(flat_indices)
+            inv_order = mx.argsort(order)
+            x = x.flatten(0, -3)[order // route_shape[-1]]
+            indices = flat_indices[order]
+            scores = scores.flatten()[order]
         if self.training:
-            idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(
-            self.activation(x_up, x_gate),
-            idx,
-            sorted_indices=do_sort,
-        )
+            indices = mx.stop_gradient(indices)
+        x_up = self.up_proj(x, indices, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, indices, sorted_indices=do_sort)
+        x = self.activation(x_up, x_gate)
+        x = x * scores.astype(x.dtype)[..., None, None]
+        x = self.down_proj(x, indices, sorted_indices=do_sort)
 
         if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
+            x = _scatter_unsort(x, inv_order, route_shape)
 
-        return x.squeeze(-2)
+        x = x.squeeze(-2)
+        return x.sum(axis=-2).astype(x.dtype).reshape(out_shape)
 
 
 class DeepseekV4RoPE(nn.Module):
@@ -592,8 +597,7 @@ class DeepseekV4MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype).reshape(x.shape)
+        y = self.switch_mlp(x, inds, scores)
         y = y + self.shared_experts(x)
 
         if self.sharding_group is not None:
