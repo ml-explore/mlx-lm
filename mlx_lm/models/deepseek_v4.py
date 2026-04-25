@@ -828,9 +828,7 @@ class DeepseekV4Cache:
                     i : i + 1, usable : usable + buffer_length
                 ]
         state["buffer_lengths"] = buffer_lengths
-        state["_new_pooled_lengths"] = [
-            usable // ratio for usable in usable_lengths
-        ]
+        state["_new_pooled_lengths"] = [usable // ratio for usable in usable_lengths]
 
         prev_lengths = mx.array(buf_lengths, dtype=mx.float32)
         if isinstance(start_pos, mx.array):
@@ -864,9 +862,9 @@ class DeepseekV4Cache:
                 if pool is not None and pool_length:
                     merged[i : i + 1, :pool_length] = pool[i : i + 1, :pool_length]
                 if new_length:
-                    merged[
-                        i : i + 1, pool_length : pool_length + new_length
-                    ] = new_pooled[i : i + 1, :new_length]
+                    merged[i : i + 1, pool_length : pool_length + new_length] = (
+                        new_pooled[i : i + 1, :new_length]
+                    )
             state["pooled"] = merged
             state["pooled_lengths"] = total_lengths
             return merged
@@ -974,7 +972,9 @@ class DeepseekV4Cache:
                     self_state[key],
                     other_state[key],
                     self_tensors["pooled" if key.startswith("pooled") else "buffer_kv"],
-                    other_tensors["pooled" if key.startswith("pooled") else "buffer_kv"],
+                    other_tensors[
+                        "pooled" if key.startswith("pooled") else "buffer_kv"
+                    ],
                     self_batch,
                     other_batch,
                 )
