@@ -22,6 +22,13 @@ from mlx_lm.utils import (
 )
 
 
+def _uses_qwen3_5_linear_attention(model):
+    return any(
+        getattr(layer, "is_linear", False) and "linear_attn" in layer
+        for layer in getattr(model, "layers", [])
+    )
+
+
 def eval_ppl(model, data, batch_size=8):
     all_loss = 0.0
     ntoks = 0
@@ -61,6 +68,8 @@ def estimate_sensitivities(
         l.unfreeze(keys=["weight"])
     q_model.freeze()
     q_model.update_modules(tree_unflatten(list(q_layers.items())))
+    if _uses_qwen3_5_linear_attention(q_model):
+        q_model.train()
 
     def loss_fn(batch, targets):
         return kl_div_loss(q_model(batch), targets).mean()
@@ -167,6 +176,18 @@ def main():
     parser.add_argument("--high-bits", type=int, default=5)
     parser.add_argument("--high-group-size", type=int, default=64)
     parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=-1,
+        help="Number of samples from the calibration dataset, use -1 for all.",
+    )
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=512,
+        help="Sequence length for the calibration data.",
+    )
+    parser.add_argument(
         "--report-ppl",
         action="store_true",
         help="Compute the perplexity of the base and quantized models.",
@@ -189,7 +210,11 @@ def main():
 
     if args.sensitivities is None:
         mx.random.seed(args.seed)
-        data = load_data(tokenizer, num_samples=-1, sequence_length=512)
+        data = load_data(
+            tokenizer,
+            num_samples=args.num_samples,
+            sequence_length=args.sequence_length,
+        )
 
         sensitivities = estimate_sensitivities(
             model,
@@ -210,7 +235,11 @@ def main():
 
     sensitivities = dict(sensitivities)
     mx.random.seed(args.seed)
-    data = load_data(tokenizer, num_samples=-1, sequence_length=512)
+    data = load_data(
+        tokenizer,
+        num_samples=args.num_samples,
+        sequence_length=args.sequence_length,
+    )
 
     if args.report_ppl:
         ppl = eval_ppl(model, data)

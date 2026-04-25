@@ -374,16 +374,49 @@ def _kl_div_loss(primals, cotangent, output):
     return dq, dp
 
 
-def kl_div_loss(logits_q, logits_p):
-    if can_run_metal():
-        return _kl_div_loss(logits_q, logits_p)
-    else:
-        return nn.losses.kl_div_loss(
-            logits_q - mx.logsumexp(logits_q, axis=-1, keepdims=True),
-            logits_p - mx.logsumexp(logits_p, axis=-1, keepdims=True),
-            axis=-1,
-            reduction="none",
+def _mlx_kl_div_loss(logits_q, logits_p):
+    return nn.losses.kl_div_loss(
+        logits_q - mx.logsumexp(logits_q, axis=-1, keepdims=True),
+        logits_p - mx.logsumexp(logits_p, axis=-1, keepdims=True),
+        axis=-1,
+        reduction="none",
+    )
+
+
+_metal_kl_usable = {}
+
+
+def _can_run_metal_kl(logits):
+    if not can_run_metal() or _kl_forward_kernel is None or _kl_backward_kernel is None:
+        return False
+    key = (logits.dtype, logits.shape[-1])
+    if key not in _metal_kl_usable:
+        try:
+            test_logits = mx.zeros((1, logits.shape[-1]), dtype=logits.dtype)
+            mx.eval(_kl_div_loss(test_logits, test_logits))
+            _metal_kl_usable[key] = True
+        except ValueError:
+            _metal_kl_usable[key] = False
+    return _metal_kl_usable[key]
+
+
+def kl_div_loss(logits_q, logits_p, implementation="auto"):
+    if implementation not in ("auto", "metal", "mlx"):
+        raise ValueError(
+            "KL loss implementation must be one of 'auto', 'metal', or 'mlx'."
         )
+
+    if implementation == "mlx":
+        return _mlx_kl_div_loss(logits_q, logits_p)
+
+    if implementation == "metal":
+        if not can_run_metal():
+            raise ValueError("Metal KL loss requested but Metal is not available.")
+        return _kl_div_loss(logits_q, logits_p)
+
+    if _can_run_metal_kl(logits_q):
+        return _kl_div_loss(logits_q, logits_p)
+    return _mlx_kl_div_loss(logits_q, logits_p)
 
 
 def _make_js_forward_kernel():

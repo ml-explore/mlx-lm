@@ -40,6 +40,9 @@ Some important options, along with their default values are:
 - `--num-samples 1024`: Number of samples to use. Using more samples can lead to
   better results but takes longer.
 - `--batch-size 8`: Use a smaller batch size to reduce the memory footprint.
+- `--kl-loss-impl auto`: Select the KL loss implementation. `auto` uses the
+  Metal kernel when available and falls back to the MLX implementation when the
+  kernel cannot be used. Use `mlx` to force the fallback implementation.
 
 For a full list of options run:
 
@@ -69,9 +72,16 @@ A few options to reduce memory use for DWQ:
 
 - Distill from an 8-bit model instead of a 16-bit model. The 8-bit
   models are usually as good as 16-bit precision models.
-- Use a shorter maximum sequence length. The default is 2048. Using
+- Use a shorter maximum sequence length. For example,
   `--max-seq-length 512` reduces the memory and still gets good results.
 - Use a smaller batch size, e.g. `--batch-size 1`
+- If you use `--target-dir`, targets are saved with metadata describing the
+  model, dataset, seed, batch size, number of samples, and sequence length. DWQ
+  validates this metadata before training and fails early if the current options
+  do not match the saved targets.
+- DWQ fails fast on non-finite training or validation losses and checks
+  model parameters before saving. This avoids silently writing checkpoints
+  from runs that have already diverged.
 
 ### Dynamic Quantization
 
@@ -95,6 +105,9 @@ Some important options are:
   parameters only certain ranges are possible. For example, with the default
   parameters a BPW in the range `[4.5, 5.5]` is achievable.
 - `--sensitivities`: A path to a precomputed sensitivities file.
+- `--num-samples`: Number of samples from the calibration data. Use a small
+  value to run a shorter calibration pass.
+- `--sequence-length`: Sequence length for the calibration data.
 - `--low-bits`: The number of bits to use for the less sensitive layers.
 - `--high-bits`: The number of bits to use for the more sensitive layers.
 
@@ -139,6 +152,15 @@ Some important options, along with their default values, are:
 
 - `--mlx-path mlx_model`: The location to save the AWQ model.
 - `--bits 4`: Precision of the quantization.
+
+### Qwen3.5
+
+The learned quantization tools support dense `qwen3_5` text models, including
+hybrid linear-attention/full-attention models such as Qwen/Qwen3.5-* and
+downstream fine-tunes. AWQ uses qwen3_5-specific layer traversal for
+`linear_attn`, `self_attn`, and dense MLP blocks. Dynamic quantization computes
+sensitivities through the differentiable qwen3_5 reference path instead of the
+inference-only gated-delta Metal kernel.
 
 
 ### Evaluate

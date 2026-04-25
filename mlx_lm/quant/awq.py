@@ -140,11 +140,53 @@ deepseek_v2_awq = AWQConfig(
     ],
 )
 
+
+def _is_linear_attention_block(block):
+    return getattr(block, "is_linear", False) and "linear_attn" in block
+
+
+def _is_full_attention_block(block):
+    return not getattr(block, "is_linear", False) and "self_attn" in block
+
+
+qwen3_5_text_awq = AWQConfig(
+    embed="embed_tokens",
+    lm_head="lm_head",
+    no_clip=["q_proj", "k_proj", "in_proj_qkv"],
+    scale_configs=[
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_proj", "k_proj", "v_proj"],
+            kwargs=["mask"],
+            use_config=_is_full_attention_block,
+        ),
+        ScaleConfig(
+            block="linear_attn",
+            prev="input_layernorm",
+            layers=["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
+            kwargs=["mask"],
+            use_config=_is_linear_attention_block,
+        ),
+        ScaleConfig(
+            prev="mlp.up_proj",
+            layers=["mlp.down_proj"],
+        ),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=["gate_proj", "up_proj"],
+        ),
+    ],
+)
+
+
 AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
     "qwen2": llama_awq,
     "qwen3": llama_awq,
+    "qwen3_5": update(qwen3_5_text_awq, lm_key="language_model"),
     "gemma3_text": gemma3_text_awq,
     "gemma3": update(gemma3_text_awq, lm_key="language_model"),
     "deepseek_v2": deepseek_v2_awq,
@@ -415,7 +457,7 @@ def awq_quantize(
         wq = mx.quantize(w, bits=bits, group_size=group_size)
         return mx.dequantize(*wq, bits=bits, group_size=group_size)
 
-    mask = create_attention_mask(inputs)
+    attention_mask = create_attention_mask(inputs)
 
     embed_key = awq_config.embed
     model.model[embed_key] = model.model[embed_key].to_quantized(
@@ -450,17 +492,20 @@ def awq_quantize(
         return Catcher()
 
     for e, block in enumerate(tqdm(model.layers)):
+        layer_kwargs = {
+            "mask": None if getattr(block, "is_linear", False) else attention_mask
+        }
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)
         block.update_modules(capture_leaves)
-        outputs = run_layer(block, inputs, mask=mask)
+        outputs = run_layer(block, inputs, **layer_kwargs)
         block.update_modules(orig_leaves)
         del capture_leaves
 
         # Quantize the block without AWQ to obtain a reference loss
         nn.quantize(block, group_size=group_size, bits=bits)
-        outputs_q = run_layer(block, inputs, mask=mask)
+        outputs_q = run_layer(block, inputs, **layer_kwargs)
         before_loss = mse(outputs, outputs_q).sum()
         if group is not None:
             before_loss = mx.distributed.all_sum(before_loss) / group.size()
@@ -473,7 +518,7 @@ def awq_quantize(
             configs=awq_config.scale_configs,
             quantize_func=quantize_func,
             n_grid=n_grid,
-            layer_kwargs={"mask": mask},
+            layer_kwargs=layer_kwargs,
         )
 
         clip_block(
@@ -486,7 +531,7 @@ def awq_quantize(
 
         # Quantize the scaled and clipped block
         nn.quantize(block, group_size=group_size, bits=bits)
-        outputs_q = run_layer(block, inputs, mask=mask)
+        outputs_q = run_layer(block, inputs, **layer_kwargs)
         after_loss = mse(outputs, outputs_q).sum()
         if group is not None:
             after_loss = mx.distributed.all_sum(after_loss) / group.size()

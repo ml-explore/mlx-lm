@@ -2,15 +2,18 @@
 
 import argparse
 import copy
+import json
+import math
 import time
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optimizers
 import numpy as np
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 from mlx_lm.tuner.datasets import load_dataset
@@ -25,6 +28,75 @@ from mlx_lm.utils import (
     save,
 )
 
+DWQ_TARGET_TOP_K = 1024
+DWQ_TARGET_METADATA = "metadata.json"
+
+
+def build_target_metadata(args, tokenizer, num_samples):
+    return {
+        "model": args.model,
+        "data_path": args.data_path,
+        "train_split": "train",
+        "valid_split": "train[:1]",
+        "num_samples": num_samples,
+        "max_seq_length": args.max_seq_length,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "top_k": DWQ_TARGET_TOP_K,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def save_target_metadata(target_dir, metadata):
+    with open(target_dir / DWQ_TARGET_METADATA, "w") as fid:
+        json.dump(metadata, fid, indent=2, sort_keys=True)
+        fid.write("\n")
+
+
+def validate_target_metadata(target_dir, expected):
+    metadata_file = target_dir / DWQ_TARGET_METADATA
+    if not metadata_file.exists():
+        raise ValueError(
+            f"Target directory {target_dir} is missing {DWQ_TARGET_METADATA}. "
+            "Regenerate targets with the current mlx_lm.dwq before training."
+        )
+    with open(metadata_file, "r") as fid:
+        actual = json.load(fid)
+
+    required_matches = (
+        "model",
+        "data_path",
+        "num_samples",
+        "max_seq_length",
+        "batch_size",
+        "seed",
+        "top_k",
+    )
+    for key in required_matches:
+        if actual.get(key) != expected.get(key):
+            raise ValueError(
+                f"Target directory was generated with {key}={actual.get(key)!r} "
+                f"but current run uses {key}={expected.get(key)!r}. Regenerate "
+                "targets or pass matching DWQ options."
+            )
+    return actual
+
+
+def _assert_finite_array(value, message):
+    mx.eval(value)
+    if not mx.all(mx.isfinite(value)).item():
+        raise FloatingPointError(message)
+
+
+def assert_finite_tree(tree, context):
+    for name, value in tree_flatten(tree):
+        if isinstance(value, mx.array):
+            _assert_finite_array(value, f"{context}: non-finite value in {name}.")
+
+
+def _assert_finite_loss(loss, message):
+    _assert_finite_array(loss, message)
+
 
 def compute_dwq_targets(
     model,
@@ -34,8 +106,12 @@ def compute_dwq_targets(
     batch_size,
     max_seq_length,
     seed,
+    metadata=None,
 ):
     rank = mx.distributed.init().rank()
+    if rank == 0 and metadata is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_target_metadata(save_dir, metadata)
 
     def _compute_targets(data, path, split):
 
@@ -56,7 +132,8 @@ def compute_dwq_targets(
             logits = mx.stop_gradient(logits, stream=mx.cpu)
             mx.eval(logits)
             if rank == 0:
-                idx = mx.argpartition(logits, kth=-1024, axis=-1)[..., -1024:]
+                top_k = min(DWQ_TARGET_TOP_K, logits.shape[-1])
+                idx = mx.argpartition(logits, kth=-top_k, axis=-1)[..., -top_k:]
                 logits = mx.take_along_axis(logits, idx, axis=-1)
 
                 file = path / f"{i:010d}.safetensors"
@@ -78,6 +155,7 @@ def dwq_quantize(
     dtype: mx.Dtype = mx.bfloat16,
     gradient_checkpoint: bool = False,
     temperature: float = 2.0,
+    kl_loss_impl: str = "auto",
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -110,8 +188,28 @@ def dwq_quantize(
         logits = model(x)
         if isinstance(targets, tuple):
             targets, ids = targets
+            if logits.shape[:2] != targets.shape[:2]:
+                raise ValueError(
+                    "DWQ target shape mismatch: model logits have token shape "
+                    f"{logits.shape[:2]} but targets have token shape "
+                    f"{targets.shape[:2]}. Regenerate target-dir with matching "
+                    "max_seq_length, batch_size, and dataset options."
+                )
+            if ids.shape != targets.shape:
+                raise ValueError(
+                    "DWQ target indices shape mismatch: indices have shape "
+                    f"{ids.shape} but targets have shape {targets.shape}."
+                )
             logits = mx.take_along_axis(logits, ids, axis=-1)
-        losses = kl_div_loss(scale * logits, scale * targets)
+        elif logits.shape[:2] != targets.shape[:2]:
+            raise ValueError(
+                "DWQ target shape mismatch: model logits have token shape "
+                f"{logits.shape[:2]} but targets have token shape "
+                f"{targets.shape[:2]}."
+            )
+        losses = kl_div_loss(
+            scale * logits, scale * targets, implementation=kl_loss_impl
+        )
         mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
         loss = (mask * losses).sum() / ntoks
@@ -141,11 +239,23 @@ def dwq_quantize(
             mx.eval(targets)
             loss, ntoks = loss_fn(params, batch, targets, lengths)
             mx.eval(loss, ntoks)
+            _assert_finite_loss(
+                loss,
+                "DWQ produced non-finite validation loss at "
+                f"iteration {it}, validation batch {i}. This usually indicates "
+                "incompatible targets, unstable KL loss, or invalid calibration data.",
+            )
             loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
             ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
             v_tokens += ntoks
             v_loss += loss * ntoks
         loss = v_loss / v_tokens
+        if not math.isfinite(loss):
+            raise FloatingPointError(
+                f"DWQ produced non-finite validation loss at iteration {it}. "
+                "Regenerate target-dir with matching options or try "
+                "--kl-loss-impl mlx."
+            )
         rprint(f"Validation: {it=}, {loss=:.3f}")
         return loss
 
@@ -177,7 +287,22 @@ def dwq_quantize(
         mx.eval(targets)
         loss, ntoks, params = step(batch, targets, lengths, params)
         mx.eval(loss, params)
+        _assert_finite_loss(
+            loss,
+            f"DWQ produced non-finite training loss at iteration {it}. "
+            "This usually indicates incompatible targets, unstable KL loss, "
+            "or invalid calibration data. Try regenerating target-dir with "
+            "matching options or use --kl-loss-impl mlx.",
+        )
+        assert_finite_tree(
+            params,
+            f"DWQ trainable parameters became non-finite at iteration {it}",
+        )
         loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
+        if not math.isfinite(loss):
+            raise FloatingPointError(
+                f"DWQ produced non-finite distributed training loss at iteration {it}."
+            )
         ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
         tokens += ntoks
         total_loss += loss * ntoks
@@ -206,7 +331,12 @@ def dwq_quantize(
             " Model quality will likely be degraded.\n❌❌❌"
         )
 
+    assert_finite_tree(params, "DWQ final trainable parameters are non-finite")
     model.update(tree_map(lambda x: x.astype(dtype), params))
+    assert_finite_tree(
+        model.parameters(),
+        "DWQ final saved parameters are non-finite",
+    )
 
 
 def load_data(
@@ -290,6 +420,12 @@ def main():
         help="Use gradient checkpointing to reduce memory use.",
     )
     parser.add_argument(
+        "--kl-loss-impl",
+        choices=["auto", "metal", "mlx"],
+        default="auto",
+        help="KL loss implementation for DWQ training.",
+    )
+    parser.add_argument(
         "--target-dir", type=str, default=None, help="Directory to save/load targets."
     )
     parser.add_argument(
@@ -324,10 +460,17 @@ def main():
         target_dir = None
 
     tokenizer = load_tokenizer(args.model)
+    expected_target_metadata = build_target_metadata(args, tokenizer, num_samples)
 
     train_data, valid_data = load_data(
-        tokenizer, args.data_path, args.num_samples, args.max_seq_length
+        tokenizer,
+        args.data_path,
+        num_samples,
+        args.max_seq_length,
     )
+
+    if has_targets:
+        validate_target_metadata(target_dir, expected_target_metadata)
 
     # Load the base model if we need it
     if not has_targets or args.quantized_model is None:
@@ -348,6 +491,7 @@ def main():
             batch_size=args.batch_size,
             max_seq_length=args.max_seq_length,
             seed=args.seed,
+            metadata=expected_target_metadata,
         )
         has_targets = True
 
@@ -401,6 +545,7 @@ def main():
         max_seq_length=args.max_seq_length,
         seed=args.seed,
         gradient_checkpoint=args.grad_checkpoint,
+        kl_loss_impl=args.kl_loss_impl,
     )
     save(
         args.mlx_path,
