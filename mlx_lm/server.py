@@ -436,6 +436,14 @@ def _make_logits_processors(args, tokenizer=None):
             tokenizer.think_end_tokens,
             getattr(args, "thinking_budget_message", None),
         )
+        # Detect if the prompt already opened a thinking block (e.g. chat
+        # template with enable_thinking=True adds <think> to the prompt).
+        prompt_tokens = getattr(args, "prompt_tokens", None)
+        if prompt_tokens is not None:
+            think_start = tokenizer.rfind_think_start(prompt_tokens)
+            think_end = tokenizer.rfind_think_end(prompt_tokens)
+            if think_start > think_end:
+                kwargs["initial_thinking"] = True
     return make_logits_processors(**kwargs)
 
 

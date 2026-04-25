@@ -81,6 +81,7 @@ def make_logits_processors(
     think_start_tokens: Optional[tuple] = None,
     think_end_tokens: Optional[tuple] = None,
     early_stop_tokens: Optional[mx.array] = None,
+    initial_thinking: bool = False,
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -139,6 +140,7 @@ def make_logits_processors(
                 think_end_tokens=think_end_tokens,
                 budget=thinking_budget,
                 early_stop_tokens=early_stop_tokens,
+                initial_thinking=initial_thinking,
             )
         )
 
@@ -411,6 +413,7 @@ def make_thinking_budget_processor(
     think_end_tokens: tuple,
     budget: int,
     early_stop_tokens: mx.array,
+    initial_thinking: bool = False,
 ) -> Callable[[mx.array, mx.array], mx.array]:
     """
     Make a logits processor that enforces a thinking token budget.
@@ -432,6 +435,10 @@ def make_thinking_budget_processor(
             early-stop injection begins.  Must be >= 0.
         early_stop_tokens (mx.array): 1-D array of token IDs to inject when
             the budget is exceeded.
+        initial_thinking (bool): If True, start in thinking state.  Use this
+            when the prompt already contains an opening ``<think>`` tag (e.g.
+            from a chat template with ``enable_thinking=True``).  Default:
+            ``False``.
 
     Returns:
         Callable[[mx.array, mx.array], mx.array]:
@@ -442,7 +449,7 @@ def make_thinking_budget_processor(
         raise ValueError(f"budget must be >= 0, got {budget}")
 
     state = {
-        "in_thinking": False,
+        "in_thinking": initial_thinking,
         "thinking_count": 0,
         "forcing": False,
         "force_idx": 0,
