@@ -145,5 +145,49 @@ class TestThinkingBudgetProcessor(unittest.TestCase):
         self.assertTrue(mx.array_equal(result, logits))
 
 
+class TestMakeLogitsProcessors(unittest.TestCase):
+
+    def test_thinking_budget_creates_processor(self):
+        from mlx_lm.sample_utils import make_logits_processors
+        processors = make_logits_processors(
+            thinking_budget=100,
+            think_start_tokens=(100,),
+            think_end_tokens=(101,),
+            early_stop_tokens=mx.array([50, 51, 101]),
+        )
+        self.assertEqual(len(processors), 1)
+
+    def test_thinking_budget_none_skips(self):
+        from mlx_lm.sample_utils import make_logits_processors
+        processors = make_logits_processors()
+        self.assertEqual(len(processors), 0)
+
+
+class TestEarlyStopPromptBuilder(unittest.TestCase):
+
+    def test_build_default_message(self):
+        from mlx_lm.sample_utils import build_early_stop_tokens
+
+        class MockTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [200 + i for i in range(len(text.split()))]
+
+        result = build_early_stop_tokens(MockTokenizer(), (101,))
+        self.assertIsInstance(result, mx.array)
+        self.assertEqual(result[-1].item(), 101)
+        self.assertGreater(len(result), 1)
+
+    def test_build_custom_message(self):
+        from mlx_lm.sample_utils import build_early_stop_tokens
+
+        class MockTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [300, 301]
+
+        result = build_early_stop_tokens(MockTokenizer(), (101,), message="Stop now.")
+        self.assertEqual(len(result), 3)  # 300, 301, 101
+        self.assertEqual(result[-1].item(), 101)
+
+
 if __name__ == "__main__":
     unittest.main()

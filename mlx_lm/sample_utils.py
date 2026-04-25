@@ -77,6 +77,10 @@ def make_logits_processors(
     presence_context_size: Optional[int] = 20,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = 20,
+    thinking_budget: Optional[int] = None,
+    think_start_tokens: Optional[tuple] = None,
+    think_end_tokens: Optional[tuple] = None,
+    early_stop_tokens: Optional[mx.array] = None,
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -122,6 +126,21 @@ def make_logits_processors(
     for make_penalty, penalty, context_size in repetition_penalties:
         if penalty is not None and penalty != 0:
             logits_processors.append(make_penalty(penalty, context_size))
+
+    if (
+        thinking_budget is not None
+        and think_start_tokens is not None
+        and think_end_tokens is not None
+        and early_stop_tokens is not None
+    ):
+        logits_processors.append(
+            make_thinking_budget_processor(
+                think_start_tokens=think_start_tokens,
+                think_end_tokens=think_end_tokens,
+                budget=thinking_budget,
+                early_stop_tokens=early_stop_tokens,
+            )
+        )
 
     return logits_processors
 
