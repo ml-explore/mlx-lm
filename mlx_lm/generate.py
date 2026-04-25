@@ -208,6 +208,18 @@ def setup_arg_parser():
         default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
+        "--kv-cache-type",
+        type=str,
+        help="KV cache type. Use 'turbo3' or 'turbo4' for TurboQuant compression.",
+        default=None,
+    )
+    parser.add_argument(
+        "--turbo-fp16-layers",
+        type=int,
+        help="Number of attention layers at each end to keep in float16 when using TurboQuant.",
+        default=0,
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -317,6 +329,8 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_cache_type: Optional[str] = None,
+    turbo_fp16_layers: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -369,10 +383,18 @@ def generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(
-            model,
-            max_kv_size=max_kv_size,
-        )
+        if kv_cache_type in ("turbo3", "turbo4"):
+            turbo_bits = int(kv_cache_type[-1])
+            prompt_cache = cache.make_turbo_cache(
+                model,
+                bits=turbo_bits,
+                fp16_layers=turbo_fp16_layers,
+            )
+        else:
+            prompt_cache = cache.make_prompt_cache(
+                model,
+                max_kv_size=max_kv_size,
+            )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
@@ -2081,6 +2103,8 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        kv_cache_type=args.kv_cache_type,
+        turbo_fp16_layers=args.turbo_fp16_layers,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
