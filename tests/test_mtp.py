@@ -171,6 +171,92 @@ class TestMTP(unittest.TestCase):
 
         self.assertEqual(len(tokens), n_tokens)
 
+    def test_mtp_generate_identity_with_logits_processor(self):
+        """mtp_generate_step must produce the same greedy tokens as generate_step
+        when a context-sensitive stateless processor is applied.
+
+        A processor that boosts (tokens[-1] + 1) % vocab biases sampling based on
+        the last token.  Incorrect prev_tokens management in the verify pass would
+        cause the bonus token or the token after a rejection to be sampled with
+        the wrong bias, producing a sequence that diverges from serial generation.
+        """
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        n_tokens = 10
+
+        def context_processor(tokens, logits):
+            if tokens is None or tokens.size == 0:
+                return logits
+            target = (int(tokens[-1].item()) + 1) % logits.shape[-1]
+            # 1D boost broadcasts correctly for both (vocab,) and (1, vocab) logits.
+            boost = mx.zeros(logits.shape[-1])
+            return logits + boost.at[target].add(10.0)
+
+        std_cache = make_prompt_cache(self.model)
+        std_tokens = []
+        for i, (tok, _) in enumerate(
+            generate_step(
+                prompt,
+                self.model,
+                prompt_cache=std_cache,
+                logits_processors=[context_processor],
+            )
+        ):
+            std_tokens.append(int(tok))
+            if i + 1 >= n_tokens:
+                break
+
+        mtp_tokens = []
+        for tok, _, _ in mtp_generate_step(
+            prompt,
+            self.model,
+            max_tokens=n_tokens,
+            logits_processors=[context_processor],
+        ):
+            mtp_tokens.append(int(tok))
+            if len(mtp_tokens) >= n_tokens:
+                break
+
+        self.assertEqual(std_tokens, mtp_tokens)
+
+    def test_mtp_processor_prev_tokens_correct_at_draft_step(self):
+        """The processor must see the just-sampled backbone token as tokens[-1]
+        when the MTP head runs, not the preceding input token.
+
+        A forcing processor logs tokens[-1] on every call.  When tokens[-1] equals
+        the last prompt token (3) it applies a large boost to token 4, guaranteeing
+        the backbone samples token 4 regardless of model weights.  The second
+        processor call comes from the MTP head: if the token context is correct it
+        sees 4; if stale it sees 3 again.
+        """
+        # Last prompt token is 3; the forcing processor boosts token 4 when it
+        # sees 3, so the backbone deterministically samples T0 = 4 regardless of weights.
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+
+        logged: list[int] = []
+
+        def forcing_processor(tokens, logits):
+            if tokens is not None and tokens.size > 0:
+                last = int(tokens[-1].item())
+                logged.append(last)
+                if last == 3:
+                    boost = mx.zeros(logits.shape[-1])
+                    return logits + boost.at[4].add(1000.0)
+            return logits
+
+        for _tok, _, _ in mtp_generate_step(
+            prompt,
+            self.model,
+            max_tokens=2,
+            logits_processors=[forcing_processor],
+        ):
+            pass
+
+        # First call (backbone): context is the last prompt token.
+        self.assertGreaterEqual(len(logged), 2)
+        self.assertEqual(logged[0], 3)
+        # Second call (MTP head): context must be T0 = 4, not the prompt token.
+        self.assertEqual(logged[1], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

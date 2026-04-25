@@ -754,13 +754,12 @@ def mtp_generate_step(
             quantize_cache_fn(model_cache)
             nonlocal prev_tokens
             toks, lps = [], []
-            y_ctx = y if n_predict == 1 else y[: -(n_predict - 1)]
             for i in range(n_predict):
                 if logits_processors:
                     prev_tokens = (
-                        mx.concatenate([prev_tokens, y_ctx])
+                        mx.concatenate([prev_tokens, y[i : i + 1]])
                         if prev_tokens is not None
-                        else y_ctx
+                        else y[i : i + 1]
                     )
                 tok, lp = _process_and_sample(prev_tokens, logits[:, i, :].squeeze(0))
                 toks.append(tok)
@@ -774,7 +773,15 @@ def mtp_generate_step(
             mtp_logits = model.mtp_forward(hidden_last, next_ids, mtp_cache)
             quantize_cache_fn(mtp_cache)
             mtp_logits = mtp_logits[:, -1, :].squeeze(0)
-            draft_tok, draft_lp = _process_and_sample(prev_tokens, mtp_logits)
+            if logits_processors:
+                tokens_for_proc = (
+                    mx.concatenate([prev_tokens, main_tok.reshape(-1)])
+                    if prev_tokens is not None
+                    else main_tok.reshape(-1)
+                )
+            else:
+                tokens_for_proc = prev_tokens
+            draft_tok, draft_lp = _process_and_sample(tokens_for_proc, mtp_logits)
         return draft_tok, draft_lp
 
     def _prefill(y):
@@ -843,6 +850,8 @@ def mtp_generate_step(
                 y = mx.array([bonus_tok.item()], mx.uint32)
             else:
                 _rollback_draft()
+                if logits_processors and prev_tokens is not None:
+                    prev_tokens = prev_tokens[:-1]  # discard rejected draft token
                 verify_tok_id = verify_pred.item()
                 ntoks += 1
                 yield verify_tok_id, verify_lp, False
