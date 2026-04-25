@@ -290,6 +290,17 @@ class TimeBudget:
 
 
 class ModelProvider:
+    # Hardcoded defaults used when neither the user nor the model's
+    # generation_config.json specifies a value.
+    _server_defaults = {
+        "temp": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "max_tokens": 512,
+        "repetition_penalty": 0.0,
+    }
+
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
         self.cli_args = cli_args
@@ -298,6 +309,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.generation_config = {}
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -323,6 +335,17 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    def _apply_generation_defaults(self, generation_config):
+        """Store the model's generation_config for request-time resolution."""
+        self.generation_config = generation_config
+
+    def resolve_default(self, key):
+        """Return the effective default for *key* (CLI > generation_config > hardcoded)."""
+        cli_val = getattr(self.cli_args, key, None)
+        if cli_val is not None:
+            return cli_val
+        return self.generation_config.get(key, self._server_defaults.get(key))
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -339,18 +362,22 @@ class ModelProvider:
 
         # Load the model and tokenizer
         if self.is_distributed:
-            model, tokenizer = sharded_load(
+            model, tokenizer, config = sharded_load(
                 model_path,
                 pipeline_group=self.pipeline_group,
                 tensor_group=self.tensor_group,
                 tokenizer_config=self._tokenizer_config,
+                return_config=True,
             )
         else:
-            model, tokenizer = load(
+            model, tokenizer, config = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                return_config=True,
             )
+
+        self._apply_generation_defaults(config.get("generation_config", {}))
 
         # Use the default chat template if needed
         if self.cli_args.use_default_chat_template:
@@ -1055,6 +1082,13 @@ class ResponseGenerator:
     def cli_args(self):
         return self.model_provider.cli_args
 
+    @property
+    def generation_config(self):
+        return self.model_provider.generation_config
+
+    def resolve_default(self, key):
+        return self.model_provider.resolve_default(key)
+
 
 class APIHandler(BaseHTTPRequestHandler):
     def __init__(
@@ -1169,15 +1203,24 @@ class APIHandler(BaseHTTPRequestHandler):
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
+                "max_tokens", self.response_generator.resolve_default("max_tokens")
             )
         self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
+            "temperature", self.response_generator.resolve_default("temp")
         )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
+        self.top_p = self.body.get(
+            "top_p", self.response_generator.resolve_default("top_p")
+        )
+        self.top_k = self.body.get(
+            "top_k", self.response_generator.resolve_default("top_k")
+        )
+        self.min_p = self.body.get(
+            "min_p", self.response_generator.resolve_default("min_p")
+        )
+        self.repetition_penalty = self.body.get(
+            "repetition_penalty",
+            self.response_generator.resolve_default("repetition_penalty"),
+        )
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.presence_penalty = self.body.get("presence_penalty", 0.0)
         self.presence_context_size = self.body.get("presence_context_size", 20)
@@ -1817,31 +1860,31 @@ def main():
     parser.add_argument(
         "--temp",
         type=float,
-        default=0.0,
+        default=None,
         help="Default sampling temperature (default: 0.0)",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=1.0,
+        default=None,
         help="Default nucleus sampling top-p (default: 1.0)",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=0,
+        default=None,
         help="Default top-k sampling (default: 0, disables top-k)",
     )
     parser.add_argument(
         "--min-p",
         type=float,
-        default=0.0,
+        default=None,
         help="Default min-p sampling (default: 0.0, disables min-p)",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
+        default=None,
         help="Default maximum number of tokens to generate (default: 512)",
     )
     parser.add_argument(
