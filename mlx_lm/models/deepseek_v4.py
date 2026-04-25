@@ -226,11 +226,10 @@ class HyperConnection(nn.Module):
         B, S, hc, D = x.shape
         dtype = x.dtype
         xf = x.reshape(B, S, hc * D).astype(mx.float32)
-        inv = mx.rsqrt((xf * xf).mean(axis=-1, keepdims=True) + self.norm_eps)
+        xf_norm = mx.fast.rms_norm(xf, weight=None, eps=self.norm_eps)
         if self._fn_t is None:
             self._fn_t = self.fn.T
-        mixes = (xf @ self._fn_t) * inv
-        mixes = mixes.reshape(B * S, -1)
+        mixes = (xf_norm @ self._fn_t).reshape(B * S, -1)
         pre, post, comb = hc_split_sinkhorn(
             mixes, self.scale, self.base, hc, self.sinkhorn_iters, self.hc_eps
         )
