@@ -14,10 +14,6 @@ from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
 
 
-def _default_quantization() -> Dict:
-    return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-
-
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v4"
@@ -60,7 +56,6 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 1
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
-    quantization: Optional[Dict] = field(default_factory=_default_quantization)
     quantization_config: Optional[Dict] = None
 
     def __post_init__(self):
@@ -80,15 +75,6 @@ class ModelArgs(BaseModelArgs):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
-        if self.quantization is None:
-            self.quantization = _default_quantization()
-        expert_quantization = _default_quantization()
-        for layer_idx in range(self.num_hidden_layers):
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                self.quantization.setdefault(
-                    f"model.layers.{layer_idx}.ffn.switch_mlp.{proj}",
-                    dict(expert_quantization),
-                )
 
 
 def _score_func(scores: mx.array, func: str) -> mx.array:
@@ -1633,7 +1619,7 @@ class Model(nn.Module):
                     ".ffn.switch_mlp.down_proj",
                 )
             ):
-                return _default_quantization()
+                return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             return True
 
         return predicate
@@ -1685,12 +1671,35 @@ class Model(nn.Module):
             weight = (weight * scale[:, None, :, None]).reshape(m + pad_m, n + pad_n)
             return weight[:m, :n].astype(mx.bfloat16)
 
-        def pack_fp4(weight: mx.array):
+        def dequant_fp4(weight: mx.array, scale: mx.array, block_size: int = 32):
+            table = mx.array(
+                [
+                    0.0,
+                    0.5,
+                    1.0,
+                    1.5,
+                    2.0,
+                    3.0,
+                    4.0,
+                    6.0,
+                    0.0,
+                    -0.5,
+                    -1.0,
+                    -1.5,
+                    -2.0,
+                    -3.0,
+                    -4.0,
+                    -6.0,
+                ],
+                dtype=mx.float32,
+            )
             packed = weight.astype(mx.uint8)
-            *dims, packed_in = packed.shape
-            packed = packed.reshape(*dims, packed_in // 4, 4).astype(mx.uint32)
-            shifts = mx.array([0, 8, 16, 24], dtype=mx.uint32)
-            return ((packed << shifts).sum(axis=-1)).astype(mx.uint32)
+            low = packed & 0x0F
+            high = (packed >> 4) & 0x0F
+            unpacked = mx.stack([mx.take(table, low), mx.take(table, high)], axis=-1)
+            unpacked = unpacked.reshape(weight.shape[0], weight.shape[1] * 2)
+            scale = mx.repeat(scale_to_float(scale), block_size, axis=-1)
+            return (unpacked * scale).astype(mx.bfloat16)
 
         new_weights = {}
         for k, v in weights.items():
@@ -1710,8 +1719,7 @@ class Model(nn.Module):
                 and weight.dtype in (mx.int8, mx.uint8)
                 and v.shape[-1] * 16 == weight.shape[-1]
             ):
-                new_weights[wk] = pack_fp4(weight)
-                new_weights[wk[: -len(".weight")] + ".scales"] = v.astype(mx.uint8)
+                new_weights[wk] = dequant_fp4(weight, v)
             elif weight.dtype == mx.uint8:
                 new_weights[wk] = dequant_fp8(weight, v)
             else:
@@ -1750,16 +1758,15 @@ class Model(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                for suffix in ("weight", "scales"):
-                    key0 = f"{prefix}.0.{src}.{suffix}"
-                    if key0 in weights:
-                        stacked = [
-                            weights.pop(f"{prefix}.{e}.{src}.{suffix}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[
-                            f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
-                        ] = mx.stack(stacked)
+                key0 = f"{prefix}.0.{src}.weight"
+                if key0 in weights:
+                    stacked = [
+                        weights.pop(f"{prefix}.{e}.{src}.weight")
+                        for e in range(self.args.n_routed_experts)
+                    ]
+                    weights[f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.weight"] = (
+                        mx.stack(stacked)
+                    )
 
         return weights
 
