@@ -1743,6 +1743,36 @@ class LRUPromptCache:
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
+        # Disk tier write-through (no-op if disk=None)
+        if self.disk is not None:
+            try:
+                from ..disk_prompt_cache import WriteJob, hash_tokens
+
+                parents = (
+                    self.disk.find_dominated_prefixes(tokens)
+                    if can_trim_prompt_cache(prompt_cache)
+                    else []
+                )
+                self.disk.enqueue_write(
+                    WriteJob(
+                        token_hash=hash_tokens(tokens),
+                        tokens=list(tokens),
+                        prompt_cache=prompt_cache,
+                        cache_type_classes=[type(c).__name__ for c in prompt_cache],
+                        trimmable=can_trim_prompt_cache(prompt_cache),
+                        parents_to_evict=parents,
+                        model_id=self.disk.model_id,
+                    )
+                )
+            except Exception as e:
+                # Disk-tier failures must never break in-memory cache.
+                import logging
+
+                logging.getLogger("mlx_lm.prompt_cache.disk").error(
+                    "insert_cache → disk enqueue failed: %r",
+                    e,
+                )
+
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
     ):

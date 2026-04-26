@@ -1131,6 +1131,54 @@ class TestLRUPromptCacheIntegration(unittest.TestCase):
         self.assertEqual(ram.max_bytes, 1 << 30)
         self.assertIsNone(ram.disk)
 
+    def test_insert_cache_writes_to_disk(self):
+        from mlx_lm.models.cache import LRUPromptCache
+
+        disk = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        disk.start()
+        try:
+            ram = LRUPromptCache(max_size=10, disk=disk)
+            tokens = [1, 2, 3, 4]
+            kv = _make_dummy_kvcache(num_layers=1, ntokens=4, dim=8)
+            ram.insert_cache(disk.model_id, tokens, kv, cache_type="user")
+            disk._queue.join()
+            from mlx_lm.disk_prompt_cache import hash_tokens
+
+            self.assertTrue(disk.entry_path(hash_tokens(tokens)).exists())
+        finally:
+            disk.shutdown(timeout=2.0)
+
+    def test_insert_cache_disk_dominator_replacement(self):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+        from mlx_lm.models.cache import LRUPromptCache
+
+        disk = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        disk.start()
+        try:
+            ram = LRUPromptCache(max_size=10, disk=disk)
+            short = [1, 2, 3]
+            long = [1, 2, 3, 4, 5]
+            kv_s = _make_dummy_kvcache(num_layers=1, ntokens=3, dim=8)
+            kv_l = _make_dummy_kvcache(num_layers=1, ntokens=5, dim=8)
+            ram.insert_cache(disk.model_id, short, kv_s, cache_type="user")
+            disk._queue.join()
+            self.assertTrue(disk.entry_path(hash_tokens(short)).exists())
+            ram.insert_cache(disk.model_id, long, kv_l, cache_type="user")
+            disk._queue.join()
+            # Shorter trimmable file should now be deleted
+            self.assertFalse(disk.entry_path(hash_tokens(short)).exists())
+            self.assertTrue(disk.entry_path(hash_tokens(long)).exists())
+        finally:
+            disk.shutdown(timeout=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
