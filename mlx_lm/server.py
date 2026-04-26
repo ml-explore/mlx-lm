@@ -1778,6 +1778,20 @@ def run(
                 )
 
     prompt_cache = LRUPromptCache(cli.prompt_cache_size, disk=disk_cache)
+
+    import signal as _signal_module
+    import sys as _sys_module
+
+    def _graceful_shutdown(signum, frame):
+        logging.info("Received signal %s; draining disk cache…", signum)
+        if disk_cache is not None:
+            disk_cache.shutdown(timeout=30.0)
+        logging.info("Disk cache drained; exiting")
+        _sys_module.exit(0)
+
+    _signal_module.signal(_signal_module.SIGTERM, _graceful_shutdown)
+    _signal_module.signal(_signal_module.SIGINT, _graceful_shutdown)
+
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
