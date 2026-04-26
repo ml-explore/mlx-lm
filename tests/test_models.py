@@ -1464,6 +1464,50 @@ class TestModels(unittest.TestCase):
             for x, y in zip(expected, actual):
                 self.assertTrue(mx.allclose(x, y, rtol=1e-5, atol=1e-5))
 
+        # Sparse pooled attention keeps per-query top-k pooled KV grouped
+        # instead of flattening it into a dense L * top_k sequence.
+        B, H, L, D = 1, 2, 3, 4
+        local_len, pooled_len, top_k = 5, 7, 2
+        q = mx.random.normal((B, H, L, D))
+        local_kv = mx.random.normal((B, 1, local_len, D))
+        pooled = mx.random.normal((B, pooled_len, D))
+        topk = mx.array([[[1, 3], [0, 4], [2, 5]]], dtype=mx.int32)
+        sinks = mx.random.normal((H,))
+        idx = topk[:, None, :, :, None]
+        selected = mx.take_along_axis(
+            mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled_len, D)),
+            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+            axis=3,
+        )
+        dense_kv = mx.concatenate(
+            [local_kv, selected.reshape(B, 1, L * top_k, D)], axis=2
+        )
+        dense_mask = mx.zeros((B, H, L, local_len + L * top_k), dtype=mx.bool_)
+        dense_mask[..., :local_len] = True
+        for i in range(L):
+            start = local_len + i * top_k
+            dense_mask[:, :, i, start : start + top_k] = True
+        expected = deepseek_v4.scaled_dot_product_attention(
+            q,
+            dense_kv,
+            dense_kv,
+            cache=None,
+            scale=0.5,
+            mask=dense_mask,
+            sinks=sinks,
+        )
+        actual = deepseek_v4._sparse_pooled_attention(
+            q,
+            local_kv,
+            pooled,
+            topk,
+            None,
+            None,
+            0.5,
+            sinks,
+        )
+        self.assertTrue(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5))
+
         # Model test
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",

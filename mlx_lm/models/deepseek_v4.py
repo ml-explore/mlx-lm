@@ -284,6 +284,55 @@ def _apply_partial_rope(
     return _rope_full(x, rope.inv_freq, pos, inverse, nope_dim)
 
 
+def _apply_score_mask(scores: mx.array, mask: Optional[mx.array]) -> mx.array:
+    if mask is None:
+        return scores
+    if mask.dtype == mx.bool_:
+        return mx.where(mask, scores, mx.finfo(scores.dtype).min)
+    return scores + mask.astype(scores.dtype)
+
+
+def _sparse_pooled_attention(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    topk: mx.array,
+    local_mask: Optional[mx.array],
+    pooled_mask: Optional[mx.array],
+    scale: float,
+    sinks: Optional[mx.array],
+) -> mx.array:
+    B, H, L, D = q.shape
+    idx = topk[:, None, :, :, None]
+    pooled = mx.take_along_axis(
+        mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
+        mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+        axis=3,
+    )
+
+    q_scaled = q * scale
+    local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
+    local_scores = _apply_score_mask(local_scores, local_mask)
+    pooled_scores = (q_scaled[:, :, :, None] * pooled).sum(axis=-1)
+    pooled_scores = _apply_score_mask(pooled_scores, pooled_mask)
+
+    scores = mx.concatenate([local_scores, pooled_scores], axis=-1)
+    sink_offset = 0
+    if sinks is not None:
+        sink_offset = 1
+        sink_scores = mx.broadcast_to(sinks.reshape(1, H, 1, 1), (B, H, L, 1))
+        scores = mx.concatenate([sink_scores.astype(scores.dtype), scores], axis=-1)
+
+    weights = mx.softmax(scores, axis=-1, precise=True)
+    local_len = local_kv.shape[2]
+    local_weights = weights[..., sink_offset : sink_offset + local_len]
+    pooled_weights = weights[..., sink_offset + local_len :]
+
+    out = local_weights @ local_kv
+    out = out + (pooled_weights[..., None] * pooled).sum(axis=-2)
+    return out.astype(q.dtype)
+
+
 @mx.compile
 def _hc_split_sinkhorn_ops(
     mixes: mx.array,
@@ -1687,6 +1736,9 @@ class V4Attention(nn.Module):
 
         pooled_mask = None
         pooled_bias = None
+        sparse_pooled = None
+        sparse_topk = None
+        sparse_pooled_mask = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
@@ -1696,10 +1748,10 @@ class V4Attention(nn.Module):
                     if v4_cache is not None
                     else None
                 )
-                use_indexer = hasattr(self, "indexer")
+                use_indexer = isinstance(getattr(self, "indexer", None), Indexer)
+                max_pooled_length = pooled.shape[1] if lengths is None else max(lengths)
                 select_all = use_indexer and (
-                    L > 1
-                    or (lengths is None and pooled.shape[1] <= self.indexer.index_topk)
+                    max_pooled_length <= self.indexer.index_topk
                 )
                 if select_all:
                     pooled = pooled[:, None]
@@ -1714,21 +1766,32 @@ class V4Attention(nn.Module):
                         x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                     )
                     if topk is not None:
-                        if lengths is not None:
-                            lengths = mx.array(lengths)
-                            pooled_mask = (topk < lengths[:, None, None]).reshape(
-                                B, 1, 1, -1
+                        if L > 1:
+                            sparse_pooled = pooled
+                            sparse_topk = topk
+                            if lengths is not None:
+                                lengths = mx.array(lengths)
+                                sparse_pooled_mask = (
+                                    topk < lengths[:, None, None]
+                                ).reshape(B, 1, L, -1)
+                        else:
+                            if lengths is not None:
+                                lengths = mx.array(lengths)
+                                pooled_mask = (topk < lengths[:, None, None]).reshape(
+                                    B, 1, 1, -1
+                                )
+                            expanded = mx.broadcast_to(
+                                pooled[:, None, None, :, :],
+                                (B, 1, L, pooled.shape[1], self.head_dim),
                             )
-                        expanded = mx.broadcast_to(
-                            pooled[:, None, None, :, :],
-                            (B, 1, L, pooled.shape[1], self.head_dim),
-                        )
-                        idx = topk[:, None, :, :, None]
-                        pooled = mx.take_along_axis(
-                            expanded,
-                            mx.broadcast_to(idx, idx.shape[:-1] + (self.head_dim,)),
-                            axis=3,
-                        ).reshape(B, 1, -1, self.head_dim)
+                            idx = topk[:, None, :, :, None]
+                            pooled = mx.take_along_axis(
+                                expanded,
+                                mx.broadcast_to(
+                                    idx, idx.shape[:-1] + (self.head_dim,)
+                                ),
+                                axis=3,
+                            ).reshape(B, 1, -1, self.head_dim)
                     else:
                         pooled = pooled[:, None]
                 else:
@@ -1738,50 +1801,65 @@ class V4Attention(nn.Module):
                             mx.arange(pooled.shape[1]) < lengths[:, None]
                         ).reshape(B, 1, 1, -1)
                     pooled = pooled[:, None]
-                full_kv = mx.concatenate([full_kv, pooled], axis=2)
+                if sparse_topk is None:
+                    full_kv = mx.concatenate([full_kv, pooled], axis=2)
 
         if mask is not None and mask.shape[-1] > local_kv_len:
             mask = mask[..., -local_kv_len:]
 
-        if mask is not None and full_kv.shape[2] > mask.shape[-1]:
-            pad_shape = mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],)
-            pad_pooled_mask = pooled_mask
-            if (
-                pad_pooled_mask is not None
-                and pad_pooled_mask.shape[-1] != pad_shape[-1]
-            ):
-                pad_pooled_mask = pad_pooled_mask[..., -pad_shape[-1] :]
-            if pooled_bias is not None:
-                dtype = q.dtype
-                if mask.dtype == mx.bool_:
-                    mask = mx.where(
-                        mask,
-                        mx.array(0, dtype=dtype),
-                        mx.full((), mx.finfo(dtype).min, dtype=dtype),
-                    )
-                pad = mx.full(pad_shape, pooled_bias, dtype=mask.dtype)
-            elif mask.dtype == mx.bool_:
-                pad = mx.ones(pad_shape, dtype=mask.dtype)
-                if pad_pooled_mask is not None:
-                    pad = pad & pad_pooled_mask
-            else:
-                pad = mx.zeros(pad_shape, dtype=mask.dtype)
-                if pad_pooled_mask is not None:
-                    pad = mx.where(
-                        pad_pooled_mask,
-                        pad,
-                        mx.full(pad_shape, mx.finfo(mask.dtype).min, dtype=mask.dtype),
-                    )
-            mask = mx.concatenate([mask, pad], axis=-1)
-        out = scaled_dot_product_attention(
-            q,
-            full_kv,
-            full_kv,
-            cache=local_cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self._attn_sink_cached,
-        )
+        if sparse_topk is not None:
+            out = _sparse_pooled_attention(
+                q,
+                full_kv,
+                sparse_pooled,
+                sparse_topk,
+                mask,
+                sparse_pooled_mask,
+                self.scale,
+                self._attn_sink_cached,
+            )
+        else:
+            if mask is not None and full_kv.shape[2] > mask.shape[-1]:
+                pad_shape = mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],)
+                pad_pooled_mask = pooled_mask
+                if (
+                    pad_pooled_mask is not None
+                    and pad_pooled_mask.shape[-1] != pad_shape[-1]
+                ):
+                    pad_pooled_mask = pad_pooled_mask[..., -pad_shape[-1] :]
+                if pooled_bias is not None:
+                    dtype = q.dtype
+                    if mask.dtype == mx.bool_:
+                        mask = mx.where(
+                            mask,
+                            mx.array(0, dtype=dtype),
+                            mx.full((), mx.finfo(dtype).min, dtype=dtype),
+                        )
+                    pad = mx.full(pad_shape, pooled_bias, dtype=mask.dtype)
+                elif mask.dtype == mx.bool_:
+                    pad = mx.ones(pad_shape, dtype=mask.dtype)
+                    if pad_pooled_mask is not None:
+                        pad = pad & pad_pooled_mask
+                else:
+                    pad = mx.zeros(pad_shape, dtype=mask.dtype)
+                    if pad_pooled_mask is not None:
+                        pad = mx.where(
+                            pad_pooled_mask,
+                            pad,
+                            mx.full(
+                                pad_shape, mx.finfo(mask.dtype).min, dtype=mask.dtype
+                            ),
+                        )
+                mask = mx.concatenate([mask, pad], axis=-1)
+            out = scaled_dot_product_attention(
+                q,
+                full_kv,
+                full_kv,
+                cache=local_cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self._attn_sink_cached,
+            )
         out = _apply_partial_rope(out, self.rope, offset, inverse=True)
         out = self._grouped_output_projection(out)
         return self.wo_b(out)
