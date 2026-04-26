@@ -686,5 +686,79 @@ class TestDiskPromptCacheTouch(unittest.TestCase):
         # No assertion; just confirming no exception
 
 
+class TestDominatedPrefixes(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+        self.cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+
+    def tearDown(self):
+        self.cache.shutdown(timeout=2.0)
+        self.tmpdir.cleanup()
+
+    def _seed(self, tokens, trimmable=True):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        kv = _make_dummy_kvcache(num_layers=1, ntokens=len(tokens), dim=8)
+        h = hash_tokens(tokens)
+        job = WriteJob(
+            token_hash=h,
+            tokens=tokens,
+            prompt_cache=kv,
+            cache_type_classes=["KVCache"],
+            trimmable=trimmable,
+            parents_to_evict=[],
+            model_id=self.cache.model_id,
+        )
+        write_entry_atomic(self.cache.entries_dir, job, fsync=False)
+        st = self.cache.entry_path(h).stat()
+        leaf = DiskLeaf(
+            token_hash=h,
+            length=len(tokens),
+            nbytes=st.st_size,
+            mtime_ns=st.st_mtime_ns,
+            trimmable=trimmable,
+        )
+        with self.cache._trie_lock:
+            self.cache._trie.add(self.cache.model_id, tokens, leaf)
+            self.cache._hash_to_tokens[h] = tokens
+        return h
+
+    def test_no_dominated_when_empty(self):
+        result = self.cache.find_dominated_prefixes([1, 2, 3])
+        self.assertEqual(result, [])
+
+    def test_dominates_shorter_trimmable(self):
+        h_short = self._seed([1, 2, 3])
+        result = self.cache.find_dominated_prefixes([1, 2, 3, 4, 5])
+        self.assertEqual(result, [h_short])
+
+    def test_skips_non_trimmable_shorter(self):
+        h_short = self._seed([1, 2, 3], trimmable=False)
+        result = self.cache.find_dominated_prefixes([1, 2, 3, 4, 5])
+        self.assertEqual(result, [])
+
+    def test_dominates_chain(self):
+        h_a = self._seed([1, 2])
+        h_b = self._seed([1, 2, 3])
+        h_c = self._seed([1, 2, 3, 4])
+        result = self.cache.find_dominated_prefixes([1, 2, 3, 4, 5, 6])
+        # All three shorter, all trimmable → all dominated
+        self.assertCountEqual(result, [h_a, h_b, h_c])
+
+    def test_does_not_dominate_off_path(self):
+        h_off = self._seed([9, 9, 9])  # totally different path
+        result = self.cache.find_dominated_prefixes([1, 2, 3, 4])
+        self.assertEqual(result, [])
+
+
 if __name__ == "__main__":
     unittest.main()

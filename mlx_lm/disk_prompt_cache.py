@@ -558,6 +558,34 @@ class DiskPromptCache:
             except OSError:
                 pass  # file may have been evicted; safe to ignore
 
+    def find_dominated_prefixes(self, tokens: List[int]) -> List[str]:
+        """Token_hashes of trimmable leaves that lie on the prefix path of ``tokens``.
+
+        These leaves can be deleted from disk after a deeper leaf is durably
+        written, since the deeper file can serve their queries via
+        ``trim_prompt_cache``.
+
+        Walks the disk trie along ``tokens``, collecting any leaf encountered
+        before reaching the full path (i.e., shorter than ``tokens``).
+        Skips non-trimmable leaves.
+        """
+        result: List[str] = []
+        with self._trie_lock:
+            if self.model_id not in self._trie._trie:
+                return result
+            current = self._trie._trie[self.model_id]
+            # Walk along tokens path, gathering trimmable leaves at each step
+            for i, tok in enumerate(tokens):
+                if tok not in current:
+                    break
+                current = current[tok]
+                value = current.get("__value__")
+                # Only collect leaves SHORTER than tokens — i.e., index < len-1
+                if value is not None and i + 1 < len(tokens):
+                    if value.trimmable:
+                        result.append(value.token_hash)
+        return result
+
     def _writer_loop(self) -> None:
         """Placeholder; full implementation in Task 12."""
         while True:
