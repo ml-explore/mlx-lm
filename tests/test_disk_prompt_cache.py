@@ -970,5 +970,122 @@ class TestShutdown(unittest.TestCase):
         cache.shutdown(timeout=2.0)  # second call is a no-op
 
 
+class TestFailureHandling(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_eaccess_disables_writes(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        cache.start()
+        try:
+            from mlx_lm import disk_prompt_cache as mod
+            from mlx_lm.disk_prompt_cache import hash_tokens
+
+            original = mod.write_entry_atomic
+
+            def fail(*a, **kw):
+                raise PermissionError(13, "Permission denied", "x")
+
+            mod.write_entry_atomic = fail
+            try:
+                tokens = [1, 2, 3]
+                kv = _make_dummy_kvcache(num_layers=1, ntokens=3, dim=8)
+                job = WriteJob(
+                    token_hash=hash_tokens(tokens),
+                    tokens=tokens,
+                    prompt_cache=kv,
+                    cache_type_classes=["KVCache"],
+                    trimmable=True,
+                    parents_to_evict=[],
+                    model_id=cache.model_id,
+                )
+                cache.enqueue_write(job)
+                cache._queue.join()
+                # Writes are now disabled
+                self.assertTrue(cache._writes_disabled)
+            finally:
+                mod.write_entry_atomic = original
+        finally:
+            cache.shutdown(timeout=2.0)
+
+    def test_enospc_triggers_emergency_eviction(self):
+        import errno
+
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        cache.start()
+        try:
+            from mlx_lm import disk_prompt_cache as mod
+            from mlx_lm.disk_prompt_cache import hash_tokens
+
+            # Seed some entries first so emergency eviction has something to evict
+            for i in range(3):
+                tokens = [i, i, i, i]
+                kv = _make_dummy_kvcache(num_layers=1, ntokens=4, dim=8)
+                job = WriteJob(
+                    token_hash=hash_tokens(tokens),
+                    tokens=tokens,
+                    prompt_cache=kv,
+                    cache_type_classes=["KVCache"],
+                    trimmable=True,
+                    parents_to_evict=[],
+                    model_id=cache.model_id,
+                )
+                cache.enqueue_write(job)
+                cache._queue.join()
+                time.sleep(0.01)
+            initial_count = len(cache._hash_to_tokens)
+
+            original = mod.write_entry_atomic
+            call_count = [0]
+
+            def fail_then_succeed(*a, **kw):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise OSError(errno.ENOSPC, "No space left", "x")
+                return original(*a, **kw)
+
+            mod.write_entry_atomic = fail_then_succeed
+            try:
+                tokens = [99, 99, 99]
+                kv = _make_dummy_kvcache(num_layers=1, ntokens=3, dim=8)
+                job = WriteJob(
+                    token_hash=hash_tokens(tokens),
+                    tokens=tokens,
+                    prompt_cache=kv,
+                    cache_type_classes=["KVCache"],
+                    trimmable=True,
+                    parents_to_evict=[],
+                    model_id=cache.model_id,
+                )
+                cache.enqueue_write(job)
+                cache._queue.join()
+                # Emergency eviction should have removed at least one earlier entry
+                self.assertLess(len(cache._hash_to_tokens), initial_count + 1)
+                # The new entry should be present (retry succeeded)
+                self.assertTrue(cache.entry_path(job.token_hash).exists())
+                # Writes still enabled
+                self.assertFalse(cache._writes_disabled)
+            finally:
+                mod.write_entry_atomic = original
+        finally:
+            cache.shutdown(timeout=2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

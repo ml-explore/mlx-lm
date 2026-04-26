@@ -714,8 +714,69 @@ class DiskPromptCache:
             )
 
     def _handle_write_error(self, e: Exception, job: WriteJob) -> None:
-        """Stub — full implementation in Task 15."""
-        logger.error("Write failed for %s: %r", job.token_hash, e)
+        """Categorize write errors and react.
+
+        - ENOSPC: emergency-evict to 80% of cap, retry once. If still fails,
+          log + drop entry from disk (RAM unaffected).
+        - EACCES / PermissionError: disable disk writes for rest of session,
+          degrade silently to RAM-only.
+        - Other OSError: log + drop this entry, keep going.
+        """
+        if isinstance(e, PermissionError) or (
+            isinstance(e, OSError) and e.errno == errno.EACCES
+        ):
+            logger.warning(
+                "Permission denied writing disk cache; disabling disk writes "
+                "for this session. Path: %s; error: %r",
+                self.entries_dir,
+                e,
+            )
+            self._writes_disabled = True
+            return
+
+        if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+            logger.warning("ENOSPC during write; running emergency eviction")
+            saved_headroom = self.eviction_headroom
+            saved_max = self.max_bytes
+            # Force eviction to 80% of current usage so we actually free space
+            # even when the accounting cap is larger than actual disk usage.
+            self.eviction_headroom = 0.80
+            self.max_bytes = max(1, int(self._total_bytes))
+            try:
+                self._run_eviction_pass()
+            finally:
+                self.eviction_headroom = saved_headroom
+                self.max_bytes = saved_max
+            try:
+                write_entry_atomic(self.entries_dir, job, fsync=self.fsync)
+                final_path = self.entry_path(job.token_hash)
+                st = final_path.stat()
+                with self._trie_lock:
+                    leaf = DiskLeaf(
+                        token_hash=job.token_hash,
+                        length=len(job.tokens),
+                        nbytes=st.st_size,
+                        mtime_ns=st.st_mtime_ns,
+                        trimmable=job.trimmable,
+                    )
+                    prev = self._trie.add(self.model_id, job.tokens, leaf)
+                    if prev is not None:
+                        self._total_bytes -= prev.nbytes
+                    self._total_bytes += st.st_size
+                    self._hash_to_tokens[job.token_hash] = list(job.tokens)
+                logger.info(
+                    "Retry after emergency eviction succeeded for %s",
+                    job.token_hash,
+                )
+                return
+            except OSError as e2:
+                logger.error(
+                    "Retry after emergency eviction also failed: %r; dropping entry",
+                    e2,
+                )
+                return
+
+        logger.error("Write failed for %s: %r; dropping entry", job.token_hash, e)
 
     def shutdown(self, timeout: float = 30.0) -> None:
         """Drain writer queue, stop background threads, release the lock.
