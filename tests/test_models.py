@@ -3351,6 +3351,35 @@ class TestModels(unittest.TestCase):
         for g_py, g_mx in zip(gs_py, gs_mx):
             self.assertTrue(mx.allclose(g_py, g_mx, atol=1e-3, rtol=1e-3))
 
+    def test_gated_delta_vjp_bf16_default_state(self):
+        """bf16 inputs with the default fp32 recurrent state must compile
+        and produce finite gradients through the public training route.
+        """
+        if not mx.metal.is_available():
+            return
+        from mlx_lm.models.gated_delta import gated_delta_update
+
+        mx.random.seed(2)
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.bfloat16)
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.bfloat16)
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.bfloat16)
+        a = (-5.0 + mx.random.normal(shape=(B, T, Hv)) * 0.1).astype(mx.bfloat16)
+        b = mx.random.normal(shape=(B, T, Hv)).astype(mx.bfloat16)
+        A_log = mx.zeros((Hv,)).astype(mx.bfloat16)
+        dt_bias = mx.ones((Hv,)).astype(mx.bfloat16)
+        cot_y = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.bfloat16) * 0.01
+
+        def loss(q_, k_, v_):
+            y, _ = gated_delta_update(q_, k_, v_, a, b, A_log, dt_bias, training=True)
+            return (y.astype(mx.float32) * cot_y.astype(mx.float32)).sum()
+
+        gq, gk, gv = mx.grad(loss, argnums=(0, 1, 2))(q, k, v)
+        self.assertTrue(bool(mx.isfinite(gq).all()))
+        self.assertTrue(bool(mx.isfinite(gk).all()))
+        self.assertTrue(bool(mx.isfinite(gv).all()))
+
 
 if __name__ == "__main__":
     unittest.main()

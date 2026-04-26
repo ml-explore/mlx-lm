@@ -115,7 +115,7 @@ def _make_fwd_save_kernel(vectorized: bool = False):
           }}
 
           for (int i = 0; i < n_per_t; ++i) {{
-            h_state[n_per_t * dk_idx + i] = static_cast<InT>(state[i]);
+            h_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
           }}
 
           q_ += Hk * Dk;
@@ -129,7 +129,7 @@ def _make_fwd_save_kernel(vectorized: bool = False):
 
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<InT>(state[i]);
+          o_state[s_idx] = static_cast<StT>(state[i]);
         }}
     """
     return mx.fast.metal_kernel(
@@ -218,7 +218,7 @@ def _make_bwd_kernel():
             S_new[i] = static_cast<float>(S_new_row[n_per_t * dk_idx + i]);
           }
 
-          const device InT* S_prev_row;
+          const device StT* S_prev_row;
           if (t == 0) {
             S_prev_row = s_initial + dv_idx * Dk;
           } else {
@@ -339,7 +339,7 @@ def _make_bwd_kernel():
         // Write dS_initial for the chunk (same (b,hv,dv) slice).
         auto ds_init_row = ds_init_ptr + dv_idx * Dk;
         for (int i = 0; i < n_per_t; ++i) {
-          ds_init_row[n_per_t * dk_idx + i] = static_cast<InT>(dS[i]);
+          ds_init_row[n_per_t * dk_idx + i] = static_cast<StT>(dS[i]);
         }
     """
     return mx.fast.metal_kernel(
@@ -448,7 +448,7 @@ def _make_bwd_kernel_vec():
             S_new[i] = static_cast<float>(S_new_row[n_per_t * dk_idx + i]);
           }
 
-          const device InT* S_prev_row;
+          const device StT* S_prev_row;
           if (t == 0) {
             S_prev_row = s_initial + dv_idx * Dk;
           } else {
@@ -563,7 +563,7 @@ def _make_bwd_kernel_vec():
 
         auto ds_init_row = ds_init_ptr + dv_idx * Dk;
         for (int i = 0; i < n_per_t; ++i) {
-          ds_init_row[n_per_t * dk_idx + i] = static_cast<InT>(dS[i]);
+          ds_init_row[n_per_t * dk_idx + i] = static_cast<StT>(dS[i]);
         }
     """
     return mx.fast.metal_kernel(
@@ -608,11 +608,13 @@ def _fwd_save(q, k, v, g, beta, state_in):
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     input_type = q.dtype
+    state_type = state_in.dtype
     kernel = _fwd_save_kernel_vec if g.ndim == 4 else _fwd_save_kernel
     return kernel(
         inputs=[q, k, v, g, beta, state_in, T],
         template=[
             ("InT", input_type),
+            ("StT", state_type),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -625,7 +627,7 @@ def _fwd_save(q, k, v, g, beta, state_in):
             state_in.shape,  # state_out
             (B, Hv, T, Dv, Dk),  # state_history
         ],
-        output_dtypes=[input_type, input_type, input_type],
+        output_dtypes=[input_type, state_type, state_type],
     )
 
 
@@ -637,6 +639,7 @@ def _bwd(q, k, v, g, beta, state_initial, state_history, dy, dS_final):
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     input_type = q.dtype
+    state_type = state_initial.dtype
     out_type = mx.float32
     if g.ndim == 4:
         kernel = _bwd_kernel_vec
@@ -659,6 +662,7 @@ def _bwd(q, k, v, g, beta, state_initial, state_history, dy, dS_final):
         ],
         template=[
             ("InT", input_type),
+            ("StT", state_type),
             ("OutT", out_type),
             ("Dk", Dk),
             ("Dv", Dv),
@@ -681,7 +685,7 @@ def _bwd(q, k, v, g, beta, state_initial, state_history, dy, dS_final):
             input_type,
             out_type,
             out_type,
-            input_type,
+            state_type,
         ],
     )
 
