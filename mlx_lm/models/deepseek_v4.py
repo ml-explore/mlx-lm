@@ -1667,9 +1667,6 @@ class V4Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache
-        if isinstance(cache, DeepseekV4Cache):
-            local_cache = cache
-
         offset = local_cache.offset if local_cache is not None else 0
         if isinstance(offset, mx.array):
             offset = offset + 0
