@@ -55,6 +55,32 @@ class TestCacheAdmin(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("format-version", result.stderr.lower())
 
+    def test_remove_model(self):
+        result = _run("remove", str(self.dir), "--model", "abc1234567890def", "--yes")
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse((self.dir / "models" / "abc1234567890def").exists())
+
+    def test_remove_nonexistent_model(self):
+        result = _run("remove", str(self.dir), "--model", "nonexistent", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_verify_empty(self):
+        result = _run("verify", str(self.dir))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("OK", result.stdout)
+
+    def test_prune_removes_old(self):
+        # Drop a fake .safetensors with a very old mtime
+        m = self.dir / "models" / "abc1234567890def" / "entries"
+        old = m / "deadbeefdeadbeef.safetensors"
+        old.write_bytes(b"x")
+        import os
+
+        os.utime(str(old), (0, 0))  # epoch 0 mtime
+        result = _run("prune", str(self.dir), "--older-than", "1d", "--yes")
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(old.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
