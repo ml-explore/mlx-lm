@@ -263,7 +263,6 @@ def _rope_full(
     return pe_out
 
 
-
 def _apply_partial_rope(
     x: mx.array,
     rope: DeepseekV4RoPE,
@@ -1550,7 +1549,6 @@ class Indexer(nn.Module):
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
 
-
 class V4Attention(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
@@ -1620,9 +1618,9 @@ class V4Attention(nn.Module):
             self._wo_a_biases = (
                 None
                 if self.wo_a.biases is None
-                else self.wo_a.biases.reshape(
-                    self.o_groups, self.o_lora_rank, -1
-                )[:, None]
+                else self.wo_a.biases.reshape(self.o_groups, self.o_lora_rank, -1)[
+                    :, None
+                ]
             )
         else:
             group_feat = (self.n_heads * self.head_dim) // self.o_groups
@@ -1677,9 +1675,7 @@ class V4Attention(nn.Module):
         q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         self._ensure_cached(q.dtype)
-        q = mx.fast.rms_norm(
-            q, self._q_norm_weight_cached, self.config.rms_norm_eps
-        )
+        q = mx.fast.rms_norm(q, self._q_norm_weight_cached, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
         kv = self.kv_norm(self.wkv(x)).reshape(B, L, 1, self.head_dim)
         kv = kv.transpose(0, 2, 1, 3)
@@ -1704,15 +1700,9 @@ class V4Attention(nn.Module):
                     else None
                 )
                 use_indexer = hasattr(self, "indexer")
-                select_all = (
-                    use_indexer
-                    and (
-                        L > 1
-                        or (
-                            lengths is None
-                            and pooled.shape[1] <= self.indexer.index_topk
-                        )
-                    )
+                select_all = use_indexer and (
+                    L > 1
+                    or (lengths is None and pooled.shape[1] <= self.indexer.index_topk)
                 )
                 if select_all:
                     pooled = pooled[:, None]
@@ -1759,7 +1749,10 @@ class V4Attention(nn.Module):
         if mask is not None and full_kv.shape[2] > mask.shape[-1]:
             pad_shape = mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],)
             pad_pooled_mask = pooled_mask
-            if pad_pooled_mask is not None and pad_pooled_mask.shape[-1] != pad_shape[-1]:
+            if (
+                pad_pooled_mask is not None
+                and pad_pooled_mask.shape[-1] != pad_shape[-1]
+            ):
                 pad_pooled_mask = pad_pooled_mask[..., -pad_shape[-1] :]
             if pooled_bias is not None:
                 dtype = q.dtype
