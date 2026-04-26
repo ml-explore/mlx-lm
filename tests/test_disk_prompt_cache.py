@@ -760,5 +760,71 @@ class TestDominatedPrefixes(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class TestWriterLoop(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+        self.cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        self.cache.start()
+
+    def tearDown(self):
+        self.cache.shutdown(timeout=5.0)
+        self.tmpdir.cleanup()
+
+    def _job(self, tokens, trimmable=True):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        kv = _make_dummy_kvcache(num_layers=1, ntokens=len(tokens), dim=8)
+        return WriteJob(
+            token_hash=hash_tokens(tokens),
+            tokens=tokens,
+            prompt_cache=kv,
+            cache_type_classes=["KVCache"],
+            trimmable=trimmable,
+            parents_to_evict=[],
+            model_id=self.cache.model_id,
+        )
+
+    def test_basic_write_lands_on_disk(self):
+        job = self._job([1, 2, 3, 4])
+        self.cache.enqueue_write(job)
+        self.cache._queue.join()
+        self.assertTrue(self.cache.entry_path(job.token_hash).exists())
+        # Trie updated
+        self.assertEqual(self.cache.search([1, 2, 3, 4]).exact, [1, 2, 3, 4])
+
+    def test_dominator_replacement_deletes_shorter(self):
+        job_a = self._job([1, 2, 3])
+        self.cache.enqueue_write(job_a)
+        self.cache._queue.join()
+        # Now insert a deeper leaf that dominates [1,2,3]
+        job_b = self._job([1, 2, 3, 4, 5])
+        job_b.parents_to_evict = self.cache.find_dominated_prefixes(job_b.tokens)
+        self.assertEqual(job_b.parents_to_evict, [job_a.token_hash])
+        self.cache.enqueue_write(job_b)
+        self.cache._queue.join()
+        self.assertFalse(self.cache.entry_path(job_a.token_hash).exists())
+        self.assertTrue(self.cache.entry_path(job_b.token_hash).exists())
+        # Trie no longer has the shorter
+        with self.cache._trie_lock:
+            self.assertNotIn(job_a.token_hash, self.cache._hash_to_tokens)
+
+    def test_total_bytes_tracking(self):
+        before = self.cache._total_bytes
+        job = self._job([10, 20, 30])
+        self.cache.enqueue_write(job)
+        self.cache._queue.join()
+        after = self.cache._total_bytes
+        self.assertGreater(after, before)
+
+
 if __name__ == "__main__":
     unittest.main()

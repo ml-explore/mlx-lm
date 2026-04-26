@@ -586,13 +586,92 @@ class DiskPromptCache:
                         result.append(value.token_hash)
         return result
 
+    def enqueue_write(self, job: WriteJob) -> None:
+        """Push a job onto the writer queue. Blocks if queue is full
+        (bounded by ``write_queue_size``).
+        """
+        if not self._accepting_writes or self._writes_disabled:
+            return
+        if self._queue is None:
+            return  # start() not called yet
+        self._queue.put(job)
+
     def _writer_loop(self) -> None:
-        """Placeholder; full implementation in Task 12."""
         while True:
             item = self._queue.get()
-            if item is _SHUTDOWN_SENTINEL:
-                return
-            # No-op until Task 12.
+            try:
+                if item is _SHUTDOWN_SENTINEL:
+                    return
+                if self._writes_disabled:
+                    continue
+                self._handle_write_job(item)
+            except Exception as e:
+                logger.error(
+                    "Writer thread error processing job %s: %r",
+                    getattr(item, "token_hash", "<sentinel>"),
+                    e,
+                )
+            finally:
+                self._queue.task_done()
+
+    def _handle_write_job(self, job: WriteJob) -> None:
+        # 1. Atomic write
+        try:
+            write_entry_atomic(self.entries_dir, job, fsync=self.fsync)
+        except OSError as e:
+            self._handle_write_error(e, job)
+            return
+
+        final_path = self.entry_path(job.token_hash)
+        st = final_path.stat()
+
+        # 2. Update trie + counters; remove dominated parents
+        with self._trie_lock:
+            for parent_hash in job.parents_to_evict:
+                parent_tokens = self._hash_to_tokens.pop(parent_hash, None)
+                if parent_tokens is None:
+                    continue
+                try:
+                    parent_leaf = self._trie.pop(self.model_id, parent_tokens)
+                    self._total_bytes -= parent_leaf.nbytes
+                except (KeyError, TypeError):
+                    pass
+                parent_path = self.entry_path(parent_hash)
+                try:
+                    parent_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning(
+                        "Could not delete dominated parent %s: %s",
+                        parent_path,
+                        e,
+                    )
+
+            leaf = DiskLeaf(
+                token_hash=job.token_hash,
+                length=len(job.tokens),
+                nbytes=st.st_size,
+                mtime_ns=st.st_mtime_ns,
+                trimmable=job.trimmable,
+            )
+            prev = self._trie.add(self.model_id, job.tokens, leaf)
+            if prev is not None:
+                self._total_bytes -= prev.nbytes
+            self._total_bytes += st.st_size
+            self._hash_to_tokens[job.token_hash] = list(job.tokens)
+
+        # 3. Eviction if over cap
+        if self._total_bytes > self.max_bytes:
+            self._run_eviction_pass()
+
+    def _run_eviction_pass(self) -> None:
+        """Stub — full implementation in Task 13."""
+        pass
+
+    def _handle_write_error(self, e: Exception, job: WriteJob) -> None:
+        """Stub — full implementation in Task 15."""
+        logger.error("Write failed for %s: %r", job.token_hash, e)
 
     def shutdown(self, timeout: float = 30.0) -> None:
         """Stub — full implementation in Task 14. Just releases the lock."""
