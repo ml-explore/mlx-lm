@@ -1626,6 +1626,7 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+        token_hash: Optional[str] = None  # pre-computed disk hash, avoids re-hashing
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1686,18 +1687,29 @@ class LRUPromptCache:
 
         # Two-tier path
         ram_quality = self._classify(ram_result, tokens)
-        disk_result = self.disk.search(tokens)
+
+        # Exact RAM hit: disk cannot possibly be better (quality 3 is the max).
+        # Skip the disk trie search entirely; only touch the disk entry's mtime.
+        # The token_hash is pre-computed and stored in the CacheEntry to avoid
+        # recomputing SHA256 on every fetch.
+        if ram_quality[0] == 3:
+            entry = self._trie.get(model, tokens)
+            if entry.token_hash is not None:
+                self.disk.touch_async(entry.token_hash)
+            return copy.deepcopy(entry.prompt_cache), []
+
+        # Non-exact RAM hit: search disk trie + update its mtime in one lock
+        # acquisition (search_and_touch) to avoid two separate lock round-trips.
+        disk_result, _touched = self.disk.search_and_touch(tokens)
         disk_quality = self._classify(disk_result, tokens)
 
         # Prefer the better match; tie → RAM
         if disk_quality > ram_quality:
             return self._serve_disk_match(model, tokens, disk_result)
 
-        # Use RAM. If we got an exact RAM match for an entry that's also on
-        # disk, touch its disk mtime. We do this here for "exact" matches
-        # only — for trimmed matches the same hash is what's on disk anyway.
+        # Use RAM. Touch the served entry on disk if we haven't already.
         served = self._serve_ram_match(model, tokens, ram_result)
-        if ram_quality[0] > 0:
+        if ram_quality[0] > 0 and _touched is None:
             # Determine which token sequence we actually served from
             served_tokens = None
             if ram_result.exact is not None:
@@ -1793,8 +1805,13 @@ class LRUPromptCache:
         cache_type: str = "assistant",
     ):
         # Make the cache entry
+        token_hash = None
+        if self.disk is not None and tokens:
+            from ..disk_prompt_cache import hash_tokens as _ht
+
+            token_hash = _ht(tokens)
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
+            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type, token_hash
         )
 
         # Insert into the trie and update the byte counter and lru position

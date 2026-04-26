@@ -276,17 +276,18 @@ class DiskLeaf:
 
 def reconstruct_disk_trie(
     entries_dir: Path, *, model_id: str
-) -> Tuple["PromptTrie", int, Dict[str, List[int]]]:
+) -> Tuple["PromptTrie", int, Dict[str, List[int]], Dict[str, "DiskLeaf"]]:
     """Walk entries_dir, read each entry's metadata, build a PromptTrie.
 
     Also removes any leftover ``*.tmp.safetensors`` files (crash debris from
     interrupted writes).
 
     Returns:
-        (trie, total_bytes, hash_to_tokens)
+        (trie, total_bytes, hash_to_tokens, hash_to_leaf)
         - trie: PromptTrie keyed by ``model_id`` with DiskLeaf values
         - total_bytes: sum of file sizes for valid entries
         - hash_to_tokens: token_hash -> tokens list, for fast mtime-touch lookups
+        - hash_to_leaf: token_hash -> DiskLeaf, for O(1) mtime updates
 
     Skipped (logged + ignored): files with mismatched ``format_version`` or
     unreadable metadata.
@@ -298,6 +299,7 @@ def reconstruct_disk_trie(
     trie = PromptTrie()
     total_bytes = 0
     hash_to_tokens: Dict[str, List[int]] = {}
+    hash_to_leaf: Dict[str, DiskLeaf] = {}
 
     # 1. Crash debris: ${hash}.tmp.safetensors
     for tmp in entries_dir.glob("*.tmp.safetensors"):
@@ -337,9 +339,10 @@ def reconstruct_disk_trie(
         )
         trie.add(model_id, meta["tokens"], leaf)
         hash_to_tokens[token_hash] = meta["tokens"]
+        hash_to_leaf[token_hash] = leaf
         total_bytes += st.st_size
 
-    return trie, total_bytes, hash_to_tokens
+    return trie, total_bytes, hash_to_tokens, hash_to_leaf
 
 
 class DiskPromptCache:
@@ -423,6 +426,7 @@ class DiskPromptCache:
                 self._trie,
                 self._total_bytes,
                 self._hash_to_tokens,
+                self._hash_to_leaf,
             ) = reconstruct_disk_trie(self.entries_dir, model_id=self.model_id)
             self._trie_lock = threading.RLock()
 
@@ -463,6 +467,36 @@ class DiskPromptCache:
         """
         with self._trie_lock:
             return self._trie.search(self.model_id, tokens)
+
+    def search_and_touch(self, tokens: List[int]):
+        """Search the disk trie and, if an exact match is found, update its
+        in-memory mtime in the same lock acquisition.
+
+        Returns ``(result, touched_hash)`` where ``touched_hash`` is the
+        token_hash that was mtime-refreshed (or ``None`` if no exact match).
+        The caller should still enqueue the background ``utime`` via
+        ``_touch_queue`` using ``touched_hash``.
+
+        Combining search + mtime into one lock acquisition halves the lock
+        overhead on the hot no-miss path.
+        """
+        now_ns = time.time_ns()
+        with self._trie_lock:
+            result = self._trie.search(self.model_id, tokens)
+            touched_hash = None
+            if result.exact is not None:
+                # Use O(1) _hash_to_leaf lookup; avoids a second trie.get walk.
+                _th = hash_tokens(result.exact)
+                leaf = self._hash_to_leaf.get(_th)
+                if leaf is not None:
+                    leaf.mtime_ns = now_ns
+                    touched_hash = _th
+        if touched_hash is not None and self._touch_queue is not None:
+            try:
+                self._touch_queue.put_nowait((touched_hash, now_ns / 1e9))
+            except queue.Full:
+                pass
+        return result, touched_hash
 
     def get_leaf(self, tokens: List[int]) -> "DiskLeaf":
         """Get the DiskLeaf at exactly ``tokens``. Caller must have first
@@ -532,14 +566,11 @@ class DiskPromptCache:
         """
         now_ns = time.time_ns()
         with self._trie_lock:
-            tokens = self._hash_to_tokens.get(token_hash)
-            if tokens is None:
+            # O(1) direct leaf lookup — avoids O(N-tokens) trie.get walk.
+            leaf = self._hash_to_leaf.get(token_hash)
+            if leaf is None:
                 return  # leaf not in trie (already evicted?)
-            try:
-                leaf = self._trie.get(self.model_id, tokens)
-                leaf.mtime_ns = now_ns
-            except (KeyError, TypeError):
-                return
+            leaf.mtime_ns = now_ns
         if self._touch_queue is not None:
             try:
                 self._touch_queue.put_nowait((token_hash, now_ns / 1e9))
@@ -629,6 +660,7 @@ class DiskPromptCache:
         with self._trie_lock:
             for parent_hash in job.parents_to_evict:
                 parent_tokens = self._hash_to_tokens.pop(parent_hash, None)
+                self._hash_to_leaf.pop(parent_hash, None)
                 if parent_tokens is None:
                     continue
                 try:
@@ -660,6 +692,7 @@ class DiskPromptCache:
                 self._total_bytes -= prev.nbytes
             self._total_bytes += st.st_size
             self._hash_to_tokens[job.token_hash] = list(job.tokens)
+            self._hash_to_leaf[job.token_hash] = leaf
 
         # 3. Eviction if over cap
         if self._total_bytes > self.max_bytes:
@@ -676,13 +709,12 @@ class DiskPromptCache:
         evicted = 0
         evicted_bytes = 0
         with self._trie_lock:
-            # Build list of (mtime_ns, token_hash, tokens, nbytes) by walking
-            # the in-memory disk trie via _hash_to_tokens.
+            # Build list of (mtime_ns, token_hash, tokens, nbytes) sorted
+            # oldest-first using the O(1) _hash_to_leaf map.
             leaves = []
-            for token_hash, tokens in list(self._hash_to_tokens.items()):
-                try:
-                    leaf = self._trie.get(self.model_id, tokens)
-                except (KeyError, TypeError):
+            for token_hash, leaf in list(self._hash_to_leaf.items()):
+                tokens = self._hash_to_tokens.get(token_hash)
+                if tokens is None:
                     continue
                 leaves.append((leaf.mtime_ns, token_hash, list(tokens), leaf.nbytes))
             leaves.sort()  # oldest first
@@ -694,6 +726,7 @@ class DiskPromptCache:
                 except (KeyError, TypeError):
                     continue
                 self._hash_to_tokens.pop(token_hash, None)
+                self._hash_to_leaf.pop(token_hash, None)
                 self._total_bytes -= nbytes
                 path = self.entry_path(token_hash)
                 try:
@@ -764,6 +797,7 @@ class DiskPromptCache:
                         self._total_bytes -= prev.nbytes
                     self._total_bytes += st.st_size
                     self._hash_to_tokens[job.token_hash] = list(job.tokens)
+                    self._hash_to_leaf[job.token_hash] = leaf
                 logger.info(
                     "Retry after emergency eviction succeeded for %s",
                     job.token_hash,

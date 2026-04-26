@@ -276,15 +276,20 @@ class TestReconstructDiskTrie(unittest.TestCase):
         return job.token_hash
 
     def test_reconstructs_empty(self):
-        trie, total_bytes, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        trie, total_bytes, h2t, h2l = reconstruct_disk_trie(
+            self.entries_dir, model_id="m"
+        )
         self.assertEqual(total_bytes, 0)
         self.assertEqual(h2t, {})
+        self.assertEqual(h2l, {})
         self.assertEqual(trie.search("m", []).common_prefix, 0)
 
     def test_reconstructs_single_entry(self):
         tokens = [1, 2, 3, 4]
         h = self._seed_entry(tokens)
-        trie, total_bytes, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        trie, total_bytes, h2t, h2l = reconstruct_disk_trie(
+            self.entries_dir, model_id="m"
+        )
         result = trie.search("m", tokens)
         self.assertEqual(result.exact, tokens)
         leaf = trie.get("m", tokens)
@@ -293,16 +298,18 @@ class TestReconstructDiskTrie(unittest.TestCase):
         self.assertTrue(leaf.trimmable)
         self.assertGreater(total_bytes, 0)
         self.assertEqual(h2t[h], tokens)
+        self.assertIs(h2l[h], leaf)
 
     def test_reconstructs_multiple(self):
         tokens_a = [1, 2, 3]
         tokens_b = [1, 2, 3, 4, 5]
         self._seed_entry(tokens_a)
         self._seed_entry(tokens_b)
-        trie, total, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        trie, total, h2t, h2l = reconstruct_disk_trie(self.entries_dir, model_id="m")
         self.assertEqual(trie.search("m", tokens_a).exact, tokens_a)
         self.assertEqual(trie.search("m", tokens_b).exact, tokens_b)
         self.assertEqual(len(h2t), 2)
+        self.assertEqual(len(h2l), 2)
 
     def test_cleans_tmp_files(self):
         # tmp files are named {hash}.tmp.safetensors
@@ -316,9 +323,10 @@ class TestReconstructDiskTrie(unittest.TestCase):
         tmp_path = self.entries_dir / "abadabadabadabad.tmp.safetensors"
         tmp_path.write_bytes(b"partial")  # not valid safetensors
         # Should not crash trying to load it as a real entry
-        trie, total, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        trie, total, h2t, h2l = reconstruct_disk_trie(self.entries_dir, model_id="m")
         # tmp file deleted, no entries loaded
         self.assertEqual(len(h2t), 0)
+        self.assertEqual(len(h2l), 0)
         self.assertFalse(tmp_path.exists())
 
 
@@ -657,6 +665,7 @@ class TestDiskPromptCacheTouch(unittest.TestCase):
         with self.cache._trie_lock:
             self.cache._trie.add(self.cache.model_id, self.tokens, leaf)
             self.cache._hash_to_tokens[self.token_hash] = self.tokens
+            self.cache._hash_to_leaf[self.token_hash] = leaf
         self.original_mtime = st.st_mtime_ns
         self.cache.start()  # start the writer + touch threads
 
