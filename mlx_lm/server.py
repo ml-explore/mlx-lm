@@ -1880,6 +1880,64 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--prompt-cache-disk-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a directory for disk-backed prompt cache. "
+            "Setting this enables a write-through L2 disk tier so that prompts "
+            "cached during a previous server lifetime survive restarts. "
+            "Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-bytes",
+        type=_parse_size,
+        default=100 * (10**9),
+        help=(
+            "Per-model size cap for the disk cache. Accepts human-readable "
+            "values like '100GB' or '4TB' (powers of 1000, matching "
+            "--prompt-cache-bytes). Default: 100GB. "
+            "Only used if --prompt-cache-disk-dir is set."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-fsync",
+        action="store_true",
+        help=(
+            "fsync each disk-cache entry + parent dir before atomic rename. "
+            "~5-10x slower writes; gains durability against power loss. "
+            "Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-write-queue-size",
+        type=int,
+        default=4,
+        help=(
+            "Maximum in-flight async disk writes. Higher pins more "
+            "GPU buffers in memory while writes drain. Default: 4."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-warm",
+        type=str,
+        default="lazy",
+        help=(
+            "Disk cache warm-up at boot: 'lazy' (default; load on demand) or "
+            "'eager-top-N' (preload N most-recently-touched entries into RAM)."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-eviction-headroom",
+        type=float,
+        default=0.95,
+        help=(
+            "Evict to this fraction of the disk-cache cap to avoid thrashing. "
+            "Default: 0.95."
+        ),
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
