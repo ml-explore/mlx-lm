@@ -1732,6 +1732,14 @@ def _run_http_server(
         response_generator.stop_and_join()
 
 
+def _eager_warm_disk(disk_cache, *, top_n: int) -> None:
+    """No-op for v1: lazy warm is the default. Configurable knob reserved for v2."""
+    logging.info(
+        "Eager warm-up requested for top %d entries — not yet implemented",
+        top_n,
+    )
+
+
 def run(
     host: str,
     port: int,
@@ -1740,7 +1748,36 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    cli = model_provider.cli_args
+    disk_cache = None
+    if getattr(cli, "prompt_cache_disk_dir", None):
+        from pathlib import Path as _Path
+
+        from .disk_prompt_cache import DiskPromptCache
+        from .utils import _download
+
+        # Resolve to local model path (downloads if HF id, no-op if local)
+        model_path = _download(cli.model)
+        disk_cache = DiskPromptCache(
+            root=_Path(cli.prompt_cache_disk_dir),
+            model_path=model_path,
+            max_bytes=cli.prompt_cache_disk_bytes,
+            fsync=cli.prompt_cache_disk_fsync,
+            write_queue_size=cli.prompt_cache_disk_write_queue_size,
+            eviction_headroom=cli.prompt_cache_disk_eviction_headroom,
+        )
+        disk_cache.start()
+        if cli.prompt_cache_disk_warm.startswith("eager-top-"):
+            try:
+                n = int(cli.prompt_cache_disk_warm.split("-")[-1])
+                _eager_warm_disk(disk_cache, top_n=n)
+            except ValueError:
+                logging.warning(
+                    "Invalid --prompt-cache-disk-warm value %r; using lazy",
+                    cli.prompt_cache_disk_warm,
+                )
+
+    prompt_cache = LRUPromptCache(cli.prompt_cache_size, disk=disk_cache)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
