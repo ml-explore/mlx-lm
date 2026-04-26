@@ -472,13 +472,12 @@ def generate_step(
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
-        mx.async_eval(y, logprobs)
+    mx.async_eval(y, logprobs)
     n = 0
     while True:
-        with mx.stream(generation_stream):
-            if n != max_tokens:
-                next_y, next_logprobs = _step(y)
-                mx.async_eval(next_y, next_logprobs)
+        if n != max_tokens:
+            next_y, next_logprobs = _step(y)
+            mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
