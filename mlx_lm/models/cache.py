@@ -594,13 +594,14 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    # Snapshot of (conv_state, ssm_state) saved after processing confirmed tokens
+    # in an MTP draft-verification step. Cleared after each step.
+    rollback_state: Optional[tuple] = None
+
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         self.left_padding = mx.array(left_padding) if left_padding else None
         self.lengths = None
-        # Snapshot of (conv_state, ssm_state) saved after processing confirmed tokens
-        # in an MTP draft-verification step. Cleared after each step.
-        self.rollback_state = None
 
     @property
     def batch_size(self):
