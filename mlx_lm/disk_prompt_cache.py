@@ -239,3 +239,22 @@ def read_entry_metadata(path: Path) -> Dict[str, Any]:
     # User metadata lives at prefix "1." in the flat safetensors header.
     user_meta = {k[2:]: v for k, v in raw.items() if k.startswith("1.")}
     return _deserialize_metadata(user_meta)
+
+
+def load_entry(path: Path) -> Tuple[List[Any], Dict[str, Any]]:
+    """Load full KV state + metadata from a disk cache entry.
+
+    Returns:
+        (prompt_cache, metadata_dict)
+
+    The metadata dict has the same shape as ``read_entry_metadata`` returns
+    (``tokens``, ``length``, ``cache_type_classes``, ``trimmable``,
+    ``parent_token_hash``, ``model_id``, ``format_version``, ``written_at``).
+
+    Note: ``load_prompt_cache`` with ``return_metadata=True`` calls
+    ``tree_unflatten`` on the raw header dict internally, so ``raw`` is already
+    the extracted user metadata dict (without the ``"1."`` prefix).
+    ``_deserialize_metadata`` can therefore be called on it directly.
+    """
+    cache, raw = load_prompt_cache(str(path), return_metadata=True)
+    return cache, _deserialize_metadata(raw)

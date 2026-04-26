@@ -209,5 +209,38 @@ class TestWriteEntryAtomic(unittest.TestCase):
             self.assertTrue(mx.allclose(orig_k, loaded_k).item())
 
 
+from mlx_lm.disk_prompt_cache import load_entry
+
+
+class TestLoadEntry(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.entries_dir = Path(self.tmpdir.name) / "entries"
+        self.entries_dir.mkdir()
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_load_returns_cache_and_metadata(self):
+        cache = _make_dummy_kvcache(num_layers=2, ntokens=4, dim=8)
+        tokens = [1, 2, 3, 4]
+        job = WriteJob(
+            token_hash="0123456789abcdef",
+            tokens=tokens,
+            prompt_cache=cache,
+            cache_type_classes=["KVCache", "KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id="m",
+        )
+        write_entry_atomic(self.entries_dir, job, fsync=False)
+        final = self.entries_dir / f"{job.token_hash}.safetensors"
+        loaded_cache, meta = load_entry(final)
+        self.assertEqual(len(loaded_cache), 2)
+        self.assertEqual(meta["length"], 4)
+        self.assertEqual(meta["tokens"], tokens)
+
+
 if __name__ == "__main__":
     unittest.main()
