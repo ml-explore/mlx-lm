@@ -718,10 +718,36 @@ class DiskPromptCache:
         logger.error("Write failed for %s: %r", job.token_hash, e)
 
     def shutdown(self, timeout: float = 30.0) -> None:
-        """Stub — full implementation in Task 14. Just releases the lock."""
-        if self._shutdown_called:
+        """Drain writer queue, stop background threads, release the lock.
+
+        Idempotent — safe to call twice. After this returns, no more writes
+        are accepted and the disk dir's flock is released so a fresh
+        DiskPromptCache instance can use the same dir.
+        """
+        if getattr(self, "_shutdown_called", False):
             return
         self._shutdown_called = True
+
+        self._accepting_writes = False
+
+        # Drain writer thread
+        if self._queue is not None and self._writer_thread is not None:
+            self._queue.put(_SHUTDOWN_SENTINEL)
+            self._writer_thread.join(timeout=timeout)
+            if self._writer_thread.is_alive():
+                remaining = self._queue.qsize()
+                logger.warning(
+                    "Writer thread did not drain in %.1fs; %d entries lost",
+                    timeout,
+                    remaining,
+                )
+
+        # Stop touch thread (no drain timeout — it just does utimes)
+        if self._touch_queue is not None and self._touch_thread is not None:
+            self._touch_queue.put(_SHUTDOWN_SENTINEL)
+            self._touch_thread.join(timeout=2.0)
+
+        # Release the flock
         try:
             self._lock_cm.__exit__(None, None, None)
         except Exception:

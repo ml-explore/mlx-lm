@@ -902,5 +902,73 @@ class TestEviction(unittest.TestCase):
             cache.shutdown(timeout=5.0)
 
 
+class TestShutdown(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_shutdown_drains_queue(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        cache.start()
+        token_hashes = []
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        for i in range(5):
+            tokens = list(range(i * 10, i * 10 + 8))
+            kv = _make_dummy_kvcache(num_layers=1, ntokens=8, dim=8)
+            job = WriteJob(
+                token_hash=hash_tokens(tokens),
+                tokens=tokens,
+                prompt_cache=kv,
+                cache_type_classes=["KVCache"],
+                trimmable=True,
+                parents_to_evict=[],
+                model_id=cache.model_id,
+            )
+            token_hashes.append(job.token_hash)
+            cache.enqueue_write(job)
+        cache.shutdown(timeout=10.0)
+        # All 5 entries on disk
+        for h in token_hashes:
+            self.assertTrue(cache.entry_path(h).exists(), f"missing {h}")
+
+    def test_shutdown_releases_lock(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        cache.start()
+        cache.shutdown(timeout=2.0)
+        # Should be able to re-create
+        cache2 = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        cache2.shutdown(timeout=2.0)
+
+    def test_shutdown_idempotent(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        cache.start()
+        cache.shutdown(timeout=2.0)
+        cache.shutdown(timeout=2.0)  # second call is a no-op
+
+
 if __name__ == "__main__":
     unittest.main()
