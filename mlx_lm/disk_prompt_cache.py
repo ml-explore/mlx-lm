@@ -11,8 +11,10 @@ behaves identically to the pre-PR baseline.
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -91,3 +93,39 @@ def compute_model_id(model_path: Path) -> str:
         mlx_lm_version.split(".")[0].encode(),
     ]
     return hashlib.sha256(b"".join(parts)).hexdigest()[:16]
+
+
+class DiskCacheLockError(RuntimeError):
+    """Raised when the disk cache directory is already locked by another process."""
+
+
+@contextlib.contextmanager
+def acquire_disk_dir_lock(disk_dir: Path):
+    """Exclusive non-blocking flock on `${disk_dir}/.lock`.
+
+    Creates the directory if missing. Raises DiskCacheLockError if another
+    process holds the lock. Lock is released when the context exits.
+    """
+    disk_dir = Path(disk_dir)
+    disk_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = disk_dir / ".lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fd_closed = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            os.close(fd)
+            fd_closed = True
+            raise DiskCacheLockError(
+                f"Disk cache directory {disk_dir} is locked by another mlx_lm process. "
+                f"Stop the other process or choose a different --prompt-cache-disk-dir."
+            ) from e
+        yield fd
+    finally:
+        if not fd_closed:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)

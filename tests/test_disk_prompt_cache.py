@@ -75,5 +75,42 @@ class TestComputeModelId(unittest.TestCase):
         self.assertEqual(len(h), 16)
 
 
+from mlx_lm.disk_prompt_cache import (
+    DiskCacheLockError,
+    acquire_disk_dir_lock,
+)
+
+
+class TestDiskDirLock(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_lock_acquires(self):
+        with acquire_disk_dir_lock(self.dir) as fd:
+            self.assertIsNotNone(fd)
+            # Lock file exists
+            self.assertTrue((self.dir / ".lock").exists())
+        # After release we can re-acquire
+        with acquire_disk_dir_lock(self.dir):
+            pass
+
+    def test_double_lock_raises(self):
+        with acquire_disk_dir_lock(self.dir):
+            with self.assertRaises(DiskCacheLockError) as cm:
+                with acquire_disk_dir_lock(self.dir):
+                    pass
+            self.assertIn("another", str(cm.exception).lower())
+
+    def test_creates_dir_if_missing(self):
+        nested = self.dir / "deeply" / "nested"
+        with acquire_disk_dir_lock(nested):
+            self.assertTrue(nested.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
