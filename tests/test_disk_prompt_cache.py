@@ -112,5 +112,102 @@ class TestDiskDirLock(unittest.TestCase):
             self.assertTrue(nested.exists())
 
 
+import mlx.core as mx
+
+from mlx_lm.disk_prompt_cache import (
+    WriteJob,
+    read_entry_metadata,
+    write_entry_atomic,
+)
+from mlx_lm.models.cache import KVCache, load_prompt_cache
+
+
+def _make_dummy_kvcache(num_layers=2, ntokens=4, dim=8):
+    """Build a tiny KVCache list for tests — no model needed."""
+    cache = [KVCache() for _ in range(num_layers)]
+    for c in cache:
+        k = mx.random.normal((1, 1, ntokens, dim))
+        v = mx.random.normal((1, 1, ntokens, dim))
+        c.update_and_fetch(k, v)
+    mx.eval([(c.state[0], c.state[1]) for c in cache])
+    return cache
+
+
+class TestWriteEntryAtomic(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.entries_dir = Path(self.tmpdir.name) / "entries"
+        self.entries_dir.mkdir()
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_writes_file_atomically(self):
+        cache = _make_dummy_kvcache()
+        tokens = [10, 20, 30, 40]
+        job = WriteJob(
+            token_hash="abc123def4567890",
+            tokens=tokens,
+            prompt_cache=cache,
+            cache_type_classes=["KVCache", "KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id="modelid0123456",
+        )
+        write_entry_atomic(self.entries_dir, job, fsync=False)
+        final = self.entries_dir / f"{job.token_hash}.safetensors"
+        self.assertTrue(final.exists())
+        # No tmp file leftover
+        self.assertFalse(
+            (self.entries_dir / f"{job.token_hash}.safetensors.tmp").exists()
+        )
+
+    def test_metadata_round_trip(self):
+        cache = _make_dummy_kvcache()
+        tokens = list(range(64))
+        job = WriteJob(
+            token_hash="ffffffffffffffff",
+            tokens=tokens,
+            prompt_cache=cache,
+            cache_type_classes=["KVCache", "KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id="m0001",
+        )
+        write_entry_atomic(self.entries_dir, job, fsync=False)
+        final = self.entries_dir / f"{job.token_hash}.safetensors"
+        meta = read_entry_metadata(final)
+        self.assertEqual(meta["length"], 64)
+        self.assertEqual(meta["trimmable"], True)
+        self.assertEqual(meta["model_id"], "m0001")
+        self.assertEqual(meta["format_version"], 1)
+        self.assertEqual(meta["tokens"], tokens)
+        self.assertEqual(meta["cache_type_classes"], ["KVCache", "KVCache"])
+
+    def test_tensor_round_trip(self):
+        original = _make_dummy_kvcache(num_layers=2, ntokens=8, dim=16)
+        original_keys = [c.state[0] for c in original]
+        mx.eval(original_keys)
+        tokens = list(range(8))
+        job = WriteJob(
+            token_hash="aaaaaaaaaaaaaaaa",
+            tokens=tokens,
+            prompt_cache=original,
+            cache_type_classes=["KVCache", "KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id="m",
+        )
+        write_entry_atomic(self.entries_dir, job, fsync=False)
+        final = self.entries_dir / f"{job.token_hash}.safetensors"
+        loaded = load_prompt_cache(str(final))
+        self.assertEqual(len(loaded), 2)
+        loaded_keys = [c.state[0] for c in loaded]
+        mx.eval(loaded_keys)
+        for orig_k, loaded_k in zip(original_keys, loaded_keys):
+            self.assertTrue(mx.allclose(orig_k, loaded_k).item())
+
+
 if __name__ == "__main__":
     unittest.main()

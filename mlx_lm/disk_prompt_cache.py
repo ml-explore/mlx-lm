@@ -129,3 +129,113 @@ def acquire_disk_dir_lock(disk_dir: Path):
             except OSError:
                 pass
             os.close(fd)
+
+
+@dataclasses.dataclass
+class WriteJob:
+    """A pending disk-cache write enqueued from `LRUPromptCache.insert_cache`.
+
+    Holds the prompt_cache reference (and therefore the underlying mx.array
+    GPU buffers) until the write completes — pinning that memory. The bounded
+    queue size in DiskPromptCache limits how much can be pinned at once.
+    """
+
+    token_hash: str  # 16 hex chars; used as filename
+    tokens: List[int]  # the token sequence (stored in metadata)
+    prompt_cache: List[Any]  # KV state to serialize
+    cache_type_classes: List[str]  # one per layer
+    trimmable: bool  # can_trim_prompt_cache result
+    parents_to_evict: List[str]  # token_hashes whose disk files this dominates
+    model_id: str  # for metadata
+
+
+def _serialize_metadata(job: "WriteJob") -> Dict[str, str]:
+    """Pack a WriteJob's metadata into the Dict[str, str] safetensors header.
+
+    Complex values (lists, ints, bools) are JSON-encoded.
+    """
+    return {
+        "tokens_b64": base64.b64encode(
+            b"".join(t.to_bytes(4, "little", signed=True) for t in job.tokens)
+        ).decode(),
+        "length": str(len(job.tokens)),
+        "cache_type_classes": json.dumps(job.cache_type_classes),
+        "trimmable": "true" if job.trimmable else "false",
+        "parent_token_hash": "",  # reserved; unused in v1
+        "model_id": job.model_id,
+        "format_version": str(FORMAT_VERSION),
+        "written_at": str(int(time.time())),
+    }
+
+
+def _deserialize_metadata(raw: Dict[str, str]) -> Dict[str, Any]:
+    """Inverse of _serialize_metadata. Raises KeyError if a required key is missing."""
+    tokens_bytes = base64.b64decode(raw["tokens_b64"])
+    tokens = [
+        int.from_bytes(tokens_bytes[i : i + 4], "little", signed=True)
+        for i in range(0, len(tokens_bytes), 4)
+    ]
+    return {
+        "tokens": tokens,
+        "length": int(raw["length"]),
+        "cache_type_classes": json.loads(raw["cache_type_classes"]),
+        "trimmable": raw["trimmable"] == "true",
+        "parent_token_hash": raw.get("parent_token_hash") or None,
+        "model_id": raw["model_id"],
+        "format_version": int(raw["format_version"]),
+        "written_at": int(raw["written_at"]),
+    }
+
+
+def write_entry_atomic(
+    entries_dir: Path, job: "WriteJob", *, fsync: bool = False
+) -> None:
+    """Write one disk-cache entry atomically.
+
+    Sequence:
+      1. write to ${entries_dir}/${token_hash}.safetensors.tmp
+      2. (optional) fsync tmp + parent dir
+      3. os.rename tmp -> .safetensors  (atomic on POSIX)
+
+    ``save_prompt_cache`` always appends ``.safetensors`` to whatever stem is
+    passed, so we pass ``${token_hash}.tmp`` and it creates
+    ``${token_hash}.tmp.safetensors`` — that is the file we fsync and rename.
+
+    If any step before rename raises, the .tmp file is left behind for the next
+    startup's debris cleanup to remove.
+    """
+    final = entries_dir / f"{job.token_hash}.safetensors"
+    tmp_stem = entries_dir / f"{job.token_hash}.tmp"
+    tmp = entries_dir / f"{job.token_hash}.tmp.safetensors"
+    metadata = _serialize_metadata(job)
+    save_prompt_cache(str(tmp_stem), job.prompt_cache, metadata=metadata)
+    if fsync:
+        fd = os.open(str(tmp), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        # parent dir fsync to commit the rename
+        fd = os.open(str(entries_dir), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    os.rename(str(tmp), str(final))
+
+
+def read_entry_metadata(path: Path) -> Dict[str, Any]:
+    """Load metadata from a disk cache entry without materializing tensors.
+
+    Uses ``mx.load(..., return_metadata=True)`` which is the only metadata-read
+    path supported by the mlx Python API today. (mx.load does read tensor
+    headers but does not materialize tensor data into Python until accessed.)
+
+    ``save_prompt_cache`` stores the user metadata dict as index-1 in a
+    tree-flattened list, so every key is prefixed ``"1."`` in the raw header.
+    We strip that prefix before handing off to ``_deserialize_metadata``.
+    """
+    _arrays, raw = mx.load(str(path), return_metadata=True)
+    # User metadata lives at prefix "1." in the flat safetensors header.
+    user_meta = {k[2:]: v for k, v in raw.items() if k.startswith("1.")}
+    return _deserialize_metadata(user_meta)
