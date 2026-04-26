@@ -826,5 +826,81 @@ class TestWriterLoop(unittest.TestCase):
         self.assertGreater(after, before)
 
 
+class TestEviction(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _job(self, cache, tokens):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        kv = _make_dummy_kvcache(num_layers=1, ntokens=len(tokens), dim=64)
+        return WriteJob(
+            token_hash=hash_tokens(tokens),
+            tokens=tokens,
+            prompt_cache=kv,
+            cache_type_classes=["KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id=cache.model_id,
+        )
+
+    def test_evicts_oldest_first(self):
+        # Tight cap: ~3 entries fit
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=200_000,
+            eviction_headroom=0.95,
+        )
+        cache.start()
+        try:
+            entries = []
+            for i in range(8):
+                tokens = [i * 10 + j for j in range(50)]
+                job = self._job(cache, tokens)
+                entries.append(job.token_hash)
+                cache.enqueue_write(job)
+                cache._queue.join()
+                # Brief sleep so mtime ordering is unambiguous
+                time.sleep(0.01)
+            # Some early entries should have been evicted
+            remaining = [h for h in entries if cache.entry_path(h).exists()]
+            self.assertLess(len(remaining), len(entries))
+            # First entries (oldest mtime) should be the ones evicted
+            self.assertNotIn(entries[0], remaining)
+            # Cap respected
+            self.assertLessEqual(cache._total_bytes, cache.max_bytes)
+        finally:
+            cache.shutdown(timeout=5.0)
+
+    def test_eviction_headroom(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=200_000,
+            eviction_headroom=0.80,
+        )
+        cache.start()
+        try:
+            for i in range(10):
+                tokens = [i * 100 + j for j in range(50)]
+                job = self._job(cache, tokens)
+                cache.enqueue_write(job)
+                cache._queue.join()
+                time.sleep(0.01)
+            # After eviction, must be ≤ headroom * cap
+            self.assertLessEqual(cache._total_bytes, int(cache.max_bytes * 0.80) + 1)
+        finally:
+            cache.shutdown(timeout=5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

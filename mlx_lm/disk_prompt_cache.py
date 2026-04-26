@@ -666,8 +666,52 @@ class DiskPromptCache:
             self._run_eviction_pass()
 
     def _run_eviction_pass(self) -> None:
-        """Stub — full implementation in Task 13."""
-        pass
+        """Evict oldest-by-mtime entries until total_bytes ≤ headroom × cap.
+
+        All disk-trie metadata is in memory, so we don't ``stat()`` files.
+        Called from the writer thread under no extra lock; we acquire
+        ``_trie_lock`` for the trie mutation.
+        """
+        target = int(self.max_bytes * self.eviction_headroom)
+        evicted = 0
+        evicted_bytes = 0
+        with self._trie_lock:
+            # Build list of (mtime_ns, token_hash, tokens, nbytes) by walking
+            # the in-memory disk trie via _hash_to_tokens.
+            leaves = []
+            for token_hash, tokens in list(self._hash_to_tokens.items()):
+                try:
+                    leaf = self._trie.get(self.model_id, tokens)
+                except (KeyError, TypeError):
+                    continue
+                leaves.append((leaf.mtime_ns, token_hash, list(tokens), leaf.nbytes))
+            leaves.sort()  # oldest first
+            for mtime_ns, token_hash, tokens, nbytes in leaves:
+                if self._total_bytes <= target:
+                    break
+                try:
+                    self._trie.pop(self.model_id, tokens)
+                except (KeyError, TypeError):
+                    continue
+                self._hash_to_tokens.pop(token_hash, None)
+                self._total_bytes -= nbytes
+                path = self.entry_path(token_hash)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning("Could not unlink during eviction: %s", e)
+                evicted += 1
+                evicted_bytes += nbytes
+        if evicted > 0:
+            logger.info(
+                "Evicted %d entries reclaiming %.2f GB (cap=%d, now=%d)",
+                evicted,
+                evicted_bytes / (1 << 30),
+                self.max_bytes,
+                self._total_bytes,
+            )
 
     def _handle_write_error(self, e: Exception, job: WriteJob) -> None:
         """Stub — full implementation in Task 15."""
