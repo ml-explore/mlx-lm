@@ -5,7 +5,7 @@ from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoTokenizer, PreTrainedConfig, PreTrainedTokenizerFast
 
 
 class StreamingDetokenizer:
@@ -611,9 +611,30 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    tokenizer_config_extra = tokenizer_config_extra or {}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra)
+    except (AttributeError, ValueError) as e:
+        message = str(e)
+        if (
+            "config" in tokenizer_config_extra
+            or (
+                "deepseek_v4" not in message
+                and "max_position_embeddings" not in message
+            )
+        ):
+            raise
+        warnings.warn(
+            "Falling back to generic tokenizer config because Transformers does "
+            f"not recognize this model config: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            config=PreTrainedConfig(),
+            **tokenizer_config_extra,
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 
