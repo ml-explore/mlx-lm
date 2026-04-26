@@ -1604,9 +1604,10 @@ class V4Attention(nn.Module):
                 self.indexer = Indexer(config, self.compress_ratio)
 
     def _ensure_cached(self, dtype):
-        if self._cached_dtype is not None and self._cached_dtype == dtype:
+        dtype_key = str(dtype)
+        if self._cached_dtype is not None and self._cached_dtype == dtype_key:
             return
-        self._cached_dtype = dtype
+        self._cached_dtype = dtype_key
         self._attn_sink_cached = self.attn_sink.astype(dtype)
         self._q_norm_weight_cached = self._q_l2_norm_weight[0].astype(dtype)
         if isinstance(self.wo_a, nn.QuantizedLinear):
@@ -1705,12 +1706,22 @@ class V4Attention(nn.Module):
                 use_indexer = hasattr(self, "indexer")
                 select_all = (
                     use_indexer
-                    and lengths is None
-                    and pooled.shape[1] <= self.indexer.index_topk
+                    and (
+                        L > 1
+                        or (
+                            lengths is None
+                            and pooled.shape[1] <= self.indexer.index_topk
+                        )
+                    )
                 )
                 if select_all:
                     pooled = pooled[:, None]
                     pooled_bias = math.log(L)
+                    if lengths is not None:
+                        lengths = mx.array(lengths)
+                        pooled_mask = (
+                            mx.arange(pooled.shape[2]) < lengths[:, None]
+                        ).reshape(B, 1, 1, -1)
                 elif use_indexer:
                     topk = self.indexer(
                         x, q_residual, self.compress_rope, self.rope, v4_cache, offset

@@ -1499,6 +1499,19 @@ class TestModels(unittest.TestCase):
         # Compressed layers use the compressed RoPE base for local and pooled KV.
         main_layer = model.model.layers[0].attn
         compress_layer = model.model.layers[2].attn
+
+        class RaisingIndexer:
+            index_topk = 1
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("Indexer should not run during prefill")
+
+        compress_layer.indexer = RaisingIndexer()
+        inputs = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=mx.int32)
+        cache = model.make_cache()
+        logits = model(inputs, cache=cache)
+        mx.eval(logits, [c.state for c in cache])
+
         freq_dims = mx.arange(0, args.qk_rope_head_dim, 2, dtype=mx.float32)
         freq_dims = freq_dims / args.qk_rope_head_dim
         main_expected = 1.0 / (args.rope_theta**freq_dims)
