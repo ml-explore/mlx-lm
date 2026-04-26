@@ -242,5 +242,84 @@ class TestLoadEntry(unittest.TestCase):
         self.assertEqual(meta["tokens"], tokens)
 
 
+from mlx_lm.disk_prompt_cache import (
+    DiskLeaf,
+    reconstruct_disk_trie,
+)
+
+
+class TestReconstructDiskTrie(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.entries_dir = Path(self.tmpdir.name) / "entries"
+        self.entries_dir.mkdir()
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _seed_entry(self, tokens, *, trimmable=True):
+        cache = _make_dummy_kvcache(num_layers=2, ntokens=len(tokens), dim=8)
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        job = WriteJob(
+            token_hash=hash_tokens(tokens),
+            tokens=tokens,
+            prompt_cache=cache,
+            cache_type_classes=["KVCache", "KVCache"],
+            trimmable=trimmable,
+            parents_to_evict=[],
+            model_id="m",
+        )
+        write_entry_atomic(self.entries_dir, job, fsync=False)
+        return job.token_hash
+
+    def test_reconstructs_empty(self):
+        trie, total_bytes, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        self.assertEqual(total_bytes, 0)
+        self.assertEqual(h2t, {})
+        self.assertEqual(trie.search("m", []).common_prefix, 0)
+
+    def test_reconstructs_single_entry(self):
+        tokens = [1, 2, 3, 4]
+        h = self._seed_entry(tokens)
+        trie, total_bytes, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        result = trie.search("m", tokens)
+        self.assertEqual(result.exact, tokens)
+        leaf = trie.get("m", tokens)
+        self.assertIsInstance(leaf, DiskLeaf)
+        self.assertEqual(leaf.token_hash, h)
+        self.assertTrue(leaf.trimmable)
+        self.assertGreater(total_bytes, 0)
+        self.assertEqual(h2t[h], tokens)
+
+    def test_reconstructs_multiple(self):
+        tokens_a = [1, 2, 3]
+        tokens_b = [1, 2, 3, 4, 5]
+        self._seed_entry(tokens_a)
+        self._seed_entry(tokens_b)
+        trie, total, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        self.assertEqual(trie.search("m", tokens_a).exact, tokens_a)
+        self.assertEqual(trie.search("m", tokens_b).exact, tokens_b)
+        self.assertEqual(len(h2t), 2)
+
+    def test_cleans_tmp_files(self):
+        # tmp files are named {hash}.tmp.safetensors
+        tmp_path = self.entries_dir / "deadbeefdeadbeef.tmp.safetensors"
+        tmp_path.write_bytes(b"partial")
+        reconstruct_disk_trie(self.entries_dir, model_id="m")
+        self.assertFalse(tmp_path.exists())
+
+    def test_skips_tmp_files_in_main_glob(self):
+        # If a .tmp.safetensors exists, it should NOT be loaded as a real entry.
+        tmp_path = self.entries_dir / "abadabadabadabad.tmp.safetensors"
+        tmp_path.write_bytes(b"partial")  # not valid safetensors
+        # Should not crash trying to load it as a real entry
+        trie, total, h2t = reconstruct_disk_trie(self.entries_dir, model_id="m")
+        # tmp file deleted, no entries loaded
+        self.assertEqual(len(h2t), 0)
+        self.assertFalse(tmp_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

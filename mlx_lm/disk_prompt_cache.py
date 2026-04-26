@@ -258,3 +258,85 @@ def load_entry(path: Path) -> Tuple[List[Any], Dict[str, Any]]:
     """
     cache, raw = load_prompt_cache(str(path), return_metadata=True)
     return cache, _deserialize_metadata(raw)
+
+
+@dataclasses.dataclass
+class DiskLeaf:
+    """In-memory record for one on-disk cache entry.
+
+    Stored as the value at trie leaves on the disk-side trie.
+    """
+
+    token_hash: str
+    length: int
+    nbytes: int
+    mtime_ns: int
+    trimmable: bool
+
+
+def reconstruct_disk_trie(
+    entries_dir: Path, *, model_id: str
+) -> Tuple["PromptTrie", int, Dict[str, List[int]]]:
+    """Walk entries_dir, read each entry's metadata, build a PromptTrie.
+
+    Also removes any leftover ``*.tmp.safetensors`` files (crash debris from
+    interrupted writes).
+
+    Returns:
+        (trie, total_bytes, hash_to_tokens)
+        - trie: PromptTrie keyed by ``model_id`` with DiskLeaf values
+        - total_bytes: sum of file sizes for valid entries
+        - hash_to_tokens: token_hash -> tokens list, for fast mtime-touch lookups
+
+    Skipped (logged + ignored): files with mismatched ``format_version`` or
+    unreadable metadata.
+    """
+    from .models.cache import PromptTrie
+
+    entries_dir = Path(entries_dir)
+    entries_dir.mkdir(parents=True, exist_ok=True)
+    trie = PromptTrie()
+    total_bytes = 0
+    hash_to_tokens: Dict[str, List[int]] = {}
+
+    # 1. Crash debris: ${hash}.tmp.safetensors
+    for tmp in entries_dir.glob("*.tmp.safetensors"):
+        try:
+            tmp.unlink()
+            logger.info("Removed crash-debris %s", tmp.name)
+        except OSError as e:
+            logger.warning("Could not remove %s: %s", tmp, e)
+
+    # 2. Real entries — no .tmp.safetensors files remain at this point
+    for path in sorted(entries_dir.glob("*.safetensors")):
+        # Race-safety: skip any tmp that snuck through
+        if ".tmp." in path.name:
+            continue
+        try:
+            meta = read_entry_metadata(path)
+        except Exception as e:
+            logger.warning("Could not read metadata from %s: %s; skipping", path, e)
+            continue
+        if meta["format_version"] != FORMAT_VERSION:
+            logger.warning(
+                "Skipping %s: format_version=%s, expected %s",
+                path.name,
+                meta["format_version"],
+                FORMAT_VERSION,
+            )
+            continue
+        # token_hash is the filename stem
+        token_hash = path.stem
+        st = path.stat()
+        leaf = DiskLeaf(
+            token_hash=token_hash,
+            length=meta["length"],
+            nbytes=st.st_size,
+            mtime_ns=st.st_mtime_ns,
+            trimmable=meta["trimmable"],
+        )
+        trie.add(model_id, meta["tokens"], leaf)
+        hash_to_tokens[token_hash] = meta["tokens"]
+        total_bytes += st.st_size
+
+    return trie, total_bytes, hash_to_tokens
