@@ -475,6 +475,34 @@ class DiskPromptCache:
         """Path to the .safetensors file for a given token_hash."""
         return self.entries_dir / f"{token_hash}.safetensors"
 
+    def load(self, token_hash: str) -> Tuple[List[Any], Dict[str, Any]]:
+        """Load full KV state for an entry, deduplicating concurrent loads.
+
+        Two threads asking for the same ``token_hash`` share one disk read via
+        an in-flight ``Future`` keyed by hash.
+        """
+        with self._inflight_lock:
+            fut = self._inflight.get(token_hash)
+            if fut is None:
+                fut = Future()
+                self._inflight[token_hash] = fut
+                we_load = True
+            else:
+                we_load = False
+
+        if we_load:
+            try:
+                result = load_entry(self.entry_path(token_hash))
+                fut.set_result(result)
+            except Exception as e:
+                fut.set_exception(e)
+                raise
+            finally:
+                with self._inflight_lock:
+                    self._inflight.pop(token_hash, None)
+
+        return fut.result()
+
     def shutdown(self, timeout: float = 30.0) -> None:
         """Stub — full implementation in Task 14. Just releases the lock."""
         if self._shutdown_called:

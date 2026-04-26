@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -520,6 +521,98 @@ class TestDiskPromptCacheSearch(unittest.TestCase):
             self.assertEqual(p.parent, cache.entries_dir)
         finally:
             cache.shutdown(timeout=2.0)
+
+
+class TestDiskPromptCacheLoad(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+        self.cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        # Seed an entry on disk + add to trie
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        kv = _make_dummy_kvcache(num_layers=2, ntokens=4, dim=8)
+        self.tokens = [1, 2, 3, 4]
+        self.token_hash = hash_tokens(self.tokens)
+        job = WriteJob(
+            token_hash=self.token_hash,
+            tokens=self.tokens,
+            prompt_cache=kv,
+            cache_type_classes=["KVCache", "KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id=self.cache.model_id,
+        )
+        write_entry_atomic(self.cache.entries_dir, job, fsync=False)
+        st = (self.cache.entries_dir / f"{job.token_hash}.safetensors").stat()
+        leaf = DiskLeaf(
+            token_hash=job.token_hash,
+            length=len(self.tokens),
+            nbytes=st.st_size,
+            mtime_ns=st.st_mtime_ns,
+            trimmable=True,
+        )
+        with self.cache._trie_lock:
+            self.cache._trie.add(self.cache.model_id, self.tokens, leaf)
+            self.cache._hash_to_tokens[job.token_hash] = self.tokens
+
+    def tearDown(self):
+        self.cache.shutdown(timeout=2.0)
+        self.tmpdir.cleanup()
+
+    def test_load_returns_cache(self):
+        prompt_cache, meta = self.cache.load(self.token_hash)
+        self.assertEqual(len(prompt_cache), 2)
+        self.assertEqual(meta["length"], 4)
+
+    def test_concurrent_load_dedup(self):
+        # Patch load_entry to count calls
+        from mlx_lm import disk_prompt_cache as mod
+
+        original = mod.load_entry
+        call_count = [0]
+        import threading as _t
+
+        gate = _t.Event()
+
+        def slow_load(path):
+            call_count[0] += 1
+            gate.wait(timeout=2.0)
+            return original(path)
+
+        mod.load_entry = slow_load
+        try:
+            results = []
+            errors = []
+
+            def worker():
+                try:
+                    results.append(self.cache.load(self.token_hash))
+                except Exception as e:
+                    errors.append(e)
+
+            threads = [_t.Thread(target=worker) for _ in range(5)]
+            for t in threads:
+                t.start()
+            time.sleep(0.05)  # let all threads enter load()
+            gate.set()
+            for t in threads:
+                t.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 5)
+            self.assertEqual(
+                call_count[0], 1, "only one disk read should have happened"
+            )
+        finally:
+            mod.load_entry = original
 
 
 if __name__ == "__main__":
