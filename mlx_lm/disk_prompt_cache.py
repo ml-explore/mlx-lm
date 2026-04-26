@@ -454,6 +454,27 @@ class DiskPromptCache:
                 pass
             raise
 
+    def search(self, tokens: List[int]):
+        """Look up `tokens` in the disk-side in-memory trie.
+
+        Returns a ``PromptTrieResult`` matching the API of
+        ``mlx_lm.models.cache.PromptTrie.search``. No disk I/O — the index is
+        already in memory after startup reconstruction.
+        """
+        with self._trie_lock:
+            return self._trie.search(self.model_id, tokens)
+
+    def get_leaf(self, tokens: List[int]) -> "DiskLeaf":
+        """Get the DiskLeaf at exactly ``tokens``. Caller must have first
+        verified via ``search()`` that ``result.exact`` matches.
+        """
+        with self._trie_lock:
+            return self._trie.get(self.model_id, tokens)
+
+    def entry_path(self, token_hash: str) -> Path:
+        """Path to the .safetensors file for a given token_hash."""
+        return self.entries_dir / f"{token_hash}.safetensors"
+
     def shutdown(self, timeout: float = 30.0) -> None:
         """Stub — full implementation in Task 14. Just releases the lock."""
         if self._shutdown_called:

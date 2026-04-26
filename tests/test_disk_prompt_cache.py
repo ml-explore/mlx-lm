@@ -408,5 +408,119 @@ class TestDiskPromptCacheInit(unittest.TestCase):
             cache_b.shutdown(timeout=2.0)
 
 
+class TestDiskPromptCacheSearch(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _seed(self, dpc, tokens):
+        cache = _make_dummy_kvcache(num_layers=2, ntokens=len(tokens), dim=8)
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        job = WriteJob(
+            token_hash=hash_tokens(tokens),
+            tokens=tokens,
+            prompt_cache=cache,
+            cache_type_classes=["KVCache", "KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id=dpc.model_id,
+        )
+        write_entry_atomic(dpc.entries_dir, job, fsync=False)
+        # Manually update trie for tests (writer thread isn't running yet)
+        st = (dpc.entries_dir / f"{job.token_hash}.safetensors").stat()
+        leaf = DiskLeaf(
+            token_hash=job.token_hash,
+            length=len(tokens),
+            nbytes=st.st_size,
+            mtime_ns=st.st_mtime_ns,
+            trimmable=True,
+        )
+        with dpc._trie_lock:
+            dpc._trie.add(dpc.model_id, tokens, leaf)
+            dpc._hash_to_tokens[job.token_hash] = tokens
+            dpc._total_bytes += st.st_size
+        return leaf
+
+    def test_search_empty(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            result = cache.search([1, 2, 3])
+            self.assertIsNone(result.exact)
+            self.assertIsNone(result.shorter)
+            self.assertIsNone(result.longer)
+            self.assertEqual(result.common_prefix, 0)
+        finally:
+            cache.shutdown(timeout=2.0)
+
+    def test_search_exact(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            self._seed(cache, [1, 2, 3, 4])
+            result = cache.search([1, 2, 3, 4])
+            self.assertEqual(result.exact, [1, 2, 3, 4])
+        finally:
+            cache.shutdown(timeout=2.0)
+
+    def test_search_longer(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            self._seed(cache, [1, 2, 3, 4, 5, 6])
+            result = cache.search([1, 2, 3])
+            # Some kind of match info should be present
+            self.assertTrue(
+                result.longer is not None
+                or result.exact is not None
+                or result.common_prefix > 0
+            )
+        finally:
+            cache.shutdown(timeout=2.0)
+
+    def test_get_leaf(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            seeded = self._seed(cache, [10, 20, 30])
+            leaf = cache.get_leaf([10, 20, 30])
+            self.assertEqual(leaf.token_hash, seeded.token_hash)
+        finally:
+            cache.shutdown(timeout=2.0)
+
+    def test_entry_path(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            p = cache.entry_path("deadbeefcafef00d")
+            self.assertEqual(p.name, "deadbeefcafef00d.safetensors")
+            self.assertEqual(p.parent, cache.entries_dir)
+        finally:
+            cache.shutdown(timeout=2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
