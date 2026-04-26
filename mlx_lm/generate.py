@@ -889,7 +889,7 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    elif mtp and hasattr(model, "mtp_forward"):
+    elif mtp and hasattr(model, "mtp"):
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         kwargs.pop("num_draft_tokens", None)

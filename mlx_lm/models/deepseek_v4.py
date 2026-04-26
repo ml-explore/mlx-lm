@@ -1280,6 +1280,11 @@ class Model(nn.Module):
 
         # 1) Keep MTP weights only when self.mtp exists; drop layers beyond n_layers
         has_mtp = hasattr(self, "mtp")
+        has_mtp_weights = any(k.startswith("mtp.") for k in weights)
+        # Disable MTP module if weights are absent (e.g. quantized checkpoints)
+        if has_mtp and not has_mtp_weights:
+            del self.mtp
+            has_mtp = False
         new_weights = {}
         for k, v in weights.items():
             if k.startswith("mtp."):
