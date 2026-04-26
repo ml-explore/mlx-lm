@@ -102,6 +102,78 @@ class ModelArgs(BaseModelArgs):
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
 
 
+# --------------------------------------------------------------------------- #
+# Fused partial-RoPE Metal kernel                                             #
+# --------------------------------------------------------------------------- #
+#
+# Decode dispatch reduction: the scalar-Python rotation (slice -> reshape ->
+# index x0/x1 -> 4 muls + add/sub -> stack -> reshape) issues ~5 graph ops per
+# rope call, and DeepseekV4 invokes rope ~3x per attention layer (q_pe, k_pe,
+# inverse on attention output) -> 129 calls/token at L=1. Collapsing the chain
+# into a single Metal kernel removes ~600 dispatches/token on the decode path.
+#
+# Adapted from @0xClandestine's optimization PR
+# (https://github.com/Blaizzy/mlx-lm/pull/13) targeting Blaizzy's V4 branch.
+# We use the rope-only signature (V4Attention splits nope/rope outside the
+# rope call), so the nope passthrough loop is dropped from the source.
+#
+# One SIMD-group per (b, h, l) work item; lane t handles the interleaved
+# pair (x[2t], x[2t+1]).
+
+def _make_partial_rope_kernel():
+    # Env-var escape hatch so benchmarks can A/B kernel ON vs OFF without
+    # monkey-patching: MLX_LM_DISABLE_PARTIAL_ROPE_KERNEL=1 -> falls back
+    # to the pure-MLX path used pre-2026-04-25.
+    import os
+    if os.environ.get("MLX_LM_DISABLE_PARTIAL_ROPE_KERNEL", "0") == "1":
+        return None
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint tid = thread_position_in_threadgroup.x;
+        uint gid = threadgroup_position_in_grid.x;
+
+        constexpr int DRH = D_ROPE / 2;
+        int L_v = dims[0];
+        int H_v = dims[1];
+        uint l   = gid % (uint)L_v;
+        uint tmp = gid / (uint)L_v;
+        uint h   = tmp % (uint)H_v;
+        uint b   = tmp / (uint)H_v;
+
+        const auto xp = x  + ((uint64_t)b * H_v * L_v + h * L_v + l) * D_ROPE;
+        auto       yp = y  + ((uint64_t)b * H_v * L_v + h * L_v + l) * D_ROPE;
+        const auto cp = cos_s + l * DRH;
+        const auto sp = sin_s + l * DRH;
+
+        // Lane t handles one interleaved pair (x[2t], x[2t+1]).
+        if ((int)tid < DRH) {
+            float x0 = float(xp[2 * tid]);
+            float x1 = float(xp[2 * tid + 1]);
+            float c  = float(cp[tid]);
+            float s  = float(sp[tid]);
+            if (INVERSE) {
+                store_elem(yp[2 * tid],     fma( x1, s, x0 * c));   //  x0*c + x1*s
+                store_elem(yp[2 * tid + 1], fma(-x0, s, x1 * c));   // -x0*s + x1*c
+            } else {
+                store_elem(yp[2 * tid],     fma(-x1, s, x0 * c));   //  x0*c - x1*s
+                store_elem(yp[2 * tid + 1], fma( x0, s, x1 * c));   //  x0*s + x1*c
+            }
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="ds4_partial_rope",
+        input_names=["x", "cos_s", "sin_s", "dims"],
+        output_names=["y"],
+        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
+        source=source,
+    )
+
+
+_partial_rope_kernel = _make_partial_rope_kernel()
+
+
 class DeepseekV4RoPE(nn.Module):
     """DeepSeek-V4 rotary embedding.
 
@@ -188,6 +260,31 @@ class DeepseekV4RoPE(nn.Module):
                 if self.dims < x.shape[-1]:
                     return mx.concatenate([rotated, x[..., self.dims:]], axis=-1)
                 return rotated
+        # Fast path: fused Metal kernel for the rope-only 4D case used by
+        # V4Attention. Falls through to the pure-MLX path on CPU, on Mode-B
+        # (x has a nope tail), or on non-4D inputs (e.g. Indexer rope).
+        # The kernel itself handles inverse via formula sign-flip; theta is
+        # always forward-direction (do NOT negate it here).
+        if (
+            _partial_rope_kernel is not None
+            and x.shape[-1] == self.dims
+            and x.ndim == 4
+        ):
+            B, H, L, _ = x.shape
+            pos = mx.arange(offset, offset + T, dtype=mx.float32)
+            theta = pos[:, None] * self.inv_freq[None, :]
+            cos = mx.cos(theta).astype(mx.float32)
+            sin = mx.sin(theta).astype(mx.float32)
+            dims_arr = mx.array([L, H], dtype=mx.int32)
+            return _partial_rope_kernel(
+                inputs=[x, cos, sin, dims_arr],
+                template=[("D_ROPE", self.dims), ("INVERSE", 1 if inverse else 0)],
+                grid=(B * H * L * 32, 1, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[x.shape],
+                output_dtypes=[x.dtype],
+            )[0]
+
         pos = mx.arange(offset, offset + T, dtype=mx.float32)
         theta = pos[:, None] * self.inv_freq[None, :]
         if inverse:
@@ -345,15 +442,19 @@ class DeepseekV4MoE(nn.Module):
 # Attention: MLA (num_kv_heads=1) + sliding window + optional compressed KV   #
 # --------------------------------------------------------------------------- #
 
-class CompressedKVCache:
+class CompressedKVCache(KVCache):
     """Cache for compressed-attention layers: sliding-window local cache + compressed KV pool.
 
     During prefill, the compressor produces all compressed rows at once.
     During decode, tokens accumulate in a buffer; every `ratio` tokens the
     buffer is compressed and the result is appended to the pool.
+
+    Inherits from KVCache so external engines (vllm-mlx) recognize it via
+    isinstance checks. All state is proxied through self.local (RotatingKVCache).
     """
 
     def __init__(self, max_size: int = 128):
+        # Skip KVCache.__init__ — we proxy everything through self.local
         self.local = RotatingKVCache(max_size=max_size, keep=0)
         self._pool = None
         self._buf = None
@@ -675,16 +776,16 @@ class V4Attention(nn.Module):
         self.wo_a = nn.Linear(group_feat, self.n_groups * self.o_lora_rank, bias=False)
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=args.attention_bias)
 
-        # RoPE: sliding layers use base theta; compressed layers use YaRN with
-        # compress_rope_theta. DeepSeek-V4 also inverse-rotates the attention
-        # output rope dims after sparse attention.
-        if self.compress_ratio:
-            base = args.compress_rope_theta
-            scaling = args.rope_scaling
-        else:
-            base = args.rope_theta
-            scaling = None
-        self.rope = DeepseekV4RoPE(self.rope_head_dim, base, scaling)
+        # RoPE: main Q/K always rotate with rope_theta. Compressed-pool RoPE
+        # (when present) uses compress_rope_theta. Reference DeepSeek-V4
+        # initializes both as separate instances — sharing them ties the main
+        # attention rotation to the wrong base on compressed layers, manifesting
+        # as periodic token drops in CJK (cf. Shinka-Man's report on #1192,
+        # fixed there in @Blaizzy/mlx-lm@b78ccb1).
+        self.rope = DeepseekV4RoPE(self.rope_head_dim, args.rope_theta, args.rope_scaling)
+        self.compress_rope = DeepseekV4RoPE(
+            self.rope_head_dim, args.compress_rope_theta, args.rope_scaling,
+        )
 
         # Compressor / Indexer — present only when compress_ratio > 0
         if self.compress_ratio:
@@ -698,31 +799,39 @@ class V4Attention(nn.Module):
         out = out.reshape(B, S, self.n_groups, group_feat)
 
         if isinstance(self.wo_a, nn.QuantizedLinear):
-            pieces = []
-            for group_idx in range(self.n_groups):
-                rows = slice(
-                    group_idx * self.o_lora_rank,
-                    (group_idx + 1) * self.o_lora_rank,
-                )
-                biases = (
-                    self.wo_a.biases[rows]
-                    if self.wo_a.biases is not None
-                    else None
-                )
-                y = mx.quantized_matmul(
-                    out[:, :, group_idx, :],
-                    self.wo_a.weight[rows],
-                    scales=self.wo_a.scales[rows],
-                    biases=biases,
-                    transpose=True,
-                    group_size=self.wo_a.group_size,
-                    bits=self.wo_a.bits,
-                    mode=self.wo_a.mode,
-                )
-                if "bias" in self.wo_a:
-                    y = y + self.wo_a.bias[rows]
-                pieces.append(y)
-            return mx.concatenate(pieces, axis=-1)
+            # Batched grouped quantized matmul: collapse the per-group Python
+            # loop (8 dispatches) into a single mx.quantized_matmul call by
+            # treating the group dim as a broadcast batch dim. Adapted from
+            # @Blaizzy's pc/add-deepseekv4flash-model branch.
+            #
+            # Shapes:
+            #   out (after transpose): [G, B, S, group_feat]
+            #   weight (reshaped):     [G, 1, o_lora_rank, group_feat / pack_factor]
+            #   scales:                [G, 1, o_lora_rank, group_feat / group_size]
+            # Single dispatch returns [G, B, S, o_lora_rank], then transpose
+            # back to [B, S, G, o_lora_rank] -> [B, S, G * o_lora_rank].
+            out_g = out.transpose(2, 0, 1, 3)
+            weight = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+            scales = self.wo_a.scales.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+            biases = (
+                None
+                if self.wo_a.biases is None
+                else self.wo_a.biases.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+            )
+            out_g = mx.quantized_matmul(
+                out_g,
+                weight,
+                scales=scales,
+                biases=biases,
+                transpose=True,
+                group_size=self.wo_a.group_size,
+                bits=self.wo_a.bits,
+                mode=self.wo_a.mode,
+            )
+            out = out_g.transpose(1, 2, 0, 3).reshape(B, S, self.n_groups * self.o_lora_rank)
+            if "bias" in self.wo_a:
+                out = out + self.wo_a.bias
+            return out
 
         wa = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, group_feat)
         out = mx.einsum("bsgd,grd->bsgr", out, wa)
