@@ -1087,5 +1087,50 @@ class TestFailureHandling(unittest.TestCase):
             cache.shutdown(timeout=2.0)
 
 
+class TestLRUPromptCacheIntegration(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_disk_param_default_none(self):
+        # Constructor still works without disk (existing API unchanged)
+        from mlx_lm.models.cache import LRUPromptCache
+
+        ram = LRUPromptCache(max_size=10)
+        self.assertIsNone(ram.disk)
+
+    def test_disk_param_accepted(self):
+        from mlx_lm.disk_prompt_cache import DiskPromptCache
+        from mlx_lm.models.cache import LRUPromptCache
+
+        disk = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            disk.start()
+            ram = LRUPromptCache(max_size=10, disk=disk)
+            self.assertIs(ram.disk, disk)
+        finally:
+            disk.shutdown(timeout=2.0)
+
+    def test_existing_two_arg_constructor_still_works(self):
+        # Verify the pre-PR API call signature works unchanged
+        from mlx_lm.models.cache import LRUPromptCache
+
+        ram = LRUPromptCache(10, 1 << 30)
+        self.assertEqual(ram.max_size, 10)
+        self.assertEqual(ram.max_bytes, 1 << 30)
+        self.assertIsNone(ram.disk)
+
+
 if __name__ == "__main__":
     unittest.main()

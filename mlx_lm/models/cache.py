@@ -1656,13 +1656,20 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        *,
+        disk: Optional[Any] = None,  # type: Optional["DiskPromptCache"]
+    ):
         self.max_size = max_size
         self.max_bytes = max_bytes
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        self.disk = disk
 
     def __len__(self):
         return len(self._lru)
