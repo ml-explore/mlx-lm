@@ -7,6 +7,7 @@ from mlx_lm.tool_parsers import (
     glm47,
     json_tools,
     kimi_k2,
+    laguna,
     longcat,
     minimax_m2,
     mistral,
@@ -328,6 +329,41 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_laguna_strips_function_name_and_preserves_string_args(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                            "days": {"type": "integer"},
+                            "postal_code": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "get_weather\n"
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>Warsaw</arg_value>\n"
+            "<arg_key>days</arg_key>\n"
+            "<arg_value>3</arg_value>\n"
+            "<arg_key>postal_code</arg_key>\n"
+            "<arg_value>00123</arg_value>"
+        )
+
+        tool_call = laguna.parse_tool_call(test_case, tools)
+
+        self.assertEqual(tool_call["name"], "get_weather")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"location": "Warsaw", "days": 3, "postal_code": "00123"},
+        )
 
 
 if __name__ == "__main__":
