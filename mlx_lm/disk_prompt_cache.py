@@ -340,3 +340,126 @@ def reconstruct_disk_trie(
         total_bytes += st.st_size
 
     return trie, total_bytes, hash_to_tokens
+
+
+class DiskPromptCache:
+    """Opt-in disk-backed L2 cache for ``LRUPromptCache``.
+
+    Constructed only when ``mlx_lm.server`` is given ``--prompt-cache-disk-dir``.
+    With no disk cache, ``LRUPromptCache`` is unchanged.
+
+    Lifecycle:
+        DiskPromptCache(root=...)             # opens dir, takes flock, builds trie
+        ... server runs ...
+        DiskPromptCache.shutdown(timeout=30)  # drains writer queue, releases lock
+
+    Threading (set up in later tasks):
+        - Construction is synchronous and runs in the main thread before the
+          server's HTTP listener binds.
+        - One background writer thread is started in start().
+        - LRUPromptCache calls into search/enqueue_write/touch_async from any
+          request thread; these methods are thread-safe.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        model_path: Path,
+        max_bytes: int,
+        fsync: bool = False,
+        write_queue_size: int = 4,
+        eviction_headroom: float = 0.95,
+    ):
+        self.root = Path(root)
+        self.model_path = Path(model_path)
+        self.max_bytes = max_bytes
+        self.fsync = fsync
+        self.write_queue_size = write_queue_size
+        self.eviction_headroom = eviction_headroom
+
+        # 1. Acquire dir lock (raises DiskCacheLockError on double-init)
+        self._lock_cm = acquire_disk_dir_lock(self.root)
+        self._lock_fd = self._lock_cm.__enter__()
+
+        try:
+            # 2. format-version
+            fv_path = self.root / "format-version"
+            if fv_path.exists():
+                existing = fv_path.read_text().strip()
+                if existing != str(FORMAT_VERSION):
+                    raise RuntimeError(
+                        f"Disk cache at {self.root} has format-version={existing}, "
+                        f"expected {FORMAT_VERSION}. Use mlx_lm.cache_admin migrate "
+                        f"or remove the directory to start fresh."
+                    )
+            else:
+                fv_path.write_text(f"{FORMAT_VERSION}\n")
+
+            # 3. model_id
+            self.model_id = compute_model_id(self.model_path)
+            self.model_dir = self.root / "models" / self.model_id
+            self.entries_dir = self.model_dir / "entries"
+            self.entries_dir.mkdir(parents=True, exist_ok=True)
+
+            # 4. info.json (write fresh on every start)
+            from . import __version__ as mlx_lm_version
+
+            (self.model_dir / "info.json").write_text(
+                json.dumps(
+                    {
+                        "model_id": self.model_id,
+                        "model_path_hint": str(self.model_path),
+                        "mlx_lm_version": mlx_lm_version,
+                        "format_version": FORMAT_VERSION,
+                        "created_at": int(time.time()),
+                    },
+                    indent=2,
+                )
+            )
+
+            # 5. Reconstruct in-memory trie
+            (
+                self._trie,
+                self._total_bytes,
+                self._hash_to_tokens,
+            ) = reconstruct_disk_trie(self.entries_dir, model_id=self.model_id)
+            self._trie_lock = threading.RLock()
+
+            # 6. Failure flag
+            self._writes_disabled = False
+            self._accepting_writes = True
+            self._shutdown_called = False
+
+            # 7. Background-thread state — populated in start() (Task 10)
+            self._queue: Optional[queue.Queue] = None
+            self._writer_thread: Optional[threading.Thread] = None
+            self._inflight: Dict[str, Future] = {}
+            self._inflight_lock = threading.Lock()
+            self._touch_queue: Optional[queue.Queue] = None
+            self._touch_thread: Optional[threading.Thread] = None
+
+            n_entries = len(self._hash_to_tokens)
+            logger.info(
+                "Loaded %d disk-cache entries totaling %.2f GB at startup",
+                n_entries,
+                self._total_bytes / (1 << 30),
+            )
+
+        except Exception:
+            # Release lock if init fails after acquiring it
+            try:
+                self._lock_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            raise
+
+    def shutdown(self, timeout: float = 30.0) -> None:
+        """Stub — full implementation in Task 14. Just releases the lock."""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        try:
+            self._lock_cm.__exit__(None, None, None)
+        except Exception:
+            pass

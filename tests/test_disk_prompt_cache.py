@@ -321,5 +321,92 @@ class TestReconstructDiskTrie(unittest.TestCase):
         self.assertFalse(tmp_path.exists())
 
 
+from mlx_lm.disk_prompt_cache import DiskPromptCache
+
+
+class TestDiskPromptCacheInit(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_creates_layout(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            self.assertTrue((self.dir / "cache" / "format-version").exists())
+            self.assertTrue((self.dir / "cache" / ".lock").exists())
+            self.assertEqual(
+                (self.dir / "cache" / "format-version").read_text().strip(), "1"
+            )
+            self.assertTrue((self.dir / "cache" / "models").exists())
+            # Per-model subdir
+            model_dirs = list((self.dir / "cache" / "models").iterdir())
+            self.assertEqual(len(model_dirs), 1)
+            self.assertTrue((model_dirs[0] / "info.json").exists())
+            self.assertTrue((model_dirs[0] / "entries").exists())
+        finally:
+            cache.shutdown(timeout=2.0)
+
+    def test_double_init_raises(self):
+        cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        try:
+            with self.assertRaises(DiskCacheLockError):
+                DiskPromptCache(
+                    root=self.dir / "cache",
+                    model_path=self.fake_model,
+                    max_bytes=1 << 30,
+                )
+        finally:
+            cache.shutdown(timeout=2.0)
+
+    def test_format_version_mismatch_refuses(self):
+        # Pre-create dir with a wrong version
+        (self.dir / "cache").mkdir()
+        (self.dir / "cache" / "format-version").write_text("999\n")
+        with self.assertRaises(RuntimeError) as cm:
+            DiskPromptCache(
+                root=self.dir / "cache",
+                model_path=self.fake_model,
+                max_bytes=1 << 30,
+            )
+        self.assertIn("format", str(cm.exception).lower())
+
+    def test_per_model_isolation(self):
+        # Two different "models" → two different model_ids → two subdirs
+        model_b = self.dir / "fake_model_b"
+        model_b.mkdir()
+        (model_b / "model.safetensors.index.json").write_text('{"x":"y"}')
+        cache_a = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        cache_a.shutdown(timeout=2.0)
+        cache_b = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=model_b,
+            max_bytes=1 << 30,
+        )
+        try:
+            model_dirs = sorted((self.dir / "cache" / "models").iterdir())
+            self.assertEqual(len(model_dirs), 2)
+        finally:
+            cache_b.shutdown(timeout=2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
