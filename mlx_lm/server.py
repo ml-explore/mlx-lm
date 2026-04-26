@@ -651,7 +651,8 @@ class ResponseGenerator:
         import mlx_lm.generate as _gen_mod
 
         new_stream = mx.new_stream(mx.default_device())
-        generation_stream = new_stream         # server.py's reference
+        mx.set_default_stream(new_stream)        # thread-local, not process-wide
+        generation_stream = new_stream           # server.py's reference
         _gen_mod.generation_stream = new_stream  # generate.py's reference
 
         current_model = None
