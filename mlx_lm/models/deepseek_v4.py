@@ -1678,8 +1678,7 @@ class V4Attention(nn.Module):
         self._ensure_cached(q.dtype)
         q = mx.fast.rms_norm(q, self._q_norm_weight_cached, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
-        kv = self.kv_norm(self.wkv(x)).reshape(B, L, 1, self.head_dim)
-        kv = kv.transpose(0, 2, 1, 3)
+        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
 
         q = _apply_partial_rope(q, self.rope, offset)
         kv = _apply_partial_rope(kv, self.rope, offset)
