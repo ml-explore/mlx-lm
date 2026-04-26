@@ -1629,12 +1629,13 @@ class V4Attention(nn.Module):
             )
 
     def _grouped_output_projection(self, out: mx.array) -> mx.array:
-        B, L = out.shape[:2]
-        group_feat = (self.n_heads * self.head_dim) // self.o_groups
-        out = out.reshape(B, L, self.o_groups, group_feat)
+        B, _, L, _ = out.shape
+        heads_per_group = self.n_heads // self.o_groups
+        out = out.reshape(B, self.o_groups, heads_per_group, L, self.head_dim)
+        out = out.transpose(1, 0, 3, 2, 4)
+        out = out.reshape(self.o_groups, B, L, heads_per_group * self.head_dim)
 
         if isinstance(self.wo_a, nn.QuantizedLinear):
-            out = out.transpose(2, 0, 1, 3)
             out = mx.quantized_matmul(
                 out,
                 self._wo_a_weight,
@@ -1652,7 +1653,7 @@ class V4Attention(nn.Module):
                 out = out + self.wo_a.bias
             return out
 
-        out = mx.einsum("bsgd,grd->bsgr", out, self._wo_a_weight_reshaped)
+        out = mx.einsum("gbsd,grd->bsgr", out, self._wo_a_weight_reshaped)
         out = out.reshape(B, L, self.o_groups * self.o_lora_rank)
         if "bias" in self.wo_a:
             out = out + self.wo_a.bias
@@ -1786,7 +1787,6 @@ class V4Attention(nn.Module):
             sinks=self._attn_sink_cached,
         )
         out = _apply_partial_rope(out, self.rope, offset, inverse=True)
-        out = out.transpose(0, 2, 1, 3).reshape(B, L, self.n_heads * self.head_dim)
         out = self._grouped_output_projection(out)
         return self.wo_b(out)
 
