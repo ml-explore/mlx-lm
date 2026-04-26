@@ -615,5 +615,76 @@ class TestDiskPromptCacheLoad(unittest.TestCase):
             mod.load_entry = original
 
 
+from mlx_lm.disk_prompt_cache import DiskLeaf
+
+
+class TestDiskPromptCacheTouch(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.fake_model = self.dir / "fake_model"
+        self.fake_model.mkdir()
+        (self.fake_model / "model.safetensors.index.json").write_text("{}")
+        self.cache = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        kv = _make_dummy_kvcache(num_layers=1, ntokens=4, dim=8)
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        self.tokens = [1, 2, 3, 4]
+        self.token_hash = hash_tokens(self.tokens)
+        job = WriteJob(
+            token_hash=self.token_hash,
+            tokens=self.tokens,
+            prompt_cache=kv,
+            cache_type_classes=["KVCache"],
+            trimmable=True,
+            parents_to_evict=[],
+            model_id=self.cache.model_id,
+        )
+        write_entry_atomic(self.cache.entries_dir, job, fsync=False)
+        st = self.cache.entry_path(self.token_hash).stat()
+        leaf = DiskLeaf(
+            token_hash=self.token_hash,
+            length=4,
+            nbytes=st.st_size,
+            mtime_ns=st.st_mtime_ns,
+            trimmable=True,
+        )
+        with self.cache._trie_lock:
+            self.cache._trie.add(self.cache.model_id, self.tokens, leaf)
+            self.cache._hash_to_tokens[self.token_hash] = self.tokens
+        self.original_mtime = st.st_mtime_ns
+        self.cache.start()  # start the writer + touch threads
+
+    def tearDown(self):
+        self.cache.shutdown(timeout=5.0)
+        self.tmpdir.cleanup()
+
+    def test_touch_updates_mtime(self):
+        time.sleep(0.05)  # so mtime changes detectably
+        self.cache.touch_async(self.token_hash)
+        # Allow background thread to flush
+        time.sleep(0.5)
+        new_mtime = self.cache.entry_path(self.token_hash).stat().st_mtime_ns
+        self.assertGreater(new_mtime, self.original_mtime)
+
+    def test_touch_updates_in_memory_leaf(self):
+        time.sleep(0.05)
+        self.cache.touch_async(self.token_hash)
+        # In-memory mtime updates synchronously
+        with self.cache._trie_lock:
+            leaf = self.cache._trie.get(self.cache.model_id, self.tokens)
+        self.assertGreater(leaf.mtime_ns, self.original_mtime)
+
+    def test_touch_unknown_hash_no_op(self):
+        # touch_async on a hash we've never seen should not raise
+        self.cache.touch_async("nonexistenthash")
+        # No assertion; just confirming no exception
+
+
 if __name__ == "__main__":
     unittest.main()

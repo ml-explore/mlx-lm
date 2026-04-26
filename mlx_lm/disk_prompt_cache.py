@@ -503,6 +503,69 @@ class DiskPromptCache:
 
         return fut.result()
 
+    def start(self) -> None:
+        """Start background writer + touch threads. Idempotent."""
+        if self._writer_thread is not None:
+            return
+        self._queue = queue.Queue(maxsize=self.write_queue_size)
+        self._touch_queue = queue.Queue()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="DiskPromptCacheWriter",
+            daemon=True,
+        )
+        self._touch_thread = threading.Thread(
+            target=self._touch_loop,
+            name="DiskPromptCacheTouch",
+            daemon=True,
+        )
+        self._writer_thread.start()
+        self._touch_thread.start()
+
+    def touch_async(self, token_hash: str) -> None:
+        """Mark entry as recently used. Updates in-memory mtime synchronously
+        and queues an ``os.utime`` call for background execution.
+
+        Called from any request thread. Best-effort: if the entry has been
+        evicted between the in-memory update and the background ``utime`` call,
+        the OSError is swallowed.
+        """
+        now_ns = time.time_ns()
+        with self._trie_lock:
+            tokens = self._hash_to_tokens.get(token_hash)
+            if tokens is None:
+                return  # leaf not in trie (already evicted?)
+            try:
+                leaf = self._trie.get(self.model_id, tokens)
+                leaf.mtime_ns = now_ns
+            except (KeyError, TypeError):
+                return
+        if self._touch_queue is not None:
+            try:
+                self._touch_queue.put_nowait((token_hash, now_ns / 1e9))
+            except queue.Full:
+                pass  # touch is best-effort
+
+    def _touch_loop(self) -> None:
+        while True:
+            item = self._touch_queue.get()
+            if item is _SHUTDOWN_SENTINEL:
+                return
+            token_hash, ts = item
+            path = self.entry_path(token_hash)
+            try:
+                os.utime(str(path), (ts, ts))
+            except OSError:
+                pass  # file may have been evicted; safe to ignore
+
+    def _writer_loop(self) -> None:
+        """Placeholder; full implementation in Task 12."""
+        while True:
+            item = self._queue.get()
+            if item is _SHUTDOWN_SENTINEL:
+                return
+            # No-op until Task 12.
+
     def shutdown(self, timeout: float = 30.0) -> None:
         """Stub — full implementation in Task 14. Just releases the lock."""
         if self._shutdown_called:
