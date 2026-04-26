@@ -36,7 +36,6 @@ from ._version import __version__
 from .generate import (
     BatchGenerator,
     SequenceStateMachine,
-    generation_stream,
     stream_generate,
 )
 from .models.cache import (
@@ -78,7 +77,14 @@ class ToolCallFormatter:
 
         result = []
         for tool_text in tool_calls:
-            parsed = self._tool_parser(tool_text, self._tools)
+            try:
+                parsed = self._tool_parser(tool_text, self._tools)
+            except (ValueError, json.JSONDecodeError) as e:
+                logging.warning(
+                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
+                    f"tool text was likely truncated mid-generation."
+                )
+                continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
@@ -272,8 +278,7 @@ class TimeBudget:
         self._loops += 1
         self._time_spent += time.time() - self._start
         if self._loops % self._sync_frequency == 0:
-            with mx.stream(generation_stream):
-                loop_time = mx.distributed.all_sum(self._time_spent).item()
+            loop_time = mx.distributed.all_sum(self._time_spent).item()
             avg_loop_time = loop_time / (
                 mx.distributed.init().size() * self._sync_frequency
             )
@@ -301,94 +306,92 @@ class ModelProvider:
         )
         self.is_distributed = group.size() > 1
 
-        # Preload the default model if it is provided
-        self.default_model_map = {}
-        if self.cli_args.model is not None:
-            self.default_model_map[self.cli_args.model] = "default_model"
-            self.load(self.cli_args.model, draft_model_path="default_model")
+        # Maps model and adapter paths the actual paths to be used. Used to
+        # map 'default_model' to the provided model by cli argument but could
+        # be used for more in the future.
+        self._model_map = {}
+        self._adapter_map = {}
+        self._draft_model_map = {}
+        self._model_map["default_model"] = self.cli_args.model
+        self._adapter_map["default_model"] = self.cli_args.adapter_path
+        self._draft_model_map["default_model"] = self.cli_args.draft_model
 
-    # Added in adapter_path to load dynamically
-    def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self.default_model_map.get(model_path, model_path)
-        if self.model_key == (model_path, adapter_path, draft_model_path):
-            return self.model, self.tokenizer
+        # Build the tokenizer config for later use in load
+        self._tokenizer_config = {
+            "trust_remote_code": True if cli_args.trust_remote_code else None
+        }
+        if cli_args.chat_template:
+            self._tokenizer_config["chat_template"] = cli_args.chat_template
+
+    def _load(self, model_path, adapter_path=None, draft_model_path=None):
+        if self.is_distributed and (
+            adapter_path is not None or draft_model_path is not None
+        ):
+            raise ValueError(
+                "Loading with adapters or draft models not supported in distributed mode"
+            )
 
         # Remove the old model if it exists.
+        self.model_key = None
         self.model = None
         self.tokenizer = None
-        self.model_key = None
         self.draft_model = None
 
-        # Building tokenizer_config
-        tokenizer_config = {
-            "trust_remote_code": True if self.cli_args.trust_remote_code else None
-        }
-        if self.cli_args.chat_template:
-            tokenizer_config["chat_template"] = self.cli_args.chat_template
-
-        if model_path == "default_model":
-            if self.cli_args.model is None:
-                raise ValueError(
-                    "A model path has to be given as a CLI "
-                    "argument or in the HTTP request"
-                )
-            adapter_path = adapter_path or self.cli_args.adapter_path
-            # TODO: Generalize distributed load
-            if self.is_distributed:
-                model, tokenizer = sharded_load(
-                    self.cli_args.model, self.pipeline_group, self.tensor_group
-                )
-            else:
-                model, tokenizer = load(
-                    self.cli_args.model,
-                    adapter_path=adapter_path,
-                    tokenizer_config=tokenizer_config,
-                )
+        # Load the model and tokenizer
+        if self.is_distributed:
+            model, tokenizer = sharded_load(
+                model_path,
+                pipeline_group=self.pipeline_group,
+                tensor_group=self.tensor_group,
+                tokenizer_config=self._tokenizer_config,
+            )
         else:
-            # TODO: Generalize distributed load
-            if self.is_distributed:
-                model, tokenizer = sharded_load(
-                    model_path, self.pipeline_group, self.tensor_group
-                )
-            else:
-                model, tokenizer = load(
-                    model_path,
-                    adapter_path=adapter_path,
-                    tokenizer_config=tokenizer_config,
-                )
+            model, tokenizer = load(
+                model_path,
+                adapter_path=adapter_path,
+                tokenizer_config=self._tokenizer_config,
+            )
 
+        # Use the default chat template if needed
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model_key = (model_path, adapter_path, draft_model_path)
-        self.model = model
-        self.tokenizer = tokenizer
-
-        def validate_draft_tokenizer(draft_tokenizer):
-            # Check if tokenizers are compatible
+        # Load the draft model for speculative decoding
+        draft_model = None
+        if draft_model_path is not None:
+            draft_model, draft_tokenizer = load(draft_model_path)
             if draft_tokenizer.vocab_size != tokenizer.vocab_size:
                 logging.warning(
                     "Draft model tokenizer does not match model tokenizer. "
                     "Speculative decoding may not work as expected."
                 )
 
-        # Load draft model if specified
-        if (
-            draft_model_path == "default_model"
-            and self.cli_args.draft_model is not None
-        ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
-            validate_draft_tokenizer(draft_tokenizer)
+        # Compute batchability
+        is_batchable = draft_model is None
+        is_batchable = is_batchable and all(
+            hasattr(c, "merge") for c in make_prompt_cache(model)
+        )
 
-        elif draft_model_path is not None and draft_model_path != "default_model":
-            self.draft_model, draft_tokenizer = load(draft_model_path)
-            validate_draft_tokenizer(draft_tokenizer)
+        # Update the member variables
+        self.model_key = (model_path, adapter_path, draft_model_path)
+        self.model = model
+        self.tokenizer = tokenizer
+        self.draft_model = draft_model
+        self.is_batchable = is_batchable
 
-        if self.draft_model is None:
-            self.is_batchable = all(
-                hasattr(c, "merge") for c in make_prompt_cache(self.model)
-            )
+    def load_default(self):
+        if self._model_map["default_model"] is not None:
+            self.load("default_model", None, "default_model")
+
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        model_path = self._model_map.get(model_path, model_path)
+        adapter_path = self._adapter_map.get(model_path, adapter_path)
+        draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
+
+        model_key = (model_path, adapter_path, draft_model_path)
+        if self.model_key != model_key:
+            self._load(*model_key)
 
         return self.model, self.tokenizer
 
@@ -482,22 +485,21 @@ class ResponseGenerator:
         if not self._is_distributed:
             return obj
 
-        with mx.stream(generation_stream):
-            if self._rank == 0:
-                if obj is None:
-                    mx.eval(mx.distributed.all_sum(0))
-                    return None
-                data = mx.array(pickle.dumps(obj))
-                mx.eval(mx.distributed.all_sum(data.size))
-                mx.eval(mx.distributed.all_sum(data))
-                return obj
-            else:
-                size = mx.distributed.all_sum(0).item()
-                if size == 0:
-                    return None
-                data = mx.zeros(size, dtype=mx.uint8)
-                data = mx.distributed.all_sum(data)
-                return pickle.loads(data)
+        if self._rank == 0:
+            if obj is None:
+                mx.eval(mx.distributed.all_sum(0))
+                return None
+            data = mx.array(pickle.dumps(obj))
+            mx.eval(mx.distributed.all_sum(data.size))
+            mx.eval(mx.distributed.all_sum(data))
+            return obj
+        else:
+            size = mx.distributed.all_sum(0).item()
+            if size == 0:
+                return None
+            data = mx.zeros(size, dtype=mx.uint8)
+            data = mx.distributed.all_sum(data)
+            return pickle.loads(data)
 
     def _share_request(self, request):
         if not self._is_distributed:
@@ -667,10 +669,11 @@ class ResponseGenerator:
             ts = tokenizer.tool_call_start_tokens
             te = tokenizer.tool_call_end_tokens
             transitions["normal"].append((ts, "tool"))
-            transitions["tool"] = [(te, "normal")]
+            transitions["tool"] = [(te, "normal")] if te else []
             transitions["tool"].extend(common_stops)
             sequences[ts] = tokenizer.tool_call_start
-            sequences[te] = tokenizer.tool_call_end
+            if te:
+                sequences[te] = tokenizer.tool_call_end
 
         sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
@@ -683,6 +686,14 @@ class ResponseGenerator:
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
+        # Local thread stream that we 'll pass to the BatchGenerator to make
+        # sure that all generation runs in the same stream as the
+        # synchronization messages.
+        generation_stream = mx.default_stream(mx.default_device())
+
+        # Load the default model if it is given
+        self.model_provider.load_default()
+
         current_model = None
         current_sampling = None
         current_tokenizer = None
@@ -812,6 +823,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -901,12 +913,11 @@ class ResponseGenerator:
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
-                    with mx.stream(generation_stream):
-                        batch_generator.remove(uids_to_remove)
-                        for uid in uids_to_remove:
-                            # It may have already been removed during
-                            # generation
-                            batch_results.pop(uid, None)
+                    batch_generator.remove(uids_to_remove)
+                    for uid in uids_to_remove:
+                        # It may have already been removed during
+                        # generation
+                        batch_results.pop(uid, None)
 
     def _serve_single(self, request):
         rqueue, request, args = request
