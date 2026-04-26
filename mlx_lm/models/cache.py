@@ -1679,26 +1679,110 @@ class LRUPromptCache:
         return self._n_bytes
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
-        result = self._trie.search(model, tokens)
+        ram_result = self._trie.search(model, tokens)
+        if self.disk is None:
+            # Fast path — original behavior, byte-identical
+            return self._serve_ram_match(model, tokens, ram_result)
+
+        # Two-tier path
+        ram_quality = self._classify(ram_result, tokens)
+        disk_result = self.disk.search(tokens)
+        disk_quality = self._classify(disk_result, tokens)
+
+        # Prefer the better match; tie → RAM
+        if disk_quality > ram_quality:
+            return self._serve_disk_match(model, tokens, disk_result)
+
+        # Use RAM. If we got an exact RAM match for an entry that's also on
+        # disk, touch its disk mtime. We do this here for "exact" matches
+        # only — for trimmed matches the same hash is what's on disk anyway.
+        served = self._serve_ram_match(model, tokens, ram_result)
+        if ram_quality[0] > 0:
+            # Determine which token sequence we actually served from
+            served_tokens = None
+            if ram_result.exact is not None:
+                served_tokens = ram_result.exact
+            elif ram_result.longer is not None and ram_result.common_prefix > (
+                len(ram_result.shorter) if ram_result.shorter else 0
+            ):
+                served_tokens = ram_result.longer
+            elif ram_result.shorter is not None:
+                served_tokens = ram_result.shorter
+            if served_tokens is not None:
+                from ..disk_prompt_cache import hash_tokens as _ht
+
+                self.disk.touch_async(_ht(served_tokens))
+        return served
+
+    @staticmethod
+    def _classify(result, tokens):
+        """Return a (quality, length) tuple ranking how good this match is.
+
+        Higher is better. Quality:
+            3 = exact match
+            2 = longer-trimmed (a longer cached entry we'd trim back)
+            1 = shorter prefix
+            0 = no match
+        """
+        if result is None:
+            return (0, 0)
+        if getattr(result, "exact", None) is not None:
+            return (3, len(result.exact))
+        short_length = (
+            len(result.shorter) if getattr(result, "shorter", None) is not None else 0
+        )
+        if (
+            getattr(result, "longer", None) is not None
+            and getattr(result, "common_prefix", 0) > short_length
+        ):
+            return (2, result.common_prefix)
+        if getattr(result, "shorter", None) is not None:
+            return (1, len(result.shorter))
+        return (0, 0)
+
+    def _serve_ram_match(self, model, tokens, result):
+        """Serve a match using the in-memory trie. This is the original
+        ``fetch_nearest_cache`` logic, factored out so the two-tier path can
+        reuse it.
+        """
         if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            entry = self._trie.get(result.model, result.exact)
+            return copy.deepcopy(entry.prompt_cache), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
-            cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+            entry = self._trie.get(result.model, result.longer)
+            if can_trim_prompt_cache(entry.prompt_cache):
+                cache = copy.deepcopy(entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
         if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            entry = self._trie.get(result.model, result.shorter)
+            return copy.deepcopy(entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
+
+    def _serve_disk_match(self, model, tokens, result):
+        """Materialize a disk match: load the deepest-matching leaf, promote
+        into RAM via insert_cache, touch its mtime, then serve via the RAM
+        path which handles trimming/prefilling correctly.
+        """
+        target_tokens = result.exact or result.longer or result.shorter
+        if target_tokens is None:
+            return None, tokens
+        leaf = self.disk._trie.get(self.disk.model_id, target_tokens)
+        loaded_cache, _meta = self.disk.load(leaf.token_hash)
+        # Promote into RAM trie. cache_type defaults to "assistant" — the
+        # disk record doesn't carry the original cache_type.
+        self.insert_cache(model, target_tokens, loaded_cache, cache_type="assistant")
+        # Touch disk mtime
+        self.disk.touch_async(leaf.token_hash)
+        # Now serve via the RAM path (entry is in RAM at target_tokens)
+        new_result = self._trie.search(model, tokens)
+        return self._serve_ram_match(model, tokens, new_result)
 
     def insert_cache(
         self,

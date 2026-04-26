@@ -1179,6 +1179,67 @@ class TestLRUPromptCacheIntegration(unittest.TestCase):
         finally:
             disk.shutdown(timeout=2.0)
 
+    def test_fetch_loads_from_disk_when_ram_misses(self):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+        from mlx_lm.models.cache import LRUPromptCache, PromptTrie
+
+        disk = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        disk.start()
+        try:
+            ram = LRUPromptCache(max_size=10, disk=disk)
+            tokens = [1, 2, 3, 4]
+            kv = _make_dummy_kvcache(num_layers=1, ntokens=4, dim=8)
+            ram.insert_cache(disk.model_id, tokens, kv, cache_type="user")
+            disk._queue.join()
+
+            # Simulate RAM eviction by clearing the RAM trie
+            ram._trie = PromptTrie()
+            ram._lru = type(ram._lru)()
+            ram._n_bytes = 0
+            ram._n_bytes_by_type = {k: 0 for k in ram._lru._ordering}
+
+            # Fetch should now load from disk
+            cache, rest = ram.fetch_nearest_cache(disk.model_id, tokens)
+            self.assertIsNotNone(cache)
+            self.assertEqual(rest, [])
+            self.assertEqual(len(cache), 1)
+            # Now in RAM trie too (promoted)
+            self.assertEqual(ram._trie.search(disk.model_id, tokens).exact, tokens)
+        finally:
+            disk.shutdown(timeout=2.0)
+
+    def test_fetch_touches_disk_mtime_on_ram_hit(self):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+        from mlx_lm.models.cache import LRUPromptCache
+
+        disk = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        disk.start()
+        try:
+            ram = LRUPromptCache(max_size=10, disk=disk)
+            tokens = [1, 2, 3, 4]
+            kv = _make_dummy_kvcache(num_layers=1, ntokens=4, dim=8)
+            ram.insert_cache(disk.model_id, tokens, kv, cache_type="user")
+            disk._queue.join()
+            original_mtime = disk.entry_path(hash_tokens(tokens)).stat().st_mtime_ns
+
+            time.sleep(0.05)
+            # Pure RAM hit
+            cache, rest = ram.fetch_nearest_cache(disk.model_id, tokens)
+            # Allow async touch to flush
+            time.sleep(0.5)
+            new_mtime = disk.entry_path(hash_tokens(tokens)).stat().st_mtime_ns
+            self.assertGreater(new_mtime, original_mtime)
+        finally:
+            disk.shutdown(timeout=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
