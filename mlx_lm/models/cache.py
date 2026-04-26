@@ -1830,7 +1830,16 @@ class LRUPromptCache:
         # Disk tier write-through (no-op if disk=None)
         if self.disk is not None:
             try:
+                # Force evaluation in the calling thread (which has a GPU
+                # stream context). The writer thread spawned by
+                # DiskPromptCache.start() lacks a stream context, so any
+                # lazy mx.array access would raise
+                # RuntimeError: There is no Stream(gpu, 0) in current thread.
+                import mlx.core as _mx_core
+
                 from ..disk_prompt_cache import WriteJob, hash_tokens
+
+                _mx_core.eval([c.state for c in prompt_cache])
 
                 parents = (
                     self.disk.find_dominated_prefixes(tokens)

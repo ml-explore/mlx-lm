@@ -1240,6 +1240,39 @@ class TestLRUPromptCacheIntegration(unittest.TestCase):
         finally:
             disk.shutdown(timeout=2.0)
 
+    def test_insert_cache_writes_unevaluated_state(self):
+        """Regression: ensure insert_cache evaluates KV state before queueing
+        the write, so the background writer thread doesn't hit
+        ``RuntimeError: There is no Stream(gpu, 0)``.
+        """
+        import mlx.core as mx
+
+        from mlx_lm.disk_prompt_cache import hash_tokens
+        from mlx_lm.models.cache import KVCache, LRUPromptCache
+
+        disk = DiskPromptCache(
+            root=self.dir / "cache",
+            model_path=self.fake_model,
+            max_bytes=1 << 30,
+        )
+        disk.start()
+        try:
+            ram = LRUPromptCache(max_size=10, disk=disk)
+            # Build cache state but DO NOT call mx.eval — leave arrays lazy.
+            cache = [KVCache() for _ in range(2)]
+            for c in cache:
+                k = mx.random.normal((1, 1, 4, 8))
+                v = mx.random.normal((1, 1, 4, 8))
+                c.update_and_fetch(k, v)
+            # No mx.eval here — that's what we're testing
+            tokens = [10, 20, 30, 40]
+            ram.insert_cache(disk.model_id, tokens, cache, cache_type="user")
+            disk._queue.join()
+            # Should be on disk; writer thread didn't crash on stream context
+            self.assertTrue(disk.entry_path(hash_tokens(tokens)).exists())
+        finally:
+            disk.shutdown(timeout=5.0)
+
 
 if __name__ == "__main__":
     unittest.main()
