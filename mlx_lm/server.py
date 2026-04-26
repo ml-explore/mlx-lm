@@ -367,10 +367,17 @@ class ModelProvider:
                     "Speculative decoding may not work as expected."
                 )
 
-        # Compute batchability
+        # Compute batchability.
+        # NOTE: DeepSeek-V4's hybrid cache (CompressedKVCache + RotatingKVCache)
+        # corrupts generation under BatchGenerator even though both implement
+        # `merge`. Force non-batch when CompressedKVCache is present.
         is_batchable = draft_model is None
+        _prompt_cache_probe = make_prompt_cache(model)
         is_batchable = is_batchable and all(
-            hasattr(c, "merge") for c in make_prompt_cache(model)
+            hasattr(c, "merge") for c in _prompt_cache_probe
+        )
+        is_batchable = is_batchable and not any(
+            type(c).__name__ == "CompressedKVCache" for c in _prompt_cache_probe
         )
 
         # Update the member variables
@@ -983,6 +990,7 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                mtp=getattr(self.cli_args, "mtp", False),
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
@@ -1789,6 +1797,12 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. DeepSeek-V4).",
     )
     parser.add_argument(
         "--trust-remote-code",
