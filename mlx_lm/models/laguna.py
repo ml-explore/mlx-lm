@@ -178,9 +178,7 @@ class Attention(nn.Module):
         self.sliding_window = args.sliding_window if self.is_sliding else None
 
         dim = args.hidden_size
-        self.q_proj = nn.Linear(
-            dim, self.n_heads * self.head_dim, bias=args.qkv_bias
-        )
+        self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=args.qkv_bias)
         self.k_proj = nn.Linear(
             dim, self.n_kv_heads * self.head_dim, bias=args.qkv_bias
         )
@@ -193,9 +191,7 @@ class Attention(nn.Module):
 
         if self.gating:
             gate_dim = (
-                self.n_heads
-                if self.gate_per_head
-                else self.n_heads * self.head_dim
+                self.n_heads if self.gate_per_head else self.n_heads * self.head_dim
             )
             self.g_proj = nn.Linear(dim, gate_dim, bias=False)
 
@@ -263,8 +259,7 @@ class Attention(nn.Module):
             if self.gate_per_head:
                 shape = output.shape
                 output = (
-                    output.reshape(B, L, self.n_heads, self.head_dim)
-                    * gate[..., None]
+                    output.reshape(B, L, self.n_heads, self.head_dim) * gate[..., None]
                 ).reshape(shape)
             else:
                 output = output * gate
@@ -397,9 +392,9 @@ class Model(nn.Module):
                     and f"{base}weight_scale" in weights
                 ):
                     scales = weights[f"{base}weight_scale"]
-                    new_weights[f"{base}weight"] = weights[
-                        f"{base}weight_packed"
-                    ].view(mx.uint32)
+                    new_weights[f"{base}weight"] = weights[f"{base}weight_packed"].view(
+                        mx.uint32
+                    )
                     new_weights[f"{base}scales"] = scales
                     new_weights[f"{base}biases"] = (-8 * scales).astype(scales.dtype)
             elif k.endswith(".weight_packed") or k.endswith(".weight_scale"):
@@ -454,6 +449,7 @@ class Model(nn.Module):
     def cast_predicate(self):
         def predicate(k):
             return "e_score_correction_bias" not in k
+
         return predicate
 
     @property

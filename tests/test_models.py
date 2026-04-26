@@ -881,8 +881,8 @@ class TestModels(unittest.TestCase):
             ),
         }
         for e in range(2):
-            weights[f"model.layers.1.mlp.experts.{e}.gate_proj.weight"] = (
-                mx.full((3, 8), e + 1, dtype=mx.float32)
+            weights[f"model.layers.1.mlp.experts.{e}.gate_proj.weight"] = mx.full(
+                (3, 8), e + 1, dtype=mx.float32
             )
             weights[f"model.layers.1.mlp.experts.{e}.up_proj.weight"] = mx.full(
                 (3, 8), e + 3, dtype=mx.float32
