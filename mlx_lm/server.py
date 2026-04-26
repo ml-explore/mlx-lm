@@ -514,8 +514,9 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        self._generation_thread = Thread(target=self._generate)
-        self._generation_thread.start()
+        # Generation runs on the main thread (see run()).
+        # MLX streams are thread-affine; async_eval requires the
+        # stream that was active when the model was loaded.
 
     def _store_cache(self, model_key, cache_key, cache, **kwargs):
         """Optionally quantize KV cache before inserting into LRU."""
@@ -526,10 +527,9 @@ class ResponseGenerator:
 
     def stop_and_join(self):
         self._stop = True
-        self._generation_thread.join()
 
     def join(self):
-        self._generation_thread.join()
+        pass
 
     def _log_cache_stats(self):
         ncaches = len(self.prompt_cache)
@@ -642,19 +642,6 @@ class ResponseGenerator:
         return True
 
     def _generate(self):
-        # Bind the generation stream to this thread.
-        # Module-level generation_stream was created during import on
-        # the main thread. MLX requires streams to be used on the
-        # thread that owns them. Create a fresh stream here and
-        # update all references (same approach as vllm-mlx).
-        global generation_stream
-        import mlx_lm.generate as _gen_mod
-
-        new_stream = mx.new_stream(mx.default_device())
-        mx.set_default_stream(new_stream)        # thread-local, not process-wide
-        generation_stream = new_stream           # server.py's reference
-        _gen_mod.generation_stream = new_stream  # generate.py's reference
-
         current_model = None
         current_sampling = None
         current_tokenizer = None
@@ -1805,9 +1792,19 @@ def run(
         prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
-        _run_http_server(host, port, response_generator)
+        # Start HTTP server in a background thread.
+        # Generation MUST run on the main thread because MLX streams
+        # are thread-affine: async_eval requires the stream that was
+        # active when the model was loaded (stream 0, main thread).
+        http_thread = Thread(
+            target=_run_http_server,
+            args=(host, port, response_generator),
+            daemon=True,
+        )
+        http_thread.start()
+        response_generator._generate()
     else:
-        response_generator.join()
+        response_generator._generate()
 
 
 def main():
