@@ -701,6 +701,39 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(mx.array_equal(loaded[mlx_norm_key], base))
 
+    def test_qwen3_5_mtp_forward(self):
+        from mlx_lm.models import qwen3_5
+
+        text_config = {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "vocab_size": 100,
+            "intermediate_size": 64,
+            "full_attention_interval": 1,
+        }
+        args = qwen3_5.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "text_config": text_config,
+                "mtp_num_hidden_layers": 1,
+            }
+        )
+        model = qwen3_5.Model(args)
+
+        # Test basic forward with MTP head present
+        x = mx.array([[1, 2, 3]])
+        logits, h = model(x, return_hidden=True)
+        self.assertEqual(logits.shape, (1, 3, 100))
+        self.assertEqual(h.shape, (1, 3, 32))
+
+        # Test MTP forward
+        token_t1 = mx.array([[4]])
+        cache = model.make_mtp_cache()
+        logits_mtp = model.mtp_forward(h[:, -1:, :], token_t1, cache=cache)
+        self.assertEqual(logits_mtp.shape, (1, 1, 100))
+
     def test_gemma4_raw_hf_language_model_prefixes_model(self):
         from mlx_lm.models import gemma4
 
