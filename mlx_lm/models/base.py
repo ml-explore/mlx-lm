@@ -105,6 +105,59 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+def _turbo_scaled_dot_product_attention(
+    queries: mx.array,
+    q_keys: tuple[mx.array, mx.array],
+    q_values: tuple[mx.array, mx.array],
+    scale: float,
+    mask: Optional[mx.array],
+    mode: str,
+    group_size: int,
+) -> mx.array:
+    """SDPA for TurboQuant-compressed keys/values.
+
+    Rotates queries with a normalized WHT before calling the fused kernel.
+    The kernel handles causal masking, GQA fan-out, online softmax, and
+    the full attention reduction in one Metal pass.
+    """
+    import math
+
+    D = queries.shape[-1]
+    inv_sqrt_d = 1.0 / math.sqrt(D)
+
+    # WHT in float32 to match encoding precision (bfloat16 butterfly accumulates
+    # enough error to shift softmax peaks on large-scale models).
+    try:
+        from .turbo_metal import is_available, wht_rotate_metal
+        if is_available():
+            q_rot = wht_rotate_metal(queries, scale=inv_sqrt_d)
+        else:
+            raise ImportError
+    except (ImportError, Exception):
+        from .turbo_cache import _hadamard_transform
+        q_rot = _hadamard_transform(queries.astype(mx.float32), scale=inv_sqrt_d)
+        q_rot = q_rot.astype(queries.dtype)
+
+    k_packed, k_scales = q_keys
+    v_packed, v_scales = q_values
+
+    causal = mask == "causal" if isinstance(mask, str) else False
+    arr_mask = None if (mask is None or isinstance(mask, str)) else mask
+
+    return mx.fast.quantized_scaled_dot_product_attention(
+        q_rot,
+        k_packed,
+        k_scales,
+        v_packed,
+        v_scales,
+        scale=scale,
+        mask=arr_mask,
+        mode=mode,
+        group_size=group_size,
+        causal=causal,
+    )
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -114,7 +167,22 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
-    if hasattr(cache, "bits"):
+    from .turbo_cache import TurboQuantKVCache
+
+    if isinstance(cache, TurboQuantKVCache) and isinstance(keys, tuple):
+        if sinks is not None:
+            raise ValueError("TurboQuant SDPA does not support attention sinks.")
+        return _turbo_scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            mode=cache.mode,
+            group_size=cache.group_size,
+        )
+    elif hasattr(cache, "bits") and not isinstance(cache, TurboQuantKVCache):
+        # Standard QuantizedKVCache (affine/mxfp4/…)
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
         return quantized_scaled_dot_product_attention(

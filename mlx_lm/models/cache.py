@@ -40,6 +40,54 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
+def make_turbo_cache(
+    model: nn.Module,
+    bits: int = 3,
+    fp16_layers: int = 0,
+) -> List[Any]:
+    """Build a per-layer cache list using TurboQuant for full-attention layers.
+
+    Layers that use a linear-attention state (e.g. DeltaNet / SSM) are left
+    with their default cache type from the model's own ``make_cache()``.
+    Standard full-attention layers receive :class:`TurboQuantKVCache`.
+
+    The first and last ``fp16_layers`` attention layers keep a plain
+    :class:`KVCache` (float16) to preserve quality at sequence boundaries.
+
+    Args:
+        model: The language model (must expose ``.layers``).
+        bits: TurboQuant bit-width, 3 or 4.  Default: ``3``.
+        fp16_layers: Number of attention layers at each end to keep in
+            float16.  Default: ``0`` (all attention layers compressed).
+
+    Returns:
+        A list of cache objects, one per model layer.
+    """
+    from .turbo_cache import TurboQuantKVCache
+
+    # Start from the model's own cache (handles SSM/DeltaNet layers correctly)
+    base_caches = make_prompt_cache(model)
+
+    # Identify which positions are plain KVCache (full-attention layers)
+    attn_indices = [
+        i for i, c in enumerate(base_caches) if isinstance(c, KVCache)
+    ]
+
+    # Determine the turbo range (skip first and last fp16_layers).
+    # `-fp16_layers or None` handles fp16_layers=0: -0 == 0 which truncates
+    # the slice to empty, so we use None (meaning "to end") instead.
+    turbo_indices = set(attn_indices[fp16_layers : -fp16_layers or None])
+
+    caches = []
+    for i, c in enumerate(base_caches):
+        if i in turbo_indices:
+            caches.append(TurboQuantKVCache(bits=bits))
+        else:
+            caches.append(c)
+
+    return caches
+
+
 def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
     """
     Save a pre-computed prompt cache to a file.
