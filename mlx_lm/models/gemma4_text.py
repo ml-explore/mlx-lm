@@ -608,6 +608,21 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
+        import re as _re
+
+        # KV-shared layers reuse projections from an earlier layer and have no
+        # k_proj/v_proj/k_norm attributes.  The safetensors files still ship
+        # those tensors, so we drop them here to avoid a strict-load error.
+        # This is the complement of PR #1158, which stopped mlx-lm from
+        # creating unused projection slots for these layers.
+        _cfg = getattr(self, "config", None) or getattr(self, "args", None)
+        if _cfg is not None:
+            first_kv_shared = (
+                _cfg.num_hidden_layers - _cfg.num_kv_shared_layers
+            )
+        else:
+            first_kv_shared = 0
+
         sanitized = {}
         for k, v in weights.items():
             if any(
@@ -620,6 +635,10 @@ class Model(nn.Module):
                     "output_min",
                 )
             ):
+                continue
+
+            m = _re.search(r"\.layers\.(\d+)\.self_attn\.(k_proj|v_proj|k_norm)\.", k)
+            if m and int(m.group(1)) >= first_kv_shared:
                 continue
 
             if k.endswith(".experts.gate_up_proj"):
