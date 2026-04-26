@@ -232,7 +232,9 @@ class Attention(nn.Module):
             if mask is not None and not isinstance(mask, str):
                 pad_shape = list(mask.shape)
                 pad_shape[-1] = n_comp
-                pad_mask = mx.zeros(pad_shape, dtype=mask.dtype)
+                # Compressed positions are always visible: True for bool masks, 0 for additive.
+                fill = True if mask.dtype == mx.bool_ else 0
+                pad_mask = mx.full(pad_shape, fill, dtype=mask.dtype)
                 mask = mx.concatenate([pad_mask, mask], axis=-1)
 
         k = kv[:, None, :, :]
