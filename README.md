@@ -234,6 +234,41 @@ requests that use the same context. See the
 [example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
 for more usage details.
 
+### Disk-Backed Prompt Cache (server)
+
+`mlx_lm.server` can persist its in-memory prompt cache to disk so that prompts cached during a previous server lifetime survive restarts. This dramatically reduces first-message latency on long system prompts (e.g., agentic CLIs that prepend tool definitions).
+
+The feature is **off by default**. To enable, pass a directory:
+
+```bash
+mlx_lm.server --model <model> --prompt-cache-disk-dir /path/to/cache
+```
+
+Useful flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--prompt-cache-disk-dir <path>` | none | Enables the feature |
+| `--prompt-cache-disk-bytes <int>` | `100GB` | Per-model size cap (accepts `100GB`, `4TB`, etc.) |
+| `--prompt-cache-disk-fsync` | off | fsync before atomic rename (slower, durable to power loss) |
+| `--prompt-cache-disk-write-queue-size <int>` | 4 | In-flight async writes |
+| `--prompt-cache-disk-warm <mode>` | `lazy` | `lazy` or `eager-top-N` |
+| `--prompt-cache-disk-eviction-headroom <float>` | `0.95` | Evict to this fraction of cap |
+
+Each model has an isolated namespace on disk keyed by a content hash of its weights index, tokenizer, and chat template — switching models doesn't contaminate caches.
+
+For inspection / pruning:
+
+```bash
+python -m mlx_lm.cache_admin stats /path/to/cache
+python -m mlx_lm.cache_admin list /path/to/cache --model <model-id>
+python -m mlx_lm.cache_admin prune /path/to/cache --older-than 30d
+python -m mlx_lm.cache_admin verify /path/to/cache
+python -m mlx_lm.cache_admin remove /path/to/cache --model <model-id>
+```
+
+See `docs/disk_prompt_cache.md` for the design overview.
+
 ### Supported Models
 
 `mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
