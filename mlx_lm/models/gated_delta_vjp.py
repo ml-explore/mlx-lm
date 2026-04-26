@@ -147,7 +147,7 @@ def gated_delta_update_vjp(
         k = mx.repeat(k, repeat_factor, axis=-2)
 
     if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     # Chunked forward; each chunk is a pure function of the incoming state,
     # so autodiff propagates gradients correctly across the recurrence.

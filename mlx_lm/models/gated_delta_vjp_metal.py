@@ -748,7 +748,7 @@ def gated_delta_update_vjp_metal(
         k = mx.repeat(k, rf, axis=-2)
 
     if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     # Chunked to bound state_history memory.
     ys = []

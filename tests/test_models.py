@@ -3312,6 +3312,45 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(y_py, y_mx, atol=1e-3, rtol=1e-4))
         self.assertTrue(mx.allclose(st_py, st_mx, atol=1e-3, rtol=1e-4))
 
+    def test_gated_delta_vjp_metal_gradients_match_python(self):
+        if not mx.metal.is_available():
+            return
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+        from mlx_lm.models.gated_delta_vjp_metal import (
+            gated_delta_update_vjp_metal,
+        )
+
+        mx.random.seed(1)
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32) * 0.1
+        a = mx.random.normal(shape=(B, T, Hv)) * 0.1
+        b = mx.random.normal(shape=(B, T, Hv)) * 0.1
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        cot_y = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.01
+        cot_s = mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.01
+
+        def make_loss(fn):
+            def loss(q_, k_, v_, a_, b_, A_log_, dt_bias_, state_):
+                y, s = fn(q_, k_, v_, a_, b_, A_log_, dt_bias_, state_)
+                return (y * cot_y).sum() + (s * cot_s).sum()
+
+            return loss
+
+        argnums = (0, 1, 2, 3, 4, 5, 6, 7)
+        grad_py = mx.grad(make_loss(gated_delta_update_vjp), argnums=argnums)
+        grad_mx = mx.grad(make_loss(gated_delta_update_vjp_metal), argnums=argnums)
+
+        gs_py = grad_py(q, k, v, a, b, A_log, dt_bias, state0)
+        gs_mx = grad_mx(q, k, v, a, b, A_log, dt_bias, state0)
+        for g_py, g_mx in zip(gs_py, gs_mx):
+            self.assertTrue(mx.allclose(g_py, g_mx, atol=1e-3, rtol=1e-3))
+
 
 if __name__ == "__main__":
     unittest.main()
