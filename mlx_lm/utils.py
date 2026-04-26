@@ -172,6 +172,31 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
+def _compressed_tensors_config(quantization_config: Dict[str, Any]) -> Dict[str, Any]:
+    config_groups = quantization_config.get("config_groups")
+    if not config_groups:
+        # Default quantization settings
+        return {"group_size": 32, "bits": 4, "mode": "affine"}
+
+    # Use first config group for parameters
+    first_group = next(iter(config_groups.values()))
+    weights_config = first_group.get("weights", {})
+
+    format_type = quantization_config.get("format")
+    weights_type = weights_config.get("type")
+
+    if format_type == "pack-quantized" and weights_type == "int":
+        return {
+            "group_size": weights_config.get("group_size", 32),
+            "bits": weights_config.get("num_bits", 4),
+            "mode": "affine",
+        }
+
+    raise ValueError(
+        f"Unsupported compressed-tensors quantization format: {format_type}"
+    )
+
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -378,7 +403,7 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            quantization = _compressed_tensors_config(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
