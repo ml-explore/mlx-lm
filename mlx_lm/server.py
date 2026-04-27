@@ -10,7 +10,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field, asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -290,9 +290,12 @@ class TimeBudget:
 
 
 class ModelProvider:
-    def __init__(self, cli_args: argparse.Namespace):
+    def __init__(self, cli_args: MLXServerConfig):
         """Load models on demand and persist them across the whole process."""
         self.cli_args = cli_args
+        self.cli_args.temp = getattr(cli_args, "temperature", 0.7)
+        self.cli_args.num_tokens = getattr(cli_args, "max_tokens", 100)
+        self.cli_args.allowed_origins = [getattr(cli_args, "allowed_origin", "*")]
         self.model_key = None
         self.model = None
         self.tokenizer = None
@@ -1739,6 +1742,11 @@ def run(
     server_class=ThreadingHTTPServer,
     handler_class=APIHandler,
 ):
+
+    if mx.metal.is_available():
+        wired_limit = mx.device_info()["max_recommended_working_set_size"]
+        mx.set_wired_limit(wired_limit)
+
     group = mx.distributed.init()
     prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
@@ -1747,6 +1755,87 @@ def run(
     else:
         response_generator.join()
 
+
+@dataclass
+class MLXServerConfig:
+    # --- Model Configuration ---
+    model: str
+    adapter_path: Optional[str] = None
+    trust_remote_code: bool = True
+    eos_token: Optional[str] = None
+
+    # --- Network / Server Settings ---
+    host: str = "127.0.0.1"
+    port: int = 8080
+    allowed_origin: str = "*"
+    allowed_origins: List[str] = field(default_factory=lambda: ["*"])
+    server_class: str = "ThreadingHTTPServer"
+
+    # --- Generation Parameters ---
+    max_tokens: int = 100
+    temperature: float = 0.7
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    repetition_penalty: Optional[float] = None
+    repetition_context_size: int = 20
+
+    # --- Speculative Decoding (Cruciale per evitare AttributeError) ---
+    draft_model: Optional[str] = None
+    draft_model_ntp_threshold: float = 0.5
+    num_draft_tokens: int = 10
+
+    # --- Batching & Concurrency (I nuovi arrivati) ---
+    decode_concurrency: int = 1
+    prompt_concurrency: int = 1
+    prompt_batch_size: int = 1
+    prefill_step_size: int = 32
+
+    # --- Cache & quantization ---
+    kv_bits: Optional[int] = None
+    kv_group_size: int = 64
+    cache_limit_gb: Optional[int] = None
+    prompt_cache_bytes: Optional[int] = None
+    max_kv_size: Optional[int] = None
+
+    # --- Performance & Resources ---
+    num_layers: Optional[int] = None
+    prompt_cache_size: int = 10
+    log_level: str = "INFO"
+
+    # --- UI / Chat Templates ---
+    chat_template: Optional[str] = None
+    chat_template_args: Dict[str, Any] = field(default_factory=dict)
+    use_default_chat_template: bool = False
+
+
+    @classmethod
+    def from_args(cls, args):
+        config_dict = {}
+        for field_name in cls.__dataclass_fields__:
+            if hasattr(args, field_name):
+                config_dict[field_name] = getattr(args, field_name)
+
+        config = cls(**config_dict)
+        config.temp = config.temperature
+        config.num_tokens = config.max_tokens
+        config.allowed_origins = [config.allowed_origin]
+        return config
+
+
+def run_server(config: MLXServerConfig):
+    logging.basicConfig(
+        level=getattr(logging, config.log_level.upper(), None),
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    run(
+        config.host,
+        config.port,
+        ModelProvider(config),
+        server_class=ThreadingHTTPServer,
+        handler_class=APIHandler,
+    )
 
 def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
@@ -1885,15 +1974,14 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
-    if mx.metal.is_available():
-        wired_limit = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_wired_limit(wired_limit)
+
+    mlx_config =  MLXServerConfig.from_args(args)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    run(args.host, args.port, ModelProvider(args))
+    run(mlx_config.host, mlx_config.port, ModelProvider(mlx_config))
 
 
 if __name__ == "__main__":
