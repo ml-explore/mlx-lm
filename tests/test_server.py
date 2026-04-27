@@ -19,7 +19,7 @@ from mlx_lm.server import (
     _process_control_tokens,
 )
 from mlx_lm.utils import load
-
+from mlx_lm.server import MLXServerConfig, ModelProvider
 
 class DummyModelProvider:
     def __init__(self, with_draft=False):
@@ -684,6 +684,32 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+    def test_config_initialization(self):
+        config = MLXServerConfig(model="test_model")
+        self.assertEqual(config.model, "test_model")
+        self.assertEqual(config.allowed_origins, ["*"])
+        self.assertIsInstance(config.chat_template_args, dict)
+
+    def test_model_provider_compatibility(self):
+        config = MLXServerConfig(model="test_model", temperature=0.5)
+        provider = ModelProvider(config)
+
+        # Verifica che gli alias siano stati creati nell'istanza
+        self.assertEqual(provider.cli_args.temp, 0.5)
+        self.assertEqual(provider.cli_args.allowed_origins, ["*"])
+
+    def test_from_args_filtering(self):
+        class Args:
+            model = "path/to/model"
+            temperature = 0.8
+            not_a_config_param = "ignore_me"
+
+        args = Args()
+        config = MLXServerConfig.from_args(args)
+        self.assertEqual(config.model, "path/to/model")
+        self.assertEqual(config.temperature, 0.8)
+        self.assertFalse(hasattr(config, "not_a_config_param"))
 
 
 if __name__ == "__main__":
