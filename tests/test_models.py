@@ -1464,6 +1464,19 @@ class TestModels(unittest.TestCase):
             for x, y in zip(expected, actual):
                 self.assertTrue(mx.allclose(x, y, rtol=1e-5, atol=1e-5))
 
+        # Expand test
+        post = mx.random.normal((2, 3, 4), dtype=mx.float32)
+        block_out = mx.random.normal((2, 3, 8), dtype=mx.bfloat16)
+        comb = mx.random.normal((2, 3, 4, 4), dtype=mx.float32)
+        residual = mx.random.normal((2, 3, 4, 8), dtype=mx.bfloat16)
+        expected = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+        expected = expected + mx.matmul(
+            comb.swapaxes(-1, -2), residual.astype(mx.float32)
+        )
+        expected = expected.astype(block_out.dtype)
+        actual = deepseek_v4._hc_expand_op(post, block_out, comb, residual)
+        self.assertTrue(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5))
+
         # Model test
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",

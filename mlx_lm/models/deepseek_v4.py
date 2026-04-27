@@ -644,7 +644,7 @@ def _hc_expand_op(
     residual: mx.array,
 ) -> mx.array:
     y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
-    y = y + mx.matmul(comb, residual.astype(mx.float32))
+    y = y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))
     return y.astype(block_out.dtype)
 
 
