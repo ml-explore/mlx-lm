@@ -1797,6 +1797,36 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_hy_v3(self):
+        from mlx_lm.models import hy_v3
+
+        args = hy_v3.ModelArgs(
+            model_type="hy_v3",
+            vocab_size=1024,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            expert_hidden_dim=128,
+            first_k_dense_replace=1,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
+            router_scaling_factor=2.0,
+            qk_norm=True,
+            route_norm=True,
+            moe_router_use_sigmoid=True,
+            moe_router_enable_expert_bias=True,
+        )
+        model = hy_v3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_hunyuan_v1_dense(self):
         from mlx_lm.models import hunyuan_v1_dense
 
