@@ -347,11 +347,17 @@ def load_model(
 
     def _quantize(quantization):
         def class_predicate(p, m):
+            # Skip layers already quantized at construction time (e.g. a
+            # model that pre-quantizes specific projections in its
+            # `__init__`). Without this guard the per-layer override
+            # branch below would return a quant config and `nn.quantize`
+            # would try to re-quantize the already-`Quantized*` module,
+            # raising "Unable to quantize model of type ...".
+            if not hasattr(m, "to_quantized"):
+                return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
             return f"{p}.scales" in weights
 
         nn.quantize(
