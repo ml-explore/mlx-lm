@@ -3220,6 +3220,166 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def test_gated_delta_vjp_forward_equivalence(self):
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+
+        mx.random.seed(0)
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 16, 8
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32)
+        a = -5.0 + mx.random.normal(shape=(B, T, Hv)) * 0.1
+        b = mx.random.normal(shape=(B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        y_ref, st_ref = gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias, state0, use_kernel=False
+        )
+        y_vjp, st_vjp = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state0)
+        self.assertTrue(mx.allclose(y_vjp, y_ref, atol=1e-5, rtol=1e-5))
+        self.assertTrue(mx.allclose(st_vjp, st_ref, atol=1e-5, rtol=1e-5))
+
+    def test_gated_delta_vjp_fd_gradient(self):
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+
+        mx.random.seed(0)
+        B, T, Hk, Hv, Dk, Dv = 1, 4, 2, 4, 8, 8
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32) * 0.1
+        a = mx.zeros((B, T, Hv))
+        b = mx.zeros((B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        cot_y = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.01
+        cot_s = mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.01
+
+        def loss(q_, k_, v_):
+            y, s = gated_delta_update_vjp(q_, k_, v_, a, b, A_log, dt_bias, state0)
+            return (y * cot_y).sum() + (s * cot_s).sum()
+
+        grad_fn = mx.grad(loss, argnums=(0, 1, 2))
+        gq, _gk, _gv = grad_fn(q, k, v)
+
+        eps = 1e-3
+        q_np = q.tolist()
+        for idx in [(0, 0, 0, 0), (0, 2, 1, 3), (0, 3, 0, 5)]:
+            qp_list = [[[row[:] for row in head] for head in batch] for batch in q_np]
+            qm_list = [[[row[:] for row in head] for head in batch] for batch in q_np]
+            qp_list[idx[0]][idx[1]][idx[2]][idx[3]] += eps
+            qm_list[idx[0]][idx[1]][idx[2]][idx[3]] -= eps
+            qp = mx.array(qp_list)
+            qm = mx.array(qm_list)
+            lp = loss(qp, k, v)
+            lm = loss(qm, k, v)
+            fd = (lp - lm) / (2 * eps)
+            self.assertAlmostEqual(float(fd), float(gq[idx]), delta=1e-3)
+
+    def test_gated_delta_vjp_metal_matches_python(self):
+        if not mx.metal.is_available():
+            return
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+        from mlx_lm.models.gated_delta_vjp_metal import (
+            gated_delta_update_vjp_metal,
+        )
+
+        mx.random.seed(0)
+        # Dk must be a multiple of 32 (SIMD lane count in the Metal kernel).
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32)
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32)
+        a = -5.0 + mx.random.normal(shape=(B, T, Hv)) * 0.1
+        b = mx.random.normal(shape=(B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        y_py, st_py = gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state0)
+        y_mx, st_mx = gated_delta_update_vjp_metal(
+            q, k, v, a, b, A_log, dt_bias, state0
+        )
+        # Metal SIMD-level reductions differ from the Python serial reduction
+        # by fp32 rounding; agreement is within machine precision but not
+        # bit-exact.
+        self.assertTrue(mx.allclose(y_py, y_mx, atol=1e-3, rtol=1e-4))
+        self.assertTrue(mx.allclose(st_py, st_mx, atol=1e-3, rtol=1e-4))
+
+    def test_gated_delta_vjp_metal_gradients_match_python(self):
+        if not mx.metal.is_available():
+            return
+        from mlx_lm.models.gated_delta_vjp import gated_delta_update_vjp
+        from mlx_lm.models.gated_delta_vjp_metal import (
+            gated_delta_update_vjp_metal,
+        )
+
+        mx.random.seed(1)
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32) * 0.1
+        a = mx.random.normal(shape=(B, T, Hv)) * 0.1
+        b = mx.random.normal(shape=(B, T, Hv)) * 0.1
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+        state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        cot_y = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.01
+        cot_s = mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.01
+
+        def make_loss(fn):
+            def loss(q_, k_, v_, a_, b_, A_log_, dt_bias_, state_):
+                y, s = fn(q_, k_, v_, a_, b_, A_log_, dt_bias_, state_)
+                return (y * cot_y).sum() + (s * cot_s).sum()
+
+            return loss
+
+        argnums = (0, 1, 2, 3, 4, 5, 6, 7)
+        grad_py = mx.grad(make_loss(gated_delta_update_vjp), argnums=argnums)
+        grad_mx = mx.grad(make_loss(gated_delta_update_vjp_metal), argnums=argnums)
+
+        gs_py = grad_py(q, k, v, a, b, A_log, dt_bias, state0)
+        gs_mx = grad_mx(q, k, v, a, b, A_log, dt_bias, state0)
+        for g_py, g_mx in zip(gs_py, gs_mx):
+            self.assertTrue(mx.allclose(g_py, g_mx, atol=1e-3, rtol=1e-3))
+
+    def test_gated_delta_vjp_bf16_default_state(self):
+        """bf16 inputs with the default fp32 recurrent state must compile
+        and produce finite gradients through the public training route.
+        """
+        if not mx.metal.is_available():
+            return
+        from mlx_lm.models.gated_delta import gated_delta_update
+
+        mx.random.seed(2)
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.bfloat16)
+        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.bfloat16)
+        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.bfloat16)
+        a = (-5.0 + mx.random.normal(shape=(B, T, Hv)) * 0.1).astype(mx.bfloat16)
+        b = mx.random.normal(shape=(B, T, Hv)).astype(mx.bfloat16)
+        A_log = mx.zeros((Hv,)).astype(mx.bfloat16)
+        dt_bias = mx.ones((Hv,)).astype(mx.bfloat16)
+        cot_y = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.bfloat16) * 0.01
+
+        def loss(q_, k_, v_):
+            y, _ = gated_delta_update(q_, k_, v_, a, b, A_log, dt_bias, training=True)
+            return (y.astype(mx.float32) * cot_y.astype(mx.float32)).sum()
+
+        gq, gk, gv = mx.grad(loss, argnums=(0, 1, 2))(q, k, v)
+        self.assertTrue(bool(mx.isfinite(gq).all()))
+        self.assertTrue(bool(mx.isfinite(gk).all()))
+        self.assertTrue(bool(mx.isfinite(gv).all()))
+
 
 if __name__ == "__main__":
     unittest.main()
