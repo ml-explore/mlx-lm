@@ -257,6 +257,65 @@ model, tokenizer = load(
 )
 ```
 
+### Server
+
+`mlx-lm` includes an OpenAI-compatible HTTP server:
+
+```bash
+mlx_lm.server --model mlx-community/Qwen3.6-35B-A3B-4bit --port 8080
+```
+
+The server supports the following endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /v1/models` | List available models |
+| `POST /v1/chat/completions` | Chat Completions API |
+| `POST /v1/completions` | Text Completions API |
+| `POST /v1/responses` | **Responses API** (new) |
+
+#### Responses API
+
+The `/v1/responses` endpoint implements the [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses), enabling compatibility with clients that require this format (e.g., [Codex CLI](https://github.com/openai/codex)).
+
+Features:
+- Translates Responses API requests to the internal Chat Completions pipeline
+- Supports both streaming (SSE) and non-streaming responses
+- Handles native tool calls via the model's tool parser
+- Fallback parsing for models that emit tool calls as plain text JSON
+- Consolidates system/developer messages at the start of the conversation
+- Filters unsupported tool types (web_search, image_generation, namespace)
+
+**Example usage with Codex CLI:**
+
+```toml
+# ~/.codex/config.toml
+model_provider = "mlx-local"
+model = "mlx-community/Qwen3.6-35B-A3B-4bit"
+
+[model_providers.mlx-local]
+name = "MLX Local"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+```
+
+**Server options for optimal performance:**
+
+```bash
+mlx_lm.server \
+  --model mlx-community/Qwen3.6-35B-A3B-4bit \
+  --port 8080 \
+  --max-tokens 8192 \
+  --prompt-cache-size 10 \
+  --prefill-step-size 4096
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--max-tokens` | 512 | Maximum tokens to generate per response |
+| `--prompt-cache-size` | 1 | Number of KV caches to keep (increase for multiple sessions) |
+| `--prefill-step-size` | 2048 | Tokens processed per prefill step (increase for faster prompt processing) |
+
 ### Large Models
 
 > [!NOTE]
