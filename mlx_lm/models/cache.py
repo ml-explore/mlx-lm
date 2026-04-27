@@ -1626,6 +1626,7 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+        token_hash: Optional[str] = None  # pre-computed disk hash, avoids re-hashing
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1656,13 +1657,20 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        *,
+        disk: Optional[Any] = None,  # type: Optional["DiskPromptCache"]
+    ):
         self.max_size = max_size
         self.max_bytes = max_bytes
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        self.disk = disk
 
     def __len__(self):
         return len(self._lru)
@@ -1672,26 +1680,121 @@ class LRUPromptCache:
         return self._n_bytes
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
-        result = self._trie.search(model, tokens)
+        ram_result = self._trie.search(model, tokens)
+        if self.disk is None:
+            # Fast path — original behavior, byte-identical
+            return self._serve_ram_match(model, tokens, ram_result)
+
+        # Two-tier path
+        ram_quality = self._classify(ram_result, tokens)
+
+        # Exact RAM hit: disk cannot possibly be better (quality 3 is the max).
+        # Skip the disk trie search entirely; only touch the disk entry's mtime.
+        # The token_hash is pre-computed and stored in the CacheEntry to avoid
+        # recomputing SHA256 on every fetch.
+        if ram_quality[0] == 3:
+            entry = self._trie.get(model, tokens)
+            if entry.token_hash is not None:
+                self.disk.touch_async(entry.token_hash)
+            return copy.deepcopy(entry.prompt_cache), []
+
+        # Non-exact RAM hit: search disk trie + update its mtime in one lock
+        # acquisition (search_and_touch) to avoid two separate lock round-trips.
+        disk_result, _touched = self.disk.search_and_touch(tokens)
+        disk_quality = self._classify(disk_result, tokens)
+
+        # Prefer the better match; tie → RAM
+        if disk_quality > ram_quality:
+            return self._serve_disk_match(model, tokens, disk_result)
+
+        # Use RAM. Touch the served entry on disk if we haven't already.
+        served = self._serve_ram_match(model, tokens, ram_result)
+        if ram_quality[0] > 0 and _touched is None:
+            # Determine which token sequence we actually served from
+            served_tokens = None
+            if ram_result.exact is not None:
+                served_tokens = ram_result.exact
+            elif ram_result.longer is not None and ram_result.common_prefix > (
+                len(ram_result.shorter) if ram_result.shorter else 0
+            ):
+                served_tokens = ram_result.longer
+            elif ram_result.shorter is not None:
+                served_tokens = ram_result.shorter
+            if served_tokens is not None:
+                from ..disk_prompt_cache import hash_tokens as _ht
+
+                self.disk.touch_async(_ht(served_tokens))
+        return served
+
+    @staticmethod
+    def _classify(result, tokens):
+        """Return a (quality, length) tuple ranking how good this match is.
+
+        Higher is better. Quality:
+            3 = exact match
+            2 = longer-trimmed (a longer cached entry we'd trim back)
+            1 = shorter prefix
+            0 = no match
+        """
+        if result is None:
+            return (0, 0)
+        if getattr(result, "exact", None) is not None:
+            return (3, len(result.exact))
+        short_length = (
+            len(result.shorter) if getattr(result, "shorter", None) is not None else 0
+        )
+        if (
+            getattr(result, "longer", None) is not None
+            and getattr(result, "common_prefix", 0) > short_length
+        ):
+            return (2, result.common_prefix)
+        if getattr(result, "shorter", None) is not None:
+            return (1, len(result.shorter))
+        return (0, 0)
+
+    def _serve_ram_match(self, model, tokens, result):
+        """Serve a match using the in-memory trie. This is the original
+        ``fetch_nearest_cache`` logic, factored out so the two-tier path can
+        reuse it.
+        """
         if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            entry = self._trie.get(result.model, result.exact)
+            return copy.deepcopy(entry.prompt_cache), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
-            cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+            entry = self._trie.get(result.model, result.longer)
+            if can_trim_prompt_cache(entry.prompt_cache):
+                cache = copy.deepcopy(entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
         if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            entry = self._trie.get(result.model, result.shorter)
+            return copy.deepcopy(entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
+
+    def _serve_disk_match(self, model, tokens, result):
+        """Materialize a disk match: load the deepest-matching leaf, promote
+        into RAM via insert_cache, touch its mtime, then serve via the RAM
+        path which handles trimming/prefilling correctly.
+        """
+        target_tokens = result.exact or result.longer or result.shorter
+        if target_tokens is None:
+            return None, tokens
+        leaf = self.disk._trie.get(self.disk.model_id, target_tokens)
+        loaded_cache, _meta = self.disk.load(leaf.token_hash)
+        # Promote into RAM trie. cache_type defaults to "assistant" — the
+        # disk record doesn't carry the original cache_type.
+        self.insert_cache(model, target_tokens, loaded_cache, cache_type="assistant")
+        # Touch disk mtime
+        self.disk.touch_async(leaf.token_hash)
+        # Now serve via the RAM path (entry is in RAM at target_tokens)
+        new_result = self._trie.search(model, tokens)
+        return self._serve_ram_match(model, tokens, new_result)
 
     def insert_cache(
         self,
@@ -1702,8 +1805,13 @@ class LRUPromptCache:
         cache_type: str = "assistant",
     ):
         # Make the cache entry
+        token_hash = None
+        if self.disk is not None and tokens:
+            from ..disk_prompt_cache import hash_tokens as _ht
+
+            token_hash = _ht(tokens)
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
+            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type, token_hash
         )
 
         # Insert into the trie and update the byte counter and lru position
@@ -1735,6 +1843,45 @@ class LRUPromptCache:
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+
+        # Disk tier write-through (no-op if disk=None)
+        if self.disk is not None:
+            try:
+                # Force evaluation in the calling thread (which has a GPU
+                # stream context). The writer thread spawned by
+                # DiskPromptCache.start() lacks a stream context, so any
+                # lazy mx.array access would raise
+                # RuntimeError: There is no Stream(gpu, 0) in current thread.
+                import mlx.core as _mx_core
+
+                from ..disk_prompt_cache import WriteJob, hash_tokens
+
+                _mx_core.eval([c.state for c in prompt_cache])
+
+                parents = (
+                    self.disk.find_dominated_prefixes(tokens)
+                    if can_trim_prompt_cache(prompt_cache)
+                    else []
+                )
+                self.disk.enqueue_write(
+                    WriteJob(
+                        token_hash=hash_tokens(tokens),
+                        tokens=list(tokens),
+                        prompt_cache=prompt_cache,
+                        cache_type_classes=[type(c).__name__ for c in prompt_cache],
+                        trimmable=can_trim_prompt_cache(prompt_cache),
+                        parents_to_evict=parents,
+                        model_id=self.disk.model_id,
+                    )
+                )
+            except Exception as e:
+                # Disk-tier failures must never break in-memory cache.
+                import logging
+
+                logging.getLogger("mlx_lm.prompt_cache.disk").error(
+                    "insert_cache → disk enqueue failed: %r",
+                    e,
+                )
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
