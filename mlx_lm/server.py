@@ -875,9 +875,36 @@ class ResponseGenerator:
     def _serve_single(self, request):
         rqueue, request, args = request
 
-        # Define the progress callback
+        # Progress state shared between callback and try block
+        _checkpoint_state = {"last": 0, "ctx": None, "cache_key": None, "cache": None}
+        _checkpoint_interval = 32768  # save checkpoint every 32K tokens
+
         def progress(tokens_processed, tokens_total):
             rqueue.put((tokens_processed, tokens_total))
+            s = _checkpoint_state
+            if (
+                s["cache"] is not None
+                and tokens_processed - s["last"] >= _checkpoint_interval
+                and tokens_processed < tokens_total
+                and tokens_processed > 0
+            ):
+                s["last"] = tokens_processed
+                try:
+                    n_cached = s["ctx"].prompt_cache_count + tokens_processed
+                    # Save directly to cache without quantization.
+                    # _store_cache would quantize in-place and break
+                    # ongoing prefill. insert_cache is safe because
+                    # _save_to_disk reads c.state synchronously before
+                    # the next prefill chunk modifies the arrays.
+                    self.prompt_cache.insert_cache(
+                        self.model_provider.model_key,
+                        s["cache_key"][:n_cached],
+                        s["cache"],
+                        cache_type="user",
+                    )
+                    logging.info(f"Prefill checkpoint saved: {n_cached} tokens")
+                except Exception as e:
+                    logging.debug(f"Checkpoint save failed: {e}")
 
         try:
             # Load the model and tokenizer
@@ -930,6 +957,11 @@ class ResponseGenerator:
                 # Dequantize for stream_generate compatibility (single-serve
                 # path doesn't support quantized cache in generate_step)
                 cache = _maybe_dequantize_cache(cache)
+
+            # Enable prefill checkpoints now that cache/ctx are ready
+            _checkpoint_state["ctx"] = ctx
+            _checkpoint_state["cache_key"] = cache_key
+            _checkpoint_state["cache"] = cache
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
