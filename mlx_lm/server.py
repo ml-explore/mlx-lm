@@ -1106,6 +1106,8 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/responses": self.handle_responses,
+            "/responses": self.handle_responses,
         }
 
         if self.path not in request_factories:
@@ -1199,7 +1201,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Create the completion request
         request = request_factories[self.path]()
-        self.handle_completion(request, stop_words)
+        if self.object_type == "response":
+            self.handle_responses_completion(request, stop_words)
+        else:
+            self.handle_completion(request, stop_words)
 
     def _validate(
         self,
@@ -1575,6 +1580,572 @@ class APIHandler(BaseHTTPRequestHandler):
                 "cached_tokens": prompt_cache_count,
             }
         return response
+
+    def handle_responses(self) -> CompletionRequest:
+        """
+        Parse an OpenAI Responses API request and return a CompletionRequest.
+
+        Translates the Responses API schema to the internal chat-completion
+        representation so the existing generation pipeline can be reused.
+
+        Responses API reference:
+          https://platform.openai.com/docs/api-reference/responses
+        """
+        body = self.body
+        self.request_id = f"resp_{uuid.uuid4().hex}"
+        self.object_type = "response"
+
+        if "max_output_tokens" in body:
+            self.max_tokens = body["max_output_tokens"]
+
+        # Collect all system/developer messages first, then non-system messages.
+        # Many models require system messages only at the beginning.
+        system_parts = []
+        non_system_messages = []
+
+        instructions = body.get("instructions")
+        if instructions:
+            system_parts.append(instructions)
+
+        inp = body.get("input", "")
+        if isinstance(inp, str):
+            non_system_messages.append({"role": "user", "content": inp})
+        elif isinstance(inp, list):
+            for item in inp:
+                if isinstance(item, dict):
+                    item_type = item.get("type", "")
+                    if item_type == "message":
+                        content = item.get("content", "")
+                        if isinstance(content, list):
+                            parts = []
+                            for c in content:
+                                if isinstance(c, dict):
+                                    text = c.get("text", "")
+                                    if text:
+                                        parts.append(text)
+                                elif isinstance(c, str):
+                                    parts.append(c)
+                            content = "\n".join(parts) if parts else ""
+                        role = item.get("role", "user")
+                        if role in ("developer", "system"):
+                            system_parts.append(content)
+                            continue
+                        non_system_messages.append(
+                            {"role": role, "content": content}
+                        )
+                    elif item_type == "function_call":
+                        non_system_messages.append(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": item.get("call_id", ""),
+                                        "type": "function",
+                                        "function": {
+                                            "name": item.get("name", ""),
+                                            "arguments": item.get(
+                                                "arguments", "{}"
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        )
+                    elif item_type == "function_call_output":
+                        non_system_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": item.get("call_id", ""),
+                                "content": item.get("output", ""),
+                            }
+                        )
+                    elif "role" in item:
+                        role = item.get("role", "user")
+                        if role in ("developer", "system"):
+                            system_parts.append(item.get("content", ""))
+                        else:
+                            non_system_messages.append(item)
+                else:
+                    non_system_messages.append(
+                        {"role": "user", "content": str(item)}
+                    )
+
+        # Build final messages: single system message at start + rest
+        messages = []
+        if system_parts:
+            messages.append(
+                {"role": "system", "content": "\n\n".join(system_parts)}
+            )
+        messages.extend(non_system_messages)
+
+        # Convert Responses API tools to Chat Completions format and filter
+        # unsupported types (web_search, image_generation, namespace, etc.).
+        # Responses API: {"type": "function", "name": ..., "parameters": ...}
+        # Chat Completions: {"type": "function", "function": {"name": ...}}
+        raw_tools = body.get("tools") or None
+        if raw_tools:
+            converted_tools = []
+            for tool in raw_tools:
+                tool_type = tool.get("type", "")
+                if tool_type == "function" and "function" not in tool:
+                    converted_tools.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": tool.get("name", ""),
+                                "description": tool.get("description", ""),
+                                "parameters": tool.get("parameters", {}),
+                                **(
+                                    {"strict": tool["strict"]}
+                                    if "strict" in tool
+                                    else {}
+                                ),
+                            },
+                        }
+                    )
+                elif tool_type == "function" and "function" in tool:
+                    converted_tools.append(tool)
+                else:
+                    logging.debug(
+                        f"Skipping unsupported tool type: {tool_type} "
+                        f"({tool.get('name', 'unnamed')})"
+                    )
+            raw_tools = converted_tools or None
+
+        return CompletionRequest(
+            "chat",
+            "",
+            messages,
+            raw_tools,
+            body.get("role_mapping"),
+        )
+
+    def handle_responses_completion(
+        self, request: CompletionRequest, stop_words: List[str]
+    ):
+        """
+        Generate and send a response in OpenAI Responses API format.
+
+        Supports both text and tool-call outputs. Streaming emits the
+        following SSE event sequence:
+
+          response.created ->
+          response.output_item.added -> response.content_part.added ->
+          response.output_text.delta (N) -> response.output_text.done ->
+          response.content_part.done -> response.output_item.done ->
+          [response.output_item.added ->
+           response.function_call_arguments.delta ->
+           response.function_call_arguments.done ->
+           response.output_item.done] (per tool call) ->
+          response.completed
+
+        Non-streaming returns the full response object in one JSON payload.
+        """
+        args = GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+                presence_penalty=self.presence_penalty,
+                presence_context_size=self.presence_context_size,
+                frequency_penalty=self.frequency_penalty,
+                frequency_context_size=self.frequency_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=False,
+            top_logprobs=-1,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+
+        def keepalive_callback(processed, total):
+            logging.info(f"Prompt processing progress: {processed}/{total}")
+            if self.stream:
+                self.wfile.write(
+                    f": keepalive {processed}/{total}\n\n".encode()
+                )
+                self.wfile.flush()
+
+        try:
+            ctx, response_gen = self.response_generator.generate(
+                request, args, progress_callback=keepalive_callback
+            )
+        except Exception as e:
+            logging.error(f"handle_responses_completion error: {e}")
+            self._set_completion_headers(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
+        # Tool call formatter (reuses the model's native tool parser)
+        tool_formatter = ToolCallFormatter(
+            ctx.tool_parser, request.tools, False
+        )
+
+        msg_id = f"msg_{uuid.uuid4().hex}"
+        full_text = ""
+        tokens = []
+        finish_reason = "stop"
+        prev_state = None
+        tool_text = ""
+        tool_calls_raw = []
+        made_tool_call = False
+
+        if self.stream:
+            self._set_stream_headers(200)
+            self.end_headers()
+            self.wfile.write(
+                self._sse_event(
+                    "response.created",
+                    {
+                        "type": "response.created",
+                        "response": {
+                            "id": self.request_id,
+                            "object": "response",
+                            "status": "in_progress",
+                            "model": self.requested_model,
+                            "output": [],
+                        },
+                    },
+                )
+            )
+            self.wfile.write(
+                self._sse_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "status": "in_progress",
+                        },
+                    },
+                )
+            )
+            self.wfile.write(
+                self._sse_event(
+                    "response.content_part.added",
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    },
+                )
+            )
+            self.wfile.flush()
+
+        try:
+            for gen in response_gen:
+                tokens.append(gen.token)
+                if gen.state == "tool":
+                    tool_text += gen.text
+                elif gen.state == "normal":
+                    if prev_state == "tool":
+                        tool_calls_raw.append(tool_text)
+                        tool_text = ""
+                        made_tool_call = True
+                    if gen.text:
+                        full_text += gen.text
+                        if self.stream:
+                            self.wfile.write(
+                                self._sse_event(
+                                    "response.output_text.delta",
+                                    {
+                                        "type": "response.output_text.delta",
+                                        "item_id": msg_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": gen.text,
+                                    },
+                                )
+                            )
+                            self.wfile.flush()
+                if gen.finish_reason is not None:
+                    finish_reason = gen.finish_reason
+                prev_state = gen.state
+
+            if prev_state == "tool" and tool_text:
+                tool_calls_raw.append(tool_text)
+                made_tool_call = True
+            if finish_reason == "stop" and made_tool_call:
+                finish_reason = "tool_calls"
+        finally:
+            ctx.stop()
+
+        # Strip leaked special tokens (e.g. <|im_end|> from Qwen models)
+        import re as _re
+
+        full_text = _re.sub(r"<\|im_end\|>\s*$", "", full_text).rstrip()
+
+        # Format tool calls via the model's native tool parser
+        formatted_tool_calls = tool_formatter(tool_calls_raw)
+
+        # Fallback: if the model generated a tool call as plain text (JSON
+        # in a code block or raw JSON) instead of using native tool_call
+        # tokens, try to parse it from the generated text.
+        if not formatted_tool_calls and request.tools and full_text:
+            import re
+
+            json_pattern = re.compile(
+                r"(?:```(?:json)?\s*\n?)?\s*"
+                r'(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*'
+                r'"arguments"\s*:\s*\{[^}]*\}\s*\})'
+                r"\s*(?:\n?```)?",
+                re.DOTALL,
+            )
+            match = json_pattern.search(full_text)
+            if match:
+                try:
+                    tc_data = json.loads(match.group(1))
+                    if "name" in tc_data and "arguments" in tc_data:
+                        tool_names = {
+                            t["function"]["name"]
+                            for t in (request.tools or [])
+                            if isinstance(t, dict)
+                            and t.get("type") == "function"
+                            and "function" in t
+                        }
+                        if tc_data["name"] in tool_names:
+                            args_str = tc_data["arguments"]
+                            if isinstance(args_str, dict):
+                                args_str = json.dumps(
+                                    args_str, ensure_ascii=False
+                                )
+                            formatted_tool_calls = [
+                                {
+                                    "id": f"call_{uuid.uuid4().hex}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc_data["name"],
+                                        "arguments": args_str,
+                                    },
+                                }
+                            ]
+                            full_text = ""
+                            made_tool_call = True
+                            finish_reason = "tool_calls"
+                            logging.info(
+                                "Fallback tool call parsed: "
+                                f"{tc_data['name']}"
+                            )
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+        usage = {
+            "input_tokens": len(ctx.prompt),
+            "output_tokens": len(tokens),
+            "total_tokens": len(ctx.prompt) + len(tokens),
+        }
+        if ctx.prompt_cache_count is not None and ctx.prompt_cache_count >= 0:
+            usage["input_tokens_details"] = {
+                "cached_tokens": ctx.prompt_cache_count
+            }
+
+        # Build output items
+        output_items = []
+        output_index = 0
+
+        text_item = {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": full_text,
+                    "annotations": [],
+                }
+            ],
+        }
+        if full_text or not formatted_tool_calls:
+            output_items.append(text_item)
+            output_index += 1
+
+        # Convert Chat Completions tool_calls to Responses API function_call
+        for tc in formatted_tool_calls:
+            func = tc.get("function", {})
+            arguments = func.get("arguments", "{}")
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            fc_item = {
+                "id": f"fc_{uuid.uuid4().hex}",
+                "type": "function_call",
+                "call_id": tc.get("id", f"call_{uuid.uuid4().hex}"),
+                "name": func.get("name", ""),
+                "arguments": arguments,
+                "status": "completed",
+            }
+            output_items.append(fc_item)
+
+        if self.stream:
+            # Close text message item
+            self.wfile.write(
+                self._sse_event(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": full_text,
+                    },
+                )
+            )
+            self.wfile.write(
+                self._sse_event(
+                    "response.content_part.done",
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": full_text,
+                            "annotations": [],
+                        },
+                    },
+                )
+            )
+            self.wfile.write(
+                self._sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": text_item,
+                    },
+                )
+            )
+
+            # Emit tool call items
+            for i, fc_item in enumerate(
+                item
+                for item in output_items
+                if item["type"] == "function_call"
+            ):
+                tc_idx = output_index + i
+                self.wfile.write(
+                    self._sse_event(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": tc_idx,
+                            "item": {
+                                **fc_item,
+                                "arguments": "",
+                                "status": "in_progress",
+                            },
+                        },
+                    )
+                )
+                self.wfile.write(
+                    self._sse_event(
+                        "response.function_call_arguments.delta",
+                        {
+                            "type": (
+                                "response.function_call_arguments.delta"
+                            ),
+                            "item_id": fc_item["id"],
+                            "output_index": tc_idx,
+                            "delta": fc_item["arguments"],
+                        },
+                    )
+                )
+                self.wfile.write(
+                    self._sse_event(
+                        "response.function_call_arguments.done",
+                        {
+                            "type": (
+                                "response.function_call_arguments.done"
+                            ),
+                            "item_id": fc_item["id"],
+                            "output_index": tc_idx,
+                            "arguments": fc_item["arguments"],
+                        },
+                    )
+                )
+                self.wfile.write(
+                    self._sse_event(
+                        "response.output_item.done",
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": tc_idx,
+                            "item": fc_item,
+                        },
+                    )
+                )
+
+            self.wfile.write(
+                self._sse_event(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": self.request_id,
+                            "object": "response",
+                            "status": "completed",
+                            "model": self.requested_model,
+                            "output": output_items,
+                            "usage": usage,
+                        },
+                    },
+                )
+            )
+            self.wfile.flush()
+        else:
+            resp = {
+                "id": self.request_id,
+                "object": "response",
+                "created_at": self.created,
+                "model": self.requested_model,
+                "status": (
+                    "completed" if finish_reason != "length" else "incomplete"
+                ),
+                "output": output_items,
+                "usage": usage,
+                "error": None,
+                "incomplete_details": None,
+                "instructions": self.body.get("instructions"),
+                "metadata": {},
+                "parallel_tool_calls": True,
+                "temperature": self.temperature,
+                "tool_choice": "auto",
+                "tools": [],
+                "top_p": self.top_p,
+                "truncation": "disabled",
+            }
+            self._set_completion_headers(200)
+            resp_bytes = json.dumps(resp).encode()
+            self.send_header("Content-Length", str(len(resp_bytes)))
+            self.end_headers()
+            self.wfile.write(resp_bytes)
+            self.wfile.flush()
+
+    def _sse_event(self, event: str, data: dict) -> bytes:
+        """Format a Server-Sent Event."""
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
     def handle_chat_completions(self) -> CompletionRequest:
         """
