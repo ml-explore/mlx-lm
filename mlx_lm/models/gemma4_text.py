@@ -643,6 +643,17 @@ class Model(nn.Module):
         def predicate(path, _):
             if path.endswith("router.proj"):
                 return {"group_size": 64, "bits": 8}
+            # The Swift counterpart in mlx-swift-lm models this layer with a
+            # plain `Module` wrapping a raw `MLXArray` (Gemma4Text.swift's
+            # `ScaledLinear`). It cannot dequantize a packed weight at load
+            # time, so a quantized `per_layer_model_projection` produces a
+            # shape mismatch on iOS:
+            #   Mismatched parameter ... ScaledLinear shape.
+            #   Actual [N, K/8], expected [N, K]
+            # Skip this single layer here so generated checkpoints load on
+            # both Python and Swift runtimes.
+            if path.endswith("per_layer_model_projection"):
+                return False
             return True
 
         return predicate
