@@ -473,6 +473,14 @@ class CompressedKVCache(KVCache):
         self.local.keys = value
 
     @property
+    def values(self):
+        return self.local.values
+
+    @values.setter
+    def values(self, value):
+        self.local.values = value
+
+    @property
     def pool(self):
         return self._pool
 
@@ -1339,12 +1347,43 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        R = group.rank()
         for layer in self.model.layers:
             a = layer.attn
             a.wq_b = shard_linear(a.wq_b, "all-to-sharded", group=group)
             a.wo_b = shard_linear(a.wo_b, "sharded-to-all", group=group)
             a.n_heads //= N
-            # (n_groups shard omitted here for simplicity; wo_a stays replicated)
+            # Slice attn_sink to local heads (mirrors gpt_oss.py:308-312).
+            # Order matters: must run AFTER `a.n_heads //= N` so the stride is
+            # the post-division (local) head count.
+            a.attn_sink = a.attn_sink[a.n_heads * R : a.n_heads * (R + 1)]
+
+            # wo_a: shape (n_groups * o_lora_rank, group_feat).
+            # group_feat = n_heads * v_head_dim / n_groups. After sharding,
+            # n_heads //= N and n_groups //= N cancel in the ratio, so group_feat
+            # stays constant. Only the OUTPUT dim (n_groups axis) gets sharded —
+            # each rank owns n_groups//N consecutive groups.
+            # wo_b is "sharded-to-all" so its input = n_groups_local * o_lora_rank.
+            old_n_groups = a.n_groups
+            new_n_groups = old_n_groups // N
+            gs = new_n_groups * R
+            ge = new_n_groups * (R + 1)
+            if isinstance(a.wo_a, nn.QuantizedLinear):
+                gf = a.wo_a.weight.shape[-1]
+                w = a.wo_a.weight.reshape(old_n_groups, a.o_lora_rank, gf)
+                a.wo_a.weight = w[gs:ge].reshape(new_n_groups * a.o_lora_rank, gf)
+                sc_gf = a.wo_a.scales.shape[-1]
+                s = a.wo_a.scales.reshape(old_n_groups, a.o_lora_rank, sc_gf)
+                a.wo_a.scales = s[gs:ge].reshape(new_n_groups * a.o_lora_rank, sc_gf)
+                if getattr(a.wo_a, "biases", None) is not None:
+                    b_gf = a.wo_a.biases.shape[-1]
+                    b = a.wo_a.biases.reshape(old_n_groups, a.o_lora_rank, b_gf)
+                    a.wo_a.biases = b[gs:ge].reshape(new_n_groups * a.o_lora_rank, b_gf)
+            else:
+                gf = a.wo_a.weight.shape[-1]
+                w = a.wo_a.weight.reshape(old_n_groups, a.o_lora_rank, gf)
+                a.wo_a.weight = w[gs:ge].reshape(new_n_groups * a.o_lora_rank, gf)
+            a.n_groups = new_n_groups
 
             if isinstance(layer.ffn, DeepseekV4MoE):
                 layer.ffn.sharding_group = group
