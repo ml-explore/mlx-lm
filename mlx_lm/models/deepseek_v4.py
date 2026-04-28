@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.utils import tree_flatten
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import BatchRotatingKVCache, RotatingKVCache
@@ -74,6 +75,31 @@ class ModelArgs(BaseModelArgs):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
+
+
+def make_quantization_config(model):
+    mxfp4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+
+    flat_modules = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+    experts = {
+        k: mxfp4
+        for k, _ in flat_modules
+        if ".ffn.switch_mlp." in k and k.endswith("_proj")
+    }
+    shared_experts = {k: mxfp8 for k, _ in flat_modules if ".ffn.shared_experts." in k}
+    attn = {
+        k: mxfp8 for k, _ in flat_modules if ".attn.w" in k or ".attn.indexer.wq" in k
+    }
+
+    return {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        **experts,
+        **shared_experts,
+        **attn,
+    }
 
 
 def _score_func(scores: mx.array, func: str) -> mx.array:
@@ -1797,9 +1823,7 @@ class V4Attention(nn.Module):
                             idx = topk[:, None, :, :, None]
                             pooled = mx.take_along_axis(
                                 expanded,
-                                mx.broadcast_to(
-                                    idx, idx.shape[:-1] + (self.head_dim,)
-                                ),
+                                mx.broadcast_to(idx, idx.shape[:-1] + (self.head_dim,)),
                                 axis=3,
                             ).reshape(B, 1, -1, self.head_dim)
                     else:
@@ -2016,57 +2040,6 @@ class Model(nn.Module):
             new_weights[k] = v
         weights = new_weights
 
-        def scale_to_float(scale: mx.array) -> mx.array:
-            if scale.dtype == mx.uint8:
-                return mx.exp((scale.astype(mx.float32) - 127.0) * math.log(2.0))
-            return scale.astype(mx.float32)
-
-        def dequant_fp8(weight: mx.array, scale: mx.array, block_size: int = 128):
-            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
-            scale = scale_to_float(scale)
-            m, n = weight.shape
-            pad_m = (-m) % block_size
-            pad_n = (-n) % block_size
-            weight = mx.pad(weight, ((0, pad_m), (0, pad_n)))
-            weight = weight.reshape(
-                (m + pad_m) // block_size,
-                block_size,
-                (n + pad_n) // block_size,
-                block_size,
-            )
-            weight = (weight * scale[:, None, :, None]).reshape(m + pad_m, n + pad_n)
-            return weight[:m, :n].astype(mx.bfloat16)
-
-        def dequant_fp4(weight: mx.array, scale: mx.array, block_size: int = 32):
-            table = mx.array(
-                [
-                    0.0,
-                    0.5,
-                    1.0,
-                    1.5,
-                    2.0,
-                    3.0,
-                    4.0,
-                    6.0,
-                    0.0,
-                    -0.5,
-                    -1.0,
-                    -1.5,
-                    -2.0,
-                    -3.0,
-                    -4.0,
-                    -6.0,
-                ],
-                dtype=mx.float32,
-            )
-            packed = weight.astype(mx.uint8)
-            low = packed & 0x0F
-            high = (packed >> 4) & 0x0F
-            unpacked = mx.stack([mx.take(table, low), mx.take(table, high)], axis=-1)
-            unpacked = unpacked.reshape(weight.shape[0], weight.shape[1] * 2)
-            scale = mx.repeat(scale_to_float(scale), block_size, axis=-1)
-            return (unpacked * scale).astype(mx.bfloat16)
-
         new_weights = {}
         for k, v in weights.items():
             if not k.endswith(".scale"):
@@ -2085,9 +2058,11 @@ class Model(nn.Module):
                 and weight.dtype in (mx.int8, mx.uint8)
                 and v.shape[-1] * 16 == weight.shape[-1]
             ):
-                new_weights[wk] = dequant_fp4(weight, v)
+                new_weights[k + "s"] = v
+                new_weights[wk] = weight.view(mx.uint32)
             elif weight.dtype == mx.uint8:
-                new_weights[wk] = dequant_fp8(weight, v)
+                new_weights[k + "s"] = mx.repeat(mx.repeat(v, 4, -1), 128, 0)
+                new_weights[wk] = weight.view(mx.uint32)
             else:
                 new_weights[k] = v
         weights = new_weights
@@ -2124,15 +2099,16 @@ class Model(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                key0 = f"{prefix}.0.{src}.weight"
-                if key0 in weights:
-                    stacked = [
-                        weights.pop(f"{prefix}.{e}.{src}.weight")
-                        for e in range(self.args.n_routed_experts)
-                    ]
-                    weights[f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.weight"] = (
-                        mx.stack(stacked)
-                    )
+                for suffix in ("weight", "scales"):
+                    key0 = f"{prefix}.0.{src}.{suffix}"
+                    if key0 in weights:
+                        stacked = [
+                            weights.pop(f"{prefix}.{e}.{src}.{suffix}")
+                            for e in range(self.args.n_routed_experts)
+                        ]
+                        weights[
+                            f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
+                        ] = mx.stack(stacked)
 
         return weights
 

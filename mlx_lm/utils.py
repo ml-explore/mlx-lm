@@ -435,6 +435,13 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "fp8" and config.get("model_type", None) == "deepseek_v4":
+            from .models.deepseek_v4 import make_quantization_config
+
+            quantization = make_quantization_config(model)
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     if config.get("quantize_activations", False):
 
