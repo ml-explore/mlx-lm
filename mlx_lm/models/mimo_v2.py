@@ -5,10 +5,12 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -227,11 +229,17 @@ class MoE(nn.Module):
             config.n_routed_experts,
         )
         self.gate = MoEGate(config)
+        self.sharding_group = None
 
     def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
-        return (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None]).sum(axis=-2)
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+        return y
 
 
 class DecoderLayer(nn.Module):
@@ -257,7 +265,7 @@ class DecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
-class MiMoV2Model(nn.Module):
+class MiMoV2Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -272,11 +280,7 @@ class MiMoV2Model(nn.Module):
             for idx in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
-        self.swa_idx = pattern.index(1) if 1 in pattern else 0
-        self.ga_idx = pattern.index(0) if 0 in pattern else 0
         self.sliding_window_size = config.sliding_window_size
-        self.has_swa = 1 in pattern
-        self.has_full = 0 in pattern
 
     def __call__(
         self,
@@ -290,23 +294,47 @@ class MiMoV2Model(nn.Module):
             else self.embed_tokens(inputs)
         )
 
+        local_layers = self.pipeline_layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(local_layers)
+
+        swa_local = ga_local = None
+        for i, l in enumerate(local_layers):
+            if swa_local is None and l.is_sliding_window:
+                swa_local = i
+            elif ga_local is None and not l.is_sliding_window:
+                ga_local = i
+            if swa_local is not None and ga_local is not None:
+                break
 
         full_mask = (
-            create_attention_mask(h, cache[self.ga_idx]) if self.has_full else None
+            create_attention_mask(h, cache[ga_local]) if ga_local is not None else None
         )
         swa_mask = (
             create_attention_mask(
-                h, cache[self.swa_idx], window_size=self.sliding_window_size
+                h, cache[swa_local], window_size=self.sliding_window_size
             )
-            if self.has_swa
+            if swa_local is not None
             else None
         )
 
-        for layer, c in zip(self.layers, cache):
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, pipeline_rank + 1)
+
+        for layer, c in zip(local_layers, cache):
             mask = swa_mask if layer.is_sliding_window else full_mask
             h = layer(h, mask, cache=c)
+
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -454,9 +482,52 @@ class Model(nn.Module):
 
         return weights
 
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        R = group.rank()
+        for layer in self.model.layers:
+            if layer is None:
+                continue
+
+            attn = layer.self_attn
+            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+            attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+            attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+            attn.n_heads //= N
+            attn.n_kv_heads //= N
+
+            if attn.attention_sink_bias is not None:
+                attn.attention_sink_bias = attn.attention_sink_bias[
+                    R * attn.n_heads : (R + 1) * attn.n_heads
+                ]
+
+            if isinstance(layer.mlp, MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
+
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     @property
     def cast_predicate(self):
