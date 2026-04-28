@@ -8,6 +8,7 @@ __pycache__/
 
 # Vim
 *.swp
+*.un~
 
 # Distribution / packaging
 .Python
@@ -107,6 +108,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-*/
 env/
 venv/
 ENV/
