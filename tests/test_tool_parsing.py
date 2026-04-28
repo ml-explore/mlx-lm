@@ -31,6 +31,14 @@ class TestToolParsing(unittest.TestCase):
                 glm47,
             ),
             (
+                "multiply\n"
+                "<arg_key>a</arg_key>\n"
+                "<arg_value>12234585</arg_value>\n"
+                "<arg_key>b</arg_key>\n"
+                "<arg_value>48838483920</arg_value>",
+                laguna,
+            ),
+            (
                 '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
                 json_tools,
             ),
@@ -99,6 +107,12 @@ class TestToolParsing(unittest.TestCase):
             (
                 'get_current_temperature<arg_key>location</arg_key><arg_value>"London"</arg_value>',
                 glm47,
+            ),
+            (
+                "get_current_temperature\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>London</arg_value>",
+                laguna,
             ),
             (
                 '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
@@ -363,6 +377,38 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(
             tool_call["arguments"],
             {"location": "Warsaw", "days": 3, "postal_code": "00123"},
+        )
+
+    def test_laguna_full_tool_call_tags(self):
+        test_case = (
+            "<tool_call>search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>weather</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_call = laguna.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call,
+            {"name": "search", "arguments": {"query": "weather"}},
+        )
+
+        test_case = (
+            "<tool_call>search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>weather</arg_value>\n"
+            "</tool_call>"
+            "<tool_call>read_file\n"
+            "<arg_key>path</arg_key>\n"
+            "<arg_value>/tmp/test.txt</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_calls = laguna.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "search", "arguments": {"query": "weather"}},
+                {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+            ],
         )
 
 
