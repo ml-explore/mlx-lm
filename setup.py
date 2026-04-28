@@ -31,6 +31,7 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "tiktoken",
     ],
     packages=[
         "mlx_lm",

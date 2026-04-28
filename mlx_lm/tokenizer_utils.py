@@ -476,6 +476,96 @@ class TokenizerWrapper:
             setattr(self._tokenizer, attr, value)
 
 
+class TalkieTiktokenTokenizer:
+    """Minimal tokenizer adapter for Talkie's tiktoken ``vocab.txt`` files."""
+
+    pat_str = "|".join(
+        [
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""\p{N}{1,3}""",
+            r""" ?[^\s\p{L}\p{N}]+[\r\n/]*""",
+            r"""\s*[\r\n]+""",
+            r"""\s+(?!\S)""",
+            r"""\s+""",
+        ]
+    )
+    base_vocab_size = 65536
+    base_special_tokens = {"<|endoftext|>": base_vocab_size - 1}
+    it_special_tokens = {
+        "<|endoftext|>": base_vocab_size - 1,
+        "<|end|>": base_vocab_size,
+        "<|user|>": base_vocab_size + 1,
+        "<|assistant|>": base_vocab_size + 2,
+        "<|system|>": base_vocab_size + 3,
+    }
+
+    def __init__(self, model_path, style="it"):
+        import tiktoken
+        from tiktoken.load import load_tiktoken_bpe
+
+        mergeable_ranks = load_tiktoken_bpe(str(model_path / "vocab.txt"))
+        mergeable_ranks = {
+            k: v
+            for k, v in mergeable_ranks.items()
+            if v < self.base_vocab_size - 1
+        }
+        self.style = style
+        self.special_tokens = (
+            dict(self.it_special_tokens)
+            if style == "it"
+            else dict(self.base_special_tokens)
+        )
+        self._encoding = tiktoken.Encoding(
+            name=f"talkie-{style}",
+            pat_str=self.pat_str,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=self.special_tokens,
+        )
+        self.eos_token = "<|endoftext|>"
+        self.eos_token_id = self.special_tokens[self.eos_token]
+        self.bos_token = None
+        self.bos_token_id = None
+        self.chat_template = "talkie"
+        self.clean_up_tokenization_spaces = False
+        self.init_kwargs = {}
+
+    def encode(self, text, add_special_tokens=False, **kwargs):
+        return self._encoding.encode(text, allowed_special="all")
+
+    def decode(self, tokens, **kwargs):
+        if hasattr(tokens, "tolist"):
+            tokens = tokens.tolist()
+        return self._encoding.decode([int(t) for t in tokens])
+
+    def batch_decode(self, batch, **kwargs):
+        return [self.decode(tokens, **kwargs) for tokens in batch]
+
+    def convert_tokens_to_ids(self, token):
+        return self.special_tokens.get(token)
+
+    def get_vocab(self):
+        return dict(self.special_tokens)
+
+
+def _talkie_chat_template(messages, **kwargs):
+    parts = []
+    for msg in messages:
+        role = msg["role"] if isinstance(msg, dict) else msg.role
+        content = msg["content"] if isinstance(msg, dict) else msg.content
+        if role == "system":
+            parts.append(f"<|system|>{content}<|end|>")
+        elif role == "user":
+            parts.append(f"<|user|>{content}<|end|>")
+        elif role == "assistant":
+            parts.append(f"<|assistant|>{content}<|end|>")
+        else:
+            raise ValueError(f"Unsupported Talkie chat role: {role}")
+    if kwargs.get("add_generation_prompt", True):
+        parts.append("<|assistant|>")
+    return "".join(parts)
+
+
 class NewlineTokenizer(PreTrainedTokenizerFast):
     """A tokenizer that replaces newlines with <n> and <n> with new line."""
 
@@ -587,6 +677,32 @@ def load(
     a Hugging Face repo ID.
     """
     detokenizer_class = NaiveStreamingDetokenizer
+
+    config_file = model_path / "config.json"
+    if config_file.exists():
+        with open(config_file, "r", encoding="utf-8") as fid:
+            try:
+                model_config = json.load(fid)
+            except JSONDecodeError as e:
+                raise JSONDecodeError("Failed to parse config.json", e.doc, e.pos)
+        if model_config.get("model_type") == "talkie":
+            tokenizer = TalkieTiktokenTokenizer(
+                model_path, style=model_config.get("style", "it")
+            )
+            if eos_token_ids is None:
+                eos_token_ids = [tokenizer.eos_token_id]
+                if tokenizer.style == "it":
+                    eos_token_ids += [
+                        tokenizer.special_tokens["<|end|>"],
+                        tokenizer.special_tokens["<|user|>"],
+                        tokenizer.special_tokens["<|system|>"],
+                    ]
+            return TokenizerWrapper(
+                tokenizer,
+                detokenizer_class,
+                eos_token_ids=eos_token_ids,
+                chat_template=_talkie_chat_template,
+            )
 
     tokenizer_file = model_path / "tokenizer.json"
 
