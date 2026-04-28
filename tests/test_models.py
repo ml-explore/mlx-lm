@@ -649,6 +649,322 @@ class TestModels(unittest.TestCase):
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
 
+    def test_qwen3_5_moe_per_expert_weights_stack_to_switch_mlp(self):
+        # Qwen/Qwen3.6-35B-A3B-FP8 ships expert MLPs as one tensor per expert
+        # per projection rather than as a single combined
+        # ``experts.gate_up_proj`` / ``experts.down_proj`` tensor (the bf16
+        # master Qwen/Qwen3.6-35B-A3B is already pre-stacked). The sanitize
+        # step must stack the per-expert tensors into the combined
+        # ``switch_mlp.*`` form that ``Qwen3_5MoeSparseMlp.load_weights``
+        # expects.
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 16,
+            "linear_num_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 1,
+            "full_attention_interval": 1,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 16,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 6,
+            "shared_expert_intermediate_size": 6,
+        }
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {"model_type": "qwen3_5_moe", "text_config": text_config}
+        )
+        model = qwen3_5_moe.Model(args)
+
+        prefix = "model.language_model.layers.0.mlp.experts"
+        per_expert = {
+            f"{prefix}.0.gate_proj.weight": mx.full((6, 4), 1.0),
+            f"{prefix}.0.up_proj.weight": mx.full((6, 4), 2.0),
+            f"{prefix}.0.down_proj.weight": mx.full((4, 6), 3.0),
+            f"{prefix}.1.gate_proj.weight": mx.full((6, 4), 4.0),
+            f"{prefix}.1.up_proj.weight": mx.full((6, 4), 5.0),
+            f"{prefix}.1.down_proj.weight": mx.full((4, 6), 6.0),
+        }
+        sanitized = model.sanitize(dict(per_expert))
+
+        out_prefix = "language_model.model.layers.0.mlp.switch_mlp"
+        gate_key = f"{out_prefix}.gate_proj.weight"
+        up_key = f"{out_prefix}.up_proj.weight"
+        down_key = f"{out_prefix}.down_proj.weight"
+
+        self.assertIn(gate_key, sanitized)
+        self.assertIn(up_key, sanitized)
+        self.assertIn(down_key, sanitized)
+        self.assertEqual(sanitized[gate_key].shape, (2, 6, 4))
+        self.assertEqual(sanitized[up_key].shape, (2, 6, 4))
+        self.assertEqual(sanitized[down_key].shape, (2, 4, 6))
+        # Per-expert keys must not leak through.
+        self.assertFalse(any(".experts.0." in k for k in sanitized))
+        self.assertFalse(any(".experts.1." in k for k in sanitized))
+        # Stacking preserves per-expert content along axis 0.
+        self.assertTrue(mx.array_equal(sanitized[gate_key][0], per_expert[f"{prefix}.0.gate_proj.weight"]))
+        self.assertTrue(mx.array_equal(sanitized[gate_key][1], per_expert[f"{prefix}.1.gate_proj.weight"]))
+        self.assertTrue(mx.array_equal(sanitized[down_key][1], per_expert[f"{prefix}.1.down_proj.weight"]))
+
+    def test_qwen3_5_moe_per_expert_gap_raises(self):
+        # Defensive: if a per-expert checkpoint has non-contiguous expert indices
+        # (e.g. ships 0, 1, 3 but not 2), sanitize must fail loudly rather than
+        # silently dropping expert 3 — which would replicate the strict-load
+        # failure this branch is meant to fix.
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 16,
+            "linear_num_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 1,
+            "full_attention_interval": 1,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 16,
+            "num_experts": 3,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 6,
+            "shared_expert_intermediate_size": 6,
+        }
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {"model_type": "qwen3_5_moe", "text_config": text_config}
+        )
+        model = qwen3_5_moe.Model(args)
+
+        prefix = "model.language_model.layers.0.mlp.experts"
+        # Index 2 deliberately missing.
+        gapped = {
+            f"{prefix}.0.gate_proj.weight": mx.zeros((6, 4)),
+            f"{prefix}.0.up_proj.weight": mx.zeros((6, 4)),
+            f"{prefix}.0.down_proj.weight": mx.zeros((4, 6)),
+            f"{prefix}.1.gate_proj.weight": mx.zeros((6, 4)),
+            f"{prefix}.1.up_proj.weight": mx.zeros((6, 4)),
+            f"{prefix}.1.down_proj.weight": mx.zeros((4, 6)),
+            f"{prefix}.3.gate_proj.weight": mx.zeros((6, 4)),
+            f"{prefix}.3.up_proj.weight": mx.zeros((6, 4)),
+            f"{prefix}.3.down_proj.weight": mx.zeros((4, 6)),
+        }
+        with self.assertRaisesRegex(ValueError, "non-contiguous"):
+            model.sanitize(dict(gapped))
+
+    def test_qwen3_5_moe_combined_format_still_splits_to_switch_mlp(self):
+        # Regression guard: pre-stacked checkpoints (e.g. mlx-community Qwen3.5
+        # / 3.6 redistributions) ship ``experts.gate_up_proj`` /
+        # ``experts.down_proj`` as combined tensors. Sanitize must still split
+        # them into ``switch_mlp.{gate,up,down}_proj.weight`` via the original
+        # branch, untouched by the new per-expert path.
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 16,
+            "linear_num_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 1,
+            "full_attention_interval": 1,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 16,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 6,
+            "shared_expert_intermediate_size": 6,
+        }
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {"model_type": "qwen3_5_moe", "text_config": text_config}
+        )
+        model = qwen3_5_moe.Model(args)
+
+        # Pre-stacked: gate_up has shape (num_experts, 2*intermediate, hidden);
+        # down has shape (num_experts, hidden, intermediate).
+        gate_up = mx.arange(2 * 12 * 4, dtype=mx.float32).reshape(2, 12, 4)
+        down = mx.arange(2 * 4 * 6, dtype=mx.float32).reshape(2, 4, 6)
+        sanitized = model.sanitize(
+            {
+                "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+                "model.language_model.layers.0.mlp.experts.down_proj": down,
+            }
+        )
+
+        out_prefix = "language_model.model.layers.0.mlp.switch_mlp"
+        self.assertEqual(sanitized[f"{out_prefix}.gate_proj.weight"].shape, (2, 6, 4))
+        self.assertEqual(sanitized[f"{out_prefix}.up_proj.weight"].shape, (2, 6, 4))
+        self.assertEqual(sanitized[f"{out_prefix}.down_proj.weight"].shape, (2, 4, 6))
+        self.assertTrue(
+            mx.array_equal(sanitized[f"{out_prefix}.gate_proj.weight"], gate_up[:, :6, :])
+        )
+        self.assertTrue(
+            mx.array_equal(sanitized[f"{out_prefix}.up_proj.weight"], gate_up[:, 6:, :])
+        )
+        self.assertTrue(mx.array_equal(sanitized[f"{out_prefix}.down_proj.weight"], down))
+        # Combined keys must not leak through after split.
+        self.assertNotIn("language_model.model.layers.0.mlp.experts.gate_up_proj", sanitized)
+        self.assertNotIn("language_model.model.layers.0.mlp.experts.down_proj", sanitized)
+
+    def test_qwen3_5_fp8_weight_scale_inv_dequantizes_in_sanitize(self):
+        # Qwen-org FP8 checkpoints (Qwen/Qwen3.6-{27B,35B-A3B}-FP8) ship FP8
+        # weights paired with bf16 weight_scale_inv tensors plus optional
+        # activation_scale tensors. Sanitize must dequantize FP8 -> bf16 using
+        # the 128x128 block-scale layout (same scheme as DeepSeek-V3 / V3.2 /
+        # MiniMax / MiMo V2 Flash / Ministral 3) and silently drop the
+        # activation_scale tensors. Mirrors the inline dequant pattern in
+        # those five sibling files.
+        if not hasattr(mx, "from_fp8") or not hasattr(mx, "to_fp8"):
+            self.skipTest("mx.from_fp8 / mx.to_fp8 not available in this mlx version")
+
+        from mlx_lm.models import qwen3_5
+
+        text_config = {
+            "model_type": "qwen3_5",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 16,
+            "linear_num_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 1,
+            "full_attention_interval": 1,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 16,
+        }
+        args = qwen3_5.ModelArgs.from_dict(
+            {"model_type": "qwen3_5", "text_config": text_config}
+        )
+        model = qwen3_5.Model(args)
+
+        # Construct an FP8 weight + bf16 scale_inv pair. Use a single 128x128
+        # block so the scale_inv shape is (1, 1) and the broadcast is trivial.
+        weight_key = "model.language_model.layers.0.linear_attn.in_proj_a.weight"
+        scale_key = weight_key + "_scale_inv"
+        activation_key = weight_key.replace(".weight", ".activation_scale")
+        # Round-trip through mx.to_fp8 produces a uint8-encoded FP8 (E4M3) array
+        # in the format `mx.from_fp8` expects to consume back.
+        weight_fp8 = mx.to_fp8(
+            mx.array([[1.0, -2.0], [0.5, 4.0]], dtype=mx.bfloat16)
+        )
+        scale_inv = mx.array([[2.0]], dtype=mx.bfloat16)
+        # Expected: from_fp8(weight) * scale_inv. Use the same dequant primitive
+        # the patched sanitize uses so the comparison is bit-identical.
+        expected = (mx.from_fp8(weight_fp8, dtype=mx.bfloat16) * 2.0).astype(
+            mx.float32
+        )
+        sanitized = model.sanitize(
+            {
+                weight_key: weight_fp8,
+                scale_key: scale_inv,
+                activation_key: mx.ones((1,), dtype=mx.bfloat16),
+            }
+        )
+
+        # weight_scale_inv and activation_scale must not leak through.
+        self.assertFalse(any("weight_scale_inv" in k for k in sanitized))
+        self.assertFalse(any("activation_scale" in k for k in sanitized))
+        # The dequanted weight should equal FP8 cast to bf16 multiplied by 2.0
+        # (the single block scale).
+        out_key = weight_key.replace("model.language_model", "language_model.model")
+        self.assertIn(out_key, sanitized)
+        np.testing.assert_allclose(
+            np.array(sanitized[out_key].astype(mx.float32)),
+            np.array(expected),
+        )
+
+    def test_qwen3_5_moe_fp8_weight_scale_inv_dequantizes_in_sanitize(self):
+        # Same FP8 dequant + activation_scale drop, exercised through the MoE
+        # sanitize entry (Qwen/Qwen3.6-35B-A3B-FP8 path).
+        if not hasattr(mx, "from_fp8") or not hasattr(mx, "to_fp8"):
+            self.skipTest("mx.from_fp8 / mx.to_fp8 not available in this mlx version")
+
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 16,
+            "linear_num_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 1,
+            "full_attention_interval": 1,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 16,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 6,
+            "shared_expert_intermediate_size": 6,
+        }
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {"model_type": "qwen3_5_moe", "text_config": text_config}
+        )
+        model = qwen3_5_moe.Model(args)
+
+        weight_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        scale_key = weight_key + "_scale_inv"
+        activation_key = weight_key.replace(".weight", ".activation_scale")
+        # Round-trip through mx.to_fp8 produces a uint8-encoded FP8 (E4M3) array
+        # in the format `mx.from_fp8` expects to consume back.
+        weight_fp8 = mx.to_fp8(
+            mx.array([[1.0, -2.0], [0.5, 4.0]], dtype=mx.bfloat16)
+        )
+        scale_inv = mx.array([[2.0]], dtype=mx.bfloat16)
+        # Expected: from_fp8(weight) * scale_inv. Use the same dequant primitive
+        # the patched sanitize uses so the comparison is bit-identical.
+        expected = (mx.from_fp8(weight_fp8, dtype=mx.bfloat16) * 2.0).astype(
+            mx.float32
+        )
+        sanitized = model.sanitize(
+            {
+                weight_key: weight_fp8,
+                scale_key: scale_inv,
+                activation_key: mx.ones((1,), dtype=mx.bfloat16),
+            }
+        )
+
+        self.assertFalse(any("weight_scale_inv" in k for k in sanitized))
+        self.assertFalse(any("activation_scale" in k for k in sanitized))
+        out_key = weight_key.replace("model.language_model", "language_model.model")
+        self.assertIn(out_key, sanitized)
+        np.testing.assert_allclose(
+            np.array(sanitized[out_key].astype(mx.float32)),
+            np.array(expected),
+        )
+
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4
 
