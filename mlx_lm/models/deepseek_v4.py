@@ -12,7 +12,7 @@ from mlx.utils import tree_flatten
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import BatchRotatingKVCache, RotatingKVCache
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU, _scatter_unsort
+from .switch_layers import SwitchGLU
 
 
 @dataclass
@@ -213,89 +213,42 @@ class DeepseekV4RoPE(nn.Module):
         elif rope_type not in (None, "default"):
             raise ValueError(f"Unsupported DeepSeek-V4 RoPE type: {rope_type}")
 
-        self._inv_freq = (inv_freq,)
+        self._freqs = 1.0 / inv_freq
+        self._freqs_cache = {}
 
-    @property
-    def inv_freq(self):
-        return self._inv_freq[0]
+    def _get_freqs(self, head_dim: int, inverse: bool, freq_scale: int):
+        key = (head_dim, inverse, freq_scale)
+        if key not in self._freqs_cache:
+            f = self._freqs
+            if freq_scale != 1:
+                f = f / freq_scale
+            if inverse:
+                f = -f
+            nope_pairs = (head_dim - self.dims) // 2
+            if nope_pairs > 0:
+                f = mx.concatenate([mx.full((nope_pairs,), mx.inf), f])
+            self._freqs_cache[key] = f
+        return self._freqs_cache[key]
 
     def __call__(
         self,
         x: mx.array,
         offset: Any = 0,
         inverse: bool = False,
-        positions: Optional[mx.array] = None,
-    ):
-        L = x.shape[-2]
-        if positions is None:
-            pos = mx.arange(L, dtype=mx.float32)
-            if isinstance(offset, mx.array):
-                offset = offset.astype(mx.float32)
-                if offset.ndim > 0:
-                    offset = offset[..., None]
-            pos = pos + offset
-        else:
-            pos = positions.astype(mx.float32)
-        return _rope_full(x, self.inv_freq, pos, inverse, 0)
-
-
-@mx.compile
-def _rope_full(
-    x: mx.array,
-    inv_freq: mx.array,
-    pos: mx.array,
-    inverse: bool,
-    nope_dim: int,
-) -> mx.array:
-    freqs = pos[..., None] * inv_freq
-    cos = mx.cos(freqs)
-    sin = mx.sin(freqs)
-    if inverse:
-        sin = -sin
-
-    if nope_dim > 0:
-        pe = x[..., nope_dim:]
-    else:
-        pe = x
-
-    if pos.ndim == 1:
-        broadcast_shape = (1,) * (pe.ndim - 2) + cos.shape
-    else:
-        broadcast_shape = (
-            pos.shape[:-1] + (1,) * (pe.ndim - pos.ndim - 1) + cos.shape[-2:]
+        freq_scale: int = 1,
+    ) -> mx.array:
+        head_dim = x.shape[-1]
+        freqs = self._get_freqs(head_dim, inverse, freq_scale)
+        offset = offset // freq_scale if freq_scale != 1 else offset
+        return mx.fast.rope(
+            x,
+            head_dim,
+            traditional=True,
+            base=None,
+            scale=1.0,
+            offset=offset,
+            freqs=freqs,
         )
-    cos = cos.reshape(broadcast_shape).astype(pe.dtype)
-    sin = sin.reshape(broadcast_shape).astype(pe.dtype)
-
-    pe = pe.reshape(*pe.shape[:-1], pe.shape[-1] // 2, 2)
-    x0, x1 = pe[..., 0], pe[..., 1]
-    out = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
-    pe_out = out.reshape(*out.shape[:-2], out.shape[-2] * 2)
-
-    if nope_dim > 0:
-        return mx.concatenate([x[..., :nope_dim], pe_out], axis=-1)
-    return pe_out
-
-
-def _apply_partial_rope(
-    x: mx.array,
-    rope: DeepseekV4RoPE,
-    offset: Any = 0,
-    inverse: bool = False,
-    positions: Optional[mx.array] = None,
-) -> mx.array:
-    nope_dim = x.shape[-1] - rope.dims if x.shape[-1] != rope.dims else 0
-    L = x.shape[-2]
-    if positions is None:
-        pos = mx.arange(L, dtype=mx.float32)
-        if isinstance(offset, mx.array):
-            offset = offset.astype(mx.float32)
-            if offset.ndim > 0:
-                offset = offset[..., None]
-        pos = pos + offset
-    else:
-        pos = positions.astype(mx.float32)
-    return _rope_full(x, rope.inv_freq, pos, inverse, nope_dim)
 
 
 def _apply_score_mask(scores: mx.array, mask: Optional[mx.array]) -> mx.array:
@@ -1557,13 +1510,10 @@ class Compressor(nn.Module):
             )
             new_pooled = (kv * weights).sum(axis=2)
             new_pooled = self.norm(new_pooled.astype(x.dtype))
-            positions = mx.arange(new_pooled.shape[1], dtype=mx.float32)
-            positions = positions * self.compress_ratio
-            if isinstance(pool_base, mx.array) and pool_base.ndim > 0:
-                pool_base = pool_base[:, None]
-            positions = positions + pool_base
-            new_pooled = _apply_partial_rope(
-                new_pooled[:, None], rope, positions=positions
+            new_pooled = rope(
+                new_pooled[:, None],
+                offset=pool_base,
+                freq_scale=self.compress_ratio,
             ).squeeze(1)
 
         if cache is not None:
@@ -1601,7 +1551,7 @@ class Indexer(nn.Module):
         offset = start_pos
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = q.transpose(0, 2, 1, 3)
-        q = _apply_partial_rope(q, position_rope, offset)
+        q = position_rope(q, offset)
 
         scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
             mx.float32
@@ -1746,8 +1696,8 @@ class V4Attention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
 
-        q = _apply_partial_rope(q, self.rope, offset)
-        kv = _apply_partial_rope(kv, self.rope, offset)
+        q = self.rope(q, offset)
+        kv = self.rope(kv, offset)
 
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, kv)
@@ -1878,7 +1828,7 @@ class V4Attention(nn.Module):
                 mask=mask,
                 sinks=self._attn_sink_cached,
             )
-        out = _apply_partial_rope(out, self.rope, offset, inverse=True)
+        out = self.rope(out, offset, inverse=True)
         out = self._grouped_output_projection(out)
         return self.wo_b(out)
 

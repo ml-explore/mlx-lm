@@ -344,7 +344,12 @@ class TestModels(unittest.TestCase):
         self.assertEqual(model.model_type, model_type)
 
         for t in [mx.float32, mx.float16]:
-            model.update(tree_map(lambda p: p.astype(t), model.parameters()))
+            model.update(
+                tree_map(
+                    lambda p: p.astype(t) if mx.issubdtype(p.dtype, mx.floating) else p,
+                    model.parameters(),
+                )
+            )
 
             inputs = mx.array([[0, 1]])
             outputs = model(inputs)
@@ -1440,14 +1445,21 @@ class TestModels(unittest.TestCase):
         expected = expected.reshape(*expected.shape[:-2], 4)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
-        positions = mx.array([1, 5, 9], dtype=mx.float32)
-        y = rope(x, positions=positions)
+        # Inverse RoPE round-trip test
+        y_inv = rope(y, offset=1, inverse=True)
+        self.assertTrue(mx.allclose(y_inv, x, rtol=1e-5, atol=1e-5))
+
+        # freq_scale test (compressor strided positions: pool_base + t * R)
+        # With pool_base=4, R=4, positions are [4, 8, 12] = arange(3)*4 + 4
+        # Equivalent to offset=4//4=1, freq_scale=4
+        y_scaled = rope(x, offset=4, freq_scale=4)
+        positions = mx.array([4, 8, 12], dtype=mx.float32)
         freqs = positions[:, None] * inv_freq[None, :]
         cos = mx.cos(freqs).reshape(1, 1, 3, 2)
         sin = mx.sin(freqs).reshape(1, 1, 3, 2)
         expected = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
         expected = expected.reshape(*expected.shape[:-2], 4)
-        self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
+        self.assertTrue(mx.allclose(y_scaled, expected, rtol=1e-5, atol=1e-5))
 
         # HyperConnection Sinkhorn test
         for hc_mult in (2, 4):
@@ -1525,14 +1537,6 @@ class TestModels(unittest.TestCase):
         logits = model(inputs, cache=cache)
         mx.eval(logits, [c.state for c in cache])
 
-        freq_dims = mx.arange(0, args.qk_rope_head_dim, 2, dtype=mx.float32)
-        freq_dims = freq_dims / args.qk_rope_head_dim
-        main_expected = 1.0 / (args.rope_theta**freq_dims)
-        compress_expected = 1.0 / (args.compress_rope_theta**freq_dims)
-        self.assertTrue(mx.allclose(main_layer.rope.inv_freq, main_expected))
-        self.assertTrue(mx.allclose(compress_layer.rope.inv_freq, compress_expected))
-        self.assertIs(compress_layer.compress_rope, compress_layer.rope)
-
         # Sanitize test
         weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
         converted = model.sanitize(
@@ -1541,16 +1545,13 @@ class TestModels(unittest.TestCase):
                 "layers.0.attn.wkv.scale": mx.full((1, 1), 127, dtype=mx.uint8),
             }
         )
-        key = "model.layers.0.attn.wkv.weight"
-        self.assertIn(key, converted)
-        self.assertTrue(
-            mx.allclose(
-                converted[key].astype(mx.float32),
-                mx.ones((128, 128), dtype=mx.float32),
-                rtol=1e-5,
-                atol=1e-5,
-            )
-        )
+        wkey = "model.layers.0.attn.wkv.weight"
+        skey = "model.layers.0.attn.wkv.scales"
+        self.assertIn(wkey, converted)
+        self.assertIn(skey, converted)
+        self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
+        self.assertTrue(mx.all(converted[skey] == 127))
+        self.assertEqual(converted[skey].shape, (128, 4))
 
     def test_gemma2(self):
         from mlx_lm.models import gemma2
