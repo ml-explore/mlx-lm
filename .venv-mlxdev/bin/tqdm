@@ -1,8 +1,0 @@
-#!/bin/sh
-'''exec' "/Volumes/Studio Storage/kDrive/documenti/dev/mlx-lm-enggpt/.venv-mlxdev/bin/python3.12" "$0" "$@"
-' '''
-import sys
-from tqdm.cli import main
-if __name__ == '__main__':
-    sys.argv[0] = sys.argv[0].removesuffix('.exe')
-    sys.exit(main())
