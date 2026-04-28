@@ -108,7 +108,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "sigmoid":
         return mx.sigmoid(scores)
     if func == "sqrtsoftplus":
-        return mx.sqrt(mx.logaddexp(scores, 0))
+        return mx.sqrt(nn.softplus(scores))
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
@@ -121,9 +121,29 @@ def _expert_select(
     norm_topk_prob: bool,
     scoring_func: str,
 ) -> Tuple[mx.array, mx.array]:
+    logits = logits.astype(mx.float32)
     scores = _score_func(logits, scoring_func)
     biased = scores + e_score_correction_bias
     inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, inds, axis=-1)
+    if scoring_func != "softmax" and norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    weights = weights * routed_scaling_factor
+    return inds, weights
+
+
+@mx.compile
+def _hash_expert_select(
+    input_ids: mx.array,
+    logits: mx.array,
+    tid2eid: mx.array,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    scoring_func: str,
+) -> Tuple[mx.array, mx.array]:
+    logits = logits.astype(mx.float32)
+    scores = _score_func(logits, scoring_func)
+    inds = tid2eid[input_ids]
     weights = mx.take_along_axis(scores, inds, axis=-1)
     if scoring_func != "softmax" and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -146,38 +166,6 @@ class LimitedSwiGLU(nn.Module):
 
     def __call__(self, x, gate):
         return _limited_swiglu(gate, x, self.limit)
-
-
-class DeepseekV4SwitchGLU(SwitchGLU):
-    sort_threshold = 8
-
-    def __call__(self, x, indices, scores) -> mx.array:
-        out_shape = x.shape
-        route_shape = indices.shape
-        x = mx.expand_dims(x, (-2, -3))
-
-        do_sort = indices.size >= self.sort_threshold
-        inv_order = None
-        if do_sort:
-            flat_indices = indices.flatten()
-            order = mx.argsort(flat_indices)
-            inv_order = mx.argsort(order)
-            x = x.flatten(0, -3)[order // route_shape[-1]]
-            indices = flat_indices[order]
-            scores = scores.flatten()[order]
-        if self.training:
-            indices = mx.stop_gradient(indices)
-        x_up = self.up_proj(x, indices, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, indices, sorted_indices=do_sort)
-        x = self.activation(x_up, x_gate)
-        x = x * scores.astype(x.dtype)[..., None, None]
-        x = self.down_proj(x, indices, sorted_indices=do_sort)
-
-        if do_sort:
-            x = _scatter_unsort(x, inv_order, route_shape)
-
-        x = x.squeeze(-2)
-        return x.sum(axis=-2).astype(x.dtype).reshape(out_shape)
 
 
 class DeepseekV4RoPE(nn.Module):
@@ -831,7 +819,6 @@ class MoEGate(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
         self.weight = mx.zeros((self.num_experts, self.hidden_dim))
-        self._weight_T_f32 = None
         if self.hash:
             self.tid2eid = mx.zeros((config.vocab_size, self.top_k), dtype=mx.int32)
         else:
@@ -840,20 +827,19 @@ class MoEGate(nn.Module):
             )
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
-        flat = x.reshape(-1, self.hidden_dim)
-        if self._weight_T_f32 is None:
-            self._weight_T_f32 = self.weight.T.astype(mx.float32)
-        logits = flat.astype(mx.float32) @ self._weight_T_f32
+        logits = x @ self.weight.T
 
         if self.hash:
             if input_ids is None:
                 raise ValueError("DeepSeek-V4 hash routing requires input_ids.")
-            scores = _score_func(logits, self.scoring_func)
-            inds = self.tid2eid[input_ids.reshape(-1)].astype(mx.int32)
-            weights = mx.take_along_axis(scores, inds, axis=-1)
-            if self.scoring_func != "softmax" and self.norm_topk_prob:
-                weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
-            weights = weights * self.routed_scaling_factor
+            inds, weights = _hash_expert_select(
+                input_ids,
+                logits,
+                self.tid2eid,
+                self.routed_scaling_factor,
+                self.norm_topk_prob,
+                self.scoring_func,
+            )
         else:
             inds, weights = _expert_select(
                 logits,
@@ -864,9 +850,6 @@ class MoEGate(nn.Module):
                 self.scoring_func,
             )
 
-        route_shape = (*x.shape[:-1], self.top_k)
-        inds = inds.reshape(route_shape)
-        weights = weights.reshape(route_shape)
         return inds, weights
 
 
@@ -896,7 +879,7 @@ class DeepseekV4MoE(nn.Module):
         super().__init__()
         self.config = config
         self.gate = MoEGate(config, layer_idx)
-        self.switch_mlp = DeepseekV4SwitchGLU(
+        self.switch_mlp = SwitchGLU(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -913,7 +896,8 @@ class DeepseekV4MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds, scores)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None].astype(y.dtype)).sum(-2)
         y = y + self.shared_experts(x)
 
         if self.sharding_group is not None:
@@ -2042,6 +2026,9 @@ class Model(nn.Module):
 
         new_weights = {}
         for k, v in weights.items():
+            if "tid2eid" in k:
+                new_weights[k] = v.astype(mx.int32)
+
             if not k.endswith(".scale"):
                 if k not in new_weights:
                     new_weights[k] = v
