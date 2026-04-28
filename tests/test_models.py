@@ -1882,7 +1882,7 @@ class TestModels(unittest.TestCase):
             shared_expert_intermediate_size=64,
             norm_topk_prob=True,
             moe_routed_scaling_factor=2.5,
-            gating="per-head",
+            gating=True,
             sliding_window=4,
             layer_types=[
                 "full_attention",
@@ -1892,15 +1892,17 @@ class TestModels(unittest.TestCase):
             ],
             num_attention_heads_per_layer=[4, 8, 8, 4],
             rope_parameters={
-                "rope_theta": 10000.0,
-                "rope_type": "default",
-                "partial_rotary_factor": 0.5,
-            },
-            swa_rope_parameters={
-                "rope_theta": 10000.0,
-                "rope_type": "linear",
-                "factor": 1.0,
-                "partial_rotary_factor": 1.0,
+                "full_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default",
+                    "partial_rotary_factor": 0.5,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "linear",
+                    "factor": 1.0,
+                    "partial_rotary_factor": 1.0,
+                },
             },
         )
         model = laguna.Model(args)
