@@ -52,18 +52,17 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
+        n = self.num_hidden_layers
         if self.hybrid_layer_pattern is None:
-            self.hybrid_layer_pattern = [0] * self.num_hidden_layers
+            self.hybrid_layer_pattern = [0] * n
         if isinstance(self.moe_layer_freq, int):
-            self.moe_layer_freq = [
-                int(self.moe_layer_freq > 0 and i % self.moe_layer_freq == 0)
-                for i in range(self.num_hidden_layers)
-            ]
+            freq = self.moe_layer_freq
+            self.moe_layer_freq = [int(freq > 0 and i % freq == 0) for i in range(n)]
         elif self.moe_layer_freq is None:
-            self.moe_layer_freq = [0] * self.num_hidden_layers
-        if len(self.hybrid_layer_pattern) != self.num_hidden_layers:
+            self.moe_layer_freq = [0] * n
+        if len(self.hybrid_layer_pattern) != n:
             raise ValueError("hybrid_layer_pattern length must match num_hidden_layers")
-        if len(self.moe_layer_freq) != self.num_hidden_layers:
+        if len(self.moe_layer_freq) != n:
             raise ValueError("moe_layer_freq length must match num_hidden_layers")
 
 
@@ -100,10 +99,7 @@ class Attention(nn.Module):
         )
         self.o_proj = nn.Linear(self.n_heads * v_head_dim, dim, bias=False)
 
-        if has_sinks:
-            self.attention_sink_bias = mx.zeros((self.n_heads,))
-        else:
-            self.attention_sink_bias = None
+        self.attention_sink_bias = mx.zeros((self.n_heads,)) if has_sinks else None
 
         self.rope = initialize_rope(
             int(args.partial_rotary_factor * head_dim),
@@ -122,19 +118,15 @@ class Attention(nn.Module):
         B, L, _ = x.shape
 
         queries = (
-            self.q_proj(x)
-            .reshape(B, L, self.n_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
+            self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim).swapaxes(1, 2)
         )
         keys = (
-            self.k_proj(x)
-            .reshape(B, L, self.n_kv_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
+            self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).swapaxes(1, 2)
         )
         values = (
             self.v_proj(x)
             .reshape(B, L, self.n_kv_heads, self.v_head_dim)
-            .transpose(0, 2, 1, 3)
+            .swapaxes(1, 2)
         )
 
         if cache is not None:
@@ -154,16 +146,11 @@ class Attention(nn.Module):
             mask=mask,
             sinks=self.attention_sink_bias,
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return self.o_proj(output.swapaxes(1, 2).reshape(B, L, -1))
 
 
 class MLP(nn.Module):
-    def __init__(
-        self,
-        config: ModelArgs,
-        intermediate_size: Optional[int] = None,
-    ):
+    def __init__(self, config: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
@@ -203,7 +190,6 @@ def group_expert_select(
     if top_k > 1 and norm_topk_prob:
         scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
     scores = scores * routed_scaling_factor
-
     return inds, scores.astype(gates.dtype)
 
 
@@ -275,36 +261,47 @@ class MiMoV2Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        pattern = config.hybrid_layer_pattern
+        moe_freq = config.moe_layer_freq
         self.layers = [
             DecoderLayer(
                 config,
-                is_moe=bool(config.moe_layer_freq[idx]),
-                is_sliding_window=bool(config.hybrid_layer_pattern[idx]),
+                is_moe=bool(moe_freq[idx]),
+                is_sliding_window=bool(pattern[idx]),
             )
             for idx in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
-        self.swa_idx = next(
-            (i for i, p in enumerate(config.hybrid_layer_pattern) if p == 1), 0
-        )
-        self.ga_idx = next(
-            (i for i, p in enumerate(config.hybrid_layer_pattern) if p == 0), 0
-        )
+        self.swa_idx = pattern.index(1) if 1 in pattern else 0
+        self.ga_idx = pattern.index(0) if 0 in pattern else 0
         self.sliding_window_size = config.sliding_window_size
+        self.has_swa = 1 in pattern
+        self.has_full = 0 in pattern
 
     def __call__(
         self,
-        x: mx.array,
+        inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        h = self.embed_tokens(x)
+        h = (
+            input_embeddings
+            if input_embeddings is not None
+            else self.embed_tokens(inputs)
+        )
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        full_mask = create_attention_mask(h, cache[self.ga_idx])
-        swa_mask = create_attention_mask(
-            h, cache[self.swa_idx], window_size=self.sliding_window_size
+        full_mask = (
+            create_attention_mask(h, cache[self.ga_idx]) if self.has_full else None
+        )
+        swa_mask = (
+            create_attention_mask(
+                h, cache[self.swa_idx], window_size=self.sliding_window_size
+            )
+            if self.has_swa
+            else None
         )
 
         for layer, c in zip(self.layers, cache):
@@ -327,72 +324,14 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        TP = 4
-        bs = 128
-
-        def dequant_qkv(qkv_fp8, scale_inv, n_h, n_kv, hd, vhd):
-            q_per_rank = (n_h // TP) * hd
-            k_per_rank = (n_kv // TP) * hd
-            v_per_rank = (n_kv // TP) * vhd
-            actual_per_rank = q_per_rank + k_per_rank + v_per_rank
-            padded_per_rank = -(-actual_per_rank // bs) * bs
-
-            qkv = mx.from_fp8(qkv_fp8, dtype=mx.bfloat16).reshape(
-                TP, actual_per_rank, -1
-            )
-            if padded_per_rank > actual_per_rank:
-                qkv = mx.pad(
-                    qkv, ((0, 0), (0, padded_per_rank - actual_per_rank), (0, 0))
-                )
-            n_orig = qkv.shape[-1]
-            n_col_blocks = scale_inv.shape[1]
-            pad_side = bs * n_col_blocks - n_orig
-            if pad_side > 0:
-                qkv = mx.pad(qkv, ((0, 0), (0, 0), (0, pad_side)))
-
-            blocked = qkv.reshape(TP * padded_per_rank // bs, bs, n_col_blocks, bs)
-            qkv = (blocked * scale_inv[:, None, :, None]).reshape(
-                TP, padded_per_rank, n_col_blocks * bs
-            )[..., :n_orig]
-
-            qkv = qkv[:, :actual_per_rank, :]
-            q = (
-                mx.contiguous(qkv[:, :q_per_rank, :])
-                .reshape(TP * q_per_rank, n_orig)
-                .astype(mx.bfloat16)
-            )
-            k = (
-                mx.contiguous(qkv[:, q_per_rank : q_per_rank + k_per_rank, :])
-                .reshape(TP * k_per_rank, n_orig)
-                .astype(mx.bfloat16)
-            )
-            v = (
-                mx.contiguous(qkv[:, q_per_rank + k_per_rank :, :])
-                .reshape(TP * v_per_rank, n_orig)
-                .astype(mx.bfloat16)
-            )
-            return q, k, v
-
-        def dequant(weight, scale_inv):
-            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
-            m, n = weight.shape
-            pad_b = (-m) % bs
-            pad_r = (-n) % bs
-            if pad_b or pad_r:
-                weight = mx.pad(weight, ((0, pad_b), (0, pad_r)))
-            weight = weight.reshape((m + pad_b) // bs, bs, (n + pad_r) // bs, bs)
-            weight = (weight * scale_inv[:, None, :, None]).reshape(
-                m + pad_b, n + pad_r
-            )
-            return weight[:m, :n].astype(mx.bfloat16)
-
         skip_prefixes = (
             "model.mtp.",
             "visual.",
@@ -408,7 +347,58 @@ class Model(nn.Module):
             if not k.startswith(skip_prefixes) and ".self_attn.rotary_emb." not in k
         }
 
+        TP = 4
+        BS = 128
+        bf16 = mx.bfloat16
+
+        def dequant_block(weight, scale_inv):
+            weight = mx.from_fp8(weight, dtype=bf16)
+            m, n = weight.shape
+            pad_b, pad_r = (-m) % BS, (-n) % BS
+            if pad_b or pad_r:
+                weight = mx.pad(weight, ((0, pad_b), (0, pad_r)))
+            weight = weight.reshape((m + pad_b) // BS, BS, (n + pad_r) // BS, BS)
+            weight = (weight * scale_inv[:, None, :, None]).reshape(
+                m + pad_b, n + pad_r
+            )
+            return weight[:m, :n].astype(bf16)
+
+        def split_qkv(qkv_fp8, scale_inv, n_h, n_kv, hd, vhd):
+            q_pr = (n_h // TP) * hd
+            k_pr = (n_kv // TP) * hd
+            v_pr = (n_kv // TP) * vhd
+            actual_pr = q_pr + k_pr + v_pr
+            padded_pr = -(-actual_pr // BS) * BS
+            n = qkv_fp8.shape[-1]
+
+            qkv = mx.from_fp8(qkv_fp8, dtype=bf16).reshape(TP, actual_pr, n)
+            if padded_pr > actual_pr:
+                qkv = mx.pad(qkv, ((0, 0), (0, padded_pr - actual_pr), (0, 0)))
+            n_col_blocks = scale_inv.shape[1]
+            pad_side = BS * n_col_blocks - n
+            if pad_side > 0:
+                qkv = mx.pad(qkv, ((0, 0), (0, 0), (0, pad_side)))
+
+            blocked = qkv.reshape(TP * padded_pr // BS, BS, n_col_blocks, BS)
+            qkv = (blocked * scale_inv[:, None, :, None]).reshape(
+                TP, padded_pr, n_col_blocks * BS
+            )[:, :actual_pr, :n]
+
+            q = mx.contiguous(qkv[:, :q_pr, :]).reshape(TP * q_pr, n).astype(bf16)
+            k = (
+                mx.contiguous(qkv[:, q_pr : q_pr + k_pr, :])
+                .reshape(TP * k_pr, n)
+                .astype(bf16)
+            )
+            v = (
+                mx.contiguous(qkv[:, q_pr + k_pr :, :])
+                .reshape(TP * v_pr, n)
+                .astype(bf16)
+            )
+            return q, k, v
+
         v_scale = self.args.attention_value_scale
+        bake_v = v_scale is not None and v_scale != 1.0
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.self_attn"
             qkv_key = f"{prefix}.qkv_proj.weight"
@@ -418,46 +408,33 @@ class Model(nn.Module):
 
             is_swa = bool(self.args.hybrid_layer_pattern[layer_idx])
             if is_swa:
-                n_heads = self.args.swa_num_attention_heads
-                n_kv_heads = self.args.swa_num_key_value_heads
-                head_dim = self.args.swa_head_dim
-                v_head_dim = self.args.swa_v_head_dim
+                n_h = self.args.swa_num_attention_heads
+                n_kv = self.args.swa_num_key_value_heads
+                hd = self.args.swa_head_dim
+                vhd = self.args.swa_v_head_dim
             else:
-                n_heads = self.args.num_attention_heads
-                n_kv_heads = self.args.num_key_value_heads
-                head_dim = self.args.head_dim
-                v_head_dim = self.args.v_head_dim
+                n_h = self.args.num_attention_heads
+                n_kv = self.args.num_key_value_heads
+                hd = self.args.head_dim
+                vhd = self.args.v_head_dim
 
-            q, k, v = dequant_qkv(
-                weights.pop(qkv_key),
-                weights.pop(scale_key),
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                v_head_dim,
+            q, k, v = split_qkv(
+                weights.pop(qkv_key), weights.pop(scale_key), n_h, n_kv, hd, vhd
             )
             weights[f"{prefix}.q_proj.weight"] = q
             weights[f"{prefix}.k_proj.weight"] = k
             weights[f"{prefix}.v_proj.weight"] = v
 
-            if v_scale is not None and v_scale != 1.0:
+            if bake_v:
                 o_key = f"{prefix}.o_proj.weight"
-                if o_key in weights:
-                    weights[o_key] = (weights[o_key] * v_scale).astype(
-                        weights[o_key].dtype
-                    )
+                w = weights.get(o_key)
+                if w is not None:
+                    weights[o_key] = (w * v_scale).astype(bf16)
 
-        fp8_weight_keys = {
-            k[: -len("_scale_inv")] for k in weights if k.endswith("weight_scale_inv")
-        }
-        new_weights = {}
-        for k, v in weights.items():
-            if k.endswith("weight_scale_inv"):
-                wk = k[: -len("_scale_inv")]
-                new_weights[wk] = dequant(weights[wk], v)
-            elif k not in fp8_weight_keys:
-                new_weights[k] = v
-        weights = new_weights
+        scale_keys = [k for k in weights if k.endswith("weight_scale_inv")]
+        for sk in scale_keys:
+            wk = sk[: -len("_scale_inv")]
+            weights[wk] = dequant_block(weights[wk], weights.pop(sk))
 
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
@@ -465,13 +442,12 @@ class Model(nn.Module):
                 expert0 = f"{prefix}.experts.0.{proj}.weight"
                 if expert0 not in weights:
                     continue
-                stacked = mx.stack(
+                weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
                     [
                         weights.pop(f"{prefix}.experts.{e}.{proj}.weight")
                         for e in range(self.args.n_routed_experts)
                     ]
                 )
-                weights[f"{prefix}.switch_mlp.{proj}.weight"] = stacked
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
