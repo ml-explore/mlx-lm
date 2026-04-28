@@ -375,9 +375,37 @@ class Model(nn.Module):
             if not k.startswith(skip_prefixes) and ".self_attn.rotary_emb." not in k
         }
 
-        TP = 4
         BS = 128
         bf16 = mx.bfloat16
+
+        def detect_tp():
+            n_h = self.args.num_attention_heads
+            n_kv = self.args.num_key_value_heads
+            hd = self.args.head_dim
+            vhd = self.args.v_head_dim
+            for layer_idx in range(self.args.num_hidden_layers):
+                if bool(self.args.hybrid_layer_pattern[layer_idx]):
+                    continue
+                qkv_key = f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
+                scale_key = f"{qkv_key}_scale_inv"
+                if qkv_key not in weights or scale_key not in weights:
+                    continue
+                actual = weights[qkv_key].shape[0]
+                padded = weights[scale_key].shape[0] * BS
+                for tp in (1, 2, 4, 8, 16, 32):
+                    if n_h % tp or n_kv % tp:
+                        continue
+                    pr = (n_h // tp) * hd + (n_kv // tp) * (hd + vhd)
+                    pr_padded = -(-pr // BS) * BS
+                    if pr * tp == actual and pr_padded * tp == padded:
+                        return tp
+                raise ValueError(
+                    f"unable to determine fused-qkv TP layout from layer {layer_idx} "
+                    f"(actual={actual}, padded={padded})"
+                )
+            return 1
+
+        TP = detect_tp()
 
         def dequant_block(weight, scale_inv):
             weight = mx.from_fp8(weight, dtype=bf16)
