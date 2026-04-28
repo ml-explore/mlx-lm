@@ -842,6 +842,68 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_laguna_sanitize_hf_moe_weights(self):
+        from mlx_lm.models import laguna
+
+        args = laguna.ModelArgs.from_dict(
+            {
+                "model_type": "laguna",
+                "vocab_size": 32,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "max_position_embeddings": 32,
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "decoder_sparse_step": 1,
+                "mlp_only_layers": [0],
+                "moe_intermediate_size": 3,
+                "shared_expert_intermediate_size": 3,
+                "layer_types": ["full_attention", "sliding_attention"],
+                "sliding_window": 4,
+                "swa_rope_parameters": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "linear",
+                    "factor": 1.0,
+                    "partial_rotary_factor": 1.0,
+                },
+            }
+        )
+        model = laguna.Model(args)
+
+        weights = {
+            "model.layers.1.mlp.gate.weight": mx.ones((2, 8)),
+            "model.layers.1.mlp.experts.e_score_correction_bias": mx.arange(
+                2, dtype=mx.float32
+            ),
+        }
+        for e in range(2):
+            weights[f"model.layers.1.mlp.experts.{e}.gate_proj.weight"] = mx.full(
+                (3, 8), e + 1, dtype=mx.float32
+            )
+            weights[f"model.layers.1.mlp.experts.{e}.up_proj.weight"] = mx.full(
+                (3, 8), e + 3, dtype=mx.float32
+            )
+            weights[f"model.layers.1.mlp.experts.{e}.down_proj.weight"] = mx.full(
+                (8, 3), e + 5, dtype=mx.float32
+            )
+
+        converted = model.sanitize(weights)
+
+        self.assertIn("model.layers.1.mlp.gate.proj.weight", converted)
+        self.assertIn("model.layers.1.mlp.gate.e_score_correction_bias", converted)
+        self.assertIn("model.layers.1.mlp.switch_mlp.gate_proj.weight", converted)
+        self.assertIn("model.layers.1.mlp.switch_mlp.up_proj.weight", converted)
+        self.assertIn("model.layers.1.mlp.switch_mlp.down_proj.weight", converted)
+        self.assertEqual(
+            converted["model.layers.1.mlp.switch_mlp.gate_proj.weight"].shape,
+            (2, 3, 8),
+        )
+        self.assertFalse(any(".experts." in k for k in converted))
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
@@ -1793,6 +1855,57 @@ class TestModels(unittest.TestCase):
             cla_share_factor=2,
         )
         model = hunyuan.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_laguna(self):
+        from mlx_lm.models import laguna
+
+        args = laguna.ModelArgs(
+            model_type="laguna",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=1000,
+            rms_norm_eps=1e-5,
+            attention_bias=False,
+            mlp_only_layers=[0],
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            norm_topk_prob=True,
+            moe_routed_scaling_factor=2.5,
+            gating=True,
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            num_attention_heads_per_layer=[4, 8, 8, 4],
+            rope_parameters={
+                "full_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default",
+                    "partial_rotary_factor": 0.5,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "linear",
+                    "factor": 1.0,
+                    "partial_rotary_factor": 1.0,
+                },
+            },
+        )
+        model = laguna.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )

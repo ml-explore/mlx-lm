@@ -557,6 +557,12 @@ def _infer_tool_parser(chat_template):
         return "function_gemma"
     elif "<longcat_tool_call>" in chat_template:
         return "longcat"
+    elif (
+        "<tool_call>function-name" in chat_template
+        and "<arg_key>" in chat_template
+        and "<arg_value>" in chat_template
+    ):
+        return "laguna"
     elif "<arg_key>" in chat_template:
         return "glm47"
     elif "<|tool_list_start|>" in chat_template:

@@ -7,6 +7,7 @@ from mlx_lm.tool_parsers import (
     glm47,
     json_tools,
     kimi_k2,
+    laguna,
     longcat,
     minimax_m2,
     mistral,
@@ -28,6 +29,14 @@ class TestToolParsing(unittest.TestCase):
             (
                 "multiply<arg_key>a</arg_key><arg_value>12234585</arg_value><arg_key>b</arg_key><arg_value>48838483920</arg_value>",
                 glm47,
+            ),
+            (
+                "multiply\n"
+                "<arg_key>a</arg_key>\n"
+                "<arg_value>12234585</arg_value>\n"
+                "<arg_key>b</arg_key>\n"
+                "<arg_value>48838483920</arg_value>",
+                laguna,
             ),
             (
                 '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
@@ -98,6 +107,12 @@ class TestToolParsing(unittest.TestCase):
             (
                 'get_current_temperature<arg_key>location</arg_key><arg_value>"London"</arg_value>',
                 glm47,
+            ),
+            (
+                "get_current_temperature\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>London</arg_value>",
+                laguna,
             ),
             (
                 '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
@@ -328,6 +343,73 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_laguna_strips_function_name_and_preserves_string_args(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                            "days": {"type": "integer"},
+                            "postal_code": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "get_weather\n"
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>Warsaw</arg_value>\n"
+            "<arg_key>days</arg_key>\n"
+            "<arg_value>3</arg_value>\n"
+            "<arg_key>postal_code</arg_key>\n"
+            "<arg_value>00123</arg_value>"
+        )
+
+        tool_call = laguna.parse_tool_call(test_case, tools)
+
+        self.assertEqual(tool_call["name"], "get_weather")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"location": "Warsaw", "days": 3, "postal_code": "00123"},
+        )
+
+    def test_laguna_full_tool_call_tags(self):
+        test_case = (
+            "<tool_call>search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>weather</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_call = laguna.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call,
+            {"name": "search", "arguments": {"query": "weather"}},
+        )
+
+        test_case = (
+            "<tool_call>search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>weather</arg_value>\n"
+            "</tool_call>"
+            "<tool_call>read_file\n"
+            "<arg_key>path</arg_key>\n"
+            "<arg_value>/tmp/test.txt</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_calls = laguna.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "search", "arguments": {"query": "weather"}},
+                {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+            ],
+        )
 
 
 if __name__ == "__main__":
