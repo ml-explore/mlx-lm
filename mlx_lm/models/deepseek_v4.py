@@ -11,6 +11,7 @@ from mlx.utils import tree_flatten
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import BatchRotatingKVCache, RotatingKVCache
+from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
@@ -1568,6 +1569,94 @@ class Indexer(nn.Module):
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
 
+class LocalAttention(nn.Module):
+    """DeepSeek V4 attention with no KV compression."""
+
+    def __init__(self, config: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.compress_ratio = 0
+        self.hidden_size = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.o_groups = config.o_groups
+        self.o_lora_rank = config.o_lora_rank
+        self.scale = self.head_dim**-0.5
+
+        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
+        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.wo_a = MultiLinear(
+            self.n_heads * self.head_dim // config.o_groups,
+            config.o_lora_rank,
+            config.o_groups,
+        )
+        self.wo_b = nn.Linear(
+            config.o_groups * config.o_lora_rank,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
+        self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+
+        self.rope = DeepseekV4RoPE(
+            config.qk_rope_head_dim,
+            config.rope_theta,
+            None,
+            config.max_position_embeddings,
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+        offset = cache.offset if cache is not None else 0
+
+        q = self.wq_b(self.q_norm(self.wq_a(x)))
+        q = q.reshape(B, L, self.n_heads, self.head_dim)
+        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+        q = q.transpose(0, 2, 1, 3)
+        q = self.rope(q, offset)
+
+        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        kv = self.rope(kv, offset)
+        if cache is not None:
+            kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+
+        out = scaled_dot_product_attention(
+            q,
+            kv,
+            kv,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attn_sink.astype(q.dtype),
+        )
+        out = self.rope(out, offset, inverse=True)
+
+        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
+        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+        out = self.wo_a(out)
+        out = out.transpose(0, 2, 1, 3).flatten(-2)
+        out = self.wo_b(out)
+
+        return out
+
+
+def v4_attention_factory(config: ModelArgs, layer_idx: int) -> nn.Module:
+    """Instantiate the appropriate attention module for a given layer."""
+    if config.compress_ratios[layer_idx] == 0:
+        return LocalAttention(config, layer_idx)
+    return V4Attention(config, layer_idx)
+
+
 class V4Attention(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
@@ -1836,7 +1925,7 @@ class V4Attention(nn.Module):
 class DeepseekV4Block(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
-        self.attn = V4Attention(config, layer_idx)
+        self.attn = v4_attention_factory(config, layer_idx)
         self.ffn = DeepseekV4MoE(config, layer_idx)
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2046,6 +2135,16 @@ class Model(nn.Module):
                         weights[
                             f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
                         ] = mx.stack(stacked)
+
+        for layer_idx in range(n_layers):
+            if self.args.compress_ratios[layer_idx] != 0:
+                continue
+            prefix = f"model.layers.{layer_idx}.attn.wo_a"
+            for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
+                if key in weights and weights[key].ndim == 2:
+                    weights[key] = weights[key].reshape(
+                        self.args.o_groups, self.args.o_lora_rank, -1
+                    )
 
         return weights
 
