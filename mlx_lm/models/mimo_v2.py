@@ -1,7 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -39,7 +39,7 @@ class ModelArgs(BaseModelArgs):
     hybrid_layer_pattern: Optional[List[int]] = None
     n_routed_experts: int = 256
     num_experts_per_tok: int = 8
-    moe_layer_freq: Optional[Union[int, List[int]]] = None
+    moe_layer_freq: Optional[List[int]] = None
     n_group: int = 1
     topk_group: int = 1
     norm_topk_prob: bool = True
@@ -57,10 +57,7 @@ class ModelArgs(BaseModelArgs):
         n = self.num_hidden_layers
         if self.hybrid_layer_pattern is None:
             self.hybrid_layer_pattern = [0] * n
-        if isinstance(self.moe_layer_freq, int):
-            freq = self.moe_layer_freq
-            self.moe_layer_freq = [int(freq > 0 and i % freq == 0) for i in range(n)]
-        elif self.moe_layer_freq is None:
+        if self.moe_layer_freq is None:
             self.moe_layer_freq = [0] * n
         if len(self.hybrid_layer_pattern) != n:
             raise ValueError("hybrid_layer_pattern length must match num_hidden_layers")
@@ -91,6 +88,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim
         self.scale = head_dim**-0.5
+        self.v_scale = args.attention_value_scale
 
         self.q_proj = nn.Linear(dim, self.n_heads * head_dim, bias=args.attention_bias)
         self.k_proj = nn.Linear(
@@ -131,6 +129,9 @@ class Attention(nn.Module):
             .swapaxes(1, 2)
         )
 
+        if self.v_scale is not None:
+            values = values * self.v_scale
+
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
@@ -152,13 +153,12 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: ModelArgs, intermediate_size: Optional[int] = None):
+    def __init__(self, config: ModelArgs):
         super().__init__()
-        hidden_size = config.hidden_size
-        intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        h, i = config.hidden_size, config.intermediate_size
+        self.gate_proj = nn.Linear(h, i, bias=False)
+        self.up_proj = nn.Linear(h, i, bias=False)
+        self.down_proj = nn.Linear(i, h, bias=False)
 
     def __call__(self, x):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
@@ -192,7 +192,7 @@ def group_expert_select(
     if top_k > 1 and norm_topk_prob:
         scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
     scores = scores * routed_scaling_factor
-    return inds, scores.astype(gates.dtype)
+    return inds, scores
 
 
 class MoEGate(nn.Module):
@@ -298,15 +298,12 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         if cache is None:
             cache = [None] * len(local_layers)
 
-        swa_local = ga_local = None
-        for i, l in enumerate(local_layers):
-            if swa_local is None and l.is_sliding_window:
-                swa_local = i
-            elif ga_local is None and not l.is_sliding_window:
-                ga_local = i
-            if swa_local is not None and ga_local is not None:
-                break
-
+        swa_local = next(
+            (i for i, l in enumerate(local_layers) if l.is_sliding_window), None
+        )
+        ga_local = next(
+            (i for i, l in enumerate(local_layers) if not l.is_sliding_window), None
+        )
         full_mask = (
             create_attention_mask(h, cache[ga_local]) if ga_local is not None else None
         )
@@ -365,15 +362,8 @@ class Model(nn.Module):
             "visual.",
             "audio_encoder.",
             "speech_embeddings.",
-            "audio_tokenizer.",
-            "model.rotary_emb.",
-            "model.swa_rotary_emb.",
         )
-        weights = {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith(skip_prefixes) and ".self_attn.rotary_emb." not in k
-        }
+        weights = {k: v for k, v in weights.items() if not k.startswith(skip_prefixes)}
 
         BS = 128
         bf16 = mx.bfloat16
@@ -453,8 +443,6 @@ class Model(nn.Module):
             )
             return q, k, v
 
-        v_scale = self.args.attention_value_scale
-        bake_v = v_scale is not None and v_scale != 1.0
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.self_attn"
             qkv_key = f"{prefix}.qkv_proj.weight"
@@ -480,12 +468,6 @@ class Model(nn.Module):
             weights[f"{prefix}.q_proj.weight"] = q
             weights[f"{prefix}.k_proj.weight"] = k
             weights[f"{prefix}.v_proj.weight"] = v
-
-            if bake_v:
-                o_key = f"{prefix}.o_proj.weight"
-                w = weights.get(o_key)
-                if w is not None:
-                    weights[o_key] = (w * v_scale).astype(bf16)
 
         scale_keys = [k for k in weights if k.endswith("weight_scale_inv")]
         for sk in scale_keys:
