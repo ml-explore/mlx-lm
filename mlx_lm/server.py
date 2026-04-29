@@ -955,10 +955,15 @@ class ResponseGenerator:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
-            elif self._kv_quant_config is not None:
-                # Dequantize for stream_generate compatibility (single-serve
-                # path doesn't support quantized cache in generate_step)
-                cache = _maybe_dequantize_cache(cache)
+            else:
+                if self._kv_quant_config is not None:
+                    cache = _maybe_dequantize_cache(cache)
+                # Exact cache hit: all prompt tokens matched, nothing to prefill.
+                # Trim last token from cache and re-process it so
+                # generate_step has at least one prompt token.
+                if len(rest) == 0:
+                    trim_prompt_cache(cache, 1)
+                    rest = prompt[-1:]
 
             # Enable prefill checkpoints now that cache/ctx are ready
             _checkpoint_state["ctx"] = ctx
