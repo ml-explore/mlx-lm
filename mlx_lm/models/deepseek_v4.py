@@ -1207,6 +1207,13 @@ class DeepseekV4Cache:
         self._pending_lengths = None
 
     def filter(self, batch_indices):
+        if isinstance(batch_indices, mx.array):
+            idx_list = batch_indices.tolist()
+        else:
+            idx_list = list(batch_indices)
+        needed = max(idx_list) + 1 if idx_list else 0
+        self._expand_state_to(needed)
+
         if hasattr(self.local, "filter"):
             self.local.filter(batch_indices)
         elif self.local.keys is not None:
@@ -1219,6 +1226,31 @@ class DeepseekV4Cache:
                     state[key] = value[batch_indices]
             for key in self._length_keys:
                 state[key] = self._filter_lengths(state[key], batch_indices)
+
+    def _expand_state_to(self, batch_size: int):
+        """Ensure compressor/indexer state arrays/lists have at least `batch_size`
+        rows along dim 0. Slots without emitted positions are zero-padded."""
+        for state in (self.compressor_state, self.indexer_state):
+            for key in self._state_keys:
+                value = state[key]
+                if value is None:
+                    continue
+                cur = value.shape[0]
+                if cur < batch_size:
+                    pad_shape = (batch_size - cur,) + value.shape[1:]
+                    state[key] = mx.concatenate(
+                        [value, mx.zeros(pad_shape, dtype=value.dtype)], axis=0
+                    )
+            for key in self._length_keys:
+                lst = state[key]
+                if lst is None:
+                    continue
+                if isinstance(lst, mx.array):
+                    lst = lst.tolist()
+                if len(lst) < batch_size:
+                    state[key] = lst + [0] * (batch_size - len(lst))
+                else:
+                    state[key] = lst
 
     def extend(self, other):
         self_batch = self._cache_batch_size(self.local)
