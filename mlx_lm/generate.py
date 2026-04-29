@@ -675,6 +675,7 @@ def mtp_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """A generator that uses the model's native MTP head for speculative decoding.
 
@@ -717,8 +718,10 @@ def mtp_generate_step(
 
     def _process_and_sample(tokens, logits):
         if logits_processors:
+            logits = logits[None]
             for processor in logits_processors:
                 logits = processor(tokens, logits)
+            logits = logits.squeeze(0)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         return sampler(logprobs), logprobs
 
@@ -783,20 +786,30 @@ def mtp_generate_step(
             draft_tok, draft_lp = _process_and_sample(tokens_for_proc, mtp_logits)
         return draft_tok, draft_lp
 
-    def _prefill(y):
+    def _prefill(y, input_embeddings):
         # Leave exactly 1 token for _step_backbone: return_hidden=True keeps
         # the hidden state [1, N, d_model] live, so N must be 1.
-        while y.size > 1:
-            n = min(prefill_step_size, y.size - 1)
-            model(y[:n][None], cache=model_cache)
+        total = len(input_embeddings) if input_embeddings is not None else y.size
+        while total > 1:
+            n = min(prefill_step_size, total - 1)
+            if input_embeddings is not None:
+                model(
+                    y[:n][None],
+                    cache=model_cache,
+                    input_embeddings=input_embeddings[:n][None],
+                )
+                input_embeddings = input_embeddings[n:]
+            else:
+                model(y[:n][None], cache=model_cache)
             quantize_cache_fn(model_cache)
             mx.eval([c.state for c in model_cache if hasattr(c, "state")])
             y = y[n:]
+            total -= n
             mx.clear_cache()
         return y
 
     with mx.stream(generation_stream):
-        y = _prefill(y)
+        y = _prefill(y, input_embeddings)
 
     ntoks = 0
     draft_tok = draft_lp = None
