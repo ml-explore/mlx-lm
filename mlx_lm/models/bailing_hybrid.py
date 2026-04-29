@@ -208,6 +208,7 @@ def recurrent_gla(
     g: mx.array,
     scale: float,
     h: Optional[mx.array] = None,
+    use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
     B, H, _, K = q.shape
     V = v.shape[-1]
@@ -215,7 +216,8 @@ def recurrent_gla(
         h = mx.zeros((B, H, K, V), dtype=q.dtype)
     q = q * scale
     use_kernel = (
-        _recurrent_gla_kernel is not None
+        use_kernel
+        and _recurrent_gla_kernel is not None
         and mx.default_device() == mx.gpu
         and K == V
         and K % 32 == 0
@@ -473,6 +475,7 @@ class LinearAttention(nn.Module):
             g=self._slope,
             scale=self.scale,
             h=cache[0],
+            use_kernel=not self.training,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
