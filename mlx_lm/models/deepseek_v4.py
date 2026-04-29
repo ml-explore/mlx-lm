@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -176,9 +177,11 @@ class DeepseekV4RoPE(nn.Module):
         base: float,
         scaling_config: Optional[Dict] = None,
         max_position_embeddings: int = 1048576,
+        freq_scale: int = 1,
     ):
         super().__init__()
         self.dims = dims
+        self.freq_scale = freq_scale
 
         inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
         rope_type = None
@@ -217,12 +220,12 @@ class DeepseekV4RoPE(nn.Module):
         self._freqs = 1.0 / inv_freq
         self._freqs_cache = {}
 
-    def _get_freqs(self, head_dim: int, inverse: bool, freq_scale: int):
-        key = (head_dim, inverse, freq_scale)
+    def _get_freqs(self, head_dim: int, inverse: bool):
+        key = (head_dim, inverse)
         if key not in self._freqs_cache:
             f = self._freqs
-            if freq_scale != 1:
-                f = f / freq_scale
+            if self.freq_scale != 1:
+                f = f / self.freq_scale
             if inverse:
                 f = -f
             nope_pairs = (head_dim - self.dims) // 2
@@ -236,11 +239,10 @@ class DeepseekV4RoPE(nn.Module):
         x: mx.array,
         offset: Any = 0,
         inverse: bool = False,
-        freq_scale: int = 1,
     ) -> mx.array:
         head_dim = x.shape[-1]
-        freqs = self._get_freqs(head_dim, inverse, freq_scale)
-        offset = offset // freq_scale if freq_scale != 1 else offset
+        freqs = self._get_freqs(head_dim, inverse)
+        offset = offset // self.freq_scale if self.freq_scale != 1 else offset
         return mx.fast.rope(
             x,
             head_dim,
@@ -258,6 +260,33 @@ def _apply_score_mask(scores: mx.array, mask: Optional[mx.array]) -> mx.array:
     if mask.dtype == mx.bool_:
         return mx.where(mask, scores, mx.finfo(scores.dtype).min)
     return scores + mask.astype(scores.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _simple_compress_kv(kv, gate, ape, head_dim):
+    weights = mx.softmax(gate.astype(mx.float32) + ape, axis=-2)
+    weights = weights.astype(kv.dtype)
+    return (kv * weights).sum(axis=-2)
+
+
+@mx.compile
+def _overlap_compress_kv(kv, gate, ape, head_dim):
+    B, L, R, D = kv.shape
+
+    gate = gate + ape.astype(gate.dtype)
+
+    kv_0 = mx.zeros((B, 1, R, D // 2), dtype=kv.dtype)
+    kv_a, kv_b = mx.split(kv, 2, axis=-1)
+    kv_a = mx.concatenate([kv_0, kv_a[:, :-1]], axis=1)
+    kv = mx.concatenate([kv_a, kv_b], axis=2)
+
+    gate_0 = mx.full((B, 1, R, D // 2), -mx.inf, dtype=kv.dtype)
+    gate_a, gate_b = mx.split(gate, 2, axis=-1)
+    gate_a = mx.concatenate([gate_0, gate_a[:, :-1]], axis=1)
+    gate = mx.concatenate([gate_a, gate_b], axis=2)
+
+    weights = mx.softmax(gate, axis=-2, precise=True)
+    return (kv * weights).sum(axis=-2)
 
 
 def _sparse_pooled_attention(
@@ -1465,20 +1494,17 @@ class Compressor(nn.Module):
         self.wgate = nn.Linear(config.hidden_size, self.out_dim, bias=False)
         self.ape = mx.zeros((compress_ratio, self.out_dim), dtype=mx.float32)
         self.norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
-
-    def _overlap_transform(self, x: mx.array, fill_value: float):
-        B, W, R, _ = x.shape
-        second_half = x[:, :, :, self.head_dim :]  # (B, W, R, head_dim)
-        fill_row = mx.full((B, 1, R, self.head_dim), fill_value, dtype=x.dtype)
-        prev_first = mx.concatenate(
-            [fill_row, x[:, :-1, :, : self.head_dim]], axis=1
-        )  # (B, W, R, head_dim)
-        return mx.concatenate([prev_first, second_half], axis=2)  # (B, W, 2R, head_dim)
+        self.rope = DeepseekV4RoPE(
+            config.qk_rope_head_dim,
+            config.compress_rope_theta,
+            config.rope_scaling,
+            config.max_position_embeddings,
+            freq_scale=compress_ratio,
+        )
 
     def __call__(
         self,
         x: mx.array,
-        rope: DeepseekV4RoPE,
         cache: Optional[DeepseekV4Cache],
         start_pos: int,
         state_key: str = "compressor_state",
@@ -1495,30 +1521,24 @@ class Compressor(nn.Module):
                 kv, gate, state_key, self.compress_ratio, start_pos
             )
 
-        if ready_kv.shape[1] == 0:
+        if ready_kv.size == 0:
             new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
         else:
-            W = ready_kv.shape[1] // self.compress_ratio
-            kv = ready_kv.reshape(B, W, self.compress_ratio, self.out_dim)
-            gate = ready_gate.reshape(
-                B, W, self.compress_ratio, self.out_dim
-            ) + self.ape.astype(ready_gate.dtype)
-            if self.overlap:
-                kv = self._overlap_transform(kv, 0.0)
-                gate = self._overlap_transform(gate, -float("inf"))
-            weights = mx.softmax(gate.astype(mx.float32), axis=2, precise=True).astype(
-                kv.dtype
+            compress_func = (
+                _overlap_compress_kv if self.overlap else _simple_compress_kv
             )
-            new_pooled = (kv * weights).sum(axis=2)
-            new_pooled = self.norm(new_pooled.astype(x.dtype))
-            new_pooled = rope(
+            kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
+            gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
+            new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+            new_pooled = self.norm(new_pooled)
+            new_pooled = self.rope(
                 new_pooled[:, None],
                 offset=pool_base,
-                freq_scale=self.compress_ratio,
             ).squeeze(1)
 
         if cache is not None:
-            return cache.update_pool(new_pooled, state_key)
+            new_pooled = cache.update_pool(new_pooled, state_key)
+
         return new_pooled
 
 
@@ -1539,13 +1559,12 @@ class Indexer(nn.Module):
         self,
         x: mx.array,
         q_residual: mx.array,
-        rope: DeepseekV4RoPE,
         position_rope: DeepseekV4RoPE,
         cache: Optional[DeepseekV4Cache],
         start_pos: int,
     ):
         B, L, _ = x.shape
-        pooled = self.compressor(x, rope, cache, start_pos, state_key="indexer_state")
+        pooled = self.compressor(x, cache, start_pos, state_key="indexer_state")
         if pooled.shape[1] == 0:
             return None
 
@@ -1650,10 +1669,133 @@ class LocalAttention(nn.Module):
         return out
 
 
+class CompressedAttention(nn.Module):
+    """DeepSeek V4 attention with pooled KV compression."""
+
+    def __init__(self, config: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.compress_ratio = config.compress_ratios[layer_idx]
+        self.hidden_size = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.o_groups = config.o_groups
+        self.o_lora_rank = config.o_lora_rank
+        self.scale = self.head_dim**-0.5
+
+        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
+        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.wo_a = MultiLinear(
+            self.n_heads * self.head_dim // config.o_groups,
+            config.o_lora_rank,
+            config.o_groups,
+        )
+        self.wo_b = nn.Linear(
+            config.o_groups * config.o_lora_rank,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
+        self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+
+        # Compressed layers use Yarn-scaled RoPE
+        self.rope = DeepseekV4RoPE(
+            config.qk_rope_head_dim,
+            config.compress_rope_theta,
+            config.rope_scaling,
+            config.max_position_embeddings,
+        )
+        self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+        v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
+        offset = cache.offset if cache is not None else 0
+
+        q = self.wq_b(self.q_norm(self.wq_a(x)))
+        q = q.reshape(B, L, self.n_heads, self.head_dim)
+        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+        q = q.transpose(0, 2, 1, 3)
+        q = self.rope(q, offset)
+
+        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        kv = self.rope(kv, offset)
+        if cache is not None:
+            kv, _ = cache.update_and_fetch(kv, kv)
+        local_kv_len = kv.shape[2]
+
+        # Pool tokens into compressed KV and concatenate with local KV
+        pooled = self.compressor(x, v4_cache, offset)
+        pooled_mask = None
+        if pooled.shape[1] > 0:
+            lengths = (
+                v4_cache.pooled_lengths("compressor_state")
+                if v4_cache is not None
+                else None
+            )
+            if lengths is not None:
+                lengths = mx.array(lengths)
+                pooled_mask = (mx.arange(pooled.shape[1]) < lengths[:, None]).reshape(
+                    B, 1, 1, -1
+                )
+            kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+
+        # Extend mask to cover pooled entries
+        if mask is not None and mask.shape[-1] > local_kv_len:
+            mask = mask[..., -local_kv_len:]
+        if mask is not None and kv.shape[2] > mask.shape[-1]:
+            pad_shape = mask.shape[:-1] + (kv.shape[2] - mask.shape[-1],)
+            if mask.dtype == mx.bool_:
+                pad = mx.ones(pad_shape, dtype=mask.dtype)
+                if pooled_mask is not None:
+                    pad = pad & pooled_mask
+            else:
+                pad = mx.zeros(pad_shape, dtype=mask.dtype)
+                if pooled_mask is not None:
+                    pad = mx.where(
+                        pooled_mask,
+                        pad,
+                        mx.full(pad_shape, mx.finfo(mask.dtype).min, dtype=mask.dtype),
+                    )
+            mask = mx.concatenate([mask, pad], axis=-1)
+
+        out = scaled_dot_product_attention(
+            q,
+            kv,
+            kv,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attn_sink.astype(q.dtype),
+        )
+        out = self.rope(out, offset, inverse=True)
+
+        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
+        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+        out = self.wo_a(out)
+        out = out.transpose(0, 2, 1, 3).flatten(-2)
+        out = self.wo_b(out)
+
+        return out
+
+
 def v4_attention_factory(config: ModelArgs, layer_idx: int) -> nn.Module:
     """Instantiate the appropriate attention module for a given layer."""
-    if config.compress_ratios[layer_idx] == 0:
+    ratio = config.compress_ratios[layer_idx]
+    if ratio == 0:
         return LocalAttention(config, layer_idx)
+    if ratio == 128:
+        return CompressedAttention(config, layer_idx)
     return V4Attention(config, layer_idx)
 
 
@@ -1703,7 +1845,6 @@ class V4Attention(nn.Module):
             rope_scaling,
             config.max_position_embeddings,
         )
-        self.compress_rope = self.rope
         if self.compress_ratio:
             self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
@@ -1800,7 +1941,7 @@ class V4Attention(nn.Module):
         sparse_pooled_mask = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
-            pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
+            pooled = self.compressor(x, v4_cache, offset)
             if pooled.shape[1] > 0:
                 lengths = (
                     v4_cache.pooled_lengths("compressor_state")
@@ -1821,9 +1962,7 @@ class V4Attention(nn.Module):
                             mx.arange(pooled.shape[2]) < lengths[:, None]
                         ).reshape(B, 1, 1, -1)
                 elif use_indexer:
-                    topk = self.indexer(
-                        x, q_residual, self.compress_rope, self.rope, v4_cache, offset
-                    )
+                    topk = self.indexer(x, q_residual, self.rope, v4_cache, offset)
                     if topk is not None:
                         if L > 1:
                             sparse_pooled = pooled
@@ -2136,8 +2275,10 @@ class Model(nn.Module):
                             f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
                         ] = mx.stack(stacked)
 
+        # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for
+        # LocalAttention (ratio=0) and CompressedAttention (ratio=128) layers
         for layer_idx in range(n_layers):
-            if self.args.compress_ratios[layer_idx] != 0:
+            if self.args.compress_ratios[layer_idx] == 4:
                 continue
             prefix = f"model.layers.{layer_idx}.attn.wo_a"
             for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):

@@ -1452,7 +1452,8 @@ class TestModels(unittest.TestCase):
         # freq_scale test (compressor strided positions: pool_base + t * R)
         # With pool_base=4, R=4, positions are [4, 8, 12] = arange(3)*4 + 4
         # Equivalent to offset=4//4=1, freq_scale=4
-        y_scaled = rope(x, offset=4, freq_scale=4)
+        scaled_rope = deepseek_v4.DeepseekV4RoPE(4, 10000, freq_scale=4)
+        y_scaled = scaled_rope(x, offset=4)
         positions = mx.array([4, 8, 12], dtype=mx.float32)
         freqs = positions[:, None] * inv_freq[None, :]
         cos = mx.cos(freqs).reshape(1, 1, 3, 2)
