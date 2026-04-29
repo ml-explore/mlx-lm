@@ -128,6 +128,15 @@ def _make_recurrent_gla_kernel():
 _recurrent_gla_kernel = _make_recurrent_gla_kernel()
 
 
+def _cache_offset(cache):
+    offset = cache.offset if cache is not None else 0
+    if isinstance(offset, mx.array):
+        if offset.size == 1:
+            return offset.item()
+        return mx.array(offset.tolist(), dtype=offset.dtype)
+    return offset
+
+
 def _recurrent_gla_kernel_call(
     q: mx.array,
     k: mx.array,
@@ -324,7 +333,7 @@ class MultiLatentAttention(nn.Module):
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         kv_latent = self.kv_a_layernorm(compressed_kv)
 
-        offset = cache.offset if cache is not None else 0
+        offset = _cache_offset(cache)
         q_pe = self.rope(q_pe, offset)
         k_pe = self.rope(k_pe, offset)
 
@@ -629,9 +638,7 @@ class LanguageModel(nn.Module):
 
         attn_mask = create_attention_mask(h, cache[self._attn_idx], return_array=True)
         gla_mask = create_ssm_mask(h, cache[self._gla_idx])
-        offset = (
-            cache[self._attn_idx].offset if cache[self._attn_idx] is not None else 0
-        )
+        offset = _cache_offset(cache[self._attn_idx])
 
         for layer, c in zip(self.layers, cache):
             mask = attn_mask if layer.is_global else gla_mask
