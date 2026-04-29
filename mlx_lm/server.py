@@ -1823,9 +1823,11 @@ def run(
     cache_dir = getattr(model_provider.cli_args, "prompt_cache_dir", None)
     if cache_dir:
         from .disk_cache import DiskBackedPromptCache
+        max_disk = getattr(model_provider.cli_args, "prompt_cache_disk_size", 100)
         prompt_cache = DiskBackedPromptCache(
             max_size=model_provider.cli_args.prompt_cache_size,
             cache_dir=cache_dir,
+            max_disk_size=max_disk,
         )
     else:
         prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
@@ -2014,6 +2016,13 @@ def main():
         help="Directory to persist prompt caches to disk. Survives server "
         "restarts — cached prompts are restored from disk on cache miss. "
         "Evicted caches are also saved here.",
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-size",
+        type=int,
+        default=100,
+        help="Maximum number of disk cache entries (default: 100). "
+        "Independent of --prompt-cache-size which controls RAM entries.",
     )
     parser.add_argument(
         "--pipeline",

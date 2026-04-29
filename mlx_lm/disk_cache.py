@@ -209,11 +209,12 @@ class DiskBackedPromptCache(LRUPromptCache):
 
     On insert: saves to disk (for restart survival).
     On cache miss in RAM: checks disk before giving up.
-    Disk entries capped at 2x max_size by mtime.
+    Disk entries capped at max_disk_size by mtime (default 100).
     """
 
-    def __init__(self, max_size: int = 10, cache_dir: str = "~/.cache/mlx_kv_cache"):
+    def __init__(self, max_size: int = 10, cache_dir: str = "~/.cache/mlx_kv_cache", max_disk_size: int = 100):
         super().__init__(max_size=max_size)
+        self._max_disk_size = max_disk_size
         self._cache_dir = Path(cache_dir).expanduser()
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -399,14 +400,14 @@ class DiskBackedPromptCache(LRUPromptCache):
             del self._disk_index[h]
 
     def _cap_disk_size(self):
-        """Remove oldest disk entries when exceeding 2x max_size."""
+        """Remove oldest disk entries when exceeding max_disk_size."""
         if self._cache_dir is None:
             return
         entries = [
             d for d in self._cache_dir.iterdir()
             if d.is_dir() and not d.name.startswith(".")
         ]
-        limit = self.max_size * 2
+        limit = self._max_disk_size
         if len(entries) <= limit:
             return
         entries.sort(key=lambda d: d.stat().st_mtime)
