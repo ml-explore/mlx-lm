@@ -882,20 +882,22 @@ class ResponseGenerator:
         def progress(tokens_processed, tokens_total):
             rqueue.put((tokens_processed, tokens_total))
             s = _checkpoint_state
-            if (
-                s["cache"] is not None
-                and tokens_processed - s["last"] >= _checkpoint_interval
-                and tokens_processed < tokens_total
-                and tokens_processed > 0
-            ):
+            if s["cache"] is None or tokens_processed <= 0:
+                return
+            n_cached = s["ctx"].prompt_cache_count + tokens_processed
+            # Save at the END of prefill -- cache offset matches key length
+            # exactly (no off-by-one from generated tokens).
+            # Also save periodic checkpoints during long prefills.
+            should_save = (
+                tokens_processed == tokens_total  # prefill complete
+                or (
+                    tokens_processed - s["last"] >= _checkpoint_interval
+                    and tokens_processed < tokens_total
+                )
+            )
+            if should_save:
                 s["last"] = tokens_processed
                 try:
-                    n_cached = s["ctx"].prompt_cache_count + tokens_processed
-                    # Save directly to cache without quantization.
-                    # _store_cache would quantize in-place and break
-                    # ongoing prefill. insert_cache is safe because
-                    # _save_to_disk reads c.state synchronously before
-                    # the next prefill chunk modifies the arrays.
                     self.prompt_cache.insert_cache(
                         self.model_provider.model_key,
                         s["cache_key"][:n_cached],
