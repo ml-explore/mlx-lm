@@ -9,6 +9,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
+    PromptProcessingBatch,
     SequenceStateMachine,
     batch_generate,
     generate,
@@ -401,6 +402,34 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid0].logprobs[0].item(), 0.0)
         self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
         self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
+
+    def test_prompt_processing_batch_extend_mixes_logits_processors(self):
+        """Test PromptProcessingBatch.extend produces a per-slot list with no None entries when merging an unconfigured batch with a processor-equipped batch."""
+        fallback = lambda x: mx.argmax(x, axis=-1)
+        a = PromptProcessingBatch.empty(self.model, fallback)
+        a.uids = [0]
+        a.tokens = [[]]
+        a.samplers = []
+        a.logits_processors = []
+        a.max_tokens = [1]
+        a.state_machines = [SequenceStateMachine()]
+        a.prompt_cache = []
+
+        procs = make_logits_processors({0: 2000.0})
+        b = PromptProcessingBatch.empty(self.model, fallback)
+        b.uids = [1]
+        b.tokens = [[]]
+        b.samplers = []
+        b.logits_processors = [procs]
+        b.max_tokens = [1]
+        b.state_machines = [SequenceStateMachine()]
+        b.prompt_cache = []
+
+        a.extend(b)
+
+        self.assertEqual(len(a.logits_processors), 2)
+        for entry in a.logits_processors:
+            self.assertIsInstance(entry, list)
 
     def test_batch_generate_processor_tokens_match_prompt_on_first_step(self):
         prompt = self.tokenizer.encode("hello")
