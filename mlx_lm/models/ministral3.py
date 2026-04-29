@@ -258,6 +258,8 @@ class Model(nn.Module):
         input_embeddings: Optional[mx.array] = None,
     ):
         out = self.model(inputs, cache, input_embeddings)
+        if self.pipeline_rank != 0:
+            return out
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

@@ -489,6 +489,8 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
     ):
         out = self.model(inputs, cache)
+        if self.pipeline_rank != 0:
+            return out
         return self.lm_head(out)
 
     def sanitize(self, weights):
