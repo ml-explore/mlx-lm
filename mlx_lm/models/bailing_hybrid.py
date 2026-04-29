@@ -61,6 +61,137 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 0
 
 
+def _make_recurrent_gla_kernel():
+    if not mx.metal.is_available():
+        return None
+    source = """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / H;
+        auto h_idx = n % H;
+        constexpr int n_per_t = D / 32;
+
+        // q, k, v, y: [B, T, H, D]
+        auto q_ = q + b_idx * T * H * D + h_idx * D;
+        auto k_ = k + b_idx * T * H * D + h_idx * D;
+        auto v_ = v + b_idx * T * H * D + h_idx * D;
+        y += b_idx * T * H * D + h_idx * D;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in, state_out: [B, H, D, D]  (k_dim outer, v_dim inner)
+        auto i_state = state_in  + n * D * D;
+        auto o_state = state_out + n * D * D;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto dk_glob = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[dk_glob * D + dv_idx]);
+        }
+
+        // g: [H], head-only decay (constant over time)
+        float decay = fast::exp(static_cast<float>(g[h_idx]));
+
+        for (int t = 0; t < T; ++t) {
+          float v_val = static_cast<float>(v_[dv_idx]);
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto dk_glob = n_per_t * dk_idx + i;
+            // h_t[dk, dv] = h_{t-1}[dk, dv] * exp(g_h) + k_t[dk] * v_t[dv]
+            state[i] = state[i] * decay
+                       + static_cast<float>(k_[dk_glob]) * v_val;
+            // y_t[dv] = sum_dk q_t[dk] * h_t[dk, dv]
+            out += state[i] * static_cast<float>(q_[dk_glob]);
+          }
+          out = simd_sum(out);
+          if (thread_index_in_simdgroup == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+          q_ += H * D;
+          k_ += H * D;
+          v_ += H * D;
+          y  += H * D;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+          auto dk_glob = n_per_t * dk_idx + i;
+          o_state[dk_glob * D + dv_idx] = static_cast<StT>(state[i]);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="recurrent_gla_kernel",
+        input_names=["q", "k", "v", "g", "state_in", "T"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
+_recurrent_gla_kernel = _make_recurrent_gla_kernel()
+
+
+def _recurrent_gla_kernel_call(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    h: mx.array,
+) -> Tuple[mx.array, mx.array]:
+    # q, k, v: [B, H, T, D] -> [B, T, H, D] for the kernel
+    q = q.transpose(0, 2, 1, 3)
+    k = k.transpose(0, 2, 1, 3)
+    v = v.transpose(0, 2, 1, 3)
+    B, T, H, D = q.shape
+    in_dtype = q.dtype
+    state_dtype = h.dtype
+    y, h = _recurrent_gla_kernel(
+        inputs=[q, k, v, g.astype(mx.float32), h, T],
+        template=[
+            ("InT", in_dtype),
+            ("StT", state_dtype),
+            ("D", D),
+            ("H", H),
+        ],
+        grid=(32, D, B * H),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(B, T, H, D), h.shape],
+        output_dtypes=[in_dtype, state_dtype],
+    )
+    return y.transpose(0, 2, 1, 3), h
+
+
+@mx.compile
+def _recurrent_gla_step(
+    q_t: mx.array,
+    k_t: mx.array,
+    v_t: mx.array,
+    h: mx.array,
+    exp_g: mx.array,
+) -> Tuple[mx.array, mx.array]:
+    h = h * exp_g + k_t.transpose(0, 1, 3, 2) @ v_t
+    return q_t @ h, h
+
+
+def _recurrent_gla_ops(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    h: mx.array,
+) -> Tuple[mx.array, mx.array]:
+    L = q.shape[2]
+    exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
+    outputs = []
+    for t in range(L):
+        y_t, h = _recurrent_gla_step(
+            q[:, :, t : t + 1],
+            k[:, :, t : t + 1],
+            v[:, :, t : t + 1],
+            h,
+            exp_g,
+        )
+        outputs.append(y_t)
+    return mx.concatenate(outputs, axis=2), h
+
+
 def recurrent_gla(
     q: mx.array,
     k: mx.array,
@@ -69,18 +200,21 @@ def recurrent_gla(
     scale: float,
     h: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
-    L = q.shape[2]
-    exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
+    B, H, _, K = q.shape
+    V = v.shape[-1]
+    if h is None:
+        h = mx.zeros((B, H, K, V), dtype=q.dtype)
     q = q * scale
-    outputs = []
-    for t in range(L):
-        q_t = q[:, :, t : t + 1]
-        k_t = k[:, :, t : t + 1]
-        v_t = v[:, :, t : t + 1]
-        h_up = k_t.transpose(0, 1, 3, 2) @ v_t
-        h = h_up if h is None else h * exp_g + h_up
-        outputs.append(q_t @ h)
-    return mx.concatenate(outputs, axis=2), h
+    use_kernel = (
+        _recurrent_gla_kernel is not None
+        and mx.default_device() == mx.gpu
+        and K == V
+        and K % 32 == 0
+        and V % 4 == 0
+    )
+    if use_kernel:
+        return _recurrent_gla_kernel_call(q, k, v, g, h)
+    return _recurrent_gla_ops(q, k, v, g, h)
 
 
 class GroupRMSNorm(nn.Module):
