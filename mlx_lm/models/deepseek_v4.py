@@ -1121,11 +1121,11 @@ class DeepseekV4Cache:
         state["buffer_lengths"] = buffer_lengths
         state["_new_pooled_lengths"] = [usable // ratio for usable in usable_lengths]
 
-        prev_lengths = mx.array(buf_lengths, dtype=mx.float32)
+        prev_lengths = mx.array(buf_lengths, dtype=mx.int32)
         if isinstance(start_pos, mx.array):
-            pool_base = mx.maximum(start_pos, 0).astype(mx.float32)
+            pool_base = mx.maximum(start_pos, 0).astype(mx.int32)
         else:
-            pool_base = mx.full((B,), max(0, start_pos), dtype=mx.float32)
+            pool_base = mx.full((B,), max(0, start_pos), dtype=mx.int32)
         return ready_kv, ready_gate, pool_base - prev_lengths
 
     def update_pool(self, new_pooled: mx.array, state_key: str) -> mx.array:
