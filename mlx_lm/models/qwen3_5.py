@@ -382,6 +382,38 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        # Dequantize FP8 weights paired with weight_scale_inv. Mirrors the
+        # inline FP8 dequant in models/{deepseek_v3,deepseek_v32,minimax,
+        # mimo_v2_flash,ministral3}.py. Triggered by checkpoints with
+        # quant_method=fp8 (e.g. Qwen/Qwen3.6-27B-FP8, Qwen3.6-35B-A3B-FP8).
+        # No-op when no weight_scale_inv keys are present.
+        def dequant(weight, scale_inv):
+            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
+            bs = 128  # block size
+            m, n = weight.shape
+            pad_bottom = (-m) % bs
+            pad_side = (-n) % bs
+            weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+            weight = weight.reshape(
+                ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
+            )
+            weight = (weight * scale_inv[:, None, :, None]).reshape(
+                m + pad_bottom, n + pad_side
+            )
+            return weight[:m, :n].astype(mx.bfloat16)
+
+        if any("weight_scale_inv" in k for k in weights):
+            new_weights = {}
+            for k, v in weights.items():
+                if "weight_scale_inv" in k:
+                    wk = k.replace("_scale_inv", "")
+                    new_weights[wk] = dequant(weights[wk], v)
+                elif "activation_scale" in k:
+                    continue
+                elif k not in new_weights:
+                    new_weights[k] = v
+            weights = new_weights
+
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
