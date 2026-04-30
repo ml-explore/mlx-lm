@@ -428,7 +428,7 @@ class LinearAttention(nn.Module):
 
         slopes = mx.array(slopes, dtype=mx.float32)
         denom = max(1, self.num_hidden_layers - 1)
-        layer_factor = 1 - (self.layer_idx - 1) / denom + 1e-5
+        layer_factor = 1 - self.layer_idx / denom + 1e-5
         return -slopes * layer_factor
 
     def __call__(
