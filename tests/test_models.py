@@ -574,6 +574,36 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_sarvam_moe(self):
+        from mlx_lm.models import sarvam_moe
+
+        args = sarvam_moe.ModelArgs(
+            model_type="sarvam_moe",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-6,
+            head_dim=256,
+            vocab_size=10_000,
+            num_experts=16,
+            num_shared_experts=1,
+            num_experts_per_tok=4,
+            moe_intermediate_size=512,
+            first_k_dense_replace=1,
+            rope_theta=10000.0,
+            max_position_embeddings=4096,
+            tie_word_embeddings=False,
+            use_qk_norm=True,
+            moe_router_enable_expert_bias=True,
+            routed_scaling_factor=2.5,
+        )
+        model = sarvam_moe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
@@ -2553,6 +2583,28 @@ class TestModels(unittest.TestCase):
                 },
                 "num_hidden_layers": 4,
                 "vocab_size": 1000,
+            },
+            {
+                "model_type": "sarvam_moe",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-6,
+                "head_dim": 32,
+                "vocab_size": 1000,
+                "num_experts": 4,
+                "num_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 64,
+                "first_k_dense_replace": 1,
+                "rope_theta": 1000.0,
+                "max_position_embeddings": 1000,
+                "tie_word_embeddings": False,
+                "use_qk_norm": True,
+                "moe_router_enable_expert_bias": True,
+                "routed_scaling_factor": 2.5,
             },
             {
                 "model_type": "seed_oss",
