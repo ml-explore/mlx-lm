@@ -111,12 +111,13 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
-_CACHE_EVAL_TARGETS = ("offset", "left_padding", "lengths", "_lengths")
+# BatchRotatingKVCache mutates this during right-padded prefill.
+_CACHE_EVAL_ATTRS = ("offset", "left_padding", "lengths", "_lengths")
 
 
 def _cache_eval_targets(c: Any) -> List[mx.array]:
     targets = []
-    for attr in _CACHE_EVAL_TARGETS:
+    for attr in _CACHE_EVAL_ATTRS:
         val = getattr(c, attr, None)
         if isinstance(val, mx.array):
             targets.append(val)
