@@ -5,6 +5,7 @@ from mlx_lm.tool_parsers import (
     function_gemma,
     gemma4,
     glm47,
+    hy_v3,
     json_tools,
     kimi_k2,
     longcat,
@@ -44,6 +45,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 "multiply<longcat_arg_key>a</longcat_arg_key>\n<longcat_arg_value>12234585</longcat_arg_value>\n<longcat_arg_key>b</longcat_arg_key>\n<longcat_arg_value>48838483920</longcat_arg_value>",
                 longcat,
+            ),
+            (
+                "<tool_call>multiply<tool_sep>\n<arg_key>a</arg_key>\n<arg_value>12234585</arg_value>\n<arg_key>b</arg_key>\n<arg_value>48838483920</arg_value>\n</tool_call>",
+                hy_v3,
             ),
             (
                 '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
@@ -114,6 +119,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 "get_current_temperature<longcat_arg_key>location</longcat_arg_key>\n<longcat_arg_value>London</longcat_arg_value>",
                 longcat,
+            ),
+            (
+                "<tool_call>get_current_temperature<tool_sep>\n<arg_key>location</arg_key>\n<arg_value>London</arg_value>\n</tool_call>",
+                hy_v3,
             ),
             (
                 '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
@@ -312,6 +321,73 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_hy_v3(self):
+        # Single tool call
+        test_case = (
+            "<tool_call>search<tool_sep>\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>weather</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_call = hy_v3.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call,
+            {"name": "search", "arguments": {"query": "weather"}},
+        )
+
+        # Multiple tool calls
+        test_case = (
+            "<tool_call>search<tool_sep>\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>weather</arg_value>\n"
+            "</tool_call>\n"
+            "<tool_call>read_file<tool_sep>\n"
+            "<arg_key>path</arg_key>\n"
+            "<arg_value>/tmp/test.txt</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_calls = hy_v3.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "search", "arguments": {"query": "weather"}},
+                {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+            ],
+        )
+
+        # Type coercion via schema (string preserved, number coerced)
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "configure",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "limit": {"type": "integer"},
+                            "enabled": {"type": "boolean"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<tool_call>configure<tool_sep>\n"
+            "<arg_key>name</arg_key>\n"
+            "<arg_value>5</arg_value>\n"
+            "<arg_key>limit</arg_key>\n"
+            "<arg_value>5</arg_value>\n"
+            "<arg_key>enabled</arg_key>\n"
+            "<arg_value>true</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_call = hy_v3.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "configure")
+        self.assertEqual(tool_call["arguments"]["name"], "5")
+        self.assertEqual(tool_call["arguments"]["limit"], 5)
+        self.assertEqual(tool_call["arguments"]["enabled"], True)
 
     def test_minimax_m2(self):
         test_case = (
