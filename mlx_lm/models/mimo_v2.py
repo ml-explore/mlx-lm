@@ -17,48 +17,44 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "mimo_v2"
-    vocab_size: int = 152576
-    hidden_size: int = 4096
-    intermediate_size: int = 16384
-    moe_intermediate_size: int = 2048
-    num_hidden_layers: int = 48
-    num_attention_heads: int = 64
-    num_key_value_heads: int = 4
-    head_dim: int = 192
-    v_head_dim: int = 128
-    rope_theta: float = 5000000.0
-    add_full_attention_sink_bias: bool = False
-    swa_num_attention_heads: int = 64
-    swa_num_key_value_heads: int = 8
-    swa_head_dim: int = 192
-    swa_v_head_dim: int = 128
-    swa_rope_theta: float = 10000.0
-    sliding_window_size: int = 128
-    add_swa_attention_sink_bias: bool = True
-    hybrid_layer_pattern: Optional[List[int]] = None
-    n_routed_experts: int = 256
-    num_experts_per_tok: int = 8
-    moe_layer_freq: Optional[List[int]] = None
-    n_group: int = 1
-    topk_group: int = 1
-    norm_topk_prob: bool = True
+    model_type: str
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    moe_intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    v_head_dim: int
+    rope_theta: float
+    swa_num_attention_heads: int
+    swa_num_key_value_heads: int
+    swa_head_dim: int
+    swa_v_head_dim: int
+    swa_rope_theta: float
+    sliding_window_size: int
+    add_full_attention_sink_bias: bool
+    add_swa_attention_sink_bias: bool
+    hybrid_layer_pattern: List[int]
+    moe_layer_freq: List[int]
+    n_routed_experts: int
+    num_experts_per_tok: int
+    n_group: int
+    topk_group: int
+    norm_topk_prob: bool
+    topk_method: str
+    partial_rotary_factor: float
+    attention_bias: bool
+    layernorm_epsilon: float
+    max_position_embeddings: int
     routed_scaling_factor: Optional[float] = None
-    topk_method: str = "noaux_tc"
-    partial_rotary_factor: float = 0.334
-    attention_bias: bool = False
     attention_value_scale: Optional[float] = None
-    layernorm_epsilon: float = 1e-5
-    max_position_embeddings: int = 262144
     rope_scaling: Optional[Dict[str, Any]] = None
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
         n = self.num_hidden_layers
-        if self.hybrid_layer_pattern is None:
-            self.hybrid_layer_pattern = [0] * n
-        if self.moe_layer_freq is None:
-            self.moe_layer_freq = [0] * n
         if len(self.hybrid_layer_pattern) != n:
             raise ValueError("hybrid_layer_pattern length must match num_hidden_layers")
         if len(self.moe_layer_freq) != n:
@@ -208,7 +204,7 @@ class MoEGate(nn.Module):
         self.e_score_correction_bias = mx.zeros((config.n_routed_experts,))
 
     def __call__(self, x):
-        inds, scores = group_expert_select(
+        return group_expert_select(
             x @ self.weight.T,
             self.e_score_correction_bias,
             self.top_k,
@@ -217,7 +213,6 @@ class MoEGate(nn.Module):
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
-        return inds, scores.astype(x.dtype)
 
 
 class MoE(nn.Module):
@@ -236,7 +231,7 @@ class MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
