@@ -46,6 +46,7 @@ class TalkieRoPE(nn.Module):
 
     def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
         L = x.shape[-2]
+        offset = int(offset)
         t = mx.arange(offset, offset + L, dtype=mx.float32)
         freqs = mx.outer(t, self._inv_freq)
         cos = mx.cos(freqs).astype(x.dtype)
