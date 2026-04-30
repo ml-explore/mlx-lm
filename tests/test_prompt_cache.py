@@ -20,6 +20,7 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     load_prompt_cache,
     make_prompt_cache,
+    prompt_cache_eval_targets,
     save_prompt_cache,
     trim_prompt_cache,
 )
@@ -529,6 +530,24 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache_a.values.shape[0], 5)
         self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
+
+    def test_prompt_cache_eval_targets(self):
+        batch_cache = BatchKVCache(left_padding=[1, 0])
+        rotating_cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
+        arrays_cache = ArraysCache(size=1, left_padding=[3, 0])
+        arrays_cache.prepare(lengths=[5, 4])
+
+        targets = prompt_cache_eval_targets(
+            [CacheList(batch_cache, CacheList(rotating_cache, arrays_cache))]
+        )
+
+        self.assertEqual(len(targets), 6)
+        self.assertIs(targets[0], batch_cache.offset)
+        self.assertIs(targets[1], batch_cache.left_padding)
+        self.assertIs(targets[2], rotating_cache.offset)
+        self.assertIs(targets[3], rotating_cache.left_padding)
+        self.assertIs(targets[4], arrays_cache.left_padding)
+        self.assertIs(targets[5], arrays_cache.lengths)
 
     def test_batch_rotating_kv_cache(self):
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])

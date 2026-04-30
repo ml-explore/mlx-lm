@@ -1366,7 +1366,13 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+
+        mx.async_eval(
+            self._next_tokens,
+            self._next_logprobs,
+            token_context,
+            cache.prompt_cache_eval_targets(self.prompt_cache),
+        )
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained

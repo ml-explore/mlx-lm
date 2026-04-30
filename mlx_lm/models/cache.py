@@ -111,6 +111,31 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+# BatchRotatingKVCache mutates this during right-padded prefill.
+_CACHE_EVAL_ATTRS = ("offset", "left_padding", "lengths", "_lengths")
+
+
+def _cache_eval_targets(c: Any) -> List[mx.array]:
+    targets = []
+    for attr in _CACHE_EVAL_ATTRS:
+        val = getattr(c, attr, None)
+        if isinstance(val, mx.array):
+            targets.append(val)
+    for sub_cache in getattr(c, "caches", ()):
+        targets.extend(_cache_eval_targets(sub_cache))
+    return targets
+
+
+def prompt_cache_eval_targets(prompt_cache: List[Any]) -> List[mx.array]:
+    """
+    Return lightweight cache metadata arrays that should be periodically eval'd.
+    """
+    targets = []
+    for c in prompt_cache:
+        targets.extend(_cache_eval_targets(c))
+    return targets
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
