@@ -30,9 +30,11 @@ from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
+    PoolingCache,
     QuantizedKVCache,
     RotatingKVCache,
     TokenBuffer,
@@ -847,6 +849,8 @@ def _make_cache(model, left_padding, max_kv_size):
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
+        elif isinstance(c, PoolingCache):
+            return BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, RotatingKVCache):
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")

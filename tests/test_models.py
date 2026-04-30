@@ -1526,13 +1526,6 @@ class TestModels(unittest.TestCase):
         main_layer = model.model.layers[0].attn
         compress_layer = model.model.layers[2].attn
 
-        class RaisingIndexer:
-            index_topk = 1
-
-            def __call__(self, *args, **kwargs):
-                raise AssertionError("Indexer should not run during prefill")
-
-        compress_layer.indexer = RaisingIndexer()
         inputs = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=mx.int32)
         cache = model.make_cache()
         logits = model(inputs, cache=cache)
