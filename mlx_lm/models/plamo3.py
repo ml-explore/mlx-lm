@@ -121,14 +121,20 @@ class Attention(nn.Module):
         queries = self.q_norm(queries).astype(attn_dtype)
         keys = self.k_norm(keys).astype(attn_dtype)
 
-        if cache is not None:
-            keys, values = cache.update_and_fetch(keys, values)
-
-        # PLaMo3 keeps unrotated keys in the cache and reapplies RoPE over the
-        # visible KV window, which resets positions for sliding attention.
-        query_offset = keys.shape[-2] - queries.shape[-2]
-        queries = self.rope(queries, offset=query_offset)
-        keys = self.rope(keys)
+        if self.full_attn:
+            offset = cache.offset if cache is not None else 0
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
+        else:
+            # Sliding layers keep unrotated keys in the rotating cache and
+            # reapply RoPE over the visible KV window to reset local positions.
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
+            query_offset = keys.shape[-2] - queries.shape[-2]
+            queries = self.rope(queries, offset=query_offset)
+            keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
             queries,
