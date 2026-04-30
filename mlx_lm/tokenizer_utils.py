@@ -608,12 +608,34 @@ def load(
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
 
-    tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    tokenizer_config_file = model_path / "tokenizer_config.json"
+    tokenizer_config_from_file = {}
+    if tokenizer_config_file.exists():
+        with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
+            tokenizer_config_from_file = json.load(fid)
+
+    if (
+        tokenizer_config_from_file.get("tokenizer_class") == "Plamo3Tokenizer"
+        and (model_path / "tokenizer.jsonl").exists()
+    ):
+        from .plamo_tokenizer import Plamo3Tokenizer
+
+        tokenizer_kwargs = {
+            **tokenizer_config_from_file,
+            **(tokenizer_config_extra or {}),
+        }
+        tokenizer_kwargs.pop("added_tokens_decoder", None)
+        tokenizer_kwargs.pop("trust_remote_code", None)
+        tokenizer = Plamo3Tokenizer(
+            vocab_file=str(model_path / "tokenizer.jsonl"),
+            **tokenizer_kwargs,
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 
