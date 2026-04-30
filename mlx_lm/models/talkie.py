@@ -24,41 +24,9 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
 
 
-def _weightless_rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
-    orig_dtype = x.dtype
-    x_fp = x.astype(mx.float32)
-    var = mx.mean(x_fp * x_fp, axis=-1, keepdims=True)
-    return (x_fp * mx.rsqrt(var + eps)).astype(orig_dtype)
-
-
-class TalkieRoPE(nn.Module):
-    """RoPE with Talkie's sign convention (rotation by -theta).
-
-    Standard HF/Llama: y = (x1*cos - x2*sin, x1*sin + x2*cos)
-    Talkie:           y = (x1*cos + x2*sin, -x1*sin + x2*cos)
-    """
-
-    def __init__(self, head_dim: int, base: float):
-        super().__init__()
-        self.head_dim = head_dim
-        idx = mx.arange(0, head_dim, 2, dtype=mx.float32)
-        self._inv_freq = 1.0 / (base ** (idx / head_dim))
-
-    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
-        L = x.shape[-2]
-        offset = int(offset)
-        t = mx.arange(offset, offset + L, dtype=mx.float32)
-        freqs = mx.outer(t, self._inv_freq)
-        cos = mx.cos(freqs).astype(x.dtype)
-        sin = mx.sin(freqs).astype(x.dtype)
-        cos = cos[None, None, :, :]
-        sin = sin[None, None, :, :]
-        d = self.head_dim // 2
-        x1 = x[..., :d]
-        x2 = x[..., d:]
-        y1 = x1 * cos + x2 * sin
-        y2 = -x1 * sin + x2 * cos
-        return mx.concatenate([y1, y2], axis=-1)
+def _weightless_rms_norm(x: mx.array) -> mx.array:
+    xf = x.astype(mx.float32)
+    return (xf * mx.rsqrt(mx.mean(mx.square(xf), axis=-1, keepdims=True) + mx.finfo(mx.float32).eps)).astype(x.dtype)
 
 
 class HeadGain(nn.Module):
@@ -67,7 +35,7 @@ class HeadGain(nn.Module):
         self.head_g = mx.ones(n_head)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x * self.head_g.reshape(1, -1, 1, 1)
+        return x * self.head_g.astype(x.dtype).reshape(1, -1, 1, 1)
 
 
 class ActGain(nn.Module):
@@ -76,7 +44,7 @@ class ActGain(nn.Module):
         self.a_g = mx.full((1,), init_value)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x * self.a_g
+        return x * self.a_g.astype(x.dtype)
 
 
 class TalkieAttention(nn.Module):
@@ -94,23 +62,33 @@ class TalkieAttention(nn.Module):
         self.attn_resid = nn.Linear(proj_dim, dim, bias=False)
         self.head_gain = HeadGain(self.n_heads)
 
-        self.rope = TalkieRoPE(self.head_dim, args.rope_theta)
+    def _apply_rotary_emb(
+        self, x: mx.array, cos: mx.array, sin: mx.array
+    ) -> mx.array:
+        d = x.shape[-1] // 2
+        x1 = x[..., :d]
+        x2 = x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = -x1 * sin + x2 * cos
+        return mx.concatenate([y1, y2], axis=-1).astype(x.dtype)
 
     def __call__(
         self,
         x: mx.array,
+        cos: mx.array,
+        sin: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
-        q = self.attn_query(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.attn_key(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.attn_value(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.attn_query(x).reshape(B, L, self.n_heads, self.head_dim)
+        k = self.attn_key(x).reshape(B, L, self.n_heads, self.head_dim)
+        v = self.attn_value(x).reshape(B, L, self.n_heads, self.head_dim)
 
-        offset = cache.offset if cache is not None else 0
-        q = self.rope(q, offset=offset)
-        k = self.rope(k, offset=offset)
+        q = self._apply_rotary_emb(q, cos, sin).transpose(0, 2, 1, 3)
+        k = self._apply_rotary_emb(k, cos, sin).transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
         q = _weightless_rms_norm(q)
         k = _weightless_rms_norm(k)
@@ -153,10 +131,12 @@ class TalkieDecoderLayer(nn.Module):
         self,
         e_x: mx.array,
         x: mx.array,
+        cos: mx.array,
+        sin: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        x = x + self.attn_gain(self.attn(_weightless_rms_norm(x), mask, cache))
+        x = x + self.attn_gain(self.attn(_weightless_rms_norm(x), cos, sin, mask, cache))
         x = x + self.mlp_gain(self.mlp(_weightless_rms_norm(x)))
         x = x + self.embed_skip(e_x)
         return x
@@ -172,6 +152,8 @@ class TalkieModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        cos: mx.array,
+        sin: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
@@ -188,7 +170,7 @@ class TalkieModel(nn.Module):
         mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.blocks, cache):
-            h = layer(e_h, h, mask, c)
+            h = layer(e_h, h, cos, sin, mask, c)
 
         return _weightless_rms_norm(h)
 
@@ -201,13 +183,36 @@ class Model(nn.Module):
         self.model = TalkieModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+        self._cos, self._sin = self._precompute_rope(args.max_position_embeddings)
+
+    def _precompute_rope(self, seq_len: int) -> tuple[mx.array, mx.array]:
+        channel_range = mx.arange(0, self.args.head_dim, 2, dtype=mx.float32)
+        inv_freq = 1.0 / (self.args.rope_theta ** (channel_range / self.args.head_dim))
+        t = mx.arange(seq_len, dtype=mx.float32)
+        freqs = t[:, None] * inv_freq[None, :]
+        cos = mx.cos(freqs)[None, :, None, :]
+        sin = mx.sin(freqs)[None, :, None, :]
+        return cos, sin
+
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        h = self.model(inputs, cache, input_embeddings)
+        if cache is None:
+            cache = [None] * len(self.model.blocks)
+            offset = 0
+        else:
+            offset = int(cache[0].offset)
+
+        L = inputs.shape[1] if input_embeddings is None else input_embeddings.shape[1]
+        if offset + L > self._cos.shape[1]:
+            self._cos, self._sin = self._precompute_rope(offset + L)
+        cos = self._cos[:, offset : offset + L]
+        sin = self._sin[:, offset : offset + L]
+
+        h = self.model(inputs, cos, sin, cache, input_embeddings)
         return self.lm_head(h)
 
     def sanitize(self, weights):
