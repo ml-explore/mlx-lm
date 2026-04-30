@@ -39,6 +39,8 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 0
     max_position_embeddings: int = 262144
+    enable_moe_fp32_combine: bool = False
+    enable_lm_head_fp32: bool = False
 
 
 class Attention(nn.Module):
@@ -121,7 +123,6 @@ def expert_select(
     routed_scaling_factor,
     norm_topk_prob,
 ):
-    in_type = gates.dtype
     scores = mx.sigmoid(gates.astype(mx.float32))
     orig_scores = scores
     scores = scores + expert_bias
@@ -129,10 +130,10 @@ def expert_select(
     inds = mx.argpartition(scores, kth=-top_k, axis=-1)[..., -top_k:]
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
-        scores = scores / scores.sum(axis=-1, keepdims=True)
+        scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
     scores = scores * routed_scaling_factor
 
-    return inds, scores.astype(in_type)
+    return inds, scores
 
 
 class MoEGate(nn.Module):
@@ -172,6 +173,7 @@ class MoE(nn.Module):
         else:
             self.shared_mlp = None
 
+        self.fp32_combine = args.enable_moe_fp32_combine
         self.sharding_group = None
 
     def __call__(self, x):
@@ -179,6 +181,8 @@ class MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.router(x)
+        if not self.fp32_combine:
+            scores = scores.astype(x.dtype)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         if self.shared_mlp is not None:
@@ -187,7 +191,7 @@ class MoE(nn.Module):
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
-        return y
+        return y.astype(x.dtype)
 
 
 class DecoderLayer(nn.Module):
@@ -269,6 +273,8 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
     ):
         out = self.model(inputs, cache)
+        if self.args.enable_lm_head_fp32:
+            out = out.astype(mx.float32)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
