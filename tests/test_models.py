@@ -926,6 +926,84 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_plamo3(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            model_type="plamo3",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            vocab_size=100,
+            window_size=8,
+            sliding_window_pattern=2,
+        )
+        model = plamo3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_plamo3_attention_cache_rope_policy(self):
+        from mlx_lm.models import plamo3
+
+        class CountingRoPE:
+            def __init__(self, rope):
+                self.rope = rope
+                self.calls = []
+
+            def __call__(self, x, *args, **kwargs):
+                self.calls.append((tuple(x.shape), kwargs.get("offset")))
+                return self.rope(x, *args, **kwargs)
+
+        args = plamo3.ModelArgs(
+            model_type="plamo3",
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            window_size=8,
+            sliding_window_pattern=2,
+        )
+
+        hidden = mx.random.uniform(shape=(1, 3, args.hidden_size))
+        next_hidden = mx.random.uniform(shape=(1, 1, args.hidden_size))
+
+        full_attention = plamo3.Attention(args, layer_idx=1)
+        full_rope = CountingRoPE(full_attention.rope)
+        full_attention.rope = full_rope
+        full_cache = KVCache()
+        mx.eval(full_attention(hidden, cache=full_cache))
+
+        full_rope.calls.clear()
+        mx.eval(full_attention(next_hidden, cache=full_cache))
+        self.assertEqual(
+            full_rope.calls,
+            [
+                ((1, args.num_attention_heads, 1, args.head_dim), 3),
+                ((1, args.num_key_value_heads, 1, args.head_dim), 3),
+            ],
+        )
+
+        sliding_attention = plamo3.Attention(args, layer_idx=0)
+        sliding_rope = CountingRoPE(sliding_attention.rope)
+        sliding_attention.rope = sliding_rope
+        sliding_cache = RotatingKVCache(max_size=args.window_size + 1)
+        mx.eval(sliding_attention(hidden, cache=sliding_cache))
+
+        sliding_rope.calls.clear()
+        mx.eval(sliding_attention(next_hidden, cache=sliding_cache))
+        self.assertEqual(
+            sliding_rope.calls,
+            [
+                ((1, args.num_attention_heads, 1, args.head_dim), 3),
+                ((1, args.num_key_value_heads, 1, args.head_dim), 3),
+            ],
+        )
+
     def test_stablelm(self):
         from mlx_lm.models import stablelm
 
