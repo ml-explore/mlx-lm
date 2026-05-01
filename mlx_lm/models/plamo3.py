@@ -1,7 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-from types import MethodType
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -9,7 +8,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, QuantizedKVCache, RotatingKVCache
+from .cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -42,52 +41,6 @@ class ModelArgs(BaseModelArgs):
 
 def is_full_attention(args: ModelArgs, layer_idx: int) -> bool:
     return not bool((layer_idx + 1) % args.sliding_window_pattern)
-
-
-def dequantize_cache_state(state: Any, cache: Any) -> mx.array:
-    if hasattr(cache, "bits"):
-        return mx.dequantize(
-            *state, group_size=cache.group_size, bits=cache.bits
-        )
-    return state
-
-
-def plamo3_full_kv_cache_to_quantized(
-    cache,
-    group_size: int = 64,
-    bits: int = 4,
-) -> QuantizedKVCache:
-    quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
-    quant_cache.offset = cache.offset
-    quant_cache.plamo3_cache_unrotated_keys = True
-    if cache.keys is not None:
-        keys, values = cache.state
-        quant_cache.keys = mx.quantize(keys, group_size=group_size, bits=bits)
-        quant_cache.values = mx.quantize(values, group_size=group_size, bits=bits)
-    return quant_cache
-
-
-def prepare_plamo3_cache(layer: Any, cache: Any) -> None:
-    if cache is None or hasattr(cache, "bits"):
-        return
-    if layer.full_attn and isinstance(cache, KVCache):
-        if cache.empty() or getattr(cache, "plamo3_cache_unrotated_keys", False):
-            cache.plamo3_cache_unrotated_keys = True
-            cache.to_quantized = MethodType(plamo3_full_kv_cache_to_quantized, cache)
-        else:
-            def to_quantized(cache, group_size: int = 64, bits: int = 4):
-                raise ValueError(
-                    "PLaMo3 full attention KV cache must be created with "
-                    "kv_bits enabled before it can be quantized without "
-                    "inverse RoPE."
-                )
-
-            cache.to_quantized = MethodType(to_quantized, cache)
-    elif not layer.full_attn and isinstance(cache, RotatingKVCache):
-        def to_quantized(cache, group_size: int = 64, bits: int = 4):
-            return cache
-
-        cache.to_quantized = MethodType(to_quantized, cache)
 
 
 class RMSNorm(nn.Module):
@@ -167,26 +120,13 @@ class Attention(nn.Module):
         attn_dtype = queries.dtype
         queries = self.q_norm(queries).astype(attn_dtype)
         keys = self.k_norm(keys).astype(attn_dtype)
-        attention_cache = cache
 
         if self.full_attn:
-            if cache is not None and (
-                getattr(cache, "plamo3_cache_unrotated_keys", False)
-                or hasattr(cache, "bits")
-            ):
-                offset = cache.offset
+            offset = cache.offset if cache is not None else 0
+            if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
-                keys = self.rope(dequantize_cache_state(keys, cache))
-                values = dequantize_cache_state(values, cache)
-                queries = self.rope(queries, offset=offset)
-                if hasattr(cache, "bits"):
-                    attention_cache = None
-            else:
-                offset = cache.offset if cache is not None else 0
-                queries = self.rope(queries, offset=offset)
-                keys = self.rope(keys, offset=offset)
-                if cache is not None:
-                    keys, values = cache.update_and_fetch(keys, values)
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys)
         else:
             # Sliding layers keep unrotated keys in the rotating cache and
             # reapply RoPE over the visible KV window to reset local positions.
@@ -200,7 +140,7 @@ class Attention(nn.Module):
             queries,
             keys,
             values,
-            cache=attention_cache,
+            cache=cache,
             scale=self.scale,
             mask=mask,
         )
@@ -351,10 +291,6 @@ class Model(nn.Module):
                 c = RotatingKVCache(max_size=self.config.window_size + 1)
             caches.append(c)
         return caches
-
-    def prepare_kv_cache_for_quantization(self, prompt_cache):
-        for layer, c in zip(self.layers, prompt_cache):
-            prepare_plamo3_cache(layer, c)
 
     def __call__(
         self,
