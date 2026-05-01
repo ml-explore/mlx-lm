@@ -304,6 +304,12 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+def prepare_kv_cache_for_quantization(model, prompt_cache, kv_bits):
+    if kv_bits is None or not hasattr(model, "prepare_kv_cache_for_quantization"):
+        return
+    model.prepare_kv_cache_for_quantization(prompt_cache)
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -373,6 +379,7 @@ def generate_step(
             model,
             max_kv_size=max_kv_size,
         )
+    prepare_kv_cache_for_quantization(model, prompt_cache, kv_bits)
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
@@ -525,6 +532,8 @@ def speculative_generate_step(
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
+    prepare_kv_cache_for_quantization(model, model_cache, kv_bits)
+    prepare_kv_cache_for_quantization(draft_model, draft_cache, kv_bits)
 
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
