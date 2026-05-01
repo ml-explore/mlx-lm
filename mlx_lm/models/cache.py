@@ -612,6 +612,78 @@ class RotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+def _inverse_rope(
+    x: mx.array,
+    dims: int,
+    *,
+    base: float,
+    traditional: bool = False,
+) -> mx.array:
+    if dims <= 0:
+        return x
+
+    x_rot = x[..., :dims]
+    x_pass = x[..., dims:]
+    positions = mx.arange(x.shape[-2], dtype=mx.float32)
+    freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+    angles = positions[:, None] / freqs[None, :]
+    cos = mx.cos(angles).astype(x.dtype)[None, None, :, :]
+    sin = mx.sin(angles).astype(x.dtype)[None, None, :, :]
+
+    if traditional:
+        x_even = x_rot[..., 0::2]
+        x_odd = x_rot[..., 1::2]
+        y_even = x_even * cos + x_odd * sin
+        y_odd = x_odd * cos - x_even * sin
+        y = mx.stack([y_even, y_odd], axis=-1).reshape(*x_rot.shape)
+    else:
+        half = dims // 2
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:]
+        y = mx.concatenate([x1 * cos + x2 * sin, x2 * cos - x1 * sin], axis=-1)
+
+    if x_pass.shape[-1] == 0:
+        return y
+    return mx.concatenate([y, x_pass], axis=-1)
+
+
+class Plamo3FullKVCache(KVCache):
+    def __init__(self, rope_dim: int = 128, rope_base: float = 1_000_000):
+        super().__init__()
+        self.rope_dim = rope_dim
+        self.rope_base = rope_base
+
+    @property
+    def meta_state(self):
+        state = [str(self.rope_dim), str(self.rope_base)]
+        if getattr(self, "plamo3_cache_unrotated_keys", False):
+            state.append("plamo3_unrotated_keys")
+        return tuple(state)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.rope_dim = int(v[0])
+        self.rope_base = float(v[1])
+        self.plamo3_cache_unrotated_keys = "plamo3_unrotated_keys" in v[2:]
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
+        quant_cache.offset = self.offset
+        quant_cache.plamo3_cache_unrotated_keys = True
+        if self.keys is not None:
+            keys, values = self.state
+            if not getattr(self, "plamo3_cache_unrotated_keys", False):
+                keys = _inverse_rope(keys, self.rope_dim, base=self.rope_base)
+            quant_cache.keys = mx.quantize(keys, group_size=group_size, bits=bits)
+            quant_cache.values = mx.quantize(values, group_size=group_size, bits=bits)
+        return quant_cache
+
+
+class Plamo3SlidingKVCache(RotatingKVCache):
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        return self
+
+
 class ArraysCache(_BaseCache):
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)

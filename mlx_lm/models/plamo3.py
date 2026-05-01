@@ -8,7 +8,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, RotatingKVCache
+from .cache import Plamo3FullKVCache, Plamo3SlidingKVCache
 
 
 @dataclass
@@ -304,20 +304,19 @@ class Model(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.full_attn:
-                caches.append(KVCache())
+                caches.append(
+                    Plamo3FullKVCache(
+                        rope_dim=self.config.head_dim,
+                        rope_base=self.config.rope_theta,
+                    )
+                )
             else:
                 # The HF sliding mask includes the current token plus
                 # window_size previous tokens.
-                caches.append(RotatingKVCache(max_size=self.config.window_size + 1))
+                caches.append(
+                    Plamo3SlidingKVCache(max_size=self.config.window_size + 1)
+                )
         return caches
-
-    def prepare_kv_cache_for_quantization(self, prompt_cache):
-        for layer, c in zip(self.layers, prompt_cache):
-            if layer.full_attn:
-                if getattr(c, "plamo3_cache_unrotated_keys", False) or c.empty():
-                    c.plamo3_cache_unrotated_keys = True
-            else:
-                c.plamo3_skip_kv_quantization = True
 
     def __call__(
         self,
