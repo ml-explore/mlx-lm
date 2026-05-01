@@ -67,26 +67,7 @@ def plamo3_full_kv_cache_to_quantized(
     return quant_cache
 
 
-def plamo3_rotated_kv_cache_to_quantized(
-    cache,
-    group_size: int = 64,
-    bits: int = 4,
-):
-    raise ValueError(
-        "PLaMo3 full attention KV cache must be created with kv_bits enabled "
-        "before it can be quantized without inverse RoPE."
-    )
-
-
-def plamo3_sliding_kv_cache_to_quantized(
-    cache,
-    group_size: int = 64,
-    bits: int = 4,
-):
-    return cache
-
-
-def prepare_plamo3_cache(config: ModelArgs, layer: Any, cache: Any) -> None:
+def prepare_plamo3_cache(layer: Any, cache: Any) -> None:
     if cache is None or hasattr(cache, "bits"):
         return
     if layer.full_attn and isinstance(cache, KVCache):
@@ -94,9 +75,19 @@ def prepare_plamo3_cache(config: ModelArgs, layer: Any, cache: Any) -> None:
             cache.plamo3_cache_unrotated_keys = True
             cache.to_quantized = MethodType(plamo3_full_kv_cache_to_quantized, cache)
         else:
-            cache.to_quantized = MethodType(plamo3_rotated_kv_cache_to_quantized, cache)
+            def to_quantized(cache, group_size: int = 64, bits: int = 4):
+                raise ValueError(
+                    "PLaMo3 full attention KV cache must be created with "
+                    "kv_bits enabled before it can be quantized without "
+                    "inverse RoPE."
+                )
+
+            cache.to_quantized = MethodType(to_quantized, cache)
     elif not layer.full_attn and isinstance(cache, RotatingKVCache):
-        cache.to_quantized = MethodType(plamo3_sliding_kv_cache_to_quantized, cache)
+        def to_quantized(cache, group_size: int = 64, bits: int = 4):
+            return cache
+
+        cache.to_quantized = MethodType(to_quantized, cache)
 
 
 class RMSNorm(nn.Module):
@@ -363,7 +354,7 @@ class Model(nn.Module):
 
     def prepare_kv_cache_for_quantization(self, prompt_cache):
         for layer, c in zip(self.layers, prompt_cache):
-            prepare_plamo3_cache(self.config, layer, c)
+            prepare_plamo3_cache(layer, c)
 
     def __call__(
         self,
