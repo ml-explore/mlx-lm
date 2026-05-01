@@ -984,7 +984,7 @@ class TestModels(unittest.TestCase):
             full_rope.calls,
             [
                 ((1, args.num_attention_heads, 1, args.head_dim), 3),
-                ((1, args.num_key_value_heads, 4, args.head_dim), None),
+                ((1, args.num_key_value_heads, 1, args.head_dim), 3),
             ],
         )
 
@@ -1000,7 +1000,7 @@ class TestModels(unittest.TestCase):
             sliding_rope.calls,
             [
                 ((1, args.num_attention_heads, 1, args.head_dim), 3),
-                ((1, args.num_key_value_heads, 4, args.head_dim), None),
+                ((1, args.num_key_value_heads, 1, args.head_dim), 3),
             ],
         )
 
