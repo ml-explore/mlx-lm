@@ -1006,6 +1006,11 @@ class TestModels(unittest.TestCase):
 
     def test_plamo3_quantized_full_attention_cache_rope_policy(self):
         from mlx_lm.models import plamo3
+        from mlx_lm.models.cache import (
+            Plamo3FullKVCache,
+            Plamo3SlidingKVCache,
+            _inverse_rope,
+        )
 
         class CountingRoPE:
             def __init__(self, rope):
@@ -1029,25 +1034,36 @@ class TestModels(unittest.TestCase):
 
         model = plamo3.Model(args)
         caches = model.make_cache()
-        model.prepare_kv_cache_for_quantization(caches)
-        self.assertFalse(getattr(caches[0], "plamo3_cache_unrotated_keys", False))
-        self.assertTrue(getattr(caches[0], "plamo3_skip_kv_quantization", False))
-        self.assertTrue(getattr(caches[1], "plamo3_cache_unrotated_keys", False))
+        self.assertIsInstance(caches[0], Plamo3SlidingKVCache)
+        self.assertIs(caches[0].to_quantized(group_size=32, bits=4), caches[0])
+        self.assertIsInstance(caches[1], Plamo3FullKVCache)
+
+        keys = mx.random.uniform(shape=(1, 2, 5, args.head_dim))
+        rotated_keys = mx.fast.rope(
+            keys,
+            args.head_dim,
+            traditional=False,
+            base=args.rope_theta,
+            scale=1.0,
+            offset=0,
+        )
+        self.assertTrue(
+            mx.allclose(
+                _inverse_rope(rotated_keys, args.head_dim, base=args.rope_theta),
+                keys,
+                atol=1e-5,
+            )
+        )
 
         attention = plamo3.Attention(args, layer_idx=1)
         rope = CountingRoPE(attention.rope)
         attention.rope = rope
 
-        cache = KVCache()
-        cache.plamo3_cache_unrotated_keys = True
+        cache = caches[1]
         hidden = mx.random.uniform(shape=(1, 3, args.hidden_size))
         next_hidden = mx.random.uniform(shape=(1, 1, args.hidden_size))
         mx.eval(attention(hidden, cache=cache))
-
-        loaded_unquantized_cache = type(cache).from_state(cache.state, cache.meta_state)
-        self.assertTrue(
-            getattr(loaded_unquantized_cache, "plamo3_cache_unrotated_keys")
-        )
+        self.assertFalse(getattr(cache, "plamo3_cache_unrotated_keys", False))
 
         quantized_cache = cache.to_quantized(group_size=32, bits=4)
         self.assertTrue(getattr(quantized_cache, "plamo3_cache_unrotated_keys"))
