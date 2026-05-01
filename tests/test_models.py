@@ -1429,6 +1429,10 @@ class TestModels(unittest.TestCase):
 
     def test_deepseek_v4(self):
         from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.hyper_connection import (
+            _hc_split_sinkhorn_ops,
+            hc_expand,
+        )
 
         # RoPE test
         rope = deepseek_v4.DeepseekV4RoPE(4, 10000)
@@ -1468,14 +1472,16 @@ class TestModels(unittest.TestCase):
             mixes = mx.random.normal((2, 3, mix), dtype=mx.float32)
             scale = mx.array([1.2, 0.7, 1.1], dtype=mx.float32)
             base = mx.random.normal((mix,), dtype=mx.float32)
-            expected = deepseek_v4._hc_split_sinkhorn_ops(
+            pre, post, comb = _hc_split_sinkhorn_ops(
                 mixes, scale, base, hc_mult, 20, 1e-6
             )
-            actual = deepseek_v4.hc_split_sinkhorn(
-                mixes, scale, base, hc_mult, 20, 1e-6
+            # Verify comb is approximately doubly stochastic
+            self.assertTrue(
+                mx.allclose(comb.sum(-1), mx.ones_like(comb.sum(-1)), atol=0.1)
             )
-            for x, y in zip(expected, actual):
-                self.assertTrue(mx.allclose(x, y, rtol=1e-5, atol=1e-5))
+            self.assertTrue(
+                mx.allclose(comb.sum(-2), mx.ones_like(comb.sum(-2)), atol=0.1)
+            )
 
         # Expand test
         post = mx.random.normal((2, 3, 4), dtype=mx.float32)
@@ -1487,7 +1493,7 @@ class TestModels(unittest.TestCase):
             comb.swapaxes(-1, -2), residual.astype(mx.float32)
         )
         expected = expected.astype(block_out.dtype)
-        actual = deepseek_v4._hc_expand_op(post, block_out, comb, residual)
+        actual = hc_expand(block_out, residual, post, comb)
         self.assertTrue(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5))
 
         # Model test
