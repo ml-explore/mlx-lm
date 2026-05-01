@@ -1161,8 +1161,20 @@ class BatchPoolingCache(_BaseCache):
 
             # Fill new remainder buffer from the tail of the input
             if nr > 0:
-                new_buf_kv[i, :nr] = kv[i, vl - nr : vl]
-                new_buf_gate[i, :nr] = gate[i, vl - nr : vl]
+                if u > 0:
+                    # Old remainder was consumed into usable output;
+                    # new remainder is purely from the tail of new input.
+                    new_buf_kv[i, :nr] = kv[i, vl - nr : vl]
+                    new_buf_gate[i, :nr] = gate[i, vl - nr : vl]
+                else:
+                    # No full window produced: carry over old buffer and
+                    # append any new valid tokens.
+                    if r > 0:
+                        new_buf_kv[i, :r] = self.buf_kv[i, :r]
+                        new_buf_gate[i, :r] = self.buf_gate[i, :r]
+                    if vl > 0:
+                        new_buf_kv[i, r : r + vl] = kv[i, :vl]
+                        new_buf_gate[i, r : r + vl] = gate[i, :vl]
 
         self.buf_kv = new_buf_kv
         self.buf_gate = new_buf_gate
