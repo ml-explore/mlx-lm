@@ -54,11 +54,22 @@ class RMSNorm(nn.Module):
         self.weight = mx.zeros(hidden_size)
         self.variance_epsilon = eps
         self.offset = offset
+        self._scale = None
+        self._scale_weight = None
+
+    @property
+    def scale(self) -> mx.array:
+        if self.offset == 0:
+            return self.weight
+        if self.training:
+            return self.weight + self.offset
+        if self._scale is None or self._scale_weight is not self.weight:
+            self._scale = self.weight + self.offset
+            self._scale_weight = self.weight
+        return self._scale
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        return mx.fast.rms_norm(
-            hidden_states, self.weight + self.offset, self.variance_epsilon
-        )
+        return mx.fast.rms_norm(hidden_states, self.scale, self.variance_epsilon)
 
 
 class Attention(nn.Module):
@@ -117,9 +128,8 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        attn_dtype = queries.dtype
-        queries = self.q_norm(queries).astype(attn_dtype)
-        keys = self.k_norm(keys).astype(attn_dtype)
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
 
         if cache is not None:
             offset = cache.offset
