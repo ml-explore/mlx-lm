@@ -609,6 +609,8 @@ class LocalAttention(nn.Module):
             config.max_position_embeddings,
         )
 
+        self.sharding_group = None
+
     def __call__(
         self,
         x: mx.array,
@@ -646,6 +648,9 @@ class LocalAttention(nn.Module):
         out = self.wo_a(out)
         out = out.transpose(0, 2, 1, 3).flatten(-2)
         out = self.wo_b(out)
+
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
 
         return out
 
@@ -692,6 +697,8 @@ class CompressedAttention(nn.Module):
             config.max_position_embeddings,
         )
         self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
+
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -744,6 +751,9 @@ class CompressedAttention(nn.Module):
         out = out.transpose(0, 2, 1, 3).flatten(-2)
         out = self.wo_b(out)
 
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+
         return out
 
 
@@ -789,6 +799,8 @@ class SparseCompressedAttention(nn.Module):
         )
         self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
         self.indexer = Indexer(config, self.compress_ratio)
+
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -872,6 +884,9 @@ class SparseCompressedAttention(nn.Module):
         out = self.wo_a(out)
         out = out.transpose(0, 2, 1, 3).flatten(-2)
         out = self.wo_b(out)
+
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
 
         return out
 
@@ -1128,13 +1143,17 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        rank = group.rank()
         for layer in self.model.layers:
+            layer.attn.sharding_group = group
             layer.attn.wq_b = shard_linear(
-                layer.attn.wq_b, "all-to-sharded", group=group
+                layer.attn.wq_b,
+                "all-to-sharded",
+                segments=self.args.o_groups,
+                group=group,
             )
-            layer.attn.wo_b = shard_linear(
-                layer.attn.wo_b, "sharded-to-all", group=group
-            )
+            shard_inplace(layer.attn.wo_a, "sharded-to-all", group=group)
+            layer.attn.attn_sink = mx.split(layer.attn.attn_sink, N)[rank]
             layer.attn.n_heads //= N
 
             layer.ffn.sharding_group = group
