@@ -1082,6 +1082,58 @@ class TestModels(unittest.TestCase):
             ],
         )
 
+    def test_plamo3_unrotated_kv_cache_marker_save_load(self):
+        import tempfile
+
+        from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
+
+        cache = [KVCache()]
+        cache[0].plamo3_cache_unrotated_keys = True
+        x = mx.random.uniform(shape=(1, 8, 10, 4))
+        cache[0].update_and_fetch(x, x)
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            cache_file = f"{test_dir}/plamo3_prompt_cache.safetensors"
+            save_prompt_cache(cache_file, cache)
+            loaded_cache = load_prompt_cache(cache_file)
+
+        self.assertTrue(
+            getattr(loaded_cache[0], "plamo3_cache_unrotated_keys", False)
+        )
+
+    def test_plamo3_cache_type_save_load(self):
+        import tempfile
+
+        from mlx_lm.models.cache import (
+            Plamo3FullKVCache,
+            Plamo3SlidingKVCache,
+            load_prompt_cache,
+            save_prompt_cache,
+        )
+
+        cache = [Plamo3FullKVCache(rope_dim=16, rope_base=1_000_000)]
+        x = mx.random.uniform(shape=(1, 8, 10, 16))
+        cache[0].update_and_fetch(x, x)
+
+        with tempfile.TemporaryDirectory() as test_dir:
+            cache_file = f"{test_dir}/plamo3_cache.safetensors"
+            save_prompt_cache(cache_file, cache)
+            loaded_cache = load_prompt_cache(cache_file)
+
+            sliding_cache = [Plamo3SlidingKVCache(max_size=8)]
+            sliding_cache[0].update_and_fetch(x, x)
+            save_prompt_cache(cache_file, sliding_cache)
+            loaded_sliding_cache = load_prompt_cache(cache_file)
+
+        self.assertIsInstance(loaded_cache[0], Plamo3FullKVCache)
+        self.assertEqual(loaded_cache[0].rope_dim, cache[0].rope_dim)
+        self.assertEqual(loaded_cache[0].rope_base, cache[0].rope_base)
+        self.assertIsInstance(loaded_sliding_cache[0], Plamo3SlidingKVCache)
+        self.assertIs(
+            loaded_sliding_cache[0].to_quantized(group_size=32, bits=4),
+            loaded_sliding_cache[0],
+        )
+
     def test_stablelm(self):
         from mlx_lm.models import stablelm
 
