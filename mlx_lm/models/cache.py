@@ -297,11 +297,15 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.group_size, self.bits)))
+        state = [str(self.offset), str(self.group_size), str(self.bits)]
+        if getattr(self, "plamo3_cache_unrotated_keys", False):
+            state.append("plamo3_unrotated_keys")
+        return tuple(state)
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset, self.group_size, self.bits = map(int, v)
+        self.offset, self.group_size, self.bits = map(int, v[:3])
+        self.plamo3_cache_unrotated_keys = "plamo3_unrotated_keys" in v[3:]
 
     def is_trimmable(self):
         return True
@@ -372,6 +376,21 @@ class KVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
 
+    @property
+    def meta_state(self):
+        if getattr(self, "plamo3_cache_unrotated_keys", False):
+            return "plamo3_unrotated_keys"
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        if v in (None, ""):
+            return
+        if v == "plamo3_unrotated_keys":
+            self.plamo3_cache_unrotated_keys = True
+            return
+        raise ValueError("Unrecognized KVCache meta_state.")
+
     def is_trimmable(self):
         return True
 
@@ -383,6 +402,8 @@ class KVCache(_BaseCache):
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
+        if getattr(self, "plamo3_cache_unrotated_keys", False):
+            quant_cache.plamo3_cache_unrotated_keys = True
         if self.keys is not None:
             quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
             quant_cache.values = mx.quantize(
