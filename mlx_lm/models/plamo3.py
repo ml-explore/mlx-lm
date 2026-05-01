@@ -121,19 +121,13 @@ class Attention(nn.Module):
         queries = self.q_norm(queries).astype(attn_dtype)
         keys = self.k_norm(keys).astype(attn_dtype)
 
-        if self.full_attn:
-            offset = cache.offset if cache is not None else 0
-            if cache is not None:
-                keys, values = cache.update_and_fetch(keys, values)
+        if cache is not None:
+            offset = cache.offset
             queries = self.rope(queries, offset=offset)
-            keys = self.rope(keys)
+            keys = self.rope(keys, offset=offset)
+            keys, values = cache.update_and_fetch(keys, values)
         else:
-            # Sliding layers keep unrotated keys in the rotating cache and
-            # reapply RoPE over the visible KV window to reset local positions.
-            if cache is not None:
-                keys, values = cache.update_and_fetch(keys, values)
-            query_offset = keys.shape[-2] - queries.shape[-2]
-            queries = self.rope(queries, offset=query_offset)
+            queries = self.rope(queries)
             keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
@@ -286,9 +280,7 @@ class Model(nn.Module):
             if layer.full_attn:
                 c = KVCache()
             else:
-                # The HF sliding mask includes the current token plus
-                # window_size previous tokens.
-                c = RotatingKVCache(max_size=self.config.window_size + 1)
+                c = RotatingKVCache(max_size=self.config.window_size)
             caches.append(c)
         return caches
 
