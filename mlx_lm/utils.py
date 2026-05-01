@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+import struct
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -55,6 +56,8 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
+
+SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 
 def _parse_size(x):
@@ -279,6 +282,50 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _load_safetensors(path: str) -> dict:
+    try:
+        return mx.load(path)
+    except RuntimeError as e:
+        if not any(dtype in str(e) for dtype in SAFETENSORS_DTYPE_FALLBACKS):
+            raise
+        load_error = e
+
+    with open(path, "r+b") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        original_header = f.read(header_len)
+        header = json.loads(original_header)
+        changed = False
+
+        for tensor_info in header.values():
+            if not isinstance(tensor_info, dict):
+                continue
+            dtype = tensor_info.get("dtype")
+            if dtype in SAFETENSORS_DTYPE_FALLBACKS:
+                tensor_info["dtype"] = SAFETENSORS_DTYPE_FALLBACKS[dtype]
+                changed = True
+
+        if not changed:
+            raise load_error
+
+        patched_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        if len(patched_header) > header_len:
+            raise RuntimeError(
+                f"Cannot reinterpret unsupported safetensors dtype in {path}: "
+                "patched header is larger than the original header."
+            )
+
+        try:
+            f.seek(8)
+            f.write(patched_header)
+            f.write(b" " * (header_len - len(patched_header)))
+            f.flush()
+            return mx.load(path)
+        finally:
+            f.seek(8)
+            f.write(original_header)
+            f.flush()
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -320,7 +367,7 @@ def load_model(
 
     weights = {}
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(_load_safetensors(wf))
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
@@ -385,6 +432,13 @@ def load_model(
         elif quant_method in ("awq", "gptq"):
             # Transform AutoAWQ/GPTQ packed weights to MLX format
             weights, quantization = _transform_awq_weights(weights, quantization_config)
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif quant_method == "fp8" and config.get("model_type", None) == "deepseek_v4":
+            from .models.deepseek_v4 import make_quantization_config
+
+            quantization = make_quantization_config(model)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
