@@ -61,6 +61,19 @@ class TestPromptCache(unittest.TestCase):
         _, loaded_metadata = load_prompt_cache(cache_file, return_metadata=True)
         self.assertEqual(metadata, loaded_metadata)
 
+    def test_save_load_plamo3_unrotated_kv_cache_marker(self):
+        cache = [KVCache()]
+        cache[0].plamo3_cache_unrotated_keys = True
+        x = mx.random.uniform(shape=(1, 8, 10, 4))
+        cache[0].update_and_fetch(x, x)
+
+        cache_file = os.path.join(self.test_dir, "plamo3_prompt_cache.safetensors")
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self.assertTrue(
+            getattr(loaded_cache[0], "plamo3_cache_unrotated_keys", False)
+        )
+
     def test_save_load_rotating_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
