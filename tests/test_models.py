@@ -842,6 +842,60 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_gemma4_moe_router_top_k_indices_no_grad(self):
+        """Regression: top_k_indices in DecoderLayer must be detached from
+        autograd. Router weights still flow through top_k_weights.
+        """
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                    "enable_moe_block": True,
+                    "num_experts": 4,
+                    "top_k_experts": 2,
+                    "moe_intermediate_size": 4,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        inputs = mx.array([[0, 1]])
+        outputs = model(inputs)
+        self.assertEqual(outputs.shape, (1, 2, args.vocab_size))
+
+        # Confirm a backward pass still works (router proj is learnable via
+        # top_k_weights even though top_k_indices is stop_gradient'd).
+        def loss_fn(model, x):
+            return model(x).sum()
+
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        loss, grads = loss_and_grad_fn(model, inputs)
+        flat_grads = dict(tree_flatten(grads))
+        router_proj_key = "language_model.model.layers.0.router.proj.weight"
+        self.assertIn(router_proj_key, flat_grads)
+        # Router proj receives gradient via top_k_weights (softmax over >1
+        # selected experts), confirming the router stays learnable even with
+        # top_k_indices stop_gradient'd.
+        self.assertGreater(float(mx.abs(flat_grads[router_proj_key]).sum()), 0.0)
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 

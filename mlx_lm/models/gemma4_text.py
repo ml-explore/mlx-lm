@@ -356,6 +356,10 @@ class DecoderLayer(nn.Module):
             h1 = self.post_feedforward_layernorm_1(h1)
 
             top_k_indices, top_k_weights = self.router(h)
+            # Block gradient through discrete expert selection; router is still
+            # learnable via top_k_weights. Without this, argmax noise from
+            # top_k_indices destabilizes adapter (LoRA/SFT) training.
+            top_k_indices = mx.stop_gradient(top_k_indices)
             h2 = self.pre_feedforward_layernorm_2(h)
             h2 = self.experts(h2, top_k_indices, top_k_weights)
             h2 = self.post_feedforward_layernorm_2(h2)
