@@ -74,9 +74,15 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             try:
                 return json.loads(param_value)
             except json.JSONDecodeError:
-                return ast.literal_eval(param_value)
+                try:
+                    return ast.literal_eval(param_value)
+                except (ValueError, SyntaxError):
+                    return param_value
 
-        return ast.literal_eval(param_value)
+        try:
+            return ast.literal_eval(param_value)
+        except (ValueError, SyntaxError):
+            return param_value
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):

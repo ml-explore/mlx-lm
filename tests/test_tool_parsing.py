@@ -330,5 +330,70 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(expected, tool_calls)
 
 
+    def test_qwen3_coder_iso_date(self):
+        """Qwen3 coder parser should not crash on ISO 8601 dates."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "schedule",
+                    "description": "Schedule a task",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["name", "deadline"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "deadline": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=schedule>\n"
+            "<parameter=name>\n"
+            "deploy\n"
+            "</parameter>\n"
+            "<parameter=deadline>\n"
+            "2025-06-15T10:30:00Z\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
+        # parse_tool_call returns dict, not list
+        self.assertEqual(tool_calls["name"], "schedule")
+        self.assertEqual(tool_calls["arguments"]["name"], "deploy")
+        self.assertEqual(tool_calls["arguments"]["deadline"], "2025-06-15T10:30:00Z")
+
+    def test_qwen3_coder_partial_number(self):
+        """Qwen3 coder parser should handle partial number-like strings."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "log",
+                    "description": "Log a message",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["msg"],
+                        "properties": {
+                            "msg": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=log>\n"
+            "<parameter=msg>\n"
+            "version 3.10.5-beta\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
+        # parse_tool_call returns dict, not list
+        self.assertEqual(tool_calls["arguments"]["msg"], "version 3.10.5-beta")
+
+
 if __name__ == "__main__":
     unittest.main()
