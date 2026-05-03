@@ -609,6 +609,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         sanitized = {}
+        first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
         for k, v in weights.items():
             if any(
                 s in k
@@ -621,6 +622,15 @@ class Model(nn.Module):
                 )
             ):
                 continue
+
+            # KV-shared layers reuse K/V from earlier layers — drop their projections
+            if any(s in k for s in (".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.k_norm")):
+                try:
+                    layer_idx = int(k.split("layers.")[1].split(".")[0])
+                    if layer_idx >= first_kv_shared:
+                        continue
+                except (IndexError, ValueError):
+                    pass
 
             if k.endswith(".experts.gate_up_proj"):
                 base = k.removesuffix(".gate_up_proj")
