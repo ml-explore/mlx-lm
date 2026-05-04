@@ -624,7 +624,10 @@ class Model(nn.Module):
                 continue
 
             # KV-shared layers reuse K/V from earlier layers — drop their projections
-            if any(s in k for s in (".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.k_norm")):
+            if any(
+                s in k
+                for s in (".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.k_norm")
+            ):
                 try:
                     layer_idx = int(k.split("layers.")[1].split(".")[0])
                     if layer_idx >= first_kv_shared:
