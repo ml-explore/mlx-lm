@@ -748,7 +748,6 @@ def mtp_generate_step(
                 c.rollback_state = None
             elif c.is_trimmable():
                 c.trim(1)
-        cache.trim_prompt_cache(mtp_cache, 1)
 
     def _step_backbone(y, prev_tokens, n_predict=1, n_confirmed=0):
         """Run the backbone on ``y`` and return (tokens, logprobs, hidden, prev_tokens)."""
