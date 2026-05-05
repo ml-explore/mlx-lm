@@ -257,6 +257,41 @@ class TestMTP(unittest.TestCase):
         # Second call (MTP head): context must be T0 = 4, not the prompt token.
         self.assertEqual(logged[1], 4)
 
+    def test_mtp_rejection_residual_sampling(self):
+        """On rejection at temp>0, the emitted token must be sampled from the
+        residual distribution max(p_target - p_draft, 0) / Z, not the backbone
+        argmax. The argmax is deterministic for a fixed model state, so rejection
+        tokens would always be identical. Residual sampling produces a
+        distribution, so tokens must vary across runs.
+
+        Using max_tokens=1 yields exactly one token per run: the accepted draft
+        (from_draft=True) or the rejection token (from_draft=False). This avoids
+        conflating rejection tokens with bonus tokens (also from_draft=False).
+        """
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+
+        def stochastic(logprobs):
+            return mx.random.categorical(logprobs)
+
+        rejection_tokens: list[int] = []
+        for _ in range(60):
+            for tok, _, from_draft in mtp_generate_step(
+                prompt, self.model, sampler=stochastic, max_tokens=1
+            ):
+                if not from_draft:
+                    rejection_tokens.append(int(tok))
+
+        self.assertGreaterEqual(
+            len(rejection_tokens),
+            5,
+            "Too few rejection events observed; increase n_runs",
+        )
+        self.assertGreater(
+            len(set(rejection_tokens)),
+            1,
+            "Rejection tokens are always identical, argmax bug likely present",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
