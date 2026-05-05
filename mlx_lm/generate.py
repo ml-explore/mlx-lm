@@ -873,13 +873,27 @@ def mtp_generate_step(
                 if logits_processors and prev_tokens is not None:
                     prev_tokens = prev_tokens[:-1]  # discard rejected draft token
                 verify_tok_id = verify_pred.item()
+                if not _is_greedy:
+                    # Sample from residual distribution max(p_target - p_draft, 0) / Z
+                    # (Leviathan et al. 2022 §2.3; Chen et al. 2023). Guarantees the
+                    # output marginal equals the target distribution exactly.
+                    p_target = mx.exp(verify_lp)
+                    p_draft = mx.exp(draft_lp)
+                    residual = mx.maximum(p_target - p_draft, 0.0)
+                    z = residual.sum().item()
+                    if z > 1e-8:
+                        verify_tok_id = mx.random.categorical(
+                            mx.log(residual / z + 1e-10).reshape(1, -1)
+                        ).item()
                 ntoks += 1
                 yield verify_tok_id, verify_lp, False
                 if ntoks >= max_tokens:
                     return
                 # Next draft from MTP at y's hidden state.
                 draft_tok, draft_lp = _step_mtp(
-                    hidden_at_confirmed, verify_pred, prev_tokens
+                    hidden_at_confirmed,
+                    mx.array([verify_tok_id], mx.uint32),
+                    prev_tokens,
                 )
                 mx.eval(draft_tok)
                 y = mx.array([verify_tok_id], mx.uint32)
