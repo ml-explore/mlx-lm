@@ -1,6 +1,8 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import os
 import argparse
+from pathlib import Path
 
 import mlx.core as mx
 
@@ -77,7 +79,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--system-prompt",
         default=None,
-        help="System prompt to be used for the chat template",
+        help="System prompt (a text or a file name) to be used for the chat template",
     )
     parser.add_argument(
         "--pipeline",
@@ -115,6 +117,17 @@ def main():
             },
         )
 
+    is_path = args.system_prompt.startswith(("./", "../", "/", "~"))
+    if args.system_prompt is not None and (
+        is_path or os.path.exists(args.system_prompt)
+    ):
+        if args.system_prompt.startswith("~"):
+            args.system_prompt = str(Path(args.system_prompt).expanduser())
+        with open(args.system_prompt, "r") as file:
+            filename = args.system_prompt
+            args.system_prompt = file.read().strip()
+            rprint("System prompt loaded from", filename)
+
     def print_help():
         rprint("The command list:")
         rprint("- 'q' to exit")
@@ -124,19 +137,24 @@ def main():
     rprint(f"[INFO] Starting chat session with {args.model}.")
     print_help()
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
+    is_first_message = True
     while True:
         query = input(">> " if rank == 0 else "")
+        if not query:
+            continue
         if query == "q":
             break
         if query == "r":
             prompt_cache = make_prompt_cache(model, args.max_kv_size)
+            is_first_message = True
             continue
         if query == "h":
             print_help()
             continue
         messages = []
-        if args.system_prompt is not None:
+        if args.system_prompt is not None and is_first_message:
             messages.append({"role": "system", "content": args.system_prompt})
+        is_first_message = False
         messages.append({"role": "user", "content": query})
         prompt = tokenizer.apply_chat_template(
             messages,
