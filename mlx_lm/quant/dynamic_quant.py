@@ -7,7 +7,6 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 

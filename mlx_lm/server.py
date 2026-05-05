@@ -22,9 +22,7 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )

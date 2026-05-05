@@ -1,9 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn

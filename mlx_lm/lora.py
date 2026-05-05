@@ -3,7 +3,6 @@ import math
 import os
 import re
 import types
-import warnings
 from pathlib import Path
 
 import mlx.core as mx

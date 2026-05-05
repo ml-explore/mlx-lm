@@ -1,10 +1,8 @@
 # Copyright © 2024 Apple Inc.
 
 import math
-import sys
 import unittest
 from contextlib import contextmanager
-from io import StringIO
 from unittest.mock import ANY, MagicMock
 
 import mlx.core as mx
@@ -12,9 +10,9 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten
 
-from mlx_lm import lora, tuner
+from mlx_lm import tuner
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
-from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
+from mlx_lm.tuner.lora import LoRAEmbedding
 from mlx_lm.tuner.trainer import evaluate
 from mlx_lm.tuner.utils import build_schedule
 

@@ -1,7 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
-from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn

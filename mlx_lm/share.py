@@ -12,7 +12,6 @@ from tempfile import TemporaryDirectory
 from typing import Literal, Optional
 
 import mlx.core as mx
-from huggingface_hub.errors import LocalEntryNotFoundError
 from mlx._distributed_utils.common import Hostfile
 from mlx._distributed_utils.launch import launch_jaccl, launch_ring
 from tqdm import tqdm

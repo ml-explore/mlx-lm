@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
 from typing import Any, Optional
 

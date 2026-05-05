@@ -1,7 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import ast
-from typing import Any, Dict, List
+from typing import Any
 
 import regex as re
 

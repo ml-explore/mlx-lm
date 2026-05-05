@@ -1,7 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import json
-
 from mlx_lm import generate, load
 from mlx_lm.models.cache import make_prompt_cache
 

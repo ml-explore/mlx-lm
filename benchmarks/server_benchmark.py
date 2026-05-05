@@ -13,9 +13,8 @@ import asyncio
 import json
 import math
 import time
-from collections import defaultdict
 from itertools import cycle
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import aiohttp
 from tqdm import tqdm

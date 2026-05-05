@@ -4,7 +4,6 @@ import types
 from pathlib import Path
 from typing import Dict
 
-import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
