@@ -80,6 +80,165 @@ def _unpack_awq_weights(qweight: mx.array) -> mx.array:
     return unpacked.reshape(out_features, in_features)
 
 
+_AWQ_LM_HEAD_QUANT_SUFFIXES = ("qweight", "qzeros", "scales")
+
+
+def _module_at_path(model: nn.Module, path: str) -> Optional[nn.Module]:
+    """Walk ``model`` along the dot-separated ``path``; return None on
+    any missing attribute."""
+    if not path:
+        return model
+    sub: Optional[nn.Module] = model
+    for part in path.split("."):
+        sub = getattr(sub, part, None)
+        if sub is None:
+            return None
+    return sub
+
+
+def _owner_aliases(owner: str):
+    """Yield owner paths to consult for an ``lm_head`` at ``owner``,
+    most-specific first.
+
+    Sanitizers commonly re-namespace text weights under an extra
+    ``model.`` segment (gpt2/gpt_neox at top level; gemma4 inside the
+    text wrapper). The tying decision still belongs to the outer
+    submodel, so a missing signal at the more-specific path falls
+    back to the outer one rather than being treated as "unknown".
+    """
+    yield owner
+    if owner.endswith(".model"):
+        yield owner[: -len(".model")]
+    elif owner == "model":
+        yield ""
+
+
+def _config_for_owner(owner: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the config fragment that governs construction of the
+    submodel at ``owner``. Multimodal text submodels (anything under
+    ``language_model``) are governed by ``config["text_config"]``;
+    everything else by top-level ``config``."""
+    if owner.startswith("language_model"):
+        return config.get("text_config", {})
+    return config
+
+
+def _tie_value_from_module(module: nn.Module) -> Optional[bool]:
+    """Return the submodel's ``args.tie_word_embeddings`` when the
+    ``ModelArgs`` declares it — the bool value whether explicitly set
+    to ``True`` or ``False``; return ``None`` when the field is absent
+    so the caller can fall back to another lookup. Using ``is True``
+    defensively coerces any non-True value (e.g., a ``None`` or non-
+    bool default) to ``False`` so an unset field never passes as an
+    authoritative tied signal."""
+    args = getattr(module, "args", None) or getattr(module, "config", None)
+    if args is not None and hasattr(args, "tie_word_embeddings"):
+        return getattr(args, "tie_word_embeddings") is True
+    return None
+
+
+def _is_authoritatively_tied_at(
+    outer_prefix: str,
+    model: nn.Module,
+    config: Dict[str, Any],
+) -> bool:
+    """For weights at ``outer_prefix`` (e.g., ``""`` for top-level,
+    ``"language_model."`` for multimodal text submodels), return True
+    iff the governing submodel is authoritatively tied.
+
+    Asks two model-level questions instead of branching on each known
+    sanitizer prefix:
+
+    1. Walk ``outer_prefix`` (and one level of sanitizer-renamed
+       fallback via :func:`_owner_aliases`) to find the governing
+       submodel. ``language_model.model`` falls back to
+       ``language_model`` (gemma4-style nested wrapper); ``model``
+       falls back to ``""`` (gpt2/gpt_neox transparent wrapper). The
+       extra ``model.`` segment is a sanitize-level renaming, not a
+       new tying boundary.
+    2. At each level, consult the config fragment that drove the
+       submodel's constructor (top-level for ``""``/``model``,
+       ``config["text_config"]`` for ``language_model``/
+       ``language_model.model``); fall back to the submodel's
+       ``ModelArgs.tie_word_embeddings`` only when config is silent,
+       and only when the field is literally ``True``.
+
+    Returns False (preserve the triple) when no level yields an
+    authoritative signal — strict load failing loudly is preferable
+    to silently dropping a real quantized output head.
+    """
+    owner = outer_prefix.removesuffix(".")
+    for candidate_owner in _owner_aliases(owner):
+        cfg = _config_for_owner(candidate_owner, config)
+        if isinstance(cfg, dict) and "tie_word_embeddings" in cfg:
+            return cfg["tie_word_embeddings"] is True
+        module = _module_at_path(model, candidate_owner)
+        if module is not None:
+            tied = _tie_value_from_module(module)
+            if tied is not None:
+                return tied
+    return False
+
+
+def _maybe_drop_redundant_lm_head_awq_triple(
+    weights: Dict[str, mx.array],
+    model: nn.Module,
+    config: Dict[str, Any],
+) -> Dict[str, mx.array]:
+    """Drop ``*lm_head.{qweight,qzeros,scales}`` keys that the
+    constructed model has no parameter target for, when an explicit
+    tied-embedding signal authorises the drop.
+
+    AutoAWQ checkpoints may quantize ``lm_head`` even on tied-embedding
+    models, where ``lm_head`` aliases ``embed_tokens`` and is not a
+    real parameter. The redundant quant triple would round-trip through
+    ``_transform_awq_weights`` into ``lm_head.{weight,scales,biases}``
+    and fail ``model.load_weights(..., strict=True)`` with "Received
+    parameters not in model".
+
+    Each candidate triple's outer prefix (``""`` for top-level,
+    ``"language_model."`` for VL text submodels) selects which config
+    fragment and submodel govern its tying decision. Drop only when
+    that local signal is authoritative:
+
+    * The relevant ``tie_word_embeddings`` (top-level for ``""``,
+      ``text_config.tie_word_embeddings`` for ``"language_model."``)
+      is explicitly ``True``.
+    * The signal is absent in config but the relevant submodel's
+      ``ModelArgs`` declares ``tie_word_embeddings`` (Qwen2/Llama
+      pattern): the constructor honoured the args, so the missing
+      target is authoritative even when the config omits the field.
+
+    Otherwise preserve the triple. Architectures whose ``sanitize``
+    decides tying from weight content (gemma3_text, recurrent_gemma)
+    leave a missing ``lm_head.weight`` target that is ambiguous between
+    a tied checkpoint with a redundant triple and an untied checkpoint
+    with a real quantized output head; without a config signal we
+    cannot distinguish, and silently dropping the latter would produce
+    wrong logits — strict load failing loudly is preferable.
+    """
+    valid_lm_head_prefixes = set()
+    for path, _ in tree_flatten(model.parameters()):
+        if path == "lm_head.weight" or path.endswith(".lm_head.weight"):
+            valid_lm_head_prefixes.add(path[: -len("weight")])
+
+    keys_to_drop = []
+    for key in weights:
+        for suffix in _AWQ_LM_HEAD_QUANT_SUFFIXES:
+            target = f"lm_head.{suffix}"
+            if key == target or key.endswith(f".{target}"):
+                prefix = key[: -len(suffix)]
+                if prefix not in valid_lm_head_prefixes:
+                    outer_prefix = prefix[: -len("lm_head.")]
+                    if _is_authoritatively_tied_at(outer_prefix, model, config):
+                        keys_to_drop.append(key)
+                break
+
+    if not keys_to_drop:
+        return weights
+    return {k: v for k, v in weights.items() if k not in keys_to_drop}
+
+
 def _transform_awq_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
@@ -383,6 +542,11 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method in ("awq", "gptq"):
+            # AutoAWQ ckpts may include a redundant lm_head quant triple
+            # (e.g., on tied-embedding models, or under multimodal
+            # sanitize prefixes); drop any whose .weight target is not
+            # present on the constructed model before transforming.
+            weights = _maybe_drop_redundant_lm_head_awq_triple(weights, model, config)
             # Transform AutoAWQ/GPTQ packed weights to MLX format
             weights, quantization = _transform_awq_weights(weights, quantization_config)
             config["quantization"] = quantization
