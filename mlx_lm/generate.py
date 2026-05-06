@@ -880,11 +880,12 @@ def mtp_generate_step(
                     p_target = mx.exp(verify_lp)
                     p_draft = mx.exp(draft_lp)
                     residual = mx.maximum(p_target - p_draft, 0.0)
-                    z = residual.sum().item()
-                    if z > 1e-8:
-                        verify_tok_id = mx.random.categorical(
-                            mx.log(residual / z + 1e-10).reshape(1, -1)
-                        ).item()
+                    z = residual.sum(keepdims=True)
+                    dist = mx.where(z > 0, residual, p_target)
+                    # categorical treats -inf log-prob as p=0.
+                    verify_tok_id = mx.random.categorical(
+                        mx.log(dist).reshape(1, -1)
+                    ).item()
                 ntoks += 1
                 yield verify_tok_id, verify_lp, False
                 if ntoks >= max_tokens:
