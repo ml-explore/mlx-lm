@@ -1312,7 +1312,7 @@ class BatchRotatingKVCache(_BaseCache):
             int,
             v[:3],
         )
-        self.rotated = bool(v[3])
+        self.rotated = v[3] == "True"
 
     def is_trimmable(self):
         return self._offset < self.max_size
