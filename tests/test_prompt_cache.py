@@ -216,22 +216,27 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
 
-        # Can't trim arrays cache
+        # Trimming arrays cache resets recurrent state
         cache = [ArraysCache(size=2) for _ in range(2)]
         for c in cache:
             c[0] = mx.zeros((5, 5))
             c[1] = mx.zeros((5, 5))
         num_trimmed = trim_prompt_cache(cache, 7)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 7)
+        for c in cache:
+            self.assertTrue(c.empty())
 
-        # All cache's have to be trimmable
+        # Hybrid cache (ArraysCache + KVCache) is trimmable
         cache = [ArraysCache(size=2), KVCache()]
         cache[0][0] = mx.zeros((5, 5))
         cache[0][1] = mx.zeros((5, 5))
         x = mx.random.uniform(shape=(1, 8, 10, 4))
         cache[1].update_and_fetch(x, x)
         num_trimmed = trim_prompt_cache(cache, 1)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 1)
+        # ArraysCache resets, KVCache trims normally
+        self.assertTrue(cache[0].empty())
+        self.assertEqual(cache[1].offset, 9)
 
         cache = [RotatingKVCache(max_size=6) for _ in range(2)]
         for c in cache:

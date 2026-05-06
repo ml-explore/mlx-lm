@@ -723,6 +723,25 @@ class ArraysCache(_BaseCache):
     def empty(self):
         return self.cache[0] is None
 
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        """Trim the cache by n tokens.
+
+        ArraysCache holds compressed recurrent state that cannot be partially
+        rolled back. When trimming is required, the cache is fully reset so
+        the recurrent layers recompute from scratch. KVCache layers in the
+        same hybrid model still benefit from their own trim.
+
+        For exact-match reuse (n=0), this method is not called and the full
+        recurrent state is preserved — the common server case.
+        """
+        if n <= 0:
+            return 0
+        self.cache = [None] * len(self.cache)
+        return n
+
     @property
     def nbytes(self):
         return sum(c.nbytes for c in self.cache if c is not None)
