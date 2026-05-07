@@ -153,23 +153,24 @@ class TestMTP(unittest.TestCase):
     def test_mtp_probabilistic_acceptance_completes(self):
         """mtp_generate_step should complete without errors with a stochastic sampler.
 
-        Exercises the probabilistic acceptance path: min(1, p_target / p_draft).
+        Exercises the probabilistic acceptance path: min(1, p_target / p_draft),
+        both with bare temp (no filters) and with top_k applied.
         """
         prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
         n_tokens = 10
 
-        def stochastic(logprobs):
-            return mx.random.categorical(logprobs)
-
-        tokens = []
-        for tok, _, _ in mtp_generate_step(
-            prompt, self.model, sampler=stochastic, max_tokens=n_tokens
-        ):
-            tokens.append(int(tok))
-            if len(tokens) >= n_tokens:
-                break
-
-        self.assertEqual(len(tokens), n_tokens)
+        for kwargs in [
+            {"temp": 0.7},
+            {"temp": 0.7, "top_k": 10},
+        ]:
+            tokens = []
+            for tok, _, _ in mtp_generate_step(
+                prompt, self.model, max_tokens=n_tokens, **kwargs
+            ):
+                tokens.append(int(tok))
+                if len(tokens) >= n_tokens:
+                    break
+            self.assertEqual(len(tokens), n_tokens, f"kwargs={kwargs}")
 
     def test_mtp_generate_identity_with_logits_processor(self):
         """mtp_generate_step must produce the same greedy tokens as generate_step
@@ -257,6 +258,31 @@ class TestMTP(unittest.TestCase):
         # Second call (MTP head): context must be T0 = 4, not the prompt token.
         self.assertEqual(logged[1], 4)
 
+    def _collect_rejection_tokens(self, n_runs=60, **kwargs):
+        """Run mtp_generate_step n_runs times with max_tokens=1 and return all
+        rejection tokens (from_draft=False)."""
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        rejection_tokens: list[int] = []
+        for _ in range(n_runs):
+            for tok, _, from_draft in mtp_generate_step(
+                prompt, self.model, max_tokens=1, **kwargs
+            ):
+                if not from_draft:
+                    rejection_tokens.append(int(tok))
+        return rejection_tokens
+
+    def _assert_residual_varies(self, rejection_tokens, label=""):
+        self.assertGreaterEqual(
+            len(rejection_tokens),
+            5,
+            f"{label}Too few rejection events observed; increase n_runs",
+        )
+        self.assertGreater(
+            len(set(rejection_tokens)),
+            1,
+            f"{label}Rejection tokens are always identical, argmax bug likely present",
+        )
+
     def test_mtp_rejection_residual_sampling(self):
         """On rejection at temp>0, the emitted token must be sampled from the
         residual distribution max(p_target - p_draft, 0) / Z, not the backbone
@@ -268,29 +294,7 @@ class TestMTP(unittest.TestCase):
         (from_draft=True) or the rejection token (from_draft=False). This avoids
         conflating rejection tokens with bonus tokens (also from_draft=False).
         """
-        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
-
-        def stochastic(logprobs):
-            return mx.random.categorical(logprobs)
-
-        rejection_tokens: list[int] = []
-        for _ in range(60):
-            for tok, _, from_draft in mtp_generate_step(
-                prompt, self.model, sampler=stochastic, max_tokens=1
-            ):
-                if not from_draft:
-                    rejection_tokens.append(int(tok))
-
-        self.assertGreaterEqual(
-            len(rejection_tokens),
-            5,
-            "Too few rejection events observed; increase n_runs",
-        )
-        self.assertGreater(
-            len(set(rejection_tokens)),
-            1,
-            "Rejection tokens are always identical, argmax bug likely present",
-        )
+        self._assert_residual_varies(self._collect_rejection_tokens(temp=1.0))
 
 
 if __name__ == "__main__":

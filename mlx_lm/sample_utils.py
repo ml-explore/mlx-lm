@@ -2,9 +2,40 @@
 
 import math
 from functools import partial
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
+
+
+def make_sampler_chain(
+    top_p: float = 0.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: List[int] = [],
+) -> Tuple[List[Callable[[mx.array], mx.array]], Optional[List]]:
+    """Return (filter_chain, xtc_cell) for use in mtp_generate_step.
+
+    xtc_cell is a mutable [uniform_draw] slot; set it before running the chain
+    to share the XTC boolean across draft and verify steps. None when XTC is off.
+    """
+    _xtc_cell: Optional[List] = [None] if xtc_probability > 0.0 else None
+    chain: List[Callable[[mx.array], mx.array]] = []
+    if top_p > 0 and top_p < 1.0:
+        chain.append(lambda x: apply_top_p(x, top_p))
+    if min_p != 0.0:
+        chain.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
+    if xtc_probability > 0.0:
+        chain.append(
+            lambda x: apply_xtc(
+                x, xtc_probability, xtc_threshold, xtc_special_tokens, _xtc_cell[0]
+            )
+        )
+    if top_k > 0:
+        chain.append(lambda x: apply_top_k(x, top_k))
+    return chain, _xtc_cell
 
 
 def make_sampler(
@@ -47,17 +78,15 @@ def make_sampler(
         return lambda x: mx.argmax(x, axis=-1)
 
     # Create sampler chain
-    sampling_methods = []
-    if top_p > 0 and top_p < 1.0:
-        sampling_methods.append(lambda x: apply_top_p(x, top_p))
-    if min_p != 0.0:
-        sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
-    if xtc_probability > 0.0:
-        sampling_methods.append(
-            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
-        )
-    if top_k > 0:
-        sampling_methods.append(lambda x: apply_top_k(x, top_k))
+    sampling_methods, _ = make_sampler_chain(
+        top_p,
+        top_k,
+        min_p,
+        min_tokens_to_keep,
+        xtc_probability,
+        xtc_threshold,
+        xtc_special_tokens,
+    )
 
     # Apply the sampling methods
     def sampler(logprobs):
@@ -243,6 +272,7 @@ def apply_xtc(
     xtc_probability: float,
     xtc_threshold: float,
     xtc_special_tokens: List[int],
+    p_draw: Optional[mx.array] = None,
 ) -> mx.array:
     """
     Apply XTC sampling to the logits.
@@ -252,6 +282,9 @@ def apply_xtc(
         xtc_probability (float): Probability of XTC sampling to happen for each token
         xtc_threshold (float): The threshold the probs need to reach for being sampled.
         special_tokens_ids (list(int)): List of special tokens IDs to be excluded from XTC sampling.
+        p_draw (mx.array, optional): Pre-drawn uniform; if None, draws fresh.
+            Pass the same draw to draft and verify steps to share the XTC
+            apply/skip decision across both forward passes.
     """
     if not (0 <= xtc_threshold <= 0.5):
         raise ValueError(
@@ -269,8 +302,9 @@ def apply_xtc(
     if xtc_special_tokens:
         mask[..., xtc_special_tokens] = False
 
+    draw = mx.random.uniform(0, 1) if p_draw is None else p_draw
     return mx.where(
-        mx.random.uniform(0, 1) > xtc_probability,
+        draw > xtc_probability,
         logits,
         mx.where(mask, -mx.inf, logits),
     )
