@@ -471,12 +471,12 @@ class TextModel(nn.Module):
         """Run the MTP head and apply the shared lm_head.
 
         Args:
-            hidden_states: Backbone pre-norm hidden state, shape (B, 1, H).
-            next_token_ids: Sampled main token ids, shape (B, 1).
+            hidden_states: Backbone pre-norm hidden state (B, N, H). N=1 during decode, N>1 during prompt prefill.
+            next_token_ids: Next token ids, shape (B, N).
             mtp_cache: KVCache entries for the MTP transformer layers.
 
         Returns:
-            logits of shape (B, 1, vocab_size).
+            logits of shape (B, N, vocab_size).
         """
         mtp_out = self.mtp(
             hidden_states,

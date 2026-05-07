@@ -825,22 +825,24 @@ def mtp_generate_step(
         return draft_tok, draft_lp, draft_accept_lp, xtc_draw
 
     def _prefill(y, input_embeddings):
-        # Leave exactly 1 token for _step_backbone: return_hidden=True keeps
-        # the hidden state [1, N, d_model] live, so N must be 1.
+        # Leave exactly 1 token for _step_backbone so the decode loop starts clean.
         total = len(input_embeddings) if input_embeddings is not None else y.size
         while total > 1:
             n = min(prefill_step_size, total - 1)
             if input_embeddings is not None:
-                model(
+                _, hidden = model(
                     y[:n][None],
                     cache=model_cache,
+                    return_hidden=True,
                     input_embeddings=input_embeddings[:n][None],
                 )
                 input_embeddings = input_embeddings[n:]
             else:
-                model(y[:n][None], cache=model_cache)
+                _, hidden = model(y[:n][None], cache=model_cache, return_hidden=True)
+            model.mtp_forward(hidden, y[1 : n + 1][None], mtp_cache)
+            quantize_cache_fn(mtp_cache)
             quantize_cache_fn(model_cache)
-            mx.eval([c.state for c in model_cache if hasattr(c, "state")])
+            mx.eval([c.state for c in model_cache + mtp_cache if hasattr(c, "state")])
             y = y[n:]
             total -= n
             mx.clear_cache()
