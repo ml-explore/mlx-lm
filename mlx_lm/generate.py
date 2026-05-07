@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import copy
-import functools
 import json
 import math
 import sys
@@ -375,7 +374,7 @@ def generate_step(
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
-    quantize_cache_fn = functools.partial(
+    quantize_cache_fn = partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
@@ -533,7 +532,7 @@ def speculative_generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    quantize_cache_fn = functools.partial(
+    quantize_cache_fn = partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
@@ -717,7 +716,7 @@ def mtp_generate_step(
         else ([], None)
     )
 
-    quantize_cache_fn = functools.partial(
+    quantize_cache_fn = partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
