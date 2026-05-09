@@ -1,9 +1,11 @@
+import json
 import unittest
 
 from mlx_lm.tool_parsers import (
     function_gemma,
     gemma4,
     glm47,
+    granite,
     json_tools,
     kimi_k2,
     longcat,
@@ -208,6 +210,25 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+    def test_granite(self):
+        test_cases = [
+            '{"name": "get_current_weather", "arguments": {"city": "Boston"}}',
+            '{"name": "get_current_weather", "arguments": {"city": "Boston"}}}',
+            '{"name": "get_current_weather", "arguments": {"city": "Boston"}}}}}}',
+            '{"name": "get_current_weather", "arguments": {"location": {"city": "Boston"}}}}',
+        ]
+
+        for test_case in test_cases:
+            with self.subTest(test_case=test_case):
+                tool_call = granite.parse_tool_call(test_case, None)
+                self.assertEqual(tool_call["name"], "get_current_weather")
+                self.assertIn("city", str(tool_call["arguments"]))
+
+        with self.assertRaises(json.JSONDecodeError):
+            granite.parse_tool_call(
+                '{"name": "get_current_weather", "arguments": {}} trailing junk', None
+            )
 
     def test_gemma4(self):
         # Nested object
