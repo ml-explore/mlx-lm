@@ -1,11 +1,14 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import pickle
 import platform
 import socket
+import struct
 import time
 import uuid
 import warnings
@@ -15,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -28,6 +31,7 @@ from typing import (
     Tuple,
     Union,
 )
+from urllib.parse import parse_qs
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
@@ -89,6 +93,236 @@ class ToolCallFormatter:
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
         return result
+
+
+def open_response_error(message, error_type="invalid_request", code=None, param=None):
+    error = {
+        "message": message,
+        "type": error_type,
+        "param": param,
+        "code": code or error_type,
+    }
+    return {"error": error}
+
+
+def _content_part_text(part):
+    part_type = part.get("type")
+    if part_type in ("input_text", "output_text", "text"):
+        return part.get("text", "")
+    if part_type == "refusal":
+        return part.get("refusal", "")
+    if part_type == "input_image":
+        return f"[input_image: {part.get('image_url', '')}]"
+    if part_type == "input_file":
+        return f"[input_file: {part.get('filename') or part.get('file_url') or ''}]"
+    if part_type == "input_video":
+        return f"[input_video: {part.get('video_url', '')}]"
+    return ""
+
+
+def open_response_content_to_text(content):
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            _content_part_text(part) for part in content if isinstance(part, dict)
+        )
+    return str(content)
+
+
+def open_response_tool_output_to_text(output):
+    if isinstance(output, str):
+        return output
+    return open_response_content_to_text(output)
+
+
+def open_response_input_to_messages(input_items, instructions=None, stored_items=None):
+    stored_items = stored_items or {}
+    if input_items is None:
+        input_items = []
+    if isinstance(input_items, str):
+        input_items = [
+            {"type": "message", "role": "user", "content": input_items},
+        ]
+
+    messages = []
+    normalized = []
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+        normalized.append(
+            {"type": "message", "role": "system", "content": instructions}
+        )
+
+    for item in input_items:
+        if not isinstance(item, dict):
+            raise ValueError("Responses input items must be objects")
+        if item.get("type") == "item_reference":
+            item_id = item.get("id")
+            if item_id not in stored_items:
+                raise ValueError(f"Referenced item '{item_id}' was not found")
+            item = stored_items[item_id]
+
+        item_type = item.get("type", "message")
+        normalized.append(item)
+
+        if item_type == "message":
+            role = item.get("role", "user")
+            if role == "developer":
+                role = "system"
+            messages.append(
+                {
+                    "role": role,
+                    "content": open_response_content_to_text(item.get("content")),
+                }
+            )
+        elif item_type == "function_call":
+            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4()}"
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": call_id,
+                            "function": {
+                                "name": item["name"],
+                                "arguments": item.get("arguments", "{}"),
+                            },
+                        }
+                    ],
+                }
+            )
+        elif item_type == "function_call_output":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id"),
+                    "content": open_response_tool_output_to_text(item.get("output", "")),
+                }
+            )
+        elif item_type in ("reasoning", "compaction"):
+            continue
+        else:
+            raise ValueError(f"Unsupported Responses input item type: {item_type}")
+
+    return messages, normalized
+
+
+def open_response_chat_tools(tools, tool_choice=None):
+    if not tools:
+        return None
+    if tool_choice == "none":
+        return None
+    allowed_names = None
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            allowed_names = {tool_choice.get("name")}
+        elif tool_choice.get("type") == "allowed_tools":
+            allowed_names = {
+                t.get("name") for t in tool_choice.get("tools", []) if t.get("name")
+            }
+    if allowed_names is None:
+        selected = tools
+    else:
+        selected = [t for t in tools if t.get("name") in allowed_names]
+
+    chat_tools = []
+    for tool in selected:
+        if "function" in tool:
+            chat_tools.append(tool)
+            continue
+        if tool.get("type") == "function":
+            chat_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name"),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters") or {},
+                    },
+                }
+            )
+    return chat_tools or None
+
+
+def validate_open_response_tool_choice(tools, tool_choice):
+    if not tools or tool_choice is None or isinstance(tool_choice, str):
+        return
+    tool_names = {t.get("name") for t in tools if t.get("name")}
+    if tool_choice.get("type") == "function":
+        name = tool_choice.get("name")
+        if name not in tool_names:
+            raise ValueError(f"tool_choice references unknown function '{name}'")
+    elif tool_choice.get("type") == "allowed_tools":
+        for tool in tool_choice.get("tools", []):
+            name = tool.get("name")
+            if name not in tool_names:
+                raise ValueError(f"allowed_tools references unknown function '{name}'")
+
+
+def open_response_function_call_ids(items):
+    return {
+        item.get("call_id")
+        for item in items
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    }
+
+
+def open_response_tool_call_required(tool_choice):
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            return True
+        if tool_choice.get("type") == "allowed_tools":
+            return tool_choice.get("mode") == "required"
+    return False
+
+
+def open_response_output_message(text, item_id=None, status="completed"):
+    return {
+        "id": item_id or f"msg_{uuid.uuid4().hex}",
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [
+            {
+                "type": "output_text",
+                "text": text,
+                "annotations": [],
+            }
+        ],
+    }
+
+
+def open_response_tool_call_item(tool_call):
+    function = tool_call.get("function", {})
+    return {
+        "id": f"fc_{uuid.uuid4().hex}",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex}",
+        "name": function.get("name", ""),
+        "arguments": function.get("arguments", "{}"),
+    }
+
+
+def open_response_usage(
+    prompt_tokens, completion_tokens, cached_tokens=0, reasoning_tokens=0
+):
+    prompt_tokens = prompt_tokens or 0
+    completion_tokens = completion_tokens or 0
+    return {
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "input_tokens_details": {"cached_tokens": cached_tokens or 0},
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens or 0},
+    }
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -443,6 +677,8 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
+        self.open_responses = {}
+        self._open_responses_lock = Lock()
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -450,6 +686,25 @@ class ResponseGenerator:
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
+
+    def get_open_response(self, response_id):
+        with self._open_responses_lock:
+            return self.open_responses.get(response_id)
+
+    def store_open_response(self, response, input_items):
+        stored = {
+            "response": response,
+            "input": input_items,
+            "output": response.get("output", []),
+            "items": {},
+        }
+        for item in stored["input"] + stored["output"]:
+            if isinstance(item, dict) and item.get("id"):
+                stored["items"][item["id"]] = item
+        with self._open_responses_lock:
+            if len(self.open_responses) > 256:
+                self.open_responses.pop(next(iter(self.open_responses)))
+            self.open_responses[response["id"]] = stored
 
     def stop_and_join(self):
         self._stop = True
@@ -1094,9 +1349,89 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _is_open_responses_path(self):
+        return self.path in ("/v1/responses", "/v1/responses/compact")
+
+    def _write_json_error(self, status_code, message, code=None, param=None):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        if self._is_open_responses_path():
+            response = open_response_error(message, code=code, param=param)
+        else:
+            response = {"error": message}
+        self.wfile.write(json.dumps(response).encode())
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
+
+    def _read_request_body(self):
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            raise ValueError("Content-Length header is required")
+        try:
+            content_length = int(content_length)
+        except ValueError as e:
+            raise ValueError("Invalid Content-Length header")
+        raw_body = self.rfile.read(content_length)
+        content_type = self.headers.get("Content-Type", "application/json")
+        if content_type.startswith("application/x-www-form-urlencoded"):
+            parsed = parse_qs(raw_body.decode())
+            body = {}
+            for k, v in parsed.items():
+                value = v[-1]
+                try:
+                    body[k] = json.loads(value)
+                except json.JSONDecodeError:
+                    body[k] = value
+            return body
+        try:
+            body = json.loads(raw_body.decode())
+        except json.JSONDecodeError as e:
+            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
+            raise ValueError(f"Invalid JSON in request body: {e}")
+        if not isinstance(body, dict):
+            debug_body = json.dumps(body, indent="\t")
+            logging.error(f"Invalid Request Body: {debug_body}")
+            raise ValueError("Request should be a JSON dictionary")
+        return body
+
+    def _load_generation_parameters(self, body):
+        self.stream = body.get("stream", False)
+        self.stream_options = body.get("stream_options", None)
+        self.requested_model = body.get("model", "default_model") or "default_model"
+        self.requested_draft_model = body.get("draft_model", "default_model")
+        self.num_draft_tokens = body.get(
+            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
+        )
+        self.adapter = body.get("adapters", None)
+        self.max_tokens = body.get("max_output_tokens", None)
+        if self.max_tokens is None:
+            self.max_tokens = body.get("max_completion_tokens", None)
+        if self.max_tokens is None:
+            self.max_tokens = body.get(
+                "max_tokens", self.response_generator.cli_args.max_tokens
+            )
+        self.temperature = body.get(
+            "temperature", self.response_generator.cli_args.temp
+        )
+        self.top_p = body.get("top_p", self.response_generator.cli_args.top_p)
+        self.top_k = body.get("top_k", self.response_generator.cli_args.top_k)
+        self.min_p = body.get("min_p", self.response_generator.cli_args.min_p)
+        self.repetition_penalty = body.get("repetition_penalty", 0.0)
+        self.repetition_context_size = body.get("repetition_context_size", 20)
+        self.presence_penalty = body.get("presence_penalty", 0.0)
+        self.presence_context_size = body.get("presence_context_size", 20)
+        self.frequency_penalty = body.get("frequency_penalty", 0.0)
+        self.frequency_context_size = body.get("frequency_context_size", 20)
+        self.xtc_probability = body.get("xtc_probability", 0.0)
+        self.xtc_threshold = body.get("xtc_threshold", 0.0)
+        self.logit_bias = body.get("logit_bias", None)
+        self.logprobs = body.get("logprobs", False)
+        self.top_logprobs = body.get("top_logprobs", -1)
+        self.seed = body.get("seed", None)
+        self.chat_template_kwargs = body.get("chat_template_kwargs")
+        self.validate_model_parameters()
 
     def do_POST(self):
         """
@@ -1106,6 +1441,8 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/responses": self.handle_open_responses,
+            "/v1/responses/compact": self.handle_open_responses_compact,
         }
 
         if self.path not in request_factories:
@@ -1114,83 +1451,31 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not Found")
             return
 
-        # Fetch and parse request body
-        content_length = self.headers.get("Content-Length")
-        if content_length is None:
-            self._set_completion_headers(411)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Content-Length header is required"}).encode()
-            )
-            return
         try:
-            content_length = int(content_length)
-        except ValueError:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Invalid Content-Length header"}).encode()
-            )
-            return
-        raw_body = self.rfile.read(content_length)
-        try:
-            self.body = json.loads(raw_body.decode())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
-            )
+            self.body = self._read_request_body()
+        except ValueError as e:
+            status_code = 411 if str(e) == "Content-Length header is required" else 400
+            self._write_json_error(status_code, str(e))
             return
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             debug_body = json.dumps(self.body, indent="\t")
             logging.debug(f"Incoming Request Body: {debug_body}")
-        if not isinstance(self.body, dict):
-            debug_body = json.dumps(self.body, indent="\t")
-            logging.error(f"Invalid Request Body: {debug_body}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
-            )
-            return
 
         # Extract request parameters from the body
-        self.stream = self.body.get("stream", False)
-        self.stream_options = self.body.get("stream_options", None)
-        self.requested_model = self.body.get("model", "default_model")
-        self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
-        )
-        self.adapter = self.body.get("adapters", None)
-        self.max_tokens = self.body.get("max_completion_tokens", None)
-        if self.max_tokens is None:
-            self.max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
-            )
-        self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
-        )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
-        self.repetition_context_size = self.body.get("repetition_context_size", 20)
-        self.presence_penalty = self.body.get("presence_penalty", 0.0)
-        self.presence_context_size = self.body.get("presence_context_size", 20)
-        self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
-        self.frequency_context_size = self.body.get("frequency_context_size", 20)
-        self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
-        self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", False)
-        self.top_logprobs = self.body.get("top_logprobs", -1)
-        self.seed = self.body.get("seed", None)
-        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self._load_generation_parameters(self.body)
+        except ValueError as e:
+            self._write_json_error(400, str(e))
+            return
+
+        if self.path == "/v1/responses/compact":
+            self.handle_open_responses_compact()
+            return
+
+        if self.path == "/v1/responses":
+            self.handle_open_responses()
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1242,7 +1527,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("frequency_penalty", (float, int))
         self._validate("frequency_context_size", int, min_val=0)
         self._validate("logprobs", bool)
-        self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
+        self._validate("top_logprobs", int, min_val=0, max_val=20, whitelist=[-1])
         self._validate("xtc_probability", float, min_val=0, max_val=1)
         self._validate("xtc_threshold", float, min_val=0, max_val=1)
         self._validate("requested_model", str)
@@ -1576,6 +1861,580 @@ class APIHandler(BaseHTTPRequestHandler):
             }
         return response
 
+    def _open_response_object(
+        self,
+        response_id,
+        output,
+        usage,
+        status="completed",
+        error=None,
+        previous_response_id=None,
+    ):
+        body = self.body
+        return {
+            "id": response_id,
+            "object": "response",
+            "created_at": self.created,
+            "completed_at": (
+                int(time.time())
+                if status in ("completed", "failed", "incomplete")
+                else None
+            ),
+            "status": status,
+            "incomplete_details": None,
+            "model": self.requested_model,
+            "previous_response_id": previous_response_id,
+            "instructions": body.get("instructions"),
+            "output": output,
+            "error": error,
+            "tools": body.get("tools") or [],
+            "tool_choice": body.get("tool_choice", "auto"),
+            "truncation": body.get("truncation", "disabled"),
+            "parallel_tool_calls": body.get("parallel_tool_calls", True),
+            "text": body.get("text") or {"format": {"type": "text"}},
+            "top_p": self.top_p,
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "top_logprobs": max(self.top_logprobs, 0),
+            "temperature": self.temperature,
+            "reasoning": body.get("reasoning") or {"effort": None, "summary": None},
+            "usage": usage,
+            "max_output_tokens": self.max_tokens,
+            "max_tool_calls": body.get("max_tool_calls"),
+            "store": body.get("store", True),
+            "background": body.get("background", False),
+            "service_tier": body.get("service_tier", "default"),
+            "metadata": body.get("metadata") or {},
+            "safety_identifier": body.get("safety_identifier"),
+            "prompt_cache_key": body.get("prompt_cache_key"),
+        }
+
+    def _open_response_event(self, event_type, sequence_number, **kwargs):
+        event = {"type": event_type, "sequence_number": sequence_number}
+        event.update(kwargs)
+        return event
+
+    def _write_open_response_sse(self, event):
+        self.wfile.write(
+            f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+        )
+        self.wfile.flush()
+
+    def _open_response_previous(self, previous_response_id, ws_cache=None):
+        if not previous_response_id:
+            return None
+        if ws_cache is not None and previous_response_id in ws_cache:
+            return ws_cache[previous_response_id]
+        return self.response_generator.get_open_response(previous_response_id)
+
+    def _prepare_open_response_request(self, ws_cache=None):
+        body = self.body
+        previous_response_id = body.get("previous_response_id")
+        previous = self._open_response_previous(previous_response_id, ws_cache)
+        if previous_response_id and previous is None:
+            error = ValueError(
+                f"Previous response with id '{previous_response_id}' not found."
+            )
+            error.code = "previous_response_not_found"
+            error.param = "previous_response_id"
+            raise error
+
+        stored_items = previous.get("items", {}) if previous else {}
+        raw_input = body.get("input", "")
+        new_items = raw_input if isinstance(raw_input, list) else []
+        if previous is not None:
+            previous_call_ids = open_response_function_call_ids(previous["output"])
+            for item in new_items:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "function_call_output"
+                    and item.get("call_id") not in previous_call_ids
+                ):
+                    error = ValueError(
+                        f"Function call output references unknown call_id '{item.get('call_id')}'."
+                    )
+                    error.code = "invalid_request"
+                    error.param = "input"
+                    raise error
+        messages, input_items = open_response_input_to_messages(
+            raw_input,
+            instructions=body.get("instructions"),
+            stored_items=stored_items,
+        )
+        if previous is not None:
+            combined_items = previous["input"] + previous["output"] + input_items
+            messages, _ = open_response_input_to_messages(
+                combined_items,
+                stored_items={
+                    **stored_items,
+                    **{
+                        i.get("id"): i
+                        for i in combined_items
+                        if isinstance(i, dict) and i.get("id")
+                    },
+                },
+            )
+            input_items = combined_items
+
+        validate_open_response_tool_choice(body.get("tools"), body.get("tool_choice"))
+        tools = open_response_chat_tools(body.get("tools"), body.get("tool_choice"))
+        return (
+            CompletionRequest("chat", "", messages, tools, body.get("role_mapping")),
+            input_items,
+            previous_response_id,
+        )
+
+    def _open_response_generation_args(self):
+        return GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+                presence_penalty=self.presence_penalty,
+                presence_context_size=self.presence_context_size,
+                frequency_penalty=self.frequency_penalty,
+                frequency_context_size=self.frequency_context_size,
+            ),
+            stop_words=[],
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+
+    def _store_open_response(self, response, input_items, ws_cache=None):
+        stored = {
+            "response": response,
+            "input": input_items,
+            "output": response.get("output", []),
+            "items": {},
+        }
+        for item in stored["input"] + stored["output"]:
+            if isinstance(item, dict) and item.get("id"):
+                stored["items"][item["id"]] = item
+        if ws_cache is not None:
+            ws_cache[response["id"]] = stored
+            while len(ws_cache) > 16:
+                ws_cache.pop(next(iter(ws_cache)))
+        if self.body.get("store", True):
+            self.response_generator.store_open_response(response, input_items)
+
+    def _run_open_response(self, send_event=None, ws_cache=None):
+        response_id = f"resp_{uuid.uuid4().hex}"
+        self.request_id = response_id
+        request, input_items, previous_response_id = self._prepare_open_response_request(
+            ws_cache
+        )
+        args = self._open_response_generation_args()
+        sequence_number = 0
+
+        def emit(event_type, **kwargs):
+            nonlocal sequence_number
+            sequence_number += 1
+            event = self._open_response_event(event_type, sequence_number, **kwargs)
+            if send_event is not None:
+                send_event(event)
+            return event
+
+        initial_response = self._open_response_object(
+            response_id,
+            [],
+            open_response_usage(0, 0),
+            status="queued",
+            previous_response_id=previous_response_id,
+        )
+        emit("response.created", response=initial_response)
+        in_progress = dict(initial_response, status="in_progress", completed_at=None)
+        emit("response.in_progress", response=in_progress)
+
+        ctx, response = self.response_generator.generate(request, args)
+        tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, False)
+
+        prev_state = None
+        finish_reason = "stop"
+        reasoning_text = ""
+        tool_text = ""
+        tool_calls = []
+        output = []
+        text = ""
+        tokens = []
+        message_id = f"msg_{uuid.uuid4().hex}"
+        message_started = False
+
+        def start_message():
+            nonlocal message_started
+            if message_started:
+                return
+            message_started = True
+            emit(
+                "response.output_item.added",
+                output_index=len(output),
+                item=open_response_output_message("", message_id, status="in_progress"),
+            )
+            emit(
+                "response.content_part.added",
+                item_id=message_id,
+                output_index=len(output),
+                content_index=0,
+                part={"type": "output_text", "text": "", "annotations": []},
+            )
+
+        def add_tool_calls(raw_tool_calls):
+            for tool_call in tool_formatter(raw_tool_calls):
+                max_tool_calls = self.body.get("max_tool_calls")
+                if max_tool_calls is not None and len(tool_calls) > max_tool_calls:
+                    break
+                item = open_response_tool_call_item(tool_call)
+                output.append(item)
+                emit(
+                    "response.output_item.added",
+                    output_index=len(output) - 1,
+                    item=dict(item, status="in_progress"),
+                )
+                emit(
+                    "response.output_item.done",
+                    output_index=len(output) - 1,
+                    item=item,
+                )
+
+        try:
+            for gen in response:
+                if gen.state == "reasoning":
+                    reasoning_text += gen.text
+                elif gen.state == "tool":
+                    tool_text += gen.text
+                elif gen.state == "normal":
+                    if prev_state == "tool":
+                        tool_calls.append(tool_text)
+                        add_tool_calls([tool_text])
+                        tool_text = ""
+                    if gen.text:
+                        start_message()
+                        text += gen.text
+                        emit(
+                            "response.output_text.delta",
+                            item_id=message_id,
+                            output_index=len(output),
+                            content_index=0,
+                            delta=gen.text,
+                        )
+                tokens.append(gen.token)
+                if gen.finish_reason is not None:
+                    finish_reason = gen.finish_reason
+                prev_state = gen.state
+
+            if prev_state == "tool" and tool_text:
+                tool_calls.append(tool_text)
+                add_tool_calls([tool_text])
+
+            if message_started or not output:
+                message = open_response_output_message(text, message_id)
+                output.append(message)
+                emit(
+                    "response.output_text.done",
+                    item_id=message_id,
+                    output_index=len(output) - 1,
+                    content_index=0,
+                    text=text,
+                )
+                emit(
+                    "response.content_part.done",
+                    item_id=message_id,
+                    output_index=len(output) - 1,
+                    content_index=0,
+                    part=message["content"][0],
+                )
+                emit(
+                    "response.output_item.done",
+                    output_index=len(output) - 1,
+                    item=message,
+                )
+            if reasoning_text:
+                output.append(
+                    {
+                        "id": f"rs_{uuid.uuid4().hex}",
+                        "type": "reasoning",
+                        "status": "completed",
+                        "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        "content": [],
+                        "encrypted_content": None,
+                    }
+                )
+
+            status = "incomplete" if finish_reason == "length" else "completed"
+            error = None
+            if open_response_tool_call_required(self.body.get("tool_choice")) and not any(
+                item.get("type") == "function_call" for item in output
+            ):
+                status = "failed"
+                error = {
+                    "code": "tool_required",
+                    "message": (
+                        "tool_choice requires a function call, "
+                        "but the model did not call a tool."
+                    ),
+                }
+            usage = open_response_usage(
+                len(ctx.prompt), len(tokens), ctx.prompt_cache_count, 0
+            )
+            final_response = self._open_response_object(
+                response_id,
+                output,
+                usage,
+                status=status,
+                error=error,
+                previous_response_id=previous_response_id,
+            )
+            if status == "incomplete":
+                final_response["incomplete_details"] = {"reason": "max_output_tokens"}
+            self._store_open_response(final_response, input_items, ws_cache)
+            emit(f"response.{status}", response=final_response)
+            return final_response
+        finally:
+            ctx.stop()
+
+    def handle_open_responses(self):
+        if self.stream:
+            self._set_stream_headers(200)
+            self.end_headers()
+            try:
+                self._run_open_response(send_event=self._write_open_response_sse)
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+            except Exception as e:
+                code = getattr(e, "code", "invalid_request")
+                error_event = self._open_response_event(
+                    "error",
+                    1,
+                    error={
+                        "type": "invalid_request",
+                        "code": code,
+                        "message": str(e),
+                        "param": getattr(e, "param", None),
+                    },
+                )
+                self._write_open_response_sse(error_event)
+                response = self._open_response_object(
+                    f"resp_{uuid.uuid4().hex}",
+                    [],
+                    open_response_usage(0, 0),
+                    status="failed",
+                    error={"code": code, "message": str(e)},
+                    previous_response_id=self.body.get("previous_response_id"),
+                )
+                self._write_open_response_sse(
+                    self._open_response_event("response.failed", 2, response=response)
+                )
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+            return
+
+        try:
+            response = self._run_open_response()
+            response_json = json.dumps(response).encode()
+            self._set_completion_headers(200)
+            self.send_header("Content-Length", str(len(response_json)))
+            self.end_headers()
+            self.wfile.write(response_json)
+            self.wfile.flush()
+        except Exception as e:
+            code = getattr(e, "code", "invalid_request")
+            status = 400 if code == "previous_response_not_found" else 400
+            self._set_completion_headers(status)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    open_response_error(
+                        str(e), code=code, param=getattr(e, "param", None)
+                    )
+                ).encode()
+            )
+
+    def handle_open_responses_compact(self):
+        if not self.body.get("model"):
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    open_response_error(
+                        "Missing required field: model",
+                        code="missing_required_parameter",
+                        param="model",
+                    )
+                ).encode()
+            )
+            return
+        try:
+            messages, _ = open_response_input_to_messages(
+                self.body.get("input", ""), instructions=self.body.get("instructions")
+            )
+            text = "\n".join(m.get("content") or "" for m in messages)
+        except ValueError:
+            text = open_response_content_to_text(self.body.get("input", ""))
+        encrypted = base64.b64encode(text.encode()).decode()
+        response = {
+            "id": f"cmpct_{uuid.uuid4().hex}",
+            "object": "response.compaction",
+            "output": [
+                {
+                    "id": f"cmp_{uuid.uuid4().hex}",
+                    "type": "compaction",
+                    "encrypted_content": encrypted,
+                    "created_by": "mlx_lm",
+                }
+            ],
+            "created_at": self.created,
+            "usage": open_response_usage(0, 0),
+        }
+        response_json = json.dumps(response).encode()
+        self._set_completion_headers(200)
+        self.send_header("Content-Length", str(len(response_json)))
+        self.end_headers()
+        self.wfile.write(response_json)
+        self.wfile.flush()
+
+    def _websocket_accept(self):
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            return False
+        accept = base64.b64encode(
+            hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+        ).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self._set_cors_headers()
+        self.end_headers()
+        return True
+
+    def _websocket_read_frame(self):
+        header = self.rfile.read(2)
+        if len(header) < 2:
+            return None, None
+        first, second = header
+        opcode = first & 0x0F
+        masked = second & 0x80
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self.rfile.read(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self.rfile.read(8))[0]
+        mask = self.rfile.read(4) if masked else b""
+        payload = self.rfile.read(length)
+        if masked:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return opcode, payload
+
+    def _websocket_write_frame(self, payload, opcode=1):
+        if isinstance(payload, str):
+            payload = payload.encode()
+        length = len(payload)
+        header = bytes([0x80 | opcode])
+        if length < 126:
+            header += bytes([length])
+        elif length < (1 << 16):
+            header += bytes([126]) + struct.pack("!H", length)
+        else:
+            header += bytes([127]) + struct.pack("!Q", length)
+        self.wfile.write(header + payload)
+        self.wfile.flush()
+
+    def _websocket_write_json(self, payload):
+        self._websocket_write_frame(json.dumps(payload))
+
+    def handle_open_responses_websocket(self):
+        if not self._websocket_accept():
+            self._set_completion_headers(400)
+            self.end_headers()
+            return
+        ws_cache = {}
+        start = time.time()
+        self.connection.settimeout(1.0)
+        while time.time() - start < 3600:
+            try:
+                opcode, payload = self._websocket_read_frame()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if opcode is None or opcode == 8:
+                break
+            if opcode == 9:
+                self._websocket_write_frame(payload, opcode=10)
+                continue
+            if opcode != 1:
+                continue
+            try:
+                body = json.loads(payload.decode())
+                if body.get("type") != "response.create":
+                    raise ValueError("WebSocket message type must be response.create")
+                for field in ("stream", "stream_options", "background"):
+                    if field in body:
+                        error = ValueError(
+                            f"{field} must not be sent on WebSocket response.create"
+                        )
+                        error.param = field
+                        error.code = "invalid_request"
+                        raise error
+                self.body = dict(body)
+                self.body.pop("type", None)
+                self.body["stream"] = False
+                self._load_generation_parameters(self.body)
+                self._run_open_response(
+                    send_event=self._websocket_write_json,
+                    ws_cache=ws_cache,
+                )
+            except Exception as e:
+                previous_response_id = None
+                try:
+                    previous_response_id = body.get("previous_response_id")
+                except Exception:
+                    pass
+                if previous_response_id:
+                    ws_cache.pop(previous_response_id, None)
+                self._websocket_write_json(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request",
+                            "code": getattr(e, "code", "invalid_request"),
+                            "message": str(e),
+                            "param": getattr(e, "param", None),
+                        },
+                    }
+                )
+        if time.time() - start >= 3600:
+            self._websocket_write_json(
+                {
+                    "type": "error",
+                    "status": 400,
+                    "error": {
+                        "code": "websocket_connection_limit_reached",
+                        "message": "WebSocket connection limit reached.",
+                        "param": None,
+                    },
+                }
+            )
+
     def handle_chat_completions(self) -> CompletionRequest:
         """
         Handle a chat completion request.
@@ -1621,7 +2480,12 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        if (
+            self.path == "/v1/responses"
+            and self.headers.get("Upgrade", "").lower() == "websocket"
+        ):
+            self.handle_open_responses_websocket()
+        elif self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()

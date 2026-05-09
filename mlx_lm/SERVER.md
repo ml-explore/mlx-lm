@@ -41,6 +41,29 @@ curl localhost:8080/v1/chat/completions \
    }'
 ```
 
+You can also use the Open Responses API:
+
+```shell
+curl localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+     "model": "default_model",
+     "input": "Say this is a test!",
+     "max_output_tokens": 128
+   }'
+```
+
+Streaming uses semantic Open Responses SSE events:
+
+```shell
+curl localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+     "input": [{"type": "message", "role": "user", "content": "Hello!"}],
+     "stream": true
+   }'
+```
+
 ### Request Fields
 
 - `messages`: An array of message objects representing the conversation
@@ -109,6 +132,45 @@ curl localhost:8080/v1/chat/completions \
 
 - `num_draft_tokens`: (Optional) The number of draft tokens the draft model
   should predict at once. Defaults to `3`.
+
+### Open Responses API
+
+The server supports these Open Responses endpoints:
+
+- `POST /v1/responses`: create a response with JSON or SSE output.
+- `GET /v1/responses`: WebSocket transport for `response.create` messages.
+- `POST /v1/responses/compact`: return an opaque compaction item.
+
+Supported input items:
+
+- `message` with `user`, `assistant`, `system`, or `developer` role.
+- `function_call` and `function_call_output` for externally hosted tools.
+- `reasoning`, `compaction`, and `item_reference` for replay/continuation.
+
+Supported generation fields include `input`, `instructions`,
+`previous_response_id`, `tools`, `tool_choice`, `temperature`, `top_p`,
+`presence_penalty`, `frequency_penalty`, `max_output_tokens`, `top_logprobs`,
+`stream`, `store`, and `max_tool_calls`.
+
+Compatibility fields accepted and echoed or ignored include `metadata`,
+`truncation`, `service_tier`, `safety_identifier`, `prompt_cache_key`,
+`include`, `reasoning`, `parallel_tool_calls`, `text`, and `background`.
+
+`previous_response_id` is backed by an in-memory store for `store: true`. The
+WebSocket transport also keeps connection-local state, including `store: false`
+responses, for continuation on the same socket.
+
+Image, file, and video input parts are accepted and converted to textual markers
+for models that do not have native multimodal support.
+
+To run the upstream OpenResponses compliance suite against a local server:
+
+```shell
+bun run test:compliance \
+  --base-url http://localhost:8080/v1 \
+  --api-key test-key \
+  --model default_model
+```
 
 ### Response Fields
 
