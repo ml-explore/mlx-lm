@@ -892,7 +892,6 @@ def mtp_generate_step(
             # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
             # after the confirmed token y, enabling exact rollback on rejection.
             y_with_draft = mx.concatenate([y, mx.array([draft_tok.item()], mx.uint32)])
-            u = mx.random.uniform()
             toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
                 y_with_draft,
                 prev_tokens,
@@ -900,6 +899,7 @@ def mtp_generate_step(
                 n_confirmed=1,
                 xtc_draw=draft_xtc_draw,
             )
+            u = mx.random.uniform()
             mx.eval(toks, draft_tok, u)
 
             verify_pred, bonus_tok = toks[0], toks[1]
