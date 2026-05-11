@@ -1740,7 +1740,19 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    # Wire BOTH --prompt-cache-size and --prompt-cache-bytes through. The
+    # bytes flag is defined in the argparser but was never forwarded —
+    # so even when an operator set --prompt-cache-bytes on the CLI it
+    # had no effect, the cache stayed unbounded by memory, and large
+    # accumulated KV caches could exhaust GPU memory mid-inference
+    # (kIOGPUCommandBufferCallbackErrorOutOfMemory). Pass None as
+    # max_bytes when the flag is absent so the LRUPromptCache default
+    # (1 << 63, effectively unbounded) still applies for back-compat.
+    cli_args = model_provider.cli_args
+    cache_kwargs = {"max_size": cli_args.prompt_cache_size}
+    if getattr(cli_args, "prompt_cache_bytes", None) is not None:
+        cache_kwargs["max_bytes"] = cli_args.prompt_cache_bytes
+    prompt_cache = LRUPromptCache(**cache_kwargs)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
