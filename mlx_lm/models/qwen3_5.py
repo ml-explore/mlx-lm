@@ -541,9 +541,6 @@ class TextModel(nn.Module):
         def predicate(path, _):
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
-            # Keep the MTP fusion projection in full precision.
-            if path.endswith("mtp.fc"):
-                return False
             return True
 
         if self.args.num_experts <= 0 and self.args.mtp_num_hidden_layers <= 0:
