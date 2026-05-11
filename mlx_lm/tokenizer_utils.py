@@ -561,6 +561,8 @@ def _infer_tool_parser(chat_template):
         return "glm47"
     elif "<|tool_list_start|>" in chat_template:
         return "pythonic"
+    elif "<function_calls>" in chat_template:
+        return "olmo3"
     elif (
         "<tool_call>\\n<function=" in chat_template
         or "<tool_call>\n<function=" in chat_template

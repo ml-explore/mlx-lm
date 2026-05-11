@@ -10,6 +10,7 @@ from mlx_lm.tool_parsers import (
     longcat,
     minimax_m2,
     mistral,
+    olmo3,
     pythonic,
     qwen3_coder,
 )
@@ -52,6 +53,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 "[multiply(a=12234585, b=48838483920)]",
                 pythonic,
+            ),
+            (
+                "multiply(a=12234585, b=48838483920)",
+                olmo3,
             ),
             (
                 'multiply[ARGS]{"a": 12234585, "b": 48838483920}',
@@ -122,6 +127,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '[get_current_temperature(location="London")]',
                 pythonic,
+            ),
+            (
+                'get_current_temperature(location="London")',
+                olmo3,
             ),
             (
                 'get_current_temperature[ARGS]{"location": "London"}',
@@ -312,6 +321,30 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_olmo3(self):
+        # Multiple tool calls
+        test_case = (
+            'search(query="weather")\n'
+            'read_file(path="/tmp/test.txt")'
+        )
+        tool_calls = olmo3.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0], {"name": "search", "arguments": {"query": "weather"}})
+        self.assertEqual(
+            tool_calls[1],
+            {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+        )
+
+        # JSON literals are accepted (true/false/null instead of Python literals)
+        test_case = 'configure(enabled=true, name="x", missing=null)'
+        tool_call = olmo3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "configure")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"enabled": True, "name": "x", "missing": None},
+        )
 
     def test_minimax_m2(self):
         test_case = (
