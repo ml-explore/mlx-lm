@@ -77,6 +77,70 @@ mistralai/Mistral-7B-v0.1`.
 If `--model` points to a quantized model, then the training will use QLoRA,
 otherwise it will use regular LoRA.
 
+#### Qwen3 QLoRA example on Apple Silicon
+
+The following example shows a minimal QLoRA training command for `Qwen/Qwen3-8B-MLX-4bit` on Apple Silicon.
+
+This is intended as a starting point. Iterations, batch size, and adapter settings should be adjusted for the dataset and available hardware.
+
+```shell
+mlx_lm.lora \
+    --model Qwen/Qwen3-8B-MLX-4bit \
+    --train \
+    --data data \
+    --adapter-path adapters/qwen3-8b-lora \
+    --iters 500 \
+    --batch-size 1 \
+    --num-layers 8 \
+    --grad-checkpoint \
+    --mask-prompt
+```
+
+The `data` directory should contain the standard local dataset files:
+
+```text
+data/
+  train.jsonl
+  valid.jsonl
+  test.jsonl
+```
+
+For example, a chat-style `train.jsonl` row can look like:
+
+```jsonl
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain DNS resolution."
+    },
+    {
+      "role": "assistant",
+      "content": "DNS resolution maps a human-readable domain name to an IP address."
+    }
+  ]
+}
+```
+
+After training, generate with the adapter:
+
+```shell
+mlx_lm.generate \
+    --model Qwen/Qwen3-8B-MLX-4bit \
+    --adapter-path adapters/qwen3-8b-lora \
+    --max-tokens 300 \
+    --temp 0.2 \
+    --top-p 0.8 \
+    --chat-template-config '{"enable_thinking": false}' \
+    --prompt "Explain DNS resolution."
+```
+
+For Qwen3 models, disabling thinking mode can be useful when a shorter direct answer is preferred:
+
+```shell
+--chat-template-config '{"enable_thinking": false}'
+```
+
 By default, the adapter config and learned weights are saved in `adapters/`.
 You can specify the output location with `--adapter-path`.
 
@@ -100,7 +164,7 @@ The default training computes a loss for every token in the sample. You can
 ignore the prompt and compute loss for just the completion by passing
 `--mask-prompt`. Note this is only supported for `chat` and `completion`
 datasets. For `chat` datasets the final message in the message list is
-considered the completion. See the [dataset section](#Data) for more details. 
+considered the completion. See the [dataset section](#Data) for more details.
 
 ### Evaluate
 
@@ -181,14 +245,14 @@ data](https://github.com/ml-explore/mlx-examples/tree/main/lora/data) in the
 correct format.
 
 Datasets can be specified in `*.jsonl` files locally or loaded from Hugging
-Face. 
+Face.
 
 ### Local Datasets
 
 For fine-tuning (`--train`), the data loader expects a `train.jsonl` to be in
 the data directory. A `valid.jsonl` is optional; if present, validation loss
 will be reported periodically during training. For evaluation (`--test`), the
-data loader expects a `test.jsonl` in the data directory. 
+data loader expects a `test.jsonl` in the data directory.
 
 Currently, `*.jsonl` files support `chat`, `tools`, `completions`, and `text`
 data formats. Here are examples of these formats:
@@ -196,13 +260,77 @@ data formats. Here are examples of these formats:
 `chat`:
 
 ```jsonl
-{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello."}, {"role": "assistant", "content": "How can I assistant you today."}]}
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Hello."
+    },
+    {
+      "role": "assistant",
+      "content": "How can I assistant you today."
+    }
+  ]
+}
 ```
 
 `tools`:
 
 ```jsonl
-{"messages":[{"role":"user","content":"What is the weather in San Francisco?"},{"role":"assistant","tool_calls":[{"id":"call_id","type":"function","function":{"name":"get_current_weather","arguments":"{\"location\": \"San Francisco, USA\", \"format\": \"celsius\"}"}}]}],"tools":[{"type":"function","function":{"name":"get_current_weather","description":"Get the current weather","parameters":{"type":"object","properties":{"location":{"type":"string","description":"The city and country, eg. San Francisco, USA"},"format":{"type":"string","enum":["celsius","fahrenheit"]}},"required":["location","format"]}}}]}
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the weather in San Francisco?"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_id",
+          "type": "function",
+          "function": {
+            "name": "get_current_weather",
+            "arguments": "{\"location\": \"San Francisco, USA\", \"format\": \"celsius\"}"
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_current_weather",
+        "description": "Get the current weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "The city and country, eg. San Francisco, USA"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "location",
+            "format"
+          ]
+        }
+      }
+    }
+  ]
+}
 ```
 
 <details>
@@ -210,45 +338,56 @@ data formats. Here are examples of these formats:
 
 ```jsonl
 {
-    "messages": [
-        { "role": "user", "content": "What is the weather in San Francisco?" },
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the weather in San Francisco?"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
         {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "call_id",
-                    "type": "function",
-                    "function": {
-                        "name": "get_current_weather",
-                        "arguments": "{\"location\": \"San Francisco, USA\", \"format\": \"celsius\"}"
-                    }
-                }
-            ]
+          "id": "call_id",
+          "type": "function",
+          "function": {
+            "name": "get_current_weather",
+            "arguments": "{\"location\": \"San Francisco, USA\", \"format\": \"celsius\"}"
+          }
         }
-    ],
-    "tools": [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_current_weather",
-                "description": "Get the current weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {
-                            "type": "string",
-                            "description": "The city and country, eg. San Francisco, USA"
-                        },
-                        "format": { "type": "string", "enum": ["celsius", "fahrenheit"] }
-                    },
-                    "required": ["location", "format"]
-                }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_current_weather",
+        "description": "Get the current weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "The city and country, eg. San Francisco, USA"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
             }
+          },
+          "required": [
+            "location",
+            "format"
+          ]
         }
-    ]
+      }
+    }
+  ]
 }
 ```
-
 
 The format for the `arguments` field in a function varies for different models.
 Common formats include JSON strings and dictionaries. The example provided
@@ -265,7 +404,10 @@ Refer to the documentation for the model you are fine-tuning for more details.
 `completions`:
 
 ```jsonl
-{"prompt": "What is the capital of France?", "completion": "Paris."}
+{
+  "prompt": "What is the capital of France?",
+  "completion": "Paris."
+}
 ```
 
 For the `completions` data format, a different key can be used for the prompt
@@ -277,12 +419,14 @@ completion_feature: "output"
 ```
 
 Here, `"input"` is the expected key instead of the default `"prompt"`, and
-`"output"` is the expected key instead of `"completion"`. 
+`"output"` is the expected key instead of `"completion"`.
 
 `text`:
 
 ```jsonl
-{"text": "This is an example for the model."}
+{
+  "text": "This is an example for the model."
+}
 ```
 
 Note, the format is automatically determined by the dataset. Note also, keys
@@ -320,7 +464,7 @@ hf_dataset:
   dataset. Use `chat_feature` to specify the key for a chat dataset.
 
 - To specify the train, valid, or test splits, set the corresponding
-  `{train,valid,test}_split` argument. 
+  `{train,valid,test}_split` argument.
 
 You can specify a list of Hugging Face datasets with a list of records each
 with the same structure as above. For example:
