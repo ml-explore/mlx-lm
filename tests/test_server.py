@@ -16,8 +16,10 @@ from mlx_lm.server import (
     LRUPromptCache,
     Response,
     ResponseGenerator,
+    ToolCallFormatter,
     _process_control_tokens,
 )
+from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
 
 
@@ -155,6 +157,71 @@ class TestProcessControlTokens(unittest.TestCase):
             [t.state for t in out],
             ["tool", "tool", "tool", "normal", "normal"],
         )
+
+
+class TestToolCallFormatter(unittest.TestCase):
+    def test_formats_nested_array_json_tool_call(self):
+        formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
+        raw_tool_call = (
+            "<tool_call>"
+            '{"name": "grocery.orderIngredients", "arguments": {'
+            '"ingredientList": ['
+            '{"name": "noodles", "amount": 500, "unit": "g"}, '
+            '{"name": "ground beef", "amount": 300, "unit": "g"}], '
+            '"deliveryAddress": "845 Willow Lane, Springfield, IL 62704"}}'
+            "</tool_call>"
+        )
+
+        tool_calls = formatter([raw_tool_call])
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["type"], "function")
+        self.assertEqual(
+            tool_calls[0]["function"]["name"], "grocery.orderIngredients"
+        )
+        arguments = json.loads(tool_calls[0]["function"]["arguments"])
+        self.assertEqual(
+            arguments,
+            {
+                "ingredientList": [
+                    {"name": "noodles", "amount": 500, "unit": "g"},
+                    {"name": "ground beef", "amount": 300, "unit": "g"},
+                ],
+                "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
+            },
+        )
+
+    def test_tool_only_chat_response_has_null_content(self):
+        handler = types.SimpleNamespace(
+            request_id="chatcmpl-test",
+            system_fingerprint="test",
+            object_type="chat.completion",
+            requested_model="chat_model",
+            created=0,
+            stream=False,
+        )
+        response = APIHandler.generate_response(
+            handler,
+            text="",
+            finish_reason="tool_calls",
+            prompt_token_count=1,
+            completion_token_count=1,
+            prompt_cache_count=0,
+            tool_calls=[
+                {
+                    "id": "123",
+                    "type": "function",
+                    "function": {
+                        "name": "grocery.orderIngredients",
+                        "arguments": '{"ingredientList": [], "deliveryAddress": "x"}',
+                    },
+                }
+            ],
+        )
+
+        message = response["choices"][0]["message"]
+        self.assertIsNone(message["content"])
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "grocery.orderIngredients")
 
 
 class TestServer(unittest.TestCase):

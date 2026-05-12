@@ -197,6 +197,40 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_pythonic_nested_array_tool_call(self):
+        expected = {
+            "name": "grocery.orderIngredients",
+            "arguments": {
+                "ingredientList": [
+                    {"name": "noodles", "amount": 500, "unit": "g"},
+                    {"name": "ground beef", "amount": 300, "unit": "g"},
+                ],
+                "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
+            },
+        }
+
+        test_cases = [
+            (
+                "[grocery.orderIngredients("
+                'ingredientList=[{"name": "noodles", "amount": 500, "unit": "g"}, '
+                '{"name": "ground beef", "amount": 300, "unit": "g"}], '
+                'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
+            ),
+            (
+                "<tool_call>"
+                '{"name": "grocery.orderIngredients", "arguments": {'
+                '"ingredientList": ['
+                '{"name": "noodles", "amount": 500, "unit": "g"}, '
+                '{"name": "ground beef", "amount": 300, "unit": "g"}], '
+                '"deliveryAddress": "845 Willow Lane, Springfield, IL 62704"}}'
+                "</tool_call>"
+            ),
+        ]
+
+        for test_case in test_cases:
+            with self.subTest(test_case=test_case):
+                self.assertEqual(pythonic.parse_tool_call(test_case, None), expected)
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
