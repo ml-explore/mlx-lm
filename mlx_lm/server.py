@@ -46,6 +46,21 @@ from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
 )
+from .server_responses import (
+    chat_tools as open_response_chat_tools,
+    compact_response as open_response_compact,
+    error_response as open_response_error,
+    event as open_response_event,
+    function_call_ids as open_response_function_call_ids,
+    input_to_messages as open_response_input_to_messages,
+    output_message as open_response_output_message,
+    response_object as open_response_object,
+    stored_response as open_response_stored,
+    tool_call_item as open_response_tool_call_item,
+    tool_call_required as open_response_tool_call_required,
+    usage as open_response_usage,
+    validate_tool_choice as validate_open_response_tool_choice,
+)
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -93,236 +108,6 @@ class ToolCallFormatter:
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
         return result
-
-
-def open_response_error(message, error_type="invalid_request", code=None, param=None):
-    error = {
-        "message": message,
-        "type": error_type,
-        "param": param,
-        "code": code or error_type,
-    }
-    return {"error": error}
-
-
-def _content_part_text(part):
-    part_type = part.get("type")
-    if part_type in ("input_text", "output_text", "text"):
-        return part.get("text", "")
-    if part_type == "refusal":
-        return part.get("refusal", "")
-    if part_type == "input_image":
-        return f"[input_image: {part.get('image_url', '')}]"
-    if part_type == "input_file":
-        return f"[input_file: {part.get('filename') or part.get('file_url') or ''}]"
-    if part_type == "input_video":
-        return f"[input_video: {part.get('video_url', '')}]"
-    return ""
-
-
-def open_response_content_to_text(content):
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            _content_part_text(part) for part in content if isinstance(part, dict)
-        )
-    return str(content)
-
-
-def open_response_tool_output_to_text(output):
-    if isinstance(output, str):
-        return output
-    return open_response_content_to_text(output)
-
-
-def open_response_input_to_messages(input_items, instructions=None, stored_items=None):
-    stored_items = stored_items or {}
-    if input_items is None:
-        input_items = []
-    if isinstance(input_items, str):
-        input_items = [
-            {"type": "message", "role": "user", "content": input_items},
-        ]
-
-    messages = []
-    normalized = []
-    if instructions:
-        messages.append({"role": "system", "content": instructions})
-        normalized.append(
-            {"type": "message", "role": "system", "content": instructions}
-        )
-
-    for item in input_items:
-        if not isinstance(item, dict):
-            raise ValueError("Responses input items must be objects")
-        if item.get("type") == "item_reference":
-            item_id = item.get("id")
-            if item_id not in stored_items:
-                raise ValueError(f"Referenced item '{item_id}' was not found")
-            item = stored_items[item_id]
-
-        item_type = item.get("type", "message")
-        normalized.append(item)
-
-        if item_type == "message":
-            role = item.get("role", "user")
-            if role == "developer":
-                role = "system"
-            messages.append(
-                {
-                    "role": role,
-                    "content": open_response_content_to_text(item.get("content")),
-                }
-            )
-        elif item_type == "function_call":
-            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4()}"
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "type": "function",
-                            "id": call_id,
-                            "function": {
-                                "name": item["name"],
-                                "arguments": item.get("arguments", "{}"),
-                            },
-                        }
-                    ],
-                }
-            )
-        elif item_type == "function_call_output":
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": item.get("call_id"),
-                    "content": open_response_tool_output_to_text(item.get("output", "")),
-                }
-            )
-        elif item_type in ("reasoning", "compaction"):
-            continue
-        else:
-            raise ValueError(f"Unsupported Responses input item type: {item_type}")
-
-    return messages, normalized
-
-
-def open_response_chat_tools(tools, tool_choice=None):
-    if not tools:
-        return None
-    if tool_choice == "none":
-        return None
-    allowed_names = None
-    if isinstance(tool_choice, dict):
-        if tool_choice.get("type") == "function":
-            allowed_names = {tool_choice.get("name")}
-        elif tool_choice.get("type") == "allowed_tools":
-            allowed_names = {
-                t.get("name") for t in tool_choice.get("tools", []) if t.get("name")
-            }
-    if allowed_names is None:
-        selected = tools
-    else:
-        selected = [t for t in tools if t.get("name") in allowed_names]
-
-    chat_tools = []
-    for tool in selected:
-        if "function" in tool:
-            chat_tools.append(tool)
-            continue
-        if tool.get("type") == "function":
-            chat_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name"),
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("parameters") or {},
-                    },
-                }
-            )
-    return chat_tools or None
-
-
-def validate_open_response_tool_choice(tools, tool_choice):
-    if not tools or tool_choice is None or isinstance(tool_choice, str):
-        return
-    tool_names = {t.get("name") for t in tools if t.get("name")}
-    if tool_choice.get("type") == "function":
-        name = tool_choice.get("name")
-        if name not in tool_names:
-            raise ValueError(f"tool_choice references unknown function '{name}'")
-    elif tool_choice.get("type") == "allowed_tools":
-        for tool in tool_choice.get("tools", []):
-            name = tool.get("name")
-            if name not in tool_names:
-                raise ValueError(f"allowed_tools references unknown function '{name}'")
-
-
-def open_response_function_call_ids(items):
-    return {
-        item.get("call_id")
-        for item in items
-        if isinstance(item, dict) and item.get("type") == "function_call"
-    }
-
-
-def open_response_tool_call_required(tool_choice):
-    if tool_choice == "required":
-        return True
-    if isinstance(tool_choice, dict):
-        if tool_choice.get("type") == "function":
-            return True
-        if tool_choice.get("type") == "allowed_tools":
-            return tool_choice.get("mode") == "required"
-    return False
-
-
-def open_response_output_message(text, item_id=None, status="completed"):
-    return {
-        "id": item_id or f"msg_{uuid.uuid4().hex}",
-        "type": "message",
-        "status": status,
-        "role": "assistant",
-        "phase": "final_answer",
-        "content": [
-            {
-                "type": "output_text",
-                "text": text,
-                "annotations": [],
-            }
-        ],
-    }
-
-
-def open_response_tool_call_item(tool_call):
-    function = tool_call.get("function", {})
-    return {
-        "id": f"fc_{uuid.uuid4().hex}",
-        "type": "function_call",
-        "status": "completed",
-        "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex}",
-        "name": function.get("name", ""),
-        "arguments": function.get("arguments", "{}"),
-    }
-
-
-def open_response_usage(
-    prompt_tokens, completion_tokens, cached_tokens=0, reasoning_tokens=0
-):
-    prompt_tokens = prompt_tokens or 0
-    completion_tokens = completion_tokens or 0
-    return {
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-        "input_tokens_details": {"cached_tokens": cached_tokens or 0},
-        "output_tokens_details": {"reasoning_tokens": reasoning_tokens or 0},
-    }
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -1861,59 +1646,6 @@ class APIHandler(BaseHTTPRequestHandler):
             }
         return response
 
-    def _open_response_object(
-        self,
-        response_id,
-        output,
-        usage,
-        status="completed",
-        error=None,
-        previous_response_id=None,
-    ):
-        body = self.body
-        return {
-            "id": response_id,
-            "object": "response",
-            "created_at": self.created,
-            "completed_at": (
-                int(time.time())
-                if status in ("completed", "failed", "incomplete")
-                else None
-            ),
-            "status": status,
-            "incomplete_details": None,
-            "model": self.requested_model,
-            "previous_response_id": previous_response_id,
-            "instructions": body.get("instructions"),
-            "output": output,
-            "error": error,
-            "tools": body.get("tools") or [],
-            "tool_choice": body.get("tool_choice", "auto"),
-            "truncation": body.get("truncation", "disabled"),
-            "parallel_tool_calls": body.get("parallel_tool_calls", True),
-            "text": body.get("text") or {"format": {"type": "text"}},
-            "top_p": self.top_p,
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
-            "top_logprobs": max(self.top_logprobs, 0),
-            "temperature": self.temperature,
-            "reasoning": body.get("reasoning") or {"effort": None, "summary": None},
-            "usage": usage,
-            "max_output_tokens": self.max_tokens,
-            "max_tool_calls": body.get("max_tool_calls"),
-            "store": body.get("store", True),
-            "background": body.get("background", False),
-            "service_tier": body.get("service_tier", "default"),
-            "metadata": body.get("metadata") or {},
-            "safety_identifier": body.get("safety_identifier"),
-            "prompt_cache_key": body.get("prompt_cache_key"),
-        }
-
-    def _open_response_event(self, event_type, sequence_number, **kwargs):
-        event = {"type": event_type, "sequence_number": sequence_number}
-        event.update(kwargs)
-        return event
-
     def _write_open_response_sse(self, event):
         self.wfile.write(
             f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
@@ -2018,15 +1750,7 @@ class APIHandler(BaseHTTPRequestHandler):
         )
 
     def _store_open_response(self, response, input_items, ws_cache=None):
-        stored = {
-            "response": response,
-            "input": input_items,
-            "output": response.get("output", []),
-            "items": {},
-        }
-        for item in stored["input"] + stored["output"]:
-            if isinstance(item, dict) and item.get("id"):
-                stored["items"][item["id"]] = item
+        stored = open_response_stored(response, input_items)
         if ws_cache is not None:
             ws_cache[response["id"]] = stored
             while len(ws_cache) > 16:
@@ -2046,12 +1770,13 @@ class APIHandler(BaseHTTPRequestHandler):
         def emit(event_type, **kwargs):
             nonlocal sequence_number
             sequence_number += 1
-            event = self._open_response_event(event_type, sequence_number, **kwargs)
+            event = open_response_event(event_type, sequence_number, **kwargs)
             if send_event is not None:
                 send_event(event)
             return event
 
-        initial_response = self._open_response_object(
+        initial_response = open_response_object(
+            self,
             response_id,
             [],
             open_response_usage(0, 0),
@@ -2192,7 +1917,8 @@ class APIHandler(BaseHTTPRequestHandler):
             usage = open_response_usage(
                 len(ctx.prompt), len(tokens), ctx.prompt_cache_count, 0
             )
-            final_response = self._open_response_object(
+            final_response = open_response_object(
+                self,
                 response_id,
                 output,
                 usage,
@@ -2218,7 +1944,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except Exception as e:
                 code = getattr(e, "code", "invalid_request")
-                error_event = self._open_response_event(
+                error_event = open_response_event(
                     "error",
                     1,
                     error={
@@ -2229,7 +1955,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     },
                 )
                 self._write_open_response_sse(error_event)
-                response = self._open_response_object(
+                response = open_response_object(
+                    self,
                     f"resp_{uuid.uuid4().hex}",
                     [],
                     open_response_usage(0, 0),
@@ -2238,7 +1965,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     previous_response_id=self.body.get("previous_response_id"),
                 )
                 self._write_open_response_sse(
-                    self._open_response_event("response.failed", 2, response=response)
+                    open_response_event("response.failed", 2, response=response)
                 )
                 self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
@@ -2279,28 +2006,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 ).encode()
             )
             return
-        try:
-            messages, _ = open_response_input_to_messages(
-                self.body.get("input", ""), instructions=self.body.get("instructions")
-            )
-            text = "\n".join(m.get("content") or "" for m in messages)
-        except ValueError:
-            text = open_response_content_to_text(self.body.get("input", ""))
-        encrypted = base64.b64encode(text.encode()).decode()
-        response = {
-            "id": f"cmpct_{uuid.uuid4().hex}",
-            "object": "response.compaction",
-            "output": [
-                {
-                    "id": f"cmp_{uuid.uuid4().hex}",
-                    "type": "compaction",
-                    "encrypted_content": encrypted,
-                    "created_by": "mlx_lm",
-                }
-            ],
-            "created_at": self.created,
-            "usage": open_response_usage(0, 0),
-        }
+        response = open_response_compact(self.body, self.created)
         response_json = json.dumps(response).encode()
         self._set_completion_headers(200)
         self.send_header("Content-Length", str(len(response_json)))
