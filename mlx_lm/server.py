@@ -823,6 +823,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        max_kv_size=self.cli_args.max_kv_size,
                         stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -968,9 +969,13 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
+                cache = make_prompt_cache(
+                    self.model_provider.model, max_kv_size=self.cli_args.max_kv_size
+                )
                 if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+                    cache += make_prompt_cache(
+                        self.model_provider.draft_model, max_kv_size=self.cli_args.max_kv_size
+                    )
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1878,6 +1883,11 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        help="Maximum size of the KV cache",
     )
     parser.add_argument(
         "--pipeline",
