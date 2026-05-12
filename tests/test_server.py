@@ -320,6 +320,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
 
+
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
