@@ -3259,8 +3259,10 @@ class TestModels(unittest.TestCase):
             }
         )
         model = gemma4_assistant.Model(args)
-        # Manually initialize token_ordering to a valid permutation for testing.
-        model.masked_embedding.token_ordering = mx.arange(8, dtype=mx.int32)
+        # Initialize the centroid lookup buffer to a valid permutation for
+        # testing. In production this is loaded from the checkpoint via
+        # `Model.sanitize` which renames `token_ordering` → `_token_ordering`.
+        model.masked_embedding._token_ordering = mx.arange(8, dtype=mx.int32)
 
         B, L, Lt, BH, H, HD = 2, 3, 5, 16, 8, 4
         inputs_embeds = mx.random.uniform(shape=(B, L, 2 * BH))
@@ -3274,10 +3276,10 @@ class TestModels(unittest.TestCase):
         position_ids = mx.array([[Lt - 1]] * B)
 
         for dt in (mx.float32, mx.float16):
+            # Underscore-prefixed `_token_ordering` is excluded from
+            # parameters(), so this tree_map cast does NOT corrupt the
+            # int32 gather indices.
             model.update(tree_map(lambda p: p.astype(dt), model.parameters()))
-            # token_ordering is an int32 gather index buffer; tree_map casts
-            # everything in parameters() including it, so restore the dtype.
-            model.masked_embedding.token_ordering = mx.arange(8, dtype=mx.int32)
             shared_kv_dt = {
                 lt: (k.astype(dt), v.astype(dt))
                 for lt, (k, v) in shared_kv.items()
@@ -3290,8 +3292,10 @@ class TestModels(unittest.TestCase):
             self.assertEqual(logits.shape, (B, L, args.vocab_size))
             self.assertEqual(logits.dtype, dt)
 
-        # make_cache returns empty list (assistant owns no KV cache)
-        self.assertEqual(model.make_cache(), [])
+        # make_cache raises NotImplementedError (assistant owns no KV cache;
+        # caller must pass target's shared_kv_states to __call__).
+        with self.assertRaises(NotImplementedError):
+            model.make_cache()
 
         # quant_predicate excludes centroids
         self.assertFalse(model.quant_predicate("masked_embedding.centroids", None))
@@ -3356,18 +3360,22 @@ class TestModels(unittest.TestCase):
         self.assertEqual(last_hidden.shape, (B, L, BH))
         self.assertEqual(logits.shape, (B, L, args.vocab_size))
 
-    def test_gemma4_assistant_loads_published_checkpoint(self):
-        """Load the real mlx-community drafter; do one forward with
-        synthetic K/V matching the real target's shapes."""
+    def test_gemma4_assistant_published_checkpoint_forward_shapes(self):
+        """Opt-in network test: load the real mlx-community drafter and run
+        a single forward pass with synthetic K/V matching the real target's
+        shapes. Skipped by default; set ``MLX_LM_RUN_NETWORK_TESTS=1`` to run.
+        """
         import os
-        if os.environ.get("MLX_LM_SKIP_NETWORK_TESTS"):
-            self.skipTest("network tests disabled")
-        from mlx_lm.utils import _download, load_model
+        if not os.environ.get("MLX_LM_RUN_NETWORK_TESTS"):
+            self.skipTest(
+                "network test; set MLX_LM_RUN_NETWORK_TESTS=1 to enable"
+            )
+        from huggingface_hub import snapshot_download
 
-        path = _download(
-            "mlx-community/gemma-4-E4B-it-assistant-bf16"
-        )
-        model, _config = load_model(path)
+        from mlx_lm import load
+
+        snapshot_download("mlx-community/gemma-4-E4B-it-assistant-bf16")
+        model, _ = load("mlx-community/gemma-4-E4B-it-assistant-bf16")
         self.assertEqual(len(model.layers), 4)
         self.assertEqual(model.args.text_config["hidden_size"], 256)
         self.assertEqual(model.args.backbone_hidden_size, 2560)

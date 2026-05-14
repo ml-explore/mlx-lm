@@ -1,16 +1,13 @@
 # Copyright © 2026 Apple Inc.
-"""
-Gemma 4 MTP drafter (assistant) model.
+"""Gemma 4 MTP drafter (assistant) model.
 
-This is the speculative-decoding companion released alongside Gemma 4. The
-drafter has NO key/value projections of its own — at each layer it cross-
-attends to the target model's K/V via `shared_kv_states`. See the spec at
-core/life/docs/superpowers/specs/2026-05-13-mlx-lm-gemma4-assistant.md
-(broomva workspace) or the HF reference at
-transformers/models/gemma4_assistant/modeling_gemma4_assistant.py.
+Speculative-decoding companion released alongside Gemma 4. The drafter has
+no K/V projections of its own — at each layer it cross-attends to the
+target model's K/V via ``shared_kv_states``. See the HuggingFace reference
+at ``transformers/models/gemma4_assistant/modeling_gemma4_assistant.py``.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -99,12 +96,14 @@ class AssistantAttention(nn.Module):
         q = q.transpose(0, 2, 1, 3)  # (B, n_heads, L, head_dim)
 
         # Apply RoPE to Q. Target has already RoPE'd K with the same params.
-        # position_ids is typically a constant (single-position MTP); broadcast
-        # the offset across L.
-        offset = 0
-        if position_ids is not None:
-            # Use the scalar offset of the last seen token.
-            offset = int(position_ids.reshape(-1)[-1].item())
+        # Pass position_ids' last entry as an mx.array offset so the
+        # graph stays on-device (no GPU→host sync). For uniform-position
+        # batches this is equivalent to a Python int; for the single-position
+        # MTP case it's a scalar; for batched non-uniform positions the
+        # caller should pass position_ids of shape (B, L) and this code
+        # picks the last position (correct for both single- and multi-
+        # position drafting against a shared target context).
+        offset = position_ids.reshape(-1)[-1] if position_ids is not None else 0
         q = self.rope(q, offset=offset)
 
         # GQA: repeat K/V from n_kv_heads to n_heads along head axis.
@@ -234,7 +233,7 @@ class MaskedEmbedder(nn.Module):
       4. Scatter those logits back into a (V,) tensor, with non-selected
          positions filled with `min(selected_logits) - 1.0` so they never win.
 
-    The `token_ordering` buffer maps cluster-ordered positions back to the
+    The `_token_ordering` buffer maps cluster-ordered positions back to the
     canonical token id space.
     """
 
@@ -252,8 +251,11 @@ class MaskedEmbedder(nn.Module):
         self.vocab_size_per_centroid = self.vocab_size // self.num_centroids
 
         self.centroids = nn.Linear(self.hidden_size, self.num_centroids, bias=False)
-        # token_ordering is a buffer (not trained). Stored as int32 for MLX gather.
-        self.token_ordering = mx.zeros((self.vocab_size,), dtype=mx.int32)
+        # Leading-underscore name excludes this from Module.parameters() so
+        # `model.update(tree_map(astype, model.parameters()))` does NOT corrupt
+        # the int32 gather indices. The buffer is loaded from the checkpoint
+        # via the `sanitize` remap (see `Model.sanitize`).
+        self._token_ordering = mx.zeros((self.vocab_size,), dtype=mx.int32)
 
     def __call__(self, hidden_states: mx.array, lm_head_weight: mx.array) -> mx.array:
         B, L = hidden_states.shape[:2]
@@ -270,7 +272,7 @@ class MaskedEmbedder(nn.Module):
         )[..., : self.top_k]
 
         # 3. canonical_positions_per_cluster: (num_centroids, V_pc)
-        canonical = self.token_ordering.reshape(self.num_centroids, V_pc)
+        canonical = self._token_ordering.reshape(self.num_centroids, V_pc)
 
         # 4. Gather the V_pc canonical token ids for each of the top_k clusters:
         # selected_canonical: (B, L, top_k, V_pc)
@@ -288,10 +290,11 @@ class MaskedEmbedder(nn.Module):
         selected_logits = (h_exp @ selected_emb.swapaxes(-1, -2)).squeeze(-2)
 
         # 7. Scatter into full-vocab output, with floor-1 mask for non-selected.
-        mask_value = mx.min(selected_logits).item() - 1.0
-        output = mx.full(
-            (B, L, V), mask_value, dtype=hidden_states.dtype
-        )
+        # Build the mask value on-device (no .item() sync — this path runs on
+        # every draft step in the MTP hot loop, and a GPU→host sync per token
+        # would defeat the whole point of having a fast drafter).
+        mask_value = (mx.min(selected_logits) - 1.0).astype(hidden_states.dtype)
+        output = mask_value + mx.zeros((B, L, V), dtype=hidden_states.dtype)
         scatter_idx = selected_canonical.reshape(B, L, -1)      # (B, L, top_k*V_pc)
         return mx.put_along_axis(output, scatter_idx, selected_logits, axis=-1)
 
@@ -357,18 +360,31 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        """Coerce token_ordering to int32 (checkpoint stores int64)."""
+        """Install the centroid lookup buffer and pass through trainable weights.
+
+        The checkpoint stores the buffer as ``masked_embedding.token_ordering``
+        (int64). We install it directly on the submodule as ``_token_ordering``
+        (int32) so the leading underscore excludes it from
+        ``Module.parameters()`` — this prevents
+        ``model.update(tree_map(astype, model.parameters()))`` from corrupting
+        the gather indices. The buffer is removed from the returned dict so
+        ``load_weights`` (which is strict and requires keys to be parameters)
+        does not see it.
+        """
         out = {}
         for k, v in weights.items():
             if k == "masked_embedding.token_ordering":
-                out[k] = v.astype(mx.int32)
+                # Assign directly; underscore-prefix means load_weights would
+                # reject it as "not a parameter."
+                if self.masked_embedding is not None:
+                    self.masked_embedding._token_ordering = v.astype(mx.int32)
                 continue
             out[k] = v
         return out
 
     @property
     def quant_predicate(self):
-        def predicate(path, _module):
+        def predicate(path, _):
             # Centroid Linear is only 2048*256 = 0.5M params. 4-bit hurts
             # cluster discrimination more than the ~0.25MB save is worth.
             if path.endswith("masked_embedding.centroids"):
@@ -377,8 +393,12 @@ class Model(nn.Module):
         return predicate
 
     def make_cache(self):
-        # The assistant owns no KV cache — it cross-attends to target K/V
-        # each forward pass. Return [] so any caller that mistakenly invokes
-        # make_prompt_cache(assistant) immediately fails on cache[0] rather
-        # than silently miscomputing.
-        return []
+        # The assistant owns no KV cache — it cross-attends to the target's
+        # shared_kv_states each forward pass. Raise loudly so that calling
+        # mlx_lm.cache.make_prompt_cache(assistant_model) fails immediately,
+        # rather than returning [] (which a zip-based iteration would silently
+        # ignore, resulting in attention without cached context).
+        raise NotImplementedError(
+            "Gemma 4 assistant has no KV cache of its own; pass the target's "
+            "per-layer-type (K, V) tensors in `shared_kv_states` to `__call__`."
+        )
