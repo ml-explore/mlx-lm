@@ -293,13 +293,88 @@ class MaskedEmbedder(nn.Module):
 
 
 class Model(nn.Module):
-    """Top-level Gemma 4 assistant model. Filled in by subsequent tasks."""
+    """Top-level Gemma 4 MTP drafter.
+
+    Forward signature:
+      inputs_embeds:        (B, L, 2 * backbone_hidden_size)
+                            = concat(target_embed(last_token), target_last_hidden)
+      shared_kv_states:     {"full_attention": (k, v), "sliding_attention": (k, v)}
+                            k, v shape: (B, n_kv_heads, L_target, head_dim)
+      position_ids:         (B, L) scalar broadcast (single-position MTP)
+      mask:                 optional (B, 1, L, L_target) bidirectional mask
+    Returns:
+      last_hidden_state:    (B, L, backbone_hidden_size) — fed back to caller
+      logits:               (B, L, vocab_size)
+    """
 
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        # Submodules added in Tasks 3–7
+        tc = args.text_config
 
-    def __call__(self, *a, **kw):
-        raise NotImplementedError("Forward pass added in Task 7")
+        self.pre_projection = nn.Linear(
+            2 * args.backbone_hidden_size, tc["hidden_size"], bias=False
+        )
+        self.model = AssistantTextModel(args)
+        self.post_projection = nn.Linear(
+            tc["hidden_size"], args.backbone_hidden_size, bias=False
+        )
+        self.masked_embedding = (
+            MaskedEmbedder(args) if args.use_ordered_embeddings else None
+        )
+
+    def __call__(
+        self,
+        inputs_embeds: mx.array,
+        shared_kv_states: Dict[str, Tuple[mx.array, mx.array]],
+        position_ids: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, mx.array]:
+        # 5120 → 256
+        h = self.pre_projection(inputs_embeds)
+
+        # 4 decoder layers, each cross-attending to shared_kv_states
+        h = self.model(h, shared_kv_states, position_ids=position_ids, mask=mask)
+
+        # 256 → 2560 (fed back to caller as next-step input)
+        last_hidden = self.post_projection(h)
+
+        # Logits: clustered (masked_embedding) or tied-embedding matmul
+        if self.masked_embedding is not None:
+            logits = self.masked_embedding(h, self.model.embed_tokens.weight)
+        else:
+            logits = self.model.embed_tokens.as_linear(h)
+
+        return last_hidden, logits
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        """Coerce token_ordering to int32 (checkpoint stores int64)."""
+        out = {}
+        for k, v in weights.items():
+            if k == "masked_embedding.token_ordering":
+                out[k] = v.astype(mx.int32)
+                continue
+            out[k] = v
+        return out
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _module):
+            # Centroid Linear is only 2048*256 = 0.5M params. 4-bit hurts
+            # cluster discrimination more than the ~0.25MB save is worth.
+            if path.endswith("masked_embedding.centroids"):
+                return False
+            return True
+        return predicate
+
+    def make_cache(self):
+        # The assistant owns no KV cache — it cross-attends to target K/V
+        # each forward pass. Return [] so any caller that mistakenly invokes
+        # make_prompt_cache(assistant) immediately fails on cache[0] rather
+        # than silently miscomputing.
+        return []
