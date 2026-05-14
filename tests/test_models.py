@@ -3220,6 +3220,86 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def test_gemma4_assistant(self):
+        from mlx_lm.models import gemma4_assistant
+
+        args = gemma4_assistant.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4_assistant",
+                "backbone_hidden_size": 16,
+                "num_centroids": 4,
+                "centroid_intermediate_top_k": 2,
+                "use_ordered_embeddings": True,
+                "vocab_size": 8,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 4,
+                    "vocab_size": 8,
+                    "rms_norm_eps": 1e-6,
+                    "max_position_embeddings": 128,
+                    "layer_types": ["full_attention", "sliding_attention"],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                    },
+                },
+            }
+        )
+        model = gemma4_assistant.Model(args)
+        # Manually initialize token_ordering to a valid permutation for testing.
+        model.masked_embedding.token_ordering = mx.arange(8, dtype=mx.int32)
+
+        B, L, Lt, BH, H, HD = 2, 3, 5, 16, 8, 4
+        inputs_embeds = mx.random.uniform(shape=(B, L, 2 * BH))
+        shared_kv = {
+            lt: (
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+            )
+            for lt in ("full_attention", "sliding_attention")
+        }
+        position_ids = mx.array([[Lt - 1]] * B)
+
+        for dt in (mx.float32, mx.float16):
+            model.update(tree_map(lambda p: p.astype(dt), model.parameters()))
+            # token_ordering is an int32 gather index buffer; tree_map casts
+            # everything in parameters() including it, so restore the dtype.
+            model.masked_embedding.token_ordering = mx.arange(8, dtype=mx.int32)
+            shared_kv_dt = {
+                lt: (k.astype(dt), v.astype(dt))
+                for lt, (k, v) in shared_kv.items()
+            }
+            last_hidden, logits = model(
+                inputs_embeds.astype(dt), shared_kv_dt, position_ids=position_ids
+            )
+            self.assertEqual(last_hidden.shape, (B, L, BH))
+            self.assertEqual(last_hidden.dtype, dt)
+            self.assertEqual(logits.shape, (B, L, args.vocab_size))
+            self.assertEqual(logits.dtype, dt)
+
+        # make_cache returns empty list (assistant owns no KV cache)
+        self.assertEqual(model.make_cache(), [])
+
+        # quant_predicate excludes centroids
+        self.assertFalse(model.quant_predicate("masked_embedding.centroids", None))
+        self.assertTrue(model.quant_predicate("pre_projection", None))
+
+        # Pickle / deepcopy compatibility (mlx-lm convention)
+        copy.deepcopy(model)
+
 
 if __name__ == "__main__":
     unittest.main()
