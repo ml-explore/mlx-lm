@@ -40,6 +40,82 @@ class ModelArgs(BaseModelArgs):
         self.text_config.setdefault("head_dim", 256)
 
 
+class AssistantAttention(nn.Module):
+    """Q-only cross-attention. K/V are supplied by the target model.
+
+    Per-layer wiring follows the assistant safetensors:
+      - self_attn.q_proj.weight       : (n_heads * head_dim, hidden_size)
+      - self_attn.q_norm.weight       : (head_dim,)
+      - self_attn.o_proj.weight       : (hidden_size, n_heads * head_dim)
+    The drafter has no k_proj/v_proj weights — those come from the target.
+    """
+
+    def __init__(self, config: ModelArgs, layer_type: str):
+        super().__init__()
+        tc = config.text_config
+        self.layer_type = layer_type
+        self.hidden_size = tc["hidden_size"]
+        self.n_heads = tc["num_attention_heads"]
+        self.n_kv_heads = tc["num_key_value_heads"]
+        self.head_dim = tc["head_dim"]
+        self.scale = self.head_dim**-0.5
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.n_heads * self.head_dim, bias=False
+        )
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=tc.get("rms_norm_eps", 1e-6))
+        self.o_proj = nn.Linear(
+            self.n_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
+        # Matching RoPE to the target so Q and target's pre-RoPE'd K stay in
+        # the same rotational frame.
+        rope_params = tc.get("rope_parameters", {}).get(layer_type, {})
+        self.rope = initialize_rope(
+            dims=self.head_dim,
+            traditional=False,
+            base=rope_params.get("rope_theta", 10000.0),
+            scaling_config=rope_params,
+            max_position_embeddings=tc.get("max_position_embeddings", 131072),
+        )
+
+    def __call__(
+        self,
+        x: mx.array,                      # (B, L, hidden_size)
+        keys: mx.array,                   # (B, n_kv_heads, L_target, head_dim)
+        values: mx.array,                 # (B, n_kv_heads, L_target, head_dim)
+        position_ids: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+
+        # Project Q and apply head-dim RMSNorm.
+        q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
+        q = self.q_norm(q)
+        q = q.transpose(0, 2, 1, 3)  # (B, n_heads, L, head_dim)
+
+        # Apply RoPE to Q. Target has already RoPE'd K with the same params.
+        # position_ids is typically a constant (single-position MTP); broadcast
+        # the offset across L.
+        offset = 0
+        if position_ids is not None:
+            # Use the scalar offset of the last seen token.
+            offset = int(position_ids.reshape(-1)[-1].item())
+        q = self.rope(q, offset=offset)
+
+        # GQA: repeat K/V from n_kv_heads to n_heads along head axis.
+        if self.n_kv_heads != self.n_heads:
+            n_rep = self.n_heads // self.n_kv_heads
+            keys = mx.repeat(keys, n_rep, axis=1)
+            values = mx.repeat(values, n_rep, axis=1)
+
+        attn_out = scaled_dot_product_attention(
+            q, keys, values, cache=None, scale=self.scale, mask=mask
+        )
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(attn_out)
+
+
 class MaskedEmbedder(nn.Module):
     """Centroid-clustered logit head.
 
