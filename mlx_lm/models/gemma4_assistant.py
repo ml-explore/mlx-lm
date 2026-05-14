@@ -116,6 +116,70 @@ class AssistantAttention(nn.Module):
         return self.o_proj(attn_out)
 
 
+def _swiglu(gate: mx.array, x: mx.array) -> mx.array:
+    return nn.silu(gate) * x
+
+
+class AssistantMLP(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        tc = config.text_config
+        hidden = tc["hidden_size"]
+        inter = tc["intermediate_size"]
+        self.gate_proj = nn.Linear(hidden, inter, bias=False)
+        self.up_proj = nn.Linear(hidden, inter, bias=False)
+        self.down_proj = nn.Linear(inter, hidden, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Gemma uses gelu-tanh in gemma4_text, but the assistant config
+        # specifies hidden_activation=gelu_pytorch_tanh too. Use gelu_approx
+        # (mlx's gelu-tanh approximation) for parity.
+        return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
+
+
+class AssistantDecoderLayer(nn.Module):
+    """Gemma-family double-norm decoder block, Q-only attention."""
+
+    def __init__(self, config: ModelArgs, layer_type: str):
+        super().__init__()
+        tc = config.text_config
+        hidden = tc["hidden_size"]
+        eps = tc.get("rms_norm_eps", 1e-6)
+        self.layer_type = layer_type
+        self.self_attn = AssistantAttention(config, layer_type)
+        self.mlp = AssistantMLP(config)
+        self.input_layernorm = nn.RMSNorm(hidden, eps=eps)
+        self.post_attention_layernorm = nn.RMSNorm(hidden, eps=eps)
+        self.pre_feedforward_layernorm = nn.RMSNorm(hidden, eps=eps)
+        self.post_feedforward_layernorm = nn.RMSNorm(hidden, eps=eps)
+        # Per-layer scalar (11th weight per layer in the checkpoint).
+        self.layer_scalar = mx.ones((1,))
+
+    def __call__(
+        self,
+        x: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        position_ids: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        # Attention sublayer: pre-norm input, post-norm sublayer output, residual.
+        residual = x
+        h = self.input_layernorm(x)
+        h = self.self_attn(h, keys, values, position_ids=position_ids, mask=mask)
+        h = self.post_attention_layernorm(h)
+        h = residual + h
+
+        # MLP sublayer: same pattern.
+        residual = h
+        h = self.pre_feedforward_layernorm(h)
+        h = self.mlp(h)
+        h = self.post_feedforward_layernorm(h)
+        h = residual + h
+
+        return h * self.layer_scalar
+
+
 class MaskedEmbedder(nn.Module):
     """Centroid-clustered logit head.
 
