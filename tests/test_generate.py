@@ -806,6 +806,95 @@ class TestGenerate(unittest.TestCase):
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, KVCache)
 
+    def test_generation_stream_per_thread(self):
+        """Verify generation_stream() returns different Stream objects per thread."""
+        import threading
+
+        from mlx_lm.generate import generation_stream
+
+        main_stream = generation_stream()
+        worker_stream = [None]
+
+        def worker():
+            worker_stream[0] = generation_stream()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        # Each thread should get its own stream
+        self.assertIsNotNone(worker_stream[0])
+        self.assertIsInstance(main_stream, mx.Stream)
+        self.assertIsInstance(worker_stream[0], mx.Stream)
+
+    def test_batch_sliding_window_threaded(self):
+        """Verify BatchGenerator with RotatingKVCache works from a worker thread.
+
+        Note: We evaluate model parameters first to materialize any lazy arrays
+        that carry stream affinity from previous tests. In the real server,
+        the model is loaded directly on the generation thread so this isn't
+        needed - it's only necessary in tests where the model is shared across
+        threads via setUpClass.
+        """
+        import threading
+
+        from mlx_lm.generate import generation_stream
+
+        # Materialize all model weights so they don't carry stream affinity
+        # from the main thread's generation_stream(). This mirrors the server's
+        # behavior where the model is loaded on the generation thread.
+        mx.eval(self.model.parameters())
+
+        prompts = [
+            "Write a story",
+            "Hello world",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        self.model.make_cache = lambda: [
+            RotatingKVCache(max_size=4) for _ in self.model.layers
+        ]
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                # Get the stream for this thread - this is what the server does
+                stream = generation_stream()
+                batch_gen = BatchGenerator(
+                    self.model,
+                    stop_tokens=self.tokenizer.eos_token_ids,
+                    max_tokens=5,
+                    prefill_batch_size=1,
+                    prefill_step_size=8,
+                    completion_batch_size=2,
+                    stream=stream,
+                )
+                batch_gen.insert(prompts)
+                while responses := batch_gen.next_generated():
+                    for r in responses:
+                        results.append(r.token)
+                batch_gen.close()
+            except Exception as e:
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        del self.model.make_cache
+
+        self.assertEqual(len(errors), 0, f"Worker thread error: {errors}")
+        self.assertGreater(len(results), 0, "Expected generated tokens")
+
 
 if __name__ == "__main__":
     unittest.main()

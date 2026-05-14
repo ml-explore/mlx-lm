@@ -36,6 +36,7 @@ from ._version import __version__
 from .generate import (
     BatchGenerator,
     SequenceStateMachine,
+    generation_stream,
     stream_generate,
 )
 from .models.cache import (
@@ -686,10 +687,10 @@ class ResponseGenerator:
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
-        # Local thread stream that we 'll pass to the BatchGenerator to make
-        # sure that all generation runs in the same stream as the
-        # synchronization messages.
-        generation_stream = mx.default_stream(mx.default_device())
+        # Use the per-thread generation stream factory from generate.py.
+        # This ensures the stream's Metal CommandEncoder is registered on this
+        # thread, avoiding "There is no Stream(gpu, N)" crashes. See #1256.
+        gen_stream = generation_stream()
 
         # Load the default model if it is given
         self.model_provider.load_default()
@@ -823,7 +824,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
-                        stream=generation_stream,
+                        stream=gen_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
