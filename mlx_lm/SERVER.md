@@ -30,6 +30,20 @@ To see a full list of options run:
 mlx_lm.server --help
 ```
 
+### Idle Model Unloading
+
+By default, the server keeps model weights in memory indefinitely. To
+automatically unload the model after a period of inactivity, use
+`--idle-timeout`:
+
+```shell
+mlx_lm.server --model <path> --idle-timeout 300
+```
+
+This unloads model weights after 300 seconds (5 minutes) without requests,
+freeing GPU memory. The model reloads transparently on the next request.
+Set to `0` to disable (default).
+
 You can make a request to the model by running:
 
 ```shell
