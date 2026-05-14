@@ -27,6 +27,8 @@ class DummyModelProvider:
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
+        self.is_distributed = False
+        self._last_request_time = 0.0
 
         # Add draft model support
         self.draft_model = None
@@ -55,6 +57,7 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "idle_timeout": 0,
             },
         )
 
