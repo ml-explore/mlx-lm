@@ -3356,6 +3356,50 @@ class TestModels(unittest.TestCase):
         self.assertEqual(last_hidden.shape, (B, L, BH))
         self.assertEqual(logits.shape, (B, L, args.vocab_size))
 
+    def test_gemma4_assistant_loads_published_checkpoint(self):
+        """Load the real mlx-community drafter; do one forward with
+        synthetic K/V matching the real target's shapes."""
+        import os
+        if os.environ.get("MLX_LM_SKIP_NETWORK_TESTS"):
+            self.skipTest("network tests disabled")
+        from mlx_lm.utils import _download, load_model
+
+        path = _download(
+            "mlx-community/gemma-4-E4B-it-assistant-bf16"
+        )
+        model, _config = load_model(path)
+        self.assertEqual(len(model.layers), 4)
+        self.assertEqual(model.args.text_config["hidden_size"], 256)
+        self.assertEqual(model.args.backbone_hidden_size, 2560)
+        self.assertEqual(model.args.num_centroids, 2048)
+
+        # Real config: full_attention layers use global_head_dim=512,
+        # sliding_attention layers use head_dim=256. The drafter dispatches
+        # per layer_type, so shared_kv head_dim must match each.
+        B, Lt = 1, 16
+        n_kv_heads = 2
+        full_head_dim = (
+            model.args.text_config.get("global_head_dim")
+            or model.args.text_config["head_dim"]
+        )
+        sliding_head_dim = model.args.text_config["head_dim"]
+        shared_kv = {
+            "full_attention": (
+                mx.zeros((B, n_kv_heads, Lt, full_head_dim)),
+                mx.zeros((B, n_kv_heads, Lt, full_head_dim)),
+            ),
+            "sliding_attention": (
+                mx.zeros((B, n_kv_heads, Lt, sliding_head_dim)),
+                mx.zeros((B, n_kv_heads, Lt, sliding_head_dim)),
+            ),
+        }
+        inputs_embeds = mx.zeros((B, 1, 2 * 2560))
+        last_hidden, logits = model(
+            inputs_embeds, shared_kv, position_ids=mx.array([[Lt - 1]])
+        )
+        self.assertEqual(last_hidden.shape, (B, 1, 2560))
+        self.assertEqual(logits.shape, (B, 1, 262144))
+
 
 if __name__ == "__main__":
     unittest.main()
