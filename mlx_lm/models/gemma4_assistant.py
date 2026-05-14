@@ -180,6 +180,44 @@ class AssistantDecoderLayer(nn.Module):
         return h * self.layer_scalar
 
 
+class AssistantTextModel(nn.Module):
+    """4-layer Q-only decoder stack with shared embedding table."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        tc = args.text_config
+        self.args = args
+        self.vocab_size = tc["vocab_size"]
+        self.num_hidden_layers = tc["num_hidden_layers"]
+        layer_types = tc.get("layer_types") or [
+            "full_attention"
+        ] * self.num_hidden_layers
+        assert len(layer_types) == self.num_hidden_layers, (
+            f"layer_types length {len(layer_types)} != "
+            f"num_hidden_layers {self.num_hidden_layers}"
+        )
+
+        self.embed_tokens = nn.Embedding(self.vocab_size, tc["hidden_size"])
+        self.layers = [
+            AssistantDecoderLayer(args, layer_type=lt)
+            for lt in layer_types
+        ]
+        self.norm = nn.RMSNorm(tc["hidden_size"], eps=tc.get("rms_norm_eps", 1e-6))
+
+    def __call__(
+        self,
+        inputs_embeds: mx.array,
+        shared_kv_states: Dict[str, Tuple[mx.array, mx.array]],
+        position_ids: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        h = inputs_embeds
+        for layer in self.layers:
+            k, v = shared_kv_states[layer.layer_type]
+            h = layer(h, k, v, position_ids=position_ids, mask=mask)
+        return self.norm(h)
+
+
 class MaskedEmbedder(nn.Module):
     """Centroid-clustered logit head.
 
