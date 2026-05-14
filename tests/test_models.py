@@ -3300,6 +3300,62 @@ class TestModels(unittest.TestCase):
         # Pickle / deepcopy compatibility (mlx-lm convention)
         copy.deepcopy(model)
 
+    def test_gemma4_assistant_no_ordered_embeddings(self):
+        from mlx_lm.models import gemma4_assistant
+
+        args = gemma4_assistant.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4_assistant",
+                "backbone_hidden_size": 16,
+                "num_centroids": 4,
+                "centroid_intermediate_top_k": 2,
+                "use_ordered_embeddings": False,  # ← flipped
+                "vocab_size": 8,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 4,
+                    "vocab_size": 8,
+                    "rms_norm_eps": 1e-6,
+                    "max_position_embeddings": 128,
+                    "layer_types": ["full_attention", "sliding_attention"],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                    },
+                },
+            }
+        )
+        model = gemma4_assistant.Model(args)
+        self.assertIsNone(model.masked_embedding)
+
+        B, L, Lt, BH, HD = 2, 3, 5, 16, 4
+        inputs_embeds = mx.random.uniform(shape=(B, L, 2 * BH))
+        shared_kv = {
+            lt: (
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+            )
+            for lt in ("full_attention", "sliding_attention")
+        }
+        last_hidden, logits = model(
+            inputs_embeds, shared_kv, position_ids=mx.array([[Lt - 1]] * B)
+        )
+        self.assertEqual(last_hidden.shape, (B, L, BH))
+        self.assertEqual(logits.shape, (B, L, args.vocab_size))
+
 
 if __name__ == "__main__":
     unittest.main()
