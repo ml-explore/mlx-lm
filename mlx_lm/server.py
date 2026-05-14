@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -298,6 +299,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self._last_request_time = time.time()
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -384,15 +386,38 @@ class ModelProvider:
         if self._model_map["default_model"] is not None:
             self.load("default_model", None, "default_model")
 
+    def unload(self):
+        """Unload model weights to free memory. Preserves model_key for reload."""
+        if self.model is None:
+            return
+        mem_before = mx.metal.get_active_memory() if mx.metal.is_available() else 0
+        logging.info(f"Unloading model: {self.model_key}")
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        # model_key is intentionally preserved so load() can reload on next request
+        if mx.metal.is_available():
+            mx.metal.clear_cache()
+        gc.collect()
+        mem_after = mx.metal.get_active_memory() if mx.metal.is_available() else 0
+        freed_gb = max(0.0, (mem_before - mem_after) / 1e9)
+        logging.info(
+            f"Model unloaded - freed {freed_gb:.2f} GB "
+            f"(active memory: {mem_before / 1e9:.2f} GB -> {mem_after / 1e9:.2f} GB)"
+        )
+
     def load(self, model_path, adapter_path=None, draft_model_path=None):
         model_path = self._model_map.get(model_path, model_path)
         adapter_path = self._adapter_map.get(model_path, adapter_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
-        if self.model_key != model_key:
+        if self.model_key != model_key or self.model is None:
+            if self.model is None and self.model_key == model_key:
+                logging.info(f"Reloading model after idle unload: {model_key}")
             self._load(*model_key)
 
+        self._last_request_time = time.time()
         return self.model, self.tokenizer
 
 
@@ -443,6 +468,7 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
+        self._idle_timeout = getattr(model_provider.cli_args, "idle_timeout", 0)
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -918,6 +944,19 @@ class ResponseGenerator:
                         # It may have already been removed during
                         # generation
                         batch_results.pop(uid, None)
+
+            # No request and no active batch - check for idle unload
+            elif (
+                self._idle_timeout > 0
+                and self.model_provider.model is not None
+                and not self.model_provider.is_distributed
+                and not unprocessed_requests
+                and time.time() - self.model_provider._last_request_time
+                > self._idle_timeout
+            ):
+                self.model_provider.unload()
+                self.prompt_cache.trim_to(n_sequences=0)
+                self._state_machine_cache.clear()
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -1884,7 +1923,15 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=0,
+        help="Unload model after N seconds without requests. 0 = never unload (default)",
+    )
     args = parser.parse_args()
+    if args.idle_timeout < 0:
+        parser.error("--idle-timeout must be >= 0")
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
