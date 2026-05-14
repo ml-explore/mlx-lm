@@ -57,7 +57,11 @@ class AssistantAttention(nn.Module):
         self.hidden_size = tc["hidden_size"]
         self.n_heads = tc["num_attention_heads"]
         self.n_kv_heads = tc["num_key_value_heads"]
-        self.head_dim = tc["head_dim"]
+        # Full-attention layers use `global_head_dim` (mirrors gemma4_text.Attention).
+        # Sliding-attention layers use plain `head_dim`. Falls back to head_dim
+        # if global_head_dim is unset (e.g. small synthetic test configs).
+        global_hd = tc.get("global_head_dim") or 0
+        self.head_dim = global_hd if (layer_type == "full_attention" and global_hd) else tc["head_dim"]
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
