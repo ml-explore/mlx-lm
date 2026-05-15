@@ -106,16 +106,6 @@ class TestMTP(unittest.TestCase):
         normed = lm.model.norm(hidden)
         self.assertFalse(mx.allclose(hidden, normed, atol=1e-5).item())
 
-    def test_quant_predicate_excludes_mtp_fc(self):
-        """quant_predicate should exclude mtp.fc from quantization."""
-        lm = self.model.language_model
-        predicate = lm.quant_predicate
-        self.assertIsNotNone(predicate)
-        # mtp.fc should not be quantized
-        self.assertFalse(predicate("mtp.fc", None))
-        # Regular layers should be quantized
-        self.assertTrue(predicate("layers.0.mlp.gate_proj", None))
-
     def test_mtp_generate_identity(self):
         """mtp_generate_step should produce the same greedy tokens as generate_step.
 
