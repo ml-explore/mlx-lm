@@ -565,11 +565,18 @@ class ResponseGenerator:
         # If we are here it means we have a chat request so we need to search
         # for segments for better cache management.
 
-        # Choose the initial state among only reasoning or normal
+        # Choose the initial state among only reasoning or normal.
+        # Restrict the scan to the assistant prefill tail (matches the
+        # tail-bounded scan in the segment-finalisation step below).
+        # Without this bound, a literal "<think>" token anywhere in
+        # user content would falsely flip the state machine into
+        # reasoning mode and route the entire generation to
+        # message.reasoning instead of message.content.
         initial_state = "normal"
         if tokenizer.has_thinking:
-            think_start = tokenizer.rfind_think_start(prompt)
-            think_end = tokenizer.rfind_think_end(prompt)
+            tail_start = max(0, len(prompt) - 11)
+            think_start = tokenizer.rfind_think_start(prompt, start=tail_start)
+            think_end = tokenizer.rfind_think_end(prompt, start=tail_start)
             if think_start > think_end:
                 initial_state = "reasoning"
 

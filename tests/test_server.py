@@ -280,6 +280,104 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_tokenize_user_think_does_not_flip_initial_state(self):
+        # Regression: a literal "<think>" token in user content must
+        # not flip initial_state to "reasoning". The state-machine
+        # scan is meant to detect a chat-template-injected <think> in
+        # the assistant prefill (tail of prompt), not arbitrary
+        # matches in user-supplied text. Before the fix, an unmatched
+        # <think> anywhere in the prompt routed the entire generation
+        # to message.reasoning, leaving message.content empty.
+        THINK_START = 100
+        THINK_END = 101
+
+        class FakeTokenizer:
+            has_chat_template = True
+            has_thinking = True
+            has_tool_calling = False
+
+            def apply_chat_template(self, messages, **kwargs):
+                # <think> (id=100) appears at index 3, far from the
+                # 11-token assistant-prefill tail (indices 5..15).
+                return [1, 2, 3, THINK_START, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+            def rfind_think_start(self, tokens, start=None, end=None):
+                start = start or 0
+                end = end if end is not None else len(tokens)
+                for i in range(end - 1, start - 1, -1):
+                    if tokens[i] == THINK_START:
+                        return i
+                return -1
+
+            def rfind_think_end(self, tokens, start=None, end=None):
+                start = start or 0
+                end = end if end is not None else len(tokens)
+                for i in range(end - 1, start - 1, -1):
+                    if tokens[i] == THINK_END:
+                        return i
+                return -1
+
+        request = types.SimpleNamespace(
+            request_type="chat",
+            messages=[{"role": "user", "content": "What does <think> do?"}],
+            tools=None,
+            role_mapping=None,
+        )
+        args = types.SimpleNamespace(chat_template_kwargs=None)
+
+        _, _, _, initial_state = self.response_generator._tokenize(
+            FakeTokenizer(), request, args
+        )
+        self.assertEqual(initial_state, "normal")
+
+    def test_tokenize_prefill_think_flips_initial_state(self):
+        # Positive guard: when the chat-template-injected <think>
+        # lives in the assistant prefill tail (last 11 tokens),
+        # initial_state must still flip to "reasoning". This protects
+        # the intended behaviour preserved by the tail-bounded scan.
+        THINK_START = 100
+        THINK_END = 101
+
+        class FakeTokenizer:
+            has_chat_template = True
+            has_thinking = True
+            has_tool_calling = False
+
+            def apply_chat_template(self, messages, **kwargs):
+                # <think> at index 14: inside the last-11-token tail of
+                # a length-16 prompt. No matching </think> follows, so
+                # the assistant turn starts mid-think.
+                return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, THINK_START, 15]
+
+            def rfind_think_start(self, tokens, start=None, end=None):
+                start = start or 0
+                end = end if end is not None else len(tokens)
+                for i in range(end - 1, start - 1, -1):
+                    if tokens[i] == THINK_START:
+                        return i
+                return -1
+
+            def rfind_think_end(self, tokens, start=None, end=None):
+                start = start or 0
+                end = end if end is not None else len(tokens)
+                for i in range(end - 1, start - 1, -1):
+                    if tokens[i] == THINK_END:
+                        return i
+                return -1
+
+        request = types.SimpleNamespace(
+            request_type="chat",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            role_mapping=None,
+        )
+        args = types.SimpleNamespace(chat_template_kwargs=None)
+
+        _, _, _, initial_state = self.response_generator._tokenize(
+            FakeTokenizer(), request, args
+        )
+        self.assertEqual(initial_state, "reasoning")
+
     def test_make_state_machine_empty_tool_call_end(self):
         class FakeTokenizer:
             has_thinking = False
