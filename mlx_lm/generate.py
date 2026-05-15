@@ -816,9 +816,20 @@ def mtp_generate_step(
                 prev_tokens,
             )
 
-    def _step_mtp(hidden_last, main_tok, prev_tokens):
-        """Run the MTP head and return (draft_token, draft_logprobs, draft_accept_lp, xtc_draw)."""
-        next_ids = main_tok.reshape(1, 1)
+    def _step_mtp(hidden_last, main_tok, prev_tokens, *, cache_commit=None):
+        """Run the MTP head and return (draft_token, draft_logprobs, draft_accept_lp, xtc_draw).
+
+        cache_commit: (hidden, tok) prepended as a cache-alignment position so that the
+        accepted draft token is committed to mtp_cache in the same batched forward.
+        """
+        if cache_commit is not None:
+            align_h, align_tok = cache_commit
+            hidden_last = mx.concatenate([align_h, hidden_last], axis=1)
+            next_ids = mx.concatenate(
+                [align_tok.reshape(1, 1), main_tok.reshape(1, 1)], axis=1
+            )
+        else:
+            next_ids = main_tok.reshape(1, 1)
         with mx.stream(generation_stream):
             mtp_logits = model.mtp_forward(hidden_last, next_ids, mtp_cache)
             quantize_cache_fn(mtp_cache)
@@ -929,9 +940,13 @@ def mtp_generate_step(
                 yield bonus_tok.item(), bonus_lp, False
                 if ntoks >= max_tokens:
                     return
-                # Next draft from MTP at draft_tok's hidden state.
+                # Next draft: one batched forward aligns the cache for the
+                # accepted draft token and generates the next draft together.
                 draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
-                    hidden_at_draft, bonus_tok, prev_tokens
+                    hidden_at_draft,
+                    bonus_tok,
+                    prev_tokens,
+                    cache_commit=(hidden_at_confirmed, draft_tok),
                 )
                 mx.eval(draft_tok)
                 y = mx.array([bonus_tok.item()], mx.uint32)
