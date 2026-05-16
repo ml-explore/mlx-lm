@@ -1230,9 +1230,13 @@ class DeepseekV4Attention(nn.Module):
             del self._batch_comp_bufs
             del self._batch_comp_ns
 
-        # Update cache offset tracker
-        cache.update_and_fetch(
-            mx.zeros((B, 1, 1, 1)), mx.zeros((B, 1, 1, 1)))
+        # Advance cache offset without per-call allocation (avoids Metal
+        # resource leak from mx.zeros being called every layer every step).
+        cache._idx += 1
+        if hasattr(cache.offset, "shape"):
+            cache.offset = cache.offset + 1
+        else:
+            cache.offset += 1
 
         return mx.concatenate(outputs, axis=0)
 
