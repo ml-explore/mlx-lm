@@ -357,6 +357,11 @@ class MoEGate(nn.Module):
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
+    def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):
+        # Router gate weights are tiny and path-dependent; keep them unquantized
+        # so per-path quantization configs can reference the gate without failing.
+        return self
+
     def __call__(self, x):
         return group_expert_select(
             x @ self.weight.T,
