@@ -26,7 +26,7 @@ def _get_arguments_config(func_name: str, tools: Optional[Any]) -> dict:
     for tool in tools:
         if not (function := tool.get("function", False)):
             continue
-        if function["name"] == func_name:
+        if function.get("name") == func_name:
             if not (params := function.get("parameters", False)):
                 return {}
             return params.get("properties", {})
