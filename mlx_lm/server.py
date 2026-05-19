@@ -34,6 +34,9 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_DRAFT_TYPE,
+    DRAFT_TYPES,
+    NGRAM_SIMPLE_DEFAULT_SIZE,
     BatchGenerator,
     SequenceStateMachine,
     stream_generate,
@@ -192,6 +195,9 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    draft_type: Optional[str] = None
+    disable_adaptive_gate: bool = False
+    ngram_size: int = NGRAM_SIMPLE_DEFAULT_SIZE
 
 
 @dataclass
@@ -983,6 +989,9 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                draft_type=args.draft_type,
+                disable_adaptive_gate=args.disable_adaptive_gate,
+                ngram_size=args.ngram_size,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
@@ -1165,6 +1174,22 @@ class APIHandler(BaseHTTPRequestHandler):
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
         )
+        self.draft_type = self.body.get(
+            "draft_type",
+            getattr(self.response_generator.cli_args, "draft_type", DEFAULT_DRAFT_TYPE),
+        )
+        self.disable_adaptive_gate = self.body.get(
+            "disable_adaptive_gate",
+            getattr(self.response_generator.cli_args, "disable_adaptive_gate", False),
+        )
+        self.ngram_size = self.body.get(
+            "ngram_size",
+            getattr(
+                self.response_generator.cli_args,
+                "ngram_size",
+                NGRAM_SIMPLE_DEFAULT_SIZE,
+            ),
+        )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
@@ -1247,6 +1272,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("xtc_threshold", float, min_val=0, max_val=1)
         self._validate("requested_model", str)
         self._validate("adapter", str, optional=True)
+        if self.draft_type is not None and self.draft_type not in DRAFT_TYPES:
+            raise ValueError(
+                f"draft_type must be one of {DRAFT_TYPES}, got {self.draft_type!r}"
+            )
+        self._validate("disable_adaptive_gate", bool)
+        self._validate("ngram_size", int, min_val=1)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
 
@@ -1403,6 +1434,9 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            draft_type=self.draft_type,
+            disable_adaptive_gate=self.disable_adaptive_gate,
+            ngram_size=self.ngram_size,
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -1789,6 +1823,34 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--draft-type",
+        type=str,
+        choices=list(DRAFT_TYPES),
+        default=DEFAULT_DRAFT_TYPE,
+        help=(
+            "Default draft source for speculative decoding when no neural "
+            "draft model is configured. Per-request overrides via "
+            "'draft_type' in the request body."
+        ),
+    )
+    parser.add_argument(
+        "--disable-adaptive-gate",
+        action="store_true",
+        help=(
+            "Disable the 3-gram repetition gate that suppresses ngram "
+            "speculative decoding on non-repetitive prompts."
+        ),
+    )
+    parser.add_argument(
+        "--ngram-size",
+        type=int,
+        default=NGRAM_SIMPLE_DEFAULT_SIZE,
+        help=(
+            "Default n-gram window size for ngram-simple lookup. "
+            "Per-request overrides via 'ngram_size' in the request body."
+        ),
     )
     parser.add_argument(
         "--trust-remote-code",

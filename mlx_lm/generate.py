@@ -16,6 +16,7 @@ from typing import (
     Generator,
     List,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
     Union,
@@ -54,6 +55,15 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+
+# Draft strategy defaults for prompt lookup decoding (PLD).
+DEFAULT_DRAFT_TYPE = "none"
+DRAFT_TYPES = ("none", "ngram-simple", "ngram-mod")
+NGRAM_SIMPLE_DEFAULT_SIZE = 3
+NGRAM_GATE_DEFAULT_SIZE = 3
+# Minimum fraction of n-gram windows in the prompt that must recur for
+# speculation to be worthwhile. Empirically derived placeholder; tune later.
+NGRAM_GATE_THRESHOLD = 0.02
 
 
 def str2bool(string):
@@ -218,6 +228,35 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--draft-type",
+        type=str,
+        choices=list(DRAFT_TYPES),
+        default=DEFAULT_DRAFT_TYPE,
+        help=(
+            "Draft source for speculative decoding. 'none' disables "
+            "draft-based speculation (a draft model may still be used via "
+            "--draft-model). 'ngram-simple' uses prompt-lookup decoding."
+        ),
+    )
+    parser.add_argument(
+        "--disable-adaptive-gate",
+        action="store_true",
+        help=(
+            "Disable the adaptive 3-gram repetition gate that skips "
+            "speculative decoding on prompts unlikely to benefit."
+        ),
+    )
+    parser.add_argument(
+        "--ngram-size",
+        type=int,
+        default=NGRAM_SIMPLE_DEFAULT_SIZE,
+        help=(
+            "N-gram window size used by ngram-simple to match against "
+            "token history. Lower values match more (noisier), higher "
+            "values match less (stricter). Default: 3."
+        ),
     )
     return parser
 
@@ -470,10 +509,238 @@ def generate_step(
         n += 1
 
 
+def ngram_repeat_score(
+    tokens: Sequence[int], n: int = NGRAM_GATE_DEFAULT_SIZE
+) -> float:
+    """Fraction of size-``n`` windows in ``tokens`` that recur at least once.
+
+    Used by the adaptive gate to decide if a prompt is repetitive enough for
+    n-gram speculative decoding to be worthwhile. Returns 0.0 when ``tokens``
+    is too short to contain a single window.
+    """
+    if len(tokens) < n + 1:
+        return 0.0
+    seen = set()
+    repeats = 0
+    total = 0
+    for i in range(len(tokens) - n + 1):
+        gram = tuple(tokens[i : i + n])
+        total += 1
+        if gram in seen:
+            repeats += 1
+        else:
+            seen.add(gram)
+    return repeats / total if total else 0.0
+
+
+@dataclass
+class _DraftContext:
+    """Helpers shared between speculative_generate_step and a DraftStrategy.
+
+    ``prev_tokens_ref`` is a single-element list used as a mutable holder for
+    the running token tensor that feeds ``logits_processors``. Strategies that
+    sample with logits processors must read and update ``prev_tokens_ref[0]``
+    so the verifier path stays in sync.
+    """
+
+    sampler: Callable[[mx.array], mx.array]
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]]
+    quantize_cache_fn: Callable[[List], None]
+    prefill_step_size: int
+    prev_tokens_ref: List[Optional[mx.array]]
+
+
+class DraftStrategy(Protocol):
+    """Pluggable draft-token source for :func:`speculative_generate_step`.
+
+    Implementations cover both neural draft models and token-only drafters
+    (e.g. prompt lookup decoding). The verifier path in
+    ``speculative_generate_step`` is shared across strategies.
+    """
+
+    def make_cache(self, model_layers: int, prompt_cache: Optional[List]) -> List: ...
+
+    def prefill(self, y: mx.array, ctx: _DraftContext) -> mx.array: ...
+
+    def propose(self, y: mx.array, n: int, ctx: _DraftContext) -> mx.array: ...
+
+    def rewind(self, num_draft: int, num_accept: int) -> None: ...
+
+    def observe(self, tokens: Sequence[int]) -> None:
+        """Ingest tokens the strategy may want to learn from (e.g. prompt
+        tokens before generation, or accepted tokens during generation).
+        Token-only drafters use this to update their lookup memory; neural
+        drafters can no-op. Called by ``stream_generate`` before the first
+        ``propose`` and continuously via :meth:`accept`."""
+        ...
+
+    def accept(self, tokens: List[int]) -> None: ...
+
+    def cache_must_be_trimmable(self) -> bool: ...
+
+    def advances_draft_input(self) -> bool:
+        """Whether the strategy benefits from re-feeding the last accepted
+        draft token on the next call to :meth:`propose` (true for neural
+        drafters that must run a forward pass over it). PLD-style drafters
+        return False."""
+        ...
+
+
+class ModelDraftStrategy:
+    """Draft tokens produced by a small neural draft model."""
+
+    def __init__(self, draft_model: nn.Module):
+        self.draft_model = draft_model
+        self._cache: List = []
+
+    def make_cache(self, model_layers: int, prompt_cache: Optional[List]) -> List:
+        if prompt_cache is None:
+            self._cache = cache.make_prompt_cache(self.draft_model)
+        else:
+            self._cache = prompt_cache[model_layers:]
+        return self._cache
+
+    def prefill(self, y: mx.array, ctx: _DraftContext) -> mx.array:
+        while y.size > 1:
+            n_to_process = min(ctx.prefill_step_size, y.size - 1)
+            self.draft_model(y[:n_to_process][None], cache=self._cache)
+            ctx.quantize_cache_fn(self._cache)
+            mx.eval([c.state for c in self._cache])
+            y = y[n_to_process:]
+            mx.clear_cache()
+        return y
+
+    def propose(self, y: mx.array, n: int, ctx: _DraftContext) -> mx.array:
+        if n == 0:
+            return mx.array([], mx.uint32)
+        # Snapshot prev_tokens so logits processors see the in-flight draft
+        # tokens during sampling, then restore it before returning so the
+        # verifier's _step sees the pre-draft state.
+        prev_before = ctx.prev_tokens_ref[0]
+        ys = []
+        for _ in range(n):
+            with mx.stream(generation_stream):
+                logits = self.draft_model(y[None], cache=self._cache)
+                logits = logits[:, -1:, :]
+                ctx.quantize_cache_fn(self._cache)
+                if ctx.logits_processors:
+                    prev = ctx.prev_tokens_ref[0]
+                    prev = mx.concatenate([prev, y]) if prev is not None else y
+                    ctx.prev_tokens_ref[0] = prev
+                    y, _ = _process_and_sample_logits(
+                        prev, logits[:, 0, :], ctx.sampler, ctx.logits_processors
+                    )
+                else:
+                    y, _ = _process_and_sample_logits(
+                        None, logits.squeeze(0), ctx.sampler, None
+                    )
+            mx.async_eval(y)
+            ys.append(y)
+        # Restore prev_tokens so the verifier's _step re-appends from the
+        # pre-draft state. This decouples prev_tokens accounting from
+        # draft_strategy so PLD-style drafters don't need to manage it.
+        ctx.prev_tokens_ref[0] = prev_before
+        return mx.concatenate(ys)
+
+    def rewind(self, num_draft: int, num_accept: int) -> None:
+        cache.trim_prompt_cache(self._cache, max(num_draft - num_accept - 1, 0))
+
+    def observe(self, tokens: Sequence[int]) -> None:  # noqa: D401 - protocol noop
+        # Neural draft model has nothing to learn from raw tokens; its
+        # state is the KV cache, updated by forward passes.
+        return None
+
+    def accept(self, tokens: List[int]) -> None:  # noqa: D401 - protocol noop
+        return None
+
+    def cache_must_be_trimmable(self) -> bool:
+        return True
+
+    def advances_draft_input(self) -> bool:
+        return True
+
+
+class NgramSimpleStrategy:
+    """Prompt-lookup decoding: draft tokens are copied from token history.
+
+    Searches the running token history for the last occurrence of the most
+    recent ``ngram_size`` tokens and returns the up-to-``n`` tokens that
+    followed that match. No neural forward pass, no KV cache.
+    """
+
+    def __init__(self, ngram_size: int = NGRAM_SIMPLE_DEFAULT_SIZE):
+        if ngram_size < 1:
+            raise ValueError("ngram_size must be >= 1")
+        self.ngram_size = ngram_size
+        self._history: List[int] = []
+
+    def observe(self, tokens: Sequence[int]) -> None:
+        self._history.extend(int(t) for t in tokens)
+
+    def make_cache(self, model_layers: int, prompt_cache: Optional[List]) -> List:
+        return []
+
+    def prefill(self, y: mx.array, ctx: _DraftContext) -> mx.array:
+        return y
+
+    def propose(self, y: mx.array, n: int, ctx: _DraftContext) -> mx.array:
+        if n == 0:
+            return mx.array([], mx.uint32)
+        history = self._history
+        size = self.ngram_size
+        if len(history) < size:
+            return mx.array([], mx.uint32)
+        pattern = history[-size:]
+        # Search backwards (excluding the trailing pattern itself) for the
+        # most recent occurrence of `pattern`.
+        for i in range(len(history) - size - 1, -1, -1):
+            if history[i : i + size] == pattern:
+                start = i + size
+                draft = history[start : start + n]
+                if not draft:
+                    return mx.array([], mx.uint32)
+                return mx.array(draft, mx.uint32)
+        return mx.array([], mx.uint32)
+
+    def rewind(self, num_draft: int, num_accept: int) -> None:
+        return None
+
+    def accept(self, tokens: List[int]) -> None:
+        self._history.extend(int(t) for t in tokens)
+
+    def cache_must_be_trimmable(self) -> bool:
+        return False
+
+    def advances_draft_input(self) -> bool:
+        return False
+
+
+class NgramModStrategy:
+    """Reserved for the rolling-hash 'ngram-mod' drafter. Not yet implemented."""
+
+    def __init__(self, *_, **__):
+        raise NotImplementedError(
+            "draft-type 'ngram-mod' is not implemented yet. Use 'ngram-simple'."
+        )
+
+
+def _process_and_sample_logits(tokens, logits, sampler, logits_processors):
+    """Module-level twin of the inner ``_process_and_sample`` helper.
+
+    Kept here so :class:`ModelDraftStrategy` can sample without rebinding the
+    closures used inside :func:`speculative_generate_step`.
+    """
+    if logits_processors:
+        for processor in logits_processors:
+            logits = processor(tokens, logits)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    return sampler(logprobs), logprobs
+
+
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
-    draft_model: nn.Module,
+    draft_strategy: DraftStrategy,
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
@@ -491,7 +758,9 @@ def speculative_generate_step(
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        draft_model (nn.Module): The draft model for speculative decoding.
+        draft_strategy (DraftStrategy): The draft-token source. Use
+          :class:`ModelDraftStrategy` for neural draft models or
+          :class:`NgramSimpleStrategy` for prompt-lookup decoding.
         num_draft_tokens (int, optional): The number of draft tokens for
           speculative decoding. Default: ``2``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
@@ -516,15 +785,17 @@ def speculative_generate_step(
     """
 
     y = prompt.astype(mx.uint32)
-    prev_tokens = None
+    # Mutable holder so the draft strategy and the verifier _step can share
+    # the running token tensor used by logits processors.
+    prev_tokens_ref: List[Optional[mx.array]] = [None]
 
-    # Create the KV cache for generation
+    # Create the KV cache for generation. The strategy owns the draft-side
+    # cache (which may be empty for token-only drafters such as PLD).
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
     else:
         model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+    draft_strategy.make_cache(len(model.layers), prompt_cache)
 
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
@@ -539,6 +810,14 @@ def speculative_generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+    )
+
+    ctx = _DraftContext(
+        sampler=sampler,
+        logits_processors=logits_processors,
+        quantize_cache_fn=quantize_cache_fn,
+        prefill_step_size=prefill_step_size,
+        prev_tokens_ref=prev_tokens_ref,
     )
 
     def _process_and_sample(tokens, logits):
@@ -557,17 +836,14 @@ def speculative_generate_step(
 
             quantize_cache_fn(cache)
             if logits_processors:
-                nonlocal prev_tokens
                 out_y, out_logprobs = [], []
                 if n_predict > 1:
                     y = y[: -(n_predict - 1)]
                 for i in range(n_predict):
-                    prev_tokens = (
-                        mx.concatenate([prev_tokens, y])
-                        if prev_tokens is not None
-                        else y
-                    )
-                    y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
+                    prev = prev_tokens_ref[0]
+                    prev = mx.concatenate([prev, y]) if prev is not None else y
+                    prev_tokens_ref[0] = prev
+                    y, logprobs = _process_and_sample(prev, logits[:, i, :])
                     out_y.append(y)
                     out_logprobs.append(logprobs)
                 return mx.concatenate(out_y, axis=0), mx.concatenate(
@@ -588,20 +864,10 @@ def speculative_generate_step(
 
     def _rewind_cache(num_draft, num_accept):
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
-
-    def _draft_generate(y, num_draft):
-        if num_draft == 0:
-            return mx.array([], mx.uint32)
-        ys = []
-        for _ in range(num_draft):
-            y, _ = _step(draft_model, draft_cache, y)
-            mx.async_eval(y)
-            ys.append(y)
-        return mx.concatenate(ys)
+        draft_strategy.rewind(num_draft, num_accept)
 
     with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
+        draft_y = draft_strategy.prefill(y, ctx)
         y = _prefill(model, model_cache, y)
 
     ntoks = 0
@@ -611,27 +877,40 @@ def speculative_generate_step(
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
+            draft_tokens = draft_strategy.propose(draft_y, num_draft, ctx)
+            # The strategy may return fewer than ``num_draft`` tokens (e.g.
+            # PLD with no matching n-gram). Re-sync num_draft so the verifier
+            # only processes what the strategy actually produced.
+            num_draft = int(draft_tokens.size)
+            # Note: the strategy is responsible for restoring prev_tokens to
+            # its pre-propose state if it touched it (see ModelDraftStrategy).
             y = mx.concatenate([y, draft_tokens])
             tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
             n = 0
+            accepted: List[int] = []
             while n < num_draft:
                 tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
                 if tn != dtn:
                     break
                 n += 1
                 ntoks += 1
+                accepted.append(tn)
                 yield tn, lpn, True
                 if ntoks == max_tokens:
                     break
             if ntoks < max_tokens:
                 ntoks += 1
+                accepted.append(tokens[n])
                 yield tokens[n], logprobs[n], False
+
+            # Let the strategy observe the accepted tokens (e.g. PLD updates
+            # its token history). Includes the verifier's bonus/correction
+            # token at position ``n``.
+            if accepted:
+                draft_strategy.accept(accepted)
 
             if ntoks == max_tokens:
                 break
@@ -639,16 +918,30 @@ def speculative_generate_step(
             y = mx.array([tokens[n]], mx.uint32)
             draft_y = y
 
-            # If we accepted all the draft tokens, include the last
-            # draft token in the next draft step since it hasn't been
-            # processed yet by the draft model
-            if n == num_draft:
+            # If we accepted all the draft tokens, neural drafters need the
+            # last accepted draft re-fed so the draft model can process it.
+            # Token-only drafters (PLD) skip this — they don't need it.
+            extends_draft = (
+                num_draft > 0
+                and n == num_draft
+                and draft_strategy.advances_draft_input()
+            )
+            if extends_draft:
                 draft_y = mx.concatenate(
                     [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
                 )
 
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
+            if prev_tokens_ref[0] is not None:
+                # Base trim removes the rejected suffix that the verifier
+                # appended to prev_tokens but never yielded. Neural drafters
+                # trim one extra when fully accepted to balance the re-fed
+                # last draft token above.
+                trim_amount = num_draft - n
+                if extends_draft:
+                    trim_amount += 1
+                if trim_amount > 0:
+                    prev = prev_tokens_ref[0]
+                    prev_tokens_ref[0] = prev[:-trim_amount]
             _rewind_cache(num_draft, n)
     finally:
         _rewind_cache(num_draft, n)
@@ -660,6 +953,10 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    draft_type: Optional[str] = None,
+    draft_strategy: Optional[DraftStrategy] = None,
+    disable_adaptive_gate: bool = False,
+    ngram_size: int = NGRAM_SIMPLE_DEFAULT_SIZE,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -672,9 +969,22 @@ def stream_generate(
           integer tokens.
         max_tokens (int): The maximum number of tokens to generate.
           Default: ``256``.
-        draft_model (Optional[nn.Module]): An optional draft model. If provided
-          then speculative decoding is used. The draft model must use the same
-          tokenizer as the main model. Default: ``None``.
+        draft_model (Optional[nn.Module]): An optional neural draft model.
+          If provided, speculative decoding with a draft model is used. The
+          draft model must share the main tokenizer. Default: ``None``.
+        draft_type (Optional[str]): One of ``"none"``, ``"ngram-simple"``,
+          ``"ngram-mod"``. Selects a token-only draft source (prompt-lookup
+          decoding). Ignored when ``draft_model`` or ``draft_strategy`` is
+          set. Default: ``None``.
+        draft_strategy (Optional[DraftStrategy]): A pre-built strategy
+          instance, used as-is. Takes precedence over ``draft_type``. The
+          server passes shared-state strategies (e.g. ``ngram-mod``) here.
+          Default: ``None``.
+        disable_adaptive_gate (bool): Disable the 3-gram repetition gate
+          that suppresses ngram speculation on non-repetitive prompts.
+          Default: ``False``.
+        ngram_size (int): N-gram window size for ngram-simple lookup.
+          Default: ``3``.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -698,7 +1008,36 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    # Resolve the draft strategy. Precedence (highest first):
+    #   1. ``draft_model`` — wrap as ModelDraftStrategy
+    #   2. ``draft_strategy`` — caller-supplied instance (used as-is)
+    #   3. ``draft_type`` — construct a fresh ngram strategy
+    # The adaptive gate only applies when we're constructing an ngram
+    # strategy ourselves; a caller passing a pre-built strategy is assumed
+    # to know what they're doing.
+    if draft_model is not None:
+        draft_strategy = ModelDraftStrategy(draft_model)
+    elif draft_strategy is not None:
+        pass  # use caller-supplied instance as-is
+    elif draft_type and draft_type != "none":
+        if draft_type not in DRAFT_TYPES:
+            raise ValueError(
+                f"Unknown draft_type {draft_type!r}; expected one of {DRAFT_TYPES}."
+            )
+        use_speculation = True
+        if not disable_adaptive_gate:
+            score = ngram_repeat_score(prompt.tolist())
+            if score < NGRAM_GATE_THRESHOLD:
+                use_speculation = False
+        if use_speculation:
+            if draft_type == "ngram-simple":
+                strategy = NgramSimpleStrategy(ngram_size=ngram_size)
+                strategy.observe(prompt.tolist())
+                draft_strategy = strategy
+            elif draft_type == "ngram-mod":
+                draft_strategy = NgramModStrategy()
+
+    if draft_strategy is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
@@ -709,7 +1048,7 @@ def stream_generate(
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
+            prompt, model, draft_strategy, **kwargs
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
