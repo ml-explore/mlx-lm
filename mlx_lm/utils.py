@@ -52,6 +52,7 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "cohere2_vision": "cohere2_moe",
 }
 
 MAX_FILE_SIZE_GB = 5
