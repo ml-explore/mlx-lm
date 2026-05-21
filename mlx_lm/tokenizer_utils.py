@@ -297,6 +297,7 @@ class TokenizerWrapper:
         tool_call_start=None,
         tool_call_end=None,
         tool_parser=None,
+        tool_parser_type=None,
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
@@ -317,6 +318,7 @@ class TokenizerWrapper:
             tokenizer.chat_template is not None or chat_template is not None
         )
         self._tool_parser = tool_parser
+        self._tool_parser_type = tool_parser_type
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
         self._tool_call_start_tokens = None
@@ -444,6 +446,10 @@ class TokenizerWrapper:
     @property
     def tool_parser(self):
         return self._tool_parser
+
+    @property
+    def tool_parser_type(self):
+        return self._tool_parser_type
 
     @property
     def detokenizer(self):
@@ -641,6 +647,7 @@ def load(
         eos_token_ids=eos_token_ids,
         chat_template=chat_template,
         tool_parser=tool_parser,
+        tool_parser_type=tool_parser_type,
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
     )

@@ -90,10 +90,12 @@ class TestTokenizers(unittest.TestCase):
         self.assertTrue(tokenizer.has_tool_calling)
         self.assertEqual(tokenizer.tool_call_start, "<tool_call>")
         self.assertEqual(tokenizer.tool_call_end, "</tool_call>")
+        self.assertEqual(tokenizer.tool_parser_type, "json_tools")
 
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
         tokenizer = load_tokenizer(tokenizer_repo)
         self.assertFalse(tokenizer.has_tool_calling)
+        self.assertIsNone(tokenizer.tool_parser_type)
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"

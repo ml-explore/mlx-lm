@@ -362,6 +362,14 @@ class ModelProvider:
         self.draft_model = draft_model
         self.is_batchable = is_batchable
 
+        if tokenizer.has_tool_calling:
+            logging.info(f"Tool calling enabled (parser: {tokenizer.tool_parser_type})")
+        elif tokenizer.has_chat_template:
+            logging.info(
+                "Tool calling not detected for this chat template; "
+                "any `tools` field on requests will be ignored."
+            )
+
     def load_default(self):
         if self._model_map["default_model"] is not None:
             self.load("default_model", None, "default_model")
