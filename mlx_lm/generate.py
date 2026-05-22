@@ -1265,16 +1265,21 @@ class GenerationBatch:
         self.prompt_cache = prompt_cache
         self.tokens = tokens
 
-        self.samplers = samplers
+        self.samplers = samplers if samplers else [None] * len(self.uids)
         self.fallback_sampler = fallback_sampler
-        self.logits_processors = logits_processors
+        self.logits_processors = (
+            [processors or [] for processors in logits_processors]
+            if logits_processors
+            else [[] for _ in self.uids]
+        )
         self.state_machines = state_machines
         self.max_tokens = max_tokens
 
-        if self.samplers and len(self.samplers) != len(self.uids):
+        if len(self.samplers) != len(self.uids):
             raise ValueError("Insufficient number of samplers provided")
-        if self.logits_processors and len(self.logits_processors) != len(self.uids):
+        if len(self.logits_processors) != len(self.uids):
             raise ValueError("Insufficient number of logits_processors provided")
+        self._refresh_active_paths()
 
         self._current_tokens = None
         self._current_logprobs = []
@@ -1289,6 +1294,17 @@ class GenerationBatch:
 
     def __len__(self):
         return len(self.uids)
+
+    def _refresh_active_paths(self):
+        self._active_samplers = [
+            sampler or self.fallback_sampler for sampler in self.samplers
+        ]
+        self._sampler_indices = [
+            i for i, sampler in enumerate(self.samplers) if sampler is not None
+        ]
+        self._logits_processor_indices = [
+            i for i, processors in enumerate(self.logits_processors) if processors
+        ]
 
     def extend(self, batch):
         """Extend this batch with another generation batch."""
@@ -1316,6 +1332,7 @@ class GenerationBatch:
         self._token_context.extend(batch._token_context)
         self._num_tokens.extend(batch._num_tokens)
         self._matcher_states.extend(batch._matcher_states)
+        self._refresh_active_paths()
 
     def _step(self) -> Tuple[List[int], List[mx.array]]:
         """
@@ -1334,29 +1351,32 @@ class GenerationBatch:
 
         # Logits processors
         token_context = []
-        if any(self.logits_processors):
+        if self._logits_processor_indices:
             # Update the token context that will be used by the logits processors
-            token_context = [
-                tc.update_and_fetch(inputs[i : i + 1])
-                for i, tc in enumerate(self._token_context)
-            ]
+            token_context_by_index = [None] * len(self.uids)
+            for i in self._logits_processor_indices:
+                token_context_by_index[i] = self._token_context[i].update_and_fetch(
+                    inputs[i : i + 1]
+                )
             processed_logits = []
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
                 for processor in self.logits_processors[e]:
-                    sample_logits = processor(token_context[e], sample_logits)
+                    sample_logits = processor(token_context_by_index[e], sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
+            token_context = [
+                token_context_by_index[i] for i in self._logits_processor_indices
+            ]
 
         # Normalize the logits
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
         # Sample
-        if any(self.samplers):
+        if self._sampler_indices:
             all_samples = []
             for e in range(len(self.uids)):
-                sample_sampler = self.samplers[e] or self.fallback_sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
+                sampled = self._active_samplers[e](logprobs[e : e + 1])
                 all_samples.append(sampled)
             sampled = mx.concatenate(all_samples, axis=0)
         else:
@@ -1389,10 +1409,8 @@ class GenerationBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
-        if any(self.samplers):
-            self.samplers = [self.samplers[idx] for idx in keep]
-        if any(self.logits_processors):
-            self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        self.samplers = [self.samplers[idx] for idx in keep]
+        self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.state_machines = [self.state_machines[idx] for idx in keep]
 
@@ -1401,6 +1419,7 @@ class GenerationBatch:
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matcher_states = [self._matcher_states[idx] for idx in keep]
+        self._refresh_active_paths()
 
     def next(self) -> List[Response]:
         """

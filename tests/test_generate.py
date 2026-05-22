@@ -421,6 +421,40 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(hasattr(seen[0], "shape"))
         self.assertEqual(seen[0].tolist(), prompt)
 
+    def test_batch_generate_with_sparse_logits_processors(self):
+        prompt_without_processor = self.tokenizer.encode("hello")
+        prompt_with_processor = self.tokenizer.encode("world")
+        seen = []
+        bias_processor = make_logits_processors({2: 2000.0})[0]
+
+        def processor(tokens, logits):
+            seen.append(tokens.tolist())
+            return bias_processor(tokens, logits)
+
+        batch_gen = BatchGenerator(self.model, max_tokens=1)
+        uid0 = batch_gen.insert([prompt_without_processor])[0]
+        uid1 = batch_gen.insert(
+            [prompt_with_processor], logits_processors=[[processor]]
+        )[0]
+
+        responses = {r.uid: r for r in batch_gen.next_generated()}
+
+        self.assertEqual(responses[uid1].token, 2)
+        self.assertIn(uid0, responses)
+        self.assertGreaterEqual(len(seen), 1)
+        self.assertTrue(
+            all(
+                tokens[: len(prompt_with_processor)] == prompt_with_processor
+                for tokens in seen
+            )
+        )
+        self.assertFalse(
+            any(
+                tokens[: len(prompt_without_processor)] == prompt_without_processor
+                for tokens in seen
+            )
+        )
+
     def test_batch_generate_function_with_logits_processors(self):
         """Test that batch_generate function with logits_processors produces correct results."""
         logit_bias = {0: 2000.0, 1: -2000.0}
