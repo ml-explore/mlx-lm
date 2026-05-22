@@ -1619,6 +1619,62 @@ class TestModels(unittest.TestCase):
             layer_idx = int(k.split("layers.")[1].split(".")[0])
             self.assertLess(layer_idx, 6)
 
+    def test_gemma4_sanitize_drops_redundant_shared_layer_kv_weights(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            sliding_window=8,
+            sliding_window_pattern=1,
+            layer_types=[
+                "full_attention",
+                "full_attention",
+                "full_attention",
+                "full_attention",
+            ],
+            hidden_size_per_layer_input=0,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            num_kv_shared_layers=2,
+        )
+        model = gemma4_text.Model(args)
+
+        weights = {
+            "model.layers.1.self_attn.k_proj.weight": mx.zeros(
+                (16, 32), dtype=mx.float32
+            ),
+            "model.layers.1.self_attn.v_proj.weight": mx.zeros(
+                (16, 32), dtype=mx.float32
+            ),
+            "model.layers.2.self_attn.q_proj.weight": mx.zeros(
+                (32, 32), dtype=mx.float32
+            ),
+            "model.layers.2.self_attn.k_proj.weight": mx.zeros(
+                (16, 32), dtype=mx.float32
+            ),
+            "model.layers.2.self_attn.v_proj.weight": mx.zeros(
+                (16, 32), dtype=mx.float32
+            ),
+            "model.layers.2.self_attn.k_norm.weight": mx.zeros(
+                (16,), dtype=mx.float32
+            ),
+        }
+
+        sanitized = model.sanitize(weights)
+
+        self.assertIn("model.layers.1.self_attn.k_proj.weight", sanitized)
+        self.assertIn("model.layers.1.self_attn.v_proj.weight", sanitized)
+        self.assertIn("model.layers.2.self_attn.q_proj.weight", sanitized)
+        self.assertNotIn("model.layers.2.self_attn.k_proj.weight", sanitized)
+        self.assertNotIn("model.layers.2.self_attn.v_proj.weight", sanitized)
+        self.assertNotIn("model.layers.2.self_attn.k_norm.weight", sanitized)
+
     def test_gemma4_input_embeddings_reconstruct_per_layer_inputs(self):
         from mlx_lm.models import gemma4_text
 
