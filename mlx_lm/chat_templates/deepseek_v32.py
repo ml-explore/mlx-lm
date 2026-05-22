@@ -331,9 +331,19 @@ def encode_messages(
 
 
 def apply_chat_template(
-    messages, continue_final_message=False, add_generation_prompt=False, **kwargs
+    messages,
+    continue_final_message=False,
+    add_generation_prompt=False,
+    enable_thinking=None,
+    thinking_mode=None,
+    **kwargs,
 ):
-    out = encode_messages(messages, **kwargs)
+    if thinking_mode is None:
+        if enable_thinking is not None:
+            thinking_mode = "thinking" if enable_thinking else "chat"
+        else:
+            thinking_mode = "thinking"
+    out = encode_messages(messages, thinking_mode=thinking_mode, **kwargs)
     if continue_final_message and add_generation_prompt:
         raise ValueError(
             "Only one of continue_final_message or add_generation_prompt can be True"
