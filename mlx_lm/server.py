@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -36,8 +36,10 @@ from ._version import __version__
 from .generate import (
     DEFAULT_DRAFT_TYPE,
     DRAFT_TYPES,
-    NGRAM_SIMPLE_DEFAULT_SIZE,
+    NGRAM_MOD_DEFAULT_SIZE,
+    NGRAM_MOD_DEFAULT_TABLE_SIZE,
     BatchGenerator,
+    NgramModTable,
     SequenceStateMachine,
     stream_generate,
 )
@@ -197,7 +199,7 @@ class GenerationArguments:
     chat_template_kwargs: Optional[Dict[str, Any]]
     draft_type: Optional[str] = None
     disable_adaptive_gate: bool = False
-    ngram_size: int = NGRAM_SIMPLE_DEFAULT_SIZE
+    ngram_size: Optional[int] = None
 
 
 @dataclass
@@ -328,6 +330,32 @@ class ModelProvider:
         }
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
+
+        # Shared ngram-mod hash table (allocated lazily on first request that
+        # uses draft_type=ngram-mod). One per server process — survives across
+        # requests, reset only by the strategy on quality collapse.
+        self._ngram_mod_table: Optional[NgramModTable] = None
+        self._ngram_mod_lock = Lock()
+
+    def get_ngram_mod_table(self, n: int) -> NgramModTable:
+        """Return the process-shared ngram-mod table, allocating it on first
+        use. If a table exists with a different ``n``, it is rebuilt — the
+        hash slots are not portable across different ngram sizes."""
+        with self._ngram_mod_lock:
+            if self._ngram_mod_table is None or self._ngram_mod_table.n != n:
+                size = getattr(
+                    self.cli_args,
+                    "ngram_mod_table_size",
+                    NGRAM_MOD_DEFAULT_TABLE_SIZE,
+                )
+                logging.info(
+                    "Allocating ngram-mod shared table: n=%d size=%d (~%.1f MB)",
+                    n,
+                    size,
+                    (size * 4) / (1024 * 1024),
+                )
+                self._ngram_mod_table = NgramModTable(n=n, size=size)
+            return self._ngram_mod_table
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
@@ -978,6 +1006,17 @@ class ResponseGenerator:
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
+            # For ngram-mod, fetch the process-shared hash table. The table
+            # is sized by ngram_size (per-request override or CLI default).
+            ngram_mod_table = None
+            if args.draft_type == "ngram-mod":
+                n = (
+                    args.ngram_size
+                    if args.ngram_size is not None
+                    else NGRAM_MOD_DEFAULT_SIZE
+                )
+                ngram_mod_table = self.model_provider.get_ngram_mod_table(n)
+
             # Process the prompt and generate tokens
             for gen in stream_generate(
                 model=model,
@@ -992,6 +1031,7 @@ class ResponseGenerator:
                 draft_type=args.draft_type,
                 disable_adaptive_gate=args.disable_adaptive_gate,
                 ngram_size=args.ngram_size,
+                ngram_mod_table=ngram_mod_table,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
@@ -1184,11 +1224,7 @@ class APIHandler(BaseHTTPRequestHandler):
         )
         self.ngram_size = self.body.get(
             "ngram_size",
-            getattr(
-                self.response_generator.cli_args,
-                "ngram_size",
-                NGRAM_SIMPLE_DEFAULT_SIZE,
-            ),
+            getattr(self.response_generator.cli_args, "ngram_size", None),
         )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
@@ -1277,7 +1313,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"draft_type must be one of {DRAFT_TYPES}, got {self.draft_type!r}"
             )
         self._validate("disable_adaptive_gate", bool)
-        self._validate("ngram_size", int, min_val=1)
+        self._validate("ngram_size", int, min_val=1, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
 
@@ -1846,10 +1882,21 @@ def main():
     parser.add_argument(
         "--ngram-size",
         type=int,
-        default=NGRAM_SIMPLE_DEFAULT_SIZE,
+        default=None,
         help=(
-            "Default n-gram window size for ngram-simple lookup. "
+            "Default n-gram window size for the ngram drafter. If unset, "
+            "defaults to 3 for ngram-simple and 16 for ngram-mod. "
             "Per-request overrides via 'ngram_size' in the request body."
+        ),
+    )
+    parser.add_argument(
+        "--ngram-mod-table-size",
+        type=int,
+        default=NGRAM_MOD_DEFAULT_TABLE_SIZE,
+        help=(
+            "Number of entries in the shared ngram-mod hash table. "
+            "Each entry is 4 bytes. Default: 4194304 (~16 MB). "
+            "Allocated once at server startup, shared across requests."
         ),
     )
     parser.add_argument(

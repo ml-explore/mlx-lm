@@ -1,11 +1,14 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import array
 import contextlib
 import copy
 import functools
 import json
+import logging
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -64,6 +67,18 @@ NGRAM_GATE_DEFAULT_SIZE = 3
 # Minimum fraction of n-gram windows in the prompt that must recur for
 # speculation to be worthwhile. Empirically derived placeholder; tune later.
 NGRAM_GATE_THRESHOLD = 0.02
+
+# ngram-mod (rolling-hash drafter, port of llama.cpp common_ngram_mod).
+# Recommended ngram size is >= 16; collisions dominate at small n.
+NGRAM_MOD_DEFAULT_SIZE = 16
+NGRAM_MOD_DEFAULT_TABLE_SIZE = 4 * 1024 * 1024  # 4M entries (~16 MB)
+NGRAM_MOD_HASH_MULTIPLIER = 6364136223846793005  # Knuth LCG multiplier
+NGRAM_MOD_HASH_MASK = 0xFFFFFFFFFFFFFFFF
+NGRAM_MOD_EMPTY = -1
+NGRAM_MOD_CHUNK_GAP = 32  # ingest only when i_last + 32 < cur_len
+NGRAM_MOD_OCCUPANCY_RESET = 0.25
+NGRAM_MOD_LOW_ACCEPT_THRESHOLD = 0.5
+NGRAM_MOD_LOW_ACCEPT_STREAK = 3
 
 
 def str2bool(string):
@@ -251,11 +266,10 @@ def setup_arg_parser():
     parser.add_argument(
         "--ngram-size",
         type=int,
-        default=NGRAM_SIMPLE_DEFAULT_SIZE,
+        default=None,
         help=(
-            "N-gram window size used by ngram-simple to match against "
-            "token history. Lower values match more (noisier), higher "
-            "values match less (stricter). Default: 3."
+            "N-gram window size for the ngram drafter. If unset, defaults "
+            "to 3 for ngram-simple and 16 for ngram-mod."
         ),
     )
     return parser
@@ -715,13 +729,205 @@ class NgramSimpleStrategy:
         return False
 
 
-class NgramModStrategy:
-    """Reserved for the rolling-hash 'ngram-mod' drafter. Not yet implemented."""
+class NgramModTable:
+    """Process-global rolling-hash n-gram table (port of llama.cpp common_ngram_mod).
 
-    def __init__(self, *_, **__):
-        raise NotImplementedError(
-            "draft-type 'ngram-mod' is not implemented yet. Use 'ngram-simple'."
-        )
+    Stores ``hash(ngram[0..n-1]) -> next_token`` in a fixed-size flat array of
+    int32. No tag verification: collisions silently overwrite, and bad lookups
+    just waste a verifier round (the verifier catches them).
+
+    Thread-safety: ``add`` and ``reset`` take a lock. ``get`` reads without a
+    lock — stale reads are harmless because the verifier rejects bad drafts.
+    """
+
+    def __init__(
+        self,
+        n: int = NGRAM_MOD_DEFAULT_SIZE,
+        size: int = NGRAM_MOD_DEFAULT_TABLE_SIZE,
+    ):
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        if size < 1:
+            raise ValueError("size must be >= 1")
+        self._n = n
+        # Signed int32 storage (token ids fit in 31 bits; -1 is the EMPTY
+        # sentinel). ``array.array`` keeps this compact in memory and faster
+        # than a Python list for index/assign.
+        self._entries = array.array("i", [NGRAM_MOD_EMPTY] * size)
+        self._used = 0
+        self._lock = threading.Lock()
+
+    @property
+    def n(self) -> int:
+        return self._n
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    @property
+    def occupancy(self) -> float:
+        return self._used / self.size if self.size else 0.0
+
+    def _idx(self, tokens: Sequence[int]) -> int:
+        """Hash ``tokens[0..n-1]`` to a table slot. Matches llama.cpp idx()."""
+        res = 0
+        for i in range(self._n):
+            res = (res * NGRAM_MOD_HASH_MULTIPLIER + tokens[i]) & NGRAM_MOD_HASH_MASK
+        return res % len(self._entries)
+
+    def add(self, tokens: Sequence[int]) -> None:
+        """Insert ``tokens[0..n-1] -> tokens[n]``.
+
+        ``tokens`` must have at least ``n + 1`` elements.
+        """
+        i = self._idx(tokens)
+        next_tok = int(tokens[self._n])
+        with self._lock:
+            if self._entries[i] == NGRAM_MOD_EMPTY:
+                self._used += 1
+            self._entries[i] = next_tok
+
+    def get(self, tokens: Sequence[int]) -> int:
+        """Return the next-token stored at hash(tokens[0..n-1]) or EMPTY."""
+        i = self._idx(tokens)
+        return self._entries[i]
+
+    def reset(self) -> None:
+        with self._lock:
+            for i in range(len(self._entries)):
+                self._entries[i] = NGRAM_MOD_EMPTY
+            self._used = 0
+
+
+class NgramModStrategy:
+    """Per-request strategy backed by a (potentially shared) :class:`NgramModTable`.
+
+    Maintains request-local state — token history, ingest cursor, and
+    acceptance-streak counters — while delegating the actual lookup memory to
+    the shared table. Multiple concurrent requests can hold their own
+    ``NgramModStrategy`` pointing at the same ``NgramModTable``.
+    """
+
+    def __init__(
+        self,
+        table: NgramModTable,
+        ngram_size: Optional[int] = None,
+        n_min: int = 0,
+    ):
+        if ngram_size is not None and ngram_size != table.n:
+            raise ValueError(
+                f"ngram_size={ngram_size} does not match table.n={table.n}; "
+                "rebuild the table or pass a matching strategy ngram_size."
+            )
+        self.table = table
+        self.ngram_size = table.n
+        self.n_min = max(0, int(n_min))
+        self._history: List[int] = []
+        self._i_last = 0
+        self._n_draft_last = 0
+        self._n_low = 0
+
+    def make_cache(self, model_layers: int, prompt_cache: Optional[List]) -> List:
+        return []
+
+    def prefill(self, y: mx.array, ctx: _DraftContext) -> mx.array:
+        return y
+
+    def observe(self, tokens: Sequence[int]) -> None:
+        """Ingest prompt tokens. Mirrors common_speculative_state_ngram_mod::begin."""
+        self._history.extend(int(t) for t in tokens)
+        self._i_last = 0
+        self._n_draft_last = 0
+        n = self.ngram_size
+        if len(self._history) < n + 1:
+            return
+        # Insert every ngram [i, i+n+1) for i in [0, len - n).
+        for i in range(len(self._history) - n):
+            self.table.add(self._history[i : i + n + 1])
+        self._i_last = len(self._history) - n
+        # Begin-time occupancy reset (matches llama.cpp's f_thold = 0.25).
+        if self.table.occupancy > NGRAM_MOD_OCCUPANCY_RESET:
+            logging.info(
+                "ngram-mod occupancy %.3f exceeds %.2f — resetting shared table",
+                self.table.occupancy,
+                NGRAM_MOD_OCCUPANCY_RESET,
+            )
+            self.table.reset()
+
+    def propose(self, y: mx.array, n: int, ctx: _DraftContext) -> mx.array:
+        """Chunked ingest of new history, then chained hash lookups."""
+        self._n_draft_last = 0
+        if n == 0:
+            return mx.array([], mx.uint32)
+        size = self.ngram_size
+        cur_len = len(self._history)
+        if cur_len < size:
+            return mx.array([], mx.uint32)
+
+        # Chunked insert of newly-accepted tokens (mirrors llama.cpp's `+32`
+        # gate). Insert ngrams [i_last, cur_len - size).
+        if self._i_last + NGRAM_MOD_CHUNK_GAP < cur_len:
+            for i in range(self._i_last, cur_len - size):
+                self.table.add(self._history[i : i + size + 1])
+            self._i_last = cur_len - size
+
+        # Form the initial lookup pattern: last (size) tokens of history.
+        # The C++ code uses prompt_tgt[cur_len - n + 1 ..] plus id_last, which
+        # is exactly the last ``size`` tokens of the running history since
+        # accept() appended id_last for us.
+        pattern: List[int] = list(self._history[cur_len - size :])
+        drafted: List[int] = []
+        for i in range(n):
+            tok = self.table.get(pattern)
+            if tok == NGRAM_MOD_EMPTY:
+                if i < self.n_min:
+                    return mx.array([], mx.uint32)
+                break
+            drafted.append(tok)
+            # Slide window: drop oldest, append the just-looked-up token.
+            pattern.pop(0)
+            pattern.append(tok)
+        if not drafted:
+            return mx.array([], mx.uint32)
+        self._n_draft_last = len(drafted)
+        return mx.array(drafted, mx.uint32)
+
+    def rewind(self, num_draft: int, num_accept: int) -> None:
+        return None
+
+    def accept(self, tokens: List[int]) -> None:
+        """Append accepted tokens to history. Track acceptance fraction and
+        trigger a table reset on sustained low acceptance."""
+        self._history.extend(int(t) for t in tokens)
+        if self._n_draft_last > 0:
+            # tokens may include the verifier's bonus correction; only the
+            # first n_draft_last positions correspond to drafted tokens that
+            # the verifier was asked to confirm.
+            n_accepted_drafts = min(self._n_draft_last, max(0, len(tokens) - 1))
+            f_acc = n_accepted_drafts / self._n_draft_last
+            if f_acc < NGRAM_MOD_LOW_ACCEPT_THRESHOLD:
+                self._n_low += 1
+                if self._n_low >= NGRAM_MOD_LOW_ACCEPT_STREAK:
+                    logging.info(
+                        "ngram-mod low-acceptance streak (%d) — resetting "
+                        "shared table",
+                        self._n_low,
+                    )
+                    self.table.reset()
+                    self._n_low = 0
+            else:
+                self._n_low = 0
+
+    def cache_must_be_trimmable(self) -> bool:
+        return False
+
+    def advances_draft_input(self) -> bool:
+        return False
 
 
 def _process_and_sample_logits(tokens, logits, sampler, logits_processors):
@@ -956,7 +1162,8 @@ def stream_generate(
     draft_type: Optional[str] = None,
     draft_strategy: Optional[DraftStrategy] = None,
     disable_adaptive_gate: bool = False,
-    ngram_size: int = NGRAM_SIMPLE_DEFAULT_SIZE,
+    ngram_size: Optional[int] = None,
+    ngram_mod_table: Optional[NgramModTable] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -983,8 +1190,12 @@ def stream_generate(
         disable_adaptive_gate (bool): Disable the 3-gram repetition gate
           that suppresses ngram speculation on non-repetitive prompts.
           Default: ``False``.
-        ngram_size (int): N-gram window size for ngram-simple lookup.
-          Default: ``3``.
+        ngram_size (Optional[int]): N-gram window size. If ``None``, uses
+          per-strategy defaults (3 for ngram-simple, 16 for ngram-mod).
+        ngram_mod_table (Optional[NgramModTable]): A pre-built shared
+          ngram-mod table to use for ``draft_type="ngram-mod"``. Servers
+          should construct one at startup and pass it here. When ``None``,
+          a fresh per-call table is constructed (CLI/one-shot usage).
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -1031,11 +1242,26 @@ def stream_generate(
                 use_speculation = False
         if use_speculation:
             if draft_type == "ngram-simple":
-                strategy = NgramSimpleStrategy(ngram_size=ngram_size)
+                size = (
+                    ngram_size if ngram_size is not None else NGRAM_SIMPLE_DEFAULT_SIZE
+                )
+                strategy = NgramSimpleStrategy(ngram_size=size)
                 strategy.observe(prompt.tolist())
                 draft_strategy = strategy
             elif draft_type == "ngram-mod":
-                draft_strategy = NgramModStrategy()
+                size = ngram_size if ngram_size is not None else NGRAM_MOD_DEFAULT_SIZE
+                if size < NGRAM_MOD_DEFAULT_SIZE:
+                    logging.warning(
+                        "ngram-mod with n=%d is below recommended %d; "
+                        "draft quality is likely to suffer (see "
+                        "llama.cpp PR 19164).",
+                        size,
+                        NGRAM_MOD_DEFAULT_SIZE,
+                    )
+                table = ngram_mod_table or NgramModTable(n=size)
+                strategy = NgramModStrategy(table)
+                strategy.observe(prompt.tolist())
+                draft_strategy = strategy
 
     if draft_strategy is None:
         kwargs.pop("num_draft_tokens", None)
