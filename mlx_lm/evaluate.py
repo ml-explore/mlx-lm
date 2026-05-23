@@ -32,6 +32,8 @@ DEFAULT_MAX_TOKENS = 8192
 
 def _rstrip_until(s, untils):
     """Limit a string <s> to the first occurrence of any substring in untils."""
+    if not untils:
+        return s
     l = len(s)
     f = [s.find(u) for u in untils]
     f = [l if x < 0 else x for x in f]

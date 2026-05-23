@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 
-from mlx_lm.evaluate import MLXLM
+from mlx_lm.evaluate import MLXLM, _rstrip_until
 
 
 class TestMLXLM(unittest.TestCase):
@@ -53,6 +53,27 @@ class TestMLXLM(unittest.TestCase):
         self.assertEqual(len(call_args_list[0][0][0]), 2)  # First batch: 2 items
         self.assertEqual(len(call_args_list[1][0][0]), 2)  # Second batch: 2 items
         self.assertEqual(len(call_args_list[2][0][0]), 1)  # Third batch: 1 item
+
+
+class TestRstripUntil(unittest.TestCase):
+    def test_returns_input_when_untils_empty(self):
+        """Some lm-eval tasks (e.g. IFEval) pass an empty `until` list. The
+        function previously called min() on the resulting empty list and
+        raised ValueError; it should now return the input unchanged."""
+        self.assertEqual(_rstrip_until("hello world", []), "hello world")
+        self.assertEqual(_rstrip_until("", []), "")
+
+    def test_truncates_at_first_match(self):
+        self.assertEqual(_rstrip_until("abc<stop>def", ["<stop>"]), "abc")
+
+    def test_truncates_at_earliest_of_multiple(self):
+        self.assertEqual(
+            _rstrip_until("abc<a>def<b>ghi", ["<b>", "<a>"]),
+            "abc",
+        )
+
+    def test_returns_input_when_no_match(self):
+        self.assertEqual(_rstrip_until("abcdef", ["xyz"]), "abcdef")
 
 
 if __name__ == "__main__":
