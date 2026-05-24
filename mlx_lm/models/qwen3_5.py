@@ -12,6 +12,7 @@ from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
+    warn_discarded_weights,
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
@@ -310,7 +311,12 @@ class TextModel(nn.Module):
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
         should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
+        n_mtp_weights = sum(1 for k in weights if "mtp." in k) if has_mtp_weights else 0
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
+
+        warn_discarded_weights(
+            n_mtp_weights, feature_name="MTP", model_name=self.model_type
+        )
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)

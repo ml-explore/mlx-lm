@@ -2,13 +2,18 @@
 import copy
 import importlib
 import unittest
+import warnings
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
-from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
+from mlx_lm.models.base import (
+    create_causal_mask,
+    scaled_dot_product_attention,
+    warn_discarded_weights,
+)
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
@@ -3219,6 +3224,27 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+    def test_no_warning_when_zero(self):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            warn_discarded_weights(0)
+            self.assertEqual(len(w), 0)
+
+    def test_warns_with_count(self):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            warn_discarded_weights(5, feature_name="MTP")
+            self.assertEqual(len(w), 1)
+            self.assertIn("5 MTP weight tensor", str(w[0].message))
+            self.assertIs(w[0].category, UserWarning)
+
+    def test_includes_model_name(self):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            warn_discarded_weights(3, feature_name="MTP", model_name="qwen3_5")
+            self.assertEqual(len(w), 1)
+            self.assertIn("qwen3_5", str(w[0].message))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+import warnings
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -135,3 +136,35 @@ def scaled_dot_product_attention(
             mask=mask,
             sinks=sinks,
         )
+
+def warn_discarded_weights(
+    n_discarded: int,
+    feature_name: str = "MTP",
+    model_name: Optional[str] = None,
+) -> None:
+    """Emit a one-time warning when feature-specific weights are dropped at loading time.
+
+    Some model checkpoints (e.g., Multi-Token Prediction variants) ship with
+    additional weight tensors that are discarded during loading because mlx-lm
+    does not currently use them at runtime. This warning surfaces the
+    discrepancy at load time so downstream benchmarks can interpret results
+    correctly.
+
+    Args:
+        n_discarded: Number of weight tensors filtered out by the caller.
+          The warning is only emitted when this is +ive.
+        feature_name: Name of the discarded feature.
+          Defaults to "MTP".
+        model_name: Optional.
+    """
+    if n_discarded <= 0:
+        return
+    suffix = f" for model '{model_name}'" if model_name else ""
+    warnings.warn(
+        f"Loaded {n_discarded} {feature_name} weight tensor(s){suffix}, "
+        f"discarded at runtime — mlx-lm does not currently support "
+        f"{feature_name}. The model will run as a standard autoregressive "
+        f"model.",
+        UserWarning,
+        stacklevel=2,  # warning come from the model file, not from base.py
+    )
