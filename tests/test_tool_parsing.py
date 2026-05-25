@@ -197,6 +197,34 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_unparseable_params(self):
+        # When the schema declares a typed field but the model emits a value
+        # that cannot be coerced into that type (e.g. an ISO 8601 date for an
+        # `integer` field, natural-language text for an `array` field), fall
+        # back to the raw string instead of raising and dropping the tool call.
+        cases = [
+            ("object", "when", "2026-01-15T10:30:00Z", "2026-01-15T10:30:00Z"),
+            ("array", "note", "Alex has written several books.", "Alex has written several books."),
+            ("datetime", "when", "2026-01-15T10:30:00Z", "2026-01-15T10:30:00Z"),
+            ("integer", "day", "2026-01-15", "2026-01-15"),
+            ("number", "ratio", "about three", "about three"),
+        ]
+        for ptype, pname, value, expected in cases:
+            with self.subTest(type=ptype):
+                tools = [{
+                    "type": "function",
+                    "function": {
+                        "name": "log_event",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {pname: {"type": ptype}},
+                        },
+                    },
+                }]
+                xml = f"<function=log_event><parameter={pname}>{value}</parameter></function>"
+                tool_call = qwen3_coder.parse_tool_call(xml, tools)
+                self.assertEqual(tool_call["arguments"][pname], expected)
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
