@@ -363,6 +363,9 @@ def load_model(
         )
 
     if (quantization := config.get("quantization", None)) is not None:
+        if hasattr(model, "sanitize_quantization"):
+            quantization = model.sanitize_quantization(quantization)
+            config["quantization"] = quantization
         _quantize(quantization)
 
     elif quantization_config := config.get("quantization_config", False):

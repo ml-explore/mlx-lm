@@ -397,6 +397,23 @@ class Model(nn.Module):
             sanitized[key] = value
         return self.language_model.sanitize(sanitized)
 
+    def sanitize_quantization(self, quant_config):
+        remapped = {}
+        for key, value in quant_config.items():
+            if key in ("bits", "group_size", "mode"):
+                remapped[key] = value
+                continue
+            if key.startswith("vision_tower") or key.startswith("model.visual"):
+                continue
+            if key.startswith("model.language_model"):
+                new_key = key.replace("model.language_model", "language_model.model")
+            elif key.startswith("language_model."):
+                new_key = key
+            else:
+                new_key = "language_model." + key
+            remapped[new_key] = value
+        return remapped
+
     def shard(self, group=None):
         group = group or mx.distributed.init()
         N = group.size()
