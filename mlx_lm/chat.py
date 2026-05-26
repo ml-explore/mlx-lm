@@ -1,9 +1,16 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import sys
 
 import mlx.core as mx
 
+from .cli_ui import (
+    make_console,
+    make_corridor_prompt,
+    print_chat_help,
+    print_header_panel,
+)
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
@@ -16,6 +23,19 @@ DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+
+
+def _print_chat_header(args, console):
+    rows = [("model", str(args.model))]
+    if args.adapter_path:
+        rows.append(("adapter", str(args.adapter_path)))
+    rows.append(("max tokens", f"{args.max_tokens:,}"))
+    if args.system_prompt:
+        sp = args.system_prompt
+        if len(sp) > 60:
+            sp = sp[:57] + "..."
+        rows.append(("system", sp))
+    print_header_panel(console, "mlx_lm.chat", rows)
 
 
 def setup_arg_parser():
@@ -96,6 +116,8 @@ def main():
     pipeline_group = group if args.pipeline else None
     tensor_group = group if not args.pipeline else None
 
+    console = make_console()
+
     def rprint(*args, **kwargs):
         if rank == 0:
             print(*args, **kwargs)
@@ -115,24 +137,38 @@ def main():
             },
         )
 
-    def print_help():
-        rprint("The command list:")
-        rprint("- 'q' to exit")
-        rprint("- 'r' to reset the chat")
-        rprint("- 'h' to display these commands")
+    if rank == 0:
+        _print_chat_header(args, console)
+        print_chat_help(console)
 
-    rprint(f"[INFO] Starting chat session with {args.model}.")
-    print_help()
+    if rank == 0:
+        prompt_console = make_console(force_terminal=True, color_system="truecolor")
+        _draw_corridor_prompt = make_corridor_prompt(prompt_console)
+    else:
+        _draw_corridor_prompt = lambda: ""
+
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
     while True:
-        query = input(">> " if rank == 0 else "")
+        prompt = _draw_corridor_prompt()
+        query = input(prompt)
+        if rank == 0:
+            # Cursor is now on the bottom-rule row; advance past it.
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         if query == "q":
+            if rank == 0:
+                console.print("[ui.muted]bye[/ui.muted]")
             break
         if query == "r":
             prompt_cache = make_prompt_cache(model, args.max_kv_size)
+            if rank == 0:
+                console.print(
+                    "  [ui.good]reset[/ui.good] [ui.muted]context cleared[/ui.muted]"
+                )
             continue
         if query == "h":
-            print_help()
+            if rank == 0:
+                print_chat_help(console)
             continue
         messages = []
         if args.system_prompt is not None:
@@ -142,6 +178,7 @@ def main():
             messages,
             add_generation_prompt=True,
         )
+        last_response = None
         for response in stream_generate(
             model,
             tokenizer,
@@ -159,7 +196,15 @@ def main():
             prompt_cache=prompt_cache,
         ):
             rprint(response.text, flush=True, end="")
+            last_response = response
         rprint()
+        if rank == 0 and last_response is not None:
+            console.print(
+                f"  [ui.muted]{last_response.generation_tokens} tokens · "
+                f"{last_response.generation_tps:.1f} tok/s · "
+                f"prompt {last_response.prompt_tps:.1f} tok/s · "
+                f"peak {last_response.peak_memory:.2f} GB[/ui.muted]"
+            )
 
 
 if __name__ == "__main__":

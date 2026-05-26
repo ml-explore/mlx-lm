@@ -13,6 +13,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
+from ..cli_ui import make_console, make_train_progress
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
@@ -182,6 +183,8 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
     clear_cache_threshold: int = 0,
+    progress: bool = True,
+    batch_callback: callable = None,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -189,24 +192,30 @@ def evaluate(
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
-    for _, batch in tqdm(
-        zip(
-            index_iterator,
-            iterate_batches(
-                dataset=dataset,
-                batch_size=batch_size,
-                max_seq_length=max_seq_length,
-                comm_group=mx.distributed.init(),
-            ),
+    batch_iter = zip(
+        index_iterator,
+        iterate_batches(
+            dataset=dataset,
+            batch_size=batch_size,
+            max_seq_length=max_seq_length,
+            comm_group=mx.distributed.init(),
         ),
-        desc="Calculating loss...",
-        total=min(len(dataset) // batch_size, num_batches),
-    ):
+    )
+    if progress:
+        batch_iter = tqdm(
+            batch_iter,
+            desc="Calculating loss...",
+            total=min(len(dataset) // batch_size, num_batches),
+        )
+
+    for _, batch in batch_iter:
         losses, toks = loss(model, *batch)
         all_losses += losses * toks
         ntokens += toks
         mx.eval(all_losses, ntokens)
         _clear_cache(clear_cache_threshold)
+        if batch_callback is not None:
+            batch_callback()
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
@@ -227,12 +236,13 @@ def train(
 ):
     if mx.metal.is_available():
         mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
-    print(f"Starting training..., iters: {args.iters}")
     world = mx.distributed.init()
     world_size = world.size()
     rank = world.rank()
-    if world_size > 1:
-        print(f"Node {rank} of {world_size}")
+
+    console = make_console()
+    if rank == 0 and world_size > 1:
+        console.print(f"[ui.muted]node {rank} of {world_size}[/ui.muted]")
 
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
@@ -269,119 +279,153 @@ def train(
     train_time = 0
     grad_accum = None
 
-    # Main training loop
-    for it, batch in zip(
-        range(1, args.iters + 1),
-        iterate_batches(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            max_seq_length=args.max_seq_length,
-            loop=True,
-            comm_group=world,
-        ),
-    ):
-        tic = time.perf_counter()
-        # Report validation loss if needed, the first validation loss
-        # is always measured before any training.
-        if val_dataset and (
-            it == 1 or it % args.steps_per_eval == 0 or it == args.iters
+    progress = make_train_progress(console, disable=(rank != 0))
+    task = progress.add_task("train", total=args.iters)
+
+    if rank == 0:
+        console.print(
+            "  [ui.heading]iter   train_loss     tok/s     tokens[/ui.heading]"
+        )
+    progress.start()
+
+    prev_train_loss = None
+    try:
+        # Main training loop
+        for it, batch in zip(
+            range(1, args.iters + 1),
+            iterate_batches(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                max_seq_length=args.max_seq_length,
+                loop=True,
+                comm_group=world,
+            ),
         ):
             tic = time.perf_counter()
-            val_loss = evaluate(
-                model=model,
-                dataset=val_dataset,
-                loss=loss,
-                batch_size=args.batch_size,
-                num_batches=args.val_batches,
-                max_seq_length=args.max_seq_length,
-                iterate_batches=iterate_batches,
-            )
-            model.train()
-            val_time = time.perf_counter() - tic
-            if rank == 0:
-                print(
-                    f"Iter {it}: "
-                    f"Val loss {val_loss:.3f}, "
-                    f"Val took {val_time:.3f}s",
-                    flush=True,
+            # Run validation periodically (skip iter 1).
+            if val_dataset and (it % args.steps_per_eval == 0 or it == args.iters):
+                if args.val_batches == -1:
+                    val_total = len(val_dataset) // args.batch_size
+                else:
+                    val_total = min(
+                        len(val_dataset) // args.batch_size, args.val_batches
+                    )
+                val_task = (
+                    progress.add_task("[bold blue]val  [/bold blue]", total=val_total)
+                    if rank == 0
+                    else None
                 )
 
-            if training_callback is not None:
-                val_info = {
-                    "iteration": it - 1,
-                    "val_loss": val_loss,
-                    "val_time": val_time,
-                }
-                training_callback.on_val_loss_report(val_info)
+                def _advance_val():
+                    if val_task is not None:
+                        progress.advance(val_task)
 
-            tic = time.perf_counter()
-
-        lvalue, toks, grad_accum = step(
-            batch,
-            grad_accum,
-            it % grad_accum_steps == 0,
-        )
-
-        losses += lvalue
-        n_tokens += toks
-        steps += 1
-        mx.eval(state, losses, n_tokens, grad_accum)
-        _clear_cache(args.clear_cache_threshold)
-        train_time += time.perf_counter() - tic
-
-        # Report training loss if needed
-        if it % args.steps_per_report == 0 or it == args.iters:
-            train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
-            train_loss /= steps * world_size
-            n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
-            learning_rate = optimizer.learning_rate.item()
-            it_sec = args.steps_per_report / train_time
-            tokens_sec = float(n_tokens) / train_time
-            trained_tokens += n_tokens
-            peak_mem = mx.get_peak_memory() / 1e9
-            if rank == 0:
-                print(
-                    f"Iter {it}: Train loss {train_loss:.3f}, "
-                    f"Learning Rate {learning_rate:.3e}, "
-                    f"It/sec {it_sec:.3f}, "
-                    f"Tokens/sec {tokens_sec:.3f}, "
-                    f"Trained Tokens {trained_tokens}, "
-                    f"Peak mem {peak_mem:.3f} GB",
-                    flush=True,
+                tic = time.perf_counter()
+                val_loss = evaluate(
+                    model=model,
+                    dataset=val_dataset,
+                    loss=loss,
+                    batch_size=args.batch_size,
+                    num_batches=args.val_batches,
+                    max_seq_length=args.max_seq_length,
+                    iterate_batches=iterate_batches,
+                    progress=False,
+                    batch_callback=_advance_val,
                 )
+                model.train()
+                val_time = time.perf_counter() - tic
+                if val_task is not None:
+                    progress.remove_task(val_task)
+                if rank == 0:
+                    progress.console.print(
+                        f"  [ui.muted]{it:>4}[/ui.muted]    "
+                        f"[ui.accent]val[/ui.accent] "
+                        f"[ui.strong]{val_loss:>5.3f}[/ui.strong]    "
+                        f"[ui.muted]({val_time:.2f}s)[/ui.muted]"
+                    )
 
-            if training_callback is not None:
-                train_info = {
-                    "iteration": it,
-                    "train_loss": train_loss,
-                    "learning_rate": learning_rate,
-                    "iterations_per_second": it_sec,
-                    "tokens_per_second": tokens_sec,
-                    "trained_tokens": trained_tokens,
-                    "peak_memory": peak_mem,
-                }
-                training_callback.on_train_loss_report(train_info)
+                if training_callback is not None:
+                    val_info = {
+                        "iteration": it - 1,
+                        "val_loss": val_loss,
+                        "val_time": val_time,
+                    }
+                    training_callback.on_val_loss_report(val_info)
 
-            losses = 0
-            n_tokens = 0
-            steps = 0
-            train_time = 0
+                tic = time.perf_counter()
 
-        # Save adapter weights
-        if it % args.steps_per_save == 0 and rank == 0:
-            adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-            mx.save_safetensors(str(args.adapter_file), adapter_weights)
-            checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+            lvalue, toks, grad_accum = step(
+                batch,
+                grad_accum,
+                it % grad_accum_steps == 0,
             )
-            mx.save_safetensors(str(checkpoint), adapter_weights)
-            print(
-                f"Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}."
-            )
+
+            losses += lvalue
+            n_tokens += toks
+            steps += 1
+            mx.eval(state, losses, n_tokens, grad_accum)
+            _clear_cache(args.clear_cache_threshold)
+            train_time += time.perf_counter() - tic
+
+            progress.advance(task)
+
+            # Report training loss if needed
+            if it % args.steps_per_report == 0 or it == args.iters:
+                train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
+                train_loss /= steps * world_size
+                n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+                learning_rate = optimizer.learning_rate.item()
+                it_sec = args.steps_per_report / train_time
+                tokens_sec = float(n_tokens) / train_time
+                trained_tokens += n_tokens
+                peak_mem = mx.get_peak_memory() / 1e9
+                if rank == 0:
+                    if prev_train_loss is None or train_loss <= prev_train_loss:
+                        arrow, arrow_style = "▼", "green"
+                    else:
+                        arrow, arrow_style = "▲", "yellow"
+                    prev_train_loss = train_loss
+                    progress.console.print(
+                        f"  [ui.muted]{it:>4}[/ui.muted]    "
+                        f"[bold {arrow_style}]{train_loss:>5.3f} {arrow}"
+                        f"[/bold {arrow_style}]    "
+                        f"[ui.strong]{tokens_sec:>5,.0f}[/ui.strong]    "
+                        f"[ui.muted]{trained_tokens / 1000:>5.1f}k[/ui.muted]"
+                    )
+
+                if training_callback is not None:
+                    train_info = {
+                        "iteration": it,
+                        "train_loss": train_loss,
+                        "learning_rate": learning_rate,
+                        "iterations_per_second": it_sec,
+                        "tokens_per_second": tokens_sec,
+                        "trained_tokens": trained_tokens,
+                        "peak_memory": peak_mem,
+                    }
+                    training_callback.on_train_loss_report(train_info)
+
+                losses = 0
+                n_tokens = 0
+                steps = 0
+                train_time = 0
+
+            # Save adapter weights
+            if it % args.steps_per_save == 0 and rank == 0:
+                adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+                mx.save_safetensors(str(args.adapter_file), adapter_weights)
+                checkpoint = (
+                    Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+                )
+                mx.save_safetensors(str(checkpoint), adapter_weights)
+                progress.console.print(
+                    f"  [ui.good]save[/ui.good]  "
+                    f"[ui.muted]{checkpoint.name}[/ui.muted]"
+                )
+    finally:
+        progress.stop()
 
     # Save final weights
     if rank == 0:
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
-        print(f"Saved final weights to {args.adapter_file}.")

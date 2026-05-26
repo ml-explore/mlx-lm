@@ -12,6 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
+from .cli_ui import make_console, print_header_panel
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
@@ -291,6 +292,8 @@ def train_model(
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
+    _print_run_header(args)
+
     # Train model
     train(
         model=model,
@@ -300,6 +303,32 @@ def train_model(
         val_dataset=CacheDataset(valid_set),
         training_callback=training_callback,
     )
+
+
+def _print_run_header(args):
+    type_label = args.fine_tune_type
+    if args.fine_tune_type in ("lora", "dora"):
+        rank = args.lora_parameters.get("rank", "?")
+        type_label = f"{args.fine_tune_type} · {args.num_layers} layers · rank {rank}"
+    elif args.fine_tune_type == "full":
+        type_label = f"full · {args.num_layers} layers"
+
+    lr = (
+        args.learning_rate
+        if isinstance(args.learning_rate, (int, float))
+        else "schedule"
+    )
+    lr_str = f"{lr:.1e}" if isinstance(lr, (int, float)) else lr
+
+    rows = [
+        ("model", str(args.model)),
+        ("type", type_label),
+        ("dataset", str(args.data)),
+        ("optimizer", f"{args.optimizer} · lr {lr_str}"),
+        ("batch · iters", f"{args.batch_size} · {args.iters:,}"),
+        ("max seq", f"{args.max_seq_length:,}"),
+    ]
+    print_header_panel(make_console(), "mlx_lm.lora", rows)
 
 
 def evaluate_model(args, model: nn.Module, test_set):
