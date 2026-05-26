@@ -70,6 +70,9 @@ CONFIG_DEFAULTS = {
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
     "clear_cache_threshold": 0,
+    "wired_limit_ratio": 1.0,
+    "memory_limit_ratio": None,
+    "cache_limit_ratio": None,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -210,6 +213,35 @@ def build_parser():
         help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+    parser.add_argument(
+        "--wired-limit-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of max_recommended_working_set_size used as the wired "
+            "memory limit on Metal. Default is 1.0; try 0.9 if training "
+            "causes high memory pressure or system instability."
+        ),
+    )
+    parser.add_argument(
+        "--memory-limit-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of max_recommended_working_set_size used as the total "
+            "memory limit on Metal. Unset uses MLX's default."
+        ),
+    )
+    parser.add_argument(
+        "--cache-limit-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of max_recommended_working_set_size used as the "
+            "allocator cache limit on Metal. Lower values (e.g. 0.5) or 0.0 "
+            "reduce memory growth during training at a modest perf cost."
+        ),
+    )
     return parser
 
 
@@ -268,7 +300,11 @@ def train_model(
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
+        clear_cache_threshold=args.clear_cache_threshold,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        wired_limit_ratio=args.wired_limit_ratio,
+        memory_limit_ratio=args.memory_limit_ratio,
+        cache_limit_ratio=args.cache_limit_ratio,
     )
 
     # Initialize the selected optimizer

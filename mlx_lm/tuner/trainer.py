@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -79,6 +80,37 @@ class TrainingArgs:
         default=0,
         metadata={
             "help": "Clear the allocator cache between steps if it grows too large."
+        },
+    )
+    wired_limit_ratio: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Fraction of max_recommended_working_set_size used as the "
+                "wired memory limit on Metal. Lower this (e.g. 0.9) if "
+                "training causes high memory pressure or system instability."
+            )
+        },
+    )
+    memory_limit_ratio: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional fraction of max_recommended_working_set_size used "
+                "as the total memory limit on Metal. If unset, MLX's default "
+                "(~1.5x the wired limit) is used."
+            )
+        },
+    )
+    cache_limit_ratio: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional fraction of max_recommended_working_set_size used "
+                "as the allocator cache limit on Metal. Lowering this "
+                "(e.g. 0.5) or setting it to 0 reduces memory growth during "
+                "training at a modest performance cost."
+            )
         },
     )
 
@@ -225,14 +257,41 @@ def train(
     iterate_batches: callable = iterate_batches,
     training_callback: TrainingCallback = None,
 ):
-    if mx.metal.is_available():
-        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     print(f"Starting training..., iters: {args.iters}")
     world = mx.distributed.init()
     world_size = world.size()
     rank = world.rank()
     if world_size > 1:
         print(f"Node {rank} of {world_size}")
+
+    if mx.metal.is_available():
+        # mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+        max_recommended = mx.device_info()["max_recommended_working_set_size"]
+        wired_limit = int(max_recommended * args.wired_limit_ratio)
+        mx.set_wired_limit(wired_limit)
+        if rank == 0:
+            print(
+                f"Setting wired limit to {wired_limit / 1e9:.2f} GB",
+                flush=True,
+            )
+
+        if args.memory_limit_ratio is not None:
+            memory_limit = int(max_recommended * args.memory_limit_ratio)
+            mx.set_memory_limit(memory_limit)
+            if rank == 0:
+                print(
+                    f"Setting memory limit to {memory_limit / 1e9:.2f} GB",
+                    flush=True,
+                )
+
+        if args.cache_limit_ratio is not None:
+            cache_limit = int(max_recommended * args.cache_limit_ratio)
+            mx.set_cache_limit(cache_limit)
+            if rank == 0:
+                print(
+                    f"Setting cache limit to {cache_limit / 1e9:.2f} GB",
+                    flush=True,
+                )
 
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
@@ -300,9 +359,7 @@ def train(
             val_time = time.perf_counter() - tic
             if rank == 0:
                 print(
-                    f"Iter {it}: "
-                    f"Val loss {val_loss:.3f}, "
-                    f"Val took {val_time:.3f}s",
+                    f"Iter {it}: Val loss {val_loss:.3f}, Val took {val_time:.3f}s",
                     flush=True,
                 )
 
