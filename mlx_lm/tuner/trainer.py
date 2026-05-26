@@ -13,7 +13,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
-from ..cli_ui import init_theme, make_console, make_train_progress
+from ..cli_ui import make_console, make_train_progress
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
@@ -240,7 +240,6 @@ def train(
     world_size = world.size()
     rank = world.rank()
 
-    init_theme(probe=(rank == 0))
     console = make_console()
     if rank == 0 and world_size > 1:
         console.print(f"[ui.muted]node {rank} of {world_size}[/ui.muted]")

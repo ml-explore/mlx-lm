@@ -3,15 +3,13 @@
 """Shared UI helpers for the mlx_lm command-line tools.
 
 Centralizes the rich-based panel/progress/prompt rendering used by the chat
-and training entry points and exposes an adaptive theme so the same markup
-reads well on both light and dark terminal backgrounds.
+and training entry points. The theme is hardcoded for a light terminal
+background.
 """
 
-import os
 import re
 import shutil
 import sys
-import time
 
 from rich.box import ROUNDED
 from rich.console import Console
@@ -27,201 +25,14 @@ from rich.text import Text
 from rich.theme import Theme
 
 
-def _is_distributed_non_root() -> bool:
-    """True when running as a non-rank-0 worker under a launcher.
-
-    We use environment variables exported by common launchers (mlx.launch,
-    OpenMPI, MPICH, SLURM, torchrun) instead of ``mlx.distributed`` so this
-    module stays independent of the heavy mlx import path.
-    """
-    for var in (
-        "OMPI_COMM_WORLD_RANK",
-        "PMI_RANK",
-        "PMIX_RANK",
-        "SLURM_PROCID",
-        "RANK",
-    ):
-        value = os.environ.get(var)
-        if value and value.strip() != "0":
-            return True
-    return False
-
-
-def _running_under_launcher() -> bool:
-    """True when any multi-process launcher signature is detected.
-
-    We can't reliably tell our rank from env vars alone (different launchers
-    use different keys). When this returns True we skip auto-detection at
-    import time and wait for the caller to opt in via :func:`init_theme`.
-    """
-    explicit = {
-        "WORLD_SIZE",
-        "LOCAL_RANK",
-        "RANK",
-        "PMI_RANK",
-        "PMIX_RANK",
-        "SLURM_PROCID",
-        "OMPI_COMM_WORLD_SIZE",
-    }
-    if any(k in os.environ for k in explicit):
-        return True
-    prefixes = ("OMPI_", "PMI_", "PMIX_", "SLURM_", "MLX_LAUNCH")
-    for k in os.environ:
-        if k.startswith(prefixes):
-            return True
-    return False
-
-
-def _osc11_to_rgb(timeout: float = 0.5):
-    """Ask the terminal for its background color via OSC 11.
-
-    Returns an (r, g, b) tuple in the 0-255 range, or None if the terminal
-    does not respond (non-TTY, unsupported terminal, redirected stdio,
-    non-rank-0 in a distributed launch, ...). The default timeout is generous
-    enough to survive an SSH round trip.
-    """
-    # In a distributed launch, all ranks share the same TTY. If every worker
-    # sends an OSC query, only one read wins and the rest of the responses
-    # leak onto the screen. Skip the probe on non-root ranks.
-    if _is_distributed_non_root():
-        return None
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return None
-    try:
-        import select
-        import termios
-        import tty
-    except ImportError:
-        return None  # Windows / restricted environments
-
-    fd = sys.stdin.fileno()
-    try:
-        saved = termios.tcgetattr(fd)
-    except termios.error:
-        return None
-
-    try:
-        tty.setraw(fd)
-        sys.stdout.write("\033]11;?\033\\")
-        sys.stdout.flush()
-
-        deadline = time.monotonic() + timeout
-        buf = b""
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if not select.select([fd], [], [], remaining)[0]:
-                break
-            chunk = os.read(fd, 64)
-            if not chunk:
-                break
-            buf += chunk
-            if buf.endswith(b"\x07") or buf.endswith(b"\x1b\\"):
-                break
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-
-    match = re.search(rb"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", buf)
-    if not match:
-        return None
-
-    def _to_byte(hex_bytes: bytes) -> int:
-        # OSC 11 components are typically 4 hex digits (16-bit) but some
-        # terminals reply with 2. Normalize to 8 bits by scaling.
-        digits = hex_bytes.decode("ascii")
-        value = int(digits, 16)
-        full = (1 << (4 * len(digits))) - 1
-        return round(value * 255 / full) if full else 0
-
-    return tuple(_to_byte(g) for g in match.groups())
-
-
-def _detect_dark_background() -> bool:
-    override = os.environ.get("MLX_LM_THEME", "").strip().lower()
-    if override in ("dark", "light"):
-        return override == "dark"
-
-    rgb = _osc11_to_rgb()
-    if rgb is not None:
-        r, g, b = rgb
-        # Perceived luminance (Rec. 601). < 128 ≈ dark background.
-        return (0.299 * r + 0.587 * g + 0.114 * b) < 128
-
-    # COLORFGBG is "fg;bg" or "fg;default;bg" with ANSI color indices.
-    cfb = os.environ.get("COLORFGBG", "")
-    if cfb:
-        last = cfb.split(";")[-1].strip()
-        try:
-            bg = int(last)
-            # 0-6 are the dim base colors and 8 is dark grey; 7 and 9-15
-            # are the bright/light variants.
-            return bg in (0, 1, 2, 3, 4, 5, 6, 8)
-        except ValueError:
-            pass
-
-    # No signal from the terminal — assume dark, which is the modern default.
-    return True
-
-
-# Lazy theme state. We avoid auto-detecting at import time when running under
-# a multi-process launcher because every worker would otherwise emit an OSC
-# query against the shared terminal, leaking the responses to the screen.
-# Single-process callers fall through to auto-detection on first use.
-_is_dark = True
-_is_dark_initialized = False
-
-
-def init_theme(probe: bool = True) -> None:
-    """Initialize the terminal theme.
-
-    Pass ``probe=False`` on non-root ranks of distributed launches so the
-    theme gets marked as initialized without sending an OSC query that would
-    leak its response onto the shared terminal.
-    """
-    global _is_dark, _is_dark_initialized
-    _is_dark_initialized = True
-    if probe:
-        _is_dark = _detect_dark_background()
-
-
-def _ensure_theme_initialized() -> None:
-    global _is_dark_initialized
-    if _is_dark_initialized:
-        return
-    if _running_under_launcher():
-        # Caller hasn't opted in via init_theme(); stay on the default theme
-        # rather than risk a probe across all ranks.
-        _is_dark_initialized = True
-        return
-    init_theme(probe=True)
-
-
-def is_dark_background() -> bool:
-    """Whether the active theme is for a dark terminal background."""
-    _ensure_theme_initialized()
-    return _is_dark
-
-
 def _make_theme() -> Theme:
-    if is_dark_background():
-        styles = {
-            "ui.strong": "bold white",
-            "ui.label": "grey70",
-            "ui.muted": "grey62",
-            "ui.heading": "bold grey62",
-            "ui.dim": "grey50",
-        }
-    else:
-        styles = {
+    return Theme(
+        {
             "ui.strong": "bold #000000",
             "ui.label": "#2a2a2a",
             "ui.muted": "grey42",
             "ui.heading": "bold #1a1a1a",
             "ui.dim": "grey62",
-        }
-    styles.update(
-        {
             "ui.accent": "bold purple",
             "ui.border": "blue",
             "ui.good": "bold green",
@@ -231,14 +42,11 @@ def _make_theme() -> Theme:
             "progress.percentage": "bold blue",
         }
     )
-    return Theme(styles)
 
 
 def make_console(**kwargs) -> Console:
-    """Return a rich Console pre-loaded with the adaptive mlx_lm theme."""
+    """Return a rich Console pre-loaded with the mlx_lm theme."""
     kwargs.setdefault("highlight", False)
-    # Force truecolor so hex values in the theme survive instead of being
-    # downgraded to ANSI colors that the terminal may remap.
     kwargs.setdefault("color_system", "truecolor")
     return Console(theme=_make_theme(), **kwargs)
 
