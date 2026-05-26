@@ -15,6 +15,11 @@ from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
 
+def printf(*args, **kwargs):
+    if mx.distributed.init().rank() == 0:
+        print(*args, **kwargs)
+
+
 def build_schedule(schedule_config: Dict):
     """
     Build a learning rate schedule from the given config.
@@ -162,7 +167,7 @@ def print_trainable_parameters(model):
     trainable_p = (
         sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 1e6
     )
-    print(
+    printf(
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
         f"({trainable_p:.3f}M/{total_p:.3f}M)"
     )

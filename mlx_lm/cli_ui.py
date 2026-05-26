@@ -7,6 +7,7 @@ and training entry points. The theme is hardcoded for a light terminal
 background.
 """
 
+import os
 import re
 import shutil
 import sys
@@ -18,11 +19,25 @@ from rich.progress import (
     Progress,
     ProgressColumn,
     TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
 )
 from rich.text import Text
 from rich.theme import Theme
+
+
+def _terminal_width(default: int = 120) -> int:
+    """Best-effort terminal width.
+
+    Under launchers like ``mlx.launch`` the worker's stdout is a pipe, so
+    Rich's auto-detection falls back to 80 columns. Honor an explicit
+    ``MLX_LM_WIDTH`` override, then ``COLUMNS``, then a real TTY query, and
+    finally a generous default that's nicer than 80 on modern terminals.
+    """
+    for var in ("MLX_LM_WIDTH", "COLUMNS"):
+        value = os.environ.get(var)
+        if value and value.isdigit():
+            return int(value)
+    width = shutil.get_terminal_size(fallback=(0, 0)).columns
+    return width if width > 0 else default
 
 
 def _make_theme() -> Theme:
@@ -37,8 +52,6 @@ def _make_theme() -> Theme:
             "ui.border": "blue",
             "ui.good": "bold green",
             "ui.warn": "yellow",
-            "progress.elapsed": "default",
-            "progress.remaining": "default",
             "progress.percentage": "bold blue",
         }
     )
@@ -48,6 +61,7 @@ def make_console(**kwargs) -> Console:
     """Return a rich Console pre-loaded with the mlx_lm theme."""
     kwargs.setdefault("highlight", False)
     kwargs.setdefault("color_system", "truecolor")
+    kwargs.setdefault("width", _terminal_width())
     return Console(theme=_make_theme(), **kwargs)
 
 
@@ -98,7 +112,7 @@ def make_corridor_prompt(console: Console):
         return _ANSI_RE.sub(lambda m: f"\x01{m.group(0)}\x02", text)
 
     def _draw() -> str:
-        width = shutil.get_terminal_size((80, 24)).columns
+        width = console.width
         dashes = "─" * max(width - 1, 10)
         with console.capture() as cap:
             console.print(f"[ui.muted]{dashes}[/ui.muted]")
@@ -152,10 +166,6 @@ def make_train_progress(console: Console, *, disable: bool = False) -> Progress:
             "[bold blue]{task.completed:>5,}[/bold blue]"
             "[ui.muted]/{task.total:,}[/ui.muted]"
         ),
-        TextColumn("[ui.muted]·[/ui.muted]"),
-        TimeElapsedColumn(),
-        TextColumn("[ui.muted]<[/ui.muted]"),
-        TimeRemainingColumn(),
         console=console,
         transient=False,
         disable=disable,

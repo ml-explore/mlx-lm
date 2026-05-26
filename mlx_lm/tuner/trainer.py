@@ -18,6 +18,11 @@ from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
 
+def printf(*args, **kwargs):
+    if mx.distributed.init().rank() == 0:
+        print(*args, **kwargs)
+
+
 def _clear_cache(threshold: int):
     if mx.get_cache_memory() > threshold:
         mx.clear_cache()
@@ -148,7 +153,7 @@ def iterate_batches(
                 offsets = [0] * len(batch)
             lengths = [len(x) for x in batch]
             if max(lengths) > max_seq_length:
-                print(
+                printf(
                     f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
                     f"The longest sentence {max(lengths)} will be truncated to {max_seq_length}. "
                     "Consider pre-splitting your data to save memory."

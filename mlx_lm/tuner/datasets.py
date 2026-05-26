@@ -5,7 +5,13 @@ import types
 from pathlib import Path
 from typing import Any, Dict, List
 
+import mlx.core as mx
 from transformers import PreTrainedTokenizer
+
+
+def printf(*args, **kwargs):
+    if mx.distributed.init().rank() == 0:
+        print(*args, **kwargs)
 
 
 class TextDataset:
@@ -264,7 +270,7 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
     collection = []
     for ds in dataset_collection:
         ds_path = ds["path"]
-        print(f"Loading Hugging Face dataset {ds_path}.")
+        printf(f"Loading Hugging Face dataset {ds_path}.")
         ds["mask_prompt"] = getattr(args, "mask_prompt", False)
         config = types.SimpleNamespace(**ds)
         hf_config = ds.get("config", {})
@@ -314,7 +320,7 @@ def load_dataset(args, tokenizer: PreTrainedTokenizer):
         if data_path.exists():
             train, valid, test = load_local_dataset(data_path, tokenizer, args)
         else:
-            print(f"Loading Hugging Face dataset {args.data}.")
+            printf(f"Loading Hugging Face dataset {args.data}.")
             train, valid, test = load_hf_dataset(args.data, tokenizer, args)
 
     if args.train and len(train) == 0:
@@ -322,7 +328,7 @@ def load_dataset(args, tokenizer: PreTrainedTokenizer):
             "Training set not found or empty. Must provide training set for fine-tuning."
         )
     if args.train and len(valid) == 0:
-        print(
+        printf(
             "Warning: Validation set not found or empty. Training will proceed without validation."
         )
     if args.test and len(test) == 0:

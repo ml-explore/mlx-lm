@@ -24,6 +24,12 @@ from .tuner.utils import (
 )
 from .utils import _parse_size, load, save_config
 
+
+def printf(*args, **kwargs):
+    if mx.distributed.init().rank() == 0:
+        print(*args, **kwargs)
+
+
 yaml_loader = yaml.SafeLoader
 yaml_loader.add_implicit_resolver(
     "tag:yaml.org,2002:float",
@@ -247,7 +253,7 @@ def train_model(
 
     # Resume from weights if provided
     if args.resume_adapter_file is not None:
-        print(f"Loading fine-tuned weights from {args.resume_adapter_file}")
+        printf(f"Loading fine-tuned weights from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
 
     print_trainable_parameters(model)
@@ -336,17 +342,19 @@ def _print_run_header(args):
 
 
 def evaluate_model(args, model: nn.Module, test_set):
+    rank = mx.distributed.init().rank()
     test_loss = evaluate(
         model=model,
         dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
+        progress=(rank == 0),
     )
 
     test_ppl = math.exp(test_loss)
 
-    print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
+    printf(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
 
 def run(args, training_callback: TrainingCallback = None):
@@ -358,10 +366,10 @@ def run(args, training_callback: TrainingCallback = None):
         config=vars(args),
     )
 
-    print("Loading pretrained model")
+    printf("Loading pretrained model")
     model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
 
-    print("Loading datasets")
+    printf("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
 
     if args.test and not args.train:
@@ -370,13 +378,13 @@ def run(args, training_callback: TrainingCallback = None):
             load_adapters(model, args.adapter_path)
 
     elif args.train:
-        print("Training")
+        printf("Training")
         train_model(args, model, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
-        print("Testing")
+        printf("Testing")
         evaluate_model(args, model, test_set)
 
 
@@ -384,10 +392,11 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     parser = build_parser()
     args = parser.parse_args()
+
     config = args.config
     args = vars(args)
     if config:
-        print("Loading configuration file", config)
+        printf("Loading configuration file", config)
         with open(config, "r") as file:
             config = yaml.load(file, yaml_loader)
         # Prefer parameters from command-line arguments
