@@ -40,7 +40,7 @@ from .models.cache import (
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
-from .utils import does_model_support_input_embeddings, load
+from .utils import does_model_support_input_embeddings, get_total_parameters, load
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -302,6 +302,39 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+
+
+def _warn_speculative_moe(model: nn.Module, draft_model: nn.Module) -> None:
+    """Warn if speculative decoding is unlikely to help for MoE models."""
+    model_config = getattr(model, "args", None)
+    if model_config is None:
+        return
+
+    num_experts = getattr(model_config, "num_experts", None) or getattr(
+        model_config, "num_local_experts", None
+    )
+    num_experts_per_tok = getattr(model_config, "num_experts_per_tok", None) or getattr(
+        model_config, "num_experts_per_token", None
+    )
+
+    if num_experts is None or num_experts_per_tok is None:
+        return
+
+    # Calculate active parameters as a fraction of total
+    draft_params = get_total_parameters(draft_model)
+    target_params = get_total_parameters(model)
+    active_params = target_params * (num_experts_per_tok / num_experts)
+    ratio = active_params / draft_params
+
+    if ratio < 4.0:
+        active_b = active_params / 1e9
+        draft_b = draft_params / 1e9
+        print(
+            f"[WARNING] Target model active parameters ({active_b:.1f}B) are close to "
+            f"draft model size ({draft_b:.1f}B). Speculative decoding may hurt "
+            f"throughput for MoE architectures. Consider benchmarking with and without "
+            f"--draft-model."
+        )
 
 
 def generate_step(
@@ -2057,6 +2090,7 @@ def main():
         draft_model, draft_tokenizer = load(args.draft_model)
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
+        _warn_speculative_moe(model, draft_model)
     else:
         draft_model = None
     sampler = make_sampler(
