@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import logging
 import sys
 import time
 from collections import deque
@@ -42,6 +43,7 @@ from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, get_total_parameters, load
 
+logger = logging.getLogger(__name__)
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_TEMP = 0.0
@@ -317,23 +319,24 @@ def _warn_speculative_moe(model: nn.Module, draft_model: nn.Module) -> None:
         model_config, "num_experts_per_token", None
     )
 
-    if num_experts is None or num_experts_per_tok is None:
+    if num_experts == 0:
         return
 
-    # Calculate active parameters as a fraction of total
     draft_params = get_total_parameters(draft_model)
     target_params = get_total_parameters(model)
     active_params = target_params * (num_experts_per_tok / num_experts)
     ratio = active_params / draft_params
 
-    if ratio < 4.0:
+    if (
+        ratio < 4.0
+    ):  # warn if draft model is >25% of active params (empirically shows slowdown)
         active_b = active_params / 1e9
         draft_b = draft_params / 1e9
-        print(
-            f"[WARNING] Target model active parameters ({active_b:.1f}B) are close to "
+        logger.warning(
+            f"Target model active parameters ({active_b:.1f}B) are close to "
             f"draft model size ({draft_b:.1f}B). Speculative decoding may hurt "
-            f"throughput for MoE architectures. Consider benchmarking with and without "
-            f"--draft-model."
+            f"throughput for MoE architectures. Consider benchmarking with and "
+            f"without --draft-model."
         )
 
 
