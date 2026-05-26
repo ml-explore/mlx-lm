@@ -27,12 +27,64 @@ from rich.text import Text
 from rich.theme import Theme
 
 
-def _osc11_to_rgb(timeout: float = 0.1):
+def _is_distributed_non_root() -> bool:
+    """True when running as a non-rank-0 worker under a launcher.
+
+    We use environment variables exported by common launchers (mlx.launch,
+    OpenMPI, MPICH, SLURM, torchrun) instead of ``mlx.distributed`` so this
+    module stays independent of the heavy mlx import path.
+    """
+    for var in (
+        "OMPI_COMM_WORLD_RANK",
+        "PMI_RANK",
+        "PMIX_RANK",
+        "SLURM_PROCID",
+        "RANK",
+    ):
+        value = os.environ.get(var)
+        if value and value.strip() != "0":
+            return True
+    return False
+
+
+def _running_under_launcher() -> bool:
+    """True when any multi-process launcher signature is detected.
+
+    We can't reliably tell our rank from env vars alone (different launchers
+    use different keys). When this returns True we skip auto-detection at
+    import time and wait for the caller to opt in via :func:`init_theme`.
+    """
+    explicit = {
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "RANK",
+        "PMI_RANK",
+        "PMIX_RANK",
+        "SLURM_PROCID",
+        "OMPI_COMM_WORLD_SIZE",
+    }
+    if any(k in os.environ for k in explicit):
+        return True
+    prefixes = ("OMPI_", "PMI_", "PMIX_", "SLURM_", "MLX_LAUNCH")
+    for k in os.environ:
+        if k.startswith(prefixes):
+            return True
+    return False
+
+
+def _osc11_to_rgb(timeout: float = 0.5):
     """Ask the terminal for its background color via OSC 11.
 
     Returns an (r, g, b) tuple in the 0-255 range, or None if the terminal
-    does not respond (non-TTY, unsupported terminal, redirected stdio, ...).
+    does not respond (non-TTY, unsupported terminal, redirected stdio,
+    non-rank-0 in a distributed launch, ...). The default timeout is generous
+    enough to survive an SSH round trip.
     """
+    # In a distributed launch, all ranks share the same TTY. If every worker
+    # sends an OSC query, only one read wins and the rest of the responses
+    # leak onto the screen. Skip the probe on non-root ranks.
+    if _is_distributed_non_root():
+        return None
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
     try:
@@ -112,11 +164,47 @@ def _detect_dark_background() -> bool:
     return True
 
 
-IS_DARK_BACKGROUND = _detect_dark_background()
+# Lazy theme state. We avoid auto-detecting at import time when running under
+# a multi-process launcher because every worker would otherwise emit an OSC
+# query against the shared terminal, leaking the responses to the screen.
+# Single-process callers fall through to auto-detection on first use.
+_is_dark = True
+_is_dark_initialized = False
+
+
+def init_theme(probe: bool = True) -> None:
+    """Initialize the terminal theme.
+
+    Pass ``probe=False`` on non-root ranks of distributed launches so the
+    theme gets marked as initialized without sending an OSC query that would
+    leak its response onto the shared terminal.
+    """
+    global _is_dark, _is_dark_initialized
+    _is_dark_initialized = True
+    if probe:
+        _is_dark = _detect_dark_background()
+
+
+def _ensure_theme_initialized() -> None:
+    global _is_dark_initialized
+    if _is_dark_initialized:
+        return
+    if _running_under_launcher():
+        # Caller hasn't opted in via init_theme(); stay on the default theme
+        # rather than risk a probe across all ranks.
+        _is_dark_initialized = True
+        return
+    init_theme(probe=True)
+
+
+def is_dark_background() -> bool:
+    """Whether the active theme is for a dark terminal background."""
+    _ensure_theme_initialized()
+    return _is_dark
 
 
 def _make_theme() -> Theme:
-    if IS_DARK_BACKGROUND:
+    if is_dark_background():
         styles = {
             "ui.strong": "bold white",
             "ui.label": "grey70",

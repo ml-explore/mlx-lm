@@ -6,6 +6,7 @@ import sys
 import mlx.core as mx
 
 from .cli_ui import (
+    init_theme,
     make_console,
     make_corridor_prompt,
     print_chat_help,
@@ -116,6 +117,7 @@ def main():
     pipeline_group = group if args.pipeline else None
     tensor_group = group if not args.pipeline else None
 
+    init_theme(probe=(rank == 0))
     console = make_console()
 
     def rprint(*args, **kwargs):

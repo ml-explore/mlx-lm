@@ -12,7 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .cli_ui import make_console, print_header_panel
+from .cli_ui import init_theme, make_console, print_header_panel
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
@@ -306,6 +306,11 @@ def train_model(
 
 
 def _print_run_header(args):
+    rank = mx.distributed.init().rank()
+    init_theme(probe=(rank == 0))
+    if rank != 0:
+        return
+
     type_label = args.fine_tune_type
     if args.fine_tune_type in ("lora", "dora"):
         rank = args.lora_parameters.get("rank", "?")
