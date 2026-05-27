@@ -23,7 +23,7 @@
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -127,10 +127,9 @@ class KVCache:
     re-allocation overhead. Compatible with mlx-lm's cache protocol.
     """
 
-    def __init__(self, head_dim: int, n_heads: int, step: int = 256):
+    def __init__(self, head_dim: int, n_heads: int):
         self.head_dim = head_dim
         self.n_heads  = n_heads
-        self.step     = step
         self.keys:   Optional[mx.array] = None
         self.values: Optional[mx.array] = None
         self._offset = 0
@@ -144,25 +143,14 @@ class KVCache:
         keys:   mx.array,   # (B, H, T, D)
         values: mx.array,
     ) -> Tuple[mx.array, mx.array]:
-        B, H, T, D = keys.shape
-        prev       = self._offset
-        new_offset = prev + T
-
-        if self.keys is None or new_offset > self.keys.shape[2]:
-            n_steps  = math.ceil(new_offset / self.step)
-            capacity = n_steps * self.step
-            new_k = mx.zeros((B, H, capacity, D), dtype=keys.dtype)
-            new_v = mx.zeros((B, H, capacity, D), dtype=values.dtype)
-            if self.keys is not None:
-                new_k = new_k.at[:, :, :prev, :].set(self.keys[:, :, :prev, :])
-                new_v = new_v.at[:, :, :prev, :].set(self.values[:, :, :prev, :])
-            self.keys   = new_k
-            self.values = new_v
-
-        self.keys   = self.keys.at[:, :, prev:new_offset, :].set(keys)
-        self.values = self.values.at[:, :, prev:new_offset, :].set(values)
-        self._offset = new_offset
-        return self.keys[:, :, :new_offset, :], self.values[:, :, :new_offset, :]
+        if self.keys is None:
+            self.keys   = keys
+            self.values = values
+        else:
+            self.keys   = mx.concatenate([self.keys,   keys],   axis=2)
+            self.values = mx.concatenate([self.values, values], axis=2)
+        self._offset += keys.shape[2]
+        return self.keys, self.values
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,10 +582,12 @@ class Model(nn.Module):
                     attn_offset = c.offset
                     break
 
-        # Causal mask (prefill only; decode is T=1 so no mask needed)
+        # Causal mask (prefill only; decode is T=1 so no mask needed).
+        # create_attention_mask only reads .shape[1], so passing inputs directly
+        # avoids a redundant embed_tokens call before the model forward pass.
         mask = None
         if T > 1:
-            mask = create_attention_mask(self.model.embed_tokens(inputs), cache[0] if cache else None)
+            mask = create_attention_mask(inputs, cache[0] if cache else None)
 
         h = self.model(inputs, mask=mask, cache=cache)
 
@@ -648,12 +638,28 @@ class Model(nn.Module):
         out = {}
         for hf_name, w in weights.items():
             mlx_name = self._hf_to_mlx(hf_name)
+
+            # Fallback: handle weights already in old MLX format — i.e. converted
+            # by a standalone model.py that lacked the OlmoHybridModel wrapper.
+            # Those keys look like "layers.{i}.mixer.*" / "embed_tokens.weight" /
+            # "norm.weight" — just prepend "model." to match the new structure.
+            if mlx_name is None:
+                if hf_name.startswith("layers.") or hf_name in ("embed_tokens.weight", "norm.weight"):
+                    mlx_name = "model." + hf_name
+                elif hf_name == "lm_head.weight":
+                    mlx_name = "lm_head.weight"
+
             if mlx_name is None:
                 continue
 
-            # Reshape depthwise conv weights: (C, 1, K) → (C, K, 1)
-            if "conv1d.weight" in mlx_name and w.ndim == 3 and w.shape[1] == 1:
-                w = w.transpose(0, 2, 1)
+            # Normalise depthwise conv weights to (C, K, 1) — MLX conv1d format.
+            # HF safetensors stores (C, 1, K) → transpose to (C, K, 1)
+            # Old MLX .npz stores  (C, K)    → unsqueeze last dim to (C, K, 1)
+            if "conv1d.weight" in mlx_name:
+                if w.ndim == 3 and w.shape[1] == 1:
+                    w = w.transpose(0, 2, 1)   # (C, 1, K) → (C, K, 1)
+                elif w.ndim == 2:
+                    w = w[:, :, None]           # (C, K)    → (C, K, 1)
 
             out[mlx_name] = w
         return out
