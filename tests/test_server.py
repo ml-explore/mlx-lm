@@ -14,6 +14,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    ModelProvider,
     Response,
     ResponseGenerator,
     _process_control_tokens,
@@ -515,6 +516,21 @@ class TestKeepalive(unittest.TestCase):
             keepalive_callback(3072, 4096)
         except Exception as e:
             self.fail(f"Callback should handle BrokenPipeError: {e}")
+
+
+class TestModelProviderBatchability(unittest.TestCase):
+    def test_non_merge_cache_logs_batching_disable_reason(self):
+        from unittest.mock import patch
+
+        class NotMergeable:
+            pass
+
+        with patch("mlx_lm.server.make_prompt_cache", return_value=[NotMergeable()]):
+            with self.assertLogs(level="INFO") as logs:
+                is_batchable = ModelProvider._supports_cache_batching(object())
+
+        self.assertFalse(is_batchable)
+        self.assertIn("NotMergeable", "\n".join(logs.output))
 
 
 class TestServerPromptCheckpointBoundary(unittest.TestCase):

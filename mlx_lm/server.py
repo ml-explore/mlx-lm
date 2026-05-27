@@ -324,6 +324,19 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    @staticmethod
+    def _supports_cache_batching(model):
+        cache_types = [
+            type(c).__name__ for c in make_prompt_cache(model) if not hasattr(c, "merge")
+        ]
+        if cache_types:
+            logging.info(
+                "Disabling batching for model because cache type %s does not implement merge()",
+                ", ".join(cache_types),
+            )
+            return False
+        return True
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -369,10 +382,7 @@ class ModelProvider:
                 )
 
         # Compute batchability
-        is_batchable = draft_model is None
-        is_batchable = is_batchable and all(
-            hasattr(c, "merge") for c in make_prompt_cache(model)
-        )
+        is_batchable = draft_model is None and self._supports_cache_batching(model)
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
