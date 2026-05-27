@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import copy
 import json
 import logging
 import pickle
@@ -469,6 +470,36 @@ class ResponseGenerator:
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
             )
 
+    @staticmethod
+    def _should_insert_segment_cache(segment_type: str) -> bool:
+        return segment_type in {"system", "user", "assistant"}
+
+    @staticmethod
+    def _remaining_uncached_segments(segments, segment_types, cached_tokens):
+        remaining_segments = []
+        remaining_types = []
+        cached = cached_tokens
+        for segment, segment_type in zip(segments, segment_types):
+            segment = segment[:]
+            if cached >= len(segment):
+                cached -= len(segment)
+                continue
+            if cached > 0:
+                segment = segment[cached:]
+                cached = 0
+            remaining_segments.append(segment)
+            remaining_types.append(segment_type)
+        return remaining_segments, remaining_types
+
+    def _insert_prompt_checkpoint(self, model_key, tokens, prompt_cache, cache_type):
+        if self._should_insert_segment_cache(cache_type):
+            self.prompt_cache.insert_cache(
+                model_key,
+                tokens[:],
+                copy.deepcopy(prompt_cache),
+                cache_type=cache_type,
+            )
+
     def _next_request(self, timeout=None):
         request = None
         if not self._is_distributed or self._rank == 0:
@@ -933,7 +964,9 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, segments, segment_types, initial_state = self._tokenize(
+                tokenizer, request, args
+            )
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -966,6 +999,11 @@ class ResponseGenerator:
                 self.model_provider.model_key, prompt
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
+            remaining_segments, remaining_types = self._remaining_uncached_segments(
+                segments, segment_types, ctx.prompt_cache_count
+            )
+            # Single-request segment checkpoints need prefill boundary callbacks.
+            del remaining_segments, remaining_types
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)

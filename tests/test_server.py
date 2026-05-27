@@ -517,6 +517,48 @@ class TestKeepalive(unittest.TestCase):
             self.fail(f"Callback should handle BrokenPipeError: {e}")
 
 
+class TestServerPromptCheckpointBoundary(unittest.TestCase):
+    def test_remaining_uncached_segments_drops_cached_prefix(self):
+        segments = [[1, 2], [3, 4, 5], [6]]
+        segment_types = ["system", "user", "assistant"]
+
+        remaining, remaining_types = ResponseGenerator._remaining_uncached_segments(
+            segments, segment_types, 4
+        )
+
+        self.assertEqual(remaining, [[5], [6]])
+        self.assertEqual(remaining_types, ["user", "assistant"])
+        self.assertEqual(segments, [[1, 2], [3, 4, 5], [6]])
+
+    def test_should_insert_segment_cache_only_accepts_prompt_segments(self):
+        self.assertTrue(ResponseGenerator._should_insert_segment_cache("system"))
+        self.assertTrue(ResponseGenerator._should_insert_segment_cache("user"))
+        self.assertTrue(ResponseGenerator._should_insert_segment_cache("assistant"))
+        self.assertFalse(ResponseGenerator._should_insert_segment_cache("tool"))
+
+    def test_insert_prompt_checkpoint_respects_segment_type(self):
+        class Store:
+            def __init__(self):
+                self.calls = []
+
+            def insert_cache(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.prompt_cache = Store()
+        cache = [MockCache("checkpoint")]
+
+        generator._insert_prompt_checkpoint(("model",), [1, 2], cache, "system")
+        generator._insert_prompt_checkpoint(("model",), [3], cache, "tool")
+
+        self.assertEqual(len(generator.prompt_cache.calls), 1)
+        args, kwargs = generator.prompt_cache.calls[0]
+        self.assertEqual(args[0], ("model",))
+        self.assertEqual(args[1], [1, 2])
+        self.assertEqual(kwargs["cache_type"], "system")
+        self.assertIsNot(args[2], cache)
+
+
 class TestServerPromptCacheWiring(unittest.TestCase):
     def test_run_wires_prompt_cache_bytes(self):
         from unittest.mock import patch
