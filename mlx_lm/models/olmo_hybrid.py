@@ -31,10 +31,10 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (field names match HF config.json — BaseModelArgs.from_dict filters extras)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -61,11 +61,11 @@ class ModelArgs(BaseModelArgs):
     layer_types: List[str] = field(default_factory=list)
 
     # GatedDeltaNet-specific
-    linear_num_key_heads:   int  = 30
-    linear_num_value_heads: int  = 30
-    linear_key_head_dim:    int  = 96    # D_k per head
-    linear_value_head_dim:  int  = 192   # D_v per head
-    linear_conv_kernel_dim: int  = 4     # ShortConv kernel size K
+    linear_num_key_heads: int = 30
+    linear_num_value_heads: int = 30
+    linear_key_head_dim: int = 96  # D_k per head
+    linear_value_head_dim: int = 192  # D_v per head
+    linear_conv_kernel_dim: int = 4  # ShortConv kernel size K
     linear_allow_neg_eigval: bool = True
 
     def __post_init__(self):
@@ -90,6 +90,7 @@ class ModelArgs(BaseModelArgs):
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache objects
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class GDNCache:
     """
@@ -129,8 +130,8 @@ class KVCache:
 
     def __init__(self, head_dim: int, n_heads: int):
         self.head_dim = head_dim
-        self.n_heads  = n_heads
-        self.keys:   Optional[mx.array] = None
+        self.n_heads = n_heads
+        self.keys: Optional[mx.array] = None
         self.values: Optional[mx.array] = None
         self._offset = 0
 
@@ -144,14 +145,14 @@ class KVCache:
 
     def update_and_fetch(
         self,
-        keys:   mx.array,   # (B, H, T, D)
+        keys: mx.array,  # (B, H, T, D)
         values: mx.array,
     ) -> Tuple[mx.array, mx.array]:
         if self.keys is None:
-            self.keys   = keys
+            self.keys = keys
             self.values = values
         else:
-            self.keys   = mx.concatenate([self.keys,   keys],   axis=2)
+            self.keys = mx.concatenate([self.keys, keys], axis=2)
             self.values = mx.concatenate([self.values, values], axis=2)
         self._offset += keys.shape[2]
         return self.keys, self.values
@@ -160,6 +161,7 @@ class KVCache:
 # ─────────────────────────────────────────────────────────────────────────────
 # ShortConv  (causal depthwise conv1d, used inside GDN)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class ShortConv(nn.Module):
     """
@@ -174,13 +176,13 @@ class ShortConv(nn.Module):
 
     def __init__(self, channels: int, kernel_size: int = 4):
         super().__init__()
-        self.channels    = channels
+        self.channels = channels
         self.kernel_size = kernel_size
-        self.weight = mx.zeros((channels, kernel_size, 1))   # (C, K, 1)
+        self.weight = mx.zeros((channels, kernel_size, 1))  # (C, K, 1)
 
     def __call__(
         self,
-        x:      mx.array,
+        x: mx.array,
         prefix: Optional[mx.array] = None,
     ) -> mx.array:
         """
@@ -189,16 +191,17 @@ class ShortConv(nn.Module):
         Returns (B, T, C)
         """
         B, T, C = x.shape
-        K   = self.kernel_size
+        K = self.kernel_size
         pad = prefix if prefix is not None else mx.zeros((B, K - 1, C))
-        x_pad = mx.concatenate([pad, x], axis=1)                     # (B, K-1+T, C)
-        out   = mx.conv1d(x_pad, self.weight, padding=0, groups=C)   # (B, T, C)
+        x_pad = mx.concatenate([pad, x], axis=1)  # (B, K-1+T, C)
+        out = mx.conv1d(x_pad, self.weight, padding=0, groups=C)  # (B, T, C)
         return nn.silu(out)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GatedDeltaNet  (linear_attention layers)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class GatedDeltaNet(nn.Module):
     """
@@ -230,27 +233,27 @@ class GatedDeltaNet(nn.Module):
 
     def __init__(self, args: ModelArgs):
         super().__init__()
-        H   = args.linear_num_key_heads
+        H = args.linear_num_key_heads
         D_k = args.linear_key_head_dim
         D_v = args.linear_value_head_dim
         hid = args.hidden_size
 
-        self.num_heads        = H
-        self.key_dim          = D_k
-        self.val_dim          = D_v
+        self.num_heads = H
+        self.key_dim = D_k
+        self.val_dim = D_v
         self.allow_neg_eigval = args.linear_allow_neg_eigval
-        self.q_scale          = 1.0 / math.sqrt(D_k)
+        self.q_scale = 1.0 / math.sqrt(D_k)
 
         self.q_proj = nn.Linear(hid, H * D_k, bias=False)
         self.k_proj = nn.Linear(hid, H * D_k, bias=False)
         self.v_proj = nn.Linear(hid, H * D_v, bias=False)
-        self.b_proj = nn.Linear(hid, H,       bias=False)   # beta
-        self.g_proj = nn.Linear(hid, H * D_v, bias=False)   # output gate
-        self.a_proj = nn.Linear(hid, H,       bias=False)   # dt input
+        self.b_proj = nn.Linear(hid, H, bias=False)  # beta
+        self.g_proj = nn.Linear(hid, H * D_v, bias=False)  # output gate
+        self.a_proj = nn.Linear(hid, H, bias=False)  # dt input
 
         # Mamba-style decay parameterisation
-        self.dt_bias = mx.zeros((H,))   # learned bias added to dt
-        self.A_log   = mx.zeros((H,))   # decay: alpha = exp(dt * −exp(A_log))
+        self.dt_bias = mx.zeros((H,))  # learned bias added to dt
+        self.A_log = mx.zeros((H,))  # decay: alpha = exp(dt * −exp(A_log))
 
         K = args.linear_conv_kernel_dim
         self.q_conv1d = ShortConv(H * D_k, kernel_size=K)
@@ -266,7 +269,7 @@ class GatedDeltaNet(nn.Module):
 
     def __call__(
         self,
-        x:     mx.array,
+        x: mx.array,
         cache: Optional[GDNCache] = None,
     ) -> mx.array:
         """
@@ -276,44 +279,50 @@ class GatedDeltaNet(nn.Module):
         """
         B, T, _ = x.shape
         H, D_k, D_v = self.num_heads, self.key_dim, self.val_dim
-        pad_len = self.q_conv1d.kernel_size - 1   # K-1
+        pad_len = self.q_conv1d.kernel_size - 1  # K-1
 
         # ── Unpack recurrent state ────────────────────────────────────────────
         if cache is None or cache.state is None:
-            S        = mx.zeros((B, H, D_v, D_k))
+            S = mx.zeros((B, H, D_v, D_k))
             q_ctx = k_ctx = v_ctx = None
         else:
             S, (q_ctx, k_ctx, v_ctx) = cache.state
 
         # ── Linear projections ────────────────────────────────────────────────
-        q_raw = self.q_proj(x)   # (B, T, H*D_k)
+        q_raw = self.q_proj(x)  # (B, T, H*D_k)
         k_raw = self.k_proj(x)
-        v_raw = self.v_proj(x)   # (B, T, H*D_v)
+        v_raw = self.v_proj(x)  # (B, T, H*D_v)
 
-        beta = mx.sigmoid(self.b_proj(x))                     # (B, T, H)
+        beta = mx.sigmoid(self.b_proj(x))  # (B, T, H)
         if self.allow_neg_eigval:
             beta = beta * 2.0
 
-        gate = nn.silu(self.g_proj(x))                        # (B, T, H*D_v)
+        gate = nn.silu(self.g_proj(x))  # (B, T, H*D_v)
 
-        dt   = nn.softplus(self.a_proj(x) + self.dt_bias)     # (B, T, H)
-        A    = -mx.exp(self.A_log)                            # (H,)
-        alpha = mx.exp(dt * A)                                # (B, T, H) ∈ (0,1]
+        dt = nn.softplus(self.a_proj(x) + self.dt_bias)  # (B, T, H)
+        A = -mx.exp(self.A_log)  # (H,)
+        alpha = mx.exp(dt * A)  # (B, T, H) ∈ (0,1]
 
         # ── ShortConv with real prior context ─────────────────────────────────
         # During prefill (q_ctx=None): zero-pad applied automatically.
         # During decode:  q/k/v_ctx = last K-1 raw tokens from prior call — no bug.
-        q = self.q_conv1d(q_raw, prefix=q_ctx)   # (B, T, H*D_k)
+        q = self.q_conv1d(q_raw, prefix=q_ctx)  # (B, T, H*D_k)
         k = self.k_conv1d(k_raw, prefix=k_ctx)
-        v = self.v_conv1d(v_raw, prefix=v_ctx)   # (B, T, H*D_v)
+        v = self.v_conv1d(v_raw, prefix=v_ctx)  # (B, T, H*D_v)
 
         # Save new conv context: last pad_len raw (pre-conv) tokens
         if T >= pad_len:
-            new_conv_ctx = (q_raw[:, -pad_len:], k_raw[:, -pad_len:], v_raw[:, -pad_len:])
+            new_conv_ctx = (
+                q_raw[:, -pad_len:],
+                k_raw[:, -pad_len:],
+                v_raw[:, -pad_len:],
+            )
         else:
+
             def _slide(old, new, C):
                 base = old if old is not None else mx.zeros((B, pad_len, C))
                 return mx.concatenate([base, new], axis=1)[:, -pad_len:]
+
             new_conv_ctx = (
                 _slide(q_ctx, q_raw, q_raw.shape[-1]),
                 _slide(k_ctx, k_raw, k_raw.shape[-1]),
@@ -321,37 +330,37 @@ class GatedDeltaNet(nn.Module):
             )
 
         # ── Per-head reshape + normalise ──────────────────────────────────────
-        q = self._l2_norm(q.reshape(B, T, H, D_k)) * self.q_scale   # (B, T, H, D_k)
+        q = self._l2_norm(q.reshape(B, T, H, D_k)) * self.q_scale  # (B, T, H, D_k)
         k = self._l2_norm(k.reshape(B, T, H, D_k))
         v = v.reshape(B, T, H, D_v)
 
-        alpha = alpha.reshape(B, T, H, 1, 1)   # broadcast over (D_v, D_k)
-        beta  = beta.reshape(B, T, H, 1, 1)
-        gate  = gate.reshape(B, T, H, D_v)
+        alpha = alpha.reshape(B, T, H, 1, 1)  # broadcast over (D_v, D_k)
+        beta = beta.reshape(B, T, H, 1, 1)
+        gate = gate.reshape(B, T, H, D_v)
 
         # ── Chunked sequential delta-rule recurrence ──────────────────────────
         # See class docstring for why chunked eval is necessary.
         CHUNK = 32
         materialized_chunks: list = []
-        outputs_chunk:       list = []
+        outputs_chunk: list = []
 
         for t in range(T):
-            q_t = q[:, t]    # (B, H, D_k)
+            q_t = q[:, t]  # (B, H, D_k)
             k_t = k[:, t]
-            v_t = v[:, t]    # (B, H, D_v)
+            v_t = v[:, t]  # (B, H, D_v)
             a_t = alpha[:, t]
             b_t = beta[:, t]
 
-            Sk    = mx.einsum("bhvd,bhd->bhv", S, k_t)
+            Sk = mx.einsum("bhvd,bhd->bhv", S, k_t)
             outer = mx.einsum("bhv,bhd->bhvd", v_t - Sk, k_t)
-            S     = a_t * S + b_t * outer
-            y_t   = mx.einsum("bhvd,bhd->bhv", S, q_t)
+            S = a_t * S + b_t * outer
+            y_t = mx.einsum("bhvd,bhd->bhv", S, q_t)
             outputs_chunk.append(y_t)
 
             if (t + 1) % CHUNK == 0:
-                mx.eval(S)                                     # break S dependency chain
-                chunk = mx.stack(outputs_chunk, axis=1)        # (B, CHUNK, H, D_v)
-                mx.eval(chunk)                                 # release S_t references
+                mx.eval(S)  # break S dependency chain
+                chunk = mx.stack(outputs_chunk, axis=1)  # (B, CHUNK, H, D_v)
+                mx.eval(chunk)  # release S_t references
                 materialized_chunks.append(chunk)
                 outputs_chunk = []
 
@@ -361,9 +370,9 @@ class GatedDeltaNet(nn.Module):
             materialized_chunks.append(chunk)
 
         # ── Readout: RMSNorm → gate → project ────────────────────────────────
-        y   = mx.concatenate(materialized_chunks, axis=1)         # (B, T, H, D_v)
-        y   = self.o_norm(y.reshape(B * T * H, D_v)).reshape(B, T, H, D_v)
-        y   = (y * gate).reshape(B, T, H * D_v)
+        y = mx.concatenate(materialized_chunks, axis=1)  # (B, T, H, D_v)
+        y = self.o_norm(y.reshape(B * T * H, D_v)).reshape(B, T, H, D_v)
+        y = (y * gate).reshape(B, T, H * D_v)
         out = self.o_proj(y)
 
         if cache is not None:
@@ -380,6 +389,7 @@ class GatedDeltaNet(nn.Module):
 # Full Attention  (full_attention layers — OLMo2 post-norm + QK-norm style)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class Attention(nn.Module):
     """
     Causal MHA with RoPE, GQA support, and OLMo2-style QK-norm.
@@ -393,24 +403,24 @@ class Attention(nn.Module):
 
     def __init__(self, args: ModelArgs):
         super().__init__()
-        H   = args.num_attention_heads
+        H = args.num_attention_heads
         Hkv = args.num_key_value_heads
-        D   = args.head_dim
+        D = args.head_dim
         hid = args.hidden_size
 
-        self.num_heads    = H
+        self.num_heads = H
         self.num_kv_heads = Hkv
-        self.head_dim     = D
-        self.scale        = D ** -0.5
+        self.head_dim = D
+        self.scale = D**-0.5
 
-        self.q_proj = nn.Linear(hid, H * D,   bias=False)
+        self.q_proj = nn.Linear(hid, H * D, bias=False)
         self.k_proj = nn.Linear(hid, Hkv * D, bias=False)
         self.v_proj = nn.Linear(hid, Hkv * D, bias=False)
-        self.o_proj = nn.Linear(H * D, hid,   bias=False)
+        self.o_proj = nn.Linear(H * D, hid, bias=False)
 
         # QK-norm: applied on full (H*D) projection — NOT per-head (D,).
         # See note above about weight shape.
-        self.q_norm = nn.RMSNorm(H * D,   eps=args.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(H * D, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(Hkv * D, eps=args.rms_norm_eps)
 
         self.rope = initialize_rope(
@@ -423,8 +433,8 @@ class Attention(nn.Module):
 
     def __call__(
         self,
-        x:     mx.array,
-        mask:  Optional[mx.array],
+        x: mx.array,
+        mask: Optional[mx.array],
         cache: Optional[KVCache] = None,
     ) -> mx.array:
         B, T, _ = x.shape
@@ -432,9 +442,9 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache is not None else 0
 
-        q = self.q_norm(self.q_proj(x)).reshape(B, T, H,   D).transpose(0, 2, 1, 3)
+        q = self.q_norm(self.q_proj(x)).reshape(B, T, H, D).transpose(0, 2, 1, 3)
         k = self.k_norm(self.k_proj(x)).reshape(B, T, Hkv, D).transpose(0, 2, 1, 3)
-        v = self.v_proj(x)             .reshape(B, T, Hkv, D).transpose(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, T, Hkv, D).transpose(0, 2, 1, 3)
 
         q = self.rope(q, offset=offset)
         k = self.rope(k, offset=offset)
@@ -453,11 +463,12 @@ class Attention(nn.Module):
 # SwiGLU FFN
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class SwiGLU(nn.Module):
     def __init__(self, hidden: int, intermediate: int):
         super().__init__()
         self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
-        self.up_proj   = nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = nn.Linear(hidden, intermediate, bias=False)
         self.down_proj = nn.Linear(intermediate, hidden, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -467,6 +478,7 @@ class SwiGLU(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Hybrid Decoder Layer
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class HybridLayer(nn.Module):
     """
@@ -490,37 +502,45 @@ class HybridLayer(nn.Module):
 
     def __init__(self, args: ModelArgs, layer_type: str):
         super().__init__()
-        assert layer_type in ("linear_attention", "full_attention"), \
-            f"Unknown layer_type: {layer_type!r}"
+        assert layer_type in (
+            "linear_attention",
+            "full_attention",
+        ), f"Unknown layer_type: {layer_type!r}"
         self.layer_type = layer_type
 
         if layer_type == "linear_attention":
-            self.input_layernorm          = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-            self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.post_attention_layernorm = nn.RMSNorm(
+                args.hidden_size, eps=args.rms_norm_eps
+            )
             self.mixer = GatedDeltaNet(args)
         else:
-            self.post_attention_layernorm   = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-            self.post_feedforward_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.post_attention_layernorm = nn.RMSNorm(
+                args.hidden_size, eps=args.rms_norm_eps
+            )
+            self.post_feedforward_layernorm = nn.RMSNorm(
+                args.hidden_size, eps=args.rms_norm_eps
+            )
             self.mixer = Attention(args)
 
         self.mlp = SwiGLU(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
-        x:    mx.array,
+        x: mx.array,
         mask: Optional[mx.array],
-        cache=None,   # GDNCache | KVCache | None
+        cache=None,  # GDNCache | KVCache | None
     ) -> mx.array:
         if self.layer_type == "linear_attention":
             normed = self.input_layernorm(x)
+
             def _gdn_fwd(n):
                 return self.mixer(n, cache=cache)
+
             x = x + mx.stop_gradient(mx.checkpoint(_gdn_fwd)(normed))
             x = x + self.mlp(self.post_attention_layernorm(x))
         else:
-            x = x + self.post_attention_layernorm(
-                self.mixer(x, mask=mask, cache=cache)
-            )
+            x = x + self.post_attention_layernorm(self.mixer(x, mask=mask, cache=cache))
             x = x + self.post_feedforward_layernorm(self.mlp(x))
         return x
 
@@ -528,6 +548,7 @@ class HybridLayer(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Model  (mlx-lm entry point)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class OlmoHybridModel(nn.Module):
     """Inner model (token embeddings + decoder layers + final norm)."""
@@ -544,8 +565,8 @@ class OlmoHybridModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask:   Optional[mx.array] = None,
-        cache:  Optional[List]     = None,
+        mask: Optional[mx.array] = None,
+        cache: Optional[List] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs)
         if cache is None:
@@ -567,6 +588,7 @@ class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        self.model_type = args.model_type
         self.model = OlmoHybridModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -574,7 +596,7 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache:  Optional[List] = None,
+        cache: Optional[List] = None,
     ) -> mx.array:
         B, T = inputs.shape
 
@@ -593,12 +615,18 @@ class Model(nn.Module):
         if T > 1:
             mask = create_attention_mask(inputs, cache[0] if cache else None)
 
+        # Track input dtype — GDN parallel scan upcasts to float32 internally,
+        # so we cast logits back to match the embedding dtype on exit.
+        embed_dtype = self.model.embed_tokens.weight.dtype
+
         h = self.model(inputs, mask=mask, cache=cache)
 
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(h)
+            out = self.model.embed_tokens.as_linear(h)
         else:
-            return self.lm_head(h)
+            out = self.lm_head(h)
+
+        return out.astype(embed_dtype)
 
     def make_cache(self) -> List:
         """
@@ -611,10 +639,12 @@ class Model(nn.Module):
             if lt == "linear_attention":
                 caches.append(GDNCache())
             else:
-                caches.append(KVCache(
-                    head_dim=self.args.head_dim,
-                    n_heads=self.args.num_key_value_heads,
-                ))
+                caches.append(
+                    KVCache(
+                        head_dim=self.args.head_dim,
+                        n_heads=self.args.num_key_value_heads,
+                    )
+                )
         return caches
 
     def sanitize(self, weights: dict) -> dict:
@@ -648,7 +678,10 @@ class Model(nn.Module):
             # Those keys look like "layers.{i}.mixer.*" / "embed_tokens.weight" /
             # "norm.weight" — just prepend "model." to match the new structure.
             if mlx_name is None:
-                if hf_name.startswith("layers.") or hf_name in ("embed_tokens.weight", "norm.weight"):
+                if hf_name.startswith("layers.") or hf_name in (
+                    "embed_tokens.weight",
+                    "norm.weight",
+                ):
                     mlx_name = "model." + hf_name
                 elif hf_name == "lm_head.weight":
                     mlx_name = "lm_head.weight"
@@ -661,9 +694,9 @@ class Model(nn.Module):
             # Old MLX .npz stores  (C, K)    → unsqueeze last dim to (C, K, 1)
             if "conv1d.weight" in mlx_name:
                 if w.ndim == 3 and w.shape[1] == 1:
-                    w = w.transpose(0, 2, 1)   # (C, 1, K) → (C, K, 1)
+                    w = w.transpose(0, 2, 1)  # (C, 1, K) → (C, K, 1)
                 elif w.ndim == 2:
-                    w = w[:, :, None]           # (C, K)    → (C, K, 1)
+                    w = w[:, :, None]  # (C, K)    → (C, K, 1)
 
             out[mlx_name] = w
         return out
@@ -682,9 +715,12 @@ class Model(nn.Module):
         name = hf_name.removeprefix("model.")
 
         # Top-level weights
-        if hf_name == "lm_head.weight":         return "lm_head.weight"
-        if name == "embed_tokens.weight":        return "model.embed_tokens.weight"
-        if name == "norm.weight":                return "model.norm.weight"
+        if hf_name == "lm_head.weight":
+            return "lm_head.weight"
+        if name == "embed_tokens.weight":
+            return "model.embed_tokens.weight"
+        if name == "norm.weight":
+            return "model.norm.weight"
 
         # Per-layer weights: model.layers.{i}.*
         m = re.match(r"^layers\.(\d+)\.(.+)$", name)
@@ -706,12 +742,12 @@ class Model(nn.Module):
 
         # GDN layers — HF uses "linear_attn." prefix
         if rest.startswith("linear_attn."):
-            sub = rest[len("linear_attn."):]
+            sub = rest[len("linear_attn.") :]
             return f"model.layers.{i}.mixer.{sub}"
 
         # Attention layers — HF uses "self_attn." prefix
         if rest.startswith("self_attn."):
-            sub = rest[len("self_attn."):]
+            sub = rest[len("self_attn.") :]
             return f"model.layers.{i}.mixer.{sub}"
 
         return None  # unknown key — skip (e.g. rotary_emb.inv_freq)
