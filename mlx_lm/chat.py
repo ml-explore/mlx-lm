@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import json
 
 import mlx.core as mx
 
@@ -80,6 +81,34 @@ def setup_arg_parser():
         help="System prompt to be used for the chat template",
     )
     parser.add_argument(
+        "--chat-template-config",
+        help="Additional JSON config for apply_chat_template, e.g. '{\"enable_thinking\": false}'",
+        default=None,
+    )
+    parser.add_argument(
+        "--draft-type",
+        choices=["none", "ngram-simple", "ngram-mod"],
+        default="none",
+        help="Draft strategy for speculative decoding.",
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=3,
+        help="Number of draft tokens to propose.",
+    )
+    parser.add_argument(
+        "--ngram-size",
+        type=int,
+        default=None,
+        help="N-gram window size. Defaults to 3 for ngram-simple and 16 for ngram-mod.",
+    )
+    parser.add_argument(
+        "--disable-adaptive-gate",
+        action="store_true",
+        help="Disable the adaptive speculative decoding gate.",
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
@@ -124,24 +153,39 @@ def main():
     rprint(f"[INFO] Starting chat session with {args.model}.")
     print_help()
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
+    template_kwargs = json.loads(args.chat_template_config or "{}")
+    messages = []
+    if args.system_prompt is not None:
+        messages.append({"role": "system", "content": args.system_prompt})
     while True:
         query = input(">> " if rank == 0 else "")
         if query == "q":
             break
         if query == "r":
             prompt_cache = make_prompt_cache(model, args.max_kv_size)
+            messages = []
+            if args.system_prompt is not None:
+                messages.append({"role": "system", "content": args.system_prompt})
             continue
         if query == "h":
             print_help()
             continue
-        messages = []
-        if args.system_prompt is not None:
-            messages.append({"role": "system", "content": args.system_prompt})
         messages.append({"role": "user", "content": query})
         prompt = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
+            **template_kwargs,
         )
+        generate_kwargs = {}
+        if args.draft_type != "none":
+            generate_kwargs["draft_type"] = args.draft_type
+            generate_kwargs["num_draft_tokens"] = args.num_draft_tokens
+            generate_kwargs["disable_adaptive_gate"] = args.disable_adaptive_gate
+            if args.ngram_size is not None:
+                generate_kwargs["ngram_size"] = args.ngram_size
+        response_text = []
+        accepted = 0
+        last_response = None
         for response in stream_generate(
             model,
             tokenizer,
@@ -157,9 +201,25 @@ def main():
                 ),
             ),
             prompt_cache=prompt_cache,
+            **generate_kwargs,
         ):
             rprint(response.text, flush=True, end="")
+            response_text.append(response.text)
+            accepted += 1 if response.from_draft else 0
+            last_response = response
         rprint()
+        if last_response is not None:
+            generated = last_response.generation_tokens
+            acceptance = 100 * accepted / generated if generated else 0.0
+            rprint(
+                "[stats] "
+                f"prompt={last_response.prompt_tokens} tok "
+                f"generated={generated} tok "
+                f"tok/s={last_response.generation_tps:.2f} "
+                f"accepted={accepted}/{generated} ({acceptance:.1f}%) "
+                f"peak={last_response.peak_memory:.2f} GB"
+            )
+        messages.append({"role": "assistant", "content": "".join(response_text)})
 
 
 if __name__ == "__main__":
