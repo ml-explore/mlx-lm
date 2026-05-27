@@ -138,6 +138,10 @@ class KVCache:
     def offset(self) -> int:
         return self._offset
 
+    @property
+    def state(self):
+        return [self.keys, self.values] if self.keys is not None else []
+
     def update_and_fetch(
         self,
         keys:   mx.array,   # (B, H, T, D)
@@ -667,6 +671,13 @@ class Model(nn.Module):
     @staticmethod
     def _hf_to_mlx(hf_name: str) -> Optional[str]:
         """Return the MLX attribute path for an HF weight name, or None to skip."""
+        # Passthrough: key is already in MLX format (e.g. loading from a previously
+        # converted safetensors rather than raw HF weights).
+        # HF format uses ".linear_attn." / ".self_attn." — MLX uses ".mixer.".
+        # Any key containing ".mixer." has already been sanitized.
+        if ".mixer." in hf_name:
+            return hf_name
+
         # Strip leading "model." for most weights
         name = hf_name.removeprefix("model.")
 
