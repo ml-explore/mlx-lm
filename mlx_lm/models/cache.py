@@ -12,6 +12,18 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 from .base import create_causal_mask
 
 
+def _parse_bool_state(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise ValueError(f"Invalid boolean cache metadata value: {value!r}")
+
+
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
@@ -111,6 +123,15 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def can_restore_prompt_cache(cache: List[Any], position: int) -> bool:
+    return all(hasattr(c, "can_restore_to") and c.can_restore_to(position) for c in cache)
+
+
+def restore_prompt_cache(cache: List[Any], position: int) -> bool:
+    results = [c.restore_to(position) for c in cache]
+    return all(r.restored for r in results)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -122,6 +143,22 @@ def create_attention_mask(
         return create_causal_mask(N, offset, window_size=window_size)
     else:
         return "causal"
+
+
+@dataclass(frozen=True)
+class CacheRetainedRange:
+    logical_start: int
+    logical_end: int
+    physical_start: int
+    physical_end: int
+
+
+@dataclass(frozen=True)
+class CacheRestoreResult:
+    restored: bool
+    restored_tokens: int
+    replay_start: int
+    reason: str = ""
 
 
 class _BaseCache:
@@ -145,6 +182,37 @@ class _BaseCache:
 
     def is_trimmable(self):
         return False
+
+    def logical_length(self):
+        return self.size()
+
+    def retained_range(self):
+        length = self.logical_length()
+        return CacheRetainedRange(
+            logical_start=0,
+            logical_end=length,
+            physical_start=0,
+            physical_end=length,
+        )
+
+    def can_restore_to(self, position: int):
+        return self.is_trimmable() and 0 <= position <= self.logical_length()
+
+    def restore_to(self, position: int):
+        if not self.can_restore_to(position):
+            return CacheRestoreResult(
+                restored=False,
+                restored_tokens=0,
+                replay_start=0,
+                reason=f"{type(self).__name__} cannot restore to {position}",
+            )
+        trimmed = self.trim(self.logical_length() - position)
+        return CacheRestoreResult(
+            restored=True,
+            restored_tokens=position,
+            replay_start=position,
+            reason=f"trimmed {trimmed} tokens",
+        )
 
     def size(self):
         """
@@ -357,6 +425,9 @@ class KVCache(_BaseCache):
     def size(self):
         return self.offset
 
+    def logical_length(self):
+        return self.offset
+
     @property
     def state(self):
         if self.offset == self.keys.shape[2]:
@@ -517,6 +588,35 @@ class RotatingKVCache(_BaseCache):
     def size(self):
         return min(self.offset, self.max_size)
 
+    def logical_length(self):
+        return self.offset
+
+    def retained_range(self):
+        if self.keys is None:
+            return CacheRetainedRange(
+                logical_start=self.offset,
+                logical_end=self.offset,
+                physical_start=0,
+                physical_end=0,
+            )
+        physical_len = self.keys.shape[2]
+        logical_start = max(0, self.offset - physical_len)
+        return CacheRetainedRange(
+            logical_start=logical_start,
+            logical_end=self.offset,
+            physical_start=0,
+            physical_end=physical_len,
+        )
+
+    def can_restore_to(self, position: int):
+        if self.keep != 0:
+            return False
+        if not 0 <= position <= self.offset:
+            return False
+        retained = self.retained_range()
+        required_start = max(0, position - self.max_size)
+        return retained.logical_start <= required_start and position <= retained.logical_end
+
     @property
     def state(self):
         if self.offset < self.keys.shape[2]:
@@ -547,6 +647,31 @@ class RotatingKVCache(_BaseCache):
         self.offset -= n
         self._idx -= n
         return n
+
+    def restore_to(self, position: int):
+        if not self.can_restore_to(position):
+            return CacheRestoreResult(
+                restored=False,
+                restored_tokens=0,
+                replay_start=0,
+                reason=f"{type(self).__name__} retained range cannot restore to {position}",
+            )
+        if self.keys is None:
+            self.offset = position
+            self._idx = 0
+            return CacheRestoreResult(True, position, position, "empty cache restored")
+
+        retained = self.retained_range()
+        required_start = max(0, position - self.max_size)
+        start = required_start - retained.logical_start
+        end = position - retained.logical_start
+        keys = self._temporal_order(self.keys)
+        values = self._temporal_order(self.values)
+        self.keys = mx.contiguous(keys[..., start:end, :])
+        self.values = mx.contiguous(values[..., start:end, :])
+        self.offset = position
+        self._idx = self.keys.shape[2]
+        return CacheRestoreResult(True, position, position, "restored retained rotating window")
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("RotatingKVCache Quantization NYI")
@@ -698,6 +823,20 @@ class ArraysCache(_BaseCache):
         else:
             return None
 
+    def logical_length(self):
+        return 0
+
+    def can_restore_to(self, position: int):
+        return False
+
+    def restore_to(self, position: int):
+        return CacheRestoreResult(
+            restored=False,
+            restored_tokens=0,
+            replay_start=0,
+            reason="ArraysCache requires an exact checkpoint or model replay",
+        )
+
     @classmethod
     def merge(cls, caches):
         n_state = len(caches[0].cache)
@@ -739,11 +878,13 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.start_position += self.keys.shape[2] - self.chunk_size
-            self.keys = self.keys[..., -self.chunk_size :, :]
-            self.values = self.values[..., -self.chunk_size :, :]
+        if self.keys is not None:
+            length = self.offset - self.start_position
+            if length >= self.chunk_size:
+                trim_size = length - self.chunk_size
+                self.start_position += trim_size
+                self.keys = self.keys[..., trim_size:length, :]
+                self.values = self.values[..., trim_size:length, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position
@@ -772,18 +913,20 @@ class ChunkedKVCache(_BaseCache):
 
     @property
     def state(self):
-        if self.offset == self.keys.shape[2]:
+        end = self.offset - self.start_position
+        if end == self.keys.shape[2]:
             return self.keys, self.values
         else:
             return (
-                self.keys[..., : self.offset, :],
-                self.values[..., : self.offset, :],
+                self.keys[..., :end, :],
+                self.values[..., :end, :],
             )
 
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        start_position = getattr(self, "start_position", 0)
+        self.offset = start_position + self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -795,11 +938,15 @@ class ChunkedKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.chunk_size, self.start_position)))
+        return tuple(map(str, (self.chunk_size, self.start_position, self.offset)))
 
     @meta_state.setter
     def meta_state(self, v):
-        self.chunk_size, self.start_position = map(int, v)
+        if len(v) == 2:
+            self.chunk_size, self.start_position = map(int, v)
+            self.offset = self.start_position + self.keys.shape[2]
+        else:
+            self.chunk_size, self.start_position, self.offset = map(int, v)
 
     def empty(self):
         return self.keys is None
@@ -825,6 +972,27 @@ class CacheList(_BaseCache):
         for c in self.caches:
             m = c.trim(n)
         return m
+
+    def logical_length(self):
+        if not self.caches:
+            return 0
+        return max(c.logical_length() for c in self.caches)
+
+    def can_restore_to(self, position: int):
+        return all(
+            hasattr(c, "can_restore_to") and c.can_restore_to(position)
+            for c in self.caches
+        )
+
+    def restore_to(self, position: int):
+        results = [c.restore_to(position) for c in self.caches]
+        restored = all(r.restored for r in results)
+        return CacheRestoreResult(
+            restored=restored,
+            restored_tokens=position if restored else 0,
+            replay_start=position if restored else 0,
+            reason="restored CacheList" if restored else "one or more child caches cannot restore",
+        )
 
     @property
     def state(self):
@@ -1312,7 +1480,7 @@ class BatchRotatingKVCache(_BaseCache):
             int,
             v[:3],
         )
-        self.rotated = bool(v[3])
+        self.rotated = _parse_bool_state(v[3])
 
     def is_trimmable(self):
         return self._offset < self.max_size
@@ -1680,9 +1848,13 @@ class LRUPromptCache:
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            if can_restore_prompt_cache(cache_entry.prompt_cache, prefix):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
+                if restore_prompt_cache(cache, prefix):
+                    return cache, tokens[prefix:]
+            elif can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]

@@ -517,6 +517,41 @@ class TestKeepalive(unittest.TestCase):
             self.fail(f"Callback should handle BrokenPipeError: {e}")
 
 
+class TestServerPromptCacheWiring(unittest.TestCase):
+    def test_run_wires_prompt_cache_bytes(self):
+        from unittest.mock import patch
+
+        from mlx_lm.server import run
+
+        class Args:
+            prompt_cache_size = 7
+            prompt_cache_bytes = 12345
+
+        class Provider:
+            cli_args = Args()
+
+        class Group:
+            def rank(self):
+                return 0
+
+        created = {}
+
+        def fake_lru(max_size=10, max_bytes=1 << 63):
+            created["max_size"] = max_size
+            created["max_bytes"] = max_bytes
+            return LRUPromptCache(max_size=max_size, max_bytes=max_bytes)
+
+        with patch("mlx_lm.server.LRUPromptCache", side_effect=fake_lru), patch(
+            "mlx_lm.server.ResponseGenerator"
+        ), patch("mlx_lm.server._run_http_server"), patch(
+            "mlx_lm.server.mx.distributed.init", return_value=Group()
+        ):
+            run("127.0.0.1", 0, Provider())
+
+        self.assertEqual(created["max_size"], 7)
+        self.assertEqual(created["max_bytes"], 12345)
+
+
 class TestLRUPromptCache(unittest.TestCase):
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)

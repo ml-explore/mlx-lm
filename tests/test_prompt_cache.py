@@ -28,6 +28,60 @@ from mlx_lm.utils import load
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
 
+class TestBatchRotatingKVCacheSerialization(unittest.TestCase):
+    def test_save_load_preserves_rotated_false(self):
+        with tempfile.TemporaryDirectory() as test_dir:
+            cache_file = os.path.join(test_dir, "prompt_cache.safetensors")
+            cache = BatchRotatingKVCache(max_size=4, left_padding=[0])
+            x = mx.random.uniform(shape=(1, 2, 2, 4))
+            cache.update_and_fetch(x, x)
+            cache.rotated = False
+
+            save_prompt_cache(cache_file, [cache])
+            loaded = load_prompt_cache(cache_file)[0]
+
+            self.assertFalse(loaded.rotated)
+            self.assertEqual(loaded.max_size, 4)
+            self.assertEqual(loaded._offset, cache._offset)
+            self.assertEqual(loaded._idx, cache._idx)
+
+    def test_save_load_preserves_rotated_true(self):
+        with tempfile.TemporaryDirectory() as test_dir:
+            cache_file = os.path.join(test_dir, "prompt_cache.safetensors")
+            cache = BatchRotatingKVCache(max_size=4, left_padding=[0])
+            for _ in range(5):
+                x = mx.random.uniform(shape=(1, 2, 1, 4))
+                cache.update_and_fetch(x, x)
+            self.assertTrue(cache.rotated)
+
+            save_prompt_cache(cache_file, [cache])
+            loaded = load_prompt_cache(cache_file)[0]
+
+            self.assertTrue(loaded.rotated)
+            self.assertEqual(loaded.max_size, 4)
+            self.assertEqual(loaded._offset, cache._offset)
+
+
+class TestChunkedKVCacheSerialization(unittest.TestCase):
+    def test_save_load_preserves_offsets_after_front_trim(self):
+        with tempfile.TemporaryDirectory() as test_dir:
+            cache_file = os.path.join(test_dir, "prompt_cache.safetensors")
+            cache = ChunkedKVCache(chunk_size=4)
+            x = mx.random.uniform(shape=(1, 2, 6, 4))
+            cache.update_and_fetch(x, x)
+            cache.maybe_trim_front()
+
+            self.assertEqual(cache.start_position, 2)
+            self.assertEqual(cache.offset, 6)
+
+            save_prompt_cache(cache_file, [cache])
+            loaded = load_prompt_cache(cache_file)[0]
+
+            self.assertEqual(loaded.chunk_size, cache.chunk_size)
+            self.assertEqual(loaded.start_position, cache.start_position)
+            self.assertEqual(loaded.offset, cache.offset)
+
+
 class TestPromptCache(unittest.TestCase):
 
     @classmethod
