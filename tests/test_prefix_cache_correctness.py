@@ -229,5 +229,20 @@ class TestHybridPrefixCacheCorrectness(unittest.TestCase):
         self.assertIsNotNone(cache)
 
 
+class TestPrefixCacheSession(unittest.TestCase):
+    def test_session_returns_rest_and_cached_count(self):
+        from mlx_lm.generate import PrefixCacheSession
+
+        session = PrefixCacheSession(max_size=4)
+        model = ("toy",)
+        session.insert(model, [1, 2, 3], [make_kv_cache(3)])
+
+        hit = session.lookup(model, [1, 2, 3, 4])
+
+        self.assertEqual(hit.cached_tokens, 3)
+        self.assertEqual(hit.tokens_to_process, [4])
+        self.assertIsNotNone(hit.prompt_cache)
+
+
 if __name__ == "__main__":
     unittest.main()

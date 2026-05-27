@@ -56,6 +56,34 @@ DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 
 
+@dataclass
+class PrefixCacheLookup:
+    prompt_cache: Optional[Any]
+    cached_tokens: int
+    tokens_to_process: List[int]
+
+
+class PrefixCacheSession:
+    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+        self._cache = cache.LRUPromptCache(max_size=max_size, max_bytes=max_bytes)
+
+    def lookup(self, model_key, tokens):
+        prompt_cache, rest = self._cache.fetch_nearest_cache(model_key, tokens)
+        return PrefixCacheLookup(
+            prompt_cache=prompt_cache,
+            cached_tokens=len(tokens) - len(rest),
+            tokens_to_process=rest,
+        )
+
+    def insert(self, model_key, tokens, prompt_cache, cache_type="assistant"):
+        self._cache.insert_cache(
+            model_key,
+            tokens,
+            prompt_cache,
+            cache_type=cache_type,
+        )
+
+
 def str2bool(string):
     return string.lower() not in ["false", "f"]
 
