@@ -9,6 +9,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import ArraysCache, RotatingKVCache
+from .recurrent_profile import profile_recurrent_call, recurrent_profile_enabled
 
 
 @dataclass
@@ -51,29 +52,44 @@ def rnn_scan(x, a, h0):
     assert a.shape == x.shape[-a.ndim :]
     assert a.dtype == x.dtype
 
-    if x.shape[1] == 1:
-        # Using scan in sampling mode.
-        if h0 is None:
-            return x, x[:, 0]
+    def run():
+        if x.shape[1] == 1:
+            # Using scan in sampling mode.
+            if h0 is None:
+                return x, x[:, 0]
+
+            else:
+                y = a * h0[:, None] + x
+                return y, y[:, -1]
 
         else:
-            y = a * h0[:, None] + x
-            return y, y[:, -1]
+            # Using scan in linear mode.
+            if h0 is not None:
+                h_t = h0
+            else:
+                B, _, D = x.shape
+                h_t = mx.zeros((B, D), dtype=x.dtype)
 
-    else:
-        # Using scan in linear mode.
-        if h0 is not None:
-            h_t = h0
-        else:
-            B, _, D = x.shape
-            h_t = mx.zeros((B, D), dtype=x.dtype)
+            y = mx.zeros_like(x)
+            for t in range(x.shape[1]):
+                h_t = a[:, t] * h_t + x[:, t]
+                y[:, t] = h_t
 
-        y = mx.zeros_like(x)
-        for t in range(x.shape[1]):
-            h_t = a[:, t] * h_t + x[:, t]
-            y[:, t] = h_t
+        return y, h_t
 
-    return y, h_t
+    if not recurrent_profile_enabled():
+        return run()
+    return profile_recurrent_call(
+        op="recurrent_gemma_rnn",
+        path="step" if x.shape[1] == 1 else "python_loop",
+        metadata={
+            "B": x.shape[0],
+            "T": x.shape[1],
+            "D": x.shape[2],
+            "has_state": h0 is not None,
+        },
+        fn=run,
+    )
 
 
 class Conv1d(nn.Module):

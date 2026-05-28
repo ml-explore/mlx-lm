@@ -3,6 +3,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .recurrent_profile import profile_recurrent_call, recurrent_profile_enabled
+
 
 @mx.compile
 def compute_dt(dt, dt_bias, time_step_limit):
@@ -228,12 +230,26 @@ def ssm_update(
     lengths: Optional[mx.array] = None,
 ):
     seq_len = hidden_states.shape[1]
-    if (
+    use_metal_step = not (
         seq_len > 1
         or state is None
         or mx.default_device() != mx.gpu
         or not mx.metal.is_available()
-    ):
+    )
+    path = "metal_step" if use_metal_step else "ssm_attn"
+    if not recurrent_profile_enabled():
+        if use_metal_step:
+            return ssm_update_kernel(
+                hidden_states,
+                A_log,
+                B,
+                C,
+                D,
+                dt,
+                dt_bias,
+                state,
+                time_step_limit,
+            )
         return ssm_attn(
             hidden_states,
             A_log,
@@ -247,8 +263,21 @@ def ssm_update(
             mask=mask,
             lengths=lengths,
         )
-    else:
-        return ssm_update_kernel(
+    metadata = {
+        "B": hidden_states.shape[0],
+        "T": seq_len,
+        "H": hidden_states.shape[2],
+        "D": hidden_states.shape[3],
+        "state_dim": A_log.shape[-1],
+        "has_state": state is not None,
+        "has_mask": mask is not None,
+        "has_lengths": lengths is not None,
+    }
+    return profile_recurrent_call(
+        op="ssm",
+        path=path,
+        metadata=metadata,
+        fn=lambda: ssm_update_kernel(
             hidden_states,
             A_log,
             B,
@@ -259,3 +288,18 @@ def ssm_update(
             state,
             time_step_limit,
         )
+        if use_metal_step
+        else ssm_attn(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            time_step_limit,
+            mask=mask,
+            lengths=lengths,
+        ),
+    )

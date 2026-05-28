@@ -9,6 +9,7 @@ import mlx.nn as nn
 from .activations import swiglu
 from .base import BaseModelArgs
 from .cache import ArraysCache
+from .recurrent_profile import profile_recurrent_call, recurrent_profile_enabled
 
 
 @dataclass
@@ -122,26 +123,43 @@ class MambaBlock(nn.Module):
         return y, new_state
 
     def _process_sequence(self, x, conv_cache, state_cache):
+        def run():
+            B, T, D = x.shape
+            xz = self.in_proj(x)
+            x_inner, z = xz.split(indices_or_sections=2, axis=-1)
+            K = self.conv_kernel_size
+            if conv_cache is not None:
+                x_full = mx.concatenate([conv_cache, x_inner], axis=1)
+            else:
+                x_full = mx.pad(x_inner, [(0, 0), (K - 1, 0), (0, 0)])
+            conv_out = self.conv1d(x_full)
+            new_conv_cache = x_full[:, -(K - 1) :, :]
+            x_inner = nn.silu(conv_out)
+            A = -mx.exp(self.A_log)
+            current_state = state_cache
+            y = []
+            for t in range(T):
+                y_t, current_state = self.ssm_step(x_inner[:, t], A, current_state)
+                y.append(y_t)
+            y = mx.stack(y, axis=1)
+            z = self.out_proj(swiglu(z, y))
+            return z, (new_conv_cache, current_state)
+
+        if not recurrent_profile_enabled():
+            return run()
         B, T, D = x.shape
-        xz = self.in_proj(x)
-        x, z = xz.split(indices_or_sections=2, axis=-1)
-        K = self.conv_kernel_size
-        if conv_cache is not None:
-            x_full = mx.concatenate([conv_cache, x], axis=1)
-        else:
-            x_full = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
-        conv_out = self.conv1d(x_full)
-        new_conv_cache = x_full[:, -(K - 1) :, :]
-        x = nn.silu(conv_out)
-        A = -mx.exp(self.A_log)
-        current_state = state_cache
-        y = []
-        for t in range(T):
-            y_t, current_state = self.ssm_step(x[:, t], A, current_state)
-            y.append(y_t)
-        y = mx.stack(y, axis=1)
-        z = self.out_proj(swiglu(z, y))
-        return z, (new_conv_cache, current_state)
+        return profile_recurrent_call(
+            op="mamba",
+            path="python_loop",
+            metadata={
+                "B": B,
+                "T": T,
+                "D": D,
+                "has_conv_cache": conv_cache is not None,
+                "has_state_cache": state_cache is not None,
+            },
+            fn=run,
+        )
 
     def __call__(self, x, cache):
         if cache is None:

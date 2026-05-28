@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .recurrent_profile import profile_recurrent_call, recurrent_profile_enabled
+
 
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
@@ -278,6 +280,27 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    use_metal = use_kernel and mx.default_device() == mx.gpu and mx.metal.is_available()
+    path = "metal" if use_metal else "ops"
+    if not recurrent_profile_enabled():
+        if use_metal:
+            return gated_delta_kernel(q, k, v, g, beta, state, mask)
         return gated_delta_ops(q, k, v, g, beta, state, mask)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask)
+    metadata = {
+        "B": q.shape[0],
+        "T": q.shape[1],
+        "Hk": q.shape[2],
+        "Dk": q.shape[3],
+        "Hv": v.shape[2],
+        "Dv": v.shape[3],
+        "vectorized_gating": g.ndim == 4,
+        "has_mask": mask is not None,
+    }
+    return profile_recurrent_call(
+        op="gated_delta",
+        path=path,
+        metadata=metadata,
+        fn=lambda: gated_delta_kernel(q, k, v, g, beta, state, mask)
+        if use_metal
+        else gated_delta_ops(q, k, v, g, beta, state, mask),
+    )
