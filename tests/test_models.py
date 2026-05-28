@@ -9,7 +9,13 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    MLACache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1421,6 +1427,98 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_mla_models_make_mla_caches(self):
+        from mlx_lm.models import deepseek_v3, deepseek_v32, kimi_k25
+
+        v3_args = deepseek_v3.ModelArgs(
+            model_type="deepseek_v3",
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=None,
+            n_shared_experts=None,
+            kv_lora_rank=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=32,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+            max_position_embeddings=64,
+        )
+        self.assertIsInstance(
+            make_prompt_cache(deepseek_v3.Model(v3_args))[0],
+            MLACache,
+        )
+        kimi = kimi_k25.Model(kimi_k25.ModelArgs(text_config=v3_args))
+        self.assertIsInstance(make_prompt_cache(kimi)[0], MLACache)
+
+        v32_args = deepseek_v32.ModelArgs(
+            model_type="deepseek_v32",
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=None,
+            n_shared_experts=None,
+            kv_lora_rank=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=32,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+            index_head_dim=32,
+            index_n_heads=2,
+            max_position_embeddings=64,
+        )
+        v32_cache = make_prompt_cache(deepseek_v32.Model(v32_args))
+        self.assertIsInstance(v32_cache[0][0], MLACache)
+        self.assertIsInstance(v32_cache[0][1], KVCache)
+
+    def test_deepseek_v3_kv_bits_skips_mla_cache(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models import deepseek_v3
+
+        args = deepseek_v3.ModelArgs(
+            model_type="deepseek_v3",
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=None,
+            n_shared_experts=None,
+            kv_lora_rank=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=32,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+            max_position_embeddings=64,
+        )
+        model = deepseek_v3.Model(args)
+        prompt_cache = make_prompt_cache(model)
+
+        self.assertIsInstance(prompt_cache[0], MLACache)
+        next(
+            generate_step(
+                mx.array([1, 2, 3]),
+                model,
+                max_tokens=1,
+                prompt_cache=prompt_cache,
+                prefill_step_size=2,
+                kv_bits=4,
+                kv_group_size=32,
+            )
+        )
+        self.assertIsInstance(prompt_cache[0], MLACache)
+        self.assertNotIsInstance(prompt_cache[0], QuantizedKVCache)
 
     def test_gemma2(self):
         from mlx_lm.models import gemma2

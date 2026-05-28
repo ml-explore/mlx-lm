@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache
+from .cache import CacheList, KVCache, MLACache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -651,4 +651,4 @@ class Model(nn.Module):
         return predicate
 
     def make_cache(self):
-        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
+        return [CacheList(MLACache(), KVCache()) for _ in self.layers]

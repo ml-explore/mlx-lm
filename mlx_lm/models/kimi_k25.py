@@ -38,6 +38,9 @@ class LanguageModel(nn.Module):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
+    def make_cache(self):
+        return self.model.make_cache()
+
 
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -52,6 +55,9 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
     ):
         return self.language_model(inputs, cache)
+
+    def make_cache(self):
+        return self.language_model.make_cache()
 
     def sanitize(self, weights):
         weights = tree_unflatten(list(weights.items()))

@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import MLACache
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -360,6 +361,9 @@ class DeepseekV3Model(PipelineMixin, nn.Module):
 
         return self.norm(h)
 
+    def make_cache(self):
+        return [MLACache() for _ in self.pipeline_layers]
+
 
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -376,6 +380,9 @@ class Model(nn.Module):
     ):
         out = self.model(inputs, cache)
         return self.lm_head(out)
+
+    def make_cache(self):
+        return self.model.make_cache()
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):

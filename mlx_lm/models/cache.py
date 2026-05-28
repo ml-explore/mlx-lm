@@ -407,6 +407,13 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class MLACache(KVCache):
+    supports_quantized_kv_cache = False
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        raise NotImplementedError("MLA cache quantization is not supported")
+
+
 class RotatingKVCache(_BaseCache):
     step = 256
 
