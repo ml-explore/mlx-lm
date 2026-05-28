@@ -9,7 +9,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
-from .mla import MultiLinear
+from .mla import MultiLinear, shard_mla_projections, split_kv_b_proj_weights
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -403,43 +403,14 @@ class Model(nn.Module):
         for l in range(self.args.num_layers):
             for i in range(2):
                 prefix = f"model.layers.{l}.self_attn.{i}"
-                kv_b_key = f"{prefix}.kv_b_proj.weight"
-                if kv_b_key in weights:
-                    num_heads = self.args.num_attention_heads
-                    head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
-                    quantized = f"{prefix}.kv_b_proj.scales" in weights
-                    v = weights.pop(kv_b_key)
-
-                    if quantized:
-                        dims = self.args.kv_lora_rank
-                        scales = weights.pop(f"{prefix}.kv_b_proj.scales")
-                        biases = weights.pop(f"{prefix}.kv_b_proj.biases")
-                        bits = (v.shape[-1] * 32) // dims
-                        group_size = dims // scales.shape[-1]
-                        v = mx.dequantize(
-                            v, scales, biases, bits=bits, group_size=group_size
-                        )
-
-                    v = v.reshape(num_heads, head_dim, -1)
-                    wk = mx.contiguous(
-                        v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
-                    )
-                    wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
-
-                    if quantized:
-                        wk, wk_s, wk_b = mx.quantize(
-                            wk, bits=bits, group_size=group_size
-                        )
-                        wv, wv_s, wv_b = mx.quantize(
-                            wv, bits=bits, group_size=group_size
-                        )
-                        weights[f"{prefix}.embed_q.scales"] = wk_s
-                        weights[f"{prefix}.embed_q.biases"] = wk_b
-                        weights[f"{prefix}.unembed_out.scales"] = wv_s
-                        weights[f"{prefix}.unembed_out.biases"] = wv_b
-
-                    weights[f"{prefix}.embed_q.weight"] = wk
-                    weights[f"{prefix}.unembed_out.weight"] = wv
+                split_kv_b_proj_weights(
+                    weights,
+                    prefix,
+                    num_heads=self.args.num_attention_heads,
+                    qk_nope_head_dim=self.args.qk_nope_head_dim,
+                    v_head_dim=self.args.v_head_dim,
+                    kv_lora_rank=self.args.kv_lora_rank,
+                )
 
         new_weights = {}
         for k, v in weights.items():
@@ -453,11 +424,10 @@ class Model(nn.Module):
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
-        N = group.size()
-        rank = group.rank()
 
         for layer in self.model.layers:
             for attn in layer.self_attn:
+                shard_mla_projections(attn, group, "num_attention_heads")
                 if attn.q_lora_rank is None:
                     attn.q_proj = shard_linear(
                         attn.q_proj, "all-to-sharded", group=group
@@ -467,16 +437,6 @@ class Model(nn.Module):
                         attn.q_b_proj, "all-to-sharded", group=group
                     )
                 attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
-                attn.num_attention_heads //= N
-                num_heads = attn.num_attention_heads
-                sh = rank * num_heads
-                eh = sh + num_heads
-
-                def shard_heads(w):
-                    return w[sh:eh]
-
-                attn.embed_q.apply(shard_heads)
-                attn.unembed_out.apply(shard_heads)
 
             for mlp in layer.mlps:
                 mlp.gate_proj = shard_linear(

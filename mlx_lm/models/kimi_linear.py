@@ -15,7 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
-from .mla import MultiLinear
+from .mla import MultiLinear, split_kv_b_proj_weights
 from .switch_layers import SwitchGLU
 
 
@@ -553,40 +553,14 @@ class Model(nn.Module):
                         weights[dt_key] = mx.reshape(weights[dt_key], (-1,))
 
             attn_prefix = f"{prefix}.self_attn"
-            kv_b_key = f"{attn_prefix}.kv_b_proj.weight"
-            if kv_b_key in weights:
-                qk_nope = self.args.qk_nope_head_dim or self.args.head_dim
-                v_head = self.args.v_head_dim or self.args.head_dim
-                head_dim = qk_nope + v_head
-                num_heads = self.args.num_attention_heads
-
-                quantized = f"{attn_prefix}.kv_b_proj.scales" in weights
-                v = weights.pop(kv_b_key)
-
-                if quantized:
-                    dims = self.args.kv_lora_rank
-                    scales = weights.pop(f"{attn_prefix}.kv_b_proj.scales")
-                    biases = weights.pop(f"{attn_prefix}.kv_b_proj.biases")
-                    bits = (v.shape[-1] * 32) // dims
-                    group_size = dims // scales.shape[-1]
-                    v = mx.dequantize(
-                        v, scales, biases, bits=bits, group_size=group_size
-                    )
-
-                v = v.reshape(num_heads, head_dim, -1)
-                wk = mx.contiguous(v[:, :qk_nope, :].swapaxes(-1, -2))
-                wv = mx.contiguous(v[:, qk_nope:, :])
-
-                if quantized:
-                    wk, wk_s, wk_b = mx.quantize(wk, bits=bits, group_size=group_size)
-                    wv, wv_s, wv_b = mx.quantize(wv, bits=bits, group_size=group_size)
-                    weights[f"{attn_prefix}.embed_q.scales"] = wk_s
-                    weights[f"{attn_prefix}.embed_q.biases"] = wk_b
-                    weights[f"{attn_prefix}.unembed_out.scales"] = wv_s
-                    weights[f"{attn_prefix}.unembed_out.biases"] = wv_b
-
-                weights[f"{attn_prefix}.embed_q.weight"] = wk
-                weights[f"{attn_prefix}.unembed_out.weight"] = wv
+            split_kv_b_proj_weights(
+                weights,
+                attn_prefix,
+                num_heads=self.args.num_attention_heads,
+                qk_nope_head_dim=self.args.qk_nope_head_dim or self.args.head_dim,
+                v_head_dim=self.args.v_head_dim or self.args.head_dim,
+                kv_lora_rank=self.args.kv_lora_rank,
+            )
 
         return weights
 

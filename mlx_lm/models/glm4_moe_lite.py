@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .mla import MultiLinear
+from .mla import MultiLinear, shard_mla_projections, split_kv_b_proj_weights
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -410,50 +410,22 @@ class Model(nn.Module):
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
             prefix = f"model.layers.{l}.self_attn"
-            if f"{prefix}.kv_b_proj.weight" in weights:
-                layer = self.layers[l].self_attn.embed_q
-                quantized = f"{prefix}.kv_b_proj.scales" in weights
-                v = weights.pop(f"{prefix}.kv_b_proj.weight")
-                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
-
-                if quantized:
-                    dims = self.args.kv_lora_rank
-                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
-                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
-                    # Try to infer bits and group size
-                    bits = (v.shape[-1] * 32) // dims
-                    group_size = dims // scales.shape[-1]
-                    v = mx.dequantize(
-                        v, scales, biases, bits=bits, group_size=group_size
-                    )
-                num_heads = self.args.num_attention_heads
-                v = v.reshape(num_heads, head_dim, -1)
-                wk = mx.contiguous(
-                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
-                )
-                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
-                if quantized:
-                    wk, wk_scales, wk_biases = mx.quantize(
-                        wk, bits=bits, group_size=group_size
-                    )
-                    wv, wv_scales, wv_biases = mx.quantize(
-                        wv, bits=bits, group_size=group_size
-                    )
-                    weights[f"{prefix}.embed_q.scales"] = wk_scales
-                    weights[f"{prefix}.unembed_out.scales"] = wv_scales
-                    weights[f"{prefix}.embed_q.biases"] = wk_biases
-                    weights[f"{prefix}.unembed_out.biases"] = wv_biases
-                weights[f"{prefix}.embed_q.weight"] = wk
-                weights[f"{prefix}.unembed_out.weight"] = wv
+            split_kv_b_proj_weights(
+                weights,
+                prefix,
+                num_heads=self.args.num_attention_heads,
+                qk_nope_head_dim=self.args.qk_nope_head_dim,
+                v_head_dim=self.args.v_head_dim,
+                kv_lora_rank=self.args.kv_lora_rank,
+            )
 
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
-        rank = group.rank()
-        N = group.size()
         for layer in self.model.layers:
             # Shard the self attention
+            shard_mla_projections(layer.self_attn, group, "num_heads")
             if layer.self_attn.q_lora_rank is None:
                 layer.self_attn.q_proj = shard_linear(
                     layer.self_attn.q_proj, "all-to-sharded", group=group
@@ -462,16 +434,6 @@ class Model(nn.Module):
                 layer.self_attn.q_b_proj = shard_linear(
                     layer.self_attn.q_b_proj, "all-to-sharded", group=group
                 )
-            layer.self_attn.num_heads //= N
-            num_heads = layer.self_attn.num_heads
-            sh = rank * num_heads
-            eh = sh + num_heads
-
-            def shard_heads(w):
-                return w[sh:eh]
-
-            layer.self_attn.embed_q.apply(shard_heads)
-            layer.self_attn.unembed_out.apply(shard_heads)
 
             layer.self_attn.o_proj = shard_linear(
                 layer.self_attn.o_proj, "sharded-to-all", group=group

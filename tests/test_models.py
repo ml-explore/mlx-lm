@@ -339,6 +339,67 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def test_mla_split_requantizes_affine_weight_without_biases(self):
+        from mlx_lm.models.mla import split_kv_b_proj_weights
+
+        prefix = "model.layers.0.self_attn"
+        num_heads, qk_nope, v_head, kv_lora = 2, 32, 32, 32
+        head_dim = qk_nope + v_head
+        weight = mx.random.normal(shape=(num_heads * head_dim, kv_lora))
+        q_weight, scales, *_ = mx.quantize(weight, group_size=32, bits=8)
+        # An affine checkpoint saved without biases (weight + scales only).
+        weights = {
+            f"{prefix}.kv_b_proj.weight": q_weight,
+            f"{prefix}.kv_b_proj.scales": scales,
+        }
+
+        split_kv_b_proj_weights(
+            weights,
+            prefix,
+            num_heads=num_heads,
+            qk_nope_head_dim=qk_nope,
+            v_head_dim=v_head,
+            kv_lora_rank=kv_lora,
+        )
+
+        # The split projections are re-quantized so they reload as
+        # QuantizedMultiLinear (the loader only quantizes modules whose
+        # matching .scales key is present in the checkpoint).
+        self.assertNotIn(f"{prefix}.kv_b_proj.weight", weights)
+        for proj in ("embed_q", "unembed_out"):
+            self.assertIn(f"{prefix}.{proj}.weight", weights)
+            self.assertIn(f"{prefix}.{proj}.scales", weights)
+            self.assertIn(f"{prefix}.{proj}.biases", weights)
+
+    def test_mla_sharding_requires_divisible_heads(self):
+        from mlx_lm.models.mla import MultiLinear, shard_mla_projections
+
+        class Group:
+            def __init__(self, size, rank=0):
+                self._size = size
+                self._rank = rank
+
+            def size(self):
+                return self._size
+
+            def rank(self):
+                return self._rank
+
+        class Attention(nn.Module):
+            def __init__(self, num_heads):
+                super().__init__()
+                self.num_heads = num_heads
+                self.embed_q = MultiLinear(4, 4, num_heads)
+                self.unembed_out = MultiLinear(4, 4, num_heads)
+
+        with self.assertRaises(ValueError):
+            shard_mla_projections(Attention(3), Group(2), "num_heads")
+
+        attention = Attention(4)
+        shard_mla_projections(attention, Group(2, rank=1), "num_heads")
+        self.assertEqual(attention.num_heads, 2)
+        self.assertEqual(attention.embed_q.weight.shape[0], 2)
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
