@@ -7,11 +7,12 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step
+from mlx_lm.generate import _merge_caches, generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchQuantizedKVCache,
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
@@ -529,6 +530,65 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache_a.values.shape[0], 5)
         self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
+
+    def test_batch_quantized_kv_cache(self):
+        c1 = QuantizedKVCache(bits=4, group_size=32)
+        c2 = QuantizedKVCache(bits=4, group_size=32)
+        c1.update_and_fetch(mx.ones((1, 1, 5, 32)), mx.ones((1, 1, 5, 32)))
+        c2.update_and_fetch(mx.ones((1, 1, 3, 32)), mx.ones((1, 1, 3, 32)))
+
+        batch = BatchQuantizedKVCache.merge([c1, c2])
+        self.assertEqual(batch.size(), 5)
+        self.assertEqual(batch.offset.tolist(), [5, 3])
+        self.assertEqual(batch.left_padding.tolist(), [0, 2])
+        self.assertEqual(batch.keys[0].shape, (2, 1, 5, 4))
+        self.assertEqual(batch.keys[1].shape, (2, 1, 5, 1))
+
+        extracted = batch.extract(1)
+        self.assertIsInstance(extracted, QuantizedKVCache)
+        self.assertEqual(extracted.offset, 3)
+        self.assertEqual(extracted.group_size, 32)
+        self.assertEqual(extracted.bits, 4)
+        self.assertEqual(extracted.keys[0].shape, (1, 1, 3, 4))
+
+        k, v = batch.update_and_fetch(
+            mx.zeros((2, 1, 2, 32)), mx.zeros((2, 1, 2, 32))
+        )
+        self.assertEqual(k[0].shape, (2, 1, 7, 4))
+        self.assertEqual(v[0].shape, (2, 1, 7, 4))
+        self.assertEqual(batch.offset.tolist(), [7, 5])
+
+        batch.filter([1])
+        self.assertEqual(batch.keys[0].shape[0], 1)
+        self.assertEqual(batch.left_padding.tolist(), [0])
+        self.assertEqual(batch.offset.tolist(), [5])
+
+    def test_merge_quantized_kv_cache_history(self):
+        c1 = QuantizedKVCache(bits=4, group_size=32)
+        c2 = QuantizedKVCache(bits=4, group_size=32)
+        c1.update_and_fetch(mx.ones((1, 1, 5, 32)), mx.ones((1, 1, 5, 32)))
+        c2.update_and_fetch(mx.ones((1, 1, 3, 32)), mx.ones((1, 1, 3, 32)))
+
+        batch = _merge_caches([[c1], [c2]])
+        self.assertIsInstance(batch[0], BatchQuantizedKVCache)
+        self.assertEqual(batch[0].offset.tolist(), [5, 3])
+        self.assertEqual(batch[0].left_padding.tolist(), [0, 2])
+
+    def test_batch_quantized_kv_cache_extend_with_empty(self):
+        c1 = QuantizedKVCache(bits=4, group_size=32)
+        c2 = QuantizedKVCache(bits=4, group_size=32)
+        c1.update_and_fetch(mx.ones((1, 1, 5, 32)), mx.ones((1, 1, 5, 32)))
+        c2.update_and_fetch(mx.ones((1, 1, 3, 32)), mx.ones((1, 1, 3, 32)))
+        batch_full = BatchQuantizedKVCache.merge([c1, c2])
+        batch_empty = BatchQuantizedKVCache.merge(
+            [QuantizedKVCache(bits=4, group_size=32) for _ in range(3)]
+        )
+
+        batch_full.extend(batch_empty)
+        self.assertEqual(batch_full.keys[0].shape[0], 5)
+        self.assertEqual(batch_full.offset.shape[0], 5)
+        self.assertEqual(batch_full.group_size, 32)
+        self.assertEqual(batch_full.bits, 4)
 
     def test_batch_rotating_kv_cache(self):
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])

@@ -30,6 +30,7 @@ from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchQuantizedKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -842,6 +843,10 @@ def _make_cache(model, left_padding, max_kv_size):
     """
 
     def to_batch_cache(c):
+        if isinstance(c, QuantizedKVCache):
+            return BatchQuantizedKVCache(
+                left_padding, group_size=c.group_size, bits=c.bits
+            )
         if type(c) is KVCache:
             return BatchKVCache(left_padding)
         elif isinstance(c, ArraysCache):
