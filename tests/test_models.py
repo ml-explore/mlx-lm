@@ -615,12 +615,11 @@ class TestModels(unittest.TestCase):
             "max_position_embeddings": 64,
         }
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        hf_conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
         mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        mlx_mtp_key = "language_model.mtp.fc.weight"
 
-        for model_type, hf_mtp_key in (
-            ("qwen3_5", "mtp.fc.weights"),
-            ("qwen3_5_moe", "mtp.fc.weight"),
-        ):
+        for model_type in ("qwen3_5", "qwen3_5_moe"):
             module = importlib.import_module(f"mlx_lm.models.{model_type}")
             args = module.ModelArgs.from_dict(
                 {
@@ -636,18 +635,23 @@ class TestModels(unittest.TestCase):
             converted = model.sanitize(
                 {
                     hf_norm_key: base,
-                    hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
+                    hf_conv_key: mx.zeros((4, 1, 3), dtype=mx.float32),
                 }
             )
             self.assertIn(mlx_norm_key, converted)
             self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
-            self.assertFalse(any("mtp." in k for k in converted))
 
-            # Simulate load sanitize on already-converted keys.
-            loaded = model.sanitize(converted)
+            # Simulate load sanitize on already-converted keys with MTP weights.
+            loaded = model.sanitize(
+                {
+                    mlx_norm_key: converted[mlx_norm_key],
+                    mlx_mtp_key: mx.zeros((1,), dtype=mx.float32),
+                }
+            )
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
+            self.assertFalse(any("mtp." in k for k in loaded))
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4
