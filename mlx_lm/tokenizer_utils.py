@@ -646,6 +646,8 @@ def _infer_tool_parser(tokenizer):
             return "mistral"
         elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
             return "json_tools"
+        elif "<function name=" in chat_template and "<param name=" in chat_template:
+            return "minicpm5"
 
     # No template match, so fall back to the vocab. LFM2.5 conversions for
     # example have the tool-call tokens but do not name them in the template.
