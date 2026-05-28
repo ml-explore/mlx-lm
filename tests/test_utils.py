@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,6 +59,48 @@ class TestUtils(unittest.TestCase):
         gb = sum(p.nbytes for _, p in weights) // 2**30
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
+
+    def test_save_respects_donate_model(self):
+        class TinyTokenizer:
+            def save_pretrained(self, path):
+                Path(path, "tokenizer_config.json").write_text("{}\n")
+
+        def make_model():
+            model = nn.Linear(2, 2, bias=False)
+            mx.eval(model.parameters())
+            return model
+
+        src_path = Path(self.test_dir) / "source_model"
+        src_path.mkdir(exist_ok=True)
+
+        with patch("mlx_lm.utils.create_model_card"):
+            model = make_model()
+            utils.save(
+                Path(self.test_dir) / "preserved_model",
+                src_path,
+                model,
+                TinyTokenizer(),
+                {"model_type": "tiny"},
+                donate_model=False,
+            )
+            self.assertEqual(
+                {k: tuple(v.shape) for k, v in tree_flatten(model.parameters())},
+                {"weight": (2, 2)},
+            )
+
+            model = make_model()
+            utils.save(
+                Path(self.test_dir) / "donated_model",
+                src_path,
+                model,
+                TinyTokenizer(),
+                {"model_type": "tiny"},
+                donate_model=True,
+            )
+            self.assertEqual(
+                {k: tuple(v.shape) for k, v in tree_flatten(model.parameters())},
+                {"weight": (0,)},
+            )
 
     def test_quantize(self):
         from mlx_lm.models import llama

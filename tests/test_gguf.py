@@ -1,11 +1,15 @@
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import mlx.nn as nn
 
+import mlx_lm.fuse as fuse
 from mlx_lm.gguf import convert_to_gguf
 
 
@@ -56,6 +60,59 @@ class TestConvertToGGUFWithoutMocks(unittest.TestCase):
         convert_to_gguf(model_path, weights, config, output_file_path)
         called_args, _ = mock_save_gguf.call_args
         self.assertEqual(called_args[0], output_file_path)
+
+
+class TestFuseGGUFExport(unittest.TestCase):
+    def test_export_gguf_receives_preserved_model_weights(self):
+        class TinyTokenizer:
+            def save_pretrained(self, path):
+                Path(path, "tokenizer_config.json").write_text("{}\n")
+
+        model = nn.Linear(2, 2, bias=False)
+        mx.eval(model.parameters())
+
+        recorded = {}
+
+        def fake_convert_to_gguf(save_path, weights, config, output_path):
+            recorded["weights"] = {k: tuple(v.shape) for k, v in weights.items()}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "source_model"
+            source_path.mkdir()
+            save_path = Path(tmpdir) / "fused_model"
+            argv = [
+                "mlx_lm.fuse",
+                "--model",
+                str(source_path),
+                "--save-path",
+                str(save_path),
+                "--export-gguf",
+            ]
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(sys, "argv", argv))
+                stack.enter_context(
+                    patch.object(
+                        fuse,
+                        "load",
+                        return_value=(
+                            model,
+                            TinyTokenizer(),
+                            {"model_type": "llama"},
+                        ),
+                    )
+                )
+                stack.enter_context(patch("mlx_lm.utils.create_model_card"))
+                stack.enter_context(
+                    patch.object(
+                        fuse,
+                        "convert_to_gguf",
+                        side_effect=fake_convert_to_gguf,
+                    )
+                )
+                fuse.main()
+
+        self.assertEqual(recorded["weights"], {"weight": (2, 2)})
 
 
 if __name__ == "__main__":
