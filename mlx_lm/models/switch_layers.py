@@ -165,6 +165,7 @@ class SwitchGLU(nn.Module):
         num_experts: int,
         activation=SwiGLU(),
         bias: bool = False,
+        fuse_gate_up: bool = False,
     ):
         super().__init__()
 
@@ -172,6 +173,96 @@ class SwitchGLU(nn.Module):
         self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
+        self.fuse_gate_up = fuse_gate_up
+        self._fused_gate_up_cache = None
+
+    def _can_fuse_gate_up(self):
+        if not self.fuse_gate_up or self.training:
+            return False
+        if type(self.up_proj) is not type(self.gate_proj):
+            return False
+        if not isinstance(self.up_proj, (SwitchLinear, QuantizedSwitchLinear)):
+            return False
+        if self.up_proj.input_dims != self.gate_proj.input_dims:
+            return False
+        if self.up_proj.output_dims != self.gate_proj.output_dims:
+            return False
+        if self.up_proj.num_experts != self.gate_proj.num_experts:
+            return False
+        if ("bias" in self.up_proj) != ("bias" in self.gate_proj):
+            return False
+        if isinstance(self.up_proj, QuantizedSwitchLinear):
+            if self.up_proj.group_size != self.gate_proj.group_size:
+                return False
+            if self.up_proj.bits != self.gate_proj.bits:
+                return False
+            if self.up_proj.mode != self.gate_proj.mode:
+                return False
+            if (self.up_proj.get("biases") is None) != (
+                self.gate_proj.get("biases") is None
+            ):
+                return False
+        return True
+
+    def _fused_gate_up_params(self):
+        up = self.up_proj
+        gate = self.gate_proj
+        key = (
+            type(up),
+            id(up["weight"]),
+            id(gate["weight"]),
+            up["weight"].shape,
+            gate["weight"].shape,
+        )
+        if self._fused_gate_up_cache is not None:
+            cached_key, params = self._fused_gate_up_cache
+            if cached_key == key:
+                return params
+
+        weight = mx.concatenate([up["weight"], gate["weight"]], axis=1)
+        bias = None
+        if "bias" in up:
+            bias = mx.concatenate([up["bias"], gate["bias"]], axis=1)
+        if isinstance(up, QuantizedSwitchLinear):
+            scales = mx.concatenate([up["scales"], gate["scales"]], axis=1)
+            up_biases = up.get("biases")
+            gate_biases = gate.get("biases")
+            biases = None
+            if up_biases is not None:
+                biases = mx.concatenate([up_biases, gate_biases], axis=1)
+            params = (weight, scales, biases, bias)
+        else:
+            params = (weight, bias)
+        self._fused_gate_up_cache = (key, params)
+        return params
+
+    def _fused_gate_up(self, x, indices, sorted_indices=False):
+        hidden_dims = self.up_proj.output_dims
+        if isinstance(self.up_proj, QuantizedSwitchLinear):
+            weight, scales, biases, bias = self._fused_gate_up_params()
+            x = mx.gather_qmm(
+                x,
+                weight,
+                scales,
+                biases,
+                rhs_indices=indices,
+                transpose=True,
+                group_size=self.up_proj.group_size,
+                bits=self.up_proj.bits,
+                mode=self.up_proj.mode,
+                sorted_indices=sorted_indices,
+            )
+        else:
+            weight, bias = self._fused_gate_up_params()
+            x = mx.gather_mm(
+                x,
+                weight.swapaxes(-1, -2),
+                rhs_indices=indices,
+                sorted_indices=sorted_indices,
+            )
+        if bias is not None:
+            x = x + mx.expand_dims(bias[indices], -2)
+        return x[..., :hidden_dims], x[..., hidden_dims:]
 
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
@@ -185,8 +276,11 @@ class SwitchGLU(nn.Module):
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        if self._can_fuse_gate_up():
+            x_up, x_gate = self._fused_gate_up(x, idx, sorted_indices=do_sort)
+        else:
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,
