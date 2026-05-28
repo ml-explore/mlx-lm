@@ -25,6 +25,20 @@ def cache_logical_length(prompt_cache):
     return max(lengths) if lengths else None
 
 
+def cache_fetch_payload(stats):
+    fetch_ms = stats.lookup_ms + stats.deepcopy_ms + stats.restore_ms
+    return {
+        "cache_fetch_ms": fetch_ms,
+        "cache_lookup_ms": stats.lookup_ms,
+        "cache_deepcopy_ms": stats.deepcopy_ms,
+        "cache_restore_ms": stats.restore_ms,
+        "cache_fetch_nbytes": stats.cache_nbytes,
+        "cache_fetch_matched_tokens": stats.matched_tokens,
+        "cache_fetch_hit_kind": stats.hit_kind,
+        "cache_fetch_fallback_reason": stats.fallback_reason,
+    }
+
+
 def prefill_snapshot(model, tokens, prefill_step_size):
     if not tokens:
         raise ValueError("Cannot prefill an empty token sequence")
@@ -105,7 +119,7 @@ def insert_snapshot(lru, model_key, key_tokens, prompt_cache, prefill_s):
 
 
 def run_hot(name, cache_hit_kind, lru, model_key, model, tokenizer, tokens, max_tokens, prefill_step_size):
-    prompt_cache, rest = lru.fetch_nearest_cache(model_key, list(tokens))
+    prompt_cache, rest, stats = lru.fetch_nearest_cache_with_stats(model_key, list(tokens))
     if prompt_cache is None:
         prompt_cache = make_prompt_cache(model)
         rest = list(tokens)
@@ -125,6 +139,7 @@ def run_hot(name, cache_hit_kind, lru, model_key, model, tokenizer, tokens, max_
         "replayed_tokens": len(rest),
         "cache_bytes": cache_nbytes(prompt_cache),
         "cache_logical_length": cache_logical_length(prompt_cache),
+        **cache_fetch_payload(stats),
         **result,
     }
 

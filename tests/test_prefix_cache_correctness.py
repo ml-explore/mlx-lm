@@ -56,6 +56,25 @@ class TestHybridPrefixCacheCorrectness(unittest.TestCase):
         self.assertIsNotNone(cache)
         self.assertTrue(mx.array_equal(cache[0][0], mx.array([[11]], dtype=mx.float32)))
 
+    def test_exact_hit_reports_fetch_stats(self):
+        lru = LRUPromptCache(max_size=4)
+        model = ("toy",)
+        prompt = [1, 2, 3]
+        prompt_cache = [make_kv_cache(3)]
+        lru.insert_cache(model, prompt, prompt_cache)
+
+        cache, rest, stats = lru.fetch_nearest_cache_with_stats(model, prompt)
+
+        self.assertEqual(rest, [])
+        self.assertIsNotNone(cache)
+        self.assertEqual(stats.hit_kind, "exact")
+        self.assertEqual(stats.fallback_reason, "exact")
+        self.assertEqual(stats.matched_tokens, 3)
+        self.assertEqual(stats.cache_nbytes, prompt_cache[0].nbytes)
+        self.assertGreaterEqual(stats.lookup_ms, 0)
+        self.assertGreaterEqual(stats.deepcopy_ms, 0)
+        self.assertEqual(stats.restore_ms, 0)
+
     def test_shorter_checkpoint_reuses_non_trimmable_arrays_cache(self):
         lru = LRUPromptCache(max_size=4)
         model = ("toy",)
@@ -67,6 +86,21 @@ class TestHybridPrefixCacheCorrectness(unittest.TestCase):
         self.assertEqual(rest, [9])
         self.assertIsNotNone(cache)
         self.assertTrue(mx.array_equal(cache[0][0], mx.array([[22]], dtype=mx.float32)))
+
+    def test_shorter_checkpoint_reports_fetch_stats(self):
+        lru = LRUPromptCache(max_size=4)
+        model = ("toy",)
+        lru.insert_cache(model, [1, 2], [make_arrays_cache(22), make_kv_cache(2)])
+        lru.insert_cache(model, [1, 2, 3, 4], [make_arrays_cache(44), make_kv_cache(4)])
+
+        cache, rest, stats = lru.fetch_nearest_cache_with_stats(model, [1, 2, 3, 9])
+
+        self.assertEqual(rest, [3, 9])
+        self.assertIsNotNone(cache)
+        self.assertEqual(stats.hit_kind, "fallback_shorter")
+        self.assertEqual(stats.fallback_reason, "longer_not_restorable")
+        self.assertEqual(stats.matched_tokens, 2)
+        self.assertGreater(stats.cache_nbytes, 0)
 
     def test_longer_non_trimmable_cache_is_not_used_without_checkpoint(self):
         lru = LRUPromptCache(max_size=4)
@@ -170,6 +204,27 @@ class TestHybridPrefixCacheCorrectness(unittest.TestCase):
         self.assertEqual(rest, [99])
         self.assertEqual(cache[0].offset, 7)
 
+    def test_restorable_longer_hit_reports_fetch_stats(self):
+        lru = LRUPromptCache(max_size=4)
+        model = ("toy",)
+        lru.insert_cache(
+            model,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [make_prefill_rotating_cache(8, max_size=4)],
+        )
+
+        cache, rest, stats = lru.fetch_nearest_cache_with_stats(
+            model, [1, 2, 3, 4, 5, 6, 7, 99]
+        )
+
+        self.assertIsNotNone(cache)
+        self.assertEqual(rest, [99])
+        self.assertEqual(cache[0].offset, 7)
+        self.assertEqual(stats.hit_kind, "longer_restore")
+        self.assertEqual(stats.fallback_reason, "longer_restore")
+        self.assertEqual(stats.matched_tokens, 7)
+        self.assertGreaterEqual(stats.restore_ms, 0)
+
     def test_lru_prefers_shorter_safe_rotating_checkpoint_over_unrestorable_longer_hit(self):
         lru = LRUPromptCache(max_size=4)
         model = ("toy",)
@@ -227,6 +282,33 @@ class TestHybridPrefixCacheCorrectness(unittest.TestCase):
 
         self.assertEqual(rest, [])
         self.assertIsNotNone(cache)
+
+    def test_miss_reports_fetch_stats(self):
+        lru = LRUPromptCache(max_size=4)
+        model = ("toy",)
+        lru.insert_cache(model, [1, 2, 3], [make_arrays_cache(7)])
+
+        cache, rest, stats = lru.fetch_nearest_cache_with_stats(model, [9, 10])
+
+        self.assertIsNone(cache)
+        self.assertEqual(rest, [9, 10])
+        self.assertEqual(stats.hit_kind, "miss")
+        self.assertEqual(stats.fallback_reason, "miss")
+        self.assertEqual(stats.matched_tokens, 0)
+        self.assertEqual(stats.cache_nbytes, 0)
+
+    def test_fetch_stats_does_not_mutate_stored_entry(self):
+        lru = LRUPromptCache(max_size=4)
+        model = ("toy",)
+        lru.insert_cache(model, [1, 2, 3], [make_kv_cache(3)])
+
+        cache, _, _ = lru.fetch_nearest_cache_with_stats(model, [1, 2, 3])
+        cache[0].trim(1)
+        cache_again, rest_again, stats = lru.fetch_nearest_cache_with_stats(model, [1, 2, 3])
+
+        self.assertEqual(rest_again, [])
+        self.assertEqual(cache_again[0].offset, 3)
+        self.assertEqual(stats.hit_kind, "exact")
 
 
 class TestPrefixCacheSession(unittest.TestCase):

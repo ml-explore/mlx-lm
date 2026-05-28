@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -1697,6 +1698,17 @@ class PromptTrieResult:
     common_prefix: int  # Length of common prefix with any path
 
 
+@dataclass
+class PromptCacheFetchStats:
+    lookup_ms: float = 0.0
+    deepcopy_ms: float = 0.0
+    restore_ms: float = 0.0
+    cache_nbytes: int = 0
+    matched_tokens: int = 0
+    fallback_reason: str = "miss"
+    hit_kind: str = "miss"
+
+
 class PromptTrie:
     def __init__(self):
         self._trie = {}
@@ -1840,30 +1852,74 @@ class LRUPromptCache:
         return self._n_bytes
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
+        cache, rest, _ = self.fetch_nearest_cache_with_stats(model, tokens)
+        return cache, rest
+
+    def fetch_nearest_cache_with_stats(self, model: Any, tokens: List[int]):
+        stats = PromptCacheFetchStats()
+
+        start = time.perf_counter()
         result = self._trie.search(model, tokens)
+        stats.lookup_ms = (time.perf_counter() - start) * 1000
+
+        def copy_cache(cache_entry):
+            start = time.perf_counter()
+            cache = copy.deepcopy(cache_entry.prompt_cache)
+            stats.deepcopy_ms += (time.perf_counter() - start) * 1000
+            stats.cache_nbytes = cache_entry.nbytes
+            return cache
+
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            stats.hit_kind = "exact"
+            stats.fallback_reason = "exact"
+            stats.matched_tokens = len(tokens)
+            return copy_cache(cache_entry), [], stats
 
         short_length = len(result.shorter) if result.shorter is not None else 0
+        fallback_reason = "miss"
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             prefix = min(len(tokens) - 1, result.common_prefix)
-            if can_restore_prompt_cache(cache_entry.prompt_cache, prefix):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
-                if restore_prompt_cache(cache, prefix):
-                    return cache, tokens[prefix:]
-            elif can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
-                num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+            start = time.perf_counter()
+            can_restore = can_restore_prompt_cache(cache_entry.prompt_cache, prefix)
+            stats.restore_ms += (time.perf_counter() - start) * 1000
+            if can_restore:
+                cache = copy_cache(cache_entry)
+                start = time.perf_counter()
+                restored = restore_prompt_cache(cache, prefix)
+                stats.restore_ms += (time.perf_counter() - start) * 1000
+                if restored:
+                    stats.hit_kind = "longer_restore"
+                    stats.fallback_reason = "longer_restore"
+                    stats.matched_tokens = prefix
+                    return cache, tokens[prefix:], stats
+                fallback_reason = "longer_restore_failed"
+            else:
+                start = time.perf_counter()
+                can_trim = can_trim_prompt_cache(cache_entry.prompt_cache)
+                stats.restore_ms += (time.perf_counter() - start) * 1000
+                if can_trim:
+                    cache = copy_cache(cache_entry)
+                    num_to_trim = len(result.longer) - prefix
+                    start = time.perf_counter()
+                    trim_prompt_cache(cache, num_to_trim)
+                    stats.restore_ms += (time.perf_counter() - start) * 1000
+                    stats.hit_kind = "longer_trim"
+                    stats.fallback_reason = "longer_trim"
+                    stats.matched_tokens = prefix
+                    return cache, tokens[prefix:], stats
+                fallback_reason = "longer_not_restorable"
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            stats.hit_kind = "shorter" if fallback_reason == "miss" else "fallback_shorter"
+            stats.fallback_reason = fallback_reason if fallback_reason != "miss" else "shorter"
+            stats.matched_tokens = short_length
+            return copy_cache(cache_entry), tokens[short_length:], stats
 
-        return None, tokens
+        stats.fallback_reason = fallback_reason
+        return None, tokens, stats
 
     def insert_cache(
         self,
