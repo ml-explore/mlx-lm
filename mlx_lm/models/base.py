@@ -90,6 +90,8 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
+        elif n_repeats > 1 and mask.ndim == scores.ndim - 1:
+            mask = mx.expand_dims(mask, axis=-3)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:

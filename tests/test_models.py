@@ -9,7 +9,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -333,6 +333,36 @@ class TestModels(unittest.TestCase):
             q,
             qk_up,
             qv_up,
+            cache=quant_cache,
+            mask=mask,
+            scale=1.0,
+        )
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
+    def test_quantized_sdpa_with_batch_left_padding(self):
+        cache = KVCache()
+        quant_cache = QuantizedKVCache(group_size=32, bits=8)
+
+        k = 1e-1 * mx.random.normal(shape=(2, 4, 5, 32))
+        v = 1e-1 * mx.random.normal(shape=(2, 4, 5, 32))
+        k_up, v_up = cache.update_and_fetch(k, v)
+        qk, qv = quant_cache.update_and_fetch(k, v)
+
+        q = 1e-1 * mx.random.normal(shape=(2, 8, 1, 32))
+        mask = create_causal_mask(1, offset=4, left_padding=mx.array([0, 1]))
+
+        out = scaled_dot_product_attention(
+            q,
+            k_up,
+            v_up,
+            cache=cache,
+            mask=mask,
+            scale=1.0,
+        )
+        qout = scaled_dot_product_attention(
+            q,
+            qk,
+            qv,
             cache=quant_cache,
             mask=mask,
             scale=1.0,
