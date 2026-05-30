@@ -1548,6 +1548,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+        except ConnectionError as e:
+            logging.info(
+                f"Client disconnected before response completed "
+                f"({type(e).__name__}); aborting generation."
+            )
         finally:
             ctx.stop()
 
