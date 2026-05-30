@@ -43,7 +43,7 @@ class TestSwitchGLUFusion(unittest.TestCase):
 
         assert_allclose(self, actual, expected)
 
-    def test_quantized_fused_gate_up_matches_unfused(self):
+    def test_quantized_gate_up_fusion_falls_back_without_building_cache(self):
         mx.random.seed(2)
         layer = SwitchGLU(64, 64, 4, bias=True)
         layer.gate_proj = layer.gate_proj.to_quantized(group_size=32, bits=4)
@@ -59,6 +59,7 @@ class TestSwitchGLUFusion(unittest.TestCase):
         mx.eval(expected, actual)
 
         assert_allclose(self, actual, expected, rtol=1e-4, atol=1e-4)
+        self.assertIsNone(layer._fused_gate_up_cache)
 
     def test_training_mode_falls_back_without_building_fused_cache(self):
         layer = SwitchGLU(16, 32, 4, fuse_gate_up=True)

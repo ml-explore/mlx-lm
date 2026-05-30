@@ -181,7 +181,7 @@ class SwitchGLU(nn.Module):
             return False
         if type(self.up_proj) is not type(self.gate_proj):
             return False
-        if not isinstance(self.up_proj, (SwitchLinear, QuantizedSwitchLinear)):
+        if not isinstance(self.up_proj, SwitchLinear):
             return False
         if self.up_proj.input_dims != self.gate_proj.input_dims:
             return False
