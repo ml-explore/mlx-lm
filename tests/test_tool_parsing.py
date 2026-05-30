@@ -197,6 +197,46 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_unparseable_numeric_params(self):
+        # A non-numeric value for an int/number-typed field must fall back to the
+        # raw string instead of raising and dropping the whole tool call.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "log_event",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "day": {"type": "integer"},
+                            "score": {"type": "number"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=log_event>"
+            "<parameter=day>2026-01-15</parameter>"
+            "<parameter=score>not-a-number</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "log_event")
+        self.assertEqual(tool_call["arguments"]["day"], "2026-01-15")
+        self.assertEqual(tool_call["arguments"]["score"], "not-a-number")
+
+        # Valid numeric values must still be coerced to int/number.
+        test_case = (
+            "<function=log_event>"
+            "<parameter=day>15</parameter>"
+            "<parameter=score>3.5</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["day"], 15)
+        self.assertEqual(tool_call["arguments"]["score"], 3.5)
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
