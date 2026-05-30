@@ -116,6 +116,50 @@ class TestSampleUtils(unittest.TestCase):
         new_probs = mx.softmax(apply_xtc(mx.log(probs), 0, 0.1, [0]), -1)
         self.assertTrue(mx.allclose(new_probs, probs))
 
+    def test_uncompiled_sampler_respects_seed_in_thread(self):
+        import queue
+        import threading
+
+        from mlx_lm.sample_utils import make_sampler
+
+        results = queue.Queue()
+        sampler_kwargs_list = [
+            {},
+            {"top_p": 0.9},
+            {"top_k": 2},
+            {"min_p": 0.05},
+            {"xtc_probability": 0.5, "xtc_threshold": 0.1},
+        ]
+
+        def worker():
+            logprobs = mx.array([[0.1, 0.2, 0.3, 0.4]])
+            for sampler_kwargs in sampler_kwargs_list:
+                sampler = make_sampler(
+                    temp=1.0,
+                    use_compiled_sampling=False,
+                    **sampler_kwargs,
+                )
+                for seed in [111, 222, 111]:
+                    mx.random.seed(seed)
+                    samples = [sampler(logprobs).item() for _ in range(5)]
+                    results.put((sampler_kwargs, seed, samples))
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        for _ in range(len(sampler_kwargs_list)):
+            first = results.get()
+            second = results.get()
+            third = results.get()
+
+            with self.subTest(sampler_kwargs=first[0]):
+                self.assertEqual(first[0], second[0])
+                self.assertEqual(first[0], third[0])
+                self.assertEqual(first[1], third[1])
+                self.assertEqual(first[2], third[2])
+                self.assertNotEqual(first[2], second[2])
+
     def test_presence_penalty(self):
         from mlx_lm.sample_utils import make_presence_penalty
 

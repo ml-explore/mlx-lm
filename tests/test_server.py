@@ -207,6 +207,56 @@ class TestServer(unittest.TestCase):
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
+    def test_handle_completions_different_seeds_do_not_replay_cache(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+
+        post_data = {
+            "model": "default_model",
+            "prompt": "Once upon a time",
+            "max_tokens": 10,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "repetition_penalty": 1.1,
+            "repetition_context_size": 20,
+            "stop": "stop sequence",
+        }
+
+        completions = []
+        for seed in [111, 222, 333]:
+            response = requests.post(url, json=dict(post_data, seed=seed))
+            response_body = json.loads(response.text)
+            completions.append(response_body["choices"][0]["text"])
+
+        self.assertGreater(len(set(completions)), 1)
+
+    def test_prompt_cache_policy_only_bypasses_seeded_stochastic_requests(self):
+        generator = self.response_generator
+
+        self.assertFalse(generator._is_batchable(types.SimpleNamespace(seed=999)))
+        self.assertTrue(generator._is_batchable(types.SimpleNamespace(seed=None)))
+
+        self.assertFalse(
+            generator._can_use_prompt_cache(
+                types.SimpleNamespace(
+                    seed=999, sampling=types.SimpleNamespace(temperature=0.5)
+                )
+            )
+        )
+        self.assertTrue(
+            generator._can_use_prompt_cache(
+                types.SimpleNamespace(
+                    seed=None, sampling=types.SimpleNamespace(temperature=0.5)
+                )
+            )
+        )
+        self.assertTrue(
+            generator._can_use_prompt_cache(
+                types.SimpleNamespace(
+                    seed=999, sampling=types.SimpleNamespace(temperature=0)
+                )
+            )
+        )
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {

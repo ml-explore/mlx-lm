@@ -36,6 +36,7 @@ from ._version import __version__
 from .generate import (
     BatchGenerator,
     SequenceStateMachine,
+    generation_stream,
     stream_generate,
 )
 from .models.cache import (
@@ -408,6 +409,11 @@ def _make_sampler(args, tokenizer):
             tokenizer.eos_token_id,
             tokenizer.encode("\n"),
         ],
+        # Compiled random sampling captures RNG state and ignores per-request
+        # reseeding in server worker threads.
+        use_compiled_sampling=not (
+            args.seed is not None and args.sampling.temperature > 0
+        ),
     )
 
 
@@ -685,6 +691,12 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         return self.model_provider.is_batchable and args.seed is None
 
+    def _uses_stochastic_sampling(self, args):
+        return args.sampling.temperature > 0
+
+    def _can_use_prompt_cache(self, args):
+        return not (args.seed is not None and self._uses_stochastic_sampling(args))
+
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
         # sure that all generation runs in the same stream as the
@@ -749,11 +761,16 @@ class ResponseGenerator:
                         initial_state,
                     )
 
-                    self._log_cache_stats()
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
-                    )
-                    prompt_cache_count = len(prompt) - len(rest)
+                    use_prompt_cache = self._can_use_prompt_cache(args)
+                    if use_prompt_cache:
+                        self._log_cache_stats()
+                        cache, rest = self.prompt_cache.fetch_nearest_cache(
+                            current_model_key, prompt
+                        )
+                        prompt_cache_count = len(prompt) - len(rest)
+                    else:
+                        cache, rest = None, prompt
+                        prompt_cache_count = 0
                     N = prompt_cache_count
                     while N > 0:
                         if N >= len(segments[0]):
@@ -788,11 +805,15 @@ class ResponseGenerator:
                         "detokenizer": tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "use_prompt_cache": use_prompt_cache,
                     }
                     # just making sure we don't leave a reference around
                     del cache
 
-                    if self.model_provider.cli_args.prompt_cache_bytes is not None:
+                    if (
+                        use_prompt_cache
+                        and self.model_provider.cli_args.prompt_cache_bytes is not None
+                    ):
                         total = self.model_provider.cli_args.prompt_cache_bytes
                         active = batch_generator.prompt_cache_nbytes
                         self.prompt_cache.trim_to(n_bytes=total - active)
@@ -868,6 +889,7 @@ class ResponseGenerator:
                         if r.end_of_segment
                         and not r.end_of_prompt
                         and batch_results[r.uid]["segment_types"]
+                        and batch_results[r.uid]["use_prompt_cache"]
                     ]
                     caches = batch_generator.extract_cache(eos_ids)
                     for uid, (cache, cache_key) in caches.items():
@@ -900,12 +922,13 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key,
-                                r.all_tokens[:],
-                                r.prompt_cache,
-                                cache_type="assistant",
-                            )
+                            if result["use_prompt_cache"]:
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    r.prompt_cache,
+                                    cache_type="assistant",
+                                )
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
@@ -954,18 +977,24 @@ class ResponseGenerator:
 
             # Seed if requested
             if args.seed is not None:
-                mx.random.seed(args.seed)
+                with mx.stream(generation_stream):
+                    mx.random.seed(args.seed)
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
-            self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
+            use_prompt_cache = self._can_use_prompt_cache(args)
+            if use_prompt_cache:
+                self._log_cache_stats()
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                ctx.prompt_cache_count = len(prompt) - len(rest)
+            else:
+                cache, rest = None, prompt
+                ctx.prompt_cache_count = 0
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -1016,9 +1045,10 @@ class ResponseGenerator:
             rqueue.put(None)
 
             # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            if use_prompt_cache:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)

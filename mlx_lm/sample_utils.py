@@ -16,6 +16,7 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: List[int] = [],
+    use_compiled_sampling: bool = True,
 ) -> Callable[[mx.array], mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
@@ -37,6 +38,8 @@ def make_sampler(
             for being sampled.
         xtc_special_tokens (list(int), optional): List of special tokens IDs to
             be excluded from XTC sampling.
+        use_compiled_sampling (bool, optional): If ``False``, stochastic
+            sampling uses uncompiled random operations. Default: ``True``.
 
 
     Returns:
@@ -53,8 +56,9 @@ def make_sampler(
     if min_p != 0.0:
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
     if xtc_probability > 0.0:
+        xtc_fn = apply_xtc if use_compiled_sampling else apply_xtc_uncompiled
         sampling_methods.append(
-            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
+            lambda x: xtc_fn(x, xtc_probability, xtc_threshold, xtc_special_tokens)
         )
     if top_k > 0:
         sampling_methods.append(lambda x: apply_top_k(x, top_k))
@@ -64,7 +68,9 @@ def make_sampler(
         for method in sampling_methods:
             logprobs = method(logprobs)
         # Return the sampled token
-        return categorical_sampling(logprobs, temp)
+        if use_compiled_sampling:
+            return categorical_sampling(logprobs, temp)
+        return categorical_sampling_uncompiled(logprobs, temp)
 
     return sampler
 
@@ -276,6 +282,37 @@ def apply_xtc(
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def categorical_sampling(logits, temp):
+    return mx.random.categorical(logits * (1 / temp))
+
+
+def apply_xtc_uncompiled(
+    logits: mx.array,
+    xtc_probability: float,
+    xtc_threshold: float,
+    xtc_special_tokens: List[int],
+) -> mx.array:
+    if not (0 <= xtc_threshold <= 0.5):
+        raise ValueError(
+            f"`threshold` has to be a float in the [0, 0.5] interval, but is {xtc_threshold}"
+        )
+    if not (0 <= xtc_probability <= 1.0):
+        raise ValueError(
+            f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
+        )
+
+    probs = mx.softmax(logits, -1)
+    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
+    if xtc_special_tokens:
+        mask[..., xtc_special_tokens] = False
+
+    return mx.where(
+        mx.random.uniform(0, 1) > xtc_probability,
+        logits,
+        mx.where(mask, -mx.inf, logits),
+    )
+
+
+def categorical_sampling_uncompiled(logits, temp):
     return mx.random.categorical(logits * (1 / temp))
 
 
