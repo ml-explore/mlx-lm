@@ -12,7 +12,15 @@ from typing import Any, Optional
 import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
-_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+# Match <parameter=NAME>VALUE</parameter> where VALUE may itself contain
+# literal "<parameter=...>" or "</parameter>" substrings (common when the
+# model emits code or markdown that mentions the tool-call format). The
+# trailing lookahead anchors the closing tag to one that is followed by
+# either the next parameter, the function end, or end of input.
+_parameter_regex = re.compile(
+    r"<parameter=([^>]+?)>(.*?)</parameter>\s*(?=<parameter=|</function>|\Z)",
+    re.DOTALL,
+)
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
 _bool_types = {"boolean", "bool", "binary"}
@@ -85,10 +93,8 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
     param_config = _get_arguments_config(function_name, tools)
     parameters = function_call_str[end_index + 1 :]
     param_dict = {}
-    for match_text in _parameter_regex.findall(parameters):
-        idx = match_text.index(">")
-        param_name = match_text[:idx]
-        param_value = str(match_text[idx + 1 :])
+    for param_name, param_value in _parameter_regex.findall(parameters):
+        param_name = param_name.strip()
         if param_value.startswith("\n"):
             param_value = param_value[1:]
         if param_value.endswith("\n"):

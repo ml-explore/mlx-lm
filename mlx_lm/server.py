@@ -79,10 +79,10 @@ class ToolCallFormatter:
         for tool_text in tool_calls:
             try:
                 parsed = self._tool_parser(tool_text, self._tools)
-            except (ValueError, json.JSONDecodeError) as e:
+            except Exception as e:
                 logging.warning(
                     f"Failed to parse tool call ({type(e).__name__}: {e}) — "
-                    f"tool text was likely truncated mid-generation."
+                    f"tool text was likely malformed or truncated mid-generation."
                 )
                 continue
             if not isinstance(parsed, list):

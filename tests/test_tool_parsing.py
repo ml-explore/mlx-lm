@@ -154,6 +154,73 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_qwen3_coder_value_contains_parameter_tags(self):
+        """Value may contain literal <parameter=...> or </parameter> substrings
+        (e.g. when the model emits code/markdown that mentions the format).
+        These must not terminate the value early."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "str_replace_editor",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "path": {"type": "string"},
+                            "file_text": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        # The file_text value contains both an opening <parameter=...> tag
+        # and a closing </parameter> tag as part of the string content.
+        test_case = (
+            "<function=str_replace_editor>\n"
+            "<parameter=command>\ncreate\n</parameter>\n"
+            "<parameter=path>\n/tmp/foo.py\n</parameter>\n"
+            "<parameter=file_text>\n"
+            "def example():\n"
+            "    # see <parameter=path>...</parameter> in the docs\n"
+            "    return '<parameter=path>nested</parameter>'\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "str_replace_editor")
+        self.assertEqual(tool_call["arguments"]["command"], "create")
+        self.assertEqual(tool_call["arguments"]["path"], "/tmp/foo.py")
+        self.assertIn("<parameter=path>", tool_call["arguments"]["file_text"])
+        self.assertIn("</parameter>", tool_call["arguments"]["file_text"])
+
+        # Object-typed value carrying JSON whose text contains tool-call markup.
+        tools_obj = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_filter",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"spec": {"type": "object"}},
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=set_filter>\n"
+            "<parameter=spec>\n"
+            '{"hint": "use <parameter=name>val</parameter>"}\n'
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools_obj)
+        self.assertEqual(
+            tool_call["arguments"]["spec"],
+            {"hint": "use <parameter=name>val</parameter>"},
+        )
+
     def test_qwen3_coder_single_quoted_params(self):
         tools = [
             {
