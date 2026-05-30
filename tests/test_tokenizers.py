@@ -10,6 +10,7 @@ from mlx_lm.tokenizer_utils import (
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
+    _has_byte_level_pretokenizer,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -122,6 +123,53 @@ class TestTokenizers(unittest.TestCase):
         prompt = [HI, THINK_START, THINK_END, THINK_START]
         self.assertEqual(find(prompt, [THINK_START], start=0), 1)
         self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
+
+    def test_has_byte_level_pretokenizer(self):
+        byte_level = {"type": "ByteLevel"}
+        self.assertTrue(_has_byte_level_pretokenizer({"pre_tokenizer": byte_level}))
+        self.assertTrue(
+            _has_byte_level_pretokenizer(
+                {
+                    "pre_tokenizer": {
+                        "type": "Sequence",
+                        "pretokenizers": [{"type": "Split"}, byte_level],
+                    }
+                }
+            )
+        )
+        self.assertFalse(
+            _has_byte_level_pretokenizer(
+                {"pre_tokenizer": {"type": "Metaspace", "replacement": "▁"}}
+            )
+        )
+        self.assertFalse(_has_byte_level_pretokenizer({}))
+
+    def test_byte_level_vocab_with_spm_decoder(self):
+        # Mistral tekken v13 tokenizers carry an SPM-style decoder but a
+        # byte-level vocabulary (ByteLevel pre-tokenizer). They must use the BPE
+        # detokenizer; the SPM detokenizer only strips the "▁" marker and so
+        # leaves the byte-level space marker "Ġ" (U+0120) in the output.
+        # Regression test for #1041. Download tokenizer files only -- the model
+        # weights are irrelevant to detokenization and very large.
+        repo = "mlx-community/Devstral-Small-2-24B-Instruct-2512-bf16"
+        path = Path(
+            snapshot_download(
+                repo,
+                allow_patterns=["*.json", "*.model", "*tokenizer*", "*.jinja"],
+            )
+        )
+        tokenizer = load_tokenizer(path)
+        self.assertIsInstance(tokenizer.detokenizer, BPEStreamingDetokenizer)
+
+        text = "Hello! How can I assist you today?"
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        detokenizer = tokenizer.detokenizer
+        detokenizer.reset()
+        for t in tokens:
+            detokenizer.add_token(t)
+        detokenizer.finalize()
+        self.assertNotIn("Ġ", detokenizer.text)
+        self.assertEqual(detokenizer.text, text)
 
 
 if __name__ == "__main__":
