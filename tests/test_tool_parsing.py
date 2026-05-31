@@ -207,6 +207,28 @@ class TestToolParsing(unittest.TestCase):
             {"settings": {"enabled": True, "name": "test"}},
         )
 
+    def test_json_tools_marker_merge(self):
+        # The start marker is "<tool_call" (without the closing ">", which many tokenizers
+        # merge with the next byte). The server therefore captures the tool segment starting
+        # at the leftover ">", and the segment may also include a trailing "</tool_call>" if
+        # that marker's tokens merge too. parse_tool_call must extract the JSON regardless.
+        expected = {"name": "get_weather", "arguments": {"city": "Paris"}}
+        variants = [
+            '{"name": "get_weather", "arguments": {"city": "Paris"}}',  # clean (backward-compat)
+            '>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n',  # leftover ">"
+            '>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>',  # + end marker
+        ]
+        for text in variants:
+            with self.subTest(text=text):
+                self.assertEqual(json_tools.parse_tool_call(text, None), expected)
+
+        # nested braces and a "}" inside a string value must not truncate extraction
+        text = '{"name": "f", "arguments": {"expr": "a{b}c", "n": {"k": 2}}}'
+        self.assertEqual(
+            json_tools.parse_tool_call(text, None),
+            {"name": "f", "arguments": {"expr": "a{b}c", "n": {"k": 2}}},
+        )
+
         # Array of strings
         test_case = 'call:tag{items:[<|"|>foo<|"|>,<|"|>bar<|"|>]}'
         tool_call = gemma4.parse_tool_call(test_case, None)
