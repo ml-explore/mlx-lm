@@ -9,6 +9,7 @@ from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
+    _infer_tool_parser,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -108,6 +109,30 @@ class TestTokenizers(unittest.TestCase):
         self.assertIsNone(tokenizer.think_end)
         self.assertIsNone(tokenizer.think_start_id)
         self.assertIsNone(tokenizer.think_end_id)
+
+    def test_infer_tool_parser(self):
+        # LFM2 (original) uses <|tool_list_start|> ... <|tool_list_end|>.
+        lfm2_template = (
+            "{%- if tools %}<|tool_list_start|>{{ tools | tojson }}"
+            "<|tool_list_end|>{% endif -%}"
+        )
+        self.assertEqual(_infer_tool_parser(lfm2_template), "pythonic")
+
+        # LFM2.5 renamed the tokens to <|tool_call_start|> ... <|tool_call_end|>
+        # while keeping the same pythonic call format inside.
+        # See https://huggingface.co/LiquidAI/LFM2.5-8B-A1B for the template.
+        lfm25_template = (
+            "{%- macro render_tool_calls(tool_calls) -%}"
+            "{{- '<|tool_call_start|>[' + "
+            "(tool_calls_ns.tool_calls | join(', ')) + "
+            "']<|tool_call_end|>' -}}"
+            "{%- endmacro -%}"
+        )
+        self.assertEqual(_infer_tool_parser(lfm25_template), "pythonic")
+
+        # Sanity: a template with neither token should not match pythonic.
+        self.assertIsNone(_infer_tool_parser("plain template, no tool tokens"))
+        self.assertIsNone(_infer_tool_parser(None))
 
 
 if __name__ == "__main__":
