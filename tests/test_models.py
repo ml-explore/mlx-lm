@@ -3251,6 +3251,57 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def test_laguna(self):
+        from mlx_lm.models import laguna
+
+        args = laguna.ModelArgs(
+            model_type="laguna",
+            vocab_size=10_000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            sliding_window=4,
+            partial_rotary_factor=0.5,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+            moe_routed_scaling_factor=2.5,
+            # First layer full + dense, remaining sliding + sparse (MoE).
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+            ],
+            mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+            num_attention_heads_per_layer=[4, 4, 4, 4],
+            rope_parameters={
+                "full_attention": {
+                    "rope_type": "yarn",
+                    "rope_theta": 500000.0,
+                    "factor": 8.0,
+                    "original_max_position_embeddings": 4096,
+                    "beta_slow": 1.0,
+                    "beta_fast": 32.0,
+                    "partial_rotary_factor": 0.5,
+                },
+                "sliding_attention": {
+                    "rope_type": "default",
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+            },
+        )
+        model = laguna.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
