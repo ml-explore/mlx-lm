@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 from mlx_lm.tool_parsers import (
+    deepseek_dsml,
     function_gemma,
     gemma4,
     glm47,
@@ -32,6 +33,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
                 json_tools,
+            ),
+            (
+                '>\n<｜DSML｜invoke name="multiply">\n<｜DSML｜parameter name="a" string="false">12234585</｜DSML｜parameter>\n<｜DSML｜parameter name="b" string="false">48838483920</｜DSML｜parameter>\n</｜DSML｜invoke>\n',
+                deepseek_dsml,
             ),
             (
                 '<invoke name="multiply">\n<parameter name="a">12234585</parameter>\n<parameter name="b">48838483920</parameter>\n</invoke>',
@@ -102,6 +107,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '{"name": "get_current_temperature", "arguments": {"location": "London"}}',
                 json_tools,
+            ),
+            (
+                '>\n<｜DSML｜invoke name="get_current_temperature">\n<｜DSML｜parameter name="location" string="true">London</｜DSML｜parameter>\n</｜DSML｜invoke>\n',
+                deepseek_dsml,
             ),
             (
                 '<invoke name="get_current_temperature">\n<parameter name="location">London</parameter>\n</invoke>',
@@ -328,6 +337,36 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_deepseek_dsml_parallel(self):
+        # DSML puts multiple <｜DSML｜invoke> in one <｜DSML｜tool_calls> block = native
+        # parallel calls. The leading ">" is the leftover the server captures after the
+        # "<｜DSML｜tool_calls" prefix start marker (which drops the ">" that BPE merges).
+        test_case = (
+            ">\n"
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="city" string="true">Tokyo</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+        )
+        expected = [
+            {"name": "get_weather", "arguments": {"city": "Tokyo"}},
+            {"name": "get_weather", "arguments": {"city": "Paris"}},
+        ]
+        self.assertEqual(deepseek_dsml.parse_tool_call(test_case, None), expected)
+
+        # string="true" -> literal string; string="false" -> JSON-decoded value
+        test_case = (
+            '<｜DSML｜invoke name="calc">\n'
+            '<｜DSML｜parameter name="expr" string="true">2+2</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="n" string="false">3</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="tags" string="false">["a", "b"]</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        tc = deepseek_dsml.parse_tool_call(test_case, None)
+        self.assertEqual(tc["arguments"], {"expr": "2+2", "n": 3, "tags": ["a", "b"]})
 
 
 if __name__ == "__main__":
