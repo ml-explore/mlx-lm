@@ -135,8 +135,25 @@ class LoRASwitchLinear(nn.Module):
         num_experts, output_dims, input_dims = weight.shape
         fused_linear = SwitchLinear(input_dims, output_dims, num_experts, bias=bias)
 
-        lora_b = self.scale * self.lora_b
-        lora_a = self.lora_a.reshape(num_experts, -1, input_dims)
+        # Support two adapter formats:
+        #   (a) per-expert (mlx-lm native): lora_a (E, r, D), lora_b (E, out, r).
+        #   (b) shared / PEFT target_parameters: lora_a (r, D), lora_b (out, r).
+        #       Same low-rank update added to every expert -> broadcast to (E, ...).
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if lora_a.ndim == 2:
+            # (r, D) -> (E, r, D); same matrix replicated across experts.
+            lora_a = mx.broadcast_to(
+                lora_a[None, :, :], (num_experts, lora_a.shape[0], lora_a.shape[1])
+            )
+        else:
+            lora_a = lora_a.reshape(num_experts, -1, input_dims)
+        if lora_b.ndim == 2:
+            lora_b = mx.broadcast_to(
+                lora_b[None, :, :], (num_experts, lora_b.shape[0], lora_b.shape[1])
+            )
+
+        lora_b = self.scale * lora_b
         fused_linear.weight = weight + (lora_b @ lora_a).astype(weight.dtype)
         if bias:
             fused_linear.bias = linear.bias
@@ -180,18 +197,24 @@ class LoRASwitchLinear(nn.Module):
 
     def __call__(self, x, indices, sorted_indices=False):
         y = self.linear(x, indices, sorted_indices=sorted_indices)
-        z = mx.gather_mm(
-            self.dropout(x),
-            self.lora_a.swapaxes(-1, -2),
-            rhs_indices=indices,
-            sorted_indices=sorted_indices,
-        )
-        z = mx.gather_mm(
-            z,
-            self.lora_b.swapaxes(-1, -2),
-            rhs_indices=indices,
-            sorted_indices=sorted_indices,
-        )
+        # Shared 2D adapter (PEFT target_parameters) -> dense matmul, broadcast to all routed experts.
+        if self.lora_a.ndim == 2 and self.lora_b.ndim == 2:
+            xd = self.dropout(x)
+            z = xd @ self.lora_a.swapaxes(-1, -2)
+            z = z @ self.lora_b.swapaxes(-1, -2)
+        else:
+            z = mx.gather_mm(
+                self.dropout(x),
+                self.lora_a.swapaxes(-1, -2),
+                rhs_indices=indices,
+                sorted_indices=sorted_indices,
+            )
+            z = mx.gather_mm(
+                z,
+                self.lora_b.swapaxes(-1, -2),
+                rhs_indices=indices,
+                sorted_indices=sorted_indices,
+            )
         return y + (self.scale * z).astype(x.dtype)
 
 
