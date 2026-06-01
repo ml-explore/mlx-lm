@@ -244,6 +244,15 @@ class Model(nn.Module):
         if any("gate_proj.weight" in k for k in weights.keys()):
             return weights  # already sanitized
 
+        hidden_size = self.args.hidden_size
+        intermediate_size = self.args.intermediate_size
+
+        def _ensure_weight_suffix(key):
+            # HF/unsloth BF16 checkpoints omit .weight on experts.{gate,up,down}_proj.
+            if key.endswith(".weight") or key.endswith(".scales"):
+                return key
+            return key + ".weight"
+
         new_weights = {}
         for k, v in weights.items():
             if "gate_up_proj" in k and "bias" not in k:
@@ -252,20 +261,46 @@ class Model(nn.Module):
                     k = k.replace("_blocks", ".weight")
                 if "_scales" in k:
                     k = k.replace("_scales", ".scales")
-                new_weights[k.replace("gate_up_proj", "gate_proj")] = mx.contiguous(
-                    v[..., ::2, :]
+                # Two known storage layouts for fused gate_up_proj, both
+                # interleaved (gate, up, gate, up, ...) along the 2*intermediate
+                # axis:
+                #  (a) openai/MXFP4   : (E, 2H, D)   interleaved on axis -2.
+                #  (b) unsloth/HF BF16: (E, D, 2H)  interleaved on axis -1.
+                # Normalize layout (b) to (a) via swapaxes(-1, -2), then split on -2.
+                if (
+                    v.shape[-1] == 2 * intermediate_size
+                    and v.shape[-2] == hidden_size
+                ):
+                    v = v.swapaxes(-1, -2)
+                gate_slice = v[..., ::2, :]
+                up_slice = v[..., 1::2, :]
+                gate_key = _ensure_weight_suffix(
+                    k.replace("gate_up_proj", "gate_proj")
                 )
-                new_weights[k.replace("gate_up_proj", "up_proj")] = mx.contiguous(
-                    v[..., 1::2, :]
+                up_key = _ensure_weight_suffix(
+                    k.replace("gate_up_proj", "up_proj")
                 )
+                new_weights[gate_key] = mx.contiguous(gate_slice)
+                new_weights[up_key] = mx.contiguous(up_slice)
             elif "down_proj" in k and "bias" not in k:
                 if "_blocks" in k:
                     v = v.view(mx.uint32).flatten(-2)
                     k = k.replace("_blocks", ".weight")
                 if "_scales" in k:
                     k = k.replace("_scales", ".scales")
-                new_weights[k] = v
+                # openai stores down_proj as (E, hidden, intermediate) i.e.
+                # (E, out, in). unsloth/HF BF16 stores (E, intermediate, hidden)
+                # i.e. (E, in, out) -> transpose to match SwitchLinear convention.
+                if (
+                    v.shape[-2] == intermediate_size
+                    and v.shape[-1] == hidden_size
+                    and intermediate_size != hidden_size
+                ):
+                    v = v.swapaxes(-1, -2)
+                k = _ensure_weight_suffix(k)
+                new_weights[k] = mx.contiguous(v)
             elif "gate_up_proj_bias" in k:
+                # Bias is interleaved on the 2*intermediate axis in both layouts.
                 new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = (
                     mx.contiguous(v[..., ::2])
                 )
