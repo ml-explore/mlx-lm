@@ -58,7 +58,11 @@ class AssistantAttention(nn.Module):
         # Sliding-attention layers use plain `head_dim`. Falls back to head_dim
         # if global_head_dim is unset (e.g. small synthetic test configs).
         global_hd = tc.get("global_head_dim") or 0
-        self.head_dim = global_hd if (layer_type == "full_attention" and global_hd) else tc["head_dim"]
+        self.head_dim = (
+            global_hd
+            if (layer_type == "full_attention" and global_hd)
+            else tc["head_dim"]
+        )
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
@@ -82,9 +86,9 @@ class AssistantAttention(nn.Module):
 
     def __call__(
         self,
-        x: mx.array,                      # (B, L, hidden_size)
-        keys: mx.array,                   # (B, n_kv_heads, L_target, head_dim)
-        values: mx.array,                 # (B, n_kv_heads, L_target, head_dim)
+        x: mx.array,  # (B, L, hidden_size)
+        keys: mx.array,  # (B, n_kv_heads, L_target, head_dim)
+        values: mx.array,  # (B, n_kv_heads, L_target, head_dim)
         position_ids: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
     ) -> mx.array:
@@ -192,19 +196,16 @@ class AssistantTextModel(nn.Module):
         self.args = args
         self.vocab_size = tc["vocab_size"]
         self.num_hidden_layers = tc["num_hidden_layers"]
-        layer_types = tc.get("layer_types") or [
-            "full_attention"
-        ] * self.num_hidden_layers
+        layer_types = (
+            tc.get("layer_types") or ["full_attention"] * self.num_hidden_layers
+        )
         assert len(layer_types) == self.num_hidden_layers, (
             f"layer_types length {len(layer_types)} != "
             f"num_hidden_layers {self.num_hidden_layers}"
         )
 
         self.embed_tokens = nn.Embedding(self.vocab_size, tc["hidden_size"])
-        self.layers = [
-            AssistantDecoderLayer(args, layer_type=lt)
-            for lt in layer_types
-        ]
+        self.layers = [AssistantDecoderLayer(args, layer_type=lt) for lt in layer_types]
         self.norm = nn.RMSNorm(tc["hidden_size"], eps=tc.get("rms_norm_eps", 1e-6))
 
     def __call__(
@@ -267,9 +268,9 @@ class MaskedEmbedder(nn.Module):
 
         # 2. Top-K clusters by score: (B, L, top_k)
         # argpartition gives unsorted top-k; that's fine here.
-        top_k_indices = mx.argpartition(
-            -centroid_logits, kth=self.top_k - 1, axis=-1
-        )[..., : self.top_k]
+        top_k_indices = mx.argpartition(-centroid_logits, kth=self.top_k - 1, axis=-1)[
+            ..., : self.top_k
+        ]
 
         # 3. canonical_positions_per_cluster: (num_centroids, V_pc)
         canonical = self._token_ordering.reshape(self.num_centroids, V_pc)
@@ -286,7 +287,7 @@ class MaskedEmbedder(nn.Module):
         )
 
         # 6. Dot product: (B, L, 1, H) @ (B, L, H, top_k*V_pc) → (B, L, top_k*V_pc)
-        h_exp = mx.expand_dims(hidden_states, -2)               # (B, L, 1, H)
+        h_exp = mx.expand_dims(hidden_states, -2)  # (B, L, 1, H)
         selected_logits = (h_exp @ selected_emb.swapaxes(-1, -2)).squeeze(-2)
 
         # 7. Scatter into full-vocab output, with floor-1 mask for non-selected.
@@ -295,7 +296,7 @@ class MaskedEmbedder(nn.Module):
         # would defeat the whole point of having a fast drafter).
         mask_value = (mx.min(selected_logits) - 1.0).astype(hidden_states.dtype)
         output = mask_value + mx.zeros((B, L, V), dtype=hidden_states.dtype)
-        scatter_idx = selected_canonical.reshape(B, L, -1)      # (B, L, top_k*V_pc)
+        scatter_idx = selected_canonical.reshape(B, L, -1)  # (B, L, top_k*V_pc)
         return mx.put_along_axis(output, scatter_idx, selected_logits, axis=-1)
 
 
@@ -390,6 +391,7 @@ class Model(nn.Module):
             if path.endswith("masked_embedding.centroids"):
                 return False
             return True
+
         return predicate
 
     def make_cache(self):

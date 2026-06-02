@@ -3281,8 +3281,7 @@ class TestModels(unittest.TestCase):
             # int32 gather indices.
             model.update(tree_map(lambda p: p.astype(dt), model.parameters()))
             shared_kv_dt = {
-                lt: (k.astype(dt), v.astype(dt))
-                for lt, (k, v) in shared_kv.items()
+                lt: (k.astype(dt), v.astype(dt)) for lt, (k, v) in shared_kv.items()
             }
             last_hidden, logits = model(
                 inputs_embeds.astype(dt), shared_kv_dt, position_ids=position_ids
@@ -3366,10 +3365,9 @@ class TestModels(unittest.TestCase):
         shapes. Skipped by default; set ``MLX_LM_RUN_NETWORK_TESTS=1`` to run.
         """
         import os
+
         if not os.environ.get("MLX_LM_RUN_NETWORK_TESTS"):
-            self.skipTest(
-                "network test; set MLX_LM_RUN_NETWORK_TESTS=1 to enable"
-            )
+            self.skipTest("network test; set MLX_LM_RUN_NETWORK_TESTS=1 to enable")
         from huggingface_hub import snapshot_download
 
         from mlx_lm import load
