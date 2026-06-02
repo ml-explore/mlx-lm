@@ -387,7 +387,6 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     parser = build_parser()
     args = parser.parse_args()
-
     config = args.config
     args = vars(args)
     if config:

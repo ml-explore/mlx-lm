@@ -3,6 +3,7 @@
 import re
 import shutil
 import sys
+from contextlib import contextmanager
 
 import mlx.core as mx
 from rich.box import ROUNDED
@@ -144,3 +145,78 @@ def make_train_progress(console: Console, *, disable: bool = False) -> Progress:
         transient=False,
         disable=disable,
     )
+
+
+class TrainUI:
+    """Helper class for rendering training progress and metrics."""
+
+    def __init__(self, total_iters: int, rank: int = 0):
+        self._rank = rank
+        self._console = make_console()
+        self._progress = make_train_progress(self._console, disable=(rank != 0))
+        self._task = self._progress.add_task("train", total=total_iters)
+        self._prev_train_loss = None
+
+    def __enter__(self):
+        if self._rank == 0:
+            self._console.print(
+                "  [ui.heading]iter   train_loss     tok/s     tokens[/ui.heading]"
+            )
+        self._progress.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._progress.__exit__(*exc)
+
+    def advance(self):
+        self._progress.advance(self._task)
+
+    def report_train(self, it, train_loss, tokens_sec, trained_tokens):
+        if self._rank != 0:
+            return
+        if self._prev_train_loss is None or train_loss <= self._prev_train_loss:
+            arrow, style = "▼", "green"
+        else:
+            arrow, style = "▲", "yellow"
+        self._prev_train_loss = train_loss
+        self._console.print(
+            f"  [ui.muted]{it:>4}[/ui.muted]    "
+            f"[bold {style}]{train_loss:>5.3f} {arrow}[/bold {style}]    "
+            f"[ui.strong]{tokens_sec:>5,.0f}[/ui.strong]    "
+            f"[ui.muted]{trained_tokens / 1000:>5.1f}k[/ui.muted]"
+        )
+
+    @contextmanager
+    def val_task(self, total: int):
+        task_id = (
+            self._progress.add_task("[bold blue]val  [/bold blue]", total=total)
+            if self._rank == 0
+            else None
+        )
+
+        def advance():
+            if task_id is not None:
+                self._progress.advance(task_id)
+
+        try:
+            yield advance
+        finally:
+            if task_id is not None:
+                self._progress.remove_task(task_id)
+
+    def report_val(self, it, val_loss, val_time):
+        if self._rank != 0:
+            return
+        self._console.print(
+            f"  [ui.muted]{it:>4}[/ui.muted]    "
+            f"[ui.accent]val[/ui.accent] "
+            f"[ui.strong]{val_loss:>5.3f}[/ui.strong]    "
+            f"[ui.muted]({val_time:.2f}s)[/ui.muted]"
+        )
+
+    def report_save(self, checkpoint):
+        if self._rank != 0:
+            return
+        self._console.print(
+            f"  [ui.good]save[/ui.good]  " f"[ui.muted]{checkpoint.name}[/ui.muted]"
+        )
