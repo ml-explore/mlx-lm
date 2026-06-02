@@ -5,13 +5,9 @@ import types
 from pathlib import Path
 from typing import Any, Dict, List
 
-import mlx.core as mx
 from transformers import PreTrainedTokenizer
 
-
-def printf(*args, **kwargs):
-    if mx.distributed.init().rank() == 0:
-        print(*args, **kwargs)
+from ..cli_ui import printf
 
 
 class TextDataset:

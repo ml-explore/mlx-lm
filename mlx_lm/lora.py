@@ -12,7 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .cli_ui import make_console, print_header_panel
+from .cli_ui import make_console, print_header_panel, printf
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
@@ -23,12 +23,6 @@ from .tuner.utils import (
     print_trainable_parameters,
 )
 from .utils import _parse_size, load, save_config
-
-
-def printf(*args, **kwargs):
-    if mx.distributed.init().rank() == 0:
-        print(*args, **kwargs)
-
 
 yaml_loader = yaml.SafeLoader
 yaml_loader.add_implicit_resolver(
@@ -312,14 +306,15 @@ def train_model(
 
 
 def _print_run_header(args):
-    rank = mx.distributed.init().rank()
-    if rank != 0:
+    if mx.distributed.init().rank() != 0:
         return
 
     type_label = args.fine_tune_type
     if args.fine_tune_type in ("lora", "dora"):
-        rank = args.lora_parameters.get("rank", "?")
-        type_label = f"{args.fine_tune_type} · {args.num_layers} layers · rank {rank}"
+        lora_rank = args.lora_parameters.get("rank", "?")
+        type_label = (
+            f"{args.fine_tune_type} · {args.num_layers} layers · rank {lora_rank}"
+        )
     elif args.fine_tune_type == "full":
         type_label = f"full · {args.num_layers} layers"
 

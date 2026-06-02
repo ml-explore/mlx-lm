@@ -9,15 +9,11 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
+from ..cli_ui import printf
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from ..utils import get_total_parameters
 from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
-
-
-def printf(*args, **kwargs):
-    if mx.distributed.init().rank() == 0:
-        print(*args, **kwargs)
 
 
 def build_schedule(schedule_config: Dict):

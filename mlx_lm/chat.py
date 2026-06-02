@@ -1,15 +1,15 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
-import sys
 
 import mlx.core as mx
 
 from .cli_ui import (
+    corridor_input,
     make_console,
-    make_corridor_prompt,
     print_chat_help,
     print_header_panel,
+    printf,
 )
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
@@ -118,10 +118,6 @@ def main():
 
     console = make_console()
 
-    def rprint(*args, **kwargs):
-        if rank == 0:
-            print(*args, **kwargs)
-
     mx.random.seed(args.seed)
 
     if group.size() > 1:
@@ -141,20 +137,12 @@ def main():
         _print_chat_header(args, console)
         print_chat_help(console)
 
-    if rank == 0:
-        prompt_console = make_console(force_terminal=True, color_system="truecolor")
-        _draw_corridor_prompt = make_corridor_prompt(prompt_console)
-    else:
-        _draw_corridor_prompt = lambda: ""
-
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
     while True:
-        prompt = _draw_corridor_prompt()
-        query = input(prompt)
         if rank == 0:
-            # Cursor is now on the bottom-rule row; advance past it.
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            query = corridor_input(console)
+        else:
+            query = input("")
         if query == "q":
             if rank == 0:
                 console.print("[ui.muted]bye[/ui.muted]")
@@ -195,9 +183,9 @@ def main():
             ),
             prompt_cache=prompt_cache,
         ):
-            rprint(response.text, flush=True, end="")
+            printf(response.text, flush=True, end="")
             last_response = response
-        rprint()
+        printf()
         if rank == 0 and last_response is not None:
             console.print(
                 f"  [ui.muted]{last_response.generation_tokens} tokens · "

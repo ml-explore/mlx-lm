@@ -1,54 +1,58 @@
 # Copyright © 2024 Apple Inc.
 
-"""Shared UI helpers for the mlx_lm command-line tools.
-
-Centralizes the rich-based panel/progress/prompt rendering used by the chat
-and training entry points. The theme is hardcoded for a light terminal
-background.
-"""
-
 import os
 import re
 import shutil
 import sys
 
+import mlx.core as mx
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import (
-    Progress,
-    ProgressColumn,
-    TextColumn,
-)
+from rich.progress import Progress, ProgressColumn, TextColumn
 from rich.text import Text
 from rich.theme import Theme
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def printf(*args, **kwargs):
+    """Print on rank 0 only; no-op on every other distributed worker."""
+    if mx.distributed.init().rank() == 0:
+        print(*args, **kwargs)
 
 
 def _terminal_width(default: int = 120) -> int:
     """Best-effort terminal width.
 
-    Under launchers like ``mlx.launch`` the worker's stdout is a pipe, so
-    Rich's auto-detection falls back to 80 columns. Honor an explicit
-    ``MLX_LM_WIDTH`` override, then ``COLUMNS``, then a real TTY query, and
-    finally a generous default that's nicer than 80 on modern terminals.
+    ``shutil.get_terminal_size`` already honors ``COLUMNS`` and queries
+    stdout's fd. Under launchers like ``mlx.launch`` rank-0's stdout can be
+    piped, so as a last resort we open the controlling terminal directly.
     """
-    for var in ("MLX_LM_WIDTH", "COLUMNS"):
-        value = os.environ.get(var)
-        if value and value.isdigit():
-            return int(value)
     width = shutil.get_terminal_size(fallback=(0, 0)).columns
-    return width if width > 0 else default
+    if width > 0:
+        return width
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY)
+    except OSError:
+        return default
+    try:
+        return os.get_terminal_size(fd).columns or default
+    except OSError:
+        return default
+    finally:
+        os.close(fd)
 
 
 def _make_theme() -> Theme:
     return Theme(
         {
-            "ui.strong": "bold #000000",
-            "ui.label": "#2a2a2a",
-            "ui.muted": "grey42",
-            "ui.heading": "bold #1a1a1a",
-            "ui.dim": "grey62",
-            "ui.accent": "bold purple",
+            "ui.strong": "bold",
+            "ui.label": "default",
+            "ui.muted": "grey50",
+            "ui.heading": "bold",
+            "ui.dim": "grey50",
+            "ui.accent": "bold magenta",
             "ui.border": "blue",
             "ui.good": "bold green",
             "ui.warn": "yellow",
@@ -95,38 +99,27 @@ def print_chat_help(console: Console) -> None:
     )
 
 
-def make_corridor_prompt(console: Console):
-    """Return a callable that draws the chat input corridor.
+def corridor_input(console: Console) -> str:
 
-    The returned callable draws the top/bottom rules around the input line,
-    repositions the cursor onto the middle line, and returns the styled
-    "›" prompt string. Pass that string to ``input()`` so readline treats
-    the marker as part of the prompt — otherwise backspace will erase it.
-    """
+    width = console.width
+    dashes = "─" * max(width - 1, 10)
+    with console.capture() as cap:
+        console.print(f"[ui.muted]{dashes}[/ui.muted]")
+        console.print()
+        console.print(f"[ui.muted]{dashes}[/ui.muted]")
+    sys.stdout.write(cap.get())
+    sys.stdout.write("\033[2A\r")  # cursor up two rows onto the blank middle line
+    sys.stdout.flush()
 
-    _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-
-    def _readline_safe(text: str) -> str:
-        # Wrap escape sequences in \x01..\x02 so readline doesn't count
-        # them when computing the prompt's visible width.
-        return _ANSI_RE.sub(lambda m: f"\x01{m.group(0)}\x02", text)
-
-    def _draw() -> str:
-        width = console.width
-        dashes = "─" * max(width - 1, 10)
-        with console.capture() as cap:
-            console.print(f"[ui.muted]{dashes}[/ui.muted]")
-            console.print()
-            console.print(f"[ui.muted]{dashes}[/ui.muted]")
-        sys.stdout.write(cap.get())
-        # Move the cursor up two rows back onto the blank middle line.
-        sys.stdout.write("\033[2A\r")
+    with console.capture() as cap2:
+        console.print("[ui.accent]›[/ui.accent] ", end="")
+    prompt = _ANSI_RE.sub(lambda m: f"\x01{m.group(0)}\x02", cap2.get())
+    try:
+        return input(prompt)
+    finally:
+        # Cursor sits on the bottom-rule row; advance past it.
+        sys.stdout.write("\n")
         sys.stdout.flush()
-        with console.capture() as cap2:
-            console.print("[ui.accent]›[/ui.accent] ", end="")
-        return _readline_safe(cap2.get())
-
-    return _draw
 
 
 class SquareBar(ProgressColumn):

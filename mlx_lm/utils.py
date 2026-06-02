@@ -342,7 +342,7 @@ def load_model(
 
     model = model_class(model_args)
 
-    if weights and hasattr(model, "sanitize"):
+    if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
     def _quantize(quantization):

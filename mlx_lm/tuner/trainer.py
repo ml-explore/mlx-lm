@@ -13,14 +13,9 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
-from ..cli_ui import make_console, make_train_progress
+from ..cli_ui import make_console, make_train_progress, printf
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
-
-
-def printf(*args, **kwargs):
-    if mx.distributed.init().rank() == 0:
-        print(*args, **kwargs)
 
 
 def _clear_cache(threshold: int):
@@ -246,8 +241,6 @@ def train(
     rank = world.rank()
 
     console = make_console()
-    if rank == 0 and world_size > 1:
-        console.print(f"[ui.muted]node {rank} of {world_size}[/ui.muted]")
 
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
