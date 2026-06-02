@@ -172,6 +172,108 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
+def _transform_compressed_tensors_nvfp4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Dict[str, mx.array]:
+    """Fold compressed-tensors NVFP4 weights into MLX-native ``nvfp4`` weights.
+
+    A ``nvfp4-pack-quantized`` checkpoint stores, per quantized Linear:
+
+    - ``<p>.weight_packed``       ``uint8``  ``[out, in // 2]``  (2x E2M1 per byte)
+    - ``<p>.weight_scale``        ``uint8``  ``[out, in // 16]`` (E4M3 per group of 16,
+      loaded by ``mx.load`` as raw bytes -- the same byte layout MLX uses for nvfp4 scales)
+    - ``<p>.weight_global_scale`` ``float32`` ``[1]`` (per-tensor; the real weight is
+      ``fp4 * weight_scale / weight_global_scale``)
+
+    MLX ``nvfp4`` ``QuantizedLinear`` expects ``<p>.weight`` (``uint32``) plus
+    ``<p>.scales`` (``uint8`` E4M3) and is single-level: the per-tensor global scale is
+    not representable (and is rejected on the Metal backend). We therefore reconstruct
+    the bf16 weight and re-quantize with MLX, folding the global scale into the per-group
+    E4M3 scales. The original FP4 codes are preserved up to MLX's re-quantization.
+    """
+    group_size = quantization_config.get("config_groups", {}).get("group_0", {}).get(
+        "weights", {}
+    ).get("group_size", 16)
+    bits = 4
+    packed_suffix = ".weight_packed"
+
+    new_weights = {}
+    for key in list(weights.keys()):
+        if key.endswith(packed_suffix):
+            prefix = key[: -len(packed_suffix)]
+            packed = weights[key]
+            scale = weights[f"{prefix}.weight_scale"]
+            global_scale = weights[f"{prefix}.weight_global_scale"].astype(mx.float32)
+
+            # weight_packed is uint8 [out, in//2]; reinterpret as uint32 [out, in//8]
+            # to match MLX's nvfp4 weight layout.
+            packed_u32 = packed.view(mx.uint32)
+
+            # Single-level dequant (fp4 * E4M3 scale), then divide by the per-tensor
+            # global scale to recover the true weight magnitude.
+            w = mx.dequantize(
+                packed_u32, scale, group_size=group_size, bits=bits, mode="nvfp4"
+            )
+            w = (w.astype(mx.float32) / global_scale).astype(mx.bfloat16)
+
+            # Re-quantize to MLX-native nvfp4 (global scale folded into E4M3 scales).
+            qweight, qscales = mx.quantize(w, group_size, bits, mode="nvfp4")
+            new_weights[f"{prefix}.weight"] = qweight
+            new_weights[f"{prefix}.scales"] = qscales
+        elif key.endswith(".weight_scale") or key.endswith(".weight_global_scale"):
+            # Consumed alongside their ``.weight_packed``.
+            continue
+        else:
+            new_weights[key] = weights[key]
+
+    return new_weights
+
+
+def _transform_compressed_tensors_int4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Dict[str, mx.array]:
+    """Remap compressed-tensors INT4 ``pack-quantized`` weights to MLX affine weights.
+
+    A symmetric int4 ``pack-quantized`` checkpoint stores, per quantized Linear:
+
+    - ``<p>.weight_packed`` ``int32`` ``[out, in // 8]`` (8x int4 per word, LSB-first)
+    - ``<p>.weight_scale``  (``bf16``/``float``) ``[out, in // group_size]``
+    - ``<p>.weight_shape``  ``int64`` ``[2]`` (unused by MLX)
+
+    MLX affine ``QuantizedLinear`` uses the same int4 packing and dequantizes as
+    ``w * scale + bias``. Symmetric int4 stores values in ``[0, 15]`` representing
+    ``[-8, 7]``, i.e. ``value = packed - 8``, so we set ``bias = -8 * scale``. The packed
+    ``int32`` is bit-identical to MLX's ``uint32`` layout (reinterpreted via ``view``).
+    This is the model-agnostic version of the int4 remap in ``deepseek_v3.sanitize``.
+    """
+    weights_cfg = (
+        quantization_config.get("config_groups", {})
+        .get("group_0", {})
+        .get("weights", {})
+    )
+    group_size = weights_cfg.get("group_size", 32)
+    bits = weights_cfg.get("num_bits", 4)
+    packed_suffix = ".weight_packed"
+
+    new_weights = {}
+    for key in list(weights.keys()):
+        if key.endswith(packed_suffix):
+            prefix = key[: -len(packed_suffix)]
+            scale = weights[f"{prefix}.weight_scale"]
+            new_weights[f"{prefix}.weight"] = weights[key].view(mx.uint32)
+            new_weights[f"{prefix}.scales"] = scale
+            new_weights[f"{prefix}.biases"] = -(2 ** (bits - 1)) * scale
+        elif key.endswith(".weight_scale") or key.endswith(".weight_shape"):
+            # Consumed alongside their ``.weight_packed`` (shape is unused by MLX).
+            continue
+        else:
+            new_weights[key] = weights[key]
+
+    return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -341,6 +443,31 @@ def load_model(
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
+
+    # Transform compressed-tensors weights into MLX-native form before sanitize() so that
+    # per-expert (MoE) tensors are renamed to .weight/.scales(/.biases) and then stacked
+    # correctly. Skip if a model already remapped them itself (no .weight_packed left).
+    if (
+        (qc := config.get("quantization_config"))
+        and isinstance(qc, dict)
+        and qc.get("quant_method") == "compressed-tensors"
+        and any(k.endswith(".weight_packed") for k in weights)
+    ):
+        ct_format = qc.get("format")
+        if ct_format == "nvfp4-pack-quantized":
+            weights = _transform_compressed_tensors_nvfp4_weights(weights, qc)
+            quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        elif ct_format == "pack-quantized":
+            weights, quantization = _transform_compressed_tensors_int4_weights(
+                weights, qc
+            )
+        else:
+            raise ValueError(
+                f"Unsupported compressed-tensors format: {ct_format!r}. "
+                "Supported: 'nvfp4-pack-quantized', 'pack-quantized'."
+            )
+        config["quantization"] = quantization
+        config["quantization_config"] = quantization
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
