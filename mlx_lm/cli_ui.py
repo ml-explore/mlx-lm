@@ -1,6 +1,5 @@
 # Copyright © 2024 Apple Inc.
 
-import os
 import re
 import shutil
 import sys
@@ -23,25 +22,7 @@ def printf(*args, **kwargs):
 
 
 def _terminal_width(default: int = 120) -> int:
-    """Best-effort terminal width.
-
-    ``shutil.get_terminal_size`` already honors ``COLUMNS`` and queries
-    stdout's fd. Under launchers like ``mlx.launch`` rank-0's stdout can be
-    piped, so as a last resort we open the controlling terminal directly.
-    """
-    width = shutil.get_terminal_size(fallback=(0, 0)).columns
-    if width > 0:
-        return width
-    try:
-        fd = os.open("/dev/tty", os.O_RDONLY)
-    except OSError:
-        return default
-    try:
-        return os.get_terminal_size(fd).columns or default
-    except OSError:
-        return default
-    finally:
-        os.close(fd)
+    return shutil.get_terminal_size(fallback=(default, 0)).columns or default
 
 
 def _make_theme() -> Theme:
