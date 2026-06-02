@@ -16,7 +16,7 @@ from rich.theme import Theme
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
-def printf(*args, **kwargs):
+def rprint(*args, **kwargs):
     """Print on rank 0 only; no-op on every other distributed worker."""
     if mx.distributed.init().rank() == 0:
         print(*args, **kwargs)
@@ -219,4 +219,64 @@ class TrainUI:
             return
         self._console.print(
             f"  [ui.good]save[/ui.good]  " f"[ui.muted]{checkpoint.name}[/ui.muted]"
+        )
+
+
+class ChatUI:
+    """Helper class for rendering the chat UI and streaming responses."""
+
+    def __init__(self, args, rank: int = 0):
+        self._rank = rank
+        self._args = args
+        self._console = make_console()
+
+    def __enter__(self):
+        if self._rank == 0:
+            rows = [("model", str(self._args.model))]
+            if self._args.adapter_path:
+                rows.append(("adapter", str(self._args.adapter_path)))
+            rows.append(("max tokens", f"{self._args.max_tokens:,}"))
+            if self._args.system_prompt:
+                sp = self._args.system_prompt
+                if len(sp) > 60:
+                    sp = sp[:57] + "..."
+                rows.append(("system", sp))
+            print_header_panel(self._console, "mlx_lm.chat", rows)
+            print_chat_help(self._console)
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def prompt(self) -> str:
+        if self._rank == 0:
+            return corridor_input(self._console)
+        return input("")
+
+    def say_bye(self):
+        if self._rank == 0:
+            self._console.print("[ui.muted]bye[/ui.muted]")
+
+    def say_reset(self):
+        if self._rank == 0:
+            self._console.print(
+                "  [ui.good]reset[/ui.good] [ui.muted]context cleared[/ui.muted]"
+            )
+
+    def say_help(self):
+        if self._rank == 0:
+            print_chat_help(self._console)
+
+    def stream_token(self, text: str):
+        rprint(text, flush=True, end="")
+
+    def end_turn(self, response):
+        rprint()  # newline after the streamed line
+        if self._rank != 0 or response is None:
+            return
+        self._console.print(
+            f"  [ui.muted]{response.generation_tokens} tokens · "
+            f"{response.generation_tps:.1f} tok/s · "
+            f"prompt {response.prompt_tps:.1f} tok/s · "
+            f"peak {response.peak_memory:.2f} GB[/ui.muted]"
         )

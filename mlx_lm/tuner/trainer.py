@@ -13,7 +13,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
-from ..cli_ui import TrainUI, printf
+from ..cli_ui import TrainUI, rprint
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
@@ -148,7 +148,7 @@ def iterate_batches(
                 offsets = [0] * len(batch)
             lengths = [len(x) for x in batch]
             if max(lengths) > max_seq_length:
-                printf(
+                rprint(
                     f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
                     f"The longest sentence {max(lengths)} will be truncated to {max_seq_length}. "
                     "Consider pre-splitting your data to save memory."

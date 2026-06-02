@@ -12,7 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .cli_ui import make_console, print_header_panel, printf
+from .cli_ui import make_console, print_header_panel, rprint
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
@@ -247,7 +247,7 @@ def train_model(
 
     # Resume from weights if provided
     if args.resume_adapter_file is not None:
-        printf(f"Loading fine-tuned weights from {args.resume_adapter_file}")
+        rprint(f"Loading fine-tuned weights from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
 
     print_trainable_parameters(model)
@@ -349,7 +349,7 @@ def evaluate_model(args, model: nn.Module, test_set):
 
     test_ppl = math.exp(test_loss)
 
-    printf(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
+    rprint(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
 
 def run(args, training_callback: TrainingCallback = None):
@@ -361,10 +361,10 @@ def run(args, training_callback: TrainingCallback = None):
         config=vars(args),
     )
 
-    printf("Loading pretrained model")
+    rprint("Loading pretrained model")
     model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
 
-    printf("Loading datasets")
+    rprint("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
 
     if args.test and not args.train:
@@ -373,13 +373,13 @@ def run(args, training_callback: TrainingCallback = None):
             load_adapters(model, args.adapter_path)
 
     elif args.train:
-        printf("Training")
+        rprint("Training")
         train_model(args, model, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
-        printf("Testing")
+        rprint("Testing")
         evaluate_model(args, model, test_set)
 
 
@@ -390,7 +390,7 @@ def main():
     config = args.config
     args = vars(args)
     if config:
-        printf("Loading configuration file", config)
+        rprint("Loading configuration file", config)
         with open(config, "r") as file:
             config = yaml.load(file, yaml_loader)
         # Prefer parameters from command-line arguments
