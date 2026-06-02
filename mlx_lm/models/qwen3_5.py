@@ -422,6 +422,10 @@ class Model(nn.Module):
             inputs, cache=cache, input_embeddings=input_embeddings
         )
 
+    @property
+    def model(self):
+        return self.language_model.model
+
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
