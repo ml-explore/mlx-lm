@@ -11,8 +11,9 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 import yaml
+from tqdm import tqdm
 
-from .cli_ui import make_console, print_header_panel, rprint
+from .cli_ui import make_console, print_lora_run_header, rprint
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
@@ -250,6 +251,8 @@ def train_model(
         rprint(f"Loading fine-tuned weights from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
 
+    if mx.distributed.init().rank() == 0:
+        print_lora_run_header(make_console(), args)
     print_trainable_parameters(model)
 
     adapter_path = Path(args.adapter_path)
@@ -292,8 +295,6 @@ def train_model(
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
-    _print_run_header(args)
-
     # Train model
     train(
         model=model,
@@ -305,47 +306,22 @@ def train_model(
     )
 
 
-def _print_run_header(args):
-    if mx.distributed.init().rank() != 0:
-        return
-
-    type_label = args.fine_tune_type
-    if args.fine_tune_type in ("lora", "dora"):
-        lora_rank = args.lora_parameters.get("rank", "?")
-        type_label = (
-            f"{args.fine_tune_type} · {args.num_layers} layers · rank {lora_rank}"
-        )
-    elif args.fine_tune_type == "full":
-        type_label = f"full · {args.num_layers} layers"
-
-    lr = (
-        args.learning_rate
-        if isinstance(args.learning_rate, (int, float))
-        else "schedule"
-    )
-    lr_str = f"{lr:.1e}" if isinstance(lr, (int, float)) else lr
-
-    rows = [
-        ("model", str(args.model)),
-        ("type", type_label),
-        ("dataset", str(args.data)),
-        ("optimizer", f"{args.optimizer} · lr {lr_str}"),
-        ("batch · iters", f"{args.batch_size} · {args.iters:,}"),
-        ("max seq", f"{args.max_seq_length:,}"),
-    ]
-    print_header_panel(make_console(), "mlx_lm.lora", rows)
-
-
 def evaluate_model(args, model: nn.Module, test_set):
     rank = mx.distributed.init().rank()
+    n_batches = len(test_set) // args.batch_size
+    if args.test_batches != -1:
+        n_batches = min(n_batches, args.test_batches)
+    pbar = tqdm(total=n_batches, desc="Calculating loss...") if rank == 0 else None
     test_loss = evaluate(
         model=model,
         dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
-        progress=(rank == 0),
+        progress_callback=pbar.update if pbar else None,
     )
+    if pbar is not None:
+        pbar.close()
 
     test_ppl = math.exp(test_loss)
 

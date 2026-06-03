@@ -11,7 +11,6 @@ import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
-from tqdm import tqdm
 
 from ..cli_ui import TrainUI, rprint
 from .callbacks import TrainingCallback
@@ -183,8 +182,7 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
     clear_cache_threshold: int = 0,
-    progress: bool = True,
-    batch_callback: callable = None,
+    progress_callback: callable = None,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -201,12 +199,6 @@ def evaluate(
             comm_group=mx.distributed.init(),
         ),
     )
-    if progress:
-        batch_iter = tqdm(
-            batch_iter,
-            desc="Calculating loss...",
-            total=min(len(dataset) // batch_size, num_batches),
-        )
 
     for _, batch in batch_iter:
         losses, toks = loss(model, *batch)
@@ -214,8 +206,8 @@ def evaluate(
         ntokens += toks
         mx.eval(all_losses, ntokens)
         _clear_cache(clear_cache_threshold)
-        if batch_callback is not None:
-            batch_callback()
+        if progress_callback is not None:
+            progress_callback()
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
@@ -309,8 +301,7 @@ def train(
                         num_batches=args.val_batches,
                         max_seq_length=args.max_seq_length,
                         iterate_batches=iterate_batches,
-                        progress=False,
-                        batch_callback=advance_val,
+                        progress_callback=advance_val,
                     )
                 model.train()
                 val_time = time.perf_counter() - tic

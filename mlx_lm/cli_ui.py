@@ -4,6 +4,7 @@ import re
 import shutil
 import sys
 from contextlib import contextmanager
+from functools import lru_cache
 
 import mlx.core as mx
 from rich.box import ROUNDED
@@ -43,12 +44,15 @@ def _make_theme() -> Theme:
     )
 
 
-def make_console(**kwargs) -> Console:
-    """Return a rich Console pre-loaded with the mlx_lm theme."""
-    kwargs.setdefault("highlight", False)
-    kwargs.setdefault("color_system", "truecolor")
-    kwargs.setdefault("width", _terminal_width())
-    return Console(theme=_make_theme(), **kwargs)
+@lru_cache(maxsize=1)
+def make_console() -> Console:
+    """Return the shared rich Console pre-loaded with the mlx_lm theme."""
+    return Console(
+        theme=_make_theme(),
+        highlight=False,
+        color_system="truecolor",
+        width=_terminal_width(),
+    )
 
 
 def print_header_panel(
@@ -79,6 +83,31 @@ def print_chat_help(console: Console) -> None:
         "[ui.strong]r[/ui.strong] [ui.muted]reset[/ui.muted]   "
         "[ui.strong]h[/ui.strong] [ui.muted]help[/ui.muted]"
     )
+
+
+def print_lora_run_header(console: Console, args) -> None:
+    """Render the lora-run startup panel from a parsed args namespace."""
+    type_label = args.fine_tune_type
+    if args.fine_tune_type in ("lora", "dora"):
+        lora_rank = args.lora_parameters.get("rank", "?")
+        type_label = (
+            f"{args.fine_tune_type} · {args.num_layers} layers · rank {lora_rank}"
+        )
+    elif args.fine_tune_type == "full":
+        type_label = f"full · {args.num_layers} layers"
+
+    lr = args.learning_rate if isinstance(args.learning_rate, (int, float)) else None
+    lr_str = f"{lr:.1e}" if lr is not None else "schedule"
+
+    rows = [
+        ("model", str(args.model)),
+        ("type", type_label),
+        ("dataset", str(args.data)),
+        ("optimizer", f"{args.optimizer} · lr {lr_str}"),
+        ("batch · iters", f"{args.batch_size} · {args.iters:,}"),
+        ("max seq", f"{args.max_seq_length:,}"),
+    ]
+    print_header_panel(console, "mlx_lm.lora", rows)
 
 
 def corridor_input(console: Console) -> str:
@@ -133,7 +162,7 @@ class SquareBar(ProgressColumn):
 
 def make_train_progress(console: Console, *, disable: bool = False) -> Progress:
     return Progress(
-        TextColumn("[bold blue]train[/bold blue]"),
+        TextColumn("[bold blue]{task.description:<5}[/bold blue]"),
         SquareBar(bar_width=30, complete_style="blue"),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TextColumn("[ui.muted]·[/ui.muted]"),
@@ -189,9 +218,7 @@ class TrainUI:
     @contextmanager
     def val_task(self, total: int):
         task_id = (
-            self._progress.add_task("[bold blue]val  [/bold blue]", total=total)
-            if self._rank == 0
-            else None
+            self._progress.add_task("val", total=total) if self._rank == 0 else None
         )
 
         def advance():
