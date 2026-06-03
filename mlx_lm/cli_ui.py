@@ -238,7 +238,7 @@ class TrainUI:
             f"  [ui.muted]{it:>4}[/ui.muted]    "
             f"[ui.accent]val[/ui.accent] "
             f"[ui.strong]{val_loss:>5.3f}[/ui.strong]    "
-            f"[ui.muted]({val_time:.2f}s)[/ui.muted]"
+            f"[ui.muted]{val_time:.2f}s[/ui.muted]"
         )
 
     def report_save(self, checkpoint):
