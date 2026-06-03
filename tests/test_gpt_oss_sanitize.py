@@ -69,6 +69,59 @@ class TestGptOssSanitize(unittest.TestCase):
         s = m.sanitize(weights)
         self.assertIs(s, weights)
 
+    def test_unsloth_bf16_down_proj_values_unequal_dims(self):
+        """down_proj values are transposed correctly when hidden_size != intermediate_size."""
+        E, D, H = 2, 5, 3
+        # unsloth down_proj layout: (E, intermediate=H, hidden=D).
+        # Mark each (intermediate, hidden) cell with a unique value so a wrong
+        # transpose is detectable.
+        dp = mx.zeros((E, H, D), dtype=mx.float32)
+        for i in range(H):
+            for j in range(D):
+                dp[:, i, j] = float(i * 10 + j)
+        weights = {
+            "model.layers.0.mlp.experts.gate_up_proj":      mx.zeros((E, D, 2 * H), dtype=mx.float32),
+            "model.layers.0.mlp.experts.down_proj":         dp,
+            "model.layers.0.mlp.experts.gate_up_proj_bias": mx.zeros((E, 2 * H),    dtype=mx.float32),
+            "model.layers.0.mlp.experts.down_proj_bias":    mx.zeros((E, D),        dtype=mx.float32),
+        }
+        args = _make_args(hidden_size=D, intermediate_size=H, num_local_experts=E)
+        m = Model(args)
+        s = m.sanitize(weights)
+        out = s["model.layers.0.mlp.experts.down_proj.weight"]
+        # SwitchLinear convention: (E, out=hidden=D, in=intermediate=H).
+        self.assertEqual(out.shape, (E, D, H))
+        # Verify the swap was applied: out[:, j, i] == i*10 + j.
+        for i in range(H):
+            for j in range(D):
+                self.assertEqual(out[0, j, i].item(), float(i * 10 + j))
+
+    def test_unsloth_bf16_down_proj_values_equal_dims(self):
+        """Regression guard: with hidden_size == intermediate_size the unsloth
+        down_proj must still be transposed (the previous shape-only guard
+        skipped it and emitted noise at inference time)."""
+        E, D = 2, 4
+        H = D  # equal dims — exactly the default GPT-OSS config.
+        # Asymmetric values so a missed transpose is detectable.
+        dp = mx.zeros((E, H, D), dtype=mx.float32)
+        for i in range(H):
+            for j in range(D):
+                dp[:, i, j] = float(i * 10 + j)
+        weights = {
+            "model.layers.0.mlp.experts.gate_up_proj":      mx.zeros((E, D, 2 * H), dtype=mx.float32),
+            "model.layers.0.mlp.experts.down_proj":         dp,
+            "model.layers.0.mlp.experts.gate_up_proj_bias": mx.zeros((E, 2 * H),    dtype=mx.float32),
+            "model.layers.0.mlp.experts.down_proj_bias":    mx.zeros((E, D),        dtype=mx.float32),
+        }
+        args = _make_args(hidden_size=D, intermediate_size=H, num_local_experts=E)
+        m = Model(args)
+        s = m.sanitize(weights)
+        out = s["model.layers.0.mlp.experts.down_proj.weight"]
+        self.assertEqual(out.shape, (E, D, H))
+        for i in range(H):
+            for j in range(D):
+                self.assertEqual(out[0, j, i].item(), float(i * 10 + j))
+
     def test_openai_interleaved_layout_preserved(self):
         """Layout (a): (E, 2H, D) — split on axis -2 as before."""
         E, D, H = 32, 2880, 2880

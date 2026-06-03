@@ -253,6 +253,25 @@ class Model(nn.Module):
                 return key
             return key + ".weight"
 
+        # Detect checkpoint layout up front. Two layouts are supported:
+        #   (a) openai/MXFP4   : keys carry `_blocks` / `_scales`; gate_up_proj
+        #       stored as (E, 2*intermediate, hidden); down_proj as
+        #       (E, hidden, intermediate). This is the original mlx-lm path.
+        #   (b) unsloth/HF BF16: bare experts.{gate_up_proj,down_proj} keys
+        #       (no .weight suffix, no _blocks/_scales); gate_up_proj stored as
+        #       (E, hidden, 2*intermediate); down_proj as (E, intermediate, hidden).
+        # Driving the layout off a single explicit signal — the bare gate_up_proj
+        # key whose trailing dim is 2*intermediate_size — avoids shape-arithmetic
+        # ambiguity when hidden_size == intermediate_size (the default GPT-OSS
+        # config), where the two down_proj layouts have identical shape and a
+        # per-tensor shape check would silently misinterpret the unsloth layout
+        # as openai and emit semantically incoherent generations at inference time.
+        is_unsloth_layout = any(
+            k.endswith("experts.gate_up_proj")
+            and weights[k].shape[-1] == 2 * intermediate_size
+            for k in weights.keys()
+        )
+
         new_weights = {}
         for k, v in weights.items():
             if "gate_up_proj" in k and "bias" not in k:
@@ -261,16 +280,11 @@ class Model(nn.Module):
                     k = k.replace("_blocks", ".weight")
                 if "_scales" in k:
                     k = k.replace("_scales", ".scales")
-                # Two known storage layouts for fused gate_up_proj, both
-                # interleaved (gate, up, gate, up, ...) along the 2*intermediate
-                # axis:
-                #  (a) openai/MXFP4   : (E, 2H, D)   interleaved on axis -2.
-                #  (b) unsloth/HF BF16: (E, D, 2H)  interleaved on axis -1.
-                # Normalize layout (b) to (a) via swapaxes(-1, -2), then split on -2.
-                if (
-                    v.shape[-1] == 2 * intermediate_size
-                    and v.shape[-2] == hidden_size
-                ):
+                # Both layouts interleave (gate, up, gate, up, ...) along the
+                # 2*intermediate axis. Layout (a) puts that axis at -2; layout
+                # (b) puts it at -1. Normalize (b) to (a) via swapaxes, then
+                # split on -2.
+                if is_unsloth_layout:
                     v = v.swapaxes(-1, -2)
                 gate_slice = v[..., ::2, :]
                 up_slice = v[..., 1::2, :]
@@ -288,14 +302,13 @@ class Model(nn.Module):
                     k = k.replace("_blocks", ".weight")
                 if "_scales" in k:
                     k = k.replace("_scales", ".scales")
-                # openai stores down_proj as (E, hidden, intermediate) i.e.
-                # (E, out, in). unsloth/HF BF16 stores (E, intermediate, hidden)
-                # i.e. (E, in, out) -> transpose to match SwitchLinear convention.
-                if (
-                    v.shape[-2] == intermediate_size
-                    and v.shape[-1] == hidden_size
-                    and intermediate_size != hidden_size
-                ):
+                # Layout (a) stores down_proj as (E, hidden, intermediate) =
+                # (E, out, in), which matches the SwitchLinear convention
+                # already. Layout (b) stores (E, intermediate, hidden) =
+                # (E, in, out) and must be transposed. Use the explicit
+                # layout signal so this is applied correctly even when
+                # hidden_size == intermediate_size.
+                if is_unsloth_layout:
                     v = v.swapaxes(-1, -2)
                 k = _ensure_weight_suffix(k)
                 new_weights[k] = mx.contiguous(v)
