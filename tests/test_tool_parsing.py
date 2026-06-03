@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 
+from mlx_lm.tokenizer_utils import _infer_tool_parser, _resolve_tool_parser_type
 from mlx_lm.tool_parsers import (
     function_gemma,
     gemma4,
@@ -13,6 +14,11 @@ from mlx_lm.tool_parsers import (
     pythonic,
     qwen3_coder,
 )
+
+# Minimal chat-template fragments carrying the markers _infer_tool_parser keys on.
+# Qwen3-Coder emits XML tool calls; Hermes-style emits JSON.
+_QWEN3_CODER_TEMPLATE = "{% for tool in tools %}<tool_call>\n<function={{ tool.name }}>{% endfor %}"
+_HERMES_JSON_TEMPLATE = '<tool_call>{"name": {{ tool_call.name }}}</tool_call>'
 
 
 class TestToolParsing(unittest.TestCase):
@@ -328,6 +334,108 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+
+class TestToolParserSelection(unittest.TestCase):
+    """Regression guard for parser selection precedence (tokenizer_utils).
+
+    The Qwen3-Coder-Next repos ship a chat template that emits XML tool calls
+    but mislabel `tool_parser_type` as the generic "json_tools", which sent
+    the server into json.loads() on XML and silently dropped every tool call.
+    """
+
+    def test_template_inference(self):
+        # The marker the XML grammar is detected by.
+        self.assertEqual(_infer_tool_parser(_QWEN3_CODER_TEMPLATE), "qwen3_coder")
+        self.assertEqual(_infer_tool_parser(_HERMES_JSON_TEMPLATE), "json_tools")
+        self.assertIsNone(_infer_tool_parser("no tools here"))
+        self.assertIsNone(_infer_tool_parser(None))
+
+    def test_generic_label_yields_to_specific_template(self):
+        # The actual bug: config says json_tools, template is XML -> use XML.
+        self.assertEqual(
+            _resolve_tool_parser_type("json_tools", _QWEN3_CODER_TEMPLATE),
+            "qwen3_coder",
+        )
+
+    def test_missing_label_uses_inference(self):
+        self.assertEqual(
+            _resolve_tool_parser_type(None, _QWEN3_CODER_TEMPLATE), "qwen3_coder"
+        )
+        self.assertEqual(
+            _resolve_tool_parser_type(None, _HERMES_JSON_TEMPLATE), "json_tools"
+        )
+
+    def test_hermes_json_unchanged(self):
+        # A genuine Hermes/JSON model must be untouched: json_tools stays
+        # json_tools (only a *generic* label yields, and only to a *specific*
+        # template-inferred parser).
+        self.assertEqual(
+            _resolve_tool_parser_type("json_tools", _HERMES_JSON_TEMPLATE),
+            "json_tools",
+        )
+        self.assertEqual(
+            _resolve_tool_parser_type("json_tools", "no tool markers"),
+            "json_tools",
+        )
+
+    def test_deliberate_specific_label_wins(self):
+        # A specific, deliberately-set parser is never overridden by inference.
+        self.assertEqual(
+            _resolve_tool_parser_type("minimax_m2", _QWEN3_CODER_TEMPLATE),
+            "minimax_m2",
+        )
+        self.assertEqual(
+            _resolve_tool_parser_type("qwen3_coder", _HERMES_JSON_TEMPLATE),
+            "qwen3_coder",
+        )
+
+    def test_no_parser_anywhere(self):
+        self.assertIsNone(_resolve_tool_parser_type(None, "plain template"))
+
+
+class TestQwen3CoderServerHandoff(unittest.TestCase):
+    """Parse tool_text exactly as server.py's state machine hands it off:
+    <tool_call>/</tool_call> stripped, with the leading/trailing newlines the
+    model emits around the <function=...> block."""
+
+    def test_server_framed_tool_text(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "limit": {"type": "integer"},
+                            "verbose": {"type": "boolean"},
+                        },
+                    },
+                },
+            }
+        ]
+        tool_text = (
+            "\n<function=read_file>\n"
+            "<parameter=path>\n/tmp/x.txt\n</parameter>\n"
+            "<parameter=limit>\n42\n</parameter>\n"
+            "<parameter=verbose>\ntrue\n</parameter>\n"
+            "</function>\n"
+        )
+        tool_call = qwen3_coder.parse_tool_call(tool_text, tools)
+        self.assertEqual(tool_call["name"], "read_file")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"path": "/tmp/x.txt", "limit": 42, "verbose": True},
+        )
+
+    def test_no_schema_defaults_to_string(self):
+        tool_text = "<function=ping>\n<parameter=host>\nlocalhost\n</parameter>\n</function>"
+        tool_call = qwen3_coder.parse_tool_call(tool_text, None)
+        self.assertEqual(
+            tool_call, {"name": "ping", "arguments": {"host": "localhost"}}
+        )
 
 
 if __name__ == "__main__":

@@ -575,6 +575,26 @@ def _infer_tool_parser(chat_template):
     return None
 
 
+def _resolve_tool_parser_type(configured, chat_template):
+    """Resolve which tool parser to use for a model.
+
+    Precedence: a deliberately-set, specific ``tool_parser_type`` from the
+    tokenizer config wins. But some repos ship the generic ``"json_tools"``
+    label even though their chat template emits a non-JSON tool-call grammar
+    (e.g. Qwen3-Coder's XML ``<tool_call>\\n<function=...>`` form). Parsing
+    that with ``json.loads`` raises ``JSONDecodeError`` and the tool call is
+    silently dropped. So when the explicit label is the generic default but
+    the template clearly identifies a specific parser, trust the template.
+    When nothing is configured, fall back to template inference.
+    """
+    inferred = _infer_tool_parser(chat_template)
+    if configured is None:
+        return inferred
+    if configured == "json_tools" and inferred is not None and inferred != "json_tools":
+        return inferred
+    return configured
+
+
 def load(
     model_path,
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
@@ -622,8 +642,8 @@ def load(
             f"mlx_lm.chat_templates.{chat_template_type}"
         ).apply_chat_template
 
-    tool_parser_type = tokenizer_config.get(
-        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
+    tool_parser_type = _resolve_tool_parser_type(
+        tokenizer_config.get("tool_parser_type"), tokenizer.chat_template
     )
 
     if tool_parser_type is not None:
