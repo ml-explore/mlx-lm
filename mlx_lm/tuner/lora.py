@@ -139,8 +139,16 @@ class LoRASwitchLinear(nn.Module):
         #   (a) per-expert (mlx-lm native): lora_a (E, r, D), lora_b (E, out, r).
         #   (b) shared / PEFT target_parameters: lora_a (r, D), lora_b (out, r).
         #       Same low-rank update added to every expert -> broadcast to (E, ...).
+        # The two formats are tightly coupled; reject mixed ndim early with a
+        # clear error rather than letting it fail deep inside gather_mm.
         lora_a = self.lora_a
         lora_b = self.lora_b
+        if lora_a.ndim != lora_b.ndim:
+            raise ValueError(
+                "LoRASwitchLinear: lora_a and lora_b must have the same ndim "
+                f"(got {lora_a.ndim} and {lora_b.ndim}). Mix of shared (2D) "
+                "and per-expert (3D) adapters is not supported."
+            )
         if lora_a.ndim == 2:
             # (r, D) -> (E, r, D); same matrix replicated across experts.
             lora_a = mx.broadcast_to(
@@ -197,6 +205,12 @@ class LoRASwitchLinear(nn.Module):
 
     def __call__(self, x, indices, sorted_indices=False):
         y = self.linear(x, indices, sorted_indices=sorted_indices)
+        if self.lora_a.ndim != self.lora_b.ndim:
+            raise ValueError(
+                "LoRASwitchLinear: lora_a and lora_b must have the same ndim "
+                f"(got {self.lora_a.ndim} and {self.lora_b.ndim}). Mix of "
+                "shared (2D) and per-expert (3D) adapters is not supported."
+            )
         # Shared 2D adapter (PEFT target_parameters) -> dense matmul, broadcast to all routed experts.
         if self.lora_a.ndim == 2 and self.lora_b.ndim == 2:
             xd = self.dropout(x)

@@ -62,5 +62,21 @@ class TestLoRASwitchLinearSharedAdapter(unittest.TestCase):
         self.assertTrue(mx.allclose(y_lora, y_fused, atol=1e-3).item())
 
 
+    def test_mixed_ndim_raises(self):
+        """Mixed 2D/3D adapters must raise a clear ValueError, not silently
+        take a partial code path."""
+        base = self._base()
+        lora = LoRASwitchLinear.from_base(base, r=self.r, scale=1.0)
+        # 2D lora_a paired with 3D lora_b -> invalid.
+        lora.lora_a = mx.random.normal(shape=(self.r, self.D))
+        lora.lora_b = mx.random.normal(shape=(self.E, self.H, self.r))
+        x = mx.random.normal(shape=(2, 1, self.D))
+        indices = mx.array([[0], [1]], dtype=mx.uint32)
+        with self.assertRaises(ValueError):
+            lora(x, indices)
+        with self.assertRaises(ValueError):
+            lora.fuse()
+
+
 if __name__ == "__main__":
     unittest.main()
