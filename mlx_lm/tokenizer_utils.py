@@ -69,6 +69,8 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def __init__(self, tokenizer):
         self._tokenizer = tokenizer
         self._tokenizer.decode([0])
+        probe = tokenizer.encode("a ,b", add_special_tokens=False)
+        self._clean_spaces = " ," not in tokenizer.decode(probe)
         self.reset()
 
     def reset(self):
@@ -92,7 +94,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
             if self._current_text.endswith("\ufffd") or (
-                self._tokenizer.clean_up_tokenization_spaces
+                self._clean_spaces
                 and len(self._current_text) > 0
                 and self._current_text[-1] == " "
             ):
@@ -163,7 +165,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _space_matches = (".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re")
 
     def __init__(self, tokenizer):
-        self.clean_spaces = tokenizer.clean_up_tokenization_spaces
+        probe = tokenizer.encode("a ,b", add_special_tokens=False)
+        self.clean_spaces = " ," not in tokenizer.decode(probe)
 
         # Extract the tokens in a list from id to text
         self.tokenmap = [None] * len(tokenizer.vocab)
