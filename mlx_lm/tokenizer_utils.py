@@ -162,12 +162,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     """
 
     _byte_decoder = None
-    _space_matches = (".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re")
 
     def __init__(self, tokenizer):
-        probe = tokenizer.encode("a ,b", add_special_tokens=False)
-        self.clean_spaces = " ," not in tokenizer.decode(probe)
-
         # Extract the tokens in a list from id to text
         self.tokenmap = [None] * len(tokenizer.vocab)
         for value, tokenid in tokenizer.vocab.items():
@@ -201,8 +197,6 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         elif current_text[0] != " ":
             return current_text
         elif not self.text:
-            return current_text[1:]
-        elif self.clean_spaces and current_text[1:].startswith(self._space_matches):
             return current_text[1:]
         return current_text
 
