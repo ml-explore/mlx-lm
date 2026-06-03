@@ -3252,5 +3252,79 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
+class TestMakePromptCache(unittest.TestCase):
+    """make_prompt_cache must apply max_kv_size for all models, including those
+    that define make_cache() for custom per-layer cache structure."""
+
+    def _tiny_llama(self):
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=256,
+        )
+        return llama.Model(args)
+
+    def test_without_max_kv_size_returns_kvcache(self):
+        model = self._tiny_llama()
+        caches = make_prompt_cache(model)
+        self.assertTrue(all(type(c) is KVCache for c in caches))
+
+    def test_with_max_kv_size_returns_rotating_for_model_with_make_cache(self):
+        # Llama defines make_cache() — previously max_kv_size was silently ignored.
+        model = self._tiny_llama()
+        self.assertTrue(
+            hasattr(model, "make_cache"), "test requires a model with make_cache()"
+        )
+        caches = make_prompt_cache(model, max_kv_size=512)
+        self.assertEqual(len(caches), 4)
+        for c in caches:
+            self.assertIsInstance(
+                c, RotatingKVCache, f"expected RotatingKVCache, got {type(c)}"
+            )
+            self.assertEqual(c.max_size, 512)
+            self.assertEqual(c.keep, 4)
+
+    def test_mixed_cache_model_only_replaces_plain_kvcache(self):
+        # Simulate a model whose make_cache() returns a mix of KVCache and
+        # RotatingKVCache (e.g. sliding-window layers). Only the plain KVCache
+        # layers should be upgraded; the RotatingKVCache layers must stay intact.
+        class MixedCacheModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def make_cache(self):
+                return [KVCache(), RotatingKVCache(max_size=256, keep=0), KVCache()]
+
+        model = MixedCacheModel()
+        caches = make_prompt_cache(model, max_kv_size=1024)
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertEqual(caches[0].max_size, 1024)  # replaced
+        self.assertEqual(caches[0].keep, 4)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertEqual(caches[1].max_size, 256)  # untouched — already rotating
+        self.assertEqual(caches[1].keep, 0)  # original keep preserved
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertEqual(caches[2].max_size, 1024)  # replaced
+
+    def test_with_max_kv_size_without_make_cache(self):
+        # Models without make_cache() — existing behaviour unchanged.
+        class SimpleCacheModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [nn.Linear(4, 4) for _ in range(3)]
+
+        model = SimpleCacheModel()
+        self.assertFalse(hasattr(model, "make_cache"))
+        caches = make_prompt_cache(model, max_kv_size=512)
+        self.assertTrue(all(isinstance(c, RotatingKVCache) for c in caches))
+        self.assertTrue(all(c.max_size == 512 for c in caches))
+
+
 if __name__ == "__main__":
     unittest.main()

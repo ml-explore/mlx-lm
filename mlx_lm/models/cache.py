@@ -24,12 +24,25 @@ def make_prompt_cache(
 
     Args:
         model (nn.Module): The language model.
-        max_kv_size (Optional[int]): If provided and the model does not have a
-            ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
-            size of ``max_kv_size``
+        max_kv_size (Optional[int]): If provided, plain :class:`KVCache` entries
+            are replaced with :class:`RotatingKVCache` capped at ``max_kv_size``
+            tokens. This applies whether or not the model defines ``make_cache``.
+            Cache entries that are already a :class:`RotatingKVCache` (e.g.
+            sliding-window layers) or non-KV caches (e.g. SSM state) are left
+            unchanged.
     """
     if hasattr(model, "make_cache"):
-        return model.make_cache()
+        caches = model.make_cache()
+        if max_kv_size is not None:
+            return [
+                (
+                    RotatingKVCache(max_size=max_kv_size, keep=4)
+                    if type(c) is KVCache
+                    else c
+                )
+                for c in caches
+            ]
+        return caches
 
     num_layers = len(model.layers)
     if max_kv_size is not None:
