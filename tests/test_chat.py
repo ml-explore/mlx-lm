@@ -84,6 +84,10 @@ class TestChat(unittest.TestCase):
         # Mock stream_generate to return some responses
         mock_response = MagicMock()
         mock_response.text = "Hello there!"
+        mock_response.generation_tokens = 1
+        mock_response.generation_tps = 1.0
+        mock_response.prompt_tps = 1.0
+        mock_response.peak_memory = 1.0
         mock_stream_generate.return_value = [mock_response]
 
         # Mock user input: first a question, then 'q' to quit
@@ -139,6 +143,10 @@ class TestChat(unittest.TestCase):
         # Mock stream_generate to return some responses
         mock_response = MagicMock()
         mock_response.text = "Hello there!"
+        mock_response.generation_tokens = 1
+        mock_response.generation_tps = 1.0
+        mock_response.prompt_tps = 1.0
+        mock_response.peak_memory = 1.0
         mock_stream_generate.return_value = [mock_response]
 
         # Mock user input: first a question, then 'q' to quit
