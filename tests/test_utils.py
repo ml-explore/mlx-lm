@@ -183,6 +183,54 @@ class TestUtils(unittest.TestCase):
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
+    def test_class_predicate_skips_non_quantizable_modules_in_per_layer_config(self):
+        """load_model must not crash when per-layer quantization config lists a
+        module that lacks to_quantized() — regression for issue #1266 (MoEGate)."""
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=256,
+        )
+        model_config = {
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 256,
+        }
+        model = llama.Model(args)
+        model, config = utils.quantize_model(
+            model,
+            model_config,
+            group_size=32,
+            bits=4,
+        )
+
+        # Inject a path for a non-quantizable module (RMSNorm has no to_quantized).
+        # This simulates a pre-quantized config like nemotron_h whose quantization
+        # config includes MoEGate paths.
+        config["quantization"]["model.layers.0.input_layernorm"] = {
+            "group_size": 32,
+            "bits": 4,
+        }
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            # Should not raise: ValueError: Unable to quantize model of type RMSNorm
+            loaded, _ = utils.load_model(Path(mlx_path))
+            logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+            mx.eval(logits)
+            self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
 
 if __name__ == "__main__":
     unittest.main()

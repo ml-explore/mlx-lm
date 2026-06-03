@@ -348,10 +348,10 @@ def load_model(
     def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
+            if p in config["quantization"]:
+                return config["quantization"][p]
             return f"{p}.scales" in weights
 
         nn.quantize(
