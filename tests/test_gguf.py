@@ -57,6 +57,26 @@ class TestConvertToGGUFWithoutMocks(unittest.TestCase):
         called_args, _ = mock_save_gguf.call_args
         self.assertEqual(called_args[0], output_file_path)
 
+    @patch("transformers.AutoTokenizer.from_pretrained")
+    @patch("mlx.core.save_gguf")
+    def test_convert_to_gguf_invalid_weights_type(
+        self,
+        mock_save_gguf,
+        mock_from_pretrained,
+    ):
+        model_path = Path(self.test_dir)
+        config = {
+            "num_attention_heads": 1,
+            "num_hidden_layers": 1,
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "_name_or_path": "test-llama",
+        }
+        output_file_path = "/fake/output/path/gguf_model.gguf"
+
+        with self.assertRaises(TypeError):
+            convert_to_gguf(model_path, [], config, output_file_path)
+
 
 if __name__ == "__main__":
     unittest.main()

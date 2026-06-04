@@ -267,6 +267,11 @@ def convert_to_gguf(
     if isinstance(model_path, str):
         model_path = Path(model_path)
 
+    if not isinstance(weights, dict):
+        raise TypeError(
+            f"weights must be a dict, got {type(weights).__name__}"
+        )
+
     quantization = config.get("quantization", None)
     if quantization:
         raise NotImplementedError(
