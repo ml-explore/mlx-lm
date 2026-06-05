@@ -63,15 +63,37 @@ class ChatDataset:
             return_dict=False,
         )
         if self.mask_prompt:
-            add_generation_prompt = messages[-1].get("role") == "assistant"
-            offset = len(
-                self.tokenizer.apply_chat_template(
-                    messages[:-1],
-                    tools=tools,
-                    add_generation_prompt=add_generation_prompt,
-                    return_dict=False,
-                )
+            # Compute the loss-mask offset by tokenizing just the prompt
+            # portion (messages[:-1]) with add_generation_prompt=False.
+            # The result is a strict prefix of the full tokenization, and
+            # the offset points to the start of the assistant role header
+            # in the full sequence.
+            #
+            # We deliberately do NOT use add_generation_prompt=True here.
+            # Some chat templates (notably Gemma 4) inject extra tokens
+            # under add_generation_prompt=True (e.g. a
+            # "<|channel>thought\n<channel|>" hint) that are NOT present
+            # in the full tokenization. Computing the offset from such a
+            # tokenization gives a value PAST the end of the full
+            # sequence, which produces an empty loss mask and triggers
+            # NaN gradients in the trainer.
+            #
+            # Using add_generation_prompt=False works for any template
+            # where the prompt portion (without the role header) is a
+            # strict prefix of the full tokenization, which is the OpenAI
+            # / HuggingFace convention followed by Llama, Mistral, Gemma,
+            # Qwen, Phi, and most other modern templates.
+            prompt_ids = self.tokenizer.apply_chat_template(
+                messages[:-1],
+                tools=tools,
+                add_generation_prompt=False,
+                return_dict=False,
             )
+            # Defensive clamp: if the template renders the prompt portion
+            # longer than the full tokenization for any reason (it should
+            # not, but could for a custom template), fall back to no
+            # masking rather than producing an empty loss mask.
+            offset = min(len(prompt_ids), len(tokens))
             return (tokens, offset)
         else:
             return (tokens, 0)
@@ -114,14 +136,19 @@ class CompletionsDataset:
             messages, tools=tools, return_dict=False
         )
         if self.mask_prompt:
-            offset = len(
-                self.tokenizer.apply_chat_template(
-                    messages[:-1],
-                    tools=tools,
-                    add_generation_prompt=True,
-                    return_dict=False,
-                )
+            # See ChatDataset.process for the rationale. We compute the
+            # offset from the prompt-only tokenization
+            # (add_generation_prompt=False) and clamp to the length of
+            # the full tokenization. This is robust against templates
+            # whose add_generation_prompt=True suffix differs from the
+            # full template's prefix (e.g. Gemma 4).
+            prompt_ids = self.tokenizer.apply_chat_template(
+                messages[:-1],
+                tools=tools,
+                add_generation_prompt=False,
+                return_dict=False,
             )
+            offset = min(len(prompt_ids), len(tokens))
             return (tokens, offset)
 
         return (tokens, 0)

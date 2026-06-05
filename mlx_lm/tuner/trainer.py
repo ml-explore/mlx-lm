@@ -94,7 +94,14 @@ def default_loss(model, batch, lengths):
 
     ce = nn.losses.cross_entropy(logits, targets) * mask
     ntoks = mask.sum()
-    ce = ce.astype(mx.float32).sum() / ntoks
+    # If the entire batch has an empty loss mask (e.g. all examples were
+    # truncated such that their response is past the truncation point),
+    # ntoks is zero and `0 / 0` would produce NaN. We use `mx.maximum` to
+    # avoid the divide-by-zero while keeping the function traceable
+    # (we can't call `.item()` inside the loss). The trainer's
+    # aggregation does `losses * toks` so the contribution of an empty
+    # batch is zero regardless of the (otherwise NaN-poisoned) loss value.
+    ce = ce.astype(mx.float32).sum() / mx.maximum(ntoks, 1)
 
     return ce, ntoks
 
@@ -143,6 +150,7 @@ def iterate_batches(
             batch = [dataset[j] for j in batch_idx[i]]
             if len(batch[0]) == 2:
                 batch, offsets = zip(*batch)
+                offsets = list(offsets)  # make mutable so we can clamp
             else:
                 offsets = [0] * len(batch)
             lengths = [len(x) for x in batch]
@@ -166,6 +174,15 @@ def iterate_batches(
                 lengths[j] = (
                     truncated_length  # Update lengths to match truncated lengths
                 )
+                # Clamp the loss-mask offset to the truncated length. If
+                # the original prompt was longer than max_seq_length, the
+                # response may be entirely outside the truncated sequence;
+                # clamping the offset means the loss mask for this
+                # example is empty (contributes 0 to the mean) rather
+                # than producing a non-empty mask on the wrong tokens
+                # (which can produce NaN in the trainer).
+                if offsets[j] > truncated_length:
+                    offsets[j] = truncated_length
             batch = mx.array(batch_arr)
             yield batch, mx.array(list(zip(offsets, lengths)))
 
