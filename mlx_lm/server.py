@@ -619,6 +619,11 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
+        # The batched generator uses BatchKVCache, which has no quantized
+        # variant yet, so route through the single-sequence path (which does
+        # support KV quantization) whenever --kv-bits is requested.
+        if self.cli_args.kv_bits is not None:
+            return False
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
@@ -931,6 +936,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
 
@@ -1849,6 +1857,27 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization. Defaults to no "
+        "quantization. Note: enabling this serves requests sequentially "
+        "(the batched path has no quantized cache yet).",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64).",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=5000,
+        help="When --kv-bits is set, begin quantizing the KV cache after "
+        "this many tokens (default: 5000).",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
