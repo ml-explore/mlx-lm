@@ -63,13 +63,25 @@ def mixed_quant_predicate_builder(
             or index >= 7 * num_layers // 8
             or (index - num_layers // 8) % 3 == 2
         )
+        always_more_bits = (
+            "lm_head" in path
+            or "embed_tokens" in path
+            or "wq_a" in path
+            or "wq_b" in path
+            or "wkv" in path
+            or "wo_a" in path
+            or "wo_b" in path
+            or "compressor" in path
+            or "indexer" in path
+            or "shared_experts" in path
+        )
+        if always_more_bits:
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if (
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits, "mode": mode}
-        if "lm_head" in path:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
 
         return {"group_size": group_size, "bits": low_bits, "mode": mode}

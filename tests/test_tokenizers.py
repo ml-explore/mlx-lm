@@ -2,13 +2,17 @@
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from huggingface_hub import snapshot_download
+from transformers import PreTrainedConfig
 
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
+    load as load_tokenizer_impl,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -108,6 +112,40 @@ class TestTokenizers(unittest.TestCase):
         self.assertIsNone(tokenizer.think_end)
         self.assertIsNone(tokenizer.think_start_id)
         self.assertIsNone(tokenizer.think_end_id)
+
+    def test_unknown_model_config_tokenizer_fallback(self):
+        class MockTokenizer:
+            eos_token_id = 1
+            chat_template = None
+            init_kwargs = {}
+
+            def get_vocab(self):
+                return {}
+
+        calls = []
+
+        def from_pretrained(*args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise AttributeError(
+                    "'PreTrainedConfig' object has no attribute "
+                    "'max_position_embeddings'"
+                )
+            return MockTokenizer()
+
+        with TemporaryDirectory() as tmpdir:
+            tokenizer_json = Path(tmpdir) / "tokenizer.json"
+            tokenizer_json.write_text("{}", encoding="utf-8")
+
+            with patch(
+                "mlx_lm.tokenizer_utils.AutoTokenizer.from_pretrained",
+                side_effect=from_pretrained,
+            ):
+                tokenizer = load_tokenizer_impl(Path(tmpdir))
+
+        self.assertEqual(tokenizer.eos_token_id, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertIsInstance(calls[1]["config"], PreTrainedConfig)
 
 
 if __name__ == "__main__":
