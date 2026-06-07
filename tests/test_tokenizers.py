@@ -123,6 +123,16 @@ class TestTokenizers(unittest.TestCase):
         self.assertEqual(find(prompt, [THINK_START], start=0), 1)
         self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
 
+    def test_thinking_gemma4(self):
+        # Gemma 4 has <|channel>/<channel|> in vocab alongside <|think|> (a mode-switch
+        # token). With enable_thinking=True the model wraps its entire response inside
+        # <|channel>thought...<channel|>, leaving content empty. We skip the channel
+        # thinking detection for these models so has_thinking stays False by default.
+        tokenizer_repo = "mlx-community/gemma-4-e4b-it-4bit"
+        tokenizer = load_tokenizer(tokenizer_repo)
+        self.assertFalse(tokenizer.has_thinking)
+        self.assertIsNone(tokenizer.think_start)
+
 
 if __name__ == "__main__":
     unittest.main()

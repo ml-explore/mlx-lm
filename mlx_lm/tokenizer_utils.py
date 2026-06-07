@@ -269,14 +269,22 @@ def _infer_thinking(tokenizer):
 
     # Multi token thinking modes
     if "<|channel>" in vocab and "<channel|>" in vocab:
-        think_start = "<|channel>thought"
-        think_end = "<channel|>"
-        return (
-            think_start,
-            think_end,
-            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
-            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
-        )
+        # Gemma 4 uses <|channel>/<channel|> for conversation structure but
+        # also has <|think|> as a mode-switch token. With enable_thinking=True,
+        # Gemma 4 wraps its entire response (not just the reasoning portion)
+        # inside <|channel>thought...<channel|>, which causes the server to
+        # classify all content as reasoning and return an empty content field.
+        # Skip thinking detection for these models; users can still opt in
+        # explicitly via chat_template_args.
+        if "<|think|>" not in vocab:
+            think_start = "<|channel>thought"
+            think_end = "<channel|>"
+            return (
+                think_start,
+                think_end,
+                tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+                tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+            )
 
     return (None, None, None, None)
 
