@@ -81,6 +81,22 @@ NGRAM_MOD_LOW_ACCEPT_THRESHOLD = 0.5
 NGRAM_MOD_LOW_ACCEPT_STREAK = 3
 
 
+def _non_trimmable_prompt_cache_types(
+    model: nn.Module, prompt_cache: Optional[Any] = None
+) -> set[str]:
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+    else:
+        model_cache = prompt_cache[: len(model.layers)]
+    if cache.can_trim_prompt_cache(model_cache):
+        return set()
+    return {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+
+
+def _clone_prompt_cache(prompt_cache: List[Any]) -> List[Any]:
+    return copy.deepcopy(prompt_cache)
+
+
 def str2bool(string):
     return string.lower() not in ["false", "f"]
 
@@ -1003,11 +1019,16 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
     draft_strategy.make_cache(len(model.layers), prompt_cache)
 
+    requires_trimmable_cache = draft_strategy.cache_must_be_trimmable()
+    use_cache_snapshot = False
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
-        raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
-        )
+        if requires_trimmable_cache:
+            raise ValueError(
+                "Speculative decoding requires a trimmable prompt cache "
+                f"(got {types})."
+            )
+        use_cache_snapshot = True
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -1072,6 +1093,18 @@ def speculative_generate_step(
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         draft_strategy.rewind(num_draft, num_accept)
 
+    def _restore_cache(snapshot):
+        model_cache[:] = _clone_prompt_cache(snapshot)
+
+    def _replay_cache_inputs(tokens: mx.array):
+        if tokens.size == 0:
+            return
+        with mx.stream(generation_stream):
+            model(tokens[None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache])
+            mx.clear_cache()
+
     with mx.stream(generation_stream):
         draft_y = draft_strategy.prefill(y, ctx)
         y = _prefill(model, model_cache, y)
@@ -1082,6 +1115,8 @@ def speculative_generate_step(
     n = 0
     try:
         while True:
+            cache_snapshot = _clone_prompt_cache(model_cache) if use_cache_snapshot else None
+            step_y = y
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
             draft_tokens = draft_strategy.propose(draft_y, num_draft, ctx)
             # The strategy may return fewer than ``num_draft`` tokens (e.g.
@@ -1148,9 +1183,18 @@ def speculative_generate_step(
                 if trim_amount > 0:
                     prev = prev_tokens_ref[0]
                     prev_tokens_ref[0] = prev[:-trim_amount]
-            _rewind_cache(num_draft, n)
+            if use_cache_snapshot:
+                _restore_cache(cache_snapshot)
+                replay_tokens = mx.concatenate([step_y, mx.array(draft_tokens[:n], mx.uint32)])
+                _replay_cache_inputs(replay_tokens)
+                draft_strategy.rewind(num_draft, n)
+            else:
+                _rewind_cache(num_draft, n)
     finally:
-        _rewind_cache(num_draft, n)
+        if use_cache_snapshot:
+            draft_strategy.rewind(num_draft, n)
+        else:
+            _rewind_cache(num_draft, n)
 
 
 def stream_generate(
@@ -1240,6 +1284,13 @@ def stream_generate(
             score = ngram_repeat_score(prompt.tolist())
             if score < NGRAM_GATE_THRESHOLD:
                 use_speculation = False
+                logging.info(
+                    "Adaptive ngram gate disabled %s speculation "
+                    "(repeat score %.4f < %.4f).",
+                    draft_type,
+                    score,
+                    NGRAM_GATE_THRESHOLD,
+                )
         if use_speculation:
             if draft_type == "ngram-simple":
                 size = (
@@ -1262,6 +1313,20 @@ def stream_generate(
                 strategy = NgramModStrategy(table)
                 strategy.observe(prompt.tolist())
                 draft_strategy = strategy
+
+    if (
+        draft_strategy is not None
+        and draft_strategy.cache_must_be_trimmable()
+        and (
+            incompatible_cache_types := _non_trimmable_prompt_cache_types(
+                model, kwargs.get("prompt_cache")
+            )
+        )
+    ):
+        raise ValueError(
+            "Speculative decoding requires a trimmable prompt cache "
+            f"(got {incompatible_cache_types})."
+        )
 
     if draft_strategy is None:
         kwargs.pop("num_draft_tokens", None)
@@ -2647,7 +2712,10 @@ def main():
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
+        draft_type=args.draft_type,
         num_draft_tokens=args.num_draft_tokens,
+        disable_adaptive_gate=args.disable_adaptive_gate,
+        ngram_size=args.ngram_size,
     )
     if not args.verbose:
         print(response)

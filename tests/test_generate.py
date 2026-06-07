@@ -3,6 +3,7 @@
 import random
 import unittest
 from typing import List
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 
@@ -15,7 +16,7 @@ from mlx_lm.generate import (
     generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -178,6 +179,175 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(
             num_embeddings / prefill_step_size < num_prompt_processing_callbacks
         )
+
+
+class TestNgramSpeculationBehavior(unittest.TestCase):
+
+    def test_stream_generate_ngram_supports_arrays_cache(self):
+        class CycleModel:
+            def __init__(self):
+                self.layers = [object()]
+
+            def __call__(self, y, cache):
+                history = cache[0][0]
+                if history is None:
+                    cache[0][0] = y
+                else:
+                    cache[0][0] = mx.concatenate([history, y], axis=1)
+
+                logits = mx.full((1, y.shape[1], 8), -1e9, dtype=mx.float32)
+                for i, token in enumerate(y[0].tolist()):
+                    logits[0, i, (token % 3) + 1] = 0.0
+                return logits
+
+        class DummyTokenizer:
+            eos_token_id = 99
+            eos_token_ids = {99}
+            bos_token = None
+            chat_template = None
+            clean_up_tokenization_spaces = False
+
+            def decode(self, tokens):
+                return "".join(str(t) for t in tokens)
+
+            def get_vocab(self):
+                return {}
+
+        model = CycleModel()
+        tokenizer = DummyTokenizer()
+        prompt = mx.array([1, 2, 3, 1, 2, 3], dtype=mx.uint32)
+
+        baseline = [
+            resp.token
+            for resp in stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=5,
+                prompt_cache=[ArraysCache(size=1)],
+            )
+        ]
+        speculative = list(
+            stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=5,
+                draft_type="ngram-simple",
+                ngram_size=1,
+                disable_adaptive_gate=True,
+                prompt_cache=[ArraysCache(size=1)],
+            )
+        )
+
+        self.assertEqual([resp.token for resp in speculative], baseline)
+        self.assertTrue(any(resp.from_draft for resp in speculative))
+
+    def test_stream_generate_rejects_untrimmable_cache_for_trim_required_strategy(self):
+        class UntrimmableCache:
+            def is_trimmable(self):
+                return False
+
+        model = MagicMock()
+        model.layers = [object(), object()]
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 0
+        tokenizer.eos_token_ids = {0}
+        tokenizer.bos_token = None
+        tokenizer.chat_template = None
+        tokenizer.encode.return_value = [1, 2, 3, 1, 2, 3]
+        tokenizer.decode.return_value = ""
+        draft_strategy = MagicMock()
+        draft_strategy.cache_must_be_trimmable.return_value = True
+
+        with self.assertRaisesRegex(ValueError, "UntrimmableCache"):
+            list(
+                stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt="repeat repeat repeat repeat",
+                    max_tokens=1,
+                    draft_strategy=draft_strategy,
+                    prompt_cache=[KVCache(), UntrimmableCache()],
+                )
+            )
+
+    @patch("mlx_lm.generate.logging.info")
+    @patch("mlx_lm.generate.generate_step")
+    def test_stream_generate_logs_when_adaptive_gate_skips_ngram(
+        self, mock_generate_step, mock_info
+    ):
+        model = MagicMock()
+        model.layers = [object()]
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 0
+        tokenizer.eos_token_ids = {99}
+        tokenizer.bos_token = None
+        tokenizer.chat_template = None
+        tokenizer.encode.return_value = [1, 2, 3, 4]
+        tokenizer.decode.return_value = "x"
+        mock_generate_step.return_value = iter(
+            [(7, mx.array([0.0], dtype=mx.float32))]
+        )
+
+        with patch("mlx_lm.generate.wired_limit", return_value=unittest.mock.MagicMock()):
+            responses = list(
+                stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt="one two three four",
+                    max_tokens=1,
+                    draft_type="ngram-simple",
+                )
+            )
+
+        self.assertEqual(len(responses), 1)
+        mock_info.assert_called_once()
+        self.assertIn("Adaptive ngram gate disabled", mock_info.call_args.args[0])
+
+
+class TestGenerateCli(unittest.TestCase):
+
+    @patch("builtins.print")
+    @patch("mlx_lm.generate.generate")
+    @patch("mlx_lm.generate.make_sampler")
+    @patch("mlx_lm.generate.load")
+    def test_main_forwards_ngram_flags(
+        self, mock_load, mock_make_sampler, mock_generate, mock_print
+    ):
+        from mlx_lm.generate import main
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.has_chat_template = False
+        mock_tokenizer.encode.side_effect = lambda text, **_: [1, 2, 3]
+        mock_tokenizer.eos_token_ids = [0]
+        mock_load.return_value = (mock_model, mock_tokenizer)
+        mock_make_sampler.return_value = MagicMock()
+        mock_generate.return_value = "ok"
+
+        with patch(
+            "sys.argv",
+            [
+                "generate.py",
+                "--prompt",
+                "hello",
+                "--draft-type",
+                "ngram-simple",
+                "--ngram-size",
+                "5",
+                "--disable-adaptive-gate",
+                "--num-draft-tokens",
+                "4",
+            ],
+        ):
+            main()
+
+        _, kwargs = mock_generate.call_args
+        self.assertEqual(kwargs["draft_type"], "ngram-simple")
+        self.assertEqual(kwargs["ngram_size"], 5)
+        self.assertTrue(kwargs["disable_adaptive_gate"])
+        self.assertEqual(kwargs["num_draft_tokens"], 4)
 
     def test_batch_matches_single(self):
 
