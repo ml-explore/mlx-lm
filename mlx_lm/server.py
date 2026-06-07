@@ -1670,15 +1670,30 @@ class APIHandler(BaseHTTPRequestHandler):
             repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
         ]
 
+        def _context_length(repo):
+            try:
+                cfg_file = next(
+                    (f for f in repo.refs["main"].files if f.file_path.name == "config.json"),
+                    None,
+                )
+                if cfg_file is None:
+                    return None
+                cfg = json.loads(cfg_file.file_path.read_text())
+                return (
+                    cfg.get("max_position_embeddings")
+                    or cfg.get("text_config", {}).get("max_position_embeddings")
+                )
+            except Exception:
+                return None
+
         # Create a list of available models
-        models = [
-            {
-                "id": repo.repo_id,
-                "object": "model",
-                "created": self.created,
-            }
-            for repo in downloaded_models
-        ]
+        models = []
+        for repo in downloaded_models:
+            m = {"id": repo.repo_id, "object": "model", "created": self.created}
+            ctx = _context_length(repo)
+            if ctx is not None:
+                m["context_length"] = ctx
+            models.append(m)
 
         if self.response_generator.cli_args.model:
             model_path = Path(self.response_generator.cli_args.model)
