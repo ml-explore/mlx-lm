@@ -2010,6 +2010,7 @@ def main():
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        lazy=True,
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
