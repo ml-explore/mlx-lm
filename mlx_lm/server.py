@@ -918,9 +918,15 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
+                cache = make_prompt_cache(
+                    self.model_provider.model,
+                    max_kv_size=self.cli_args.max_kv_size,
+                )
                 if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+                    cache += make_prompt_cache(
+                        self.model_provider.draft_model,
+                        max_kv_size=self.cli_args.max_kv_size,
+                    )
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
@@ -1878,6 +1884,14 @@ def main():
         default=5000,
         help="When --kv-bits is set, begin quantizing the KV cache after "
         "this many tokens (default: 5000).",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum KV cache size in tokens; older entries are evicted "
+        "beyond this limit (uses a RotatingKVCache). Ignored for models that "
+        "provide their own make_cache (e.g. some hybrid architectures).",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
