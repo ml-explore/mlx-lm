@@ -768,6 +768,26 @@ class TestPromptCache(unittest.TestCase):
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
 
+    def test_batch_rotating_cache_meta_state_roundtrip(self):
+        # Regression for #1250: bool('False') == True in Python, so a cache
+        # with rotated=False would reload as rotated=True after save/load,
+        # silently corrupting sliding-window KV reuse.
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[0])
+
+        # rotated=False — the broken case
+        self.assertFalse(cache.rotated)
+        state = cache.meta_state
+        cache.rotated = True  # corrupt it, then restore via meta_state
+        cache.meta_state = state
+        self.assertFalse(cache.rotated)
+
+        # rotated=True — must also survive the round-trip
+        cache.rotated = True
+        state = cache.meta_state
+        cache.rotated = False
+        cache.meta_state = state
+        self.assertTrue(cache.rotated)
+
 
 if __name__ == "__main__":
     unittest.main()
