@@ -366,6 +366,10 @@ class ModelProvider:
                     "Draft model tokenizer does not match model tokenizer. "
                     "Speculative decoding may not work as expected."
                 )
+            else:
+                logging.info(
+                    f"Speculative decoding active: draft model '{draft_model_path}'"
+                )
 
         # Compute batchability
         is_batchable = draft_model is None
