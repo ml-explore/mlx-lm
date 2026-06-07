@@ -109,6 +109,20 @@ class TestTokenizers(unittest.TestCase):
         self.assertIsNone(tokenizer.think_start_id)
         self.assertIsNone(tokenizer.think_end_id)
 
+    def test_find_negative_start(self):
+        # Regression test for #1326: rfind_think_start should not raise IndexError
+        # when the prompt is shorter than the think-token lookahead window (11 tokens).
+        tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
+        tokenizer = load_tokenizer(tokenizer_repo)
+        self.assertTrue(tokenizer.has_thinking)
+
+        # A short prompt is shorter than the 11-token lookahead; before the fix
+        # this caused a negative start index, Python negative-index wrap-around, and
+        # an IndexError surfaced as HTTP 404 by the server.
+        short_prompt = tokenizer.encode("hi")
+        result = tokenizer.rfind_think_start(short_prompt)
+        self.assertEqual(result, -1)  # not found, no crash
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -355,7 +355,7 @@ class TokenizerWrapper:
         self._eos_token_ids.add(token_id)
 
     def _find(self, tokens, sequence, start=None, end=None, reverse=False):
-        start = start or 0
+        start = max(0, start or 0)
         end = end or len(tokens)
         outer_loop = (
             range(end - len(sequence), start - 1, -1)
