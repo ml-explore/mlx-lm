@@ -100,6 +100,9 @@ def linear_to_lora_layers(
         for l in model.layers:
             l.apply_to_modules(get_keys_for_lora)
 
+        if extra_keys := getattr(model, "lora_default_keys", None):
+            keys.update(extra_keys() if callable(extra_keys) else extra_keys)
+
     for l in model.layers[-max(num_layers, 0) :]:
         lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
         if lora_layers:
