@@ -143,11 +143,10 @@ def process_message_content(messages):
         elif content is None:
             message["content"] = ""
 
-        if tool_calls := message.get("tool_calls"):
-            for tool_call in tool_calls:
-                if func := tool_call.get("function"):
-                    if args := func.get("arguments"):
-                        func["arguments"] = json.loads(args)
+        # Leave tool_call arguments as a JSON string per the OpenAI spec.
+        # Pre-decoding to a dict breaks chat templates that call json.loads()
+        # themselves (e.g. deepseek_v32, DSML-format models) because
+        # json.loads() on an already-decoded dict raises TypeError.
 
 
 @dataclass
