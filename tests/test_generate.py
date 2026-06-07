@@ -18,6 +18,7 @@ from mlx_lm.generate import (
 )
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.utils import load
 
 
@@ -213,8 +214,34 @@ class TestNgramSpeculationBehavior(unittest.TestCase):
             def get_vocab(self):
                 return {}
 
+        class DummyDetokenizer:
+            def __init__(self, tokenizer):
+                self.text = ""
+                self.tokens = []
+                self.offset = 0
+
+            def reset(self):
+                self.text = ""
+                self.tokens = []
+                self.offset = 0
+
+            def add_token(self, token):
+                self.tokens.append(token)
+                self.text += str(token)
+
+            def finalize(self):
+                return None
+
+            @property
+            def last_segment(self):
+                segment = self.text[self.offset :]
+                self.offset = len(self.text)
+                return segment
+
         model = CycleModel()
-        tokenizer = DummyTokenizer()
+        tokenizer = TokenizerWrapper(
+            DummyTokenizer(), detokenizer_class=DummyDetokenizer
+        )
         prompt = mx.array([1, 2, 3, 1, 2, 3], dtype=mx.uint32)
 
         baseline = [
@@ -307,6 +334,12 @@ class TestNgramSpeculationBehavior(unittest.TestCase):
 
 
 class TestGenerateCli(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+        cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
+        cls.model.set_dtype(mx.float32)
 
     @patch("builtins.print")
     @patch("mlx_lm.generate.generate")

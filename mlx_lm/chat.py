@@ -5,6 +5,7 @@ import json
 
 import mlx.core as mx
 
+from .cli_ui import ChatUI
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
@@ -125,10 +126,6 @@ def main():
     pipeline_group = group if args.pipeline else None
     tensor_group = group if not args.pipeline else None
 
-    def rprint(*args, **kwargs):
-        if rank == 0:
-            print(*args, **kwargs)
-
     mx.random.seed(args.seed)
 
     if group.size() > 1:
@@ -144,82 +141,77 @@ def main():
             },
         )
 
-    def print_help():
-        rprint("The command list:")
-        rprint("- 'q' to exit")
-        rprint("- 'r' to reset the chat")
-        rprint("- 'h' to display these commands")
-
-    rprint(f"[INFO] Starting chat session with {args.model}.")
-    print_help()
-    prompt_cache = make_prompt_cache(model, args.max_kv_size)
-    template_kwargs = json.loads(args.chat_template_config or "{}")
-    messages = []
-    if args.system_prompt is not None:
-        messages.append({"role": "system", "content": args.system_prompt})
-    while True:
-        query = input(">> " if rank == 0 else "")
-        if query == "q":
-            break
-        if query == "r":
-            prompt_cache = make_prompt_cache(model, args.max_kv_size)
-            messages = []
-            if args.system_prompt is not None:
-                messages.append({"role": "system", "content": args.system_prompt})
-            continue
-        if query == "h":
-            print_help()
-            continue
-        messages.append({"role": "user", "content": query})
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            **template_kwargs,
-        )
-        generate_kwargs = {}
-        if args.draft_type != "none":
-            generate_kwargs["draft_type"] = args.draft_type
-            generate_kwargs["num_draft_tokens"] = args.num_draft_tokens
-            generate_kwargs["disable_adaptive_gate"] = args.disable_adaptive_gate
-            if args.ngram_size is not None:
-                generate_kwargs["ngram_size"] = args.ngram_size
-        response_text = []
-        accepted = 0
-        last_response = None
-        for response in stream_generate(
-            model,
-            tokenizer,
-            prompt,
-            max_tokens=args.max_tokens,
-            sampler=make_sampler(
-                args.temp,
-                args.top_p,
-                xtc_threshold=args.xtc_threshold,
-                xtc_probability=args.xtc_probability,
-                xtc_special_tokens=(
-                    tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
-                ),
-            ),
-            prompt_cache=prompt_cache,
-            **generate_kwargs,
-        ):
-            rprint(response.text, flush=True, end="")
-            response_text.append(response.text)
-            accepted += 1 if response.from_draft else 0
-            last_response = response
-        rprint()
-        if last_response is not None:
-            generated = last_response.generation_tokens
-            acceptance = 100 * accepted / generated if generated else 0.0
-            rprint(
-                "[stats] "
-                f"prompt={last_response.prompt_tokens} tok "
-                f"generated={generated} tok "
-                f"tok/s={last_response.generation_tps:.2f} "
-                f"accepted={accepted}/{generated} ({acceptance:.1f}%) "
-                f"peak={last_response.peak_memory:.2f} GB"
+    with ChatUI(args, rank=rank) as ui:
+        prompt_cache = make_prompt_cache(model, args.max_kv_size)
+        template_kwargs = json.loads(args.chat_template_config or "{}")
+        messages = []
+        if args.system_prompt is not None:
+            messages.append({"role": "system", "content": args.system_prompt})
+        while True:
+            query = ui.prompt()
+            if query == "q":
+                ui.say_bye()
+                break
+            if query == "r":
+                prompt_cache = make_prompt_cache(model, args.max_kv_size)
+                messages = []
+                if args.system_prompt is not None:
+                    messages.append({"role": "system", "content": args.system_prompt})
+                ui.say_reset()
+                continue
+            if query == "h":
+                ui.say_help()
+                continue
+            messages.append({"role": "user", "content": query})
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                **template_kwargs,
             )
-        messages.append({"role": "assistant", "content": "".join(response_text)})
+            generate_kwargs = {}
+            if args.draft_type != "none":
+                generate_kwargs["draft_type"] = args.draft_type
+                generate_kwargs["num_draft_tokens"] = args.num_draft_tokens
+                generate_kwargs["disable_adaptive_gate"] = args.disable_adaptive_gate
+                if args.ngram_size is not None:
+                    generate_kwargs["ngram_size"] = args.ngram_size
+            response_text = []
+            accepted = 0
+            last_response = None
+            for response in stream_generate(
+                model,
+                tokenizer,
+                prompt,
+                max_tokens=args.max_tokens,
+                sampler=make_sampler(
+                    args.temp,
+                    args.top_p,
+                    xtc_threshold=args.xtc_threshold,
+                    xtc_probability=args.xtc_probability,
+                    xtc_special_tokens=(
+                        tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+                    ),
+                ),
+                prompt_cache=prompt_cache,
+                **generate_kwargs,
+            ):
+                ui.stream_token(response.text)
+                response_text.append(response.text)
+                accepted += 1 if response.from_draft else 0
+                last_response = response
+            ui.end_turn(last_response)
+            if last_response is not None and rank == 0:
+                generated = last_response.generation_tokens
+                acceptance = 100 * accepted / generated if generated else 0.0
+                print(
+                    "[stats] "
+                    f"prompt={last_response.prompt_tokens} tok "
+                    f"generated={generated} tok "
+                    f"tok/s={last_response.generation_tps:.2f} "
+                    f"accepted={accepted}/{generated} ({acceptance:.1f}%) "
+                    f"peak={last_response.peak_memory:.2f} GB"
+                )
+            messages.append({"role": "assistant", "content": "".join(response_text)})
 
 
 if __name__ == "__main__":

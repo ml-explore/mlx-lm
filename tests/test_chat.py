@@ -1,3 +1,4 @@
+import copy
 import argparse
 import unittest
 from unittest.mock import MagicMock, patch
@@ -74,7 +75,13 @@ class TestChat(unittest.TestCase):
         # Mock the model and tokenizer
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
-        mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
+        captured_messages = []
+
+        def apply_chat_template(messages, *args, **kwargs):
+            captured_messages.append(copy.deepcopy(messages))
+            return "processed_prompt"
+
+        mock_tokenizer.apply_chat_template.side_effect = apply_chat_template
         mock_load.return_value = (mock_model, mock_tokenizer)
 
         # Mock prompt cache
@@ -84,6 +91,10 @@ class TestChat(unittest.TestCase):
         # Mock stream_generate to return some responses
         mock_response = MagicMock()
         mock_response.text = "Hello there!"
+        mock_response.generation_tokens = 1
+        mock_response.generation_tps = 1.0
+        mock_response.prompt_tps = 1.0
+        mock_response.peak_memory = 1.0
         mock_stream_generate.return_value = [mock_response]
 
         # Mock user input: first a question, then 'q' to quit
@@ -100,9 +111,7 @@ class TestChat(unittest.TestCase):
 
         # Verify that apply_chat_template was called with system prompt
         mock_tokenizer.apply_chat_template.assert_called()
-        call_args = mock_tokenizer.apply_chat_template.call_args[0][
-            0
-        ]  # First positional arg (messages)
+        call_args = captured_messages[-1]
 
         # Check that the messages contain both system and user messages
         self.assertEqual(len(call_args), 2)
@@ -129,7 +138,13 @@ class TestChat(unittest.TestCase):
         # Mock the model and tokenizer
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
-        mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
+        captured_messages = []
+
+        def apply_chat_template(messages, *args, **kwargs):
+            captured_messages.append(copy.deepcopy(messages))
+            return "processed_prompt"
+
+        mock_tokenizer.apply_chat_template.side_effect = apply_chat_template
         mock_load.return_value = (mock_model, mock_tokenizer)
 
         # Mock prompt cache
@@ -139,6 +154,10 @@ class TestChat(unittest.TestCase):
         # Mock stream_generate to return some responses
         mock_response = MagicMock()
         mock_response.text = "Hello there!"
+        mock_response.generation_tokens = 1
+        mock_response.generation_tps = 1.0
+        mock_response.prompt_tps = 1.0
+        mock_response.peak_memory = 1.0
         mock_stream_generate.return_value = [mock_response]
 
         # Mock user input: first a question, then 'q' to quit
@@ -153,9 +172,7 @@ class TestChat(unittest.TestCase):
 
         # Verify that apply_chat_template was called without system prompt
         mock_tokenizer.apply_chat_template.assert_called()
-        call_args = mock_tokenizer.apply_chat_template.call_args[0][
-            0
-        ]  # First positional arg (messages)
+        call_args = captured_messages[-1]
 
         # Check that the messages contain only user message
         self.assertEqual(len(call_args), 1)
