@@ -6,6 +6,7 @@ import json
 import threading
 import types
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -18,6 +19,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     _process_control_tokens,
 )
+from mlx_lm.tool_parsers import mistral
 from mlx_lm.utils import load
 
 
@@ -306,6 +308,66 @@ class TestServer(unittest.TestCase):
             self.assertEqual(s, "tool")
         state, _, s = sm.match(state, 2)
         self.assertIsNone(s)
+
+    def test_tool_call_without_end_marker_is_not_dropped(self):
+        # Regression: a tool call from a model with no tool-call end marker
+        # (Mistral-style, empty tool_call_end) is closed by the EOS token.
+        # The EOS moves the state machine out of "tool" on the final token,
+        # so the buffered tool text must still be flushed afterwards instead
+        # of being dropped (which returned an empty message with a "stop"
+        # finish reason). Here the generation is mocked, so the test only
+        # exercises the response handler and not a real model.
+        stream = [
+            Response("", 100, "tool", (100,), 0.0, None, ()),
+            Response('add[ARGS]{"a": 2, "b": 3}', 50, "tool", None, 0.0, None, ()),
+            Response("", 2, None, (2,), 0.0, "stop", ()),
+        ]
+        fake_ctx = types.SimpleNamespace(
+            tool_parser=mistral.parse_tool_call,
+            prompt=[0],
+            prompt_cache_count=0,
+            stop=lambda: None,
+        )
+
+        def fake_generate(*args, **kwargs):
+            return fake_ctx, iter(stream)
+
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        post_data = {
+            "model": "default_model",
+            "stream": False,
+            "messages": [{"role": "user", "content": "what is 2+3?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "description": "Add two numbers.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "number"},
+                                "b": {"type": "number"},
+                            },
+                            "required": ["a", "b"],
+                        },
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            self.response_generator, "generate", side_effect=fake_generate
+        ):
+            response = requests.post(url, json=post_data)
+
+        choice = json.loads(response.text)["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        tool_calls = choice["message"].get("tool_calls")
+        self.assertTrue(tool_calls)
+        self.assertEqual(tool_calls[0]["function"]["name"], "add")
+        self.assertEqual(
+            json.loads(tool_calls[0]["function"]["arguments"]), {"a": 2, "b": 3}
+        )
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"

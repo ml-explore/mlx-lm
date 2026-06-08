@@ -1497,7 +1497,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
-            if prev_state == "tool" and tool_text:
+            # Flush a tool call still open when generation ends. With no
+            # tool-call end marker (e.g. Mistral) the EOS token closes it and
+            # moves the final token out of "tool", so a prev_state == "tool"
+            # check would drop the buffered text and return an empty message.
+            if tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
 
