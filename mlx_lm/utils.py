@@ -6,6 +6,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import resource
 import shutil
 from pathlib import Path
@@ -171,6 +172,170 @@ def _transform_awq_weights(
     }
 
     return new_weights, mlx_quantization
+
+
+_PARO_EXPERT_RE = re.compile(r"^(.+)\.experts\.(\d+)\.(\w+)\.(\w+)$")
+_PARO_STACKABLE = ("weight", "scales", "biases")
+_PARO_SHARED_ROT_RE = re.compile(
+    r"^(.+)\.experts\.(gate_up_weight|down_weight)_(theta|pairs|channel_scales)$"
+)
+
+
+def _transform_paro_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Dict[str, mx.array]:
+    """Convert a ParoQuant checkpoint to the layout consumed by the inference
+    layers in ``mlx_lm.models.paroquant``.
+
+    Public ParoQuant checkpoints ship AutoAWQ-packed weights
+    (``prefix.qweight``/``qzeros``/``scales``) plus rotation params
+    (``prefix.theta``/``pairs``/``channel_scales``). The packed weights are
+    converted with the shared :func:`_transform_awq_weights`; the rotation keys
+    pass through. Then per-expert weights are stacked into the ``switch_mlp``
+    namespace and shared MoE rotations are remapped to
+    ``gate_up_rot`` / ``down_rot``.
+    """
+    if any(k.endswith(".qweight") for k in weights):
+        out, _ = _transform_awq_weights(weights, quantization_config)
+    else:
+        out = dict(weights)
+
+    out = _stack_paro_moe_experts(out)
+    out = _remap_paro_shared_rotation(out)
+    return out
+
+
+def _stack_paro_moe_experts(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """Stack per-expert params into the ``switch_mlp`` format for ``SwitchGLU``.
+
+    ``...experts.{e}.{proj}.{suffix}`` -> ``...switch_mlp.{proj}.{suffix}``.
+    """
+    groups: Dict[str, Dict[int, Dict[str, str]]] = {}
+    for key in list(weights):
+        m = _PARO_EXPERT_RE.match(key)
+        if m is None:
+            continue
+        base, expert_str, proj, suffix = m.groups()
+        if suffix not in _PARO_STACKABLE:
+            continue
+        group_key = f"{base}.switch_mlp.{proj}"
+        groups.setdefault(group_key, {}).setdefault(int(expert_str), {})[suffix] = key
+
+    for group_key, experts_dict in groups.items():
+        num_experts = max(experts_dict) + 1
+        for suffix in _PARO_STACKABLE:
+            dest = f"{group_key}.{suffix}"
+            if dest in weights:
+                continue
+            src = [experts_dict.get(e, {}).get(suffix) for e in range(num_experts)]
+            if all(src):
+                weights[dest] = mx.stack([weights.pop(k) for k in src])
+    return weights
+
+
+def _remap_paro_shared_rotation(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """Remap shared expert rotation keys into the ``switch_mlp`` namespace.
+
+    ``...experts.gate_up_weight_{s}`` -> ``...switch_mlp.gate_up_rot_{s}``
+    ``...experts.down_weight_{s}``    -> ``...switch_mlp.down_rot_{s}``
+    """
+    remap = {"gate_up_weight": "gate_up_rot", "down_weight": "down_rot"}
+    for key in list(weights):
+        m = _PARO_SHARED_ROT_RE.match(key)
+        if m is None:
+            continue
+        base, proj, suffix = m.groups()
+        weights[f"{base}.switch_mlp.{remap[proj]}_{suffix}"] = weights.pop(key)
+    return weights
+
+
+def _paro_get_module(root, path: str):
+    node = root
+    for part in path.split("."):
+        node = (
+            node[int(part)] if isinstance(node, (list, tuple)) else getattr(node, part)
+        )
+    return node
+
+
+def _paro_set_module(root, path: str, value):
+    parts = path.split(".")
+    parent = _paro_get_module(root, ".".join(parts[:-1])) if len(parts) > 1 else root
+    if isinstance(parent, list):
+        parent[int(parts[-1])] = value
+    else:
+        setattr(parent, parts[-1], value)
+
+
+def _patch_paro_layers(
+    model: nn.Module,
+    weights: Dict[str, mx.array],
+    bits: int,
+    group_size: int,
+):
+    """Replace linear layers with their ParoQuant variants before loading weights.
+
+    - Dense ``nn.Linear`` with a ``.theta`` rotation -> ``RotateQuantizedLinear``
+    - ``SwitchLinear`` with a stacked uint32 weight  -> ``QuantizedSwitchLinear``
+    - ``SwitchGLU`` with shared rotation keys        -> ``RotateSwitchGLU``
+    """
+    from .models.paroquant import RotateQuantizedLinear, RotateSwitchGLU
+    from .models.switch_layers import (
+        QuantizedSwitchLinear,
+        SwitchGLU,
+        SwitchLinear,
+    )
+
+    # Dense rotation layers
+    for prefix in sorted(k[: -len(".theta")] for k in weights if k.endswith(".theta")):
+        try:
+            original = _paro_get_module(model, prefix)
+        except (AttributeError, IndexError):
+            continue
+        if not isinstance(original, nn.Linear):
+            continue
+        _paro_set_module(
+            model,
+            prefix,
+            RotateQuantizedLinear(
+                input_dims=original.weight.shape[-1],
+                output_dims=original.weight.shape[0],
+                bias="bias" in original,
+                group_size=group_size,
+                bits=bits,
+                krot=weights[f"{prefix}.theta"].shape[0],
+            ),
+        )
+
+    # Quantized MoE experts (no rotation on the expert matmul itself)
+    for path, mod in model.named_modules():
+        if not isinstance(mod, SwitchLinear):
+            continue
+        w = weights.get(f"{path}.weight")
+        if w is not None and w.dtype in (mx.uint32, mx.uint16, mx.uint8):
+            _paro_set_module(
+                model,
+                path,
+                QuantizedSwitchLinear(
+                    mod.input_dims,
+                    mod.output_dims,
+                    mod.num_experts,
+                    bias="bias" in mod,
+                    group_size=group_size,
+                    bits=bits,
+                ),
+            )
+
+    # SwitchGLU -> RotateSwitchGLU where shared rotation keys are present
+    for path, mod in model.named_modules():
+        if not isinstance(mod, SwitchGLU):
+            continue
+        rot_key = f"{path}.gate_up_rot_theta"
+        if rot_key in weights:
+            _paro_set_module(
+                model, path, RotateSwitchGLU(mod, group_size, weights[rot_key].shape[0])
+            )
 
 
 def _get_classes(config: dict):
@@ -389,6 +554,19 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "paroquant":
+            # ParoQuant (pairwise rotation quantization): transform the packed
+            # checkpoint and swap in the rotation-aware layers. Layers are patched
+            # explicitly (not via nn.quantize) because the rotation step is not
+            # part of the standard QuantizedLinear; embed_tokens/lm_head are kept
+            # in their checkpoint (float) form and load as-is.
+            bits = quantization_config.get("bits", 4)
+            group_size = quantization_config.get("group_size", 128)
+            weights = _transform_paro_weights(weights, quantization_config)
+            _patch_paro_layers(model, weights, bits, group_size)
+            quantization = {"group_size": group_size, "bits": bits, "mode": "affine"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
 
     if config.get("quantize_activations", False):
 
