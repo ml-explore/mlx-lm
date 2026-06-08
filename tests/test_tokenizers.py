@@ -9,6 +9,7 @@ from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
+    TokenizerWrapper,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -100,6 +101,27 @@ class TestTokenizers(unittest.TestCase):
         self.assertTrue(tokenizer.has_thinking)
         self.assertEqual(tokenizer.think_start, "<think>")
         self.assertEqual(tokenizer.think_end, "</think>")
+
+        tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        tokenizer = load_tokenizer(tokenizer_repo)
+        self.assertFalse(tokenizer.has_thinking)
+        self.assertIsNone(tokenizer.think_start)
+        self.assertIsNone(tokenizer.think_end)
+        self.assertIsNone(tokenizer.think_start_id)
+        self.assertIsNone(tokenizer.think_end_id)
+
+    def test_find_token(self):
+        # Check that _find returns a valid index when
+        # searching for a think token in short system prompts
+        HI, THINK_START, THINK_END = 200, 100, 101
+        find = TokenizerWrapper._find
+        prompt = [HI]
+        start = len(prompt) - 11
+        self.assertEqual(find(prompt, [THINK_START], start=start), -1)
+        self.assertEqual(find(prompt, [THINK_START], start=start, reverse=True), -1)
+        prompt = [HI, THINK_START, THINK_END, THINK_START]
+        self.assertEqual(find(prompt, [THINK_START], start=0), 1)
+        self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
 
 
 if __name__ == "__main__":

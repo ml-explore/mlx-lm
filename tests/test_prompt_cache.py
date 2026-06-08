@@ -662,6 +662,102 @@ class TestPromptCache(unittest.TestCase):
         c_out = KVCache.merge((c1, c2))
         self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
 
+    def test_extend_with_empty_and_nonempty_batch_caches(self):
+        """Extending a batch cache when one side has keys=None should use the
+        correct batch size for the placeholder, not the batch size from the
+        non-None side. Regression test for broadcast error in dynamic_roll."""
+        H, D = 8, 64
+        max_size = 512
+
+        # -- BatchRotatingKVCache --
+        # Create 2 caches with content and 3 empty caches
+        c1 = RotatingKVCache(max_size=max_size)
+        c2 = RotatingKVCache(max_size=max_size)
+        c1.update_and_fetch(mx.ones((1, H, 5, D)), mx.ones((1, H, 5, D)))
+        c2.update_and_fetch(mx.ones((1, H, 3, D)), mx.ones((1, H, 3, D)))
+        batch_full = BatchRotatingKVCache.merge([c1, c2])
+
+        empty_caches = [RotatingKVCache(max_size=max_size) for _ in range(3)]
+        batch_empty = BatchRotatingKVCache.merge(empty_caches)
+
+        # Extend non-empty with empty (different batch sizes)
+        batch_full.extend(batch_empty)
+        self.assertEqual(batch_full.keys.shape[0], 5)
+        self.assertEqual(batch_full.offset.shape[0], 5)
+
+        # Prompt processing with right padding should not crash
+        batch_full.prepare(lengths=[10, 8, 12, 7, 11], right_padding=[2, 4, 0, 5, 1])
+        new_kv = mx.ones((5, H, 12, D))
+        batch_full.update_and_fetch(new_kv, new_kv)
+
+        # Also test empty extending non-empty
+        batch_full2 = BatchRotatingKVCache.merge(
+            [RotatingKVCache(max_size=max_size) for _ in range(3)]
+        )
+        c3 = RotatingKVCache(max_size=max_size)
+        c4 = RotatingKVCache(max_size=max_size)
+        c3.update_and_fetch(mx.ones((1, H, 4, D)), mx.ones((1, H, 4, D)))
+        c4.update_and_fetch(mx.ones((1, H, 6, D)), mx.ones((1, H, 6, D)))
+        batch_content = BatchRotatingKVCache.merge([c3, c4])
+        batch_full2.extend(batch_content)
+        self.assertEqual(batch_full2.keys.shape[0], 5)
+        self.assertEqual(batch_full2.offset.shape[0], 5)
+
+        # -- BatchKVCache --
+        c1 = KVCache()
+        c2 = KVCache()
+        c1.update_and_fetch(mx.ones((1, H, 5, D)), mx.ones((1, H, 5, D)))
+        c2.update_and_fetch(mx.ones((1, H, 3, D)), mx.ones((1, H, 3, D)))
+        batch_full = BatchKVCache.merge([c1, c2])
+
+        empty_caches = [KVCache() for _ in range(3)]
+        batch_empty = BatchKVCache.merge(empty_caches)
+
+        batch_full.extend(batch_empty)
+        self.assertEqual(batch_full.keys.shape[0], 5)
+        self.assertEqual(batch_full.offset.shape[0], 5)
+
+    def test_arrays_cache_extend_with_empty(self):
+        # test simple merge
+        c1 = ArraysCache(2)
+        c2 = ArraysCache(2)
+        c1[0] = mx.zeros((1, 4, 8))
+        c1[1] = mx.zeros((1, 4))
+        c2[0] = mx.zeros((1, 4, 8))
+        c2[1] = mx.zeros((1, 4))
+        full = ArraysCache.merge((c1, c2))
+        self.assertEqual(full[0].shape, (2, 4, 8))
+
+        # extend with empty
+        empty = ArraysCache.merge((ArraysCache(2),))
+        full.extend(empty)
+        self.assertEqual(full[0].shape, (3, 4, 8))
+        self.assertEqual(full[1].shape, (3, 4))
+        self.assertTrue(mx.all(full[0][2:] == 0))
+
+        # making an empty cache with 2 sequences and merging it with
+        # another one with 2 sequences
+        empty2 = ArraysCache.merge((ArraysCache(2), ArraysCache(2)))
+        content = ArraysCache.merge((c1, c2))
+        empty2.extend(content)
+        self.assertEqual(empty2[0].shape, (4, 4, 8))
+        self.assertEqual(empty2[1].shape, (4, 4))
+
+        # Extend content with empty
+        content = ArraysCache.merge((c1, c2))
+        empty2 = ArraysCache.merge((ArraysCache(2), ArraysCache(2)))
+        content.extend(empty2)
+        self.assertEqual(content[0].shape, (4, 4, 8))
+        self.assertEqual(content[1].shape, (4, 4))
+        self.assertEqual(content.make_mask(10).shape, (4, 10))
+
+        # multiple empty extensions accumulate correctly
+        stepwise = ArraysCache.merge((c1,))
+        stepwise.extend(ArraysCache(2))
+        stepwise.extend(ArraysCache.merge((ArraysCache(2), ArraysCache(2))))
+        self.assertEqual(stepwise[0].shape, (4, 4, 8))
+        self.assertEqual(stepwise[1].shape, (4, 4))
+
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()
         kv = mx.zeros((1, 1, 32, 128))

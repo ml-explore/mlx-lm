@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 import argparse
+import time
 
 import mlx.core as mx
 
@@ -65,6 +66,12 @@ def setup_arg_parser():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=0,
+        help="Delay between each test in seconds (default: 0)",
     )
     return parser
 
@@ -139,10 +146,15 @@ def main():
     rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
+        if args.delay > 0:
+            time.sleep(args.delay)
+        tic = time.perf_counter()
         response = _bench()
+        toc = time.perf_counter()
         responses.append(response)
         results = [(k, getattr(response, k)) for k in report_keys]
         results = [f"{k}={v:.3f}" for k, v in results]
+        results.append(f"total_time={toc - tic:.3f}")
         rprint(f"Trial {i+1}:  " + ", ".join(results))
 
     def avg(k):

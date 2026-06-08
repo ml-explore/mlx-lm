@@ -267,7 +267,7 @@ class ShortConv1d(nn.Module):
             positions = (ends[:, None] + mx.arange(n_keep))[..., None]
             new_state = mx.take_along_axis(conv_input, positions, axis=1)
         else:
-            new_state = conv_input[:, -n_keep:, :]
+            new_state = mx.contiguous(conv_input[:, -n_keep:, :])
 
         return out, new_state
 

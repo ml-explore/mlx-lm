@@ -52,6 +52,7 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -507,6 +508,8 @@ def sharded_load(
     pipeline_group: Optional[mx.distributed.Group] = None,
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
+    *,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -571,7 +574,7 @@ def sharded_load(
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
-        {"trust_remote_code": True},
+        tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)

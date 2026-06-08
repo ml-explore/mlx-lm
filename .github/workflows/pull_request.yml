@@ -40,5 +40,5 @@ jobs:
         run: |
           curl -o test_data.zip -L https://github.com/ml-explore/mlx-lm/releases/download/test_data/test_data.zip
           unzip test_data.zip
-          HF_HOME="." python -m xmlrunner discover -v tests -o test-results/
+          METAL_DEVICE_WRAPPER_TYPE=1 METAL_DEBUG_ERROR_MODE=0 HF_HOME="." python -m xmlrunner discover -v tests -o test-results/
           mlx.launch -n 2 tests/model_parallel_tests.py
