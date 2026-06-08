@@ -713,6 +713,7 @@ def stream_generate(
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
+        n = -1
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -737,6 +738,11 @@ def stream_generate(
                 peak_memory=mx.get_peak_memory() / 1e9,
                 finish_reason=None,
             )
+
+        if n < 0:
+            # No tokens were generated (e.g. max_tokens=0); there is no final
+            # token to report, so end the stream without a final response.
+            return
 
         detokenizer.finalize()
         yield GenerationResponse(
