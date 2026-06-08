@@ -461,8 +461,11 @@ class CompressedKVCache(KVCache):
         # Skip KVCache.__init__ — we proxy everything through self.local
         self.local = RotatingKVCache(max_size=max_size, keep=0)
         self._pool = None
+        self._state_kv = None
+        self._state_score = None
         self._buf = None
         self._buf_count = 0
+        self._abs_pos = 0
 
     @property
     def offset(self):
@@ -638,6 +641,14 @@ class CompressedKVCache(KVCache):
     def accumulate(self, x: mx.array, compressor: 'Compressor') -> Optional[mx.array]:
         """Buffer tokens and compress when a full window is ready.
 
+        Uses ds4-style rolling state: each token is immediately projected through
+        wkv/wgate with correct absolute-position APE, stored in rolling state
+        buffers, and pooled at ratio boundaries via softmax-weighted gating.
+
+        This fixes the decode-time cache divergence bug where buffer-relative APE
+        indices caused wrong KV at decode S=1 (see: anerjy's report on PR #1189,
+        cross-validated against antirez/ds4 reference at ds4.c:6970-7034).
+
         Args:
             x: [B, S, D] hidden states for current step(s)
             compressor: the Compressor module to apply
@@ -659,25 +670,39 @@ class CompressedKVCache(KVCache):
             else:
                 self._buf = None
                 self._buf_count = 0
+            self._abs_pos = S
+            self._state_kv = None
+            self._state_score = None
             return self._pool
 
-        if self._buf is None:
-            self._buf = x
-            self._buf_count = 1
-        else:
-            self._buf = mx.concatenate([self._buf, x], axis=1)
-            self._buf_count += 1
+        coff = 2 if compressor.overlap else 1
+        width = coff * compressor.head_dim
+        pos = self._abs_pos
+        pos_mod = pos % r
 
-        if self._buf_count >= r:
-            ckv = compressor(self._buf[:, :r])
-            if ckv.shape[1] > 0:
-                self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
-            if self._buf_count > r:
-                self._buf = self._buf[:, r:]
-                self._buf_count -= r
-            else:
-                self._buf = None
-                self._buf_count = 0
+        xf = x.astype(mx.float32)
+        kv_cur = compressor.wkv(xf)
+        sc_cur = compressor.wgate(xf)
+        sc_cur = sc_cur + compressor.ape[pos_mod:pos_mod+1]
+
+        if self._state_kv is None:
+            self._state_kv = mx.zeros((B, r if not compressor.overlap else 2 * r, width), dtype=mx.float32)
+            self._state_score = mx.full((B, r if not compressor.overlap else 2 * r, width), float('-inf'), dtype=mx.float32)
+
+        row = (r + pos_mod) if compressor.overlap else pos_mod
+        self._state_kv[:, row:row+1, :] = kv_cur
+        self._state_score[:, row:row+1, :] = sc_cur
+
+        self._abs_pos = pos + 1
+
+        if (pos + 1) % r == 0:
+            weights = mx.softmax(self._state_score, axis=1, precise=True)
+            pooled = (self._state_kv * weights).sum(axis=1, keepdims=True)
+            pooled = pooled[:, :, :compressor.head_dim]
+            ckv = compressor.norm(pooled.astype(x.dtype))
+            self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
+            self._state_kv = None
+            self._state_score = None
 
         return self._pool
 
@@ -1297,12 +1322,12 @@ class Model(nn.Module):
                 try:
                     idx = int(parts[1])
                 except ValueError:
-                    new[k] = v
+                    new_weights[k] = v
                     continue
                 if idx >= n_layers:
                     continue
-            new[k] = v
-        weights = new
+            new_weights[k] = v
+        weights = new_weights
 
         def _scale_to_float(scale: mx.array) -> mx.array:
             if scale.dtype == mx.uint8:
@@ -1433,8 +1458,8 @@ class Model(nn.Module):
             for w_old, w_new in w_remap.items():
                 nk = nk.replace(f".shared_experts.{w_old}.", f".shared_experts.{w_new}.")
 
-            new_weights[nk] = v
-        weights = new_weights
+            new[nk] = v
+        weights = new
 
         # 5) Stack expert weights: experts.E.w{1,2,3}.weight -> switch_mlp.{gate,down,up}_proj.weight
         #    Also handle pre-stacked experts (community quants): experts.w{1,2,3}.X -> switch_mlp.{proj}.X
