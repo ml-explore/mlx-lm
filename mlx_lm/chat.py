@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import readline  # noqa: F401  # Enables terminal line editing/history on rank 0.
 
 import mlx.core as mx
 
@@ -17,6 +18,24 @@ DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+
+
+def broadcast_string(
+    value: str, group: mx.distributed.Group, src: int = 0
+) -> str:
+    """Broadcast a UTF-8 string from src to every rank in group."""
+    if group.size() == 1:
+        return value
+    if group.rank() == src:
+        data = mx.array(value.encode("utf-8"))
+        mx.eval(mx.distributed.all_sum(data.size, group=group))
+        mx.eval(mx.distributed.all_sum(data, group=group))
+        return value
+
+    size = mx.distributed.all_sum(0, group=group).item()
+    data = mx.distributed.all_sum(mx.zeros(size, dtype=mx.uint8), group=group)
+    mx.eval(data)
+    return bytes(data).decode("utf-8")
 
 
 def setup_arg_parser():
@@ -115,7 +134,11 @@ def main():
     with ChatUI(args, rank=rank) as ui:
         prompt_cache = make_prompt_cache(model, args.max_kv_size)
         while True:
-            query = ui.prompt()
+            query = ui.prompt() if rank == 0 else ""
+            query = broadcast_string(query, group).strip()
+
+            if not query:
+                continue
             if query == "q":
                 ui.say_bye()
                 break
