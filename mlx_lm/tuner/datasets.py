@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 
 from transformers import PreTrainedTokenizer
 
+from ..cli_ui import rprint
+
 
 class TextDataset:
     """
@@ -116,7 +118,7 @@ class CompletionsDataset:
         if self.mask_prompt:
             offset = len(
                 self.tokenizer.apply_chat_template(
-                    messages[0],
+                    messages[:-1],
                     tools=tools,
                     add_generation_prompt=True,
                     return_dict=False,
@@ -264,7 +266,7 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
     collection = []
     for ds in dataset_collection:
         ds_path = ds["path"]
-        print(f"Loading Hugging Face dataset {ds_path}.")
+        rprint(f"Loading Hugging Face dataset {ds_path}.")
         ds["mask_prompt"] = getattr(args, "mask_prompt", False)
         config = types.SimpleNamespace(**ds)
         hf_config = ds.get("config", {})
@@ -314,7 +316,7 @@ def load_dataset(args, tokenizer: PreTrainedTokenizer):
         if data_path.exists():
             train, valid, test = load_local_dataset(data_path, tokenizer, args)
         else:
-            print(f"Loading Hugging Face dataset {args.data}.")
+            rprint(f"Loading Hugging Face dataset {args.data}.")
             train, valid, test = load_hf_dataset(args.data, tokenizer, args)
 
     if args.train and len(train) == 0:
@@ -322,7 +324,7 @@ def load_dataset(args, tokenizer: PreTrainedTokenizer):
             "Training set not found or empty. Must provide training set for fine-tuning."
         )
     if args.train and len(valid) == 0:
-        print(
+        rprint(
             "Warning: Validation set not found or empty. Training will proceed without validation."
         )
     if args.test and len(test) == 0:

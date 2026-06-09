@@ -314,7 +314,11 @@ def main():
 
     if args.target_dir is not None:
         target_dir = Path(args.target_dir)
-        has_targets = target_dir.exists()
+        has_targets = (
+            target_dir.is_dir()
+            and any((target_dir / "train").glob("*.safetensors"))
+            and any((target_dir / "valid").glob("*.safetensors"))
+        )
     else:
         has_targets = False
         target_dir = None
@@ -383,7 +387,7 @@ def main():
         del model
 
     if mx.metal.is_available():
-        max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(max_rec_size)
 
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)

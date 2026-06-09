@@ -13,21 +13,21 @@ class TestLosses(unittest.TestCase):
         self.assertTrue(can_run_metal())
         mx.random.seed(0)
 
-        logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
-        logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
+        logits_q = mx.random.normal((2, 4, 4000))
+        logits_p = mx.random.normal((2, 4, 4000))
 
         with mx.stream(mx.cpu):
             expected = kl_div_loss(logits_q, logits_p)
         kl = kl_div_loss(logits_q, logits_p)
 
-        self.assertTrue(mx.allclose(kl, expected, rtol=1e-4))
+        self.assertTrue(mx.allclose(kl, expected))
 
     def test_js_div_loss(self):
         self.assertTrue(can_run_metal())
         mx.random.seed(0)
 
-        logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
-        logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
+        logits_q = mx.random.normal((2, 4, 4000))
+        logits_p = mx.random.normal((2, 4, 4000))
 
         with mx.stream(mx.cpu):
             expected = js_div_loss(logits_q, logits_p)
@@ -39,9 +39,9 @@ class TestLosses(unittest.TestCase):
         self.assertTrue(can_run_metal())
         mx.random.seed(0)
 
-        logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
-        logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
-        cotan = mx.random.uniform(shape=(4, 8), dtype=mx.float32)
+        logits_q = mx.random.normal((2, 4, 4000))
+        logits_p = mx.random.normal((2, 4, 4000))
+        cotan = mx.random.normal((2, 4))
 
         with mx.stream(mx.cpu):
             expected = mx.vjp(kl_div_loss, [logits_q, logits_p], [cotan])[1][0]
@@ -53,9 +53,9 @@ class TestLosses(unittest.TestCase):
         self.assertTrue(can_run_metal())
         mx.random.seed(0)
 
-        logits_q = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
-        logits_p = mx.random.uniform(shape=(4, 8, 4000), dtype=mx.float32)
-        cotan = mx.random.uniform(shape=(4, 8), dtype=mx.float32)
+        logits_q = mx.random.normal((2, 4, 4000))
+        logits_p = mx.random.normal((2, 4, 4000))
+        cotan = mx.random.normal((2, 4))
 
         with mx.stream(mx.cpu):
             expected = mx.vjp(js_div_loss, [logits_q, logits_p], [cotan])[1][0]

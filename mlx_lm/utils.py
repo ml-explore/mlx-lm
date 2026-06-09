@@ -52,9 +52,22 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
 }
 
 MAX_FILE_SIZE_GB = 5
+
+
+def _parse_size(x):
+    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    split = 0
+    for xi in x:
+        if not (xi.isdigit() or xi == "."):
+            break
+        split += 1
+    digits = float(x[:split])
+    size = (x[split:]).strip().upper()
+    return int(digits * sizes[size])
 
 
 def _unpack_awq_weights(qweight: mx.array) -> mx.array:
@@ -495,6 +508,8 @@ def sharded_load(
     pipeline_group: Optional[mx.distributed.Group] = None,
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
+    *,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -515,7 +530,7 @@ def sharded_load(
     # weights we need to download.
     model, config = load_model(model_path, lazy=True, strict=False)
 
-    has_pipelining = hasattr(model.model, "pipeline")
+    has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_tensor_parallel = hasattr(model, "shard")
 
     if pipeline_group is not None and not has_pipelining:
@@ -559,7 +574,7 @@ def sharded_load(
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
-        {"trust_remote_code": True},
+        tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)

@@ -5,12 +5,16 @@ import unittest
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
-from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+from mlx_lm.models.gated_delta import (
+    gated_delta_kernel,
+    gated_delta_ops,
+    gated_delta_update,
+)
 from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
@@ -237,6 +241,67 @@ class TestModels(unittest.TestCase):
             scaling_config={"rope_type": "llama3", "factor": 2.0},
         )
         self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
+
+        rope = rope_utils.initialize_rope(
+            16,
+            base=100.0,
+            traditional=False,
+            scaling_config={
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.5,
+            },
+        )
+        self.assertTrue(isinstance(rope, rope_utils.ProportionalRoPE))
+        expected_freqs = 100.0 ** (mx.arange(0, 8, 2, dtype=mx.float32) / 16)
+        self.assertTrue(mx.allclose(rope._freqs[:4], expected_freqs))
+        self.assertTrue(mx.all(mx.isinf(rope._freqs[4:])))
+
+        x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 1, 16)
+        y = rope(x, offset=1)
+        expected_rotated = mx.fast.rope(
+            mx.concatenate([x[..., :4], x[..., 8:12]], axis=-1),
+            8,
+            traditional=False,
+            base=None,
+            scale=1.0,
+            offset=1,
+            freqs=expected_freqs,
+        )
+        expected = mx.concatenate(
+            [
+                expected_rotated[..., :4],
+                x[..., 4:8],
+                expected_rotated[..., 4:],
+                x[..., 12:],
+            ],
+            axis=-1,
+        )
+        mx.eval(y, expected)
+        self.assertTrue(mx.allclose(y, expected))
+
+    def test_su_scaled_rope_no_mutation(self):
+        rope = rope_utils.SuScaledRoPE(
+            dims=8,
+            max_position_embeddings=131072,
+            original_max_position_embeddings=4096,
+            long_factor=[1.0] * 4,
+        )
+        x = mx.ones((1, 2, 4, 8))
+        rope(x)
+        mx.eval(x)
+        self.assertTrue((x == 1).all())
+
+    def test_yarn_rope_no_mutation(self):
+        rope = rope_utils.YarnRoPE(
+            dims=8,
+            scaling_factor=2.0,
+            mscale=1.0,
+            mscale_all_dim=0,
+        )
+        x = mx.ones((1, 2, 4, 8))
+        rope(x)
+        mx.eval(x)
+        self.assertTrue((x == 1).all())
 
     def test_quantized_sdpa(self):
         cache = KVCache()
@@ -584,6 +649,199 @@ class TestModels(unittest.TestCase):
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
 
+    def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        base = mx.arange(8, dtype=mx.float32)
+        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+
+        converted = model.sanitize(
+            {
+                hf_norm_key: base,
+                "model.vision_tower.stub": mx.zeros((1,), dtype=mx.float32),
+            }
+        )
+        self.assertIn(mlx_norm_key, converted)
+        self.assertNotIn(
+            "language_model.model.model.layers.0.input_layernorm.weight", converted
+        )
+        self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
+        self.assertFalse(any("vision_tower" in k for k in converted))
+
+        loaded = model.sanitize({mlx_norm_key: base})
+        self.assertIn(mlx_norm_key, loaded)
+        self.assertNotIn(
+            "language_model.model.model.layers.0.input_layernorm.weight", loaded
+        )
+        self.assertTrue(mx.array_equal(loaded[mlx_norm_key], base))
+
+    def test_gemma4_raw_hf_language_model_prefixes_model(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        base = mx.arange(8, dtype=mx.float32)
+        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+
+        converted = model.sanitize({hf_norm_key: base})
+        self.assertIn(mlx_norm_key, converted)
+        self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
+
+    def test_gemma4_raw_hf_moe_expert_weights_split_for_switch_glu(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                    "enable_moe_block": True,
+                    "num_experts": 2,
+                    "top_k_experts": 1,
+                    "moe_intermediate_size": 3,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        gate_up = mx.arange(2 * 6 * 8, dtype=mx.float32).reshape(2, 6, 8)
+        down = mx.arange(2 * 8 * 3, dtype=mx.float32).reshape(2, 8, 3)
+
+        converted = model.sanitize(
+            {
+                "model.language_model.layers.0.experts.gate_up_proj": gate_up,
+                "model.language_model.layers.0.experts.down_proj": down,
+            }
+        )
+
+        gate_key = "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"
+        up_key = "language_model.model.layers.0.experts.switch_glu.up_proj.weight"
+        down_key = "language_model.model.layers.0.experts.switch_glu.down_proj.weight"
+
+        self.assertIn(gate_key, converted)
+        self.assertIn(up_key, converted)
+        self.assertIn(down_key, converted)
+        self.assertTrue(mx.array_equal(converted[gate_key], gate_up[:, :3, :]))
+        self.assertTrue(mx.array_equal(converted[up_key], gate_up[:, 3:, :]))
+        self.assertTrue(mx.array_equal(converted[down_key], down))
+        self.assertFalse(any("gate_up_proj" in k for k in converted))
+
+    def test_gemma4_moe_router_quantizes_to_8bit(self):
+        from mlx_lm.models import gemma4
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_lm.utils import quantize_model
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 64,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 64,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 128,
+                    "moe_intermediate_size": 128,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 64,
+                    "global_head_dim": 64,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": True,
+                    "enable_moe_block": True,
+                    "num_experts": 8,
+                    "top_k_experts": 2,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+        model, config = quantize_model(
+            model,
+            {"model_type": "gemma4", "text_config": copy.deepcopy(args.text_config)},
+            group_size=64,
+            bits=4,
+        )
+
+        layer = model.language_model.model.layers[0]
+        self.assertIsInstance(layer.router.proj, nn.QuantizedLinear)
+        self.assertEqual(layer.router.proj.bits, 8)
+        self.assertIsInstance(layer.experts.switch_glu.gate_proj, QuantizedSwitchLinear)
+        self.assertEqual(layer.experts.switch_glu.gate_proj.bits, 4)
+        self.assertEqual(
+            config["quantization"]["language_model.model.layers.0.router.proj"]["bits"],
+            8,
+        )
+        self.assertEqual(config["quantization"]["bits"], 4)
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
@@ -761,6 +1019,104 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_step3p5_make_cache_uses_rotating_for_sliding_layers(self):
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 10000.0, 10000.0, 10000.0],
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            partial_rotary_factors=[0.5, 1.0, 1.0, 0.5],
+            attention_other_setting={
+                "num_attention_heads": 8,
+                "num_attention_groups": 2,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        model = step3p5.Model(args)
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]], dtype=mx.int32)
+        step = model(tokens[:, :3], cache=caches)
+        mx.eval(step)
+        for i in range(3, 7):
+            step = model(tokens[:, i : i + 1], cache=caches)
+            mx.eval(step)
+
+        self.assertEqual(caches[0].size(), 7)
+        self.assertEqual(caches[1].size(), args.sliding_window)
+        self.assertEqual(caches[2].size(), args.sliding_window)
+        self.assertEqual(caches[3].size(), 7)
+
+    def test_step3p5_make_cache_uses_fallback_sliding_pattern(self):
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=5,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            sliding_window=4,
+            partial_rotary_factors=[1.0] * 5,
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3,4",
+        )
+        model = step3p5.Model(args)
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[1], KVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+        self.assertIsInstance(caches[4], RotatingKVCache)
+
+        tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        for i in range(2, 6):
+            step = model(tokens[:, i : i + 1], cache=caches)
+            mx.eval(step)
+
+        self.assertEqual(caches[0].size(), args.sliding_window)
+        self.assertEqual(caches[1].size(), 6)
+        self.assertEqual(caches[2].size(), args.sliding_window)
+        self.assertEqual(caches[3].size(), 6)
+        self.assertEqual(caches[4].size(), args.sliding_window)
 
     def test_cohere(self):
         from mlx_lm.models import cohere
@@ -1103,6 +1459,206 @@ class TestModels(unittest.TestCase):
         model = gemma3_text.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_gemma4_text(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=10,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=4,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                },
+            },
+        )
+        model = gemma4_text.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_gemma4_quantized_embedding_preserves_lookup_scale(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            sliding_window=8,
+            sliding_window_pattern=1,
+            layer_types=["full_attention"],
+            hidden_size_per_layer_input=0,
+            vocab_size=4,
+            num_kv_shared_layers=0,
+        )
+        model = gemma4_text.Gemma4TextModel(args)
+        model.embed_tokens.weight = mx.ones((4, 32), dtype=mx.float32)
+        model.embed_tokens = model.embed_tokens.to_quantized(group_size=32, bits=8)
+
+        token_ids = mx.array([[0, 1]], dtype=mx.int32)
+        lookup = model.embed_tokens(token_ids) * model.embed_scale
+        logits = model.embed_tokens.as_linear(mx.ones((1, 1, 32), dtype=mx.float32))
+        mx.eval(lookup, logits)
+
+        self.assertTrue(
+            mx.allclose(
+                lookup,
+                mx.ones((1, 2, 32), dtype=mx.float32) * (32.0**0.5),
+            )
+        )
+        self.assertTrue(
+            mx.allclose(logits, mx.ones((1, 1, 4), dtype=mx.float32) * 32.0)
+        )
+
+    def test_gemma4_kv_shared_layers_omit_kv_projections(self):
+        """KV-shared layers must not create k_proj/v_proj/k_norm/v_norm so that
+        models saved without redundant weights (e.g. via transformers
+        save_pretrained) can be loaded with strict=True."""
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=10,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=4,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                },
+            },
+        )
+        model = gemma4_text.Model(args)
+
+        # Non-shared layers (0-5) should have KV projections
+        for i in range(6):
+            attn = model.model.layers[i].self_attn
+            self.assertTrue(attn.has_kv)
+            self.assertTrue(hasattr(attn, "k_proj"))
+            self.assertTrue(hasattr(attn, "k_norm"))
+
+        # Shared layers (6-9) should NOT have KV projections
+        for i in range(6, 10):
+            attn = model.model.layers[i].self_attn
+            self.assertFalse(attn.has_kv)
+            self.assertFalse(hasattr(attn, "k_proj"))
+            self.assertFalse(hasattr(attn, "k_norm"))
+            self.assertFalse(hasattr(attn, "v_proj"))
+
+        # Verify the model can load weights that omit shared-layer KV params
+        weights = dict(tree_flatten(model.parameters()))
+        kv_keys = [
+            k for k in weights if "k_proj" in k or "v_proj" in k or "k_norm" in k
+        ]
+        for k in kv_keys:
+            # All KV keys should belong to non-shared layers (0-5)
+            layer_idx = int(k.split("layers.")[1].split(".")[0])
+            self.assertLess(layer_idx, 6)
+
+    def test_gemma4_input_embeddings_reconstruct_per_layer_inputs(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            sliding_window=8,
+            sliding_window_pattern=1,
+            layer_types=["full_attention", "full_attention"],
+            hidden_size_per_layer_input=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            num_kv_shared_layers=0,
+        )
+        model = gemma4_text.Model(args)
+        tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+        embeddings = model.model.embed_tokens(tokens)
+        per_layer_inputs = model.model._get_per_layer_inputs(tokens)
+
+        direct = model(tokens)
+        from_embeddings = model(None, input_embeddings=embeddings)
+        explicit = model(
+            None,
+            input_embeddings=embeddings,
+            per_layer_inputs=per_layer_inputs,
+        )
+        mx.eval(direct, from_embeddings, explicit)
+
+        self.assertTrue(
+            mx.allclose(direct.astype(mx.float32), from_embeddings.astype(mx.float32))
+        )
+        self.assertTrue(
+            mx.allclose(direct.astype(mx.float32), explicit.astype(mx.float32))
         )
 
     def test_gpt_bigcode(self):
@@ -1539,6 +2095,50 @@ class TestModels(unittest.TestCase):
                 "sliding_window_pattern": "LLGL",
             },
             {
+                "model_type": "gemma4",
+                "num_hidden_layers": 10,
+                "vocab_size": 1000,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 10,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "head_dim": 32,
+                    "global_head_dim": 64,
+                    "rms_norm_eps": 1e-6,
+                    "vocab_size": 1000,
+                    "vocab_size_per_layer_input": 1000,
+                    "num_key_value_heads": 1,
+                    "num_kv_shared_layers": 4,
+                    "hidden_size_per_layer_input": 32,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 5,
+                    "final_logit_softcapping": 30.0,
+                    "layer_types": [
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "partial_rotary_factor": 0.25,
+                            "rope_theta": 1000000.0,
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                        },
+                    },
+                },
+            },
+            {
                 "model_type": "gemma3n",
                 "num_hidden_layers": 4,
                 "vocab_size": 1000,
@@ -1585,7 +2185,7 @@ class TestModels(unittest.TestCase):
                 "rms_norm_eps": 1e-5,
                 "vocab_size": 1000,
                 "num_key_value_heads": 2,
-                "partial_rotary_factor": 0,
+                "partial_rotary_factor": 0.5,
                 "rope_theta": 1000,
             },
             {
@@ -1613,7 +2213,7 @@ class TestModels(unittest.TestCase):
                 "use_qk_norm": True,
                 "tie_word_embeddings": False,
                 "attention_bias": False,
-                "partial_rotary_factor": 0.0,
+                "partial_rotary_factor": 0.5,
             },
             {
                 "model_type": "glm4_moe_lite",
@@ -2531,6 +3131,60 @@ class TestModels(unittest.TestCase):
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_precision(self):
+        mx.random.seed(42)
+
+        N_STEPS = 512
+        B = 1
+        Hk = 4
+        Hv = 4
+        Dk = 64
+        Dv = 64
+
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+
+        all_q = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_k = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_v = mx.random.normal(shape=(N_STEPS, B, 1, Hv, Dv)) * 0.1
+        all_a = -7.0 + mx.random.normal(shape=(N_STEPS, B, 1, Hv)) * 0.3
+        all_b = mx.random.normal(shape=(N_STEPS, B, 1, Hv))
+        mx.eval(all_q, all_k, all_v, all_a, all_b, A_log, dt_bias)
+
+        state_ref = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        for t in range(N_STEPS):
+            y_ref, state_ref = gated_delta_update(
+                all_q[t],
+                all_k[t],
+                all_v[t],
+                all_a[t],
+                all_b[t],
+                A_log,
+                dt_bias,
+                state_ref,
+                use_kernel=False,
+            )
+            mx.eval(y_ref, state_ref)
+
+        for use_kernel in (False, True):
+            state_lo = mx.zeros((B, Hv, Dv, Dk), dtype=mx.bfloat16)
+            for t in range(N_STEPS):
+                y_lo, state_lo = gated_delta_update(
+                    all_q[t].astype(mx.bfloat16),
+                    all_k[t].astype(mx.bfloat16),
+                    all_v[t].astype(mx.bfloat16),
+                    all_a[t].astype(mx.bfloat16),
+                    all_b[t].astype(mx.bfloat16),
+                    A_log,
+                    dt_bias,
+                    state_lo,
+                    use_kernel=use_kernel,
+                )
+                mx.eval(y_lo, state_lo)
+
+            self.assertTrue(mx.allclose(state_lo, state_ref, rtol=0.05, atol=0.01))
+            self.assertTrue(mx.allclose(y_lo, y_ref, rtol=0.05, atol=0.01))
 
     def test_gated_delta_masked(self):
         B = 1

@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.utils import tree_map
 
 from .base import (
     BaseModelArgs,
@@ -14,6 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -126,6 +128,8 @@ class GatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+        self.sharding_group = None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -133,6 +137,9 @@ class GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+
+        if self.sharding_group is not None:
+            inputs = sum_gradients(self.sharding_group)(inputs)
 
         qkv = self.in_proj_qkv(inputs)
         z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
@@ -151,7 +158,13 @@ class GatedDeltaNet(nn.Module):
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -183,9 +196,15 @@ class GatedDeltaNet(nn.Module):
 
         if cache is not None:
             cache[1] = state
+            cache.advance(S)
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        out = self.out_proj(out.reshape(B, S, -1))
+
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+
+        return out
 
 
 class DecoderLayer(nn.Module):
@@ -222,7 +241,7 @@ class DecoderLayer(nn.Module):
         return out
 
 
-class Qwen3_5TextModel(nn.Module):
+class Qwen3_5TextModel(PipelineMixin, nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -232,6 +251,18 @@ class Qwen3_5TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
+
+    def pipeline(self, group):
+        super().pipeline(group)
+        self.ssm_idx = None
+        self.fa_idx = None
+        for e, l in enumerate(self.pipeline_layers):
+            if self.ssm_idx is None and l.is_linear:
+                self.ssm_idx = e
+            elif self.fa_idx is None and not l.is_linear:
+                self.fa_idx = e
+            if self.ssm_idx is not None and self.fa_idx is not None:
+                break
 
     def __call__(
         self,
@@ -244,15 +275,43 @@ class Qwen3_5TextModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(hidden_states, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         return self.norm(hidden_states)
 
@@ -281,7 +340,7 @@ class TextModel(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
@@ -363,12 +422,15 @@ class Model(nn.Module):
             inputs, cache=cache, input_embeddings=input_embeddings
         )
 
-    def sanitize(self, weights):
-        weights = tree_unflatten(list(weights.items()))
-        weights = dict(tree_flatten(weights))
+    @property
+    def model(self):
+        return self.language_model.model
 
+    def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
+            if key.startswith("vision_tower") or key.startswith("model.visual"):
+                continue
             if key.startswith("model.visual"):
                 continue
             if key.startswith("model.language_model"):
@@ -380,9 +442,127 @@ class Model(nn.Module):
             sanitized[key] = value
         return self.language_model.sanitize(sanitized)
 
+    def shard(self, group=None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        rank = group.rank()
+
+        # A sharding factory for the convolution in gated delta net
+        def conv_sharding(key_dim):
+            return lambda p, w: (0, [key_dim, 2 * key_dim])
+
+        def repeat_kv_layer_inplace(layer, h):
+            # No repeat needed cause we have more heads than nodes
+            if N <= h:
+                return
+
+            # Repeat function to apply to the layer weights
+            def _repeat(p):
+                s = p.shape
+                p = p.reshape(h, s[0] // h, *s[1:])
+                p = mx.repeat(p, N // h, axis=0)
+                p = p.reshape(-1, *s[1:])
+                return p
+
+            layer.update(tree_map(_repeat, layer.parameters()))
+
+        for layer in self.layers:
+            # Linear attention
+            if layer.is_linear:
+                kd = layer.linear_attn.key_dim
+                layer.linear_attn.sharding_group = group
+                shard_inplace(layer.linear_attn.conv1d, conv_sharding(kd), group=group)
+                layer.linear_attn.conv1d.groups //= N
+                shard_inplace(
+                    layer.linear_attn.in_proj_qkv,
+                    "all-to-sharded",
+                    segments=[kd, 2 * kd],
+                    group=group,
+                )
+                shard_inplace(
+                    layer.linear_attn.in_proj_z, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.linear_attn.in_proj_b, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.linear_attn.in_proj_a, "all-to-sharded", group=group
+                )
+                layer.linear_attn.dt_bias = mx.contiguous(
+                    mx.split(layer.linear_attn.dt_bias, N)[rank]
+                )
+                layer.linear_attn.A_log = mx.contiguous(
+                    mx.split(layer.linear_attn.A_log, N)[rank]
+                )
+                shard_inplace(layer.linear_attn.out_proj, "sharded-to-all", group=group)
+                layer.linear_attn.num_k_heads //= N
+                layer.linear_attn.num_v_heads //= N
+                layer.linear_attn.key_dim //= N
+                layer.linear_attn.value_dim //= N
+                layer.linear_attn.conv_dim //= N
+
+            # Softmax attention
+            else:
+                layer.self_attn.o_proj = shard_linear(
+                    layer.self_attn.o_proj, "sharded-to-all", group=group
+                )
+                layer.self_attn.q_proj = shard_linear(
+                    layer.self_attn.q_proj, "all-to-sharded", group=group
+                )
+                repeat_kv_layer_inplace(
+                    layer.self_attn.k_proj, layer.self_attn.num_key_value_heads
+                )
+                repeat_kv_layer_inplace(
+                    layer.self_attn.v_proj, layer.self_attn.num_key_value_heads
+                )
+                layer.self_attn.k_proj = shard_linear(
+                    layer.self_attn.k_proj, "all-to-sharded", group=group
+                )
+                layer.self_attn.v_proj = shard_linear(
+                    layer.self_attn.v_proj, "all-to-sharded", group=group
+                )
+                layer.self_attn.num_attention_heads //= N
+                layer.self_attn.num_key_value_heads = max(
+                    1, layer.self_attn.num_key_value_heads // N
+                )
+
+            # MLP
+            if isinstance(layer.mlp, MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+
+            # MoE
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.shared_expert.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.shared_expert.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.language_model.model.pipeline_layers
 
     def make_cache(self):
         return self.language_model.make_cache()

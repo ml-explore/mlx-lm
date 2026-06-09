@@ -1,9 +1,11 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import readline  # noqa: F401  # Enables terminal line editing/history on rank 0.
 
 import mlx.core as mx
 
+from .cli_ui import ChatUI
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
@@ -15,7 +17,33 @@ DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
+DEFAULT_RENDER_WINDOW_SIZE = 20
+DEFAULT_REFRESH_RATE = 10
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Your responses are rendered in a terminal with "
+    "Markdown support. Feel free to use Markdown formatting when appropriate: "
+    "**bold**, *italic*, `inline code`, code blocks with syntax highlighting "
+    "(```language), bullet lists, numbered lists, and headers."
+)
+
+
+def broadcast_string(
+    value: str, group: mx.distributed.Group, src: int = 0
+) -> str:
+    """Broadcast a UTF-8 string from src to every rank in group."""
+    if group.size() == 1:
+        return value
+    if group.rank() == src:
+        data = mx.array(value.encode("utf-8"))
+        mx.eval(mx.distributed.all_sum(data.size, group=group))
+        mx.eval(mx.distributed.all_sum(data, group=group))
+        return value
+
+    size = mx.distributed.all_sum(0, group=group).item()
+    data = mx.distributed.all_sum(mx.zeros(size, dtype=mx.uint8), group=group)
+    mx.eval(data)
+    return bytes(data).decode("utf-8")
 
 
 def setup_arg_parser():
@@ -52,8 +80,8 @@ def setup_arg_parser():
     parser.add_argument(
         "--xtc-threshold",
         type=float,
-        default=0.0,
-        help="Thresold the probs of each next token candidate to be sampled by XTC",
+        default=DEFAULT_XTC_THRESHOLD,
+        help="Threshold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
         "--seed",
@@ -77,12 +105,30 @@ def setup_arg_parser():
     parser.add_argument(
         "--system-prompt",
         default=None,
-        help="System prompt to be used for the chat template",
+        help="System prompt to be used for the chat template "
+        "(replaces the default Markdown-aware prompt)",
+    )
+    parser.add_argument(
+        "--no-system-prompt",
+        action="store_true",
+        help="Disable the default system prompt entirely",
     )
     parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=DEFAULT_RENDER_WINDOW_SIZE,
+        help="The number of recent rendered lines to keep in the live panel",
+    )
+    parser.add_argument(
+        "--refresh-rate",
+        type=int,
+        default=DEFAULT_REFRESH_RATE,
+        help="The live panel refresh rate during generation",
     )
     return parser
 
@@ -95,10 +141,6 @@ def main():
     rank = group.rank()
     pipeline_group = group if args.pipeline else None
     tensor_group = group if not args.pipeline else None
-
-    def rprint(*args, **kwargs):
-        if rank == 0:
-            print(*args, **kwargs)
 
     mx.random.seed(args.seed)
 
@@ -115,51 +157,55 @@ def main():
             },
         )
 
-    def print_help():
-        rprint("The command list:")
-        rprint("- 'q' to exit")
-        rprint("- 'r' to reset the chat")
-        rprint("- 'h' to display these commands")
+    with ChatUI(args, rank=rank) as ui:
+        prompt_cache = make_prompt_cache(model, args.max_kv_size)
+        while True:
+            query = ui.prompt() if rank == 0 else ""
+            query = broadcast_string(query, group).strip()
 
-    rprint(f"[INFO] Starting chat session with {args.model}.")
-    print_help()
-    prompt_cache = make_prompt_cache(model, args.max_kv_size)
-    while True:
-        query = input(">> " if rank == 0 else "")
-        if query == "q":
-            break
-        if query == "r":
-            prompt_cache = make_prompt_cache(model, args.max_kv_size)
-            continue
-        if query == "h":
-            print_help()
-            continue
-        messages = []
-        if args.system_prompt is not None:
-            messages.append({"role": "system", "content": args.system_prompt})
-        messages.append({"role": "user", "content": query})
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-        )
-        for response in stream_generate(
-            model,
-            tokenizer,
-            prompt,
-            max_tokens=args.max_tokens,
-            sampler=make_sampler(
-                args.temp,
-                args.top_p,
-                xtc_threshold=args.xtc_threshold,
-                xtc_probability=args.xtc_probability,
-                xtc_special_tokens=(
-                    tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+            if not query:
+                continue
+            if query == "q":
+                ui.say_bye()
+                break
+            if query == "r":
+                prompt_cache = make_prompt_cache(model, args.max_kv_size)
+                ui.say_reset()
+                continue
+            if query == "h":
+                ui.say_help()
+                continue
+            messages = []
+            if not args.no_system_prompt:
+                system_content = args.system_prompt or DEFAULT_SYSTEM_PROMPT
+                messages.append({"role": "system", "content": system_content})
+            elif args.system_prompt:
+                messages.append({"role": "system", "content": args.system_prompt})
+            messages.append({"role": "user", "content": query})
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+            )
+            last_response = None
+            for response in stream_generate(
+                model,
+                tokenizer,
+                prompt,
+                max_tokens=args.max_tokens,
+                sampler=make_sampler(
+                    args.temp,
+                    args.top_p,
+                    xtc_threshold=args.xtc_threshold,
+                    xtc_probability=args.xtc_probability,
+                    xtc_special_tokens=(
+                        tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+                    ),
                 ),
-            ),
-            prompt_cache=prompt_cache,
-        ):
-            rprint(response.text, flush=True, end="")
-        rprint()
+                prompt_cache=prompt_cache,
+            ):
+                ui.stream_token(response.text)
+                last_response = response
+            ui.end_turn(last_response)
 
 
 if __name__ == "__main__":

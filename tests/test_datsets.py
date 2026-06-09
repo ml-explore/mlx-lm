@@ -61,6 +61,37 @@ class TestDatasets(unittest.TestCase):
         self.assertTrue(len(valid[0]) > 0)
         self.assertTrue(isinstance(train, datasets.CompletionsDataset))
 
+    def test_completions_mask_prompt(self):
+        data = {"prompt": "What is the capital of France?", "completion": "Paris."}
+        self.save_data(4 * [data])
+        args = types.SimpleNamespace(
+            train=True, test=False, data=self.test_dir, mask_prompt=True
+        )
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, local_files_only=True)
+        train, valid, test = datasets.load_dataset(args, tokenizer)
+        self.assertEqual(len(train), 4)
+        self.assertEqual(len(valid), 4)
+        self.assertEqual(len(test), 0)
+        expected_prompt_tokens = tokenizer.apply_chat_template(
+            [{"role": "user", "content": data["prompt"]}],
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+        expected_offset = len(expected_prompt_tokens)
+
+        train_tokens, train_offset = train.process(train[0])
+        valid_tokens, valid_offset = valid.process(valid[0])
+
+        self.assertTrue(len(train_tokens) > 0)
+        self.assertTrue(len(valid_tokens) > 0)
+        self.assertEqual(train_offset, expected_offset)
+        self.assertEqual(valid_offset, expected_offset)
+        self.assertLess(train_offset, len(train_tokens))
+        self.assertLess(valid_offset, len(valid_tokens))
+        self.assertEqual(train_tokens[:train_offset], expected_prompt_tokens)
+        self.assertEqual(valid_tokens[:valid_offset], expected_prompt_tokens)
+        self.assertTrue(isinstance(train, datasets.CompletionsDataset))
+
     def test_chat(self):
         data = {
             "messages": [
