@@ -115,7 +115,7 @@ class Attention(nn.Module):
         if self.attn_temperature_tuning and not self.use_rope:
             attn_scales = (
                 mx.log(
-                    mx.floor(mx.arange(offset + 1, offset + L + 1) / self.floor_scale)
+                    mx.floor(mx.arange(int(offset + 1), int(offset + L + 1)) / self.floor_scale)
                     + 1.0
                 )
                 * self.attn_scale
