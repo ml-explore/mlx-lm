@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import re
+import readline  # noqa: F401  # Enables terminal line editing/history.
 import shutil
 import sys
 from contextlib import contextmanager
@@ -9,6 +10,8 @@ from functools import lru_cache
 import mlx.core as mx
 from rich.box import ROUNDED
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress, ProgressColumn, TextColumn
 from rich.text import Text
@@ -256,6 +259,10 @@ class ChatUI:
         self._rank = rank
         self._args = args
         self._console = make_console()
+        self._response_text = ""
+        self._live = None
+        self._window_size = max(getattr(args, "window_size", 20), 1)
+        self._refresh_rate = max(getattr(args, "refresh_rate", 10), 1)
 
     def __enter__(self):
         if self._rank == 0:
@@ -294,16 +301,59 @@ class ChatUI:
         if self._rank == 0:
             print_chat_help(self._console)
 
+    def _display_text(self) -> str:
+        lines = self._response_text.splitlines(keepends=True)
+        if len(lines) > self._window_size:
+            return "".join(lines[-self._window_size :])
+        return self._response_text
+
+    def _ensure_live(self):
+        if self._rank != 0 or self._live is not None:
+            return
+        self._live = Live(
+            Panel(
+                Markdown(""),
+                title="[ui.accent]generating[/ui.accent]",
+                border_style="ui.border",
+                box=ROUNDED,
+            ),
+            console=self._console,
+            refresh_per_second=self._refresh_rate,
+            transient=True,
+        )
+        self._live.start()
+
     def stream_token(self, text: str):
-        rprint(text, flush=True, end="")
+        if self._rank != 0:
+            return
+        self._ensure_live()
+        self._response_text += text
+        self._live.update(
+            Panel(
+                Markdown(self._display_text()),
+                title="[ui.accent]generating[/ui.accent]",
+                border_style="ui.border",
+                box=ROUNDED,
+            )
+        )
 
     def end_turn(self, response):
-        rprint()  # newline after the streamed line
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
         if self._rank != 0 or response is None:
+            self._response_text = ""
             return
+        self._console.print(Markdown(self._response_text))
+        if getattr(response, "finish_reason", None) == "length":
+            self._console.print(
+                f"  [ui.warn]output truncated[/ui.warn] "
+                f"[ui.muted](max tokens: {self._args.max_tokens})[/ui.muted]"
+            )
         self._console.print(
             f"  [ui.muted]{response.generation_tokens} tokens · "
             f"{response.generation_tps:.1f} tok/s · "
             f"prompt {response.prompt_tps:.1f} tok/s · "
             f"peak {response.peak_memory:.2f} GB[/ui.muted]"
         )
+        self._response_text = ""

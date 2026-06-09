@@ -42,6 +42,10 @@ class TestChat(unittest.TestCase):
                 "512",
                 "--system-prompt",
                 "You are a helpful assistant.",
+                "--window-size",
+                "30",
+                "--refresh-rate",
+                "12",
             ]
         )
 
@@ -55,12 +59,20 @@ class TestChat(unittest.TestCase):
         self.assertEqual(args.max_kv_size, 1024)
         self.assertEqual(args.max_tokens, 512)
         self.assertEqual(args.system_prompt, "You are a helpful assistant.")
+        self.assertEqual(args.window_size, 30)
+        self.assertEqual(args.refresh_rate, 12)
 
     def test_broadcast_string_single_rank_returns_input(self):
         group = MagicMock()
         group.size.return_value = 1
 
         self.assertEqual(broadcast_string("hello", group), "hello")
+
+    def test_no_system_prompt_flag(self):
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--no-system-prompt"])
+
+        self.assertTrue(args.no_system_prompt)
 
     @patch("mlx_lm.chat.sharded_load")
     @patch("mlx_lm.chat.make_prompt_cache")
@@ -130,6 +142,102 @@ class TestChat(unittest.TestCase):
         self.assertEqual(call_args[1]["role"], "user")
         self.assertEqual(call_args[1]["content"], "What is the weather?")
         mock_broadcast_string.assert_any_call("What is the weather?", group)
+
+    @patch("mlx_lm.chat.sharded_load")
+    @patch("mlx_lm.chat.make_prompt_cache")
+    @patch("mlx_lm.chat.stream_generate")
+    @patch("mlx_lm.chat.broadcast_string")
+    @patch("mlx_lm.chat.ChatUI")
+    def test_default_system_prompt_in_messages(
+        self,
+        mock_chat_ui,
+        mock_broadcast_string,
+        mock_stream_generate,
+        mock_make_prompt_cache,
+        mock_sharded_load,
+    ):
+        from mlx_lm.chat import DEFAULT_SYSTEM_PROMPT, main
+
+        group = MagicMock()
+        group.rank.return_value = 0
+        group.size.return_value = 2
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
+        mock_sharded_load.return_value = (mock_model, mock_tokenizer)
+        mock_make_prompt_cache.return_value = MagicMock()
+
+        ui = MagicMock()
+        ui.prompt.side_effect = ["Hello", "q"]
+        mock_chat_ui.return_value.__enter__.return_value = ui
+
+        mock_response = MagicMock()
+        mock_response.text = "Hi!"
+        mock_response.generation_tokens = 1
+        mock_response.generation_tps = 1.0
+        mock_response.prompt_tps = 1.0
+        mock_response.peak_memory = 1.0
+        mock_stream_generate.return_value = [mock_response]
+        mock_broadcast_string.side_effect = lambda query, *_args, **_kwargs: query
+
+        with patch("mlx_lm.chat.mx.distributed.init", return_value=group), patch(
+            "sys.argv", ["chat.py"]
+        ):
+            main()
+
+        call_args = mock_tokenizer.apply_chat_template.call_args[0][0]
+        self.assertEqual(call_args[0]["role"], "system")
+        self.assertEqual(call_args[0]["content"], DEFAULT_SYSTEM_PROMPT)
+        self.assertEqual(call_args[1]["content"], "Hello")
+
+    @patch("mlx_lm.chat.sharded_load")
+    @patch("mlx_lm.chat.make_prompt_cache")
+    @patch("mlx_lm.chat.stream_generate")
+    @patch("mlx_lm.chat.broadcast_string")
+    @patch("mlx_lm.chat.ChatUI")
+    def test_no_system_prompt_in_messages(
+        self,
+        mock_chat_ui,
+        mock_broadcast_string,
+        mock_stream_generate,
+        mock_make_prompt_cache,
+        mock_sharded_load,
+    ):
+        from mlx_lm.chat import main
+
+        group = MagicMock()
+        group.rank.return_value = 0
+        group.size.return_value = 2
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
+        mock_sharded_load.return_value = (mock_model, mock_tokenizer)
+        mock_make_prompt_cache.return_value = MagicMock()
+
+        ui = MagicMock()
+        ui.prompt.side_effect = ["What is the weather?", "q"]
+        mock_chat_ui.return_value.__enter__.return_value = ui
+
+        mock_response = MagicMock()
+        mock_response.text = "Hello there!"
+        mock_response.generation_tokens = 1
+        mock_response.generation_tps = 1.0
+        mock_response.prompt_tps = 1.0
+        mock_response.peak_memory = 1.0
+        mock_stream_generate.return_value = [mock_response]
+        mock_broadcast_string.side_effect = lambda query, *_args, **_kwargs: query
+
+        with patch("mlx_lm.chat.mx.distributed.init", return_value=group), patch(
+            "sys.argv", ["chat.py", "--no-system-prompt"]
+        ):
+            main()
+
+        call_args = mock_tokenizer.apply_chat_template.call_args[0][0]
+        self.assertEqual(len(call_args), 1)
+        self.assertEqual(call_args[0]["role"], "user")
+        self.assertEqual(call_args[0]["content"], "What is the weather?")
 
     @patch("mlx_lm.chat.sharded_load")
     @patch("mlx_lm.chat.make_prompt_cache")

@@ -17,7 +17,15 @@ DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
+DEFAULT_RENDER_WINDOW_SIZE = 20
+DEFAULT_REFRESH_RATE = 10
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Your responses are rendered in a terminal with "
+    "Markdown support. Feel free to use Markdown formatting when appropriate: "
+    "**bold**, *italic*, `inline code`, code blocks with syntax highlighting "
+    "(```language), bullet lists, numbered lists, and headers."
+)
 
 
 def broadcast_string(
@@ -72,8 +80,8 @@ def setup_arg_parser():
     parser.add_argument(
         "--xtc-threshold",
         type=float,
-        default=0.0,
-        help="Thresold the probs of each next token candidate to be sampled by XTC",
+        default=DEFAULT_XTC_THRESHOLD,
+        help="Threshold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
         "--seed",
@@ -97,12 +105,30 @@ def setup_arg_parser():
     parser.add_argument(
         "--system-prompt",
         default=None,
-        help="System prompt to be used for the chat template",
+        help="System prompt to be used for the chat template "
+        "(replaces the default Markdown-aware prompt)",
+    )
+    parser.add_argument(
+        "--no-system-prompt",
+        action="store_true",
+        help="Disable the default system prompt entirely",
     )
     parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=DEFAULT_RENDER_WINDOW_SIZE,
+        help="The number of recent rendered lines to keep in the live panel",
+    )
+    parser.add_argument(
+        "--refresh-rate",
+        type=int,
+        default=DEFAULT_REFRESH_RATE,
+        help="The live panel refresh rate during generation",
     )
     return parser
 
@@ -150,7 +176,10 @@ def main():
                 ui.say_help()
                 continue
             messages = []
-            if args.system_prompt is not None:
+            if not args.no_system_prompt:
+                system_content = args.system_prompt or DEFAULT_SYSTEM_PROMPT
+                messages.append({"role": "system", "content": system_content})
+            elif args.system_prompt:
                 messages.append({"role": "system", "content": args.system_prompt})
             messages.append({"role": "user", "content": query})
             prompt = tokenizer.apply_chat_template(
