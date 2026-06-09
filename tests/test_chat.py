@@ -68,6 +68,42 @@ class TestChat(unittest.TestCase):
 
         self.assertEqual(broadcast_string("hello", group), "hello")
 
+    @patch("mlx_lm.chat.sharded_load")
+    @patch("mlx_lm.chat.make_prompt_cache")
+    @patch("mlx_lm.chat.stream_generate")
+    @patch("mlx_lm.chat.broadcast_string")
+    @patch("mlx_lm.chat.ChatUI")
+    def test_root_rank_prompts_then_broadcasts_input(
+        self,
+        mock_chat_ui,
+        mock_broadcast_string,
+        mock_stream_generate,
+        mock_make_prompt_cache,
+        mock_sharded_load,
+    ):
+        from mlx_lm.chat import main
+
+        group = MagicMock()
+        group.rank.return_value = 0
+        group.size.return_value = 2
+
+        mock_sharded_load.return_value = (MagicMock(), MagicMock())
+        mock_make_prompt_cache.return_value = MagicMock()
+        mock_broadcast_string.return_value = "q"
+
+        ui = MagicMock()
+        ui.prompt.return_value = "q"
+        mock_chat_ui.return_value.__enter__.return_value = ui
+
+        with patch("mlx_lm.chat.mx.distributed.init", return_value=group), patch(
+            "sys.argv", ["chat.py"]
+        ):
+            main()
+
+        ui.prompt.assert_called_once()
+        mock_broadcast_string.assert_called_once_with("q", group)
+        mock_stream_generate.assert_not_called()
+
     def test_no_system_prompt_flag(self):
         parser = setup_arg_parser()
         args = parser.parse_args(["--no-system-prompt"])

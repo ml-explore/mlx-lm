@@ -54,6 +54,8 @@ def make_console() -> Console:
         theme=_make_theme(),
         highlight=False,
         color_system="truecolor",
+        force_terminal=True,
+        force_interactive=True,
         width=_terminal_width(),
     )
 
