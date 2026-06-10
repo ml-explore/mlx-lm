@@ -279,6 +279,77 @@ class TestModels(unittest.TestCase):
         mx.eval(y, expected)
         self.assertTrue(mx.allclose(y, expected))
 
+    def test_cope_rope(self):
+        # Auto-sized clip: components whose period exceeds the original
+        # context window are clipped. base=10M, dims=64, context=262144
+        # gives 10 of 32 clipped components.
+        rope = rope_utils.initialize_rope(
+            64,
+            base=10_000_000,
+            traditional=False,
+            scaling_config={
+                "rope_type": "cope",
+                "original_max_position_embeddings": 262144,
+            },
+        )
+        self.assertTrue(isinstance(rope, rope_utils.CoPERoPE))
+        self.assertEqual(rope.clip_n, 10)
+
+        raw = 10_000_000 ** (mx.arange(0, 64, 2, dtype=mx.float32) / 64)
+        # Unclipped head is untouched, boundary component is preserved
+        # (mask=1), and the lowest-frequency component is frozen (inf).
+        self.assertTrue(mx.allclose(rope._freqs[:22], raw[:22]))
+        self.assertTrue(mx.allclose(rope._freqs[22], raw[22], rtol=1e-5))
+        self.assertTrue(mx.isinf(rope._freqs[-1]))
+        # Effective rotation speed decreases monotonically across the taper
+        inv = 1.0 / rope._freqs[22:]
+        self.assertTrue(mx.all(inv[:-1] >= inv[1:]))
+
+        # Explicit clip_n overrides the derivation
+        rope = rope_utils.initialize_rope(
+            64,
+            base=10_000_000,
+            traditional=False,
+            scaling_config={"rope_type": "cope", "clip_n": 4},
+        )
+        self.assertEqual(rope.clip_n, 4)
+
+        # original_max_position_embeddings falls back to the model's
+        # max_position_embeddings when not set in the scaling config.
+        rope = rope_utils.initialize_rope(
+            64,
+            base=10_000_000,
+            traditional=False,
+            scaling_config={"rope_type": "cope"},
+            max_position_embeddings=262144,
+        )
+        self.assertEqual(rope.clip_n, 10)
+
+        # clip_n=0 (nothing out-of-distribution) matches default RoPE
+        rope = rope_utils.initialize_rope(
+            8,
+            base=100.0,
+            traditional=False,
+            scaling_config={"rope_type": "cope", "clip_n": 0},
+        )
+        x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 2, 8)
+        expected = mx.fast.rope(
+            x, 8, traditional=False, base=100.0, scale=1.0, offset=3
+        )
+        mx.eval(rope(x, offset=3), expected)
+        self.assertTrue(mx.allclose(rope(x, offset=3), expected))
+
+    def test_cope_rope_no_mutation(self):
+        rope = rope_utils.CoPERoPE(
+            dims=8,
+            base=10000.0,
+            original_max_position_embeddings=128,
+        )
+        x = mx.ones((1, 2, 4, 8))
+        rope(x)
+        mx.eval(x)
+        self.assertTrue((x == 1).all())
+
     def test_su_scaled_rope_no_mutation(self):
         rope = rope_utils.SuScaledRoPE(
             dims=8,

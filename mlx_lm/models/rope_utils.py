@@ -232,6 +232,92 @@ class ProportionalRoPE(nn.Module):
         )
 
 
+class CoPERoPE(nn.Module):
+    """Clipped RoPE (CoPE) with a raised-cosine taper on low frequencies.
+
+    Implements the soft-clipping strategy from `CoPE: Clipped RoPE as A
+    Scalable Free Lunch for Long Context LLMs <https://arxiv.org/abs/2602.05258>`_.
+    The lowest-frequency components — whose rotation periods exceed the
+    pre-training context window and therefore go out-of-distribution when
+    extrapolating — are attenuated by a raised-cosine (Hann) mask. The
+    boundary component is left untouched and the lowest-frequency component
+    is frozen entirely, avoiding the spectral leakage of a hard cutoff.
+
+    Args:
+        dims (int): The feature dimensions to be rotated.
+        base (float): Base for the exponential scaling.
+        original_max_position_embeddings (int, optional): The context window
+          the model was pre-trained with. When ``clip_n`` is not given, the
+          number of clipped components is derived from it: every component
+          whose period exceeds this length is clipped.
+        traditional (bool, optional): Unused legacy rotation order flag,
+          kept for parity with the other RoPE classes. Default: ``False``.
+        clip_n (int, optional): Explicit number of low-frequency components
+          to clip. Overrides the derivation from
+          ``original_max_position_embeddings``.
+    """
+
+    def __init__(
+        self,
+        dims: int,
+        base: float = 10000.0,
+        original_max_position_embeddings: Optional[int] = None,
+        traditional: bool = False,
+        clip_n: Optional[int] = None,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+
+        n = dims // 2
+        freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+
+        if clip_n is None:
+            if original_max_position_embeddings is None:
+                raise ValueError(
+                    "CoPE requires either clip_n or "
+                    "original_max_position_embeddings to size the clip."
+                )
+            # A component is out-of-distribution if its period (the number
+            # of positions per full rotation, 2*pi*freqs) exceeds the
+            # pre-training context window.
+            periods = 2 * math.pi * freqs
+            clip_n = int((periods > original_max_position_embeddings).sum())
+        clip_n = min(clip_n, n)
+        self.clip_n = clip_n
+
+        if clip_n > 0:
+            # Raised-cosine mask going 1 -> 0 across the clip_n lowest
+            # frequencies. In the freqs convention of mx.fast.rope the
+            # rotation angle is position / freqs, so attenuating a
+            # frequency means dividing freqs by the mask; a fully masked
+            # component becomes inf (identity rotation).
+            theta = mx.linspace(0, math.pi, num=clip_n)
+            mask = 0.5 * (1.0 + mx.cos(theta))
+            tail = mx.where(
+                mask > 1e-6,
+                freqs[n - clip_n :] / mx.maximum(mask, 1e-6),
+                mx.inf,
+            )
+            freqs = mx.concatenate([freqs[: n - clip_n], tail])
+
+        self._freqs = freqs
+
+    def extra_repr(self):
+        return f"{self.dims}, clip_n={self.clip_n}/{self.dims // 2}"
+
+    def __call__(self, x, offset=0):
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=self.traditional,
+            base=None,
+            scale=1.0,
+            offset=offset,
+            freqs=self._freqs,
+        )
+
+
 def initialize_rope(
     dims,
     base,
@@ -297,6 +383,16 @@ def initialize_rope(
             traditional=traditional,
             base=base,
             factor=scaling_config.get("factor", 1.0),
+        )
+    elif rope_type == "cope":
+        return CoPERoPE(
+            dims=dims,
+            base=base,
+            traditional=traditional,
+            original_max_position_embeddings=scaling_config.get(
+                "original_max_position_embeddings", max_position_embeddings
+            ),
+            clip_n=scaling_config.get("clip_n"),
         )
     elif rope_type == "mrope":
         mrope_section = scaling_config.get("mrope_section", [])
