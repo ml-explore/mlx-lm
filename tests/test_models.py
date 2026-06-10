@@ -11,8 +11,10 @@ from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
+    compute_g,
     gated_delta_kernel,
     gated_delta_ops,
+    gated_delta_ops_chunked,
     gated_delta_update,
 )
 from mlx_lm.models.ssm import ssm_attn, ssm_update
@@ -3219,6 +3221,133 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+    def test_gated_delta_chunked(self):
+        B, Hk, Hv, Dk, Dv = 1, 2, 4, 32, 32
+
+        # (T, chunk_size, repeat_keys, with_state, g_mode)
+        cases = [
+            (96, 16, False, False, "random"),  # multi-chunk
+            (96, 16, True, False, "random"),  # repeated keys (adversarial)
+            (70, 16, False, False, "random"),  # T not a multiple of chunk_size
+            (128, 64, False, False, "random"),  # blocked solve (C > SUB_BLOCK)
+            (128, 64, True, False, "random"),  # blocked solve, repeated keys
+            (96, 16, False, True, "random"),  # carried-in state
+            (96, 16, False, False, "zero"),  # g -> 0 (log-domain hazard)
+            (96, 16, False, False, "one"),  # g -> 1 (no decay)
+        ]
+        for T, chunk_size, repeat_keys, with_state, g_mode in cases:
+            mx.random.seed(0)
+            q = mx.random.normal(shape=(B, T, Hk, Dk)) * 0.5
+            k = mx.random.normal(shape=(B, T, Hk, Dk))
+            k = k / mx.linalg.norm(k, axis=-1, keepdims=True)
+            if repeat_keys:
+                k = mx.broadcast_to(k[:, :1], k.shape) * 1.0
+            v = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.5
+            if g_mode == "zero":
+                g = mx.full((B, T, Hv), 1e-30)
+            elif g_mode == "one":
+                g = mx.full((B, T, Hv), 1.0 - 1e-7)
+            else:
+                g = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)))
+            beta = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)) + 2.0)
+            state = (
+                mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.3 if with_state else None
+            )
+
+            y_ref, st_ref = gated_delta_ops(q, k, v, g, beta, state)
+            y, st = gated_delta_ops_chunked(
+                q, k, v, g, beta, state, chunk_size=chunk_size
+            )
+            self.assertTrue(mx.allclose(y, y_ref, rtol=1e-3, atol=1e-4))
+            self.assertTrue(mx.allclose(st, st_ref, rtol=1e-3, atol=1e-4))
+
+    def test_gated_delta_chunked_masked(self):
+        B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
+
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(B, T, Hk, Dk))
+        k = mx.random.normal(shape=(B, T, Hk, Dk))
+        v = mx.random.normal(shape=(B, T, Hv, Dv))
+        g = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)))
+        beta = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)))
+        state = mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.3
+
+        for s, e, mask in [
+            (3, 8, mx.array([[False] * 3 + [True] * 5])),
+            (0, 5, mx.array([[True] * 5 + [False] * 3])),
+        ]:
+            y_gt, st_gt = gated_delta_ops(
+                q[:, s:e],
+                k[:, s:e],
+                v[:, s:e],
+                g[:, s:e],
+                beta[:, s:e],
+                state,
+            )
+            y, st = gated_delta_ops_chunked(q, k, v, g, beta, state, mask, chunk_size=4)
+            self.assertTrue(mx.allclose(y[:, s:e], y_gt, rtol=1e-3, atol=1e-4))
+            self.assertTrue(mx.allclose(st, st_gt, rtol=1e-3, atol=1e-4))
+
+    def test_gated_delta_chunked_grads(self):
+        B, T, Hk, Hv, Dk, Dv = 1, 64, 2, 4, 32, 32
+
+        def loss_ref(q, k, v, g, beta):
+            y, s = gated_delta_ops(q, k, v, g, beta)
+            return (y**2).sum() + (s**2).sum()
+
+        def loss_chunked(q, k, v, g, beta):
+            y, s = gated_delta_ops_chunked(q, k, v, g, beta, chunk_size=16)
+            return (y**2).sum() + (s**2).sum()
+
+        for repeat_keys in [False, True]:
+            mx.random.seed(0)
+            q = mx.random.normal(shape=(B, T, Hk, Dk)) * 0.5
+            k = mx.random.normal(shape=(B, T, Hk, Dk))
+            k = k / mx.linalg.norm(k, axis=-1, keepdims=True)
+            if repeat_keys:
+                k = mx.broadcast_to(k[:, :1], k.shape) * 1.0
+            v = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.5
+            g = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)))
+            beta = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)) + 2.0)
+
+            grads_ref = mx.grad(loss_ref, argnums=(0, 1, 2, 3, 4))(q, k, v, g, beta)
+            grads = mx.grad(loss_chunked, argnums=(0, 1, 2, 3, 4))(q, k, v, g, beta)
+            for g_ref, g_chunked in zip(grads_ref, grads):
+                self.assertTrue(mx.allclose(g_chunked, g_ref, rtol=5e-3, atol=5e-3))
+
+    def test_gated_delta_chunked_update(self):
+        B, T, Hk, Hv, Dk, Dv = 1, 40, 2, 4, 32, 32
+
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(B, T, Hk, Dk)) * 0.1
+        k = mx.random.normal(shape=(B, T, Hk, Dk)) * 0.1
+        v = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.1
+        a = -5.0 + mx.random.normal(shape=(B, T, Hv)) * 0.1
+        b = mx.random.normal(shape=(B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+
+        # use_kernel=False routes multi-token calls through the chunked path.
+        y, st = gated_delta_update(q, k, v, a, b, A_log, dt_bias, use_kernel=False)
+        g = compute_g(A_log, a, dt_bias)
+        beta = mx.sigmoid(b)
+        y_ref, st_ref = gated_delta_ops(q, k, v, g, beta)
+        self.assertTrue(mx.allclose(y, y_ref, rtol=1e-3, atol=1e-4))
+        self.assertTrue(mx.allclose(st, st_ref, rtol=1e-3, atol=1e-4))
+
+        # bf16 training inputs must produce finite gradients.
+        qb, kb, vb, ab, bb = (t.astype(mx.bfloat16) for t in (q, k, v, a, b))
+
+        def loss(q_, k_, v_, a_, b_):
+            y, s = gated_delta_update(
+                q_, k_, v_, a_, b_, A_log, dt_bias, use_kernel=False
+            )
+            return (y.astype(mx.float32) ** 2).sum() + (s**2).sum()
+
+        grads = mx.grad(loss, argnums=(0, 1, 2, 3, 4))(qb, kb, vb, ab, bb)
+        for grad in grads:
+            self.assertTrue(bool(mx.isfinite(grad).all()))
 
 
 if __name__ == "__main__":
