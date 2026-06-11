@@ -1991,7 +1991,7 @@ def main():
     tokenizer_config = (
         {} if not using_cache else json.loads(metadata["tokenizer_config"])
     )
-    tokenizer_config["trust_remote_code"] = True if args.trust_remote_code else None
+    tokenizer_config["trust_remote_code"] = args.trust_remote_code
 
     model_path = args.model
     if using_cache:

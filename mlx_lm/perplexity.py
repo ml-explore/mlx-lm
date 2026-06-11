@@ -144,7 +144,7 @@ def main():
 
     # Load model
     print(f"Loading model from {args.model}...")
-    tokenizer_config = {"trust_remote_code": True if args.trust_remote_code else None}
+    tokenizer_config = {"trust_remote_code": args.trust_remote_code}
     model, tokenizer = load(
         args.model,
         tokenizer_config=tokenizer_config,

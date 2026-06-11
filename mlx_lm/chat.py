@@ -112,9 +112,7 @@ def main():
         model, tokenizer = load(
             args.model,
             adapter_path=args.adapter_path,
-            tokenizer_config={
-                "trust_remote_code": True if args.trust_remote_code else None
-            },
+            tokenizer_config={"trust_remote_code": args.trust_remote_code},
             trust_remote_code=args.trust_remote_code,
         )
 

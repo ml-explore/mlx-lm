@@ -346,9 +346,7 @@ def run(args, training_callback: TrainingCallback = None):
     rprint("Loading pretrained model")
     model, tokenizer = load(
         args.model,
-        tokenizer_config={
-            "trust_remote_code": True if args.trust_remote_code else None
-        },
+        tokenizer_config={"trust_remote_code": args.trust_remote_code},
         trust_remote_code=args.trust_remote_code,
     )
 
