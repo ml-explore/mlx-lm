@@ -17,6 +17,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     _process_control_tokens,
+    make_lru_prompt_cache,
 )
 from mlx_lm.utils import load
 
@@ -518,6 +519,19 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_server_prompt_cache_uses_byte_limit(self):
+        args = types.SimpleNamespace(prompt_cache_size=100, prompt_cache_bytes=10)
+        cache = make_lru_prompt_cache(args)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("aaa")])
+        cache.insert_cache(model, [3, 4], [MockCache("bbb")])
+        cache.insert_cache(model, [4, 5], [MockCache("ccc")])
+        cache.insert_cache(model, [6, 7], [MockCache("ddd")])
+
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(cache.nbytes, 9)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 

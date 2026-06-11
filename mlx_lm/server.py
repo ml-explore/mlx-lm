@@ -1740,12 +1740,19 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache = make_lru_prompt_cache(model_provider.cli_args)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
     else:
         response_generator.join()
+
+
+def make_lru_prompt_cache(args):
+    max_bytes = getattr(args, "prompt_cache_bytes", None)
+    if max_bytes is None:
+        max_bytes = 1 << 63
+    return LRUPromptCache(args.prompt_cache_size, max_bytes=max_bytes)
 
 
 def main():
