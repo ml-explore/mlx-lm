@@ -13,9 +13,10 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    maybe_quantize_kv_cache,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -805,6 +806,25 @@ class TestGenerate(unittest.TestCase):
             if r.finish_reason is not None:
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, KVCache)
+
+    def test_maybe_quantize_kv_cache_hybrid(self):
+        # Hybrid cache (full-attention + sliding-window), as used by models
+        # like Gemma. RotatingKVCache has no quantized variant, so it must be
+        # skipped rather than crashing with NotImplementedError.
+        full = KVCache()
+        rotating = RotatingKVCache(max_size=8)
+        keys = mx.zeros((1, 1, 4, 64))
+        values = mx.zeros((1, 1, 4, 64))
+        full.update_and_fetch(keys, values)
+        rotating.update_and_fetch(keys, values)
+
+        prompt_cache = [full, rotating]
+        maybe_quantize_kv_cache(
+            prompt_cache, quantized_kv_start=0, kv_group_size=32, kv_bits=4
+        )
+
+        self.assertIsInstance(prompt_cache[0], QuantizedKVCache)
+        self.assertIsInstance(prompt_cache[1], RotatingKVCache)
 
 
 if __name__ == "__main__":
