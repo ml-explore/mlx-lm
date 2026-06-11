@@ -58,17 +58,6 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 
-def _trust_remote_code(trust_remote_code: bool) -> bool:
-    """Check if remote code execution is enabled via flag or environment variable."""
-    if trust_remote_code:
-        return True
-    return os.environ.get("MLX_LM_TRUST_REMOTE_CODE", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def _parse_size(x):
     sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
     split = 0
@@ -316,8 +305,7 @@ def load_model(
             Defaults to the ``_get_classes`` function.
         trust_remote_code (bool): If ``True``, allow executing a custom model
             architecture file specified by the config's ``model_file`` key.
-            Can also be enabled by setting the ``MLX_LM_TRUST_REMOTE_CODE``
-            environment variable to ``1``/``true``/``yes``. Default: ``False``.
+            Default: ``False``.
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
@@ -342,12 +330,12 @@ def load_model(
         weights.update(mx.load(wf))
 
     if (model_file := config.get("model_file")) is not None:
-        if not _trust_remote_code(trust_remote_code):
+        if not trust_remote_code:
             raise ValueError(
                 f"The model at {model_path} requires importing and running a "
                 f"custom module ({model_file!r}) to build its architecture. This "
-                "is disabled by default. Pass trust_remote_code=True (or set the "
-                "env var MLX_LM_TRUST_REMOTE_CODE=1) if you trust this model."
+                "is disabled by default. Pass trust_remote_code=True if you "
+                "trust this model."
             )
         spec = importlib.util.spec_from_file_location(
             "custom_model",
@@ -506,9 +494,8 @@ def load(
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
         trust_remote_code (bool): If ``True``, allow loading models that require
-            executing a custom Python file specified in their config. Can also
-            be enabled with the ``MLX_LM_TRUST_REMOTE_CODE`` environment
-            variable. Default: ``False``.
+            executing a custom Python file specified in their config.
+            Default: ``False``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.

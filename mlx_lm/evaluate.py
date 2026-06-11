@@ -85,7 +85,9 @@ class MLXLM(LM):
         super().__init__()
         tokenizer_config = {"trust_remote_code": True if trust_remote_code else None}
         self._model, self.tokenizer = load(
-            path_or_hf_repo, tokenizer_config=tokenizer_config
+            path_or_hf_repo,
+            tokenizer_config=tokenizer_config,
+            trust_remote_code=trust_remote_code,
         )
         self._max_tokens = max_tokens
         self._batch_size = batch_size

@@ -344,12 +344,14 @@ class ModelProvider:
                 pipeline_group=self.pipeline_group,
                 tensor_group=self.tensor_group,
                 tokenizer_config=self._tokenizer_config,
+                trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
             model, tokenizer = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                trust_remote_code=self.cli_args.trust_remote_code,
             )
 
         # Use the default chat template if needed

@@ -93,6 +93,7 @@ def main():
         args.model,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
+        trust_remote_code=args.trust_remote_code,
     )
 
     args.prompt = sys.stdin.read() if args.prompt == "-" else args.prompt

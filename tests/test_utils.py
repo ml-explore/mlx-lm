@@ -5,7 +5,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -213,12 +212,8 @@ class TestTrustRemoteCode(unittest.TestCase):
     def setUp(self):
         self.model_dir_fid = tempfile.TemporaryDirectory()
         self.model_path = Path(self.model_dir_fid.name)
-        self.env_patcher = mock.patch.dict(os.environ)
-        self.env_patcher.start()
-        os.environ.pop("MLX_LM_TRUST_REMOTE_CODE", None)
 
     def tearDown(self):
-        self.env_patcher.stop()
         self.model_dir_fid.cleanup()
 
     @property
@@ -249,14 +244,6 @@ class TestTrustRemoteCode(unittest.TestCase):
         model, config = utils.load_model(self.model_path, trust_remote_code=True)
         self.assertIsInstance(model, nn.Module)
         self.assertEqual(config["model_file"], "arch.py")
-        self.assertTrue(self._side_effect_file.exists())
-
-    def test_model_file_enabled_via_env_var(self):
-        """MLX_LM_TRUST_REMOTE_CODE=1 enables model_file execution."""
-        self._write_custom_model_dir()
-        os.environ["MLX_LM_TRUST_REMOTE_CODE"] = "1"
-        model, _ = utils.load_model(self.model_path)
-        self.assertIsInstance(model, nn.Module)
         self.assertTrue(self._side_effect_file.exists())
 
     def test_normal_model_unaffected_by_default(self):
