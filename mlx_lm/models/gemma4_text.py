@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_linear
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
@@ -671,6 +672,32 @@ class Model(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+            if attn.has_kv:
+                attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+                if not attn.use_k_eq_v:
+                    attn.v_proj = shard_linear(
+                        attn.v_proj, "all-to-sharded", group=group
+                    )
+            attn.n_heads //= N
+            attn.n_kv_heads //= N
+
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
 
     def make_cache(self):
         first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
