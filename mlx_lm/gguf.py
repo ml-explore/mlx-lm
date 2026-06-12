@@ -101,6 +101,9 @@ class HfVocab:
 
 
 def translate_weight_names(name):
+    # Strip language_model. prefix (Qwen3.6 ConditionalGeneration wrapper)
+    name = name.replace("language_model.", "")
+
     name = name.replace("model.layers.", "blk.")
     # for mixtral gate
     name = name.replace("block_sparse_moe.gate", "ffn_gate_inp")
@@ -114,6 +117,27 @@ def translate_weight_names(name):
     pattern = r"block_sparse_moe\.experts\.(\d+)\.w3\.weight"
     replacement = r"ffn_up.\1.weight"
     name = re.sub(pattern, replacement, name)
+
+    # for Qwen3.6 MoE (switch_mlp merged expert tensors)
+    name = name.replace("mlp.switch_mlp.gate_up_proj", "ffn_gate_up_exps")
+    name = name.replace("mlp.switch_mlp.down_proj", "ffn_down_exps")
+    # Qwen3.6 shared experts
+    name = name.replace("mlp.shared_expert.gate_proj", "ffn_gate_shexp")
+    name = name.replace("mlp.shared_expert.down_proj", "ffn_down_shexp")
+    name = name.replace("mlp.shared_expert.up_proj", "ffn_up_shexp")
+    name = name.replace("mlp.shared_expert_gate", "ffn_gate_inp_shexp")
+    # Qwen3.6 MoE router
+    name = name.replace("mlp.gate", "ffn_gate_inp")
+    # Qwen3.6 linear attention (Mamba-style SSM)
+    name = name.replace("linear_attn.A_log", "ssm_a")
+    name = name.replace("linear_attn.conv1d", "ssm_conv1d")
+    name = name.replace("linear_attn.dt_bias", "ssm_dt.bias")
+    name = name.replace("linear_attn.in_proj_a", "ssm_alpha")
+    name = name.replace("linear_attn.in_proj_b", "ssm_beta")
+    name = name.replace("linear_attn.in_proj_qkv", "attn_qkv")
+    name = name.replace("linear_attn.in_proj_z", "attn_gate")
+    name = name.replace("linear_attn.norm", "ssm_norm")
+    name = name.replace("linear_attn.out_proj", "ssm_out")
 
     name = name.replace("mlp.gate_proj", "ffn_gate")
     name = name.replace("mlp.down_proj", "ffn_down")
@@ -290,6 +314,27 @@ def convert_to_gguf(
         )
         for k, v in weights.items()
     }
+
+    # Pre-process Qwen3.6 MoE: fuse gate_proj + up_proj → gate_up_proj
+    # switch_mlp stores gate and up projections as separate tensors,
+    # but GGUF expects them concatenated as gate_up_proj
+    fused_weights = {}
+    skip_keys = set()
+    for k, v in weights.items():
+        if "switch_mlp.gate_proj" in k:
+            up_key = k.replace("gate_proj", "up_proj")
+            if up_key in weights:
+                cat_dim = 1 if v.ndim == 3 else 0
+                fused = mx.concatenate([v, weights[up_key]], axis=cat_dim)
+                fused_key = k.replace("gate_proj", "gate_up_proj")
+                fused_weights[fused_key] = fused
+                skip_keys.add(k)
+                skip_keys.add(up_key)
+    if fused_weights:
+        weights = {
+            **(fused_weights),
+            **{k: v for k, v in weights.items() if k not in skip_keys},
+        }
 
     # rename weights for gguf format
     weights = {translate_weight_names(k): v for k, v in weights.items()}

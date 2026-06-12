@@ -92,7 +92,7 @@ def main() -> None:
 
     if args.export_gguf:
         model_type = config["model_type"]
-        if model_type not in ["llama", "mixtral", "mistral"]:
+        if model_type not in ["llama", "mixtral", "mistral", "qwen3_5_moe"]:
             raise ValueError(
                 f"Model type {model_type} not supported for GGUF conversion."
             )
