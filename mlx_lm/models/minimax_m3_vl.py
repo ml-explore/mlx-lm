@@ -311,6 +311,7 @@ class Model(nn.Module):
                     "vision_model.",
                     "multi_modal_projector.",
                     "mm_projector.",
+                    "patch_merge_mlp.",
                 )
             ):
                 continue
