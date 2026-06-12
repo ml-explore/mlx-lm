@@ -59,7 +59,7 @@ class ToolCallFormatter:
         self._streaming = streaming
 
     def _format(self, tc):
-        tc_id = tc.pop("id", None) or str(uuid.uuid4())
+        tc_id = tc.pop("id", None) or uuid.uuid4().hex[:9]
         tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
         out = {
             "function": tc,
