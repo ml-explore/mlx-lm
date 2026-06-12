@@ -1875,13 +1875,20 @@ class BatchResponse:
     A data object to hold a batch generation response.
 
     Args:
-        texts: (List[str]): The generated text for each prompt.
+        texts (List[str]): The generated text for each prompt.
         stats (BatchStats): Statistics about the generation.
+        caches (Optional[List[List[Any]]]): The prompt caches, if requested.
+        logprobs (Optional[List[List[mx.array]]]): Per-token log probabilities
+            for each prompt. Each inner list contains one full-vocabulary
+            ``mx.array`` of log probabilities per generated token. Only
+            populated when ``return_logprobs=True`` is passed to
+            :func:`batch_generate`.
     """
 
     texts: List[str]
     stats: BatchStats
     caches: Optional[List[List[Any]]]
+    logprobs: Optional[List[List[mx.array]]] = None
 
 
 def batch_generate(
@@ -1892,6 +1899,7 @@ def batch_generate(
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     return_prompt_caches: bool = False,
+    return_logprobs: bool = False,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1910,6 +1918,10 @@ def batch_generate(
           can be per prompt if a list is provided.
        return_prompt_caches (bool): Return the prompt caches in the batch
           responses. Default: ``False``.
+       return_logprobs (bool): Return per-token full-vocabulary log
+          probabilities in :attr:`BatchResponse.logprobs`. Each entry is a
+          list of ``mx.array`` (shape ``[vocab_size]``) aligned with the
+          generated tokens. Default: ``False``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
@@ -1929,6 +1941,7 @@ def batch_generate(
 
     uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
     results = {uid: [] for uid in uids}
+    logprobs_results = {uid: [] for uid in uids} if return_logprobs else None
     prompt_caches = {}
     with gen.stats() as stats:
         while responses := gen.next_generated():
@@ -1944,6 +1957,8 @@ def batch_generate(
                         )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+                    if return_logprobs:
+                        logprobs_results[r.uid].append(r.logprobs)
     gen.close()
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
@@ -1951,6 +1966,7 @@ def batch_generate(
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     caches = [prompt_caches[uid] for uid in uids] if return_prompt_caches else None
+    logprobs = [logprobs_results[uid] for uid in uids] if return_logprobs else None
     if verbose:
         print(
             f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
@@ -1960,7 +1976,7 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return BatchResponse(texts, stats, caches)
+    return BatchResponse(texts, stats, caches, logprobs)
 
 
 def main():
