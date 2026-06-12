@@ -3225,18 +3225,19 @@ class TestModels(unittest.TestCase):
     def test_gated_delta_chunked(self):
         B, Hk, Hv, Dk, Dv = 1, 2, 4, 32, 32
 
-        # (T, chunk_size, repeat_keys, with_state, g_mode)
+        # (T, chunk_size, repeat_keys, with_state, g_mode, beta_high)
         cases = [
-            (96, 16, False, False, "random"),  # multi-chunk
-            (96, 16, True, False, "random"),  # repeated keys (adversarial)
-            (70, 16, False, False, "random"),  # T not a multiple of chunk_size
-            (128, 64, False, False, "random"),  # blocked solve (C > SUB_BLOCK)
-            (128, 64, True, False, "random"),  # blocked solve, repeated keys
-            (96, 16, False, True, "random"),  # carried-in state
-            (96, 16, False, False, "zero"),  # g -> 0 (log-domain hazard)
-            (96, 16, False, False, "one"),  # g -> 1 (no decay)
+            (96, 16, False, False, "random", False),  # multi-chunk
+            (96, 16, True, False, "random", False),  # repeated keys (adversarial)
+            (70, 16, False, False, "random", False),  # T not multiple of chunk_size
+            (128, 64, False, False, "random", False),  # blocked solve (C > SUB_BLOCK)
+            (128, 64, True, False, "random", False),  # blocked solve, repeated keys
+            (96, 16, False, True, "random", False),  # carried-in state
+            (96, 16, False, False, "zero", False),  # g -> 0 (log-domain hazard)
+            (96, 16, False, False, "one", False),  # g -> 1 (no decay)
+            (128, 64, True, False, "one", True),  # collinear, no decay, beta -> 1
         ]
-        for T, chunk_size, repeat_keys, with_state, g_mode in cases:
+        for T, chunk_size, repeat_keys, with_state, g_mode, beta_high in cases:
             mx.random.seed(0)
             q = mx.random.normal(shape=(B, T, Hk, Dk)) * 0.5
             k = mx.random.normal(shape=(B, T, Hk, Dk))
@@ -3250,7 +3251,10 @@ class TestModels(unittest.TestCase):
                 g = mx.full((B, T, Hv), 1.0 - 1e-7)
             else:
                 g = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)))
-            beta = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)) + 2.0)
+            if beta_high:
+                beta = mx.full((B, T, Hv), 0.999)
+            else:
+                beta = mx.sigmoid(mx.random.normal(shape=(B, T, Hv)) + 2.0)
             state = (
                 mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.3 if with_state else None
             )
@@ -3259,8 +3263,11 @@ class TestModels(unittest.TestCase):
             y, st = gated_delta_ops_chunked(
                 q, k, v, g, beta, state, chunk_size=chunk_size
             )
-            self.assertTrue(mx.allclose(y, y_ref, rtol=1e-3, atol=1e-4))
-            self.assertTrue(mx.allclose(st, st_ref, rtol=1e-3, atol=1e-4))
+            # The collinear beta -> 1 corner is a blow-up guard: the blocked
+            # solve degrades to ~1e-3 there instead of fp32 noise.
+            rtol, atol = (1e-2, 1e-2) if beta_high else (1e-3, 1e-4)
+            self.assertTrue(mx.allclose(y, y_ref, rtol=rtol, atol=atol))
+            self.assertTrue(mx.allclose(st, st_ref, rtol=rtol, atol=atol))
 
     def test_gated_delta_chunked_masked(self):
         B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 4, 32, 32
