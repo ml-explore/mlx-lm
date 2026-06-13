@@ -77,6 +77,7 @@ CONFIG_DEFAULTS = {
     "mask_prompt": False,
     "report_to": None,
     "project_name": None,
+    "trust_remote_code": False,
 }
 
 
@@ -212,6 +213,11 @@ def build_parser():
         help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     return parser
 
 
@@ -338,7 +344,11 @@ def run(args, training_callback: TrainingCallback = None):
     )
 
     rprint("Loading pretrained model")
-    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
+    model, tokenizer = load(
+        args.model,
+        tokenizer_config={"trust_remote_code": args.trust_remote_code},
+        trust_remote_code=args.trust_remote_code,
+    )
 
     rprint("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
