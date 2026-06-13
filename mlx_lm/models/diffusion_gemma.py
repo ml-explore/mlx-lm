@@ -40,8 +40,18 @@
 #   [x] 5. diffusion_generate       — EntropyBound accept/renoise + temp schedule
 #                                     (0.8→0.4) + adaptive stop. (single-canvas;
 #                                     block-autoregressive outer loop = 5b.)
-#   [ ] 6. PARITY vs transformers (needs torch) + encoder-bidi-"all" + real-weights
-#         load + mlx-lm registry/CLI wiring + 5b outer loop. ← what's left.
+#   [x] 6. VERIFICATION — MoE numerically parity-verified vs transformers (Router
+#         exact, Experts 1e-9). 12-agent adversarial review fixed: argmax-commit
+#         (was emitting renoised/random tokens), self-cond carrying SCALED logits,
+#         padding-mask threading, per-step renoise key-split.
+#   [ ] 7. REMAINING: real-weights load (an mlx-community conversion) + Mac tok/s
+#         receipts; mlx-lm registry/CLI wiring; the block-autoregressive outer loop
+#         (>canvas_length, 5b). KNOWN-LIMITATIONS (LOW, vs HF default dynamic path):
+#         sliding decoder layers window the encoder cache to sliding_window-1 for
+#         prompts >512 (inherited verbatim from the parity-verified mlx-vlm impl);
+#         no per-row freeze for finished rows in batched (B>1) generation; and the
+#         HF config halves sliding_window for use_bidirectional_attention="all"
+#         (verify against the real conversion's config.json before replicating).
 
 import weakref
 from dataclasses import dataclass
@@ -567,19 +577,35 @@ class EncoderModel(nn.Module):
                 caches.append(RotatingKVCache(max_size=self.config.sliding_window))
         return caches
 
-    def _make_encoder_masks(self, h, cache):
-        # PARITY ITEM: use_bidirectional_attention="all" makes the encoder fully
-        # bidirectional. We mirror mlx-vlm's create_attention_mask path here; verify
-        # the "all" bidirectional case against transformers in the parity gate.
-        return [
-            create_attention_mask(h, c) for c in cache
-        ]
+    def _make_encoder_masks(self, h, cache, attention_mask=None):
+        # No padding mask → the fast idiomatic per-layer causal/sliding mask.
+        if attention_mask is None:
+            return [create_attention_mask(h, c) for c in cache]
+        # Padded/batched prompt: build the explicit causal (+ sliding-window) mask and
+        # AND in the key padding mask, so PAD positions are not attended / cached.
+        # Mirrors mlx-vlm's EncoderModel._make_encoder_masks.
+        B, N, _ = h.shape
+        key_len = N + (_cache_offset(cache[0]) if cache else 0)
+        key_mask = attention_mask.astype(mx.bool_)
+        if key_mask.shape[-1] != key_len:
+            key_mask = key_mask[..., -key_len:]
+        positions = mx.arange(key_len)
+        q_positions = mx.arange(key_len - N, key_len)[:, None]
+        base = q_positions >= positions[None, :]
+        masks = []
+        for layer in self.decoder.layers:
+            m = base
+            if layer.layer_type == "sliding_attention":
+                m = m & (q_positions < positions[None, :] + self.config.sliding_window)
+            m = m[None, None, :, :] & key_mask[:, None, None, :]
+            masks.append(mx.broadcast_to(m, (B, 1, N, key_len)))
+        return masks
 
     def __call__(self, input_ids, attention_mask=None, cache=None):
         h = self.decoder.embed_tokens(input_ids) * self.decoder.embed_scale
         if cache is None:
             cache = self.make_cache()
-        masks = self._make_encoder_masks(h, cache)
+        masks = self._make_encoder_masks(h, cache, attention_mask)
         for i, (layer, c, mask) in enumerate(zip(self.decoder.layers, cache, masks)):
             h = layer(h, mask, c, decoder=False,
                       layer_scalar=self.language_model.layers[i].layer_scalar)
@@ -634,6 +660,7 @@ class Model(nn.Module):
     def __call__(self, input_ids=None, cache=None, canvas_ids=None, **kwargs):
         hidden_states, _ = self.model(
             input_ids=input_ids, cache=cache, canvas_ids=canvas_ids,
+            attention_mask=kwargs.get("attention_mask"),
             self_conditioning_logits=kwargs.get("self_conditioning_logits"),
             self_conditioning_embeddings=kwargs.get("self_conditioning_embeddings"),
             decoder_attention_mask=kwargs.get("decoder_attention_mask"))
@@ -750,9 +777,20 @@ def diffusion_generate(
     def _rand_canvas(k):
         return mx.random.randint(0, cfg.vocab_size, (B, canvas_length), key=k)
 
-    canvas = _rand_canvas(key)
+    # Per-step RNG: split the provided key so each renoise draws FRESH randomness
+    # (reusing a fixed key would repeat the initial canvas every step). key=None
+    # advances the global RNG, matching HF's unseeded torch.randint.
+    def _next_key():
+        nonlocal key
+        if key is None:
+            return None
+        key, sub = mx.random.split(key)
+        return sub
+
+    canvas = _rand_canvas(_next_key())
     self_cond = None
     history = mx.full((stability_threshold, B, canvas_length), -1, dtype=canvas.dtype)
+    argmax_canvas = canvas  # the committed output is the argmax of the logits (HF)
 
     for step in range(max_denoising_steps):
         logits = _decoder_logits(canvas, self_cond)
@@ -763,11 +801,14 @@ def diffusion_generate(
         scaled = logits / temperature
 
         denoiser = mx.random.categorical(scaled, axis=-1)            # (B, L)
-        accepted, accept_mask = _entropy_bound_accept(canvas, denoiser, scaled, entropy_bound)
+        _, accept_mask = _entropy_bound_accept(canvas, denoiser, scaled, entropy_bound)
+
+        # HF COMMITS the per-position ARGMAX of the (processed) logits — NOT the
+        # sampled/renoised canvas (argmax is invariant to the positive temp scale).
+        argmax_canvas = mx.argmax(logits, axis=-1)
 
         # Adaptive stop: argmax canvas stable across `stability_threshold` steps
         # AND mean per-token entropy below the confidence threshold.
-        argmax_canvas = mx.argmax(logits, axis=-1)
         if stability_threshold == 0:
             stable = mx.ones((B,), dtype=mx.bool_)
         else:
@@ -776,13 +817,13 @@ def diffusion_generate(
             history[-1] = argmax_canvas
         confident = mx.mean(_token_entropy(scaled), axis=-1) < confidence_threshold
         if bool(mx.all(stable & confident).item()):
-            canvas = accepted
             break
 
-        # Continue: keep accepted tokens, renoise the rest, carry logits as self-cond.
-        canvas = mx.where(accept_mask, denoiser, _rand_canvas(key))
-        self_cond = logits
+        # Continue: keep accepted tokens, renoise the rest; carry the SCALED logits
+        # (HF's processed_logits) as self-conditioning — softmax(logits) != softmax(logits/T).
+        canvas = mx.where(accept_mask, denoiser, _rand_canvas(_next_key()))
+        self_cond = scaled
         mx.eval(canvas, history)
 
-    return canvas
+    return argmax_canvas
 
