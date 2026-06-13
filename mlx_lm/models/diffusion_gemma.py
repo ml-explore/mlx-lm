@@ -27,18 +27,21 @@
 # ── BUILD SEQUENCE (this file, top-down; each step gated by tests/test_models.py
 #    conventions + logits parity vs transformers on a tiny random-init config) ──
 #   [x] 1. ModelArgs                — config (mirrors DiffusionGemmaTextConfig).
-#   [ ] 2. building blocks          — RMSNorm, Attention (generic mask =
-#                                     bidirectional injectable), summed MLP+MoE
-#                                     (SwitchGLU) w/ per-expert router scale,
-#                                     layer_scalar, v_norm, self-conditioning MLP.
-#   [ ] 3. Encoder / Decoder        — encoder prefills cache; decoder does the
+#   [x] 2. building blocks          — Attention (v_norm, k==v on full layers,
+#                                     per-layer rope, decoder cache-concat),
+#                                     summed MLP+MoE (Router scale + per_expert_scale,
+#                                     Experts), layer_scalar, self-conditioning MLP.
+#   [x] 3. Encoder / Decoder        — encoder prefills cache (standard mlx-lm
+#                                     KVCache/RotatingKVCache!); decoder does the
 #                                     cache-concat bidirectional canvas attention.
-#   [ ] 4. Model (+ sanitize)       — tie encoder↔decoder; sanitize the existing
+#   [x] 4. Model (+ sanitize)       — tie encoder↔decoder; sanitize the existing
 #                                     mlx-community conversions (MoE key splits,
 #                                     drop vision tower); softcapped logits.
-#   [ ] 5. diffusion_generate       — new top-level sibling to stream_generate:
-#                                     EntropyBoundSampler + temp schedule (0.8→0.4)
-#                                     + adaptive stop; per-canvas streaming.
+#   [x] 5. diffusion_generate       — EntropyBound accept/renoise + temp schedule
+#                                     (0.8→0.4) + adaptive stop. (single-canvas;
+#                                     block-autoregressive outer loop = 5b.)
+#   [ ] 6. PARITY vs transformers (needs torch) + encoder-bidi-"all" + real-weights
+#         load + mlx-lm registry/CLI wiring + 5b outer loop. ← what's left.
 
 import weakref
 from dataclasses import dataclass
@@ -682,3 +685,104 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+
+# ── Slice 5: the diffusion sampler ────────────────────────────────────────────
+# Block-diffusion generation: prefill the prompt into the encoder cache, then
+# denoise a random token canvas over ≤max_denoising_steps reverse steps. Each step:
+# decode (with self-conditioning) → temperature-scheduled sample → accept the
+# lowest-entropy tokens whose joint MI is bounded (EntropyBound) → renoise the rest.
+# Adaptive stop when the argmax canvas is stable AND mean entropy is low. (Single
+# canvas = up to canvas_length tokens; the block-autoregressive outer loop that
+# commits a canvas and extends the cache for >canvas_length output is slice 5b.)
+
+
+def _token_entropy(logits):
+    """Per-position Shannon entropy of the softmax over the vocab. (B, L)."""
+    logp = nn.log_softmax(logits, axis=-1)
+    return -mx.sum(mx.exp(logp) * logp, axis=-1)
+
+
+def _entropy_bound_accept(current, denoiser, logits, entropy_bound):
+    """Accept the k lowest-entropy denoiser tokens while
+    `cumulative_entropy - sorted_entropy <= entropy_bound` (≈ independent tokens);
+    keep the current token elsewhere. Returns (accepted_canvas, accepted_mask)."""
+    H = _token_entropy(logits)                          # (B, L)
+    order = mx.argsort(H, axis=-1)                       # ascending
+    sorted_H = mx.take_along_axis(H, order, axis=-1)
+    cumulative = mx.cumsum(sorted_H, axis=-1)
+    sel_sorted = (cumulative - sorted_H) <= entropy_bound
+    # scatter the sorted-order selection back to original positions
+    inverse = mx.argsort(order, axis=-1)
+    accepted_mask = mx.take_along_axis(sel_sorted, inverse, axis=-1)
+    accepted = mx.where(accepted_mask, denoiser, current)
+    return accepted, accepted_mask
+
+
+def diffusion_generate(
+    model,
+    prompt_ids: mx.array,
+    *,
+    max_denoising_steps: int = 48,
+    t_min: float = 0.4,
+    t_max: float = 0.8,
+    entropy_bound: float = 0.1,
+    confidence_threshold: float = 0.005,
+    stability_threshold: int = 1,
+    key=None,
+):
+    """Denoise one canvas conditioned on `prompt_ids` (B, prompt_len) and return the
+    committed canvas tokens (B, canvas_length). Mirrors transformers'
+    DiffusionGemma generate inner loop (credit @Blaizzy / the HF reference)."""
+    cfg = model.config
+    B = prompt_ids.shape[0]
+    canvas_length = cfg.canvas_length
+    softcap = float(cfg.final_logit_softcapping)
+
+    # Prefill the prompt into the encoder cache once.
+    cache = model.make_cache()
+    _, cache = model.model.encoder(prompt_ids, cache=cache)
+
+    def _decoder_logits(canvas, self_cond):
+        hidden = model.model.decoder(canvas, cache=cache, self_conditioning_logits=self_cond)
+        return _softcap(softcap, model.model.decoder.embed_tokens.as_linear(hidden))
+
+    def _rand_canvas(k):
+        return mx.random.randint(0, cfg.vocab_size, (B, canvas_length), key=k)
+
+    canvas = _rand_canvas(key)
+    self_cond = None
+    history = mx.full((stability_threshold, B, canvas_length), -1, dtype=canvas.dtype)
+
+    for step in range(max_denoising_steps):
+        logits = _decoder_logits(canvas, self_cond)
+        # Reverse-diffusion schedule: t_max (noisy, exploratory) at the FIRST step
+        # down to t_min (sharp) at the last — i.e. 0.8 → 0.4 with the defaults. HF
+        # achieves this with a descending cur_step; our `step` ascends, so we invert.
+        temperature = t_min + (t_max - t_min) * ((max_denoising_steps - step) / max_denoising_steps)
+        scaled = logits / temperature
+
+        denoiser = mx.random.categorical(scaled, axis=-1)            # (B, L)
+        accepted, accept_mask = _entropy_bound_accept(canvas, denoiser, scaled, entropy_bound)
+
+        # Adaptive stop: argmax canvas stable across `stability_threshold` steps
+        # AND mean per-token entropy below the confidence threshold.
+        argmax_canvas = mx.argmax(logits, axis=-1)
+        if stability_threshold == 0:
+            stable = mx.ones((B,), dtype=mx.bool_)
+        else:
+            stable = mx.all(mx.all(history == argmax_canvas[None], axis=-1), axis=0)
+            history = mx.roll(history, -1, axis=0)
+            history[-1] = argmax_canvas
+        confident = mx.mean(_token_entropy(scaled), axis=-1) < confidence_threshold
+        if bool(mx.all(stable & confident).item()):
+            canvas = accepted
+            break
+
+        # Continue: keep accepted tokens, renoise the rest, carry logits as self-cond.
+        canvas = mx.where(accept_mask, denoiser, _rand_canvas(key))
+        self_cond = logits
+        mx.eval(canvas, history)
+
+    return canvas
+
