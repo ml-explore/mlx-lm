@@ -137,6 +137,19 @@ class ModelArgs(BaseModelArgs):
         if self.num_global_key_value_heads is None:
             self.num_global_key_value_heads = self.num_key_value_heads
 
+    @classmethod
+    def from_dict(cls, params):
+        # The mlx-community/HF config nests the text fields under `text_config`
+        # (the top level is the multimodal wrapper); `canvas_length` lives at the
+        # top. Flatten to the text-only args so mlx-lm's loader builds the right model.
+        import inspect
+
+        src = dict(params.get("text_config", params))
+        if "canvas_length" in params:
+            src.setdefault("canvas_length", params["canvas_length"])
+        allowed = set(inspect.signature(cls).parameters)
+        return cls(**{k: v for k, v in src.items() if k in allowed})
+
 
 # ── Slice 1: building blocks ──────────────────────────────────────────────────
 # Mirrors mlx-vlm's DiffusionGemma4Backbone (Blaizzy / Pedro Cuenca) so the wire
