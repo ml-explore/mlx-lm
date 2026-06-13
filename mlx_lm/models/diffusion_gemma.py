@@ -40,6 +40,7 @@
 #                                     EntropyBoundSampler + temp schedule (0.8→0.4)
 #                                     + adaptive stop; per-canvas streaming.
 
+import weakref
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -47,7 +48,8 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, scaled_dot_product_attention
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .gemma4_text import RMSNormNoScale
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
@@ -394,3 +396,289 @@ class DecoderLayer(nn.Module):
         h = self.post_feedforward_layernorm(h1 + h2)
         h = residual + h
         return h * (self.layer_scalar if layer_scalar is None else layer_scalar)
+
+
+# ── Slice 2: the decoder model (canvas denoiser) ──────────────────────────────
+# The decoder embeds a token canvas (× sqrt(hidden)), folds in the previous step's
+# self-conditioning signal, builds per-layer-type masks over [encoder-cache | canvas]
+# (full layers see the whole valid prefix; sliding layers see a window), and runs
+# the DecoderLayers in `decoder=True` mode so each canvas attends to the prompt's
+# encoder cache. With no cache (cache=None) it degrades to pure canvas self-attention.
+
+
+class DecoderModel(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_scale = config.hidden_size**0.5
+        self.layers = [DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_conditioning = SelfConditioning(config)
+
+    def _embed_canvas(self, canvas_ids, self_conditioning_logits=None,
+                      self_conditioning_embeddings=None):
+        inputs_embeds = self.embed_tokens(canvas_ids) * self.embed_scale
+        if self_conditioning_logits is not None and self_conditioning_embeddings is not None:
+            raise ValueError(
+                "Only one of self_conditioning_logits or self_conditioning_embeddings can be set."
+            )
+        if self_conditioning_embeddings is not None:
+            soft_embeddings = self_conditioning_embeddings.astype(inputs_embeds.dtype)
+        elif self_conditioning_logits is None:
+            soft_embeddings = mx.zeros_like(inputs_embeds)
+        else:
+            probs = mx.softmax(self_conditioning_logits, axis=-1, precise=True)
+            if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
+                soft_embeddings = mx.quantized_matmul(
+                    probs.astype(inputs_embeds.dtype),
+                    self.embed_tokens.weight, self.embed_tokens.scales, self.embed_tokens.biases,
+                    transpose=False, group_size=self.embed_tokens.group_size,
+                    bits=self.embed_tokens.bits, mode=getattr(self.embed_tokens, "mode", "affine"),
+                )
+            else:
+                soft_embeddings = probs @ self.embed_tokens.weight
+            soft_embeddings = soft_embeddings.astype(inputs_embeds.dtype) * self.embed_scale
+        return self.self_conditioning(inputs_embeds, soft_embeddings)
+
+    def _make_decoder_masks(self, h, caches, decoder_attention_mask=None):
+        if isinstance(decoder_attention_mask, dict):
+            return decoder_attention_mask
+        B, canvas_length, _ = h.shape
+        masks = {}
+        for layer_type in set(self.config.layer_types):
+            cache = next(
+                (c for c, layer in zip(caches or [], self.layers)
+                 if layer.layer_type == layer_type),
+                None,
+            )
+            state = _cache_state(cache)
+            encoder_len = state[0].shape[2] if state is not None else 0
+            valid_encoder_len = min(_cache_offset(cache), encoder_len)
+            key_len = encoder_len + canvas_length
+
+            if layer_type == "full_attention":
+                if decoder_attention_mask is None:
+                    if encoder_len == valid_encoder_len:
+                        masks[layer_type] = None
+                    else:
+                        row = mx.concatenate(
+                            [mx.arange(encoder_len) < valid_encoder_len,
+                             mx.ones((canvas_length,), dtype=mx.bool_)], axis=0,
+                        )
+                        masks[layer_type] = mx.broadcast_to(
+                            row[None, None, None, :], (B, 1, canvas_length, key_len))
+                else:
+                    full = decoder_attention_mask.astype(mx.bool_)
+                    if full.shape[-1] != key_len:
+                        full = full[..., -key_len:]
+                    masks[layer_type] = mx.broadcast_to(
+                        full[:, None, None, :], (B, 1, canvas_length, key_len))
+                continue
+
+            # sliding_attention
+            window_prefix = max(self.config.sliding_window - 1, 0)
+            if decoder_attention_mask is None:
+                if encoder_len == valid_encoder_len and encoder_len <= window_prefix:
+                    masks[layer_type] = None
+                    continue
+                start = max(0, valid_encoder_len - window_prefix)
+                positions = mx.arange(encoder_len)
+                encoder_mask = (positions >= start) & (positions < valid_encoder_len)
+                row = mx.concatenate(
+                    [encoder_mask, mx.ones((canvas_length,), dtype=mx.bool_)], axis=0)
+                masks[layer_type] = mx.broadcast_to(
+                    row[None, None, None, :], (B, 1, canvas_length, key_len))
+            else:
+                full = decoder_attention_mask.astype(mx.bool_)
+                if full.shape[-1] != key_len:
+                    full = full[..., -key_len:]
+                start = max(0, valid_encoder_len - window_prefix)
+                positions = mx.arange(encoder_len)
+                keep = mx.concatenate(
+                    [(positions >= start) & (positions < valid_encoder_len),
+                     mx.ones((canvas_length,), dtype=mx.bool_)], axis=0)
+                row = full[:, None, None, :] & keep[None, None, None, :]
+                masks[layer_type] = mx.broadcast_to(row, (B, 1, canvas_length, key_len))
+        return masks
+
+    def __call__(self, canvas_ids, cache=None, self_conditioning_logits=None,
+                 self_conditioning_embeddings=None, decoder_attention_mask=None):
+        h = self._embed_canvas(canvas_ids, self_conditioning_logits, self_conditioning_embeddings)
+        cache = cache or [None] * len(self.layers)
+        masks = self._make_decoder_masks(h, cache, decoder_attention_mask)
+        offset = _cache_offset(cache[0]) if cache else 0
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, masks.get(layer.layer_type), c, decoder=True, offset=offset)
+        return self.norm(h)
+
+
+# ── Slice 3: encoder (prompt prefill), backbone, top-level Model ───────────────
+
+
+class _EncoderLayerScalar(nn.Module):
+    """The only encoder weight NOT tied to the decoder — its per-layer scalar."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer_scalar = mx.ones((1,))
+
+
+class EncoderLanguageModel(nn.Module):
+    """The encoder's view of the decoder: the SAME layers (tied weights) but its own
+    per-layer scalars. A weakref keeps the decoder out of this module's tree so its
+    weights aren't double-counted."""
+
+    def __init__(self, decoder: "DecoderModel"):
+        super().__init__()
+        self._decoder_ref = weakref.ref(decoder)
+        self.layers = [_EncoderLayerScalar() for _ in decoder.layers]
+
+    @property
+    def decoder(self):
+        return self._decoder_ref()
+
+
+class EncoderModel(nn.Module):
+    """Prefills the prompt into a KV cache by running the DECODER's layers in encoder
+    mode (decoder=False) with the encoder's own per-layer scalars. Text-only (no
+    vision tower). Cache = standard mlx-lm KVCache (full) / RotatingKVCache (sliding),
+    so the decoder's cache-concat reads their `.state` via `_cache_state`."""
+
+    def __init__(self, config: ModelArgs, decoder: "DecoderModel"):
+        super().__init__()
+        self.config = config
+        self.language_model = EncoderLanguageModel(decoder)
+        self._decoder_ref = weakref.ref(decoder)
+
+    @property
+    def decoder(self):
+        return self._decoder_ref()
+
+    def make_cache(self):
+        caches = []
+        for layer_type in self.config.layer_types:
+            if layer_type == "full_attention":
+                caches.append(KVCache())
+            else:
+                caches.append(RotatingKVCache(max_size=self.config.sliding_window))
+        return caches
+
+    def _make_encoder_masks(self, h, cache):
+        # PARITY ITEM: use_bidirectional_attention="all" makes the encoder fully
+        # bidirectional. We mirror mlx-vlm's create_attention_mask path here; verify
+        # the "all" bidirectional case against transformers in the parity gate.
+        return [
+            create_attention_mask(h, c) for c in cache
+        ]
+
+    def __call__(self, input_ids, attention_mask=None, cache=None):
+        h = self.decoder.embed_tokens(input_ids) * self.decoder.embed_scale
+        if cache is None:
+            cache = self.make_cache()
+        masks = self._make_encoder_masks(h, cache)
+        for i, (layer, c, mask) in enumerate(zip(self.decoder.layers, cache, masks)):
+            h = layer(h, mask, c, decoder=False,
+                      layer_scalar=self.language_model.layers[i].layer_scalar)
+        return self.decoder.norm(h), cache
+
+
+class DiffusionGemma4Backbone(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.decoder = DecoderModel(config)
+        self.encoder = EncoderModel(config, self.decoder)
+
+    def __call__(self, input_ids=None, attention_mask=None, cache=None, canvas_ids=None,
+                 self_conditioning_logits=None, self_conditioning_embeddings=None,
+                 decoder_attention_mask=None):
+        if input_ids is not None:
+            _, cache = self.encoder(input_ids, attention_mask=attention_mask, cache=cache)
+        elif cache is None:
+            raise ValueError("Either input_ids or cache must be provided.")
+        if canvas_ids is None:
+            batch_size = input_ids.shape[0]
+            canvas_ids = mx.random.randint(
+                0, self.config.vocab_size, (batch_size, self.config.canvas_length))
+        hidden_states = self.decoder(
+            canvas_ids, cache=cache,
+            self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_embeddings=self_conditioning_embeddings,
+            decoder_attention_mask=decoder_attention_mask)
+        return hidden_states, cache
+
+
+@partial(mx.compile, shapeless=True)
+def _softcap(softcap, x):
+    return mx.tanh(x.astype(mx.float32) / softcap) * softcap
+
+
+class Model(nn.Module):
+    """Top-level mlx-lm model. NOTE: this is an encoder-decoder DIFFUSION model —
+    `__call__(input_ids=...)` prefills the prompt, denoises ONE random canvas, and
+    returns its softcapped logits (B, canvas_length, vocab). It is NOT an
+    autoregressive next-token step; real generation goes through `diffusion_generate`
+    (slice 5), which the standard mlx-lm generate loop will dispatch to."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.model_type = config.model_type
+        self.model = DiffusionGemma4Backbone(config)
+        self.final_logit_softcapping = config.final_logit_softcapping
+
+    def __call__(self, input_ids=None, cache=None, canvas_ids=None, **kwargs):
+        hidden_states, _ = self.model(
+            input_ids=input_ids, cache=cache, canvas_ids=canvas_ids,
+            self_conditioning_logits=kwargs.get("self_conditioning_logits"),
+            self_conditioning_embeddings=kwargs.get("self_conditioning_embeddings"),
+            decoder_attention_mask=kwargs.get("decoder_attention_mask"))
+        logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
+        return _softcap(float(self.final_logit_softcapping), logits)
+
+    @property
+    def layers(self):
+        return self.model.decoder.layers
+
+    def make_cache(self):
+        return self.model.encoder.make_cache()
+
+    def sanitize(self, weights):
+        sanitized = {}
+        for key, value in weights.items():
+            if "rotary_emb" in key or key == "lm_head.weight":
+                continue
+            # Encoder text weights are tied to the decoder; the checkpoint only
+            # carries the encoder's separate layer scalars.
+            if key.startswith("model.encoder.language_model."):
+                if key.endswith(".layer_scalar"):
+                    sanitized[key] = value
+                continue
+            # Drop the vision tower (this is the text-only port).
+            if key.startswith("model.encoder.embed_vision.") or key.startswith(
+                "model.encoder.vision_tower."
+            ):
+                continue
+            # MoE expert tensors → SwitchLinear's `.weight` name.
+            if key.endswith(".experts.down_proj"):
+                sanitized[key.replace(".experts.down_proj", ".experts.down_proj.weight")] = value
+                continue
+            if key.endswith(".experts.gate_up_proj"):
+                sanitized[key.replace(".experts.gate_up_proj", ".experts.gate_up_proj.weight")] = value
+                continue
+            sanitized[key] = value
+        return sanitized
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, m):
+            if not hasattr(m, "to_quantized"):
+                return False
+            if "router" in path or path.endswith(
+                ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+            ):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
