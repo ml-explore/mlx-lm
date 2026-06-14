@@ -70,6 +70,23 @@ class TestDiffusionGemmaGenerate(unittest.TestCase):
         )
         self.assertEqual(out.shape, (1, 8))
 
+    def test_stream_yields_one_array_per_canvas(self):
+        # The streaming generator yields one committed canvas per block; the collected
+        # wrapper returns the same total. ceil(20/8) = 3 canvases.
+        m = _tiny_model()
+        chunks = list(
+            m.diffusion_stream_generate(
+                self.PROMPT, max_tokens=20, max_denoising_steps=3, key=mx.random.key(0)
+            )
+        )
+        self.assertEqual(len(chunks), 3)
+        for c in chunks:
+            self.assertEqual(c.shape, (1, 8))
+        full = m.diffusion_generate(
+            self.PROMPT, max_tokens=20, max_denoising_steps=3, key=mx.random.key(0)
+        )
+        self.assertEqual(full.shape, (1, 24))
+
 
 if __name__ == "__main__":
     unittest.main()

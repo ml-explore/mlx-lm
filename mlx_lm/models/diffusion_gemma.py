@@ -693,6 +693,11 @@ class Model(nn.Module):
         Delegates to the module-level `diffusion_generate` (resolved at call time)."""
         return diffusion_generate(self, prompt_ids, **kwargs)
 
+    def diffusion_stream_generate(self, prompt_ids, **kwargs):
+        """Streaming sibling — yields each committed canvas as it is produced.
+        Delegates to the module-level `diffusion_stream_generate`."""
+        return diffusion_stream_generate(self, prompt_ids, **kwargs)
+
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
@@ -841,7 +846,7 @@ def _denoise_one_canvas(
     return argmax_canvas
 
 
-def diffusion_generate(
+def diffusion_stream_generate(
     model,
     prompt_ids: mx.array,
     *,
@@ -856,18 +861,18 @@ def diffusion_generate(
     stability_threshold: int = 1,
     key=None,
 ):
-    """Block-autoregressive diffusion generation. Prefill `prompt_ids` (B, prompt_len)
-    into the encoder cache, then repeatedly denoise a canvas, commit it, and append it
-    to the cache (re-encode it, encoder/causal) so the next canvas attends to the
-    prompt + everything generated so far — until an EOS token is committed (any row),
-    `max_tokens` is reached, or `max_canvases` blocks. Returns the committed tokens
-    (B, n_blocks * canvas_length); a single block (max_tokens ≤ canvas_length, the
-    default) reproduces the prior single-canvas output exactly. Mirrors transformers'
-    DiffusionGemma generate (credit @Blaizzy / the HF reference).
+    """Streaming (generator) form of block-autoregressive diffusion generation:
+    prefill `prompt_ids` (B, prompt_len) into the encoder cache, then for each block
+    denoise a canvas, YIELD it (B, canvas_length) as soon as it commits, and re-encode
+    it into the cache so the next canvas attends to the prompt + everything generated —
+    until an EOS token is committed (any row), `max_tokens` is reached, or
+    `max_canvases` blocks. Per-canvas is the natural streaming granularity for block
+    diffusion (mid-denoise tokens still flicker). Mirrors transformers' DiffusionGemma
+    generate (credit @Blaizzy / the HF reference).
 
-    Batched caveat (B>1): there is no per-row freeze for finished rows yet — the loop
-    stops the moment ANY row commits an EOS, so other rows may be short. Single-prompt
-    use (the CLI) is unaffected."""
+    Batched caveat (B>1): no per-row freeze for finished rows yet — the loop ends the
+    moment ANY row commits an EOS, so other rows may be short. Single-prompt use
+    (the CLI) is unaffected."""
     cfg = model.config
     batch_size = prompt_ids.shape[0]
     canvas_length = cfg.canvas_length
@@ -903,13 +908,12 @@ def diffusion_generate(
         stability_threshold=stability_threshold,
     )
 
-    blocks: List[mx.array] = []
     for block_idx in range(n_blocks):
         canvas = _denoise_one_canvas(
             model, cache, batch_size, softcap, _next_key, **canvas_params
         )
         mx.eval(canvas)
-        blocks.append(canvas)
+        yield canvas
 
         # Stop once any row has committed an EOS in this canvas.
         if eos_set and any(t in eos_set for row in canvas.tolist() for t in row):
@@ -920,5 +924,12 @@ def diffusion_generate(
         if block_idx != n_blocks - 1:
             _, cache = model.model.encoder(canvas, cache=cache)
 
+
+def diffusion_generate(model, prompt_ids: mx.array, **kwargs) -> mx.array:
+    """Block-autoregressive diffusion generation (collected form): run
+    `diffusion_stream_generate` to completion and return the committed tokens
+    (B, n_blocks * canvas_length). A single block (max_tokens ≤ canvas_length, the
+    default) reproduces the prior single-canvas output exactly."""
+    blocks = list(diffusion_stream_generate(model, prompt_ids, **kwargs))
     return mx.concatenate(blocks, axis=1) if len(blocks) > 1 else blocks[0]
 

@@ -2079,28 +2079,30 @@ def main():
     # than emit tokens autoregressively — dispatch to the model's own generator
     # instead of the token-by-token loop. Generic: any model exposing
     # `diffusion_generate` opts in; no model-specific import here.
-    if hasattr(model, "diffusion_generate"):
-        import math
+    if hasattr(model, "diffusion_stream_generate"):
         import time
 
-        # `--max-tokens` drives the block-autoregressive canvas count; EOS stops early.
+        # Block-diffusion: STREAM each canvas as it commits (watch it generate) instead
+        # of freeze-then-dump. `--max-tokens` drives the canvas count; an EOS in a
+        # committed canvas ends generation.
         eos_ids = set(getattr(tokenizer, "eos_token_ids", None) or [tokenizer.eos_token_id])
         gen_kwargs = {"max_tokens": args.max_tokens, "eos_token_ids": eos_ids}
-        out = model.diffusion_generate(mx.array([prompt]), **gen_kwargs)
-        mx.eval(out)
         tic = time.perf_counter()
-        out = model.diffusion_generate(mx.array([prompt]), **gen_kwargs)  # timed (warm) pass
-        mx.eval(out)
+        n_tokens, n_canvases = 0, 0
+        for canvas in model.diffusion_stream_generate(mx.array([prompt]), **gen_kwargs):
+            mx.eval(canvas)
+            n_canvases += 1
+            toks = canvas[0].tolist()
+            n_tokens += len(toks)
+            cut = next((i for i, t in enumerate(toks) if t in eos_ids), len(toks))
+            print(tokenizer.decode(toks[:cut]), end="", flush=True)
+            if cut < len(toks):  # EOS committed in this canvas → done
+                break
         dt = time.perf_counter() - tic
-        toks = out[0].tolist()
-        cut = next((i for i, t in enumerate(toks) if t in eos_ids), len(toks))
-        print(tokenizer.decode(toks[:cut]))
+        print()
         if args.verbose:
-            n = out.shape[1]
-            canvas_len = getattr(getattr(model, "config", None), "canvas_length", 0) or n
-            n_canvases = max(1, math.ceil(n / canvas_len))
-            print(f"\n{'=' * 10}\n{n} tokens across {n_canvases} canvas(es) in "
-                  f"{dt:.3f}s ({n / dt:.1f} tok/s)", flush=True)
+            print(f"{'=' * 10}\n{n_tokens} tokens across {n_canvases} canvas(es) in "
+                  f"{dt:.3f}s ({n_tokens / dt:.1f} tok/s)", flush=True)
         return
 
     if args.draft_model is not None:
