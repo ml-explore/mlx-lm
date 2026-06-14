@@ -317,9 +317,7 @@ class ModelProvider:
         self._draft_model_map["default_model"] = self.cli_args.draft_model
 
         # Build the tokenizer config for later use in load
-        self._tokenizer_config = {
-            "trust_remote_code": True if cli_args.trust_remote_code else None
-        }
+        self._tokenizer_config = {"trust_remote_code": cli_args.trust_remote_code}
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
@@ -344,12 +342,14 @@ class ModelProvider:
                 pipeline_group=self.pipeline_group,
                 tensor_group=self.tensor_group,
                 tokenizer_config=self._tokenizer_config,
+                trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
             model, tokenizer = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                trust_remote_code=self.cli_args.trust_remote_code,
             )
 
         # Use the default chat template if needed

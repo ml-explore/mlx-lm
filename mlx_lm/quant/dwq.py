@@ -20,9 +20,9 @@ from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
     load,
     load_tokenizer,
-    pipeline_load,
     quantize_model,
     save,
+    sharded_load,
 )
 
 
@@ -300,6 +300,11 @@ def main():
         action="store_true",
         help="Use pipeline parallel instead of data parallel.",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
 
     args = parser.parse_args()
 
@@ -332,9 +337,20 @@ def main():
     # Load the base model if we need it
     if not has_targets or args.quantized_model is None:
         if args.pipeline and group.size() > 1:
-            model, _, config = pipeline_load(args.model, return_config=True)
+            model, _, config = sharded_load(
+                args.model,
+                pipeline_group=mx.distributed.init(),
+                tensor_group=None,
+                return_config=True,
+                trust_remote_code=args.trust_remote_code,
+            )
         else:
-            model, _, config = load(args.model, return_config=True, lazy=True)
+            model, _, config = load(
+                args.model,
+                return_config=True,
+                lazy=True,
+                trust_remote_code=args.trust_remote_code,
+            )
     else:
         model = None
 
@@ -370,6 +386,7 @@ def main():
             args.quantized_model,
             lazy=True,
             return_config=True,
+            trust_remote_code=args.trust_remote_code,
         )
         if "quantization" not in config:
             raise ValueError("Quantized model must already be quantized.")

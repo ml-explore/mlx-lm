@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import json
 import os
 import tempfile
 import unittest
@@ -15,7 +16,6 @@ HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
 
 class TestUtils(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()
@@ -182,6 +182,87 @@ class TestUtils(unittest.TestCase):
             logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
+
+CUSTOM_MODEL_FILE = """\
+from pathlib import Path
+
+import mlx.nn as nn
+
+(Path(__file__).parent / "side_effect.txt").write_text("executed")
+
+
+class ModelArgs:
+    @classmethod
+    def from_dict(cls, params):
+        return cls()
+
+
+class Model(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.linear = nn.Linear(8, 8)
+
+    def __call__(self, x):
+        return self.linear(x)
+"""
+
+
+class TestTrustRemoteCode(unittest.TestCase):
+    def setUp(self):
+        self.model_dir_fid = tempfile.TemporaryDirectory()
+        self.model_path = Path(self.model_dir_fid.name)
+
+    def tearDown(self):
+        self.model_dir_fid.cleanup()
+
+    @property
+    def _side_effect_file(self) -> Path:
+        return self.model_path / "side_effect.txt"
+
+    def _write_custom_model_dir(self):
+        config = {"model_type": "custom", "model_file": "arch.py"}
+        with open(self.model_path / "config.json", "w") as f:
+            json.dump(config, f)
+        (self.model_path / "arch.py").write_text(CUSTOM_MODEL_FILE)
+        mx.save_safetensors(
+            str(self.model_path / "model.safetensors"),
+            {"linear.weight": mx.zeros((8, 8)), "linear.bias": mx.zeros((8,))},
+        )
+
+    def test_model_file_blocked_by_default(self):
+        """load_model must refuse to execute a custom model_file by default."""
+        self._write_custom_model_dir()
+        with self.assertRaises(ValueError) as cm:
+            utils.load_model(self.model_path)
+        self.assertIn("trust_remote_code", str(cm.exception))
+        self.assertFalse(self._side_effect_file.exists())
+
+    def test_model_file_loads_with_trust_remote_code(self):
+        """Passing trust_remote_code=True opts in to executing model_file."""
+        self._write_custom_model_dir()
+        model, config = utils.load_model(self.model_path, trust_remote_code=True)
+        self.assertIsInstance(model, nn.Module)
+        self.assertEqual(config["model_file"], "arch.py")
+        self.assertTrue(self._side_effect_file.exists())
+
+    def test_normal_model_unaffected_by_default(self):
+        """Models without model_file load fine with default arguments."""
+        config = {
+            "model_type": "llama",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 64,
+        }
+        with open(self.model_path / "config.json", "w") as f:
+            json.dump(config, f)
+        model, loaded_config = utils.load_model(self.model_path, strict=False)
+        self.assertIsInstance(model, nn.Module)
+        self.assertEqual(loaded_config["model_type"], "llama")
 
 
 if __name__ == "__main__":

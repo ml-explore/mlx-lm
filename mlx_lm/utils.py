@@ -286,6 +286,7 @@ def load_model(
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    trust_remote_code: bool = False,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -302,13 +303,18 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
+        trust_remote_code (bool): If ``True``, allow executing a custom model
+            architecture file specified by the config's ``model_file`` key.
+            Default: ``False``.
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
-        ValueError: If the model class or args class are not found or cannot be instantiated.
+        ValueError: If the model class or args class are not found or cannot be
+            instantiated, or if the config requests a custom ``model_file`` and
+            ``trust_remote_code`` is not enabled.
     """
     config = load_config(model_path)
     if model_config is not None:
@@ -324,6 +330,13 @@ def load_model(
         weights.update(mx.load(wf))
 
     if (model_file := config.get("model_file")) is not None:
+        if not trust_remote_code:
+            raise ValueError(
+                f"The model at {model_path} requires importing and running a "
+                f"custom module ({model_file!r}) to build its architecture. This "
+                "is disabled by default. Pass trust_remote_code=True if you "
+                "trust this model."
+            )
         spec = importlib.util.spec_from_file_location(
             "custom_model",
             model_path / model_file,
@@ -459,6 +472,7 @@ def load(
     lazy: bool = False,
     return_config: bool = False,
     revision: Optional[str] = None,
+    trust_remote_code: bool = False,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -479,6 +493,9 @@ def load(
             when needed. Default: ``False``
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+        trust_remote_code (bool): If ``True``, allow loading models that require
+            executing a custom Python file specified in their config.
+            Default: ``False``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -489,7 +506,12 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(model_path, lazy, model_config=model_config)
+    model, config = load_model(
+        model_path,
+        lazy,
+        model_config=model_config,
+        trust_remote_code=trust_remote_code,
+    )
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -510,6 +532,7 @@ def sharded_load(
     return_config: bool = False,
     *,
     tokenizer_config: Optional[Dict[str, Any]] = None,
+    trust_remote_code: bool = False,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -528,7 +551,9 @@ def sharded_load(
 
     # Lazy load model to figure out what type of sharding we can do and which
     # weights we need to download.
-    model, config = load_model(model_path, lazy=True, strict=False)
+    model, config = load_model(
+        model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
+    )
 
     has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_tensor_parallel = hasattr(model, "shard")
@@ -577,7 +602,9 @@ def sharded_load(
         tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = load_model(
+        model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
+    )
     if tensor_group is not None:
         model.shard(tensor_group)
     if pipeline_group is not None:

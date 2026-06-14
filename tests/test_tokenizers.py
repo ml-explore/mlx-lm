@@ -9,6 +9,7 @@ from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
+    TokenizerWrapper,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -108,6 +109,19 @@ class TestTokenizers(unittest.TestCase):
         self.assertIsNone(tokenizer.think_end)
         self.assertIsNone(tokenizer.think_start_id)
         self.assertIsNone(tokenizer.think_end_id)
+
+    def test_find_token(self):
+        # Check that _find returns a valid index when
+        # searching for a think token in short system prompts
+        HI, THINK_START, THINK_END = 200, 100, 101
+        find = TokenizerWrapper._find
+        prompt = [HI]
+        start = len(prompt) - 11
+        self.assertEqual(find(prompt, [THINK_START], start=start), -1)
+        self.assertEqual(find(prompt, [THINK_START], start=start, reverse=True), -1)
+        prompt = [HI, THINK_START, THINK_END, THINK_START]
+        self.assertEqual(find(prompt, [THINK_START], start=0), 1)
+        self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
 
 
 if __name__ == "__main__":
