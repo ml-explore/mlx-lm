@@ -847,6 +847,74 @@ class TestGenerate(unittest.TestCase):
         self.assertIsNone(response.logprobs)
         self.assertIsNone(response.token_ids)
 
+    def test_batch_same_prompt_basic(self):
+        """Test that batch_generate_same_prompt returns K completions."""
+        from mlx_lm.generate import batch_generate_same_prompt
+
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        response = batch_generate_same_prompt(
+            self.model,
+            self.tokenizer,
+            prompt=prompt,
+            num_completions=4,
+            max_tokens=5,
+        )
+        self.assertEqual(len(response.texts), 4)
+        self.assertIsNotNone(response.token_ids)
+        self.assertEqual(len(response.token_ids), 4)
+        for tids in response.token_ids:
+            self.assertGreater(len(tids), 0)
+            self.assertLessEqual(len(tids), 5)
+
+    def test_batch_same_prompt_logprobs(self):
+        """Test that logprobs are returned and valid."""
+        from mlx_lm.generate import batch_generate_same_prompt
+
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Count to 3"}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        response = batch_generate_same_prompt(
+            self.model,
+            self.tokenizer,
+            prompt=prompt,
+            num_completions=2,
+            max_tokens=5,
+        )
+        self.assertIsNotNone(response.logprobs)
+        self.assertEqual(len(response.logprobs), 2)
+        for lps, tids in zip(response.logprobs, response.token_ids):
+            self.assertEqual(len(lps), len(tids))
+            for lp in lps:
+                self.assertLessEqual(lp, 0.0)
+
+    def test_batch_same_prompt_deterministic_with_temp_zero(self):
+        """With temp=0, all K completions should be identical."""
+        from mlx_lm.generate import batch_generate_same_prompt
+        from mlx_lm.sample_utils import make_sampler
+
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        response = batch_generate_same_prompt(
+            self.model,
+            self.tokenizer,
+            prompt=prompt,
+            num_completions=3,
+            max_tokens=5,
+            sampler=make_sampler(temp=0.0),
+        )
+        # All completions should be the same with greedy decoding
+        self.assertEqual(response.texts[0], response.texts[1])
+        self.assertEqual(response.texts[1], response.texts[2])
+
 
 if __name__ == "__main__":
     unittest.main()

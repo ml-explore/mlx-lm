@@ -1984,6 +1984,153 @@ def batch_generate(
     return BatchResponse(texts, stats, caches, token_ids, logprobs)
 
 
+def batch_generate_same_prompt(
+    model: nn.Module,
+    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    prompt: Union[str, List[int]],
+    num_completions: int = 4,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    verbose: bool = False,
+) -> BatchResponse:
+    """
+    Generate multiple completions from the same prompt in a single batched
+    forward pass.
+
+    Unlike :func:`batch_generate` which uses continuous batching (optimal for
+    transformers with heterogeneous prompts), this function exploits the fact
+    that all sequences share the same prompt. It prefills once with batch
+    dimension K, then decodes K tokens per step in one ``model()`` call.
+
+    This is particularly effective for SSM/hybrid models (Mamba, Nemotron-H,
+    Jamba) where continuous batching adds overhead, and for RL workloads (GRPO,
+    RLOO, PPO) that generate K rollouts from the same prompt.
+
+    Args:
+        model (nn.Module): The language model.
+        tokenizer: The tokenizer.
+        prompt (Union[str, List[int]]): The input prompt string or token IDs.
+        num_completions (int): Number of completions to generate (K).
+            Default: ``4``.
+        max_tokens (int): Maximum tokens per completion. Default: ``256``.
+        sampler (Callable, optional): Sampling function that takes log
+            probabilities and returns a token. If None, uses greedy (argmax).
+            Default: ``None``.
+        verbose (bool): Print timing stats. Default: ``False``.
+
+    Returns:
+        BatchResponse: Contains ``texts``, ``token_ids``, ``logprobs``, and
+            ``stats``. Each list has length ``num_completions``.
+    """
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    if isinstance(prompt, str):
+        add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
+            tokenizer.bos_token
+        )
+        prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+
+    K = num_completions
+    eos_ids = set(tokenizer.eos_token_ids)
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    # Duplicate prompt K times for batched prefill
+    prompt_arr = mx.array([prompt] * K)  # [K, prompt_len]
+
+    tic = time.perf_counter()
+
+    # Prefill — process entire prompt for all K sequences at once
+    prompt_cache = cache.make_prompt_cache(model)
+    with mx.stream(generation_stream):
+        logits = model(prompt_arr, cache=prompt_cache)
+        logits = logits[:, -1, :]  # [K, V]
+
+    mx.eval([c.state for c in prompt_cache])
+    prompt_time = time.perf_counter() - tic
+    tic = time.perf_counter()
+
+    # Decode — generate K tokens per step in one forward pass
+    active = [True] * K
+    generated = [[] for _ in range(K)]
+    all_logprobs = [[] for _ in range(K)]
+
+    for step in range(max_tokens):
+        with mx.stream(generation_stream):
+            # Log-probabilities
+            log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+            # Sample — apply sampler per sequence
+            tokens = mx.concatenate(
+                [sampler(log_probs[i : i + 1]) for i in range(K)]
+            )  # [K]
+        mx.eval(tokens, log_probs)
+
+        tok_list = tokens.tolist()
+        any_active = False
+
+        for i in range(K):
+            if not active[i]:
+                continue
+            token_id = tok_list[i]
+            token_logp = log_probs[i, token_id].item()
+
+            if token_id in eos_ids:
+                active[i] = False
+                continue
+
+            generated[i].append(token_id)
+            all_logprobs[i].append(token_logp)
+            any_active = True
+
+        if not any_active:
+            break
+
+        # Next step — feed all K tokens through model at once
+        with mx.stream(generation_stream):
+            logits = model(tokens.reshape(K, 1), cache=prompt_cache)
+            logits = logits[:, -1, :]
+        mx.eval(logits)
+
+        if step % 256 == 0:
+            mx.clear_cache()
+
+    gen_time = time.perf_counter() - tic
+    total_tokens = sum(len(g) for g in generated)
+
+    # Decode texts
+    texts = [tokenizer.decode(g) for g in generated]
+
+    stats = BatchStats(
+        prompt_tokens=len(prompt) * K,
+        prompt_tps=(len(prompt) * K) / prompt_time if prompt_time > 0 else 0,
+        prompt_time=prompt_time,
+        generation_tokens=total_tokens,
+        generation_tps=total_tokens / gen_time if gen_time > 0 else 0,
+        generation_time=gen_time,
+        peak_memory=mx.get_peak_memory() / 1e9,
+    )
+
+    if verbose:
+        print(
+            f"[batch_generate_same_prompt] Prompt: {len(prompt)} tokens, "
+            f"{stats.prompt_tps:.0f} tok/s"
+        )
+        print(
+            f"[batch_generate_same_prompt] Decode: {total_tokens} tokens "
+            f"({K} seqs), {stats.generation_tps:.0f} tok/s"
+        )
+        print(f"[batch_generate_same_prompt] Peak memory: {stats.peak_memory:.3f} GB")
+
+    return BatchResponse(
+        texts=texts,
+        stats=stats,
+        caches=None,
+        token_ids=generated,
+        logprobs=all_logprobs,
+    )
+
+
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
