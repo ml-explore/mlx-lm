@@ -687,6 +687,12 @@ class Model(nn.Module):
     def make_cache(self):
         return self.model.encoder.make_cache()
 
+    def diffusion_generate(self, prompt_ids, **kwargs):
+        """Instance entry-point so the CLI / a caller can dispatch generically via
+        `hasattr(model, "diffusion_generate")` without importing this module.
+        Delegates to the module-level `diffusion_generate` (resolved at call time)."""
+        return diffusion_generate(self, prompt_ids, **kwargs)
+
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():

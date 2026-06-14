@@ -2075,6 +2075,29 @@ def main():
     else:
         prompt = tokenizer.encode(prompt)
 
+    # Diffusion models (e.g. DiffusionGemma) denoise a fixed token canvas rather
+    # than emit tokens autoregressively — dispatch to the model's own generator
+    # instead of the token-by-token loop. Generic: any model exposing
+    # `diffusion_generate` opts in; no model-specific import here.
+    if hasattr(model, "diffusion_generate"):
+        import time
+
+        out = model.diffusion_generate(mx.array([prompt]))
+        mx.eval(out)
+        tic = time.perf_counter()
+        out = model.diffusion_generate(mx.array([prompt]))  # timed (warm) pass
+        mx.eval(out)
+        dt = time.perf_counter() - tic
+        toks = out[0].tolist()
+        eos_ids = set(getattr(tokenizer, "eos_token_ids", None) or [tokenizer.eos_token_id])
+        cut = next((i for i, t in enumerate(toks) if t in eos_ids), len(toks))
+        print(tokenizer.decode(toks[:cut]))
+        if args.verbose:
+            n = out.shape[1]
+            print(f"\n{'=' * 10}\nCanvas: {n} tokens in {dt:.3f}s ({n / dt:.1f} tok/s)",
+                  flush=True)
+        return
+
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:
