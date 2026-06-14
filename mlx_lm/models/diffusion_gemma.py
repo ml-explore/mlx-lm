@@ -733,14 +733,20 @@ class Model(nn.Module):
         return predicate
 
 
-# ── Slice 5: the diffusion sampler ────────────────────────────────────────────
-# Block-diffusion generation: prefill the prompt into the encoder cache, then
-# denoise a random token canvas over ≤max_denoising_steps reverse steps. Each step:
-# decode (with self-conditioning) → temperature-scheduled sample → accept the
-# lowest-entropy tokens whose joint MI is bounded (EntropyBound) → renoise the rest.
-# Adaptive stop when the argmax canvas is stable AND mean entropy is low. (Single
-# canvas = up to canvas_length tokens; the block-autoregressive outer loop that
-# commits a canvas and extends the cache for >canvas_length output is slice 5b.)
+# ── Slice 5: single-canvas sampler + 5b: block-autoregressive outer loop ──────
+# Block-diffusion generation, in two layers:
+#   _denoise_one_canvas — denoise ONE random canvas against an already-prefilled
+#     cache over ≤max_denoising_steps reverse steps. Each step: decode (with
+#     self-conditioning) → temperature-scheduled sample → accept the lowest-entropy
+#     tokens whose joint MI is bounded (EntropyBound) → renoise the rest; adaptive
+#     stop when the argmax canvas is stable AND mean entropy is low. Parity-verified
+#     vs transformers (Router exact, Experts 1e-9; the sampler bugs from the 12-agent
+#     review are fixed). Behaviour here is byte-for-byte the prior single-canvas loop.
+#   diffusion_generate — the block-autoregressive outer loop (5b): prefill the prompt,
+#     then denoise → commit → append the committed canvas to the cache (re-encode it,
+#     so the next canvas attends to prompt + everything generated) → repeat until an
+#     EOS token is committed, max_tokens is reached, or max_canvases blocks. A single
+#     block (max_tokens ≤ canvas_length) reproduces slice 5's single-canvas output.
 
 
 def _token_entropy(logits):
@@ -765,9 +771,12 @@ def _entropy_bound_accept(current, denoiser, logits, entropy_bound):
     return accepted, accepted_mask
 
 
-def diffusion_generate(
+def _denoise_one_canvas(
     model,
-    prompt_ids: mx.array,
+    cache,
+    batch_size: int,
+    softcap: float,
+    next_key,
     *,
     max_denoising_steps: int = 48,
     t_min: float = 0.4,
@@ -775,40 +784,25 @@ def diffusion_generate(
     entropy_bound: float = 0.1,
     confidence_threshold: float = 0.005,
     stability_threshold: int = 1,
-    key=None,
 ):
-    """Denoise one canvas conditioned on `prompt_ids` (B, prompt_len) and return the
-    committed canvas tokens (B, canvas_length). Mirrors transformers'
-    DiffusionGemma generate inner loop (credit @Blaizzy / the HF reference)."""
+    """Denoise ONE canvas against the already-prefilled `cache`; return the committed
+    (batch_size, canvas_length) argmax tokens. `next_key()` yields fresh per-renoise
+    RNG (or None to advance the global RNG). Mirrors transformers' DiffusionGemma
+    inner loop (credit @Blaizzy / the HF reference) — behaviour is unchanged from the
+    prior single-canvas `diffusion_generate`."""
     cfg = model.config
-    B = prompt_ids.shape[0]
     canvas_length = cfg.canvas_length
-    softcap = float(cfg.final_logit_softcapping)
-
-    # Prefill the prompt into the encoder cache once.
-    cache = model.make_cache()
-    _, cache = model.model.encoder(prompt_ids, cache=cache)
 
     def _decoder_logits(canvas, self_cond):
         hidden = model.model.decoder(canvas, cache=cache, self_conditioning_logits=self_cond)
         return _softcap(softcap, model.model.decoder.embed_tokens.as_linear(hidden))
 
     def _rand_canvas(k):
-        return mx.random.randint(0, cfg.vocab_size, (B, canvas_length), key=k)
+        return mx.random.randint(0, cfg.vocab_size, (batch_size, canvas_length), key=k)
 
-    # Per-step RNG: split the provided key so each renoise draws FRESH randomness
-    # (reusing a fixed key would repeat the initial canvas every step). key=None
-    # advances the global RNG, matching HF's unseeded torch.randint.
-    def _next_key():
-        nonlocal key
-        if key is None:
-            return None
-        key, sub = mx.random.split(key)
-        return sub
-
-    canvas = _rand_canvas(_next_key())
+    canvas = _rand_canvas(next_key())
     self_cond = None
-    history = mx.full((stability_threshold, B, canvas_length), -1, dtype=canvas.dtype)
+    history = mx.full((stability_threshold, batch_size, canvas_length), -1, dtype=canvas.dtype)
     argmax_canvas = canvas  # the committed output is the argmax of the logits (HF)
 
     for step in range(max_denoising_steps):
@@ -829,7 +823,7 @@ def diffusion_generate(
         # Adaptive stop: argmax canvas stable across `stability_threshold` steps
         # AND mean per-token entropy below the confidence threshold.
         if stability_threshold == 0:
-            stable = mx.ones((B,), dtype=mx.bool_)
+            stable = mx.ones((batch_size,), dtype=mx.bool_)
         else:
             stable = mx.all(mx.all(history == argmax_canvas[None], axis=-1), axis=0)
             history = mx.roll(history, -1, axis=0)
@@ -840,9 +834,91 @@ def diffusion_generate(
 
         # Continue: keep accepted tokens, renoise the rest; carry the SCALED logits
         # (HF's processed_logits) as self-conditioning — softmax(logits) != softmax(logits/T).
-        canvas = mx.where(accept_mask, denoiser, _rand_canvas(_next_key()))
+        canvas = mx.where(accept_mask, denoiser, _rand_canvas(next_key()))
         self_cond = scaled
         mx.eval(canvas, history)
 
     return argmax_canvas
+
+
+def diffusion_generate(
+    model,
+    prompt_ids: mx.array,
+    *,
+    max_tokens: Optional[int] = None,
+    max_canvases: int = 8,
+    eos_token_ids=None,
+    max_denoising_steps: int = 48,
+    t_min: float = 0.4,
+    t_max: float = 0.8,
+    entropy_bound: float = 0.1,
+    confidence_threshold: float = 0.005,
+    stability_threshold: int = 1,
+    key=None,
+):
+    """Block-autoregressive diffusion generation. Prefill `prompt_ids` (B, prompt_len)
+    into the encoder cache, then repeatedly denoise a canvas, commit it, and append it
+    to the cache (re-encode it, encoder/causal) so the next canvas attends to the
+    prompt + everything generated so far — until an EOS token is committed (any row),
+    `max_tokens` is reached, or `max_canvases` blocks. Returns the committed tokens
+    (B, n_blocks * canvas_length); a single block (max_tokens ≤ canvas_length, the
+    default) reproduces the prior single-canvas output exactly. Mirrors transformers'
+    DiffusionGemma generate (credit @Blaizzy / the HF reference).
+
+    Batched caveat (B>1): there is no per-row freeze for finished rows yet — the loop
+    stops the moment ANY row commits an EOS, so other rows may be short. Single-prompt
+    use (the CLI) is unaffected."""
+    cfg = model.config
+    batch_size = prompt_ids.shape[0]
+    canvas_length = cfg.canvas_length
+    softcap = float(cfg.final_logit_softcapping)
+    eos_set = set(eos_token_ids or [])
+
+    # max_tokens rounds UP to whole canvases, capped by max_canvases. None → 1 canvas.
+    if max_tokens is None:
+        n_blocks = 1
+    else:
+        n_blocks = max(1, min(max_canvases, -(-int(max_tokens) // canvas_length)))
+
+    # Prefill the prompt into the encoder cache once.
+    cache = model.make_cache()
+    _, cache = model.model.encoder(prompt_ids, cache=cache)
+
+    # Per-renoise RNG: split the provided key so each draw is FRESH (a fixed key
+    # repeats the canvas). key=None advances the global RNG (HF's unseeded randint).
+    # Threaded across canvases so blocks don't share noise.
+    def _next_key():
+        nonlocal key
+        if key is None:
+            return None
+        key, sub = mx.random.split(key)
+        return sub
+
+    canvas_params = dict(
+        max_denoising_steps=max_denoising_steps,
+        t_min=t_min,
+        t_max=t_max,
+        entropy_bound=entropy_bound,
+        confidence_threshold=confidence_threshold,
+        stability_threshold=stability_threshold,
+    )
+
+    blocks: List[mx.array] = []
+    for block_idx in range(n_blocks):
+        canvas = _denoise_one_canvas(
+            model, cache, batch_size, softcap, _next_key, **canvas_params
+        )
+        mx.eval(canvas)
+        blocks.append(canvas)
+
+        # Stop once any row has committed an EOS in this canvas.
+        if eos_set and any(t in eos_set for row in canvas.tolist() for t in row):
+            break
+
+        # Commit: append this canvas to the cache (re-encode, encoder/causal) so the
+        # next canvas attends to the prompt + everything generated so far.
+        if block_idx != n_blocks - 1:
+            _, cache = model.model.encoder(canvas, cache=cache)
+
+    return mx.concatenate(blocks, axis=1) if len(blocks) > 1 else blocks[0]
 
