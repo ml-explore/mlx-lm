@@ -301,18 +301,27 @@ def _solve_strict_lower(A: mx.array, b: mx.array, sb: int = SUB_BLOCK) -> mx.arr
 
 
 def _gated_delta_chunk(
-    state: mx.array,  # [B, H, Dk, Dv]
-    q: mx.array,  # [B, H, C, Dk]
-    k: mx.array,  # [B, H, C, Dk]
-    v: mx.array,  # [B, H, C, Dv]
-    g: mx.array,  # [B, H, C], gating in (0, 1)
-    beta: mx.array,  # [B, H, C]
+    state: mx.array,  # [B, Hv, Dk, Dv]
+    q: mx.array,  # [B, Hk, C, Dk]
+    k: mx.array,  # [B, Hk, C, Dk]
+    v: mx.array,  # [B, Hv, C, Dv]
+    g: mx.array,  # [B, Hv, C], gating in (0, 1)
+    beta: mx.array,  # [B, Hv, C]
+    repeat_factor: int = 1,
 ) -> Tuple[mx.array, mx.array]:
     """Run C timesteps as one triangular solve (gated UT/WY transform).
 
     Exact reformulation of the sequential recurrence; runs in fp32.
+
+    Under grouped-query attention (repeat_factor > 1) the C x C key Gram
+    and q . k^T products depend only on the Hk query/key heads, so they
+    are formed before the GQA broadcast to Hv; the per-Hv gating is
+    applied afterwards. This avoids materializing the repeated q/k for the
+    whole sequence and shrinks those two matmuls by repeat_factor.
     """
     C = q.shape[2]
+    Hk = q.shape[1]
+    Hv = v.shape[1]
     orig_dtype = q.dtype
 
     q = q.astype(mx.float32)
@@ -332,21 +341,40 @@ def _gated_delta_chunk(
     L_diff = (g_cumlog[..., :, None] - g_cumlog[..., None, :]) * tril_ones
     L_mask = mx.exp(L_diff) * tril_ones
 
-    v_beta = v * beta[..., None]  # [B, H, C, Dv]
-    k_beta = k * beta[..., None]  # [B, H, C, Dk]
+    # GQA sharing: the C x C products only need the Hk heads. Form them
+    # first, then broadcast q/k and the products to Hv.
+    kkT = k @ mx.swapaxes(k, -1, -2)  # [B, Hk, C, C], kkT[i, j] = <k_i, k_j>
+    qkT = q @ mx.swapaxes(k, -1, -2)  # [B, Hk, C, C]
+    if repeat_factor > 1:
+        B = q.shape[0]
 
+        def _to_hv(x):  # [B, Hk, C, D] -> [B, Hv, C, D]
+            D = x.shape[-1]
+            return mx.broadcast_to(x[:, :, None], (B, Hk, repeat_factor, C, D)).reshape(
+                B, Hv, C, D
+            )
+
+        kkT = _to_hv(kkT)
+        qkT = _to_hv(qkT)
+        q = _to_hv(q)
+        k = _to_hv(k)
+
+    v_beta = v * beta[..., None]  # [B, Hv, C, Dv]
+    k_beta = k * beta[..., None]  # [B, Hv, C, Dk]
+
+    # (k_beta @ k^T)[i, j] = beta_i * <k_i, k_j> = beta_i * kkT[i, j]
     strict_lower = mx.tril(mx.ones((C, C), dtype=mx.float32), k=-1)
-    A = -(k_beta @ mx.swapaxes(k, -1, -2)) * L_mask * strict_lower
+    A = -(beta[..., :, None] * kkT) * L_mask * strict_lower
 
-    decay_exp = mx.exp(g_cumlog)[..., None]  # [B, H, C, 1]
+    decay_exp = mx.exp(g_cumlog)[..., None]  # [B, Hv, C, 1]
     rhs = mx.concatenate([v_beta, k_beta * decay_exp], axis=-1)
     sol = _solve_strict_lower(A, rhs)
     v_corrected, k_cumdecay = mx.split(sol, [v.shape[-1]], axis=-1)
 
-    v_new = v_corrected - k_cumdecay @ state  # [B, H, C, Dv]
-    y_inter = (q * decay_exp) @ state  # [B, H, C, Dv]
+    v_new = v_corrected - k_cumdecay @ state  # [B, Hv, C, Dv]
+    y_inter = (q * decay_exp) @ state  # [B, Hv, C, Dv]
 
-    attn = (q @ mx.swapaxes(k, -1, -2)) * L_mask
+    attn = qkT * L_mask
     y = y_inter + attn @ v_new
 
     state_decay = mx.exp(g_last)[..., None]
@@ -390,13 +418,13 @@ def gated_delta_ops_chunked(
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     C = chunk_size or CHUNK_SIZE
+    repeat_factor = Hv // Hk
 
     if state is None:
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if (repeat_factor := Hv // Hk) > 1:
-        q = mx.repeat(q, repeat_factor, -2)
-        k = mx.repeat(k, repeat_factor, -2)
+    # q/k stay on the Hk query/key heads; the chunk shares their C x C
+    # products across the GQA group and broadcasts to Hv internally.
 
     # Masked steps are identities on the state (g = 1, beta = 0).
     if mask is not None:
@@ -415,9 +443,9 @@ def gated_delta_ops_chunked(
 
     num_chunks = (T + pad_len) // C
 
-    # [B, T, H, D] -> [B, H, Nc, C, D]
-    q = mx.swapaxes(q, 1, 2).reshape(B, Hv, num_chunks, C, Dk)
-    k = mx.swapaxes(k, 1, 2).reshape(B, Hv, num_chunks, C, Dk)
+    # [B, T, H, D] -> [B, H, Nc, C, D]; q/k keep their Hk heads.
+    q = mx.swapaxes(q, 1, 2).reshape(B, Hk, num_chunks, C, Dk)
+    k = mx.swapaxes(k, 1, 2).reshape(B, Hk, num_chunks, C, Dk)
     v = mx.swapaxes(v, 1, 2).reshape(B, Hv, num_chunks, C, Dv)
     g = mx.swapaxes(g, 1, 2).reshape(B, Hv, num_chunks, C)
     beta = mx.swapaxes(beta, 1, 2).reshape(B, Hv, num_chunks, C)
@@ -434,6 +462,7 @@ def gated_delta_ops_chunked(
             v[:, :, ci],
             g[:, :, ci],
             beta[:, :, ci],
+            repeat_factor,
         )
         ys.append(y_c)
 
