@@ -1497,7 +1497,13 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
-            if prev_state == "tool" and tool_text:
+            # Flush any tool call still pending at end of generation. ``tool_text``
+            # is only non-empty when generation finished while in the "tool"
+            # state (e.g. Mistral/Devstral, whose ``tool_call_end`` is empty so
+            # the state machine never transitions back to "normal"). Guarding on
+            # ``prev_state == "tool"`` dropped these because the terminal event
+            # resets ``prev_state``.
+            if tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
 

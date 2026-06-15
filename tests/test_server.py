@@ -13,11 +13,13 @@ import requests
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
+    GenerationContext,
     LRUPromptCache,
     Response,
     ResponseGenerator,
     _process_control_tokens,
 )
+from mlx_lm.tool_parsers import mistral
 from mlx_lm.utils import load
 
 
@@ -684,6 +686,96 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class TestMistralToolStateFlush(unittest.TestCase):
+    """A tool call that ends while still in the "tool" state must be flushed.
+
+    Mistral / Devstral emit ``[TOOL_CALLS]<name>[ARGS]{json}`` and their
+    ``tool_call_end`` is empty, so the state machine never transitions back to
+    "normal" — generation finishes inside the "tool" state. The terminal
+    generation event resets ``prev_state``, so the old
+    ``if prev_state == "tool"`` flush guard dropped the call and the response
+    came back with an empty assistant message.
+    """
+
+    class _FakeGenerator:
+        cli_args = types.SimpleNamespace(
+            allowed_origins=["*"],
+            num_draft_tokens=3,
+            max_tokens=512,
+            temp=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            model=None,
+        )
+
+        def __init__(self, stream):
+            self._stream = stream
+
+        def generate(self, request, generation_args, progress_callback=None):
+            ctx = GenerationContext(
+                has_tool_calling=True,
+                has_thinking=False,
+                tool_parser=mistral.parse_tool_call,
+                sequences={(0,): "[TOOL_CALLS]"},
+                prompt=[1, 2, 3],
+                prompt_cache_count=0,
+            )
+            return ctx, iter(self._stream)
+
+        def stop_and_join(self):
+            pass
+
+    def _post(self, stream, stream_response=False):
+        gen = self._FakeGenerator(stream)
+        httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(gen, *args, **kwargs),
+        )
+        port = httpd.server_port
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            return requests.post(
+                f"http://localhost:{port}/v1/chat/completions",
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "read the file"}],
+                    "stream": stream_response,
+                },
+            ).text
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
+
+    def test_tool_call_flushed_when_generation_ends_in_tool_state(self):
+        # Last event carries the stop and a reset state (None), as the real
+        # generator does — this is what defeated the old prev_state guard.
+        stream = [
+            Response(
+                'read[ARGS]{"file_path": "/tmp/foo.txt"}',
+                10,
+                "tool",
+                None,
+                0.0,
+                None,
+                (),
+            ),
+            Response("", 2, None, None, 0.0, "stop", ()),
+        ]
+        body = json.loads(self._post(stream))
+        choice = body["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        tool_calls = choice["message"]["tool_calls"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read")
+        self.assertEqual(
+            json.loads(tool_calls[0]["function"]["arguments"]),
+            {"file_path": "/tmp/foo.txt"},
+        )
 
 
 if __name__ == "__main__":
