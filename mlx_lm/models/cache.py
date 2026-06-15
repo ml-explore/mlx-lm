@@ -1,9 +1,11 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import json
+import os
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1761,3 +1763,106 @@ class LRUPromptCache:
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
         return result
+
+    # ------------------------------------------------------------------
+    # Disk persistence (server-side resumable prompt cache)
+    # ------------------------------------------------------------------
+    #
+    # Layout of `directory`:
+    #   manifest.json                -- list of entries, ordered oldest -> newest
+    #   entry-<index>.safetensors    -- one per cached prompt; safetensors payload
+    #                                   identical to what `save_prompt_cache` writes
+    #
+    # The model is identified by a caller-supplied stable key (e.g. the model
+    # path or HF repo id). On `load`, the caller passes a `model_key_to_model`
+    # mapping plus the currently-active model so we can resurrect the
+    # in-memory `model` handles each entry refers to. Entries whose model key
+    # is not present in the mapping are skipped (the cache is still loadable
+    # under model-set changes).
+
+    MANIFEST_VERSION = 1
+
+    def save(self, directory: str, model_keys: Dict[int, str]) -> int:
+        """Persist every cached prompt to ``directory``.
+
+        Args:
+            directory: target directory (created if missing).
+            model_keys: mapping from ``id(model)`` to a stable string key.
+                Entries whose model is not in this mapping are skipped.
+
+        Returns:
+            The number of entries written.
+        """
+        os.makedirs(directory, exist_ok=True)
+        entries: List[Dict[str, Any]] = []
+        # Iterate oldest-first across cache types so reload preserves LRU order.
+        for cache_type in self._lru._ordering:
+            for model, tokens in list(self._lru._lrus[cache_type]):
+                key = model_keys.get(id(model))
+                if key is None:
+                    continue
+                entry = self._trie.get(model, tokens)
+                if entry is None:
+                    continue
+                idx = len(entries)
+                fname = f"entry-{idx:05d}.safetensors"
+                save_prompt_cache(
+                    os.path.join(directory, fname),
+                    entry.prompt_cache,
+                )
+                entries.append(
+                    {
+                        "file": fname,
+                        "model_key": key,
+                        "tokens": [int(t) for t in tokens],
+                        "cache_type": cache_type,
+                    }
+                )
+        manifest = {
+            "version": self.MANIFEST_VERSION,
+            "max_size": self.max_size,
+            "max_bytes": int(self.max_bytes) if self.max_bytes < (1 << 62) else -1,
+            "entries": entries,
+        }
+        with open(os.path.join(directory, "manifest.json"), "w") as f:
+            json.dump(manifest, f)
+        return len(entries)
+
+    def load(
+        self,
+        directory: str,
+        model_for_key: Callable[[str], Optional[Any]],
+    ) -> int:
+        """Restore cached prompts written by ``save``.
+
+        Args:
+            directory: directory previously passed to ``save``.
+            model_for_key: callable mapping the stable model key back to a live
+                ``nn.Module``. Returning ``None`` skips the entry.
+
+        Returns:
+            The number of entries restored.
+        """
+        manifest_path = os.path.join(directory, "manifest.json")
+        if not os.path.exists(manifest_path):
+            return 0
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if manifest.get("version") != self.MANIFEST_VERSION:
+            raise ValueError(
+                f"Unsupported prompt-cache manifest version: {manifest.get('version')}"
+            )
+        restored = 0
+        for entry in manifest.get("entries", []):
+            model = model_for_key(entry["model_key"])
+            if model is None:
+                continue
+            cache = load_prompt_cache(os.path.join(directory, entry["file"]))
+            self.insert_cache(
+                model,
+                entry["tokens"],
+                cache,
+                cache_type=entry.get("cache_type", "assistant"),
+            )
+            restored += 1
+        return restored

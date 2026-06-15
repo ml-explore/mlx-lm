@@ -1,10 +1,12 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import atexit
 import json
 import logging
 import pickle
 import platform
+import signal
 import socket
 import time
 import uuid
@@ -1732,6 +1734,68 @@ def _run_http_server(
         response_generator.stop_and_join()
 
 
+def _prompt_cache_model_key(model_key) -> str:
+    """Stable string form of ModelProvider.model_key for on-disk manifests."""
+    # model_key is (model_path, adapter_path, draft_model_path) or None.
+    if model_key is None:
+        return ""
+    return "|".join("" if k is None else str(k) for k in model_key)
+
+
+def _install_prompt_cache_persistence(
+    prompt_cache: LRUPromptCache,
+    model_provider: "ModelProvider",
+    directory: Optional[str],
+) -> None:
+    """Load on startup + save on shutdown when --prompt-cache-dir is set."""
+    if not directory:
+        return
+
+    def _current_model_keys() -> Dict[int, str]:
+        keys: Dict[int, str] = {}
+        if model_provider.model is not None and model_provider.model_key is not None:
+            keys[id(model_provider.model)] = _prompt_cache_model_key(
+                model_provider.model_key
+            )
+        return keys
+
+    def _model_for_key(target: str):
+        # Only return a live model if it matches the currently-loaded one.
+        if model_provider.model is None or model_provider.model_key is None:
+            return None
+        if _prompt_cache_model_key(model_provider.model_key) == target:
+            return model_provider.model
+        return None
+
+    # Load whatever is already on disk (entries for other models are skipped).
+    try:
+        n = prompt_cache.load(directory, _model_for_key)
+        if n:
+            logging.info("Restored %d prompt-cache entries from %s", n, directory)
+    except Exception as e:
+        logging.warning("Failed to restore prompt cache from %s: %s", directory, e)
+
+    def _save() -> None:
+        try:
+            n = prompt_cache.save(directory, _current_model_keys())
+            logging.info("Persisted %d prompt-cache entries to %s", n, directory)
+        except Exception as e:
+            logging.warning("Failed to persist prompt cache to %s: %s", directory, e)
+
+    atexit.register(_save)
+
+    def _on_signal(signum, frame):
+        _save()
+        # Re-raise default behaviour: exit cleanly.
+        raise SystemExit(0)
+
+    # Best-effort: install on SIGTERM only when running in the main thread.
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+    except (ValueError, OSError):
+        pass
+
+
 def run(
     host: str,
     port: int,
@@ -1741,6 +1805,12 @@ def run(
 ):
     group = mx.distributed.init()
     prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    if group.rank() == 0:
+        _install_prompt_cache_persistence(
+            prompt_cache,
+            model_provider,
+            getattr(model_provider.cli_args, "prompt_cache_dir", None),
+        )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1878,6 +1948,17 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory used to persist the in-memory LRU prompt cache across "
+            "server restarts. Entries are loaded on startup and re-saved on "
+            "atexit / SIGTERM. Only entries that match a currently-loaded "
+            "model are restored."
+        ),
     )
     parser.add_argument(
         "--pipeline",

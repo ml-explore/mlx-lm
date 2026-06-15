@@ -140,6 +140,21 @@ curl localhost:8080/v1/chat/completions \
     - `completion_tokens`: The number of tokens generated.
     - `total_tokens`: The total number of tokens, i.e. the sum of the above two fields.
 
+### Persistent Prompt Cache
+
+The server maintains an in-memory LRU of recent prompt caches (see
+`--prompt-cache-size` and `--prompt-cache-bytes`). Pass `--prompt-cache-dir`
+to also persist that LRU to disk so it survives restarts:
+
+```shell
+mlx_lm.server --model <model> --prompt-cache-dir ~/.cache/mlx-lm/prompts
+```
+
+On startup the server restores any entries whose model key matches the
+currently-loaded model. The cache is re-saved on `atexit` and on `SIGTERM`.
+Entries are stored as one safetensors file per cached prompt plus a
+`manifest.json`; the format is forward-compatible via `MANIFEST_VERSION`.
+
 ### List Models
 
 Use the `v1/models` endpoint to list available models:

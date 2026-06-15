@@ -686,5 +686,64 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [3, 4])
 
 
+class TestPromptCacheDiskPersistence(unittest.TestCase):
+    """Server-side load-on-start + save-on-exit wiring for --prompt-cache-dir."""
+
+    def test_install_loads_and_saves(self):
+        import atexit
+        import os
+        import tempfile
+
+        from mlx_lm.server import (
+            _install_prompt_cache_persistence,
+            _prompt_cache_model_key,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = DummyModelProvider()
+            # Seed an LRU and persist it to disk via .save() so we have a real
+            # manifest to reload from.
+            seed = LRUPromptCache(max_size=4)
+            cache = [KVCache()]
+            x = mx.random.uniform(shape=(1, 8, 6, 4))
+            cache[0].update_and_fetch(x, x)
+            seed.insert_cache(provider.model, [1, 2, 3, 4, 5, 6], cache)
+            stable_key = _prompt_cache_model_key(provider.model_key)
+            n_saved = seed.save(tmp, {id(provider.model): stable_key})
+            self.assertEqual(n_saved, 1)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "manifest.json")))
+
+            # Install persistence on a fresh LRU and confirm load-on-start
+            # restored the seeded entry.
+            provider.cli_args.prompt_cache_dir = tmp
+            restored = LRUPromptCache(max_size=4)
+            # Capture atexit-registered callable so we can drive save without
+            # actually exiting the test process.
+            captured = []
+            orig_register = atexit.register
+
+            def _capture(fn, *a, **kw):
+                captured.append(fn)
+                return fn
+
+            atexit.register = _capture
+            try:
+                _install_prompt_cache_persistence(restored, provider, tmp)
+            finally:
+                atexit.register = orig_register
+            self.assertEqual(len(restored), 1)
+
+            # Mutate then drive the captured save callable; manifest entry-count
+            # should reflect the new state.
+            another = [KVCache()]
+            another[0].update_and_fetch(x, x)
+            restored.insert_cache(provider.model, [9, 9, 9], another)
+            self.assertTrue(captured, "atexit save callback was not registered")
+            captured[0]()
+            with open(os.path.join(tmp, "manifest.json")) as f:
+                manifest = json.load(f)
+            self.assertEqual(len(manifest["entries"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from mlx_lm.models.cache import (
     CacheList,
     ChunkedKVCache,
     KVCache,
+    LRUPromptCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -767,6 +768,78 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+
+class TestLRUPromptCacheDiskPersistence(unittest.TestCase):
+    """Round-trip tests for ``LRUPromptCache.save`` / ``.load``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.test_dir_fid = tempfile.TemporaryDirectory()
+        cls.test_dir = cls.test_dir_fid.name
+        cls.model, _ = load(HF_MODEL_PATH)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.test_dir_fid.cleanup()
+
+    def _make_entry(self):
+        cache = make_prompt_cache(self.model)
+        x = mx.random.uniform(shape=(1, 8, 10, 4))
+        for c in cache:
+            c.update_and_fetch(x, x)
+        return cache
+
+    def test_save_load_roundtrip(self):
+        lru = LRUPromptCache(max_size=4)
+        toks_a = [1, 2, 3, 4, 5]
+        toks_b = [10, 20, 30]
+        lru.insert_cache(self.model, toks_a, self._make_entry(), cache_type="user")
+        lru.insert_cache(self.model, toks_b, self._make_entry(), cache_type="assistant")
+        original_nbytes = lru.nbytes
+        original_len = len(lru)
+
+        out_dir = os.path.join(self.test_dir, "persist_roundtrip")
+        n_saved = lru.save(out_dir, {id(self.model): "model-A"})
+        self.assertEqual(n_saved, original_len)
+        self.assertTrue(os.path.exists(os.path.join(out_dir, "manifest.json")))
+
+        # Fresh cache reload via callback.
+        reloaded = LRUPromptCache(max_size=4)
+        n_loaded = reloaded.load(
+            out_dir, lambda k: self.model if k == "model-A" else None
+        )
+        self.assertEqual(n_loaded, original_len)
+        self.assertEqual(len(reloaded), original_len)
+        self.assertEqual(reloaded.nbytes, original_nbytes)
+
+        # Both entries are retrievable.
+        cache_a, rest_a = reloaded.fetch_nearest_cache(self.model, toks_a)
+        self.assertIsNotNone(cache_a)
+        self.assertEqual(rest_a, [])
+        cache_b, rest_b = reloaded.fetch_nearest_cache(self.model, toks_b)
+        self.assertIsNotNone(cache_b)
+        self.assertEqual(rest_b, [])
+
+    def test_load_skips_unknown_model(self):
+        lru = LRUPromptCache(max_size=4)
+        lru.insert_cache(self.model, [7, 8, 9], self._make_entry())
+        out_dir = os.path.join(self.test_dir, "persist_unknown_model")
+        lru.save(out_dir, {id(self.model): "model-A"})
+
+        # Caller does not know "model-A": every entry is skipped silently.
+        reloaded = LRUPromptCache(max_size=4)
+        n_loaded = reloaded.load(out_dir, lambda k: None)
+        self.assertEqual(n_loaded, 0)
+        self.assertEqual(len(reloaded), 0)
+
+    def test_load_missing_dir_is_noop(self):
+        reloaded = LRUPromptCache(max_size=4)
+        n = reloaded.load(
+            os.path.join(self.test_dir, "does-not-exist"),
+            lambda k: self.model,
+        )
+        self.assertEqual(n, 0)
 
 
 if __name__ == "__main__":
