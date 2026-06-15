@@ -4,6 +4,7 @@ import http
 import io
 import json
 import threading
+import types
 import unittest
 
 import mlx.core as mx
@@ -11,7 +12,13 @@ import requests
 
 from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, Response, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+    _make_sampler,
+)
 from mlx_lm.utils import load
 
 
@@ -189,6 +196,35 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(text, "f[ARGS]{}")
         state, s = sm.discard(state)
         self.assertEqual(s, "tool")
+
+
+class TestMakeSampler(unittest.TestCase):
+    def test_xtc_special_tokens_are_flat(self):
+        # Regression: _make_sampler built xtc_special_tokens as a nested list
+        # ([eos_token_id, encode("\n")]), so apply_xtc raised
+        # "Initialization encountered extra dimension." for any request with
+        # temperature > 0 and xtc_probability > 0.
+        # The real TokenizerWrapper exposes both eos_token_id and eos_token_ids.
+        tokenizer = types.SimpleNamespace(
+            encode=lambda s: [3],
+            eos_token_id=0,
+            eos_token_ids=[0],
+        )
+        args = types.SimpleNamespace(
+            sampling=types.SimpleNamespace(
+                temperature=0.6,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                xtc_probability=1.0,
+                xtc_threshold=0.1,
+            )
+        )
+        sampler = _make_sampler(args, tokenizer)
+        logits = mx.log(mx.array([[0.4, 0.3, 0.15, 0.15]]))
+        token = sampler(logits)
+        mx.eval(token)
+        self.assertEqual(token.shape, (1,))
 
 
 class TestServer(unittest.TestCase):
