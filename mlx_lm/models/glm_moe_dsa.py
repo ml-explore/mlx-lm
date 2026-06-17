@@ -42,6 +42,9 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    # Per-layer DSA indexer schedule ("full" -> own indexer, else none). GLM-5.2
+    # uses this; absent -> indexer on every layer (DeepSeek-V3.2 behaviour).
+    indexer_types: Optional[Any] = None
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
