@@ -114,7 +114,7 @@ class Indexer(nn.Module):
 
 
 class DeepseekV32Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, layer_idx: int = None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -165,7 +165,15 @@ class DeepseekV32Attention(nn.Module):
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
 
-        self.indexer = Indexer(config)
+        # Some DSA models (e.g. GLM-5.2) enable the lightning indexer on only a
+        # subset of layers via a per-layer `indexer_types` list ("full" = own
+        # indexer, otherwise none). When the field is absent (DeepSeek-V3.2) the
+        # indexer is built on every layer, as before.
+        indexer_types = getattr(config, "indexer_types", None)
+        if indexer_types is None or layer_idx is None or indexer_types[layer_idx] == "full":
+            self.indexer = Indexer(config)
+        else:
+            self.indexer = None
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -203,36 +211,37 @@ class DeepseekV32Attention(nn.Module):
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
-        if topk_indices is not None:
-            if L == 1:
-                idx = topk_indices[:, :, 0, :, None]
-                kv_latent = mx.take_along_axis(
-                    kv_latent,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
-                    axis=2,
-                )
-                k_pe = mx.take_along_axis(
-                    k_pe,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
-                    axis=2,
-                )
-                if mask is not None:
-                    mask = mx.take_along_axis(mask, topk_indices, axis=-1)
-            else:
-                shape = list(topk_indices.shape)
-                shape[-1] = kv_latent.shape[2]
-                sparse_mask = mx.zeros(shape, dtype=mx.bool_)
-                sparse_mask = mx.put_along_axis(
-                    sparse_mask, topk_indices, mx.array(True), axis=-1
-                )
-                if mask is not None:
-                    sparse_mask = sparse_mask & mask
-                mask = sparse_mask
-        # Ensure the indexer cache is evaluated even if the topk_indices are unused
-        # to keep the graph from getting too large
-        if cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+        if self.indexer is not None:
+            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+            if topk_indices is not None:
+                if L == 1:
+                    idx = topk_indices[:, :, 0, :, None]
+                    kv_latent = mx.take_along_axis(
+                        kv_latent,
+                        mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
+                        axis=2,
+                    )
+                    k_pe = mx.take_along_axis(
+                        k_pe,
+                        mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
+                        axis=2,
+                    )
+                    if mask is not None:
+                        mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+                else:
+                    shape = list(topk_indices.shape)
+                    shape[-1] = kv_latent.shape[2]
+                    sparse_mask = mx.zeros(shape, dtype=mx.bool_)
+                    sparse_mask = mx.put_along_axis(
+                        sparse_mask, topk_indices, mx.array(True), axis=-1
+                    )
+                    if mask is not None:
+                        sparse_mask = sparse_mask & mask
+                    mask = sparse_mask
+            # Ensure the indexer cache is evaluated even if the topk_indices are unused
+            # to keep the graph from getting too large
+            if cache is not None and cache[0] is not None:
+                cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -379,7 +388,7 @@ class DeepseekV32MoE(nn.Module):
 class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekV32Attention(config)
+        self.self_attn = DeepseekV32Attention(config, layer_idx)
         self.mlp = (
             DeepseekV32MoE(config)
             if (
@@ -651,4 +660,13 @@ class Model(nn.Module):
         return predicate
 
     def make_cache(self):
-        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
+        # Layers without an indexer (DSA disabled for that layer) need only the
+        # main attention cache; a second, never-written KVCache would crash
+        # CacheList.state on its empty `keys`.
+        caches = []
+        for layer in self.layers:
+            if layer is not None and getattr(layer.self_attn, "indexer", None) is None:
+                caches.append(CacheList(KVCache()))
+            else:
+                caches.append(CacheList(KVCache(), KVCache()))
+        return caches
