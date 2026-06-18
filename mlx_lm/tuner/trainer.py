@@ -244,20 +244,37 @@ def train(
     state = [model.state, optimizer.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch, prev_grad, do_update):
+    def step(batch, prev_grad, prev_ntoks, do_update):
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
 
-        if prev_grad is not None:
-            grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+        # Token-weighted running mean of the gradient, so accumulation matches the
+        # token-mean loss over the full batch instead of a fixed 1/K average.
+        if prev_grad is None:
+            ntoks = toks
+        else:
+            ntoks = prev_ntoks + toks
+            denom = mx.maximum(ntoks, 1)
+            grad = tree_map(
+                lambda g, acc: (toks / denom) * g + (prev_ntoks / denom) * acc,
+                grad,
+                prev_grad,
+            )
 
         if do_update:
-            grad = average_gradients(grad)
-            if grad_accum_steps > 1:
-                grad = tree_map(lambda x: x / grad_accum_steps, grad)
+            # Single process: the running mean is already the gradient. Only
+            # multiple ranks need the token-weighted reduce.
+            if world_size > 1:
+                grad = average_gradients(tree_map(lambda g: g * ntoks, grad))
+                ntoks = (
+                    mx.maximum(mx.distributed.all_sum(ntoks, stream=mx.cpu), 1)
+                    / world_size
+                )
+                grad = tree_map(lambda g: g / ntoks, grad)
             optimizer.update(model, grad)
             grad = None
+            ntoks = None
 
-        return lvalue, toks, grad
+        return lvalue, toks, grad, ntoks
 
     model.train()
     losses = 0
@@ -266,6 +283,7 @@ def train(
     trained_tokens = 0
     train_time = 0
     grad_accum = None
+    ntoks_accum = None
 
     ui = TrainUI(args.iters, rank=rank)
     with ui:
@@ -318,16 +336,17 @@ def train(
 
                 tic = time.perf_counter()
 
-            lvalue, toks, grad_accum = step(
+            lvalue, toks, grad_accum, ntoks_accum = step(
                 batch,
                 grad_accum,
-                it % grad_accum_steps == 0,
+                ntoks_accum,
+                it % grad_accum_steps == 0 or it == args.iters,
             )
 
             losses += lvalue
             n_tokens += toks
             steps += 1
-            mx.eval(state, losses, n_tokens, grad_accum)
+            mx.eval(state, losses, n_tokens, grad_accum, ntoks_accum)
             _clear_cache(args.clear_cache_threshold)
             train_time += time.perf_counter() - tic
 
