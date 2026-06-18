@@ -341,7 +341,6 @@ class TestScheduleConfig(unittest.TestCase):
         self.assertAlmostEqual(optimizer.learning_rate.item(), expected_lr, delta=1e-1)
 
     def test_single_schedule(self):
-
         config = {
             "name": "cosine_decay",
             "arguments": [0.1, 10],
@@ -445,6 +444,169 @@ class TestScheduleConfig(unittest.TestCase):
             comm_group=ANY,
         )
         self.assertEqual(mock_default_loss.call_count, 3)
+
+
+class TestGradientAccumulation(unittest.TestCase):
+    def _build(self):
+        import numpy as np
+
+        vocab, dim = 64, 16
+
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(vocab, dim)
+                self.lm_head = nn.Linear(dim, vocab, bias=False)
+
+            def __call__(self, x):
+                return self.lm_head(self.embed(x))
+
+        def fresh_model():
+            mx.random.seed(0)
+            model = TinyLM()
+            mx.eval(model.parameters())
+            return model
+
+        def make_mb(ntok, seq_len=33):
+            np.random.seed(ntok)
+            arr = np.zeros((1, seq_len), np.int32)
+            arr[0, :ntok] = np.random.randint(1, vocab, ntok)
+            return mx.array(arr), ntok
+
+        def lengths(ls):
+            return mx.array([[0, n] for n in ls])
+
+        return fresh_model, make_mb, lengths
+
+    def _run(self, model, batches, iters, grad_accum, loss=None):
+        import contextlib
+        import os
+        import tempfile
+
+        from mlx_lm.tuner.trainer import TrainingArgs, default_loss, train
+
+        def batch_iterator(bs):
+            def iterate(
+                dataset, batch_size, max_seq_length, loop=False, comm_group=None
+            ):
+                while True:
+                    yield from bs
+                    if not loop:
+                        break
+
+            return iterate
+
+        with (
+            tempfile.TemporaryDirectory() as td,
+            contextlib.redirect_stdout(StringIO()),
+        ):
+            train(
+                model,
+                opt.SGD(learning_rate=0.1),
+                train_dataset=list(range(len(batches))),
+                args=TrainingArgs(
+                    iters=iters,
+                    batch_size=int(batches[0][0].shape[0]),
+                    grad_accumulation_steps=grad_accum,
+                    max_seq_length=64,
+                    steps_per_report=1000,
+                    steps_per_eval=1000,
+                    steps_per_save=1000,
+                    adapter_file=os.path.join(td, "adapters.safetensors"),
+                ),
+                loss=loss or default_loss,
+                iterate_batches=batch_iterator(batches),
+            )
+        return dict(tree_flatten(model.parameters()))
+
+    def _rel_diff(self, pa, pb):
+        diff = sum(mx.abs(pa[k] - pb[k]).sum().item() for k in pa)
+        norm = sum(mx.abs(pb[k]).sum().item() for k in pb)
+        return diff / norm
+
+    def test_unequal_token_microbatches_match_combined_batch(self):
+        # Unequal-token micro-batches must give the same update as one combined batch.
+        fresh_model, make_mb, lengths = self._build()
+        a1, n1 = make_mb(12)
+        a2, n2 = make_mb(4)
+        both = mx.concatenate([a1, a2], axis=0)
+        micro = [(a1, lengths([n1])), (a2, lengths([n2]))]
+        combined = [(both, lengths([n1, n2]))]
+        pa = self._run(fresh_model(), micro, iters=2, grad_accum=2)
+        pb = self._run(fresh_model(), combined, iters=1, grad_accum=1)
+        self.assertLess(self._rel_diff(pa, pb), 1e-4)
+
+    def test_final_partial_window_is_applied(self):
+        # A trailing partial window (iters not a multiple of grad_accum) must
+        # still be applied: 3 micro-batches at grad_accum=2 should match the two
+        # windows run explicitly.
+        fresh_model, make_mb, lengths = self._build()
+        a1, n1 = make_mb(12)
+        a2, n2 = make_mb(4)
+        a3, n3 = make_mb(7)
+        w1 = mx.concatenate([a1, a2], axis=0)
+        micro = [(a1, lengths([n1])), (a2, lengths([n2])), (a3, lengths([n3]))]
+        windows = [(w1, lengths([n1, n2])), (a3, lengths([n3]))]
+        pa = self._run(fresh_model(), micro, iters=3, grad_accum=2)
+        pb = self._run(fresh_model(), windows, iters=2, grad_accum=1)
+        self.assertLess(self._rel_diff(pa, pb), 1e-4)
+
+    def test_zero_token_window_keeps_params_finite(self):
+        # An all-zero-token window must not add a step-side divide-by-zero (the
+        # zero-token loss NaN itself lives in default_loss). Use a guarded loss.
+        fresh_model, make_mb, lengths = self._build()
+
+        def guarded_loss(model, batch, length):
+            inputs = batch[:, :-1]
+            targets = batch[:, 1:]
+            logits = model(inputs)
+            steps = mx.arange(1, targets.shape[1] + 1)
+            mask = mx.logical_and(steps >= length[:, 0:1], steps <= length[:, 1:])
+            ce = nn.losses.cross_entropy(logits, targets) * mask
+            ntoks = mask.sum()
+            ce = ce.astype(mx.float32).sum() / mx.maximum(ntoks, 1)
+            return ce, ntoks
+
+        a0, n0 = make_mb(0)
+        zero_window = [(a0, lengths([n0])), (a0, lengths([n0]))]
+        params = self._run(
+            fresh_model(), zero_window, iters=2, grad_accum=2, loss=guarded_loss
+        )
+        for name, p in params.items():
+            self.assertFalse(bool(mx.isnan(p.astype(mx.float32)).any().item()), name)
+
+    def test_mixed_zero_and_nonzero_window_ignores_zero_token(self):
+        # A zero-token micro-batch contributes nothing, so mixing it with a normal
+        # one (either order) must match the normal micro-batch alone.
+        fresh_model, make_mb, lengths = self._build()
+
+        def guarded_loss(model, batch, length):
+            inputs = batch[:, :-1]
+            targets = batch[:, 1:]
+            logits = model(inputs)
+            steps = mx.arange(1, targets.shape[1] + 1)
+            mask = mx.logical_and(steps >= length[:, 0:1], steps <= length[:, 1:])
+            ce = nn.losses.cross_entropy(logits, targets) * mask
+            ntoks = mask.sum()
+            ce = ce.astype(mx.float32).sum() / mx.maximum(ntoks, 1)
+            return ce, ntoks
+
+        a0, n0 = make_mb(0)
+        a1, n1 = make_mb(9)
+        zero_first = [(a0, lengths([n0])), (a1, lengths([n1]))]
+        nonzero_first = [(a1, lengths([n1])), (a0, lengths([n0]))]
+        only = [(a1, lengths([n1]))]
+        p_zero_first = self._run(
+            fresh_model(), zero_first, iters=2, grad_accum=2, loss=guarded_loss
+        )
+        p_nonzero_first = self._run(
+            fresh_model(), nonzero_first, iters=2, grad_accum=2, loss=guarded_loss
+        )
+        p_only = self._run(
+            fresh_model(), only, iters=1, grad_accum=1, loss=guarded_loss
+        )
+        self.assertLess(self._rel_diff(p_zero_first, p_only), 1e-4)
+        self.assertLess(self._rel_diff(p_nonzero_first, p_only), 1e-4)
 
 
 if __name__ == "__main__":
