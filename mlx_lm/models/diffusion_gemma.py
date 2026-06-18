@@ -21,37 +21,14 @@
 #     canonical architecture + sampler semantics.
 #   - mlx_lm.models.gemma4_text — the base whose blocks we extend (it already has
 #     SwitchGLU MoE, per-layer-type RoPE, global heads, logit softcap).
-# Full recon: ~/Projects/mlx-diffusion-gemma/RECON.md. Upstream lane: ml-explore/
-# mlx-lm issue #1391 (our shape comment posted; building on it while silent).
+# Tracking issue: ml-explore/mlx-lm#1391.
 #
-# ── BUILD SEQUENCE (this file, top-down; each step gated by tests/test_models.py
-#    conventions + logits parity vs transformers on a tiny random-init config) ──
-#   [x] 1. ModelArgs                — config (mirrors DiffusionGemmaTextConfig).
-#   [x] 2. building blocks          — Attention (v_norm, k==v on full layers,
-#                                     per-layer rope, decoder cache-concat),
-#                                     summed MLP+MoE (Router scale + per_expert_scale,
-#                                     Experts), layer_scalar, self-conditioning MLP.
-#   [x] 3. Encoder / Decoder        — encoder prefills cache (standard mlx-lm
-#                                     KVCache/RotatingKVCache!); decoder does the
-#                                     cache-concat bidirectional canvas attention.
-#   [x] 4. Model (+ sanitize)       — tie encoder↔decoder; sanitize the existing
-#                                     mlx-community conversions (MoE key splits,
-#                                     drop vision tower); softcapped logits.
-#   [x] 5. diffusion_generate       — EntropyBound accept/renoise + temp schedule
-#                                     (0.8→0.4) + adaptive stop. (single-canvas;
-#                                     block-autoregressive outer loop = 5b.)
-#   [x] 6. VERIFICATION — MoE numerically parity-verified vs transformers (Router
-#         exact, Experts 1e-9). 12-agent adversarial review fixed: argmax-commit
-#         (was emitting renoised/random tokens), self-cond carrying SCALED logits,
-#         padding-mask threading, per-step renoise key-split.
-#   [ ] 7. REMAINING: real-weights load (an mlx-community conversion) + Mac tok/s
-#         receipts; mlx-lm registry/CLI wiring; the block-autoregressive outer loop
-#         (>canvas_length, 5b). KNOWN-LIMITATIONS (LOW, vs HF default dynamic path):
-#         sliding decoder layers window the encoder cache to sliding_window-1 for
-#         prompts >512 (inherited verbatim from the parity-verified mlx-vlm impl);
-#         no per-row freeze for finished rows in batched (B>1) generation; and the
-#         HF config halves sliding_window for use_bidirectional_attention="all"
-#         (verify against the real conversion's config.json before replicating).
+# Known limitations (vs the HF default dynamic path; low impact):
+#   - sliding decoder layers window the encoder cache to sliding_window-1 for
+#     prompts longer than the window (inherited from the mlx-vlm impl);
+#   - no per-row freeze for finished rows in batched (B>1) generation;
+#   - the HF config halves sliding_window for use_bidirectional_attention="all"
+#     (verify against the conversion's config.json before replicating).
 
 import weakref
 from dataclasses import dataclass
@@ -168,9 +145,15 @@ class MLP(nn.Module):
 
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def __call__(self, x):
         return self.down_proj(geglu(self.gate_proj(x), self.up_proj(x)))
@@ -290,15 +273,21 @@ class Attention(nn.Module):
         )
         self.scale = 1.0  # mlx-vlm passes 1.0 (no SDPA rescale); mirror for parity.
 
-        self.q_proj = nn.Linear(config.hidden_size, self.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(
+            config.hidden_size, self.n_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, self.n_kv_heads * self.head_dim, bias=False
+        )
         # Full (global) layers reuse keys as values; only sliding layers carry v_proj.
         self.v_proj = (
             nn.Linear(config.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
             if self.is_sliding
             else None
         )
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, config.hidden_size, bias=False)
+        self.o_proj = nn.Linear(
+            self.n_heads * self.head_dim, config.hidden_size, bias=False
+        )
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
@@ -342,7 +331,7 @@ class Attention(nn.Module):
                         encoder_keys = encoder_keys[:, :, -window:, :]
                         encoder_values = encoder_values[:, :, -window:, :]
                         if mask is not None and not isinstance(mask, str):
-                            mask = mask[..., -(window + L):]
+                            mask = mask[..., -(window + L) :]
                 keys = mx.concatenate([encoder_keys, keys], axis=2)
                 values = mx.concatenate([encoder_values, values], axis=2)
             attn_cache = None
@@ -366,9 +355,15 @@ class SelfConditioning(nn.Module):
         super().__init__()
         self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_norm = RMSNormNoScale(config.hidden_size, eps=config.rms_norm_eps)
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def __call__(self, inputs_embeds, self_conditioning_signal):
         normed = self.pre_norm(self_conditioning_signal)
@@ -400,7 +395,9 @@ class DecoderLayer(nn.Module):
         self.post_feedforward_layernorm_2 = nn.RMSNorm(h, eps=eps)
         self.layer_scalar = mx.ones((1,))
 
-    def __call__(self, x, mask=None, cache=None, *, decoder=False, offset=None, layer_scalar=None):
+    def __call__(
+        self, x, mask=None, cache=None, *, decoder=False, offset=None, layer_scalar=None
+    ):
         residual = x
         h = self.input_layernorm(x)
         h = self.self_attn(h, mask, cache, decoder=decoder, offset=offset)
@@ -442,10 +439,17 @@ class DecoderModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_conditioning = SelfConditioning(config)
 
-    def _embed_canvas(self, canvas_ids, self_conditioning_logits=None,
-                      self_conditioning_embeddings=None):
+    def _embed_canvas(
+        self,
+        canvas_ids,
+        self_conditioning_logits=None,
+        self_conditioning_embeddings=None,
+    ):
         inputs_embeds = self.embed_tokens(canvas_ids) * self.embed_scale
-        if self_conditioning_logits is not None and self_conditioning_embeddings is not None:
+        if (
+            self_conditioning_logits is not None
+            and self_conditioning_embeddings is not None
+        ):
             raise ValueError(
                 "Only one of self_conditioning_logits or self_conditioning_embeddings can be set."
             )
@@ -458,13 +462,19 @@ class DecoderModel(nn.Module):
             if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
                 soft_embeddings = mx.quantized_matmul(
                     probs.astype(inputs_embeds.dtype),
-                    self.embed_tokens.weight, self.embed_tokens.scales, self.embed_tokens.biases,
-                    transpose=False, group_size=self.embed_tokens.group_size,
-                    bits=self.embed_tokens.bits, mode=getattr(self.embed_tokens, "mode", "affine"),
+                    self.embed_tokens.weight,
+                    self.embed_tokens.scales,
+                    self.embed_tokens.biases,
+                    transpose=False,
+                    group_size=self.embed_tokens.group_size,
+                    bits=self.embed_tokens.bits,
+                    mode=getattr(self.embed_tokens, "mode", "affine"),
                 )
             else:
                 soft_embeddings = probs @ self.embed_tokens.weight
-            soft_embeddings = soft_embeddings.astype(inputs_embeds.dtype) * self.embed_scale
+            soft_embeddings = (
+                soft_embeddings.astype(inputs_embeds.dtype) * self.embed_scale
+            )
         return self.self_conditioning(inputs_embeds, soft_embeddings)
 
     def _make_decoder_masks(self, h, caches, decoder_attention_mask=None):
@@ -474,8 +484,11 @@ class DecoderModel(nn.Module):
         masks = {}
         for layer_type in set(self.config.layer_types):
             cache = next(
-                (c for c, layer in zip(caches or [], self.layers)
-                 if layer.layer_type == layer_type),
+                (
+                    c
+                    for c, layer in zip(caches or [], self.layers)
+                    if layer.layer_type == layer_type
+                ),
                 None,
             )
             state = _cache_state(cache)
@@ -489,17 +502,22 @@ class DecoderModel(nn.Module):
                         masks[layer_type] = None
                     else:
                         row = mx.concatenate(
-                            [mx.arange(encoder_len) < valid_encoder_len,
-                             mx.ones((canvas_length,), dtype=mx.bool_)], axis=0,
+                            [
+                                mx.arange(encoder_len) < valid_encoder_len,
+                                mx.ones((canvas_length,), dtype=mx.bool_),
+                            ],
+                            axis=0,
                         )
                         masks[layer_type] = mx.broadcast_to(
-                            row[None, None, None, :], (B, 1, canvas_length, key_len))
+                            row[None, None, None, :], (B, 1, canvas_length, key_len)
+                        )
                 else:
                     full = decoder_attention_mask.astype(mx.bool_)
                     if full.shape[-1] != key_len:
                         full = full[..., -key_len:]
                     masks[layer_type] = mx.broadcast_to(
-                        full[:, None, None, :], (B, 1, canvas_length, key_len))
+                        full[:, None, None, :], (B, 1, canvas_length, key_len)
+                    )
                 continue
 
             # sliding_attention
@@ -512,9 +530,11 @@ class DecoderModel(nn.Module):
                 positions = mx.arange(encoder_len)
                 encoder_mask = (positions >= start) & (positions < valid_encoder_len)
                 row = mx.concatenate(
-                    [encoder_mask, mx.ones((canvas_length,), dtype=mx.bool_)], axis=0)
+                    [encoder_mask, mx.ones((canvas_length,), dtype=mx.bool_)], axis=0
+                )
                 masks[layer_type] = mx.broadcast_to(
-                    row[None, None, None, :], (B, 1, canvas_length, key_len))
+                    row[None, None, None, :], (B, 1, canvas_length, key_len)
+                )
             else:
                 full = decoder_attention_mask.astype(mx.bool_)
                 if full.shape[-1] != key_len:
@@ -522,15 +542,27 @@ class DecoderModel(nn.Module):
                 start = max(0, valid_encoder_len - window_prefix)
                 positions = mx.arange(encoder_len)
                 keep = mx.concatenate(
-                    [(positions >= start) & (positions < valid_encoder_len),
-                     mx.ones((canvas_length,), dtype=mx.bool_)], axis=0)
+                    [
+                        (positions >= start) & (positions < valid_encoder_len),
+                        mx.ones((canvas_length,), dtype=mx.bool_),
+                    ],
+                    axis=0,
+                )
                 row = full[:, None, None, :] & keep[None, None, None, :]
                 masks[layer_type] = mx.broadcast_to(row, (B, 1, canvas_length, key_len))
         return masks
 
-    def __call__(self, canvas_ids, cache=None, self_conditioning_logits=None,
-                 self_conditioning_embeddings=None, decoder_attention_mask=None):
-        h = self._embed_canvas(canvas_ids, self_conditioning_logits, self_conditioning_embeddings)
+    def __call__(
+        self,
+        canvas_ids,
+        cache=None,
+        self_conditioning_logits=None,
+        self_conditioning_embeddings=None,
+        decoder_attention_mask=None,
+    ):
+        h = self._embed_canvas(
+            canvas_ids, self_conditioning_logits, self_conditioning_embeddings
+        )
         cache = cache or [None] * len(self.layers)
         masks = self._make_decoder_masks(h, cache, decoder_attention_mask)
         offset = _cache_offset(cache[0]) if cache else 0
@@ -620,8 +652,13 @@ class EncoderModel(nn.Module):
             cache = self.make_cache()
         masks = self._make_encoder_masks(h, cache, attention_mask)
         for i, (layer, c, mask) in enumerate(zip(self.decoder.layers, cache, masks)):
-            h = layer(h, mask, c, decoder=False,
-                      layer_scalar=self.language_model.layers[i].layer_scalar)
+            h = layer(
+                h,
+                mask,
+                c,
+                decoder=False,
+                layer_scalar=self.language_model.layers[i].layer_scalar,
+            )
         return self.decoder.norm(h), cache
 
 
@@ -632,22 +669,34 @@ class DiffusionGemma4Backbone(nn.Module):
         self.decoder = DecoderModel(config)
         self.encoder = EncoderModel(config, self.decoder)
 
-    def __call__(self, input_ids=None, attention_mask=None, cache=None, canvas_ids=None,
-                 self_conditioning_logits=None, self_conditioning_embeddings=None,
-                 decoder_attention_mask=None):
+    def __call__(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        cache=None,
+        canvas_ids=None,
+        self_conditioning_logits=None,
+        self_conditioning_embeddings=None,
+        decoder_attention_mask=None,
+    ):
         if input_ids is not None:
-            _, cache = self.encoder(input_ids, attention_mask=attention_mask, cache=cache)
+            _, cache = self.encoder(
+                input_ids, attention_mask=attention_mask, cache=cache
+            )
         elif cache is None:
             raise ValueError("Either input_ids or cache must be provided.")
         if canvas_ids is None:
             batch_size = input_ids.shape[0]
             canvas_ids = mx.random.randint(
-                0, self.config.vocab_size, (batch_size, self.config.canvas_length))
+                0, self.config.vocab_size, (batch_size, self.config.canvas_length)
+            )
         hidden_states = self.decoder(
-            canvas_ids, cache=cache,
+            canvas_ids,
+            cache=cache,
             self_conditioning_logits=self_conditioning_logits,
             self_conditioning_embeddings=self_conditioning_embeddings,
-            decoder_attention_mask=decoder_attention_mask)
+            decoder_attention_mask=decoder_attention_mask,
+        )
         return hidden_states, cache
 
 
@@ -672,11 +721,14 @@ class Model(nn.Module):
 
     def __call__(self, input_ids=None, cache=None, canvas_ids=None, **kwargs):
         hidden_states, _ = self.model(
-            input_ids=input_ids, cache=cache, canvas_ids=canvas_ids,
+            input_ids=input_ids,
+            cache=cache,
+            canvas_ids=canvas_ids,
             attention_mask=kwargs.get("attention_mask"),
             self_conditioning_logits=kwargs.get("self_conditioning_logits"),
             self_conditioning_embeddings=kwargs.get("self_conditioning_embeddings"),
-            decoder_attention_mask=kwargs.get("decoder_attention_mask"))
+            decoder_attention_mask=kwargs.get("decoder_attention_mask"),
+        )
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         return _softcap(float(self.final_logit_softcapping), logits)
 
@@ -716,10 +768,14 @@ class Model(nn.Module):
                 continue
             # MoE expert tensors → SwitchLinear's `.weight` name.
             if key.endswith(".experts.down_proj"):
-                sanitized[key.replace(".experts.down_proj", ".experts.down_proj.weight")] = value
+                sanitized[
+                    key.replace(".experts.down_proj", ".experts.down_proj.weight")
+                ] = value
                 continue
             if key.endswith(".experts.gate_up_proj"):
-                sanitized[key.replace(".experts.gate_up_proj", ".experts.gate_up_proj.weight")] = value
+                sanitized[
+                    key.replace(".experts.gate_up_proj", ".experts.gate_up_proj.weight")
+                ] = value
                 continue
             sanitized[key] = value
         return sanitized
@@ -764,8 +820,8 @@ def _entropy_bound_accept(current, denoiser, logits, entropy_bound):
     """Accept the k lowest-entropy denoiser tokens while
     `cumulative_entropy - sorted_entropy <= entropy_bound` (≈ independent tokens);
     keep the current token elsewhere. Returns (accepted_canvas, accepted_mask)."""
-    H = _token_entropy(logits)                          # (B, L)
-    order = mx.argsort(H, axis=-1)                       # ascending
+    H = _token_entropy(logits)  # (B, L)
+    order = mx.argsort(H, axis=-1)  # ascending
     sorted_H = mx.take_along_axis(H, order, axis=-1)
     cumulative = mx.cumsum(sorted_H, axis=-1)
     sel_sorted = (cumulative - sorted_H) <= entropy_bound
@@ -799,7 +855,9 @@ def _denoise_one_canvas(
     canvas_length = cfg.canvas_length
 
     def _decoder_logits(canvas, self_cond):
-        hidden = model.model.decoder(canvas, cache=cache, self_conditioning_logits=self_cond)
+        hidden = model.model.decoder(
+            canvas, cache=cache, self_conditioning_logits=self_cond
+        )
         return _softcap(softcap, model.model.decoder.embed_tokens.as_linear(hidden))
 
     def _rand_canvas(k):
@@ -807,7 +865,9 @@ def _denoise_one_canvas(
 
     canvas = _rand_canvas(next_key())
     self_cond = None
-    history = mx.full((stability_threshold, batch_size, canvas_length), -1, dtype=canvas.dtype)
+    history = mx.full(
+        (stability_threshold, batch_size, canvas_length), -1, dtype=canvas.dtype
+    )
     argmax_canvas = canvas  # the committed output is the argmax of the logits (HF)
 
     for step in range(max_denoising_steps):
@@ -815,10 +875,12 @@ def _denoise_one_canvas(
         # Reverse-diffusion schedule: t_max (noisy, exploratory) at the FIRST step
         # down to t_min (sharp) at the last — i.e. 0.8 → 0.4 with the defaults. HF
         # achieves this with a descending cur_step; our `step` ascends, so we invert.
-        temperature = t_min + (t_max - t_min) * ((max_denoising_steps - step) / max_denoising_steps)
+        temperature = t_min + (t_max - t_min) * (
+            (max_denoising_steps - step) / max_denoising_steps
+        )
         scaled = logits / temperature
 
-        denoiser = mx.random.categorical(scaled, axis=-1)            # (B, L)
+        denoiser = mx.random.categorical(scaled, axis=-1)  # (B, L)
         _, accept_mask = _entropy_bound_accept(canvas, denoiser, scaled, entropy_bound)
 
         # HF COMMITS the per-position ARGMAX of the (processed) logits — NOT the
@@ -932,4 +994,3 @@ def diffusion_generate(model, prompt_ids: mx.array, **kwargs) -> mx.array:
     default) reproduces the prior single-canvas output exactly."""
     blocks = list(diffusion_stream_generate(model, prompt_ids, **kwargs))
     return mx.concatenate(blocks, axis=1) if len(blocks) > 1 else blocks[0]
-

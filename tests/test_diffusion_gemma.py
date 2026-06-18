@@ -42,7 +42,9 @@ class TestDiffusionGemmaGenerate(unittest.TestCase):
     def test_single_canvas_default(self):
         # max_tokens unset → one canvas → (1, canvas_length); preserves slice-5 behaviour.
         m = _tiny_model()
-        out = m.diffusion_generate(self.PROMPT, max_denoising_steps=4, key=mx.random.key(0))
+        out = m.diffusion_generate(
+            self.PROMPT, max_denoising_steps=4, key=mx.random.key(0)
+        )
         self.assertEqual(out.shape, (1, 8))
 
     def test_block_autoregressive_extends_beyond_one_canvas(self):
@@ -56,8 +58,11 @@ class TestDiffusionGemmaGenerate(unittest.TestCase):
     def test_max_canvases_caps_block_count(self):
         m = _tiny_model()
         out = m.diffusion_generate(
-            self.PROMPT, max_tokens=999, max_canvases=2,
-            max_denoising_steps=3, key=mx.random.key(1),
+            self.PROMPT,
+            max_tokens=999,
+            max_canvases=2,
+            max_denoising_steps=3,
+            key=mx.random.key(1),
         )
         self.assertEqual(out.shape, (1, 16))
 
@@ -65,8 +70,11 @@ class TestDiffusionGemmaGenerate(unittest.TestCase):
         # Every vocab id marked EOS → the first committed canvas triggers the stop.
         m = _tiny_model()
         out = m.diffusion_generate(
-            self.PROMPT, max_tokens=99, eos_token_ids=list(range(64)),
-            max_denoising_steps=3, key=mx.random.key(2),
+            self.PROMPT,
+            max_tokens=99,
+            eos_token_ids=list(range(64)),
+            max_denoising_steps=3,
+            key=mx.random.key(2),
         )
         self.assertEqual(out.shape, (1, 8))
 

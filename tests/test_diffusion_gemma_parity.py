@@ -21,11 +21,22 @@ from mlx_lm.models import diffusion_gemma as dg
 
 def _tiny_model(canvas_length=8):
     args = dg.ModelArgs(
-        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=16, global_head_dim=16,
-        sliding_window=8, sliding_window_pattern=2, canvas_length=canvas_length,
-        num_experts=4, top_k_experts=2, moe_intermediate_size=32,
-        use_bidirectional_attention="all", final_logit_softcapping=30.0,
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=16,
+        sliding_window=8,
+        sliding_window_pattern=2,
+        canvas_length=canvas_length,
+        num_experts=4,
+        top_k_experts=2,
+        moe_intermediate_size=32,
+        use_bidirectional_attention="all",
+        final_logit_softcapping=30.0,
     )
     model = dg.Model(args)
     mx.eval(model.parameters())
@@ -54,7 +65,9 @@ class TestDiffusionGemmaNumerics(unittest.TestCase):
 
     def test_logits_shape(self):
         logits = np.array(self.model(_PROMPT, canvas_ids=_CANVAS))
-        self.assertEqual(logits.shape, (1, _CANVAS.shape[1], 64))  # (B, canvas_length, vocab)
+        self.assertEqual(
+            logits.shape, (1, _CANVAS.shape[1], 64)
+        )  # (B, canvas_length, vocab)
 
     def test_logits_are_finite(self):
         logits = np.array(self.model(_PROMPT, canvas_ids=_CANVAS))
@@ -77,10 +90,14 @@ class TestDiffusionGemmaTrueParity(unittest.TestCase):
         try:
             import transformers  # noqa: F401
         except ImportError:
-            self.skipTest("transformers not installed — MoE parity verified offline (~1e-9)")
+            self.skipTest(
+                "transformers not installed — MoE parity verified offline (~1e-9)"
+            )
         # Building the HF DiffusionGemma reference with matched weights is not wired
         # into CI; skip rather than fake it.
-        self.skipTest("HF DiffusionGemma reference not wired into CI yet (offline-verified)")
+        self.skipTest(
+            "HF DiffusionGemma reference not wired into CI yet (offline-verified)"
+        )
 
 
 if __name__ == "__main__":
