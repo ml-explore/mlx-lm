@@ -54,7 +54,7 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
         or param_type.startswith("short")
         or param_type.startswith("unsigned")
     ):
-        return int(param_value)
+        return int(float(param_value))
     elif param_type.startswith("num") or param_type.startswith("float"):
         float_param_value = float(param_value)
         int_param_value = int(float_param_value)
