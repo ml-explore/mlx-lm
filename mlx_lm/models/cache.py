@@ -359,6 +359,12 @@ class KVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # Unwritten cache (e.g. the DSA indexer KV on GLM IndexShare "shared"
+            # layers, which never run the indexer): report empty in-memory state so
+            # mx.eval(cache.state) during generation does not dereference keys=None.
+            # (Round-tripping such a cache to disk is a separate, pre-existing limit.)
+            return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -370,7 +376,7 @@ class KVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -772,6 +778,12 @@ class ChunkedKVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # Unwritten cache (e.g. the DSA indexer KV on GLM IndexShare "shared"
+            # layers, which never run the indexer): report empty in-memory state so
+            # mx.eval(cache.state) during generation does not dereference keys=None.
+            # (Round-tripping such a cache to disk is a separate, pre-existing limit.)
+            return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -783,7 +795,7 @@ class ChunkedKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
