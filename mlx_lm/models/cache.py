@@ -359,6 +359,12 @@ class KVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # Unwritten cache (e.g. the DSA indexer KV on GLM IndexShare "shared"
+            # layers, which never run the indexer): report empty in-memory state so
+            # mx.eval(cache.state) during generation does not dereference keys=None.
+            # (Round-tripping such a cache to disk is a separate, pre-existing limit.)
+            return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -370,7 +376,7 @@ class KVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -772,6 +778,12 @@ class ChunkedKVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # Unwritten cache (e.g. the DSA indexer KV on GLM IndexShare "shared"
+            # layers, which never run the indexer): report empty in-memory state so
+            # mx.eval(cache.state) during generation does not dereference keys=None.
+            # (Round-tripping such a cache to disk is a separate, pre-existing limit.)
+            return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -783,7 +795,7 @@ class ChunkedKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -901,6 +913,9 @@ class CacheList(_BaseCache):
 
 
 def dynamic_roll(x, shifts, axis):
+    if x is None:
+        # Unwritten batched cache (DSA indexer KV on IndexShare "shared" layers).
+        return x
     n = x.shape[axis]
     expand_shifts = (...,) + (None,) * (x.ndim - axis)
     expand_indices = expand_shifts[:-1]
@@ -989,6 +1004,11 @@ class BatchKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
+        if k is None:
+            # Unwritten batched cache (e.g. the DSA indexer KV on GLM IndexShare
+            # "shared" layers) — report empty so mx.eval(cache.state) in batch_generate
+            # doesn't dereference keys=None.
+            return None, None, self.offset, self.left_padding
         if self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
@@ -997,7 +1017,7 @@ class BatchKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values, self.offset, self.left_padding = v
-        self._idx = self.keys.shape[2]
+        self._idx = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -1079,6 +1099,10 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
+        if self.keys is None:
+            # Unwritten batched cache (DSA indexer KV on IndexShare "shared" layers):
+            # extract an empty per-sequence cache.
+            return cache
         padding = self.left_padding[idx].item()
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])

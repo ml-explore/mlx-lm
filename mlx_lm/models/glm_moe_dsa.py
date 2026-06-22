@@ -28,13 +28,10 @@ class ModelArgs(BaseModelArgs):
     qk_rope_head_dim: int
     v_head_dim: int
     qk_nope_head_dim: int
-    topk_method: str
-    scoring_func: str
     norm_topk_prob: bool
     n_group: int
     topk_group: int
     num_experts_per_tok: int
-    moe_layer_freq: int
     first_k_dense_replace: int
     max_position_embeddings: int
     rms_norm_eps: float
@@ -42,6 +39,23 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    # GLM-5.2's HF config omits these; deepseek_v32 defaults them, so default here too
+    # (loading a real GLM-5.2 config.json fails otherwise).
+    topk_method: str = "noaux_tc"
+    scoring_func: str = "sigmoid"
+    moe_layer_freq: int = 1
+    # DSA IndexShare: "full" layers run the indexer, "shared" layers reuse the
+    # previous full layer's top-k. indexer_types is provided by GLM-5.2's config;
+    # if absent it is derived from index_topk_freq. index_skip_topk_offset is only
+    # used for MTP iteration in the reference and is accepted-but-ignored here.
+    index_topk_freq: int = 1
+    indexer_types: Optional[Any] = None
+    index_skip_topk_offset: int = 0
+    # GLM-5.2 indexer: non-interleaved RoPE + LayerNorm eps 1e-6 (verified vs HF).
+    # The config's `indexer_rope_interleave` flag is not honored by HF's modeling,
+    # which hardcodes half-split RoPE; we match that empirically-correct behavior.
+    indexer_rope_traditional: bool = False
+    indexer_norm_eps: float = 1e-6
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
