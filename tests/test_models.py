@@ -3101,6 +3101,22 @@ class TestModels(unittest.TestCase):
         self.assertEqual(out.shape, (1, 1, 1024))
         self.assertTrue(bool(mx.isfinite(out).all()))
 
+    def test_batch_kv_cache_unwritten(self):
+        # batch_generate converts each per-layer cache to BatchKVCache; the DSA
+        # indexer KV on GLM IndexShare "shared" layers is never written (keys=None).
+        # state / extract and dynamic_roll must tolerate that, else batch_generate
+        # crashes for glm_moe_dsa / deepseek_v32 with index_topk_freq > 1.
+        from mlx_lm.models.cache import BatchKVCache, dynamic_roll
+
+        c = BatchKVCache([0, 0])  # never updated -> keys is None
+        k, v, _, _ = c.state
+        self.assertIsNone(k)
+        self.assertIsNone(v)
+        self.assertIsNone(c.extract(0).keys)
+        self.assertIsNone(dynamic_roll(None, mx.array([0, 0]), 2))
+        c.state = c.state  # round-trip empty state through the setter
+        self.assertEqual(c._idx, 0)
+
     def test_ssm(self):
         for batch_size in [1, 2]:
             for n_group in [1, 4]:
