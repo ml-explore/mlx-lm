@@ -595,11 +595,11 @@ def speculative_generate_step(
             if not c.is_trimmable():
                 return 0
 
-            max_size = getattr(c, "max_size", None)
-            offset = getattr(c, "offset", None)
-            if max_size is None or offset is None:
+            if not isinstance(c, (RotatingKVCache, BatchRotatingKVCache)):
                 continue
 
+            max_size = c.max_size
+            offset = c._offset if isinstance(c, BatchRotatingKVCache) else c.offset
             if hasattr(offset, "item"):
                 offset = offset.item()
             # Rotating caches stop being trimmable once the window fills, so
