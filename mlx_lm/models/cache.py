@@ -1671,25 +1671,36 @@ class LRUPromptCache:
     def nbytes(self):
         return self._n_bytes
 
-    def fetch_nearest_cache(self, model: Any, tokens: List[int]):
+    def fetch_nearest_cache(
+        self, model: Any, tokens: List[int], pop: bool = False
+    ):
         result = self._trie.search(model, tokens)
+
+        def _fetch(key_tokens: List[int], cached_entry=None) -> List[Any]:
+            if pop:
+                entry = self._trie.pop(result.model, key_tokens)
+                self._n_bytes -= entry.nbytes
+                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+                self._lru.remove(result.model, key_tokens)
+                return entry.prompt_cache
+            e = cached_entry or self._trie.get(result.model, key_tokens)
+            return copy.deepcopy(e.prompt_cache)
+
         if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            return _fetch(result.exact), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache = _fetch(result.longer, cache_entry)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
         if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            return _fetch(result.shorter), tokens[short_length:]
 
         return None, tokens
 

@@ -751,7 +751,7 @@ class ResponseGenerator:
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
+                        current_model_key, prompt, pop=True
                     )
                     prompt_cache_count = len(prompt) - len(rest)
                     N = prompt_cache_count
@@ -926,6 +926,9 @@ class ResponseGenerator:
         def progress(tokens_processed, tokens_total):
             rqueue.put((tokens_processed, tokens_total))
 
+        cache = None
+        cache_key = None
+        cache_was_popped = False
         try:
             # Load the model and tokenizer
             model = self.model_provider.model
@@ -963,8 +966,9 @@ class ResponseGenerator:
             # Load the KV cache
             self._log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                self.model_provider.model_key, prompt, pop=True
             )
+            cache_was_popped = cache is not None
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
@@ -1022,6 +1026,10 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+            if cache_was_popped:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
     def generate(
         self,

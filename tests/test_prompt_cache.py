@@ -768,6 +768,45 @@ class TestPromptCache(unittest.TestCase):
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
 
+    def test_lru_prompt_cache_pop(self):
+        from mlx_lm.models.cache import LRUPromptCache, KVCache
+
+        lru = LRUPromptCache()
+        model_key = "test_model"
+
+        # 1. Test exact match with pop
+        tokens = [1, 2, 3]
+        c1 = KVCache()
+        c1.update_and_fetch(mx.zeros((1, 1, 3, 4)), mx.zeros((1, 1, 3, 4)))
+        lru.insert_cache(model_key, tokens, [c1])
+        self.assertEqual(len(lru), 1)
+
+        # Fetch without pop
+        cache, rest = lru.fetch_nearest_cache(model_key, tokens)
+        self.assertIsNotNone(cache)
+        self.assertEqual(len(lru), 1)
+
+        # Fetch with pop
+        cache, rest = lru.fetch_nearest_cache(model_key, tokens, pop=True)
+        self.assertIsNotNone(cache)
+        self.assertEqual(len(lru), 0)  # LRU is emptied
+        self.assertEqual(lru.nbytes, 0) # Memory bytes removed
+
+        # 2. Test longer prefix with pop (trimming)
+        tokens_longer = [1, 2, 3, 4, 5]
+        c2 = KVCache()
+        c2.update_and_fetch(mx.zeros((1, 1, 5, 4)), mx.zeros((1, 1, 5, 4)))
+        lru.insert_cache(model_key, tokens_longer, [c2])
+        self.assertEqual(len(lru), 1)
+
+        # Fetch shorter prompt from longer cache
+        cache, rest = lru.fetch_nearest_cache(model_key, [1, 2, 3], pop=True)
+        self.assertIsNotNone(cache)
+        self.assertEqual(rest, [3])
+        self.assertEqual(cache[0].offset, 2) # Verify cache was trimmed to prefix len 2
+        self.assertEqual(len(lru), 0) # LRU is emptied
+        self.assertEqual(lru.nbytes, 0) # Memory bytes removed
+
 
 if __name__ == "__main__":
     unittest.main()
