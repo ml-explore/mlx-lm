@@ -3220,6 +3220,199 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    _GEMMA3N_TEXT_CONFIG = {
+        "model_type": "gemma3n",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        "head_dim": 32,
+        "rms_norm_eps": 1e-5,
+        "vocab_size": 1000,
+        "num_key_value_heads": 2,
+        "num_kv_shared_layers": 2,
+        "vocab_size_per_layer_input": 1000,
+        "sliding_window": 8,
+        "max_position_embeddings": 1000,
+        "rope_local_base_freq": 1.0,
+        "rope_theta": 1000.0,
+        "final_logit_softcapping": 1.0,
+        "layer_types": [
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+        "hidden_size_per_layer_input": 256,
+        "altup_num_inputs": 4,
+        "altup_coef_clip": 1.0,
+        "altup_correct_scale": True,
+        "altup_active_idx": 0,
+        "laurel_rank": 8,
+    }
+
+    def _make_gemma3n_model(self):
+        from mlx_lm.models import gemma3n
+
+        args = gemma3n.ModelArgs.from_dict(
+            {
+                "model_type": "gemma3n",
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+                "text_config": self._GEMMA3N_TEXT_CONFIG,
+            }
+        )
+        return gemma3n.Model(args)
+
+    def _make_gemma3n_altup(self):
+        from mlx_lm.models import gemma3n
+
+        cfg = gemma3n.TextConfig.from_dict(self._GEMMA3N_TEXT_CONFIG)
+        return gemma3n.Gemma3nAltUp(cfg), cfg
+
+    def _make_gemma3n_laurel(self):
+        from mlx_lm.models import gemma3n
+
+        cfg = gemma3n.TextConfig.from_dict(self._GEMMA3N_TEXT_CONFIG)
+        return gemma3n.Gemma3nLaurelBlock(cfg), cfg
+
+    def test_gemma3n_kv_shared_layer_flag_is_set_correctly(self):
+        model = self._make_gemma3n_model()
+        lm = model.model.language_model
+        first_kv_shared = lm.first_kv_shared_layer_idx
+        for i, layer in enumerate(model.layers):
+            attn = layer.self_attn
+            if i >= first_kv_shared:
+                self.assertTrue(
+                    attn.is_kv_shared_layer,
+                    f"Layer {i} should have is_kv_shared_layer=True",
+                )
+            else:
+                self.assertFalse(
+                    attn.is_kv_shared_layer,
+                    f"Layer {i} should have is_kv_shared_layer=False",
+                )
+
+    def test_gemma3n_make_cache_returns_only_non_shared_layers(self):
+        model = self._make_gemma3n_model()
+        cfg = model.model.language_model.config
+        expected = cfg.num_hidden_layers - cfg.num_kv_shared_layers
+        cache = model.make_cache()
+        self.assertEqual(len(cache), expected)
+
+    def test_gemma3n_make_cache_types_match_layer_types(self):
+        model = self._make_gemma3n_model()
+        cfg = model.model.language_model.config
+        non_shared_types = cfg.layer_types[
+            : cfg.num_hidden_layers - cfg.num_kv_shared_layers
+        ]
+        cache = model.make_cache()
+        for idx, (c, layer_type) in enumerate(zip(cache, non_shared_types)):
+            if layer_type == "full_attention":
+                self.assertIsInstance(c, KVCache)
+            elif layer_type == "sliding_attention":
+                self.assertIsInstance(c, RotatingKVCache)
+
+    def test_gemma3n_altup_predict_output_shape(self):
+        altup, cfg = self._make_gemma3n_altup()
+        x = mx.random.normal(shape=(cfg.altup_num_inputs, 1, 4, cfg.hidden_size))
+        out = altup.predict(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, (cfg.altup_num_inputs, 1, 4, cfg.hidden_size))
+
+    def test_gemma3n_altup_correct_output_shape(self):
+        altup, cfg = self._make_gemma3n_altup()
+        predictions = mx.random.normal(
+            shape=(cfg.altup_num_inputs, 1, 4, cfg.hidden_size)
+        )
+        activated = mx.random.normal(shape=(1, 4, cfg.hidden_size))
+        out = altup.correct(predictions, activated)
+        mx.eval(out)
+        self.assertEqual(out.shape, (cfg.altup_num_inputs, 1, 4, cfg.hidden_size))
+
+    def test_gemma3n_altup_preserves_dtype(self):
+        altup, cfg = self._make_gemma3n_altup()
+        for dtype in [mx.float32, mx.float16]:
+            x = mx.random.normal(
+                shape=(cfg.altup_num_inputs, 1, 2, cfg.hidden_size)
+            ).astype(dtype)
+            out = altup.predict(x)
+            mx.eval(out)
+            self.assertEqual(out.dtype, dtype)
+            activated = mx.random.normal(shape=(1, 2, cfg.hidden_size)).astype(dtype)
+            out = altup.correct(x, activated)
+            mx.eval(out)
+            self.assertEqual(out.dtype, dtype)
+
+    def test_gemma3n_laurel_output_shape_matches_input(self):
+        laurel, cfg = self._make_gemma3n_laurel()
+        x = mx.random.normal(shape=(2, 6, cfg.hidden_size))
+        out = laurel(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+
+    def test_gemma3n_laurel_is_residual_with_zero_projection(self):
+        laurel, cfg = self._make_gemma3n_laurel()
+        laurel.linear_left.weight = mx.zeros_like(laurel.linear_left.weight)
+        x = mx.random.normal(shape=(1, 4, cfg.hidden_size))
+        out = laurel(x)
+        mx.eval(out, x)
+        self.assertTrue(mx.allclose(out, x, atol=1e-5))
+
+    def test_gemma3n_sanitize_removes_multimodal_keys(self):
+        model = self._make_gemma3n_model()
+        weights = dict(tree_flatten(model.parameters()))
+        for key in [
+            "model.vision_tower.weight",
+            "model.audio_tower.weight",
+            "model.embed_audio.weight",
+            "model.embed_vision.weight",
+        ]:
+            weights[key] = mx.zeros((4, 4))
+        sanitized = model.sanitize(weights)
+        for key in [
+            "model.vision_tower.weight",
+            "model.audio_tower.weight",
+            "model.embed_audio.weight",
+            "model.embed_vision.weight",
+        ]:
+            self.assertNotIn(key, sanitized)
+
+    def test_gemma3n_sanitize_preserves_text_weights(self):
+        model = self._make_gemma3n_model()
+        weights = dict(tree_flatten(model.parameters()))
+        sanitized = model.sanitize(weights)
+        for key in weights:
+            self.assertIn(key, sanitized)
+
+    def test_gemma3n_forward_output_shape(self):
+        model = self._make_gemma3n_model()
+        cfg = model.model.language_model.config
+        out = model(mx.array([[1, 2, 3, 4]]))
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 4, cfg.vocab_size))
+
+    def test_gemma3n_incremental_generation_shape(self):
+        model = self._make_gemma3n_model()
+        cfg = model.model.language_model.config
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        out = model(inputs, cache=cache)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 4, cfg.vocab_size))
+        next_token = mx.argmax(out[0, -1:, :], keepdims=True)
+        out2 = model(next_token, cache=cache)
+        mx.eval(out2)
+        self.assertEqual(out2.shape, (1, 1, cfg.vocab_size))
+
+    def test_gemma3n_logit_softcapping_bounds_output(self):
+        model = self._make_gemma3n_model()
+        out = model(mx.array([[1, 2, 3]]))
+        mx.eval(out)
+        self.assertTrue(mx.all(out < 1.0).item())
+        self.assertTrue(mx.all(out > -1.0).item())
+
 
 if __name__ == "__main__":
     unittest.main()
