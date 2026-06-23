@@ -13,11 +13,85 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    speculative_generate_step,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
+
+
+class _OffsetTokenModel:
+    def __init__(self, bias=0, max_cache_size=3, vocab_size=16):
+        self.bias = bias
+        self.max_cache_size = max_cache_size
+        self.vocab_size = vocab_size
+        self.layers = [object()]
+
+    def make_cache(self):
+        return [RotatingKVCache(max_size=self.max_cache_size)]
+
+    def __call__(self, tokens, cache):
+        cache_entry = cache[0]
+        offset = int(cache_entry.offset)
+        batch_size, seq_len = tokens.shape
+
+        logits = []
+        for _ in range(batch_size):
+            batch_logits = []
+            for i in range(seq_len):
+                token = (offset + i + self.bias) % self.vocab_size
+                row = [-1000.0] * self.vocab_size
+                row[token] = 0.0
+                batch_logits.append(row)
+            logits.append(batch_logits)
+
+        state = mx.zeros((batch_size, 1, seq_len, 1), dtype=mx.float32)
+        cache_entry.update_and_fetch(state, state)
+        return mx.array(logits, dtype=mx.float32)
+
+
+class TestSpeculativeGenerateStep(unittest.TestCase):
+    def test_draft_tokens_are_used_when_rotating_cache_can_rollback(self):
+        results = list(
+            speculative_generate_step(
+                mx.array([1, 2], dtype=mx.uint32),
+                _OffsetTokenModel(max_cache_size=10),
+                _OffsetTokenModel(max_cache_size=10),
+                num_draft_tokens=2,
+                max_tokens=5,
+            )
+        )
+
+        self.assertEqual(
+            [from_draft for _, _, from_draft in results],
+            [True, True, False, True, True],
+        )
+
+    def test_rotating_cache_falls_back_when_rollback_is_not_safe(self):
+        prompt = mx.array([1, 2], dtype=mx.uint32)
+
+        expected = [
+            token
+            for token, _ in generate_step(
+                prompt,
+                _OffsetTokenModel(max_cache_size=3),
+                max_tokens=4,
+            )
+        ]
+
+        results = list(
+            speculative_generate_step(
+                prompt,
+                _OffsetTokenModel(max_cache_size=3),
+                _OffsetTokenModel(bias=1, max_cache_size=3),
+                num_draft_tokens=2,
+                max_tokens=4,
+            )
+        )
+
+        self.assertEqual([token for token, _, _ in results], expected)
+        self.assertEqual([from_draft for _, _, from_draft in results], [False] * 4)
 
 
 class TestGenerate(unittest.TestCase):

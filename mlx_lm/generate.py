@@ -590,6 +590,25 @@ def speculative_generate_step(
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
+    def _limit_draft_tokens(prompt_cache, num_draft, extra_target_tokens):
+        for c in prompt_cache:
+            if not c.is_trimmable():
+                return 0
+
+            max_size = getattr(c, "max_size", None)
+            offset = getattr(c, "offset", None)
+            if max_size is None or offset is None:
+                continue
+
+            if hasattr(offset, "item"):
+                offset = offset.item()
+            # Rotating caches stop being trimmable once the window fills, so
+            # only draft while a verifier rejection can still be rewound.
+            rollback_safe = max_size - int(offset) - extra_target_tokens - 1
+            num_draft = min(num_draft, rollback_safe)
+
+        return max(num_draft, 0)
+
     def _draft_generate(y, num_draft):
         if num_draft == 0:
             return mx.array([], mx.uint32)
@@ -611,6 +630,8 @@ def speculative_generate_step(
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
+            num_draft = _limit_draft_tokens(model_cache, num_draft, 1)
+            num_draft = _limit_draft_tokens(draft_cache, num_draft, 0)
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
