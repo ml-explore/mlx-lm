@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache
+from .cache import CacheList, KVCache, QuantizedKVCache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -50,6 +50,48 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    index_topk_freq: int = 1
+    indexer_types: Optional[Any] = None
+    # Indexer RoPE/eps knobs. These DEFAULTS reproduce DeepSeek-V3.2 exactly
+    # (interleaved RoPE via traditional=True, LayerNorm eps 1e-5). GLM-5.2 overrides
+    # them in glm_moe_dsa.py to non-interleaved RoPE (traditional=False) + eps 1e-6.
+    indexer_rope_traditional: bool = True
+    indexer_norm_eps: float = 1e-5
+
+
+def derive_indexer_types(num_layers, index_topk_freq, indexer_types):
+    """Per-layer DSA mode. "full" layers run the indexer; "shared" layers reuse
+    the previous full layer's top-k (GLM-5.2 IndexShare). Mirrors the HF rule;
+    index_topk_freq=1 -> every layer "full" (DeepSeek-V3.2 behavior)."""
+    if indexer_types is not None:
+        return list(indexer_types)
+    return [
+        "full" if (max(i - 1, 0) % index_topk_freq) == 0 else "shared"
+        for i in range(num_layers)
+    ]
+
+
+class MLACacheList(CacheList):
+    """Per-layer cache for MLA + DSA: caches[0] is the compressed-latent KV,
+    caches[1] is the DSA indexer KV. Unlike the generic CacheList it exposes
+    ``offset`` and ``to_quantized`` so ``generate.maybe_quantize_kv_cache`` can
+    int8-quantize ONLY the large latent cache (the tiny indexer cache stays full
+    precision) — this is what lets a 1M-token context fit. The MLA attention
+    dequantizes the latent on read. Keeping this on a subclass leaves the generic
+    CacheList (used by other hybrid models) untouched."""
+
+    @property
+    def offset(self):
+        return self.caches[0].offset
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> "MLACacheList":
+        latent = self.caches[0]
+        q0 = (
+            latent.to_quantized(group_size=group_size, bits=bits)
+            if hasattr(latent, "to_quantized")
+            else latent
+        )
+        return MLACacheList(q0, *self.caches[1:])
 
 
 class Indexer(nn.Module):
@@ -65,13 +107,13 @@ class Indexer(nn.Module):
             self.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
         self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=args.indexer_norm_eps)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=True,
+            traditional=args.indexer_rope_traditional,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
@@ -83,30 +125,23 @@ class Indexer(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any] = None,
     ):
-        # Computes top_k indices for attention.
-        # K-side first — needed for the cache update even if we short-circuit.
-        # Q-side (wq_b matmul + rope) is deferred past the index_topk check:
-        # for sequences shorter than index_topk we return None without ever
-        # computing q. On DeepSeek-V3.2-Exp this skips ~25 MB of wq_b weight
-        # reads per attention layer per decode step when the sequence hasn't
-        # yet crossed the index_topk threshold.
+        # Computes top_k indices for attention
         b, s, _ = x.shape
-        offset = cache.offset if cache is not None else 0
-
+        q = self.wq_b(qr)
+        q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
         k = self.wk(x)
         k = self.k_norm(k)
         k = mx.reshape(k, (b, 1, s, self.head_dim))
+
+        offset = cache.offset if cache is not None else 0
+
+        q = self.rope(q, offset=offset)
         k = self.rope(k, offset=offset)
 
         if cache is not None:
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
-
-        q = self.wq_b(qr)
-        q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
-        q = self.rope(q, offset=offset)
-
         scores = q @ k.swapaxes(-1, -2)
         scores = mx.maximum(scores, 0)
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
@@ -121,9 +156,10 @@ class Indexer(nn.Module):
 
 
 class DeepseekV32Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, is_full: bool = True):
         super().__init__()
         self.config = config
+        self.is_full = is_full
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
@@ -172,7 +208,7 @@ class DeepseekV32Attention(nn.Module):
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
 
-        self.indexer = Indexer(config)
+        self.indexer = Indexer(config) if is_full else None
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -186,7 +222,8 @@ class DeepseekV32Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
+        prev_topk: Optional[mx.array] = None,
+    ):
         B, L, D = x.shape
 
         qr = self.q_a_layernorm(self.q_a_proj(x))
@@ -207,10 +244,21 @@ class DeepseekV32Attention(nn.Module):
 
         if cache is not None:
             kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
+            if isinstance(cache[0], QuantizedKVCache):
+                # int8 MLA latent KV: the cache returns quantized (packed,scales,biases)
+                # tuples; dequantize so the MLA reconstruction (take_along_axis /
+                # embed_q / unembed_out) sees plain arrays. Enables comfortable 1M ctx.
+                _qp = dict(group_size=cache[0].group_size, bits=cache[0].bits)
+                kv_latent = mx.dequantize(*kv_latent, **_qp)
+                k_pe = mx.dequantize(*k_pe, **_qp)
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        if self.is_full:
+            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        else:
+            # IndexShare: reuse the most recent "full" layer's top-k indices.
+            topk_indices = prev_topk
         if topk_indices is not None:
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
@@ -224,20 +272,8 @@ class DeepseekV32Attention(nn.Module):
                     mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
                     axis=2,
                 )
-                # Build the left-padding mask unconditionally when the cache
-                # carries ``left_padding``. The previous implementation branched
-                # on ``left_padding.max().item() > 0`` which forced a GPU→CPU
-                # sync at every attention layer (61 layers → 61 syncs per decode
-                # token), breaking pipeline-parallel overlap on multi-machine
-                # inference. When no sequence has left padding the check
-                # ``gathered_idx >= 0`` is trivially True and SDPA produces the
-                # same output as ``mask=None``.
-                if mask is not None and hasattr(cache[0], "left_padding"):
-                    gathered_idx = topk_indices[:, :, 0, :]
-                    left_pad = cache[0].left_padding[:, None, None]
-                    mask = (gathered_idx >= left_pad)[:, :, None, :]
-                else:
-                    mask = None
+                if mask is not None:
+                    mask = mx.take_along_axis(mask, topk_indices, axis=-1)
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
@@ -250,8 +286,13 @@ class DeepseekV32Attention(nn.Module):
                 mask = sparse_mask
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
-        if cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+        if self.is_full and cache is not None and cache[0] is not None:
+            _dep = (cache[1].keys, cache[1].values)
+            if isinstance(cache[0], QuantizedKVCache):
+                # keys is a (packed, scales, biases) tuple when quantized
+                cache[0].keys = tuple(mx.depends(k, _dep) for k in cache[0].keys)
+            else:
+                cache[0].keys = mx.depends(cache[0].keys, _dep)
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -275,7 +316,7 @@ class DeepseekV32Attention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return self.o_proj(output), topk_indices
 
 
 class DeepseekV32MLP(nn.Module):
@@ -396,9 +437,9 @@ class DeepseekV32MoE(nn.Module):
 
 
 class DeepseekV32DecoderLayer(nn.Module):
-    def __init__(self, config: ModelArgs, layer_idx: int):
+    def __init__(self, config: ModelArgs, layer_idx: int, is_full: bool = True):
         super().__init__()
-        self.self_attn = DeepseekV32Attention(config)
+        self.self_attn = DeepseekV32Attention(config, is_full=is_full)
         self.mlp = (
             DeepseekV32MoE(config)
             if (
@@ -418,11 +459,12 @@ class DeepseekV32DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        prev_topk: Optional[mx.array] = None,
+    ):
+        r, topk = self.self_attn(self.input_layernorm(x), mask, cache, prev_topk)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        return h + r, topk
 
 
 class DeepseekV32Model(nn.Module):
@@ -430,8 +472,11 @@ class DeepseekV32Model(nn.Module):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        indexer_types = derive_indexer_types(
+            config.num_hidden_layers, config.index_topk_freq, config.indexer_types
+        )
         self.layers = [
-            DeepseekV32DecoderLayer(config, idx)
+            DeepseekV32DecoderLayer(config, idx, is_full=(indexer_types[idx] == "full"))
             for idx in range(config.num_hidden_layers)
         ]
         self.start_idx = 0
@@ -478,8 +523,11 @@ class DeepseekV32Model(nn.Module):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
+        # Thread DSA top-k across layers (GLM-5.2 IndexShare): a "full" layer
+        # computes the indices and subsequent "shared" layers reuse them.
+        topk = None
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+            h, topk = self.layers[self.start_idx + i](h, mask, cache[i], topk)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -670,4 +718,4 @@ class Model(nn.Module):
         return predicate
 
     def make_cache(self):
-        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
+        return [MLACacheList(KVCache(), KVCache()) for _ in self.layers]
