@@ -3219,6 +3219,188 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+    
+
+    def test_afm7_kv_reuse_cache_count(self):
+        """
+        make_cache() should only allocate cache entries for non-reuse layers.
+        With 4 total layers and 1 reuse layer, expect 3 cache entries.
+        """
+
+        from mlx_lm.models import afm7
+
+        args = afm7.ModelArgs(
+            model_type="afm7",
+            vocab_size=32,
+            hidden_dim=32,
+            num_layers=4,
+            num_kv_reuse_layers=1,
+            num_heads=4,
+            num_kv_heads=2,
+        )
+        model = afm7.Model(args)
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), 3)
+    
+    def test_afm7_kv_reuse_attention_has_no_kv_projections(self):
+        """
+        KVReuseAttention should have its own query projection (q_proj) but no
+        fused qkv_proj, unlike the normal Attention class. This confirms reuse
+        layers only compute queries themselves and rely on borrowed keys/values
+        rather than projecting their own.
+        """
+        from mlx_lm.models import afm7
+
+        args = afm7.ModelArgs(
+            model_type="afm7",
+            vocab_size=32,
+            hidden_dim=32,
+            num_layers=4,
+            num_kv_reuse_layers=1,
+            num_heads=4,
+            num_kv_heads=2,
+        )
+        attn = afm7.KVReuseAttention(args)
+        self.assertTrue(hasattr(attn, "q_proj"))
+        self.assertFalse(hasattr(attn, "qkv_proj"))
+        
+
+    def test_afm7_kv_reuse_attention(self):
+        """
+        KVReuseTransformerBlock should use the provided keys and values.
+        Passing zeroed keys/values instead of real ones should produce a
+        different output, confirming the block is not ignoring its KV inputs.
+        """
+        from mlx_lm.models import afm7
+
+        args = afm7.ModelArgs(
+            model_type="afm7",
+            vocab_size=32,
+            hidden_dim=32,
+            num_layers=4,
+            num_kv_reuse_layers=1,
+            num_heads=4,
+            num_kv_heads=2,
+        )
+
+        model = afm7.Model(args)
+        cache = model.make_cache()
+        input = mx.array([[0, 1]])
+
+        model.model(input, cache)
+        keys, values = cache[-1].state
+
+        x = mx.random.normal(shape=(1, 2, 32))
+
+        block = afm7.KVReuseTransformerBlock(args)
+        output_actual = block(x, keys, values)
+        output_wrong = block(x, mx.zeros_like(keys), mx.zeros_like(values))
+
+        self.assertFalse(mx.array_equal(output_actual, output_wrong))
+    
+
+    def test_afm7_fused_linear_split_shape(self):
+        """
+        FusedLinear packs multiple output projections into a single linear
+        layer for efficiency, then splits the result back into separate
+        arrays. This checks that the split correctly preserves the requested
+        output_dims for each piece.
+        """
+        from mlx_lm.models import afm7
+
+        fl = afm7.FusedLinear(input_dims=8, output_dims=[4, 2, 2])
+        x = mx.random.normal(shape=(1, 5, 8))
+        out1, out2, out3 = fl(x)
+
+        self.assertEqual(out1.shape, (1, 5, 4))
+        self.assertEqual(out2.shape, (1, 5, 2))
+        self.assertEqual(out3.shape, (1, 5, 2))
+    
+    def test_afm7_fake_8bit_quant_clipping(self):
+        """
+        fake_8bit_quant simulates 8-bit integer storage by rounding and
+        clipping to the signed 8-bit range [-128, 127]. This checks that
+        values far outside that range are correctly clipped at both the
+        upper bound (127) and the lower, asymmetric bound (-128).
+        """
+        from mlx_lm.models import afm7
+
+        scale = mx.array(1.0)
+
+        # test the upper bound
+        x1 = mx.array([500.0])
+        out1 = afm7.fake_8bit_quant(x1, scale)
+        self.assertEqual(out1.item(), 127)
+
+        # test the lower bound
+        x2 = mx.array([-500.0])
+        out2 = afm7.fake_8bit_quant(x2, scale)
+        self.assertEqual(out2.item(), -128)
+    
+
+    def test_afm7_incremental_generation_matches_full_forward(self):
+        """
+        Running the model incrementally (one token at a time, using a cache)
+        should produce the same output as running the full sequence in a
+        single forward pass. This is the key correctness check for caching
+        and KV-reuse working together correctly during real generation.
+        """
+        from mlx_lm.models import afm7
+
+        args = afm7.ModelArgs(
+            model_type="afm7",
+            vocab_size=32,
+            hidden_dim=32,
+            num_layers=4,
+            num_kv_reuse_layers=1,
+            num_heads=4,
+            num_kv_heads=2,
+        )
+        model = afm7.Model(args)
+
+        tokens = [0, 1, 2, 3]
+
+        # Full forward pass, no cache
+        full_input = mx.array([tokens])
+        full_output = model(full_input)
+
+        # Incremental: one token at a time, using a cache
+        cache = model.make_cache()
+        incremental_outputs = []
+        for t in tokens:
+            step_input = mx.array([[t]])
+            step_output = model(step_input, cache=cache)
+            incremental_outputs.append(step_output)
+        incremental_output = mx.concatenate(incremental_outputs, axis=1)
+
+        self.assertTrue(
+            mx.allclose(full_output, incremental_output, atol=1e-4).item()
+        )
+    
+    def test_afm7_fused_linear_to_quantized_roundtrip(self):
+        """
+        Converting a FusedLinear to a FusedQuantizedLinear should preserve
+        its output_dims structure, and running the same input through both
+        versions should produce reasonably close outputs despite the lossy
+        nature of quantization.
+        """
+        from mlx_lm.models import afm7
+
+        fl = afm7.FusedLinear(input_dims=64, output_dims=[32, 16, 16])
+        ql = fl.to_quantized()
+
+        self.assertEqual(ql.output_dims, [32, 16, 16])
+
+        mx.random.seed(42)
+        x = mx.random.normal(shape=(1, 5, 64))
+        fl_out1, fl_out2, fl_out3 = fl(x)
+        ql_out1, ql_out2, ql_out3 = ql(x)
+
+        self.assertTrue(mx.allclose(fl_out1, ql_out1, atol=0.2).item())
+        self.assertTrue(mx.allclose(fl_out2, ql_out2, atol=0.2).item())
+        self.assertTrue(mx.allclose(fl_out3, ql_out3, atol=0.2).item())
+
 
 
 if __name__ == "__main__":
