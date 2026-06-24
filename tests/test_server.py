@@ -6,6 +6,8 @@ import json
 import threading
 import types
 import unittest
+from argparse import Namespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -14,6 +16,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    ModelProvider,
     Response,
     ResponseGenerator,
     _process_control_tokens,
@@ -154,6 +157,50 @@ class TestProcessControlTokens(unittest.TestCase):
         self.assertEqual(
             [t.state for t in out],
             ["tool", "tool", "tool", "normal", "normal"],
+        )
+
+
+class TestServerCli(unittest.TestCase):
+    def test_parser_exposes_lazy_flag(self):
+        from mlx_lm import server
+
+        parser = server._build_arg_parser()
+
+        self.assertFalse(parser.parse_args([]).lazy)
+        self.assertTrue(parser.parse_args(["--lazy"]).lazy)
+
+    def test_model_provider_passes_lazy_to_main_model_load(self):
+        args = Namespace(
+            model="mlx-community/test-model",
+            adapter_path=None,
+            draft_model=None,
+            trust_remote_code=False,
+            chat_template="",
+            use_default_chat_template=False,
+            pipeline=False,
+            lazy=True,
+        )
+        group = types.SimpleNamespace(size=lambda: 1)
+        tokenizer = types.SimpleNamespace(
+            chat_template=None,
+            default_chat_template="default",
+            vocab_size=1,
+        )
+
+        with patch("mlx_lm.server.mx.distributed.init", return_value=group):
+            with patch(
+                "mlx_lm.server.load", return_value=(object(), tokenizer)
+            ) as load:
+                with patch("mlx_lm.server.make_prompt_cache", return_value=[]):
+                    provider = ModelProvider(args)
+                    provider.load_default()
+
+        load.assert_called_once_with(
+            "mlx-community/test-model",
+            adapter_path=None,
+            tokenizer_config={"trust_remote_code": False},
+            trust_remote_code=False,
+            lazy=True,
         )
 
 

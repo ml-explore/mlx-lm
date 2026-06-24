@@ -350,6 +350,7 @@ class ModelProvider:
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
                 trust_remote_code=self.cli_args.trust_remote_code,
+                lazy=getattr(self.cli_args, "lazy", False),
             )
 
         # Use the default chat template if needed
@@ -1748,7 +1749,7 @@ def run(
         response_generator.join()
 
 
-def main():
+def _build_arg_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -1794,6 +1795,11 @@ def main():
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer",
+    )
+    parser.add_argument(
+        "--lazy",
+        action="store_true",
+        help="Load model weights lazily instead of evaluating them on startup",
     )
     parser.add_argument(
         "--log-level",
@@ -1884,6 +1890,11 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    return parser
+
+
+def main():
+    parser = _build_arg_parser()
     args = parser.parse_args()
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
