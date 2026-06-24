@@ -1120,15 +1120,22 @@ class BatchKVCache(_BaseCache):
 
         padding = [max_length - l for l in lengths]
         B = len(caches)
-        H = max(c.keys.shape[1] for c in caches if c.keys is not None)
-        Dk = max(c.keys.shape[3] for c in caches if c.keys is not None)
-        Dv = max(c.values.shape[3] for c in caches if c.values is not None)
-        dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+        written = [c for c in caches if c.keys is not None and c.values is not None]
+
+        # GLM IndexShare can leave entire cache branches unwritten; when that
+        # happens there is nothing to merge and shape inference via max() would fail.
+        if not written:
+            return BatchKVCache([0] * len(caches))
+
+        H = max(c.keys.shape[1] for c in written)
+        Dk = max(c.keys.shape[3] for c in written)
+        Dv = max(c.values.shape[3] for c in written)
+        dt = written[0].keys.dtype
 
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, c) in enumerate(zip(padding, caches)):
-            if c.keys is None:
+            if c.keys is None or c.values is None:
                 continue
             keys[i : i + 1, :, p : p + c.offset] = c.keys[..., : c.offset, :]
             values[i : i + 1, :, p : p + c.offset] = c.values[..., : c.offset, :]

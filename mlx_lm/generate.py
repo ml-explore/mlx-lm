@@ -1226,6 +1226,37 @@ class PromptProcessingBatch:
         )
 
 
+
+
+def _merge_logprobs(lhs, rhs):
+    """Merge logprob batches across GenerationBatch.extend calls."""
+    if rhs is None:
+        return lhs
+    if lhs is None:
+        return rhs
+
+    lhs_arr = isinstance(lhs, mx.array)
+    rhs_arr = isinstance(rhs, mx.array)
+
+    if lhs_arr and rhs_arr:
+        return mx.concatenate([lhs, rhs], axis=0)
+
+    if lhs_arr:
+        lhs_rows = list(lhs)
+    elif isinstance(lhs, list):
+        lhs_rows = lhs
+    else:
+        lhs_rows = list(lhs)
+
+    if rhs_arr:
+        rhs_rows = list(rhs)
+    elif isinstance(rhs, list):
+        rhs_rows = rhs
+    else:
+        rhs_rows = list(rhs)
+
+    return lhs_rows + rhs_rows
+
 class GenerationBatch:
     """
     A batched token generator that manages multiple sequences in parallel.
@@ -1306,13 +1337,17 @@ class GenerationBatch:
             self._current_tokens = mx.concatenate(
                 [self._current_tokens, batch._current_tokens]
             )
-            self._current_logprobs.extend(batch._current_logprobs)
+            self._current_logprobs = _merge_logprobs(
+                self._current_logprobs, batch._current_logprobs
+            )
         if self._next_tokens is None:
             self._next_tokens = batch._next_tokens
             self._next_logprobs = batch._next_logprobs
         elif batch._next_tokens is not None:
             self._next_tokens = mx.concatenate([self._next_tokens, batch._next_tokens])
-            self._next_logprobs.extend(batch._next_logprobs)
+            self._next_logprobs = _merge_logprobs(
+                self._next_logprobs, batch._next_logprobs
+            )
         self._token_context.extend(batch._token_context)
         self._num_tokens.extend(batch._num_tokens)
         self._matcher_states.extend(batch._matcher_states)
