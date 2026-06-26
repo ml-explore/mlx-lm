@@ -1671,25 +1671,48 @@ class LRUPromptCache:
     def nbytes(self):
         return self._n_bytes
 
-    def fetch_nearest_cache(self, model: Any, tokens: List[int]):
+    def _pop_entry(self, model: Any, tokens: List[int]):
+        entry = self._trie.pop(model, tokens)
+        self._lru.remove(model, tokens)
+        self._n_bytes -= entry.nbytes
+        self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        return entry
+
+    def _get_entry(self, model: Any, tokens: List[int], consume: bool):
+        if consume:
+            return self._pop_entry(model, tokens)
+        return self._trie.get(model, tokens)
+
+    def _return_cache(self, prompt_cache: List[Any], consume: bool):
+        if consume:
+            return prompt_cache
+        return copy.deepcopy(prompt_cache)
+
+    def fetch_nearest_cache(
+        self, model: Any, tokens: List[int], *, consume: bool = False
+    ):
         result = self._trie.search(model, tokens)
         if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            cache_entry = self._get_entry(result.model, result.exact, consume)
+            return self._return_cache(cache_entry.prompt_cache, consume), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache_entry = self._get_entry(result.model, result.longer, consume)
+                cache = self._return_cache(cache_entry.prompt_cache, consume)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
         if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            cache_entry = self._get_entry(result.model, result.shorter, consume)
+            return (
+                self._return_cache(cache_entry.prompt_cache, consume),
+                tokens[short_length:],
+            )
 
         return None, tokens
 

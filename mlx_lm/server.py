@@ -963,7 +963,7 @@ class ResponseGenerator:
             # Load the KV cache
             self._log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                self.model_provider.model_key, prompt, consume=True
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
@@ -1732,6 +1732,16 @@ def _run_http_server(
         response_generator.stop_and_join()
 
 
+def make_lru_prompt_cache(model_provider: ModelProvider):
+    max_bytes = model_provider.cli_args.prompt_cache_bytes
+    if max_bytes is None:
+        return LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    return LRUPromptCache(
+        model_provider.cli_args.prompt_cache_size,
+        max_bytes=max_bytes,
+    )
+
+
 def run(
     host: str,
     port: int,
@@ -1740,7 +1750,7 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache = make_lru_prompt_cache(model_provider)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)

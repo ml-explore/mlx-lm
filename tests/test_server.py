@@ -17,6 +17,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     _process_control_tokens,
+    make_lru_prompt_cache,
 )
 from mlx_lm.utils import load
 
@@ -568,6 +569,63 @@ class TestLRUPromptCache(unittest.TestCase):
         cache.insert_cache(model, tokens, c)
         self.assertEqual(len(cache), 2)
 
+    def test_fetch_deep_copies_by_default(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        prompt_cache = [MockCache("test1")]
+
+        cache.insert_cache(model, [1, 2], prompt_cache)
+        fetched, rest = cache.fetch_nearest_cache(model, [1, 2])
+
+        self.assertEqual(fetched, prompt_cache)
+        self.assertIsNot(fetched, prompt_cache)
+        self.assertIsNot(fetched[0], prompt_cache[0])
+        self.assertEqual(rest, [])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 5)
+
+    def test_fetch_can_consume_exact_match(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        prompt_cache = [MockCache("test1")]
+
+        cache.insert_cache(model, [1, 2], prompt_cache)
+        fetched, rest = cache.fetch_nearest_cache(model, [1, 2], consume=True)
+
+        self.assertIs(fetched, prompt_cache)
+        self.assertEqual(rest, [])
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.nbytes, 0)
+
+    def test_fetch_can_consume_shorter_match(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        prompt_cache = [MockCache("test1")]
+
+        cache.insert_cache(model, [1, 2], prompt_cache)
+        fetched, rest = cache.fetch_nearest_cache(model, [1, 2, 3], consume=True)
+
+        self.assertIs(fetched, prompt_cache)
+        self.assertEqual(rest, [3])
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.nbytes, 0)
+
+    def test_fetch_can_consume_trimmed_longer_match(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        prompt_cache = [KVCache()]
+        keys = mx.arange(3).reshape(1, 1, 3, 1)
+        prompt_cache[0].update_and_fetch(keys, keys)
+
+        cache.insert_cache(model, [1, 2, 3], prompt_cache)
+        fetched, rest = cache.fetch_nearest_cache(model, [1, 2, 4], consume=True)
+
+        self.assertIs(fetched, prompt_cache)
+        self.assertEqual(fetched[0].offset, 2)
+        self.assertEqual(rest, [4])
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.nbytes, 0)
+
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
         model = ("test", None, None)
@@ -684,6 +742,28 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+    def test_server_prompt_cache_honors_byte_limit(self):
+        model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                prompt_cache_size=100,
+                prompt_cache_bytes=10,
+            )
+        )
+        cache = make_lru_prompt_cache(model_provider)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("aaa")])
+        cache.insert_cache(model, [3, 4], [MockCache("bbb")])
+        cache.insert_cache(model, [4, 5], [MockCache("ccc")])
+        cache.insert_cache(model, [6, 7], [MockCache("ddd")])
+
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(cache.nbytes, 9)
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [1, 2])
 
 
 if __name__ == "__main__":
