@@ -50,6 +50,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    indexer_rope_interleave: bool = True
     indexer_types: Optional[List[str]] = None
     index_topk_pattern: Optional[Any] = None
     index_topk_freq: int = 1
