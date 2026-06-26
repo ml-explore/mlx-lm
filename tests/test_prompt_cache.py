@@ -95,8 +95,22 @@ class TestPromptCache(unittest.TestCase):
             k, v = c.update_and_fetch(x, x)
             lk, lv = lc.update_and_fetch(x, x)
             self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c._offset, lc._offset)
             self.assertTrue(mx.array_equal(k, lk))
             self.assertTrue(mx.array_equal(v, lv))
+
+        # The physical offset must survive a round-trip, and a post-load trim
+        # must behave identically to a trim on the original.
+        for c, lc in zip(cache, loaded_cache):
+            self.assertEqual(c.trim(3), lc.trim(3))
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c._offset, lc._offset)
+
+        # Backward compatibility: an old 4-value meta_state (pre offset split)
+        # must load with _offset reconstructed as the chronological offset.
+        old = RotatingKVCache(max_size=8, keep=2)
+        old.meta_state = ("2", "8", "5", "5")
+        self.assertEqual(old._offset, 5)
 
     def test_save_load_mixed_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
@@ -241,14 +255,25 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 4)
 
-        # Can't trim fixed-size KV cache after processing
-        # more than max_kv_size tokens
+        # A rotating cache can still be trimmed after it has wrapped, but only
+        # back within its window (older tokens have been overwritten).
         for c in cache:
             x = mx.random.uniform(shape=(1, 8, 10, 4))
             c.update_and_fetch(x, x)
 
         num_trimmed = trim_prompt_cache(cache, 4)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 4)
+
+        # Asking to trim past the retained window only trims as far as the
+        # window allows (max_size=6 tokens).
+        cache = [RotatingKVCache(max_size=6) for _ in range(2)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 20, 4))
+            c.update_and_fetch(x, x)
+            x = mx.random.uniform(shape=(1, 8, 1, 4))
+            c.update_and_fetch(x, x)
+        num_trimmed = trim_prompt_cache(cache, 100)
+        self.assertEqual(num_trimmed, 6)
 
         cache = [QuantizedKVCache() for _ in range(2)]
         for c in cache:
@@ -290,6 +315,88 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(toks, second_toks)
         self.assertTrue(
             all(mx.allclose(l, l2) for l, l2 in zip(all_logits, second_all_logits))
+        )
+
+    def test_rotating_trim_matches_recompute(self):
+        # Feeding N tokens then trimming back to a prefix must leave the cache in
+        # the same logical state as building it from the prefix directly, even
+        # after the ring buffer has wrapped.
+        def build(seq, max_size, keep):
+            c = RotatingKVCache(max_size=max_size, keep=keep)
+            c.update_and_fetch(seq, seq)
+            return c
+
+        for keep in (0, 2):
+            mx.random.seed(0)
+            full_seq = mx.random.uniform(shape=(1, 8, 20, 4))
+            prefix_len = 15
+
+            c = build(full_seq, max_size=8, keep=keep)
+            trimmed = c.trim(20 - prefix_len)
+            self.assertEqual(trimmed, 5)
+            # Chronological position rolls back exactly.
+            self.assertEqual(c.offset, prefix_len)
+            # Physical buffer holds at most the window.
+            self.assertEqual(c.size(), 8)
+
+            # Reference: process only the retained prefix.
+            ref = build(full_seq[..., :prefix_len, :], max_size=8, keep=keep)
+            self.assertEqual(c.offset, ref.offset)
+            self.assertEqual(c.size(), ref.size())
+            self.assertTrue(mx.allclose(c.state[0], ref.state[0]))
+            self.assertTrue(mx.allclose(c.state[1], ref.state[1]))
+
+    def test_rotating_trim_can_trim(self):
+        from mlx_lm.models.cache import can_trim_prompt_cache
+
+        # Interleaved full + sliding-window layers, like Gemma 3 / GPT-OSS.
+        cache = [RotatingKVCache(max_size=8), KVCache()]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 40, 4))
+            c.update_and_fetch(x, x)
+        # The whole cache must report trimmable even after the rotating layer
+        # has wrapped past its window.
+        self.assertTrue(can_trim_prompt_cache(cache))
+
+    def test_trim_rotating_cache_matches_fresh_through_model(self):
+        # This mirrors the server's prefix-reuse path for a sliding-window
+        # cache: prefill a long prompt, trim back to a common prefix, then
+        # process the divergent suffix. The result must match a cache that was
+        # freshly prefilled on the prefix, token-for-token, even though the
+        # prompt exceeds the rotating window.
+        model, tokenizer = self.model, self.tokenizer
+        tokens = tokenizer.encode(
+            "The quick brown fox jumps over the lazy dog near the river bank "
+            "while the sun sets behind the distant mountains."
+        )
+        tokens = mx.array(tokens)[None]
+        suffix_len = 5
+        prefix = tokens[:, :-suffix_len]
+        suffix = tokens[:, -suffix_len:]
+
+        # Reused path: prefill the full prompt, then trim back to the prefix.
+        reused = make_prompt_cache(model, max_kv_size=8)
+        model(tokens, cache=reused)
+        trimmed = trim_prompt_cache(reused, suffix_len)
+        self.assertEqual(trimmed, suffix_len)
+
+        # Fresh path: prefill only the prefix.
+        fresh = make_prompt_cache(model, max_kv_size=8)
+        model(prefix, cache=fresh)
+
+        # Caches must be in the same logical state.
+        for r, f in zip(reused, fresh):
+            self.assertEqual(r.offset, f.offset)
+
+        # Processing the same suffix through both must predict the same next
+        # tokens. (Greedy/token-for-token identity is the correctness gate; we
+        # don't compare raw logits because a 4-bit model's matmul reduction
+        # order depends on the prefill length, which perturbs logits within the
+        # quantization grid without changing the argmax.)
+        logits_reused = model(suffix, cache=reused)
+        logits_fresh = model(suffix, cache=fresh)
+        self.assertTrue(
+            mx.array_equal(logits_reused.argmax(-1), logits_fresh.argmax(-1))
         )
 
     def test_cache_copying(self):

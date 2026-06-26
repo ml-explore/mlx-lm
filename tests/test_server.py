@@ -87,6 +87,11 @@ class MockCache:
     def is_trimmable(self):
         return self._is_trimmable
 
+    def size(self):
+        # This mock models a fully (unboundedly) trimmable cache, so report a
+        # size large enough that the prefix-eviction guard never blocks.
+        return 1 << 30
+
     def trim(self, n):
         assert self._is_trimmable
         return n

@@ -108,7 +108,11 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     """
     if not can_trim_prompt_cache(cache) or len(cache) == 0:
         return 0
-    return [c.trim(num_tokens) for c in cache][0]
+    # Interleaved cache types (e.g. sliding-window models mixing RotatingKVCache
+    # and KVCache) may trim by different amounts. The number actually trimmed is
+    # the minimum across layers, since the cache is only consistent up to the
+    # least-trimmed layer.
+    return min(c.trim(num_tokens) for c in cache)
 
 
 def create_attention_mask(
@@ -414,7 +418,11 @@ class RotatingKVCache(_BaseCache):
         self.keep = keep
         self.keys = None
         self.values = None
+        # ``offset`` is the absolute chronological position (drives RoPE).
+        # ``_offset`` is the number of tokens physically resident in the ring
+        # buffer, capped at ``max_size``. The two diverge once the buffer wraps.
         self.offset = 0
+        self._offset = 0
         self.max_size = max_size
         self._idx = 0
 
@@ -434,7 +442,7 @@ class RotatingKVCache(_BaseCache):
         """
         if self._idx == v.shape[2]:
             return v
-        elif self._idx < self.offset:
+        elif self._idx < self._offset:
             return mx.concatenate(
                 [
                     v[..., : self.keep, :],
@@ -463,6 +471,7 @@ class RotatingKVCache(_BaseCache):
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
         self.offset += keys.shape[2]
+        self._offset += keys.shape[2]
         self._idx = self.keys.shape[2]
         return self.keys, self.values
 
@@ -470,7 +479,7 @@ class RotatingKVCache(_BaseCache):
         # May not have hit the max size yet, so potentially
         # keep growing the cache
         B, n_kv_heads, S, k_head_dim = keys.shape
-        prev = self.offset
+        prev = self._offset
         if self.keys is None or (
             prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size
         ):
@@ -502,11 +511,15 @@ class RotatingKVCache(_BaseCache):
         self.keys[..., self._idx : self._idx + S, :] = keys
         self.values[..., self._idx : self._idx + S, :] = values
         self.offset += S
+        self._offset += S
         self._idx += S
 
         # If the buffer is not full, slice off the end
-        if self.offset < self.max_size:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        if self._offset < self.max_size:
+            return (
+                self.keys[..., : self._offset, :],
+                self.values[..., : self._offset, :],
+            )
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
@@ -515,12 +528,15 @@ class RotatingKVCache(_BaseCache):
         return self._update_concat(keys, values)
 
     def size(self):
-        return min(self.offset, self.max_size)
+        return min(self._offset, self.max_size)
 
     @property
     def state(self):
-        if self.offset < self.keys.shape[2]:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        if self._offset < self.keys.shape[2]:
+            return (
+                self.keys[..., : self._offset, :],
+                self.values[..., : self._offset, :],
+            )
         else:
             return self.keys, self.values
 
@@ -530,22 +546,48 @@ class RotatingKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        return tuple(
+            map(
+                str,
+                (self.keep, self.max_size, self.offset, self._idx, self._offset),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.keep, self.max_size, self.offset, self._idx = map(
-            int,
-            v,
-        )
+        self.keep, self.max_size, self.offset, self._idx = map(int, v[:4])
+        # Backward compatibility: caches saved before the chronological/physical
+        # offset split only stored 4 values. Old code never trimmed, so the two
+        # offsets always coincided (``_offset == offset``).
+        self._offset = int(v[4]) if len(v) > 4 else self.offset
 
     def is_trimmable(self):
-        return self.offset < self.max_size
+        return True
 
     def trim(self, n):
-        n = min(self.offset, n)
+        if self.keys is None or n <= 0:
+            return 0
+        # Linearize the (possibly wrapped) ring buffer into temporal order. This
+        # also collapses any over-allocation so the tensor length equals the
+        # number of physically resident tokens, which bounds how far back the
+        # cache can be rolled (older tokens have been overwritten on wrap).
+        self.keys = self._temporal_order(self.keys)
+        self.values = self._temporal_order(self.values)
+        trimmable = self.keys.shape[2]
+        n = min(trimmable, n)
         self.offset -= n
-        self._idx -= n
+        new_size = trimmable - n
+        if new_size == 0:
+            self.keys = None
+            self.values = None
+            self._idx = 0
+            self._offset = 0
+        else:
+            # Drop the most recent ``n`` tokens.
+            self.keys = self.keys[..., :new_size, :]
+            self.values = self.values[..., :new_size, :]
+            self._idx = new_size
+            self._offset = new_size
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
@@ -556,7 +598,7 @@ class RotatingKVCache(_BaseCache):
     ):
         if N > 1:
             window_size = window_size or self.max_size
-            offset = min(self.max_size - 1, self.offset)
+            offset = min(self.max_size - 1, self._offset)
             if offset + N > window_size or return_array:
                 return create_causal_mask(N, offset, window_size=window_size)
             else:
@@ -565,12 +607,12 @@ class RotatingKVCache(_BaseCache):
             if window_size is None:
                 return None
             # May need a mask for when window_size < max_size
-            if self.offset >= window_size and self.max_size > window_size:
+            if self._offset >= window_size and self.max_size > window_size:
                 idx = self._idx
                 if idx >= self.max_size:
                     idx = 0
-                if self.offset < self.max_size:
-                    mask_size = self.offset + 1
+                if self._offset < self.max_size:
+                    mask_size = self._offset + 1
                 else:
                     mask_size = self.max_size
                 mask = mx.arange(mask_size) >= (mask_size - window_size)
@@ -1315,13 +1357,32 @@ class BatchRotatingKVCache(_BaseCache):
         self.rotated = bool(v[3])
 
     def is_trimmable(self):
-        return self._offset < self.max_size
+        return True
 
     def trim(self, n):
-        n = min(self._offset, n)
-        self._offset -= n
-        self._idx -= n
+        if self.keys is None or n <= 0:
+            return 0
+        # Linearize the (possibly wrapped) ring buffer into temporal order. This
+        # collapses any over-allocation so the tensor length equals the number
+        # of physically resident tokens, bounding how far back the cache can be
+        # rolled (older tokens have been overwritten on wrap).
+        self._temporal_order()
+        trimmable = self.keys.shape[2]
+        n = min(trimmable, n)
         self.offset -= n
+        new_size = trimmable - n
+        if new_size == 0:
+            self.keys = None
+            self.values = None
+            self._idx = 0
+            self._offset = 0
+            self.rotated = False
+        else:
+            # Drop the most recent ``n`` tokens.
+            self.keys = self.keys[..., :new_size, :]
+            self.values = self.values[..., :new_size, :]
+            self._idx = new_size
+            self._offset = new_size
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
@@ -1417,6 +1478,9 @@ class BatchRotatingKVCache(_BaseCache):
     def extract(self, idx):
         mx.eval(self.left_padding, self.offset)
         cache = RotatingKVCache(self.max_size)
+        if self.keys is None:
+            cache.offset = self.offset.tolist()[idx]
+            return cache
         padding = max(0, self.left_padding.tolist()[idx])
         offset = self.offset.tolist()[idx]
         cache.keys = self.keys[idx : idx + 1]
@@ -1430,6 +1494,7 @@ class BatchRotatingKVCache(_BaseCache):
         cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
         cache.offset = offset
         cache._idx = cache.keys.shape[2]
+        cache._offset = cache.keys.shape[2]
         return cache
 
     @classmethod
@@ -1684,8 +1749,12 @@ class LRUPromptCache:
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                trimmed = trim_prompt_cache(cache, num_to_trim)
+                # A rotating cache can only be trimmed back within its window.
+                # If the full trim did not succeed, the cache no longer matches
+                # the requested prefix, so fall back to the shorter-cache path.
+                if trimmed >= num_to_trim:
+                    return cache, tokens[prefix:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
@@ -1716,13 +1785,21 @@ class LRUPromptCache:
             self._lru.remove(model, tokens)
         self._lru.push(model, tokens, cache_type)
 
-        # If it is a trimmable cache remove all prefixes cause they just take
-        # space
+        # If it is a trimmable cache remove the prefixes that this entry can be
+        # trimmed back to, since they just take space. A wrapped rotating cache
+        # can only be trimmed back within its window, so keep prefixes older than
+        # that as fallbacks for future reuse.
         if can_trim_prompt_cache(prompt_cache):
+            max_trimmable = min(c.size() for c in prompt_cache)
+            n = len(tokens)
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
-                self._n_bytes -= entry.nbytes
-                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-                self._lru.remove(model, tokens[:prefix_len])
+                if n - prefix_len <= max_trimmable:
+                    self._n_bytes -= entry.nbytes
+                    self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+                    self._lru.remove(model, tokens[:prefix_len])
+                else:
+                    # Re-attach this prefix; pop_prefixes already detached it.
+                    self._trie.add(model, tokens[:prefix_len], entry)
 
         # Ensure we match the constraints
         if len(self._lru) > self.max_size:
