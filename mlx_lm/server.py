@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -41,6 +41,15 @@ from .generate import (
 from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
+)
+from .server_responses import (
+    load_generation_parameters as open_response_load_generation_parameters,
+    read_request_body as open_response_read_request_body,
+    stored_response as open_response_stored,
+    handle_compact as open_response_handle_compact,
+    handle_response as open_response_handle,
+    handle_websocket as open_response_handle_websocket,
+    write_json_error as open_response_write_json_error,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -443,6 +452,8 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
+        self.open_responses = {}
+        self._open_responses_lock = Lock()
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -450,6 +461,17 @@ class ResponseGenerator:
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
+
+    def get_open_response(self, response_id):
+        with self._open_responses_lock:
+            return self.open_responses.get(response_id)
+
+    def store_open_response(self, response, input_items):
+        stored = open_response_stored(response, input_items)
+        with self._open_responses_lock:
+            if len(self.open_responses) > 256:
+                self.open_responses.pop(next(iter(self.open_responses)))
+            self.open_responses[response["id"]] = stored
 
     def stop_and_join(self):
         self._stop = True
@@ -1106,6 +1128,8 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/responses": self.handle_open_responses,
+            "/v1/responses/compact": self.handle_open_responses_compact,
         }
 
         if self.path not in request_factories:
@@ -1114,83 +1138,31 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not Found")
             return
 
-        # Fetch and parse request body
-        content_length = self.headers.get("Content-Length")
-        if content_length is None:
-            self._set_completion_headers(411)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Content-Length header is required"}).encode()
-            )
-            return
         try:
-            content_length = int(content_length)
-        except ValueError:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Invalid Content-Length header"}).encode()
-            )
-            return
-        raw_body = self.rfile.read(content_length)
-        try:
-            self.body = json.loads(raw_body.decode())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
-            )
+            self.body = open_response_read_request_body(self)
+        except ValueError as e:
+            status_code = 411 if str(e) == "Content-Length header is required" else 400
+            open_response_write_json_error(self, status_code, str(e))
             return
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             debug_body = json.dumps(self.body, indent="\t")
             logging.debug(f"Incoming Request Body: {debug_body}")
-        if not isinstance(self.body, dict):
-            debug_body = json.dumps(self.body, indent="\t")
-            logging.error(f"Invalid Request Body: {debug_body}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
-            )
-            return
 
         # Extract request parameters from the body
-        self.stream = self.body.get("stream", False)
-        self.stream_options = self.body.get("stream_options", None)
-        self.requested_model = self.body.get("model", "default_model")
-        self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
-        )
-        self.adapter = self.body.get("adapters", None)
-        self.max_tokens = self.body.get("max_completion_tokens", None)
-        if self.max_tokens is None:
-            self.max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
-            )
-        self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
-        )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
-        self.repetition_context_size = self.body.get("repetition_context_size", 20)
-        self.presence_penalty = self.body.get("presence_penalty", 0.0)
-        self.presence_context_size = self.body.get("presence_context_size", 20)
-        self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
-        self.frequency_context_size = self.body.get("frequency_context_size", 20)
-        self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
-        self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", False)
-        self.top_logprobs = self.body.get("top_logprobs", -1)
-        self.seed = self.body.get("seed", None)
-        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            open_response_load_generation_parameters(self, self.body)
+        except ValueError as e:
+            open_response_write_json_error(self, 400, str(e))
+            return
+
+        if self.path == "/v1/responses/compact":
+            self.handle_open_responses_compact()
+            return
+
+        if self.path == "/v1/responses":
+            self.handle_open_responses()
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1242,7 +1214,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("frequency_penalty", (float, int))
         self._validate("frequency_context_size", int, min_val=0)
         self._validate("logprobs", bool)
-        self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
+        self._validate("top_logprobs", int, min_val=0, max_val=20, whitelist=[-1])
         self._validate("xtc_probability", float, min_val=0, max_val=1)
         self._validate("xtc_threshold", float, min_val=0, max_val=1)
         self._validate("requested_model", str)
@@ -1576,6 +1548,25 @@ class APIHandler(BaseHTTPRequestHandler):
             }
         return response
 
+    def _open_response_deps(self):
+        return (
+            CompletionRequest,
+            GenerationArguments,
+            ModelDescription,
+            SamplingArguments,
+            LogitsProcessorArguments,
+            ToolCallFormatter,
+        )
+
+    def handle_open_responses(self):
+        open_response_handle(self, self._open_response_deps())
+
+    def handle_open_responses_compact(self):
+        open_response_handle_compact(self)
+
+    def handle_open_responses_websocket(self):
+        open_response_handle_websocket(self, self._open_response_deps())
+
     def handle_chat_completions(self) -> CompletionRequest:
         """
         Handle a chat completion request.
@@ -1621,7 +1612,12 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        if (
+            self.path == "/v1/responses"
+            and self.headers.get("Upgrade", "").lower() == "websocket"
+        ):
+            self.handle_open_responses_websocket()
+        elif self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()

@@ -41,6 +41,18 @@ curl localhost:8080/v1/chat/completions \
    }'
 ```
 
+You can also use the Responses API with JSON, SSE, or WebSocket transport:
+
+```shell
+curl localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+     "model": "default_model",
+     "input": "Say this is a test!",
+     "max_output_tokens": 128
+   }'
+```
+
 ### Request Fields
 
 - `messages`: An array of message objects representing the conversation
@@ -109,6 +121,15 @@ curl localhost:8080/v1/chat/completions \
 
 - `num_draft_tokens`: (Optional) The number of draft tokens the draft model
   should predict at once. Defaults to `3`.
+
+### Responses API
+
+The server supports Responses API endpoints for response creation, streaming,
+WebSocket sessions, compaction, tools, and `previous_response_id` continuation:
+
+- `POST /v1/responses`: create a response with JSON or SSE output.
+- `GET /v1/responses`: WebSocket transport for `response.create` messages.
+- `POST /v1/responses/compact`: return an opaque compaction item.
 
 ### Response Fields
 
