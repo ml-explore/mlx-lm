@@ -157,6 +157,106 @@ class TestProcessControlTokens(unittest.TestCase):
         )
 
 
+class TestTrailingToolCallFlush(unittest.TestCase):
+    """Regression test for models with an empty ``tool_call_end``.
+
+    For Mistral/Devstral-style models the tool call has no explicit end marker,
+    so the final EOS moves the state machine out of the ``"tool"`` state
+    (``prev_state`` becomes ``None``). ``handle_completion`` must still surface
+    the buffered tool call rather than silently dropping it.
+    See https://github.com/ml-explore/mlx-lm/issues/1307.
+    """
+
+    def _make_handler(self, stream_responses, ctx):
+        handler = APIHandler.__new__(APIHandler)
+
+        # Minimal attributes read by handle_completion / generate_response.
+        defaults = dict(
+            requested_model="test-model",
+            requested_draft_model=None,
+            adapter=None,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            xtc_probability=0.0,
+            xtc_threshold=0.0,
+            logit_bias=None,
+            repetition_penalty=None,
+            repetition_context_size=20,
+            presence_penalty=0.0,
+            presence_context_size=20,
+            frequency_penalty=0.0,
+            frequency_context_size=20,
+            max_tokens=64,
+            num_draft_tokens=0,
+            logprobs=False,
+            top_logprobs=0,
+            seed=None,
+            chat_template_kwargs={},
+            stream=False,
+            request_id="chatcmpl-test",
+            system_fingerprint="test",
+            object_type="chat.completion",
+            created=0,
+            wfile=io.BytesIO(),
+        )
+        for key, value in defaults.items():
+            setattr(handler, key, value)
+
+        # No-op the HTTP header machinery.
+        handler._set_completion_headers = lambda *a, **k: None
+        handler._set_stream_headers = lambda *a, **k: None
+        handler.send_header = lambda *a, **k: None
+        handler.end_headers = lambda *a, **k: None
+
+        # Mock generation: return the scripted (ctx, stream).
+        handler.response_generator = types.SimpleNamespace(
+            generate=lambda request, args, progress_callback=None: (
+                ctx,
+                iter(stream_responses),
+            )
+        )
+        return handler
+
+    def test_empty_tool_call_end_flushes_trailing_tool_call(self):
+        from mlx_lm.tool_parsers.mistral import parse_tool_call
+
+        # What _process_control_tokens yields for
+        # "[TOOL_CALLS]run_shell[ARGS]{...}<eos>": the marker is consumed as a
+        # state crossing, the body streams in the "tool" state, and the final
+        # EOS carries state=None because tool_call_end is empty.
+        stream = [
+            Response(
+                'run_shell[ARGS]{"command": "ls"}', 42, "tool", None, 0.0, None, ()
+            ),
+            Response("", 2, None, None, 0.0, "stop", ()),
+        ]
+        ctx = types.SimpleNamespace(
+            tool_parser=parse_tool_call,
+            prompt=[1, 2, 3],
+            prompt_cache_count=0,
+            stop=lambda: None,
+        )
+        request = types.SimpleNamespace(
+            tools=[{"type": "function", "function": {"name": "run_shell"}}]
+        )
+
+        handler = self._make_handler(stream, ctx)
+        handler.handle_completion(request, stop_words=[])
+
+        resp = json.loads(handler.wfile.getvalue().decode())
+        choice = resp["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+
+        tool_calls = choice["message"].get("tool_calls")
+        self.assertIsNotNone(tool_calls, "trailing tool call was dropped")
+        self.assertEqual(tool_calls[0]["function"]["name"], "run_shell")
+        self.assertEqual(
+            json.loads(tool_calls[0]["function"]["arguments"]), {"command": "ls"}
+        )
+
+
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

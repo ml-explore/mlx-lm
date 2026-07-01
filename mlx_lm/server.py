@@ -1497,7 +1497,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
-            if prev_state == "tool" and tool_text:
+            # Flush any tool call still buffered at the end of generation. For
+            # models with an empty tool_call_end (e.g. Mistral/Devstral), the
+            # final EOS transitions the state machine out of "tool" to None, so
+            # prev_state is no longer "tool" here; keying off tool_text captures
+            # the trailing call in that case.
+            if tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
 
