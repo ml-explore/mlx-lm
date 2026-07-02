@@ -181,6 +181,40 @@ class GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
+        if (
+            cache is not None
+            and getattr(cache, "speculating", False)
+            and mask is None
+            and cache.lengths is None
+            and cache.left_padding is None
+        ):
+            # Record an exact rollback for speculative decoding: replaying the
+            # recurrence from the pre-forward state over the first m of the
+            # exact per-token inputs the kernel consumes reproduces the state
+            # after m tokens bit-for-bit; the conv state after m tokens is a
+            # slice of conv_input. See ArraysCache.record_rollback.
+            n_keep = self.conv_kernel_size - 1
+            use_kernel = not self.training
+
+            def _rollback(
+                m, q=q, k=k, v=v, a=a, b=b, S0=state, ci=conv_input, nk=n_keep
+            ):
+                _, s_m = gated_delta_update(
+                    q[:, :m],
+                    k[:, :m],
+                    v[:, :m],
+                    a[:, :m],
+                    b[:, :m],
+                    self.A_log,
+                    self.dt_bias,
+                    S0,
+                    None,
+                    use_kernel,
+                )
+                return [mx.contiguous(ci[:, m : m + nk, :]), s_m]
+
+            cache.record_rollback(S, _rollback, [conv_state, state])
+
         out, state = gated_delta_update(
             q,
             k,
@@ -406,6 +440,11 @@ class ModelArgs(BaseModelArgs):
 
 
 class Model(nn.Module):
+    # The GDN layers record exact rollbacks on their ArraysCache during
+    # speculative decoding, making the hybrid cache trimmable (see
+    # GatedDeltaNet.__call__ and ArraysCache.record_rollback).
+    supports_speculative_rollback = True
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

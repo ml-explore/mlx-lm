@@ -517,7 +517,9 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache):
+    if not cache.can_trim_prompt_cache(model_cache) and not getattr(
+        model, "supports_speculative_rollback", False
+    ):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
@@ -595,6 +597,12 @@ def speculative_generate_step(
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
+    # After prefill (recording a rollback for the whole prompt would hold on to
+    # prompt-sized tensors), let rollback-capable caches start recording so
+    # verify steps can be trimmed exactly (no-op for regular KV caches).
+    for c in model_cache:
+        c.start_speculation()
+
     ntoks = 0
     # Set these so the finally block doesn't raise
     num_draft = 0
@@ -643,6 +651,8 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
     finally:
         _rewind_cache(num_draft, n)
+        for c in model_cache:
+            c.stop_speculation()
 
 
 def stream_generate(
