@@ -40,10 +40,20 @@ from .generate import (
 )
 from .models.cache import (
     LRUPromptCache,
+    can_trim_prompt_cache,
     make_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
+
+
+def _ensure_speculation_supported(prompt_cache, model_path):
+    if not can_trim_prompt_cache(prompt_cache):
+        non_trimmable = {type(c).__name__ for c in prompt_cache if not c.is_trimmable()}
+        raise ValueError(
+            f"--draft-model was set, but speculative decoding requires a trimmable "
+            f"prompt cache; '{model_path}' uses non-trimmable cache(s): {non_trimmable}"
+        )
 
 
 def get_system_fingerprint():
@@ -357,6 +367,11 @@ class ModelProvider:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
+        # Speculative decoding needs a trimmable target cache, fail fast if not
+        prompt_cache = make_prompt_cache(model)
+        if draft_model_path is not None:
+            _ensure_speculation_supported(prompt_cache, model_path)
+
         # Load the draft model for speculative decoding
         draft_model = None
         if draft_model_path is not None:
@@ -369,9 +384,7 @@ class ModelProvider:
 
         # Compute batchability
         is_batchable = draft_model is None
-        is_batchable = is_batchable and all(
-            hasattr(c, "merge") for c in make_prompt_cache(model)
-        )
+        is_batchable = is_batchable and all(hasattr(c, "merge") for c in prompt_cache)
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)

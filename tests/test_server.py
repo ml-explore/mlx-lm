@@ -16,6 +16,7 @@ from mlx_lm.server import (
     LRUPromptCache,
     Response,
     ResponseGenerator,
+    _ensure_speculation_supported,
     _process_control_tokens,
 )
 from mlx_lm.utils import load
@@ -155,6 +156,26 @@ class TestProcessControlTokens(unittest.TestCase):
             [t.state for t in out],
             ["tool", "tool", "tool", "normal", "normal"],
         )
+
+
+class TestSpeculationValidation(unittest.TestCase):
+    def test_rejects_non_trimmable_cache(self):
+        with self.assertRaises(ValueError):
+            _ensure_speculation_supported(
+                [MockCache("aaa", is_trimmable=False)], "test/model"
+            )
+
+    def test_allows_trimmable_cache(self):
+        # Should not raise
+        _ensure_speculation_supported(
+            [MockCache("aaa", is_trimmable=True)], "test/model"
+        )
+
+    def test_error_message_names_bad_cache_type(self):
+        with self.assertRaisesRegex(ValueError, "MockCache"):
+            _ensure_speculation_supported(
+                [MockCache("aaa", is_trimmable=False)], "test/model"
+            )
 
 
 class TestServer(unittest.TestCase):
