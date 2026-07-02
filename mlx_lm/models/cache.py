@@ -605,12 +605,18 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    # Tokens of exact-rollback history kept while speculating — records beyond
+    # this window are dropped (speculative trims never exceed the last verify
+    # window, so 64 tokens is far more than any round needs). Bounding by
+    # tokens keeps the retained per-token stashes small.
+    _ROLLBACK_WINDOW = 64
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
         instance.speculating = False
-        instance._rollback = None
+        instance._rollbacks = deque()
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -620,11 +626,11 @@ class ArraysCache(_BaseCache):
 
     def start_speculation(self):
         self.speculating = True
-        self._rollback = None
+        self._rollbacks.clear()
 
     def stop_speculation(self):
         self.speculating = False
-        self._rollback = None
+        self._rollbacks.clear()
 
     def record_rollback(self, num_tokens, fn, snapshot):
         """Recorded by the owning layer during a forward while ``speculating``.
@@ -638,27 +644,40 @@ class ArraysCache(_BaseCache):
             snapshot (list): The cache entries from before the forward (returned
                 for a full rollback, ``m == 0``).
         """
-        self._rollback = (num_tokens, fn, snapshot)
+        self._rollbacks.append((num_tokens, fn, snapshot))
+        total = sum(r[0] for r in self._rollbacks)
+        while (
+            len(self._rollbacks) > 1
+            and total - self._rollbacks[0][0] >= self._ROLLBACK_WINDOW
+        ):
+            total -= self._rollbacks.popleft()[0]
 
     def is_trimmable(self):
         # While speculating, every forward records an exact rollback, so the
-        # cache is trimmable within the last forward's window.
+        # cache is trimmable within the recorded window.
         return self.speculating
 
     def trim(self, n):
         if n <= 0:
             return 0
-        if self._rollback is None:
+        if sum(r[0] for r in self._rollbacks) < n:
             raise RuntimeError(
-                "ArraysCache.trim requires a rollback recorded by the model's "
-                "recurrent layers; this model does not support speculative "
-                "rollback."
+                f"Cannot trim {n} tokens from ArraysCache: only "
+                f"{sum(r[0] for r in self._rollbacks)} tokens of exact rollback "
+                "are recorded. Recurrent state cannot be trimmed beyond the "
+                "speculative window."
             )
-        num_tokens, fn, snapshot = self._rollback
-        n = min(n, num_tokens)
-        m = num_tokens - n
-        self.cache = list(snapshot) if m == 0 else fn(m)
-        self._rollback = None
+        trimmed = 0
+        while trimmed < n:
+            num_tokens, fn, snapshot = self._rollbacks.pop()
+            take = min(n - trimmed, num_tokens)
+            m = num_tokens - take
+            self.cache = list(snapshot) if m == 0 else fn(m)
+            trimmed += take
+            if m > 0:
+                # The record still describes the first m tokens of its chunk
+                # (fn(m') is valid for any m' <= m), so keep it for further trims.
+                self._rollbacks.append((m, fn, snapshot))
         return n
 
     @property

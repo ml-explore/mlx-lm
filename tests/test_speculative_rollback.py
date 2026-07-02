@@ -138,7 +138,7 @@ class TestSpeculativeRollback(unittest.TestCase):
         for x in model_cache:
             if isinstance(x, cache.ArraysCache):
                 self.assertFalse(x.speculating)
-                self.assertIsNone(x._rollback)
+                self.assertEqual(len(x._rollbacks), 0)
 
         # continue decoding on the same cache with plain steps
         cont = [
@@ -184,6 +184,72 @@ class TestSpeculativeRollback(unittest.TestCase):
             c.trim(1)
         c.stop_speculation()
         self.assertFalse(c.is_trimmable())
+
+    def test_hybrid_draft_model(self):
+        # Target AND draft are hybrid GDN models (the setup reported in #1446:
+        # Qwen3.6 target + Qwen3.5 draft). The draft cache is rewound exactly
+        # too — its rollback spans several T=1 records per round — and the
+        # output must still equal vanilla greedy.
+        model = make_hybrid(seed=0)
+        draft = make_hybrid(seed=7)  # different weights, same arch
+        prompt = mx.random.randint(0, 1000, (16,), dtype=mx.uint32)
+        n = 24
+
+        vanilla = [int(tok) for tok, _ in generate_step(prompt, model, max_tokens=n)]
+        spec = [
+            int(tok)
+            for tok, _, _ in speculative_generate_step(
+                prompt, model, draft, num_draft_tokens=3, max_tokens=n
+            )
+        ]
+        self.assertEqual(vanilla, spec)
+
+    def test_draft_exception_not_masked(self):
+        # An exception raised mid-round (e.g. inside the draft model) must
+        # surface as itself: the finally-block cache rewind must not replace it
+        # with a rollback RuntimeError.
+        model = make_hybrid()
+        mx.random.seed(4)
+        draft = llama.Model(llama.ModelArgs.from_dict(LLAMA_ARGS))
+        prompt = mx.random.randint(0, 1000, (16,), dtype=mx.uint32)
+
+        boom = ValueError("draft exploded")
+        calls = {"n": 0}
+
+        class Flaky:
+            def __call__(self, *args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] > 4:  # fail during the second round's draft steps
+                    raise boom
+                return draft(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(draft, name)
+
+        gen = speculative_generate_step(
+            prompt, model, Flaky(), num_draft_tokens=3, max_tokens=32
+        )
+        with self.assertRaises(ValueError) as ctx:
+            for _ in gen:
+                pass
+        self.assertIs(ctx.exception, boom)
+
+    def test_trim_beyond_window_raises(self):
+        # Trimming more than the recorded rollback window must fail loudly and
+        # consistently rather than silently clamping (which would desync the
+        # ArraysCache layers from the KVCache layers).
+        model = make_hybrid()
+        prompt = mx.random.randint(0, 1000, (32,), dtype=mx.uint32)
+        c = model.make_cache()
+        model(prompt[None], cache=c)
+        mx.eval([x.state for x in c])
+        for x in c:
+            x.start_speculation()
+        chunk = mx.random.randint(0, 1000, (4,), dtype=mx.uint32)
+        model(chunk[None], cache=c)
+        arrays = next(x for x in c if isinstance(x, cache.ArraysCache))
+        with self.assertRaises(RuntimeError):
+            arrays.trim(10)  # only 4 tokens of rollback recorded
 
 
 if __name__ == "__main__":

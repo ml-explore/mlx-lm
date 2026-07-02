@@ -526,10 +526,17 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache) and not getattr(
-        model, "supports_speculative_rollback", False
-    ):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+    def _can_speculate(c):
+        # Trimmable directly, or able to record an exact rollback while
+        # speculating (see ArraysCache.record_rollback). The model must also
+        # declare support: recording is done by its recurrent layers.
+        return c.is_trimmable() or (
+            hasattr(c, "record_rollback")
+            and getattr(model, "supports_speculative_rollback", False)
+        )
+
+    if not all(_can_speculate(c) for c in model_cache):
+        types = {type(c).__name__ for c in model_cache if not _can_speculate(c)}
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
         )
@@ -608,8 +615,10 @@ def speculative_generate_step(
 
     # After prefill (recording a rollback for the whole prompt would hold on to
     # prompt-sized tensors), let rollback-capable caches start recording so
-    # verify steps can be trimmed exactly (no-op for regular KV caches).
-    for c in model_cache:
+    # verify steps can be trimmed exactly (no-op for regular KV caches). The
+    # draft cache records too: hybrid draft models (e.g. a small Qwen3.5) need
+    # their recurrent state rewound just like the target's.
+    for c in model_cache + draft_cache:
         c.start_speculation()
 
     ntoks = 0
@@ -619,6 +628,11 @@ def speculative_generate_step(
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
+            # Until this round's verify step has advanced the caches there is
+            # nothing to rewind; keep n == num_draft so an exception here (or a
+            # generator close) makes the finally-block rewind a no-op instead
+            # of trimming with values from a previous round.
+            n = num_draft
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
