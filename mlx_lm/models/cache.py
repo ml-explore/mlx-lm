@@ -146,6 +146,19 @@ class _BaseCache:
     def is_trimmable(self):
         return False
 
+    def start_speculation(self):
+        """Called by speculative decoding before draft/verify steps begin.
+
+        Caches that cannot trim directly but support an exact rollback (e.g.
+        recurrent-state caches, see ``ArraysCache``) use this to start recording
+        the information needed to roll a verify step back. No-op by default.
+        """
+        pass
+
+    def stop_speculation(self):
+        """Called by speculative decoding when it finishes. No-op by default."""
+        pass
+
     def size(self):
         """
         Return the size (i.e. sequence length) of the cache.
@@ -596,12 +609,57 @@ class ArraysCache(_BaseCache):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
+        instance.speculating = False
+        instance._rollback = None
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         if left_padding:
             self.left_padding = mx.array(left_padding)
+
+    def start_speculation(self):
+        self.speculating = True
+        self._rollback = None
+
+    def stop_speculation(self):
+        self.speculating = False
+        self._rollback = None
+
+    def record_rollback(self, num_tokens, fn, snapshot):
+        """Recorded by the owning layer during a forward while ``speculating``.
+
+        Args:
+            num_tokens (int): Sequence length of the forward being recorded.
+            fn (callable): ``fn(m) -> list`` returning the cache entries as they
+                would be had only the first ``m`` of ``num_tokens`` tokens been
+                processed. Must be exact (e.g. replay the recurrence from the
+                pre-forward state over the stashed per-token inputs).
+            snapshot (list): The cache entries from before the forward (returned
+                for a full rollback, ``m == 0``).
+        """
+        self._rollback = (num_tokens, fn, snapshot)
+
+    def is_trimmable(self):
+        # While speculating, every forward records an exact rollback, so the
+        # cache is trimmable within the last forward's window.
+        return self.speculating
+
+    def trim(self, n):
+        if n <= 0:
+            return 0
+        if self._rollback is None:
+            raise RuntimeError(
+                "ArraysCache.trim requires a rollback recorded by the model's "
+                "recurrent layers; this model does not support speculative "
+                "rollback."
+            )
+        num_tokens, fn, snapshot = self._rollback
+        n = min(n, num_tokens)
+        m = num_tokens - n
+        self.cache = list(snapshot) if m == 0 else fn(m)
+        self._rollback = None
+        return n
 
     @property
     def batch_size(self):
