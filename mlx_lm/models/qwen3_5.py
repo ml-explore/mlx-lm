@@ -112,12 +112,10 @@ class GatedDeltaNet(nn.Module):
             padding=0,
         )
 
-        self.in_proj_qkv = nn.Linear(
-            self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
+        self.in_proj_qkvz = nn.Linear(
+            self.hidden_size, self.key_dim * 2 + self.value_dim * 2, bias=False
         )
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_ba = nn.Linear(self.hidden_size, self.num_v_heads * 2, bias=False)
 
         self.dt_bias = mx.ones(self.num_v_heads)
 
@@ -130,6 +128,27 @@ class GatedDeltaNet(nn.Module):
 
         self.sharding_group = None
 
+    def _conv1d_decode(self, qkv: mx.array, cache: Any) -> mx.array:
+        conv_state = cache[0]
+        K = self.conv_kernel_size
+        conv_input = mx.concatenate([conv_state, qkv], axis=1)
+        cache[0] = mx.contiguous(conv_input[:, -K + 1 :, :])
+        w = self.conv1d.weight.squeeze(-1).T
+        out = (conv_input * w).sum(axis=1)
+        return nn.silu(out[:, None, :])
+
+    def _conv1d_decode_multi(self, qkv: mx.array, cache: Any) -> mx.array:
+        B, S, C = qkv.shape
+        K = self.conv_kernel_size
+        w = self.conv1d.weight.squeeze(-1).T
+        all_tokens = mx.concatenate([cache[0], qkv], axis=1)
+        cache[0] = mx.contiguous(all_tokens[:, -(K - 1) :, :])
+        windows = mx.stack(
+            [all_tokens[:, t : t + K, :] for t in range(S)], axis=1
+        )
+        out = (windows * w).sum(axis=2)
+        return nn.silu(out)
+
     def __call__(
         self,
         inputs: mx.array,
@@ -141,31 +160,45 @@ class GatedDeltaNet(nn.Module):
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        qkvz = self.in_proj_qkvz(inputs)
+        qkv_dim = self.key_dim * 2 + self.value_dim
+        qkv = qkvz[..., : qkv_dim]
+        z = qkvz[..., qkv_dim :].reshape(
+            B, S, self.num_v_heads, self.head_v_dim
+        )
+        ba = self.in_proj_ba(inputs)
+        b = ba[..., : self.num_v_heads]
+        a = ba[..., self.num_v_heads :]
 
-        if cache is not None and cache[0] is not None:
-            conv_state = cache[0]
+        is_decode = cache is not None and cache[0] is not None
+        if is_decode and S == 1:
+            if mask is not None:
+                qkv = mx.where(mask[..., None], qkv, 0)
+            conv_out = self._conv1d_decode(qkv, cache)
+        elif is_decode:
+            if mask is not None:
+                qkv = mx.where(mask[..., None], qkv, 0)
+            conv_out = self._conv1d_decode_multi(qkv, cache)
         else:
-            conv_state = mx.zeros(
-                (B, self.conv_kernel_size - 1, self.conv_dim),
-                dtype=inputs.dtype,
-            )
-
-        if mask is not None:
-            qkv = mx.where(mask[..., None], qkv, 0)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            if cache is not None and cache[0] is not None:
+                conv_state = cache[0]
             else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+                conv_state = mx.zeros(
+                    (B, self.conv_kernel_size - 1, self.conv_dim),
+                    dtype=inputs.dtype,
+                )
+            if mask is not None:
+                qkv = mx.where(mask[..., None], qkv, 0)
+            conv_input = mx.concatenate([conv_state, qkv], axis=1)
+            if cache is not None:
+                n_keep = self.conv_kernel_size - 1
+                if cache.lengths is not None:
+                    ends = mx.clip(cache.lengths, 0, S)
+                    positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                    cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
             t.reshape(B, S, h, d)
@@ -356,6 +389,142 @@ class TextModel(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
+        fused = {}
+        skip = set()
+        for key, val in list(weights.items()):
+            if key in skip:
+                continue
+            # Fuse GatedDeltaNet: in_proj_qkv + in_proj_z → in_proj_qkvz
+            if ".linear_attn.in_proj_qkv.weight" in key:
+                prefix = key.replace(".linear_attn.in_proj_qkv.weight", "")
+                z_key = prefix + ".linear_attn.in_proj_z.weight"
+                if z_key in weights:
+                    fused[prefix + ".linear_attn.in_proj_qkvz.weight"] = mx.concatenate(
+                        [val, weights[z_key]], axis=0
+                    )
+                    skip.update([key, z_key])
+                    qkv_scales = key.replace(".weight", ".scales")
+                    z_scales = z_key.replace(".weight", ".scales")
+                    if qkv_scales in weights:
+                        fused[prefix + ".linear_attn.in_proj_qkvz.scales"] = (
+                            mx.concatenate(
+                                [weights[qkv_scales], weights[z_scales]], axis=0
+                            )
+                        )
+                        skip.update([qkv_scales, z_scales])
+                    qkv_biases = key.replace(".weight", ".biases")
+                    z_biases = z_key.replace(".weight", ".biases")
+                    if qkv_biases in weights:
+                        fused[prefix + ".linear_attn.in_proj_qkvz.biases"] = (
+                            mx.concatenate(
+                                [weights[qkv_biases], weights[z_biases]], axis=0
+                            )
+                        )
+                        skip.update([qkv_biases, z_biases])
+                else:
+                    fused[key] = val
+            # Fuse GatedDeltaNet: in_proj_b + in_proj_a → in_proj_ba
+            elif ".linear_attn.in_proj_b.weight" in key:
+                prefix = key.replace(".linear_attn.in_proj_b.weight", "")
+                a_key = prefix + ".linear_attn.in_proj_a.weight"
+                if a_key in weights:
+                    fused[prefix + ".linear_attn.in_proj_ba.weight"] = mx.concatenate(
+                        [val, weights[a_key]], axis=0
+                    )
+                    skip.update([key, a_key])
+                    b_scales = key.replace(".weight", ".scales")
+                    a_scales = a_key.replace(".weight", ".scales")
+                    if b_scales in weights:
+                        fused[prefix + ".linear_attn.in_proj_ba.scales"] = (
+                            mx.concatenate(
+                                [weights[b_scales], weights[a_scales]], axis=0
+                            )
+                        )
+                        skip.update([b_scales, a_scales])
+                    b_biases = key.replace(".weight", ".biases")
+                    a_biases = a_key.replace(".weight", ".biases")
+                    if b_biases in weights:
+                        fused[prefix + ".linear_attn.in_proj_ba.biases"] = (
+                            mx.concatenate(
+                                [weights[b_biases], weights[a_biases]], axis=0
+                            )
+                        )
+                        skip.update([b_biases, a_biases])
+                else:
+                    fused[key] = val
+            elif ".self_attn.q_proj.weight" in key:
+                prefix = key.replace(".self_attn.q_proj.weight", "")
+                k_key = prefix + ".self_attn.k_proj.weight"
+                v_key = prefix + ".self_attn.v_proj.weight"
+                if k_key in weights and v_key in weights:
+                    fused[prefix + ".self_attn.qkv_proj.weight"] = mx.concatenate(
+                        [val, weights[k_key], weights[v_key]], axis=0
+                    )
+                    skip.update([key, k_key, v_key])
+                    q_scales = key.replace(".weight", ".scales")
+                    k_scales = k_key.replace(".weight", ".scales")
+                    v_scales = v_key.replace(".weight", ".scales")
+                    if q_scales in weights:
+                        fused[prefix + ".self_attn.qkv_proj.scales"] = mx.concatenate(
+                            [weights[q_scales], weights[k_scales], weights[v_scales]], axis=0
+                        )
+                        skip.update([q_scales, k_scales, v_scales])
+                    qb = key.replace(".weight", ".bias")
+                    kb = k_key.replace(".weight", ".bias")
+                    vb = v_key.replace(".weight", ".bias")
+                    if qb in weights:
+                        fused[prefix + ".self_attn.qkv_proj.bias"] = mx.concatenate(
+                            [weights[qb], weights[kb], weights[vb]], axis=0
+                        )
+                        skip.update([qb, kb, vb])
+                    q_biases = key.replace(".weight", ".biases")
+                    k_biases = k_key.replace(".weight", ".biases")
+                    v_biases = v_key.replace(".weight", ".biases")
+                    if q_biases in weights:
+                        fused[prefix + ".self_attn.qkv_proj.biases"] = mx.concatenate(
+                            [weights[q_biases], weights[k_biases], weights[v_biases]], axis=0
+                        )
+                        skip.update([q_biases, k_biases, v_biases])
+                else:
+                    fused[key] = val
+            elif ".mlp.gate_proj.weight" in key and ".switch_mlp." not in key:
+                prefix = key.replace(".mlp.gate_proj.weight", "")
+                up_key = prefix + ".mlp.up_proj.weight"
+                if up_key in weights and ".switch_mlp." not in up_key:
+                    fused[prefix + ".mlp.gate_up_proj.weight"] = mx.concatenate(
+                        [val, weights[up_key]], axis=0
+                    )
+                    skip.update([key, up_key])
+                    g_scales = key.replace(".weight", ".scales")
+                    u_scales = up_key.replace(".weight", ".scales")
+                    if g_scales in weights:
+                        fused[prefix + ".mlp.gate_up_proj.scales"] = mx.concatenate(
+                            [weights[g_scales], weights[u_scales]], axis=0
+                        )
+                        skip.update([g_scales, u_scales])
+                    gb = key.replace(".weight", ".bias")
+                    ub = up_key.replace(".weight", ".bias")
+                    if gb in weights:
+                        fused[prefix + ".mlp.gate_up_proj.bias"] = mx.concatenate(
+                            [weights[gb], weights[ub]], axis=0
+                        )
+                        skip.update([gb, ub])
+                    g_biases = key.replace(".weight", ".biases")
+                    u_biases = up_key.replace(".weight", ".biases")
+                    if g_biases in weights:
+                        fused[prefix + ".mlp.gate_up_proj.biases"] = mx.concatenate(
+                            [weights[g_biases], weights[u_biases]], axis=0
+                        )
+                        skip.update([g_biases, u_biases])
+                else:
+                    fused[key] = val
+            else:
+                fused[key] = val
+
+        weights.update(fused)
+        for k in skip:
+            weights.pop(k, None)
+
         norm_keys = (
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
@@ -370,6 +539,16 @@ class TextModel(nn.Module):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights
+
+    def prealloc_caches(self, cache, max_seq_len=4096, B=1):
+        args = self.args
+        head_dim = args.head_dim
+        for c in cache:
+            if isinstance(c, KVCache) and c.keys is None:
+                c.prealloc(
+                    B, args.num_key_value_heads, head_dim, head_dim,
+                    max_seq_len, dtype=mx.float16,
+                )
 
     @property
     def quant_predicate(self):
@@ -503,23 +682,16 @@ class Model(nn.Module):
 
             # Softmax attention
             else:
+                q_out = layer.self_attn.num_attention_heads * layer.self_attn.head_dim * 2
+                kv_out = layer.self_attn.num_key_value_heads * layer.self_attn.head_dim
                 layer.self_attn.o_proj = shard_linear(
                     layer.self_attn.o_proj, "sharded-to-all", group=group
                 )
-                layer.self_attn.q_proj = shard_linear(
-                    layer.self_attn.q_proj, "all-to-sharded", group=group
-                )
-                repeat_kv_layer_inplace(
-                    layer.self_attn.k_proj, layer.self_attn.num_key_value_heads
-                )
-                repeat_kv_layer_inplace(
-                    layer.self_attn.v_proj, layer.self_attn.num_key_value_heads
-                )
-                layer.self_attn.k_proj = shard_linear(
-                    layer.self_attn.k_proj, "all-to-sharded", group=group
-                )
-                layer.self_attn.v_proj = shard_linear(
-                    layer.self_attn.v_proj, "all-to-sharded", group=group
+                layer.self_attn.qkv_proj = shard_linear(
+                    layer.self_attn.qkv_proj,
+                    "all-to-sharded",
+                    segments=[q_out, kv_out, kv_out],
+                    group=group,
                 )
                 layer.self_attn.num_attention_heads //= N
                 layer.self_attn.num_key_value_heads = max(
@@ -528,27 +700,29 @@ class Model(nn.Module):
 
             # MLP
             if isinstance(layer.mlp, MLP):
-                layer.mlp.gate_proj = shard_linear(
-                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                hidden_dim = layer.mlp.down_proj.weight.shape[1]
+                layer.mlp.gate_up_proj = shard_linear(
+                    layer.mlp.gate_up_proj,
+                    "all-to-sharded",
+                    segments=[hidden_dim, hidden_dim],
+                    group=group,
                 )
                 layer.mlp.down_proj = shard_linear(
                     layer.mlp.down_proj, "sharded-to-all", group=group
-                )
-                layer.mlp.up_proj = shard_linear(
-                    layer.mlp.up_proj, "all-to-sharded", group=group
                 )
 
             # MoE
             else:
                 layer.mlp.sharding_group = group
+                se_hidden = layer.mlp.shared_expert.down_proj.weight.shape[1]
                 shard_inplace(
-                    layer.mlp.shared_expert.gate_proj, "all-to-sharded", group=group
+                    layer.mlp.shared_expert.gate_up_proj,
+                    "all-to-sharded",
+                    segments=[se_hidden, se_hidden],
+                    group=group,
                 )
                 shard_inplace(
                     layer.mlp.shared_expert.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
                 )
                 shard_inplace(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
@@ -566,6 +740,9 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def prealloc_caches(self, cache, max_seq_len=4096, B=1):
+        self.language_model.prealloc_caches(cache, max_seq_len, B)
 
     @property
     def quant_predicate(self):

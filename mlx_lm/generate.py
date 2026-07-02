@@ -36,7 +36,9 @@ from .models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
     TokenBuffer,
+    can_trim_prompt_cache,
     load_prompt_cache,
+    trim_prompt_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -217,6 +219,17 @@ def setup_arg_parser():
         "--num-draft-tokens",
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
+        default=3,
+    )
+    parser.add_argument(
+        "--ngram-spec",
+        action="store_true",
+        help="Use n-gram self-speculative decoding (no draft model needed).",
+    )
+    parser.add_argument(
+        "--ngram-n",
+        type=int,
+        help="N-gram order for self-speculative decoding (default: 3).",
         default=3,
     )
     return parser
@@ -470,6 +483,279 @@ def generate_step(
         n += 1
 
 
+class NgramDraftTable:
+    """N-gram table for CPU-side draft token generation in self-speculative
+    decoding.  Zero GPU cost — the draft step is a hash-table lookup.
+    Uses frequency counting so the most common continuation is always
+    returned as the draft token.  Falls back from n-gram → bigram →
+    unigram to maximise draft coverage."""
+
+    def __init__(self, n: int = 3):
+        self.n = n
+        self._freqs = {}
+        self._bigram_freqs = {}
+        self._unigram_freqs = {}
+        self._recent = []
+
+    def build(self, tokens):
+        """Build n-gram, bigram, and unigram frequency tables from prompt."""
+        for i in range(len(tokens) - self.n + 1):
+            key = tuple(tokens[i : i + self.n - 1])
+            val = tokens[i + self.n - 1]
+            bucket = self._freqs.setdefault(key, {})
+            bucket[val] = bucket.get(val, 0) + 1
+        for i in range(len(tokens) - 1):
+            key = tokens[i]
+            val = tokens[i + 1]
+            bucket = self._bigram_freqs.setdefault(key, {})
+            bucket[val] = bucket.get(val, 0) + 1
+        for t in tokens:
+            self._unigram_freqs[t] = self._unigram_freqs.get(t, 0) + 1
+        self._recent = list(tokens[-(self.n - 1) :])
+
+    def update(self, token):
+        """Rolling update with a newly generated token."""
+        if len(self._recent) >= self.n - 1:
+            key = tuple(self._recent[-(self.n - 1) :])
+            bucket = self._freqs.setdefault(key, {})
+            bucket[token] = bucket.get(token, 0) + 1
+        if len(self._recent) >= 1:
+            key = self._recent[-1]
+            bucket = self._bigram_freqs.setdefault(key, {})
+            bucket[token] = bucket.get(token, 0) + 1
+        self._unigram_freqs[token] = self._unigram_freqs.get(token, 0) + 1
+        self._recent.append(token)
+        if len(self._recent) > self.n:
+            self._recent = self._recent[-(self.n - 1) :]
+
+    def draft(self):
+        """Return the most frequent next token, falling back from
+        n-gram → bigram → unigram.  Returns None only when the table
+        is completely empty."""
+        if len(self._recent) >= self.n - 1:
+            key = tuple(self._recent[-(self.n - 1) :])
+            bucket = self._freqs.get(key)
+            if bucket:
+                return max(bucket, key=bucket.get)
+        if len(self._recent) >= 1:
+            key = self._recent[-1]
+            bucket = self._bigram_freqs.get(key)
+            if bucket:
+                return max(bucket, key=bucket.get)
+        if self._unigram_freqs:
+            return max(self._unigram_freqs, key=self._unigram_freqs.get)
+        return None
+
+
+def ngram_speculative_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: int = 1,
+    ngram_n: int = 3,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    max_kv_size: Optional[int] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    input_embeddings: Optional[mx.array] = None,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """Self-speculative decoding using an n-gram draft table.
+
+    Instead of a separate draft model, draft tokens come from a CPU-side
+    n-gram table built from the prompt.  The verification step is free
+    because it reuses the logits already computed by the main model.
+
+    Args:
+        prompt: The input prompt.
+        model: The model to use for generation.
+        num_draft_tokens: Number of draft tokens per step (1 or 2).
+        ngram_n: N-gram order (3 = trigram).
+        max_tokens: Maximum tokens to generate.
+        sampler: Token sampler.
+        logits_processors: Logits processors.
+        max_kv_size: Maximum KV cache size.
+        prompt_cache: Pre-computed prompt cache.
+        prefill_step_size: Step size for prompt processing.
+        kv_bits: KV cache quantization bits.
+        kv_group_size: KV cache quantization group size.
+        quantized_kv_start: Step to begin KV cache quantization.
+        prompt_progress_callback: Callback for prompt progress.
+        input_embeddings: Optional input embeddings.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: token, logprobs, from_draft
+    """
+    if input_embeddings is not None:
+        if not does_model_support_input_embeddings(model):
+            raise ValueError("Model does not support input embeddings.")
+    elif len(prompt) == 0:
+        raise ValueError("Either input_embeddings or prompt must be provided.")
+
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(
+            model, max_kv_size=max_kv_size
+        )
+        if hasattr(model, "prealloc_caches"):
+            model.prealloc_caches(prompt_cache, max_seq_len=max(max_tokens + 128, 4096))
+
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    ngram = NgramDraftTable(n=ngram_n)
+    ngram.build(prompt.tolist())
+
+    def _model_call(input_tokens, input_embeddings=None):
+        if input_embeddings is not None:
+            return model(input_tokens, cache=prompt_cache, input_embeddings=input_embeddings)
+        return model(input_tokens, cache=prompt_cache)
+
+    def _sample(logits):
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(None, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs), logprobs
+
+    with mx.stream(generation_stream):
+        total_prompt_tokens = (
+            len(input_embeddings) if input_embeddings is not None else len(prompt)
+        )
+        prompt_processed_tokens = 0
+        prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        while total_prompt_tokens - prompt_processed_tokens > 1:
+            remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+            n_to_process = min(prefill_step_size, remaining)
+            _model_call(
+                input_tokens=prompt[:n_to_process][None],
+                input_embeddings=(
+                    input_embeddings[:n_to_process][None]
+                    if input_embeddings is not None
+                    else None
+                ),
+            )
+            quantize_cache_fn(prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            prompt_processed_tokens += n_to_process
+            prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+            prompt = prompt[n_to_process:]
+            input_embeddings = (
+                input_embeddings[n_to_process:]
+                if input_embeddings is not None
+                else input_embeddings
+            )
+            mx.clear_cache()
+
+        logits = _model_call(
+            input_tokens=prompt[None],
+            input_embeddings=(
+                input_embeddings[None] if input_embeddings is not None else None
+            ),
+        )
+        logits = logits[:, -1, :]
+        quantize_cache_fn(prompt_cache)
+        y, logprobs = _sample(logits)
+        y = y.squeeze(0)
+        logprobs = logprobs.squeeze(0)
+
+    mx.async_eval(y, logprobs)
+    prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+
+    ntoks = 0
+    while True:
+        if ntoks == max_tokens:
+            break
+
+        draft_tokens = []
+        for _ in range(num_draft_tokens):
+            dt = ngram.draft()
+            if dt is None:
+                break
+            draft_tokens.append(dt)
+
+        num_draft = len(draft_tokens)
+
+        if num_draft > 0:
+            for c in prompt_cache:
+                if isinstance(c, ArraysCache):
+                    c.checkpoint()
+
+            draft_arr = mx.array(draft_tokens, mx.uint32)
+            with mx.stream(generation_stream):
+                all_tokens = mx.concatenate([y.reshape(1), draft_arr])
+                logits = _model_call(input_tokens=all_tokens[None])
+                logits = logits[:, -(num_draft + 1) :, :]
+                quantize_cache_fn(prompt_cache)
+
+                sampled_tokens = []
+                sampled_logprobs = []
+                accepted = 0
+                for i in range(num_draft + 1):
+                    s, lp = _sample(logits[:, i, :])
+                    s_item = s.item()
+                    sampled_tokens.append(s_item)
+                    sampled_logprobs.append((s.squeeze(0), lp.squeeze(0)))
+
+                    if i < num_draft:
+                        if s_item == draft_tokens[i]:
+                            accepted += 1
+                        else:
+                            break
+
+                if accepted < num_draft:
+                    trim_count = num_draft - accepted
+                    for c in prompt_cache:
+                        if isinstance(c, ArraysCache):
+                            c.rollback()
+                    if can_trim_prompt_cache(prompt_cache):
+                        trim_prompt_cache(prompt_cache, trim_count)
+
+                ngram.update(sampled_tokens[0])
+                for i in range(1, accepted + 1):
+                    ngram.update(sampled_tokens[i])
+
+                yield sampled_tokens[0], sampled_logprobs[0][1], False
+                ntoks += 1
+                if ntoks == max_tokens:
+                    break
+
+                for i in range(1, accepted + 1):
+                    yield sampled_tokens[i], sampled_logprobs[i][1], True
+                    ntoks += 1
+                    if ntoks == max_tokens:
+                        break
+
+                y = mx.array([sampled_tokens[accepted]], mx.uint32)
+        else:
+            with mx.stream(generation_stream):
+                logits = _model_call(input_tokens=y.reshape(1, 1))
+                logits = logits[:, -1, :]
+                quantize_cache_fn(prompt_cache)
+                y, logprobs = _sample(logits)
+                y = y.squeeze(0)
+                logprobs = logprobs.squeeze(0)
+
+            y_item = y.item()
+            ngram.update(y_item)
+            yield y_item, logprobs, False
+            ntoks += 1
+            if ntoks == max_tokens:
+                break
+
+
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -660,6 +946,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    ngram_spec: bool = False,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -675,6 +962,8 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        ngram_spec (bool): Use n-gram self-speculative decoding instead of a
+          draft model. Default: ``False``.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -698,8 +987,16 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if ngram_spec:
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        ngram_n_val = kwargs.pop("ngram_n", 3)
+        token_generator = ngram_speculative_generate_step(
+            prompt, model, ngram_n=ngram_n_val, **kwargs
+        )
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("ngram_n", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -2105,6 +2402,8 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        ngram_spec=args.ngram_spec,
+        ngram_n=args.ngram_n,
     )
     if not args.verbose:
         print(response)

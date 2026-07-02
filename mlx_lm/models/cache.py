@@ -727,6 +727,24 @@ class ArraysCache(_BaseCache):
     def nbytes(self):
         return sum(c.nbytes for c in self.cache if c is not None)
 
+    def is_trimmable(self):
+        return True
+
+    def checkpoint(self):
+        """Save current state for rollback after speculative decode rejection."""
+        self._checkpoint_state = list(self.cache)
+
+    def rollback(self):
+        """Restore state from last checkpoint."""
+        if hasattr(self, "_checkpoint_state"):
+            self.cache = self._checkpoint_state
+            self._checkpoint_state = None
+
+    def trim(self, n):
+        """Trim is a no-op for ArraysCache (state-based, not offset-based).
+        Rollback via checkpoint/rollback is used instead for speculative decode."""
+        return 0
+
 
 class ChunkedKVCache(_BaseCache):
     step = 256
