@@ -106,7 +106,21 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
-        scores = scores.sum(axis=1, keepdims=True)
+        if s > 1:
+            # Reduce heads with elementwise adds instead of mx.sum: works around
+            # ml-explore/mlx#3784 (mx.sum over a non-last axis of a large strided
+            # tensor returns all-zeros, e.g. [1, 32, 4096, 131072] at >=128k
+            # context), which silently zeroes the indexer scores and corrupts the
+            # top-k selection past ~128k tokens. At decode (s == 1) the tensor is
+            # far below the trigger threshold, so the fast fused sum is kept.
+            # TODO: revert to scores.sum(axis=1, keepdims=True) once the MLX fix
+            # lands.
+            summed = scores[:, 0:1]
+            for h in range(1, scores.shape[1]):
+                summed = summed + scores[:, h : h + 1]
+            scores = summed
+        else:
+            scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
