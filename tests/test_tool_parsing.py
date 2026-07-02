@@ -275,6 +275,60 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["action"], "create")
         self.assertIn("{", tool_call["arguments"]["content"])
 
+    def test_mistral(self):
+        # Single call with trailing natural-language text. Mistral has no
+        # tool_call_end token, so trailing tokens land in the same segment and
+        # must be ignored rather than fed to json.loads (which raises
+        # "Extra data").
+        test_case = 'get_weather[ARGS]{"city": "Paris"}\n\nLet me check that.'
+        tool_call = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Paris"}}
+        )
+
+        # Multiple (parallel) tool calls concatenated into one segment,
+        # separated by the "[TOOL_CALLS]" marker. These must all be returned as
+        # a list rather than dropped.
+        test_case = (
+            'get_weather[ARGS]{"city": "Paris"}'
+            '[TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}'
+        )
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(
+            tool_calls[0], {"name": "get_weather", "arguments": {"city": "Paris"}}
+        )
+        self.assertEqual(
+            tool_calls[1], {"name": "get_weather", "arguments": {"city": "Tokyo"}}
+        )
+
+        # Multiple calls with no separator between them.
+        test_case = 'a[ARGS]{"x": 1}b[ARGS]{"y": 2}'
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "a", "arguments": {"x": 1}},
+                {"name": "b", "arguments": {"y": 2}},
+            ],
+        )
+
+        # Nested JSON and literal braces / "[ARGS]" inside a string must not
+        # confuse the parser.
+        test_case = (
+            'run[ARGS]{"cmd": "echo {x} [ARGS] }", '
+            '"opts": {"deep": [1, 2, {"k": "v"}]}}'
+        )
+        tool_call = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "run")
+        self.assertEqual(tool_call["arguments"]["cmd"], "echo {x} [ARGS] }")
+        self.assertEqual(tool_call["arguments"]["opts"], {"deep": [1, 2, {"k": "v"}]})
+
+        # Text with no tool call still raises.
+        with self.assertRaises(ValueError):
+            mistral.parse_tool_call("just some prose, no call here", None)
+
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
