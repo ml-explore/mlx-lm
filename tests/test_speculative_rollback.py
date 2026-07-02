@@ -71,8 +71,7 @@ class TestSpeculativeRollback(unittest.TestCase):
             for x in c:
                 x.start_speculation()
             model(chunk[None], cache=c)
-            self.assertEqual(cache.trim_prompt_cache(c, chunk.size - m),
-                             chunk.size - m)
+            self.assertEqual(cache.trim_prompt_cache(c, chunk.size - m), chunk.size - m)
             logits = model(probe[None], cache=c)
             mx.eval(logits, [x.state for x in c])
             return c, logits
@@ -89,11 +88,15 @@ class TestSpeculativeRollback(unittest.TestCase):
                 else:
                     self.assertEqual(a.offset, b.offset)
                     self.assertTrue(
-                        mx.array_equal(a.keys[..., : a.offset, :],
-                                       b.keys[..., : b.offset, :]))
+                        mx.array_equal(
+                            a.keys[..., : a.offset, :], b.keys[..., : b.offset, :]
+                        )
+                    )
                     self.assertTrue(
-                        mx.array_equal(a.values[..., : a.offset, :],
-                                       b.values[..., : b.offset, :]))
+                        mx.array_equal(
+                            a.values[..., : a.offset, :], b.values[..., : b.offset, :]
+                        )
+                    )
 
     def test_speculative_matches_vanilla(self):
         # With an unrelated (random) draft model the acceptance rate is ~0, so
@@ -105,9 +108,7 @@ class TestSpeculativeRollback(unittest.TestCase):
         prompt = mx.random.randint(0, 1000, (16,), dtype=mx.uint32)
         n = 24
 
-        vanilla = [
-            int(tok) for tok, _ in generate_step(prompt, model, max_tokens=n)
-        ]
+        vanilla = [int(tok) for tok, _ in generate_step(prompt, model, max_tokens=n)]
         spec = [
             int(tok)
             for tok, _, _ in speculative_generate_step(
@@ -115,6 +116,62 @@ class TestSpeculativeRollback(unittest.TestCase):
             )
         ]
         self.assertEqual(vanilla, spec)
+
+    def test_cache_reusable_after_speculation(self):
+        # A prompt cache used for speculative decoding must come back clean:
+        # not trimmable, no dangling rollback, and usable for plain decoding
+        # that matches a never-speculated run.
+        model = make_hybrid()
+        mx.random.seed(2)
+        draft = llama.Model(llama.ModelArgs.from_dict(LLAMA_ARGS))
+        prompt = mx.random.randint(0, 1000, (16,), dtype=mx.uint32)
+
+        c = cache.make_prompt_cache(model) + cache.make_prompt_cache(draft)
+        spec = [
+            int(tok)
+            for tok, _, _ in speculative_generate_step(
+                prompt, model, draft, num_draft_tokens=3, max_tokens=8, prompt_cache=c
+            )
+        ]
+        model_cache = c[: len(model.layers)]
+        self.assertFalse(cache.can_trim_prompt_cache(model_cache))
+        for x in model_cache:
+            if isinstance(x, cache.ArraysCache):
+                self.assertFalse(x.speculating)
+                self.assertIsNone(x._rollback)
+
+        # continue decoding on the same cache with plain steps
+        cont = [
+            int(tok)
+            for tok, _ in generate_step(
+                mx.array(spec[-1:], mx.uint32),
+                model,
+                max_tokens=8,
+                prompt_cache=model_cache,
+            )
+        ]
+
+        # reference: one uninterrupted vanilla run over the same tokens
+        ref = [
+            int(tok)
+            for tok, _ in generate_step(prompt, model, max_tokens=8 + len(spec))
+        ]
+        self.assertEqual(ref, spec + cont)
+
+    def test_early_generator_close(self):
+        # Closing the speculative generator mid-stream must roll the cache back
+        # cleanly (the finally path) without raising.
+        model = make_hybrid()
+        mx.random.seed(3)
+        draft = llama.Model(llama.ModelArgs.from_dict(LLAMA_ARGS))
+        prompt = mx.random.randint(0, 1000, (16,), dtype=mx.uint32)
+
+        gen = speculative_generate_step(
+            prompt, model, draft, num_draft_tokens=3, max_tokens=64
+        )
+        took = [next(gen) for _ in range(3)]
+        gen.close()  # must not raise (double-rewind / consumed-rollback bugs)
+        self.assertEqual(len(took), 3)
 
     def test_unsupported_hybrid_still_raises(self):
         # An ArraysCache whose layers never record a rollback must not be
