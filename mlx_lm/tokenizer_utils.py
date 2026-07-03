@@ -500,7 +500,13 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
         return [self._postprocess_text(d) for d in decoded]
 
 
-AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+try:
+    AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+except (AttributeError, TypeError):
+    # transformers >= 5.13 requires the auto-mapping key to be a config class;
+    # the name-based lookup we rely on is populated before that step, so the
+    # custom tokenizer stays resolvable and import can proceed.
+    pass
 
 
 def _match(a, b):
