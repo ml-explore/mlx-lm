@@ -422,6 +422,17 @@ class KVCache(_BaseCache):
 
 class RotatingKVCache(_BaseCache):
     step = 256
+    # Tokens of exact-rollback history kept while speculating (mirrors
+    # ArraysCache; a speculative trim never exceeds the last verify window).
+    _ROLLBACK_WINDOW = 64
+
+    def __new__(cls, *args, **kwargs):
+        # Set on __new__ (not __init__) so caches reconstructed by
+        # load_prompt_cache (which bypasses __init__) still have them.
+        instance = super().__new__(cls)
+        instance.speculating = False
+        instance._rollbacks = deque()
+        return instance
 
     def __init__(self, max_size, keep=0):
         self.keep = keep
@@ -430,6 +441,32 @@ class RotatingKVCache(_BaseCache):
         self.offset = 0
         self.max_size = max_size
         self._idx = 0
+
+    def start_speculation(self):
+        self.speculating = True
+        self._rollbacks.clear()
+
+    def stop_speculation(self):
+        self.speculating = False
+        self._rollbacks.clear()
+
+    def record_rollback(self, num_tokens, snapshot, keys, values):
+        """Recorded by ``update_and_fetch`` during a forward while
+        ``speculating``. A sliding-window KV cache is not directly trimmable
+        once it has wrapped (``offset >= max_size``): the tokens a verify step
+        pushes out of the window are gone. So we stash the pre-forward window
+        (``snapshot``) plus this forward's new K/V; ``trim`` rebuilds the exact
+        window for any accepted prefix by restoring the snapshot and
+        re-appending the first ``m`` tokens. The verify path uses
+        ``_update_concat`` which reallocates (never mutates in place), so
+        holding references in ``snapshot`` is safe."""
+        self._rollbacks.append((num_tokens, snapshot, keys, values))
+        total = sum(r[0] for r in self._rollbacks)
+        while (
+            len(self._rollbacks) > 1
+            and total - self._rollbacks[0][0] >= self._ROLLBACK_WINDOW
+        ):
+            total -= self._rollbacks.popleft()[0]
 
     def _trim(self, trim_size, v, append=None):
         to_cat = []
@@ -523,6 +560,13 @@ class RotatingKVCache(_BaseCache):
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
+        if self.speculating:
+            self.record_rollback(
+                keys.shape[2],
+                [self.keys, self.values, self._idx, self.offset],
+                keys,
+                values,
+            )
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
@@ -553,12 +597,43 @@ class RotatingKVCache(_BaseCache):
         )
 
     def is_trimmable(self):
-        return self.offset < self.max_size
+        # While speculating every forward records an exact rollback, so the
+        # cache is trimmable within the recorded window even after it wraps.
+        return self.speculating or self.offset < self.max_size
 
     def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        self._idx -= n
+        if not self.speculating:
+            n = min(self.offset, n)
+            self.offset -= n
+            self._idx -= n
+            return n
+        recorded = sum(r[0] for r in self._rollbacks)
+        if recorded < n:
+            raise RuntimeError(
+                f"Cannot trim {n} tokens from RotatingKVCache: only {recorded} "
+                "tokens of exact rollback are recorded (speculative window)."
+            )
+        trimmed = 0
+        while trimmed < n:
+            num_tokens, snap, keys, values = self._rollbacks.pop()
+            take = min(n - trimmed, num_tokens)
+            m = num_tokens - take
+            # Restore the pre-forward window, then re-append the first m tokens
+            # of this chunk to reconstruct the exact accepted-prefix window.
+            self.keys, self.values, self._idx, self.offset = (
+                snap[0],
+                snap[1],
+                snap[2],
+                snap[3],
+            )
+            if m > 0:
+                if m == 1:
+                    self._update_in_place(keys[..., :1, :], values[..., :1, :])
+                else:
+                    self._update_concat(keys[..., :m, :], values[..., :m, :])
+                # The record still describes its first m tokens; keep it.
+                self._rollbacks.append((m, snap, keys, values))
+            trimmed += take
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:

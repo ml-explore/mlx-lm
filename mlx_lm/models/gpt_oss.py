@@ -230,6 +230,11 @@ class GptOssMoeModel(nn.Module):
 
 
 class Model(nn.Module):
+    # Sliding-window (RotatingKVCache) layers record an exact rollback while
+    # speculating, so the cache is trimmable within the verify window (see
+    # RotatingKVCache.record_rollback) — enables --draft-model speculation.
+    supports_speculative_rollback = True
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
