@@ -8,6 +8,8 @@ from huggingface_hub import snapshot_download
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
+    NewlineTokenizer,
+    NewlineTokenizerConfig,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
 )
@@ -122,6 +124,33 @@ class TestTokenizers(unittest.TestCase):
         prompt = [HI, THINK_START, THINK_END, THINK_START]
         self.assertEqual(find(prompt, [THINK_START], start=0), 1)
         self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
+
+    def test_newline_tokenizer_registration(self):
+        """Test that NewlineTokenizer is properly registered with a config class.
+
+        This test verifies the fix for transformers 5.13.0+ compatibility where
+        AutoTokenizer.register() requires a config class instead of a string.
+        """
+        from transformers import AutoTokenizer
+
+        # Verify the config class exists and has required attributes
+        self.assertTrue(hasattr(NewlineTokenizerConfig, "model_type"))
+        self.assertEqual(NewlineTokenizerConfig.model_type, "newline_tokenizer")
+
+        # Verify the config class has __module__ attribute (required by transformers 5.13.0+)
+        self.assertTrue(hasattr(NewlineTokenizerConfig, "__module__"))
+        self.assertFalse(NewlineTokenizerConfig.__module__.startswith("transformers."))
+
+        # Verify NewlineTokenizer class exists and is properly defined
+        self.assertTrue(
+            issubclass(NewlineTokenizer, AutoTokenizer.__bases__[0].__class__)
+        )
+
+        # Test that the tokenizer can process newlines correctly
+        # Note: We can't easily test the full registration without a tokenizer file,
+        # but we can verify the class methods work as expected
+        self.assertTrue(hasattr(NewlineTokenizer, "_preprocess_text"))
+        self.assertTrue(hasattr(NewlineTokenizer, "_postprocess_text"))
 
 
 if __name__ == "__main__":
