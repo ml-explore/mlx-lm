@@ -42,6 +42,10 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    # Multi-token-prediction head (Qwen3.5 "-mtp" checkpoints). The module
+    # is built when this is > 0 and dropped again in sanitize() if the
+    # checkpoint carries no mtp.* tensors.
+    mtp_num_hidden_layers: int = 0
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -135,6 +139,7 @@ class GatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -180,6 +185,26 @@ class GatedDeltaNet(nn.Module):
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        if gdn_sink is not None:
+            # Everything needed to replay this update on an accepted prefix
+            # during speculative rollback; tuple layout consumed by
+            # TextModel.rollback_speculative_cache.
+            gdn_sink.append(
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    self.A_log,
+                    self.dt_bias,
+                    state,
+                    mask,
+                    conv_input,
+                    self.conv_kernel_size,
+                )
+            )
 
         out, state = gated_delta_update(
             q,
@@ -231,9 +256,10 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(self.input_layernorm(x), mask, cache, gdn_sink)
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -269,6 +295,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -294,7 +321,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
 
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(hidden_states, mask=mask, cache=c, gdn_sink=gdn_sink)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -316,12 +343,35 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         return self.norm(hidden_states)
 
 
+class MTPModule(nn.Module):
+    """Qwen3.5 multi-token-prediction head, present in "-mtp" checkpoints:
+    fc([norm(embed(t_{p+1})); norm(hidden_p)]) -> full-attention decoder
+    layer (own KV cache) -> norm -> the target's own lm_head. Enables
+    self-speculative decoding with no external draft model."""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+        self.pre_fc_norm_embedding = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        # layer_idx chosen so is_linear=False: the MTP block is full attention.
+        self.layers = [
+            DecoderLayer(args, layer_idx=args.full_attention_interval - 1)
+            for _ in range(args.mtp_num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+
 class TextModel(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
         self.model = Qwen3_5TextModel(args)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTPModule(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -345,13 +395,143 @@ class TextModel(nn.Module):
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
+    def logits(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    def make_mtp_cache(self):
+        return [KVCache() for _ in self.mtp.layers]
+
+    def mtp_step(self, hidden, tokens, mtp_cache):
+        """One MTP forward over S positions.
+
+        hidden: [B, S, H] post-final-norm hiddens at positions p..p+S-1
+        (from the trunk, or from a previous mtp_step when chaining draft
+        depth). tokens: [B, S] the tokens at positions p+1..p+S (the
+        committed or drafted token FOLLOWING each hidden's position).
+        Returns (logits [B, S, V], post_norm_hidden [B, S, H]).
+
+        The MTP KV cache offset counts pairs fed, i.e. rope positions are
+        uniformly shifted by -1 vs absolute; the shift cancels in q·k
+        since the MTP layer only attends within its own cache.
+        """
+        e = self.mtp.pre_fc_norm_embedding(self.model.embed_tokens(tokens))
+        h = self.mtp.pre_fc_norm_hidden(hidden)
+        x = self.mtp.fc(mx.concatenate([e, h], axis=-1))
+        mask = create_attention_mask(x, mtp_cache[0])
+        x = self.mtp.layers[0](x, mask=mask, cache=mtp_cache[0])
+        post = self.mtp.norm(x)
+        return self.logits(post), post
+
+    def rollback_speculative_cache(self, caches, gdn_states, keep, block_size):
+        """Rewind target caches after a speculative verify forward of
+        `block_size` tokens of which the first `keep` are kept.
+
+        KV caches trim normally. GatedDeltaNet caches (ArraysCache) hold a
+        recurrent state that cannot trim, so they are rebuilt by replaying
+        the captured verify inputs (`gdn_states`, from a `gdn_sink` passed
+        to the verify forward) on the kept prefix — all linear layers
+        batched into one gated_delta_update call. Single-sequence (B=1,
+        unpadded) only."""
+        trim = block_size - keep
+        ssm_caches = []
+        for c in caches:
+            if c is None:
+                continue
+            if c.is_trimmable():
+                if trim > 0:
+                    c.trim(trim)
+            else:
+                if c.lengths is not None or c.left_padding is not None:
+                    raise ValueError(
+                        "rollback_speculative_cache supports single-sequence "
+                        "caches only (lengths/left_padding must be None)"
+                    )
+                ssm_caches.append(c)
+        if not ssm_caches or trim == 0:
+            return
+        if len(ssm_caches) != len(gdn_states):
+            raise ValueError(
+                f"gdn_states has {len(gdn_states)} entries for "
+                f"{len(ssm_caches)} linear-attention caches"
+            )
+
+        if keep == 0:
+            # Nothing kept: restore the pre-verify state verbatim.
+            for c, st in zip(ssm_caches, gdn_states):
+                _, _, _, _, _, _, _, state, _, conv_input, K = st
+                c[1] = state
+                c[0] = conv_input[:, : K - 1]
+            return
+
+        q_l, k_l, v_l, a_l, b_l, al_l, dt_l, st_l = [], [], [], [], [], [], [], []
+        conv_data = []
+        replay_mask = None
+        for st in gdn_states:
+            q, k, v, a, b, A_log, dt_bias, state, mask, conv_input, K = st
+            rows = q.shape[0]
+            q_l.append(q[:, :keep])
+            k_l.append(k[:, :keep])
+            v_l.append(v[:, :keep])
+            a_l.append(a[:, :keep])
+            b_l.append(b[:, :keep])
+            al_l.append(
+                mx.broadcast_to(A_log[None, None, :], (rows, 1, A_log.shape[0]))
+            )
+            dt_l.append(
+                mx.broadcast_to(dt_bias[None, None, :], (rows, 1, dt_bias.shape[0]))
+            )
+            if state is None:
+                state = mx.zeros(
+                    (rows, v.shape[-2], v.shape[-1], k.shape[-1]),
+                    dtype=mx.float32,
+                )
+            st_l.append(state)
+            conv_data.append((conv_input, K))
+            if replay_mask is None and mask is not None:
+                replay_mask = mask[:, :keep]
+
+        if replay_mask is not None and replay_mask.shape[0] != len(gdn_states):
+            replay_mask = mx.concatenate([replay_mask] * len(gdn_states), axis=0)
+
+        _, states_out = gated_delta_update(
+            mx.concatenate(q_l, axis=0),
+            mx.concatenate(k_l, axis=0),
+            mx.concatenate(v_l, axis=0),
+            mx.concatenate(a_l, axis=0),
+            mx.concatenate(b_l, axis=0),
+            mx.concatenate(al_l, axis=0),
+            mx.concatenate(dt_l, axis=0),
+            mx.concatenate(st_l, axis=0),
+            replay_mask,
+            use_kernel=True,
+        )
+
+        for j, c in enumerate(ssm_caches):
+            c[1] = states_out[j : j + 1]
+            conv_input, K = conv_data[j]
+            c[0] = mx.contiguous(conv_input[:, keep : keep + K - 1])
+
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # Raw HF checkpoints store zero-centered norms AND raw conv1d
+        # shapes. mtp.* presence is NOT a raw-checkpoint signal:
+        # mlx-community "-mtp" conversions keep mtp tensors but already
+        # have shifted norms and sanitized conv1d — shifting again
+        # double-shifts every RMSNorm and produces garbage output.
+        should_shift_norm_weights = has_unsanitized_conv1d
+
+        has_mtp_weights = any("mtp." in k for k in weights)
+        if not (has_mtp_weights and hasattr(self, "mtp")):
+            # Checkpoint has no MTP tensors (or config declared no MTP
+            # layers): drop both the weights and the module so strict
+            # loading stays consistent.
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
+            if hasattr(self, "mtp"):
+                self.mtp = None
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -360,6 +540,9 @@ class TextModel(nn.Module):
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
             "model.norm.weight",
+            "mtp.norm.weight",
+            ".pre_fc_norm_embedding.weight",
+            ".pre_fc_norm_hidden.weight",
             ".q_norm.weight",
             ".k_norm.weight",
         )

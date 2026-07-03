@@ -609,13 +609,18 @@ class TestModels(unittest.TestCase):
             "linear_num_key_heads": 1,
             "linear_key_head_dim": 4,
             "linear_value_head_dim": 4,
-            "linear_conv_kernel_dim": 1,
-            "full_attention_interval": 1,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 2,
             "tie_word_embeddings": False,
             "max_position_embeddings": 64,
         }
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
         mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        # Raw HF checkpoints are identified by their unsanitized conv1d
+        # layout (mtp.* presence is NOT a raw signal: converted "-mtp"
+        # checkpoints keep mtp tensors with already-shifted norms).
+        hf_conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
+        mlx_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
 
         for model_type, hf_mtp_key in (
             ("qwen3_5", "mtp.fc.weights"),
@@ -632,21 +637,34 @@ class TestModels(unittest.TestCase):
 
             base = mx.arange(8, dtype=mx.float32)
 
-            # Simulate convert sanitize on HF-style keys.
+            # Simulate convert sanitize on HF-style keys (raw layout:
+            # unsanitized conv1d, zero-centered norms, mtp present).
             converted = model.sanitize(
                 {
                     hf_norm_key: base,
+                    hf_conv_key: mx.zeros((12, 1, 4), dtype=mx.float32),
                     hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
                 }
             )
             self.assertIn(mlx_norm_key, converted)
             self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
+            self.assertEqual(converted[mlx_conv_key].shape, (12, 4, 1))
             self.assertFalse(any("mtp." in k for k in converted))
 
-            # Simulate load sanitize on already-converted keys.
+            # Simulate load sanitize on already-converted keys: sanitized
+            # conv1d means no second norm shift — even if a conversion
+            # kept mtp.* tensors (mlx-community "-mtp" checkpoints).
             loaded = model.sanitize(converted)
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
+            )
+            with_mtp = dict(converted)
+            with_mtp[hf_mtp_key.replace("mtp.", "language_model.mtp.")] = mx.zeros(
+                (1,), dtype=mx.float32
+            )
+            loaded2 = model.sanitize(with_mtp)
+            self.assertTrue(
+                mx.array_equal(loaded2[mlx_norm_key], converted[mlx_norm_key])
             )
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
