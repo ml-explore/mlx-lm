@@ -42,6 +42,10 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    # Multi-token-prediction head (Qwen3.5 "-mtp" checkpoints). The module
+    # is built when this is > 0 and dropped again in sanitize() if the
+    # checkpoint carries no mtp.* tensors.
+    mtp_num_hidden_layers: int = 0
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -350,12 +354,35 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         return self.norm(hidden_states)
 
 
+class MTPModule(nn.Module):
+    """Qwen3.5 multi-token-prediction head, present in "-mtp" checkpoints:
+    fc([norm(embed(t_{p+1})); norm(hidden_p)]) -> full-attention decoder
+    layer (own KV cache) -> norm -> the target's own lm_head. Enables
+    self-speculative decoding with no external draft model."""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+        self.pre_fc_norm_embedding = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        # layer_idx chosen so is_linear=False: the MTP block is full attention.
+        self.layers = [
+            DecoderLayer(args, layer_idx=args.full_attention_interval - 1)
+            for _ in range(args.mtp_num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+
 class TextModel(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
         self.model = Qwen3_5TextModel(args)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTPModule(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -379,13 +406,54 @@ class TextModel(nn.Module):
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
+    def logits(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    def make_mtp_cache(self):
+        return [KVCache() for _ in self.mtp.layers]
+
+    def mtp_step(self, hidden, tokens, mtp_cache):
+        """One MTP forward over S positions.
+
+        hidden: [B, S, H] post-final-norm hiddens at positions p..p+S-1
+        (from the trunk, or from a previous mtp_step when chaining draft
+        depth). tokens: [B, S] the tokens at positions p+1..p+S (the
+        committed or drafted token FOLLOWING each hidden's position).
+        Returns (logits [B, S, V], post_norm_hidden [B, S, H]).
+
+        The MTP KV cache offset counts pairs fed, i.e. rope positions are
+        uniformly shifted by -1 vs absolute; the shift cancels in q·k
+        since the MTP layer only attends within its own cache.
+        """
+        e = self.mtp.pre_fc_norm_embedding(self.model.embed_tokens(tokens))
+        h = self.mtp.pre_fc_norm_hidden(hidden)
+        x = self.mtp.fc(mx.concatenate([e, h], axis=-1))
+        mask = create_attention_mask(x, mtp_cache[0])
+        x = self.mtp.layers[0](x, mask=mask, cache=mtp_cache[0])
+        post = self.mtp.norm(x)
+        return self.logits(post), post
+
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # Raw HF checkpoints store zero-centered norms AND raw conv1d
+        # shapes. mtp.* presence is NOT a raw-checkpoint signal:
+        # mlx-community "-mtp" conversions keep mtp tensors but already
+        # have shifted norms and sanitized conv1d — shifting again
+        # double-shifts every RMSNorm and produces garbage output.
+        should_shift_norm_weights = has_unsanitized_conv1d
+
+        has_mtp_weights = any("mtp." in k for k in weights)
+        if not (has_mtp_weights and hasattr(self, "mtp")):
+            # Checkpoint has no MTP tensors (or config declared no MTP
+            # layers): drop both the weights and the module so strict
+            # loading stays consistent.
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
+            if hasattr(self, "mtp"):
+                self.mtp = None
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -394,6 +462,9 @@ class TextModel(nn.Module):
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
             "model.norm.weight",
+            "mtp.norm.weight",
+            ".pre_fc_norm_embedding.weight",
+            ".pre_fc_norm_hidden.weight",
             ".q_norm.weight",
             ".k_norm.weight",
         )
