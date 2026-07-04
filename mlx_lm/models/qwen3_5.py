@@ -283,7 +283,13 @@ class MTPHead(nn.Module):
     ) -> mx.array:
         h = self.pre_fc_norm_hidden(hidden_state)
         e = self.pre_fc_norm_embedding(embedding)
-        x = self.fc(mx.concatenate([h, e], axis=-1))
+        # Matches the published DeepSeek-V3-style MTP projection: the
+        # embedding half comes first, then the hidden-state half. Getting
+        # this backwards still produces a real (if scrambled) vocabulary
+        # projection rather than an error, which made it very hard to spot
+        # -- confirmed against ground truth by comparing draft vs. verify
+        # tokens with both orderings.
+        x = self.fc(mx.concatenate([e, h], axis=-1))
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -321,6 +327,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        output_hidden_states: bool = False,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -365,7 +372,15 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return self.norm(hidden_states)
+        out = self.norm(hidden_states)
+        if output_hidden_states:
+            # The MTP head (see MTPHead / mtp_step) needs the *pre-final-
+            # norm* residual stream, not the post-norm output used for the
+            # LM head -- that's what it was trained on (DeepSeek-V3-style
+            # MTP: final norm is paired with the output head, not meant to
+            # be fed back into an auxiliary module).
+            return out, hidden_states
+        return out
 
 
 class TextModel(nn.Module):
@@ -392,11 +407,16 @@ class TextModel(nn.Module):
         input_embeddings: Optional[mx.array] = None,
         output_hidden_states: bool = False,
     ):
-        hidden = self.model(inputs, cache, input_embeddings=input_embeddings)
-        out = self._to_logits(hidden)
         if output_hidden_states:
-            return out, hidden
-        return out
+            normed, hidden = self.model(
+                inputs,
+                cache,
+                input_embeddings=input_embeddings,
+                output_hidden_states=True,
+            )
+            return self._to_logits(normed), hidden
+        normed = self.model(inputs, cache, input_embeddings=input_embeddings)
+        return self._to_logits(normed)
 
     def _to_logits(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
