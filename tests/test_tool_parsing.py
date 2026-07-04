@@ -154,6 +154,11 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_longcat_no_args(self):
+        tool_call = longcat.parse_tool_call("get_current_time\n", None)
+        expected = {"name": "get_current_time", "arguments": {}}
+        self.assertEqual(tool_call, expected)
+
     def test_qwen3_coder_single_quoted_params(self):
         tools = [
             {
