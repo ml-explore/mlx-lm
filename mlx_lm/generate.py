@@ -517,11 +517,23 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+    if not cache.can_rewind_prompt_cache(model_cache):
+        types = {
+            type(c).__name__
+            for c in model_cache
+            if not (c.is_trimmable() or c.is_checkpointable())
+        }
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            "Speculative decoding requires a trimmable or checkpointable "
+            f"prompt cache (got {types})."
         )
+    # Some hybrid linear-attention models mix trimmable KV layers with
+    # fixed-size recurrent state that can only be checkpointed/restored, not
+    # trimmed to an arbitrary position -- rejecting draft tokens on those
+    # models means rewinding the whole round and replaying the accepted
+    # prefix (see _rewind_cache below), not just an O(1) trim.
+    needs_checkpoint = not cache.can_trim_prompt_cache(model_cache)
+    model_checkpoint = None
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -577,8 +589,29 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
-    def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
+    def _rewind_cache(num_draft, num_accept, batch_y):
+        if needs_checkpoint:
+            # model_checkpoint is None if this round never got far enough
+            # to take one (e.g. an exception during draft generation, which
+            # only touches the draft cache) -- nothing to rewind in that
+            # case, model_cache is still exactly where the last round left it.
+            if num_accept < num_draft and model_checkpoint is not None:
+                # A fixed-size recurrent state can't be trimmed back to the
+                # accepted position the way a KV cache can -- undo the
+                # whole round (trimmable layers roll back for free, the
+                # checkpointed ones are restored) and replay exactly the
+                # tokens that turned out to be correct so every layer ends
+                # up in sync again.
+                cache.rewind_prompt_cache(model_cache, model_checkpoint, num_draft + 1)
+                accepted = batch_y[: num_accept + 1]
+                with mx.stream(generation_stream):
+                    model(accepted[None], cache=model_cache)
+                    quantize_cache_fn(model_cache)
+                    mx.eval([c.state for c in model_cache])
+            # else: every draft token was accepted, so model_cache already
+            # reflects the true trajectory -- nothing to rewind.
+        else:
+            cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
@@ -599,6 +632,7 @@ def speculative_generate_step(
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    batch_y = y
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
@@ -606,6 +640,9 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
+            batch_y = y
+            if needs_checkpoint:
+                model_checkpoint = cache.checkpoint_prompt_cache(model_cache)
             tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
@@ -640,9 +677,9 @@ def speculative_generate_step(
 
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-            _rewind_cache(num_draft, n)
+            _rewind_cache(num_draft, n, batch_y)
     finally:
-        _rewind_cache(num_draft, n)
+        _rewind_cache(num_draft, n, batch_y)
 
 
 def mtp_speculative_generate_step(
@@ -701,11 +738,21 @@ def mtp_speculative_generate_step(
         model_cache = prompt_cache
     mtp_cache = model.make_mtp_cache()
 
-    if not cache.can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+    if not cache.can_rewind_prompt_cache(model_cache):
+        types = {
+            type(c).__name__
+            for c in model_cache
+            if not (c.is_trimmable() or c.is_checkpointable())
+        }
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            "Speculative decoding requires a trimmable or checkpointable "
+            f"prompt cache (got {types})."
         )
+    # See the comment in speculative_generate_step -- hybrid linear-attention
+    # models need checkpoint/restore + replay for the recurrent layers
+    # instead of an O(1) trim when draft tokens are rejected.
+    needs_checkpoint = not cache.can_trim_prompt_cache(model_cache)
+    model_checkpoint = None
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -747,8 +794,20 @@ def mtp_speculative_generate_step(
             mx.clear_cache()
         return y, hidden
 
-    def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
+    def _rewind_cache(num_draft, num_accept, batch_y):
+        if needs_checkpoint:
+            if num_accept < num_draft and model_checkpoint is not None:
+                # See the comment in speculative_generate_step's
+                # _rewind_cache -- recurrent state can't be trimmed, so
+                # undo the round and replay the accepted prefix.
+                cache.rewind_prompt_cache(model_cache, model_checkpoint, num_draft + 1)
+                accepted = batch_y[: num_accept + 1]
+                with mx.stream(generation_stream):
+                    model(accepted[None], cache=model_cache)
+                    quantize_cache_fn(model_cache)
+                    mx.eval([c.state for c in model_cache])
+        else:
+            cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(mtp_cache, max(num_draft - num_accept - 1, 0))
 
     def _mtp_draft_generate(hidden_state, last_token, num_draft):
@@ -760,8 +819,17 @@ def mtp_speculative_generate_step(
         h, t = hidden_state, last_token
         for _ in range(num_draft):
             with mx.stream(generation_stream):
+                # t[None] turns the (1,)-shaped token id into (1, 1) so the
+                # embedding comes out (1, 1, D), matching h's (1, 1, D) --
+                # mx.concatenate inside MTPHead requires matching ranks.
                 logits, h = model.mtp_step(h, t[None], cache=mtp_cache)
                 t, _ = _process_and_sample(None, logits.squeeze(0)[-1])
+                # _process_and_sample's sampler (e.g. argmax) collapses a
+                # 1-D logits vector to a 0-d scalar; reshape back to (1,)
+                # so it chains into the next iteration the same way it
+                # came in, and so mx.concatenate(ys) below works at all
+                # (mx.concatenate rejects 0-d arrays).
+                t = t.reshape(1)
                 mx.async_eval(t)
             ys.append(t)
         return mx.concatenate(ys)
@@ -770,7 +838,10 @@ def mtp_speculative_generate_step(
         y, hidden = _prefill(y)
         logits, hidden = _target_forward(y, 1)
         tok, logprobs = _process_and_sample(None, logits.squeeze(0)[-1])
-        hidden = hidden[:, -1, :]
+        # Keep the sequence dim (shape (1, 1, D)) rather than collapsing to
+        # (1, D) -- _mtp_draft_generate needs a 3-D hidden state to
+        # concatenate against the 3-D token embedding.
+        hidden = hidden[:, -1:, :]
         mx.eval(tok, hidden)
 
     ntoks = 1
@@ -778,26 +849,34 @@ def mtp_speculative_generate_step(
     if ntoks == max_tokens:
         return
 
-    last_token = tok
+    # 0-d -> (1,), matching the shape last_token has on every later round
+    # (mx.array([...]) below) and what _mtp_draft_generate expects.
+    last_token = tok.reshape(1)
     num_draft = 0
     n = 0
+    batch_y = None
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
             draft_tokens = _mtp_draft_generate(hidden, last_token, num_draft)
             y = mx.concatenate([last_token, draft_tokens])
+            batch_y = y
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
 
+            if needs_checkpoint:
+                model_checkpoint = cache.checkpoint_prompt_cache(model_cache)
             with mx.stream(generation_stream):
                 verify_logits, verify_hidden = _target_forward(y, num_draft + 1)
                 verify_logits = verify_logits.squeeze(0)
-                verify_hidden = verify_hidden.squeeze(0)
                 verify_tokens = []
                 verify_logprobs = []
                 for i in range(num_draft + 1):
                     vt, vlp = _process_and_sample(None, verify_logits[i])
-                    verify_tokens.append(vt)
+                    # See the note in _mtp_draft_generate -- sampling a 1-D
+                    # logits vector gives a 0-d scalar, which
+                    # mx.concatenate below can't handle.
+                    verify_tokens.append(vt.reshape(1))
                     verify_logprobs.append(vlp)
                 verify_tokens = mx.concatenate(verify_tokens)
                 mx.eval(verify_tokens, draft_tokens)
@@ -823,13 +902,16 @@ def mtp_speculative_generate_step(
                 break
 
             last_token = mx.array([verify_list[n]], mx.uint32)
-            hidden = verify_hidden[n : n + 1]
+            # verify_hidden is (1, num_draft + 1, D) -- keep the sequence
+            # dim (shape (1, 1, D)) for the same reason as the initial
+            # `hidden` assignment above.
+            hidden = verify_hidden[:, n : n + 1, :]
 
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-            _rewind_cache(num_draft, n)
+            _rewind_cache(num_draft, n, batch_y)
     finally:
-        _rewind_cache(num_draft, n)
+        _rewind_cache(num_draft, n, batch_y)
 
 
 def stream_generate(

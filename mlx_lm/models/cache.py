@@ -111,6 +111,50 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def can_rewind_prompt_cache(cache: List[Any]) -> bool:
+    """
+    Check if a prompt cache can be rewound after a rejected speculative
+    decoding round -- either because every layer is exactly trimmable, or
+    because the non-trimmable layers (e.g. fixed-size recurrent state used
+    by hybrid linear-attention models) support checkpoint/restore.
+    """
+    return all(c.is_trimmable() or c.is_checkpointable() for c in cache)
+
+
+def checkpoint_prompt_cache(cache: List[Any]) -> List[Any]:
+    """
+    Snapshot the non-trimmable layers of a cache ahead of a speculative
+    decoding round, so they can be restored if the round is rejected.
+    Trimmable layers don't need a snapshot -- ``None`` is stored for them,
+    since they can just be trimmed back exactly.
+    """
+    return [None if c.is_trimmable() else c.checkpoint() for c in cache]
+
+
+def rewind_prompt_cache(
+    cache: List[Any], checkpoint: List[Any], num_tokens: int
+) -> None:
+    """
+    Roll ``cache`` all the way back to the state it was in when
+    ``checkpoint_prompt_cache`` produced ``checkpoint`` -- i.e. undo an
+    entire speculative decoding round (``num_tokens`` is the number of
+    tokens processed since then). Trimmable layers are trimmed exactly;
+    non-trimmable layers are restored from their snapshot.
+
+    Unlike ``trim_prompt_cache``, this cannot roll back to an arbitrary
+    partial position within the round for non-trimmable layers -- a fixed-
+    size recurrent state has no notion of "the state as of token k" other
+    than by recomputing it. The caller is responsible for replaying
+    whichever tokens turned out to be correct back through the model to
+    bring every layer (including the ones that were trimmed) back in sync.
+    """
+    for c, ckpt in zip(cache, checkpoint):
+        if ckpt is None:
+            c.trim(num_tokens)
+        else:
+            c.restore(ckpt)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -145,6 +189,25 @@ class _BaseCache:
 
     def is_trimmable(self):
         return False
+
+    def is_checkpointable(self):
+        """
+        Whether this cache supports checkpoint()/restore(), for caches whose
+        state can't be exactly trimmed to an arbitrary earlier position
+        (e.g. a fixed-size recurrent state, as opposed to an append-only
+        buffer like KVCache).
+        """
+        return False
+
+    def checkpoint(self):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support checkpoint/restore."
+        )
+
+    def restore(self, checkpoint):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support checkpoint/restore."
+        )
 
     def size(self):
         """
@@ -628,6 +691,19 @@ class ArraysCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.cache = v
+
+    def is_checkpointable(self):
+        return True
+
+    def checkpoint(self):
+        # Every update replaces cache[i] wholesale (see e.g. mamba.py,
+        # qwen3_5.py) rather than mutating an array in place, so a shallow
+        # copy of the list is enough to freeze this snapshot -- the arrays
+        # it references are never written to after the fact.
+        return list(self.cache)
+
+    def restore(self, checkpoint):
+        self.cache = list(checkpoint)
 
     def filter(self, batch_indices):
         """
