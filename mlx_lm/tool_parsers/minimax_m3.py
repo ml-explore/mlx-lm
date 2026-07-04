@@ -21,9 +21,12 @@ payload, and walks each ``<invoke>`` block with ElementTree, mapping
 """
 
 import json
+import logging
 import re
 import xml.etree.ElementTree as ET
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 NAMESPACE_TOKEN: str = "]<]minimax[>["
 
@@ -101,10 +104,45 @@ def parse_tool_call(text: str, tools: list | None = None):
         try:
             root = ET.fromstring(f"<args>{body}</args>")
             args = _element_to_python(root)
-        except ET.ParseError:
-            args = {}
+        except ET.ParseError as e:
+            # Do NOT silently fall back to {} — that reaches the client as
+            # arguments: "{}", fails tool validation with no hint of why, and
+            # lets any narration the model emitted alongside the call stand
+            # as a phantom success. Surface an explicit error payload instead:
+            # the client's validation error echoes it back to the model,
+            # which can then retry with fixed args. Also log it so the server
+            # has primary evidence of M3 emitting malformed argument XML.
+            logger.warning(
+                "minimax_m3: malformed argument XML for invoke %r (%s); "
+                "raw body[:300]=%r", name, e, body[:300],
+            )
+            args = {
+                "__parse_error__": (
+                    f"MiniMax-M3 emitted malformed argument XML for tool "
+                    f"'{name}' ({e}). Re-issue this tool call with each "
+                    f"argument as a simple <key>value</key> tag. "
+                    f"Raw snippet: {body[:200]!r}"
+                )
+            }
         if not isinstance(args, dict):
-            args = {}
+            if args == "":
+                # Legitimate no-argument call, e.g. <invoke name="x"></invoke>
+                # (empty body parses to an empty scalar, not a dict).
+                args = {}
+            else:
+                logger.warning(
+                    "minimax_m3: arguments for invoke %r parsed to %s, not "
+                    "an object; body[:300]=%r",
+                    name, type(args).__name__, body[:300],
+                )
+                args = {
+                    "__parse_error__": (
+                        f"Arguments for tool '{name}' parsed to "
+                        f"{type(args).__name__} instead of an object. "
+                        f"Re-issue the call with named <key>value</key> "
+                        f"argument tags."
+                    )
+                }
         calls.append({"name": name, "arguments": args})
 
     if not calls:

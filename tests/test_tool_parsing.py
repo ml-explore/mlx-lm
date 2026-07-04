@@ -414,6 +414,35 @@ class TestToolParsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             minimax_m3.parse_tool_call("just plain text, no tool call", None)
 
+        # Malformed argument XML must NOT silently become {} — that reaches
+        # OpenAI-compat clients as arguments: "{}", fails tool validation
+        # with no reason, and any narration the model emitted alongside the
+        # call stands as a phantom success. The parser surfaces an explicit
+        # __parse_error__ payload instead so the calling harness/model can
+        # see why and retry (observed in production agent loops).
+        test_case = (
+            ']<]minimax[>[<tool_call>'
+            ']<]minimax[>[<invoke name="exec">'
+            ']<]minimax[>[<command>ls & rm <oops'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[</tool_call>'
+        )
+        tool_call = minimax_m3.parse_tool_call(test_case, None)
+        self.assertEqual("exec", tool_call["name"])
+        self.assertIn("__parse_error__", tool_call["arguments"])
+
+        # Top-level non-object arguments (bare <item> list) also surface
+        # __parse_error__ — OpenAI arguments must be an object.
+        test_case = (
+            ']<]minimax[>[<tool_call>'
+            ']<]minimax[>[<invoke name="exec">'
+            ']<]minimax[>[<item>a]<]minimax[>[</item>'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[</tool_call>'
+        )
+        tool_call = minimax_m3.parse_tool_call(test_case, None)
+        self.assertIn("__parse_error__", tool_call["arguments"])
+
 
 if __name__ == "__main__":
     unittest.main()
