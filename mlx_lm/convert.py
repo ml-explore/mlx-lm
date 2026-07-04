@@ -77,7 +77,43 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
+def quant2_predicate_builder(
+    recipe: str, model: nn.Module, group_size: int = 64
+) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
+    mode = "affine"
+    down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
+    if len(down_keys) == 0:
+        raise ValueError("Model does not have expected keys for quant2.")
+    for layer_location, k in enumerate(down_keys[0].split(".")):
+        if k.isdigit():
+            break
+    num_layers = len(model.layers)
+    # quant2_128 uses a wider group size (128) for a better quality/speed
+    # balance; quant2 uses the caller-supplied group_size.
+    gs = 128 if recipe == "quant2_128" else group_size
+
+    def quant2_predicate(path: str, module: nn.Module) -> Union[bool, dict]:
+        index = (
+            int(path.split(".")[layer_location])
+            if len(path.split(".")) > layer_location
+            else 0
+        )
+        # Keep embedding and output projection at 4-bit to preserve token
+        # resolution; keep the first and last decoder layers at 3-bit and
+        # quantize the bulk of the body at 2-bit for maximum decode speedup.
+        if "embed_tokens" in path or "lm_head" in path:
+            return {"group_size": group_size, "bits": 4, "mode": mode}
+        if index == 0 or index == num_layers - 1:
+            return {"group_size": gs, "bits": 3, "mode": mode}
+        return {"group_size": gs, "bits": 2, "mode": mode}
+
+    return quant2_predicate
+
+
+QUANT_RECIPES = [
+    "mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6",
+    "quant2", "quant2_128",
+]
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
@@ -121,11 +157,16 @@ def convert(
     if isinstance(quant_predicate, str):
         if q_mode != "affine":
             raise ValueError(f"Quant predicates only support 'affine' quantization.")
-        quant_predicate = mixed_quant_predicate_builder(
-            quant_predicate,
-            model,
-            q_group_size,
-        )
+        if quant_predicate in ("quant2", "quant2_128"):
+            quant_predicate = quant2_predicate_builder(
+                quant_predicate, model, q_group_size,
+            )
+        else:
+            quant_predicate = mixed_quant_predicate_builder(
+                quant_predicate,
+                model,
+                q_group_size,
+            )
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
@@ -220,7 +261,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
+        help="Mixed-bit quantization recipe. The quant2 family (quant2, quant2_128) uses 2-bit for the decoder body and 4-bit for embed/lm_head for maximum decode speedup.",
         choices=QUANT_RECIPES,
         type=str,
         required=False,
