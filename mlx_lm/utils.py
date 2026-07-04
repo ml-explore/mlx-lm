@@ -450,6 +450,87 @@ def load_model(
     return model, config
 
 
+def is_mtp_head_checkpoint(config: dict) -> bool:
+    """True if a config describes a standalone multi-token-prediction (MTP)
+    drafter checkpoint (e.g. the community-published "*_mtp" repos split out
+    from a bundled release) rather than a regular, independently-runnable
+    model. These have no vocabulary/embedding of their own — they must be
+    attached to a matching target model with :func:`load_mtp_head` instead
+    of loaded with :func:`load`."""
+    text_config = config.get("text_config", config)
+    return (
+        str(config.get("model_type", "")).endswith("_mtp")
+        and text_config.get("mtp_num_hidden_layers", 0) > 0
+    )
+
+
+def load_mtp_head(model: nn.Module, mtp_path: str, lazy: bool = False) -> dict:
+    """
+    Load a separately-published MTP drafter checkpoint and attach it to an
+    already-loaded target ``model`` for use with
+    :func:`generate.mtp_speculative_generate_step`.
+
+    Unlike a normal ``--draft-model``, this is *not* an independent peer
+    model — the checkpoint has no embedding table or output head of its own
+    (see ``models.qwen3_5.MTPHead``), it borrows the target model's, and its
+    forward pass needs the target's hidden state as an input. That's
+    fundamentally incompatible with :func:`load`/:func:`load_model`, which
+    assume a self-contained model that can be called with just token ids.
+
+    Args:
+        model (nn.Module): An already-loaded target model. Must implement
+          ``mtp_step`` (currently: ``models.qwen3_5.Model``).
+        mtp_path (str): Local path or Hugging Face repo id of the MTP
+          checkpoint.
+        lazy (bool): If ``False``, eval the attached parameters immediately.
+
+    Returns:
+        dict: The MTP checkpoint's config (for callers that want e.g. its
+          ``block_size``).
+
+    Raises:
+        ValueError: If ``model`` has no ``mtp_step`` method, or the MTP
+          checkpoint's hidden size doesn't match the target model's.
+        FileNotFoundError: If no safetensors are found at ``mtp_path``.
+    """
+    if not hasattr(model, "mtp_step"):
+        raise ValueError(
+            f"{type(model).__name__} does not support attached MTP heads "
+            "(no mtp_step method)."
+        )
+
+    path = _download(mtp_path)
+    config = load_config(path)
+    text_config = config.get("text_config", config)
+
+    from .models.qwen3_5 import MTPHead, TextModelArgs
+
+    mtp_args = TextModelArgs.from_dict(text_config)
+    target_args = model.language_model.args
+    if mtp_args.hidden_size != target_args.hidden_size:
+        raise ValueError(
+            f"MTP checkpoint hidden_size ({mtp_args.hidden_size}) does not "
+            f"match the target model's ({target_args.hidden_size}) — is this "
+            "drafter published for a different model?"
+        )
+
+    weight_files = glob.glob(str(path / "model*.safetensors"))
+    if not weight_files:
+        raise FileNotFoundError(f"No safetensors found in {path}")
+    weights = {}
+    for wf in weight_files:
+        weights.update(mx.load(wf))
+
+    mtp = MTPHead(mtp_args)
+    mtp.load_weights(list(weights.items()), strict=True)
+    if not lazy:
+        mx.eval(mtp.parameters())
+
+    model.language_model.mtp = mtp
+    model.args.block_size = config.get("block_size", 1)
+    return config
+
+
 def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     from .tuner.utils import load_adapters as _load_adapters
 

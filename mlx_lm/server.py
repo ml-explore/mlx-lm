@@ -42,7 +42,15 @@ from .generate import (
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import _parse_size, load, sharded_load
+from .utils import (
+    _download,
+    _parse_size,
+    load,
+    load_config,
+    load_mtp_head,
+    is_mtp_head_checkpoint,
+    sharded_load,
+)
 
 
 def get_system_fingerprint():
@@ -339,18 +347,26 @@ class ModelProvider:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        # Load the draft model for speculative decoding
+        # Load the draft model for speculative decoding — or, if the path
+        # points at a multi-token-prediction (MTP) head rather than a
+        # regular independently-runnable model, attach it directly to
+        # `model` instead (it has no embeddings/output head of its own and
+        # can't be loaded as a peer model; see utils.load_mtp_head).
         draft_model = None
         if draft_model_path is not None:
-            draft_model, draft_tokenizer = load(draft_model_path)
-            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
-                logging.warning(
-                    "Draft model tokenizer does not match model tokenizer. "
-                    "Speculative decoding may not work as expected."
-                )
+            draft_config = load_config(_download(draft_model_path))
+            if is_mtp_head_checkpoint(draft_config):
+                load_mtp_head(model, draft_model_path)
+            else:
+                draft_model, draft_tokenizer = load(draft_model_path)
+                if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                    logging.warning(
+                        "Draft model tokenizer does not match model tokenizer. "
+                        "Speculative decoding may not work as expected."
+                    )
 
         # Compute batchability
-        is_batchable = draft_model is None
+        is_batchable = draft_model is None and not getattr(model, "has_mtp", False)
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )

@@ -43,6 +43,11 @@ class TextModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
 
+    # Multi-token-prediction head (speculative decoding). 0 layers means the
+    # checkpoint has no MTP head — everything below is a no-op in that case.
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = True
+
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
     num_experts_per_tok: int = 0
@@ -241,6 +246,53 @@ class DecoderLayer(nn.Module):
         return out
 
 
+class MTPHead(nn.Module):
+    """Multi-token-prediction head, following the published DeepSeek-V3 MTP
+    design that Qwen3.6's own checkpoints reuse: normalize the backbone's
+    hidden state and the (speculated) next token's embedding separately,
+    concatenate and project them back down to hidden_size, run through one
+    (or a few) ordinary transformer layer(s), and hand the result to the
+    *backbone's own* embedding/output-head weights — there is no separate
+    vocabulary projection here, `mtp_use_dedicated_embeddings=False` means
+    exactly that: this module borrows the target model's embed_tokens/lm_head
+    rather than carrying its own.
+
+    MTP layers always run as ordinary full attention regardless of the
+    backbone's linear/full attention interval, so `layer_idx` is fixed to a
+    value that makes `DecoderLayer.is_linear` resolve to False.
+    """
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+        self.layers = [
+            DecoderLayer(args=args, layer_idx=args.full_attention_interval - 1)
+            for _ in range(args.mtp_num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_state: mx.array,
+        embedding: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        h = self.pre_fc_norm_hidden(hidden_state)
+        e = self.pre_fc_norm_embedding(embedding)
+        x = self.fc(mx.concatenate([h, e], axis=-1))
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+        mask = create_attention_mask(x, cache[0] if cache else None)
+        for layer, c in zip(self.layers, cache):
+            x = layer(x, mask=mask, cache=c)
+        return self.norm(x)
+
+
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -324,19 +376,60 @@ class TextModel(nn.Module):
         self.model = Qwen3_5TextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        # Built lazily in sanitize() — the config can declare
+        # mtp_num_hidden_layers > 0 purely as an architecture capability
+        # while the specific checkpoint file doesn't bundle the actual MTP
+        # tensors (they're commonly published as a separate drafter repo).
+        # Constructing this eagerly from config alone makes load_weights()
+        # fail with "missing parameters" on every checkpoint that doesn't
+        # carry the weights, which today is all of them.
+        self.mtp = None
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
-    ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        output_hidden_states: bool = False,
+    ):
+        hidden = self.model(inputs, cache, input_embeddings=input_embeddings)
+        out = self._to_logits(hidden)
+        if output_hidden_states:
+            return out, hidden
         return out
+
+    def _to_logits(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    @property
+    def has_mtp(self) -> bool:
+        return self.mtp is not None
+
+    def mtp_step(
+        self,
+        hidden_state: mx.array,
+        token_ids: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        """One MTP forward step: given the backbone's hidden state at some
+        position and the token that was (speculatively) placed there, predict
+        the logits for the *next* position. Chain calls, feeding each step's
+        returned hidden state back in as `hidden_state` alongside the newly
+        sampled token, to speculate more than one token ahead (up to
+        `ModelArgs.block_size`). Uses the backbone's own embedding table and
+        output head — the MTP head itself has neither."""
+        if self.mtp is None:
+            raise ValueError("This checkpoint has no attached MTP head.")
+        embedding = self.model.embed_tokens(token_ids)
+        hidden = self.mtp(hidden_state, embedding, cache=cache)
+        return self._to_logits(hidden), hidden
+
+    def make_mtp_cache(self):
+        if self.mtp is None:
+            return []
+        return [KVCache() for _ in self.mtp.layers]
 
     @property
     def layers(self):
@@ -346,10 +439,30 @@ class TextModel(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
+        # Substring match, not startswith: by the time weights reach here,
+        # the outer Model.sanitize() has already prefixed every key with
+        # "language_model.", so an MTP tensor never literally starts with
+        # "mtp." in practice — it's "language_model.mtp....".
+        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+
+        if has_mtp_weights and self.args.mtp_num_hidden_layers > 0:
+            # The checkpoint actually bundles MTP tensors (prefixed
+            # "mtp.") and the config declares the architecture for them —
+            # build the submodule now so load_weights() has somewhere to
+            # put them, then keep the keys as-is.
+            if self.mtp is None:
+                self.mtp = MTPHead(self.args)
+            weights = dict(weights)
+        else:
+            # No bundled MTP weights in this specific file — this is the
+            # common case, including checkpoints whose config declares
+            # mtp_num_hidden_layers > 0 as an architecture capability while
+            # publishing the drafter separately. Same behavior as before
+            # this feature existed: drop any stray "mtp." keys.
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -395,6 +508,9 @@ class TextModel(nn.Module):
 class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
+    # Number of extra tokens an attached MTP head can speculate per step
+    # (e.g. the community-published "qwen3_5_mtp" drafter checkpoints use 3).
+    block_size: int = 1
 
     @classmethod
     def from_dict(cls, params):
@@ -415,10 +531,28 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        output_hidden_states: bool = False,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            output_hidden_states=output_hidden_states,
         )
+
+    @property
+    def has_mtp(self) -> bool:
+        return self.language_model.has_mtp
+
+    def mtp_step(self, hidden_state, token_ids, cache=None):
+        return self.language_model.mtp_step(hidden_state, token_ids, cache=cache)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    @property
+    def mtp_block_size(self) -> int:
+        return self.args.block_size
 
     @property
     def model(self):

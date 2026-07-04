@@ -645,6 +645,193 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def mtp_speculative_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: Optional[int] = None,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """
+    Speculative decoding for models with a built-in multi-token-prediction
+    (MTP) head (see ``models.qwen3_5.MTPHead``) rather than an independent
+    peer draft model. The head has no embedding table or output head of its
+    own — it's chained ``num_draft_tokens`` times, each step consuming the
+    target model's (or the previous MTP step's) hidden state plus the newly
+    proposed token's embedding, then every proposed token is verified
+    against the target model in a single batched forward pass, exactly like
+    :func:`speculative_generate_step`. The only difference from that
+    function is *how* draft tokens are produced; the verify/accept/reject
+    logic is the same, so this preserves the same lossless-relative-to-
+    greedy-decoding guarantee.
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The target model. Must have ``has_mtp == True``.
+        num_draft_tokens (int, optional): Number of tokens to speculate per
+          round. Defaults to ``model.mtp_block_size``.
+        (all other args match :func:`speculative_generate_step`)
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: One token, a vector of log
+          probabilities, and a bool indicating if the token came from the
+          MTP head.
+    """
+    if not getattr(model, "has_mtp", False):
+        raise ValueError(
+            f"{type(model).__name__} has no attached MTP head — load one "
+            "first (see utils.load_mtp_head)."
+        )
+
+    num_draft_tokens = num_draft_tokens or getattr(model, "mtp_block_size", 1)
+
+    y = prompt.astype(mx.uint32)
+    prev_tokens = None
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+    else:
+        model_cache = prompt_cache
+    mtp_cache = model.make_mtp_cache()
+
+    if not cache.can_trim_prompt_cache(model_cache):
+        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+        raise ValueError(
+            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+        )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _process_and_sample(tokens, logits):
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        y = sampler(logprobs)
+        return y, logprobs
+
+    def _target_forward(y, n_predict):
+        # Runs the *target* model, returning logits and hidden states for
+        # the last n_predict positions of y (the accepted/pending tokens
+        # plus this round's draft tokens).
+        logits, hidden = model(
+            y[None], cache=model_cache, output_hidden_states=True
+        )
+        return logits[:, -n_predict:, :], hidden[:, -n_predict:, :]
+
+    def _prefill(y):
+        hidden = None
+        while y.size > 1:
+            n_to_process = min(prefill_step_size, y.size - 1)
+            _, hidden = model(
+                y[:n_to_process][None], cache=model_cache, output_hidden_states=True
+            )
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache])
+            y = y[n_to_process:]
+            mx.clear_cache()
+        return y, hidden
+
+    def _rewind_cache(num_draft, num_accept):
+        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
+        cache.trim_prompt_cache(mtp_cache, max(num_draft - num_accept - 1, 0))
+
+    def _mtp_draft_generate(hidden_state, last_token, num_draft):
+        # hidden_state/last_token describe the most recently *accepted*
+        # position — chain the MTP head forward from there.
+        if num_draft == 0:
+            return mx.array([], mx.uint32)
+        ys = []
+        h, t = hidden_state, last_token
+        for _ in range(num_draft):
+            with mx.stream(generation_stream):
+                logits, h = model.mtp_step(h, t[None], cache=mtp_cache)
+                t, _ = _process_and_sample(None, logits.squeeze(0)[-1])
+                mx.async_eval(t)
+            ys.append(t)
+        return mx.concatenate(ys)
+
+    with mx.stream(generation_stream):
+        y, hidden = _prefill(y)
+        logits, hidden = _target_forward(y, 1)
+        tok, logprobs = _process_and_sample(None, logits.squeeze(0)[-1])
+        hidden = hidden[:, -1, :]
+        mx.eval(tok, hidden)
+
+    ntoks = 1
+    yield tok.item(), logprobs, False
+    if ntoks == max_tokens:
+        return
+
+    last_token = tok
+    num_draft = 0
+    n = 0
+    try:
+        while True:
+            num_draft = min(max_tokens - ntoks, num_draft_tokens)
+            draft_tokens = _mtp_draft_generate(hidden, last_token, num_draft)
+            y = mx.concatenate([last_token, draft_tokens])
+            if prev_tokens is not None:
+                prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
+
+            with mx.stream(generation_stream):
+                verify_logits, verify_hidden = _target_forward(y, num_draft + 1)
+                verify_logits = verify_logits.squeeze(0)
+                verify_hidden = verify_hidden.squeeze(0)
+                verify_tokens = []
+                verify_logprobs = []
+                for i in range(num_draft + 1):
+                    vt, vlp = _process_and_sample(None, verify_logits[i])
+                    verify_tokens.append(vt)
+                    verify_logprobs.append(vlp)
+                verify_tokens = mx.concatenate(verify_tokens)
+                mx.eval(verify_tokens, draft_tokens)
+
+            draft_list = draft_tokens.tolist()
+            verify_list = verify_tokens.tolist()
+
+            n = 0
+            while n < num_draft:
+                tn, dtn, lpn = verify_list[n], draft_list[n], verify_logprobs[n]
+                if tn != dtn:
+                    break
+                n += 1
+                ntoks += 1
+                yield tn, lpn, True
+                if ntoks == max_tokens:
+                    break
+            if ntoks < max_tokens:
+                ntoks += 1
+                yield verify_list[n], verify_logprobs[n], False
+
+            if ntoks == max_tokens:
+                break
+
+            last_token = mx.array([verify_list[n]], mx.uint32)
+            hidden = verify_hidden[n : n + 1]
+
+            if prev_tokens is not None:
+                prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
+            _rewind_cache(num_draft, n)
+    finally:
+        _rewind_cache(num_draft, n)
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -689,19 +876,26 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if draft_model is None and not getattr(model, "has_mtp", False):
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
         )
-    else:
+    elif draft_model is not None:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
+    else:
+        # No separate peer draft model, but the target model has a built-in
+        # MTP head attached (see utils.load_mtp_head) — speculate using that
+        # instead of an independent model.
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        token_generator = mtp_speculative_generate_step(prompt, model, **kwargs)
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
