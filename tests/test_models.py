@@ -1966,6 +1966,68 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_glm_moe_dsa_shared_schedule(self):
+        """GLM-5.2 full/shared indexer typing: shared layers carry no indexer
+        (checkpoint has no weights for them), reuse the previous full layer's
+        top-k, and the sparse path engages past index_topk tokens."""
+        from mlx_lm.models import glm_moe_dsa
+
+        args = glm_moe_dsa.ModelArgs(
+            model_type="glm_moe_dsa",
+            vocab_size=1000,
+            hidden_size=32,
+            index_head_dim=8,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=64,
+            moe_intermediate_size=16,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=12,
+            qk_rope_head_dim=4,
+            v_head_dim=8,
+            qk_nope_head_dim=8,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=1,
+            topk_group=1,
+            num_experts_per_tok=4,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 8000000.0, "rope_type": "default"},
+            attention_bias=False,
+            indexer_types=["full", "shared", "full", "shared"],
+        )
+        model = glm_moe_dsa.Model(args)
+
+        # schedule construction: full layers own an indexer, shared layers don't
+        for i, t in enumerate(args.indexer_types):
+            has = hasattr(model.model.layers[i].self_attn, "indexer")
+            self.assertEqual(has, t == "full", f"layer {i} ({t}) indexer={has}")
+
+        # GLM-5.2's indexer rope is interleaved (post-#1431 flag default here)
+        self.assertTrue(model.model.layers[0].self_attn.indexer.rope.traditional)
+
+        # asymmetric cache: CacheList(kv, indexer) on full, CacheList(kv) on shared
+        cache = model.make_cache()
+        self.assertEqual(len(cache[0].caches), 2)
+        self.assertEqual(len(cache[1].caches), 1)
+
+        # sparse path ENGAGES past index_topk: prefill L=8 > topk=4, then a
+        # decode step (prev_topk threads full -> shared). Outputs stay finite.
+        out = model(mx.array([[1, 2, 3, 4, 5, 6, 7, 8]]), cache=cache)
+        out = model(mx.array([[9]]), cache=cache)
+        self.assertEqual(out.shape, (1, 1, args.vocab_size))
+        self.assertTrue(mx.isfinite(out).all())
+
     def test_all_models(self):
         test_configs = [
             {
@@ -2248,6 +2310,43 @@ class TestModels(unittest.TestCase):
                 "partial_rotary_factor": 1.0,
                 "tie_word_embeddings": False,
                 "num_nextn_predict_layers": 1,
+            },
+            {
+                # GLM-5.2: DeepSeek-V3.2 arch + full/shared indexer typing.
+                # ["full","shared",...] exercises the shared-layer construction
+                # (del'd indexer, asymmetric CacheList) at B=1 and B=2.
+                "model_type": "glm_moe_dsa",
+                "vocab_size": 1000,
+                "hidden_size": 32,
+                "index_head_dim": 8,
+                "index_n_heads": 4,
+                "index_topk": 4,
+                "intermediate_size": 64,
+                "moe_intermediate_size": 16,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "n_shared_experts": 1,
+                "n_routed_experts": 8,
+                "routed_scaling_factor": 2.5,
+                "kv_lora_rank": 16,
+                "q_lora_rank": 12,
+                "qk_rope_head_dim": 4,
+                "v_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "topk_method": "noaux_tc",
+                "scoring_func": "sigmoid",
+                "norm_topk_prob": True,
+                "n_group": 1,
+                "topk_group": 1,
+                "num_experts_per_tok": 4,
+                "moe_layer_freq": 1,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 1024,
+                "rms_norm_eps": 1e-5,
+                "rope_parameters": {"rope_theta": 8000000.0, "rope_type": "default"},
+                "attention_bias": False,
+                "indexer_types": ["full", "shared", "full", "shared"],
             },
             {
                 "model_type": "granite",

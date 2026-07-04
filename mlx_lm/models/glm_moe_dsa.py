@@ -57,6 +57,12 @@ class ModelArgs(BaseModelArgs):
     index_share_for_mtp_iteration: bool = False
     index_topk_freq: int = 4
     index_skip_topk_offset: int = 3
+    # GLM-5.2's indexer rope is interleaved (traditional), unlike the
+    # DeepSeek-V3.2 default introduced in #1431. Validated against the real
+    # 743B mxfp4 checkpoint: engaged-DSA generation at 3k context is coherent
+    # and an independent C reference reproduces the selection exactly with
+    # interleaved rope (glmx engine parity gates, 2026-07-03).
+    indexer_rope_interleave: bool = True
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
