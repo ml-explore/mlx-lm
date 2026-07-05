@@ -683,6 +683,11 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
+        # Quantized KV caches are not mergeable, so they cannot participate in
+        # continuous batching. When --kv-bits is set, fall back to sequential
+        # generation (which applies the quantization) instead.
+        if self.cli_args.kv_bits is not None:
+            return False
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
@@ -985,6 +990,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1878,6 +1886,25 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization. Defaults to no quantization.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="When --kv-bits is set, start quantizing the KV cache "
+        "from this step onwards.",
     )
     parser.add_argument(
         "--pipeline",
