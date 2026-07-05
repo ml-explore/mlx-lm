@@ -500,7 +500,23 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
         return [self._postprocess_text(d) for d in decoded]
 
 
-AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+def _register_newline_tokenizer():
+    try:
+        from transformers.models.auto import tokenization_auto
+    except ImportError:
+        tokenization_auto = None
+
+    registered_tokenizer_classes = getattr(
+        tokenization_auto, "REGISTERED_TOKENIZER_CLASSES", None
+    )
+    if registered_tokenizer_classes is not None:
+        registered_tokenizer_classes[NewlineTokenizer.__name__] = NewlineTokenizer
+        return
+
+    AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+
+
+_register_newline_tokenizer()
 
 
 def _match(a, b):

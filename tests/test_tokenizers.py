@@ -4,10 +4,12 @@ import unittest
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
+from transformers.models.auto.tokenization_auto import tokenizer_class_from_name
 
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
+    NewlineTokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
 )
@@ -122,6 +124,9 @@ class TestTokenizers(unittest.TestCase):
         prompt = [HI, THINK_START, THINK_END, THINK_START]
         self.assertEqual(find(prompt, [THINK_START], start=0), 1)
         self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
+
+    def test_newline_tokenizer_is_registered(self):
+        self.assertIs(tokenizer_class_from_name("NewlineTokenizer"), NewlineTokenizer)
 
 
 if __name__ == "__main__":
