@@ -1626,6 +1626,7 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+        checked_out: bool = False
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1692,6 +1693,74 @@ class LRUPromptCache:
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
+
+    def _checkout_or_copy(self, model: Any, entry_tokens: List[int], cache_entry):
+        # Two concurrent owners must never share one mutable KV buffer --
+        # KVCache.update_and_fetch() writes new tokens into a slice of a
+        # pre-allocated buffer in place, so a second in-progress generation
+        # sharing that reference would corrupt the first's history. Only
+        # hand out the shared reference (skipping the copy) when nothing
+        # else currently holds it; otherwise fall back to the safe copy.
+        if cache_entry.checked_out:
+            return copy.deepcopy(cache_entry.prompt_cache), None
+        cache_entry.checked_out = True
+        return cache_entry.prompt_cache, (model, entry_tokens)
+
+    def checkout_cache(self, model: Any, tokens: List[int]):
+        """Like fetch_nearest_cache, but avoids deep-copying the returned KV
+        cache when the matched entry isn't already checked out by another
+        caller.
+
+        The caller MUST call return_cache with the returned checkout token
+        once done with the cache -- including on error paths (e.g. in a
+        try/finally) -- so the entry becomes eligible for the no-copy path
+        again for future callers. Forgetting to call return_cache doesn't
+        corrupt anything; it just means that specific entry permanently
+        falls back to the safe copy-based behavior from then on.
+
+        Returns (prompt_cache, rest_tokens, checkout_token). checkout_token
+        is None whenever nothing was actually checked out (no match, or the
+        deep-copy fallback was used) -- passing None to return_cache is
+        always a safe no-op.
+        """
+        result = self._trie.search(model, tokens)
+        if result.exact is not None:
+            cache_entry = self._trie.get(result.model, result.exact)
+            cache, token = self._checkout_or_copy(model, result.exact, cache_entry)
+            return cache, [], token
+
+        short_length = len(result.shorter) if result.shorter is not None else 0
+        if result.longer is not None and result.common_prefix > short_length:
+            cache_entry = self._trie.get(result.model, result.longer)
+            if can_trim_prompt_cache(cache_entry.prompt_cache):
+                # Trimming rewinds the offset and then continues generation
+                # into the region the untrimmed entry still needs -- always
+                # unsafe to share, regardless of checkout state.
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                prefix = min(len(tokens) - 1, result.common_prefix)
+                num_to_trim = len(result.longer) - prefix
+                trim_prompt_cache(cache, num_to_trim)
+                return cache, tokens[prefix:], None
+
+        if short_length > 0:
+            cache_entry = self._trie.get(result.model, result.shorter)
+            cache, token = self._checkout_or_copy(model, result.shorter, cache_entry)
+            return cache, tokens[short_length:], token
+
+        return None, tokens, None
+
+    def return_cache(self, checkout_token):
+        """Release a checkout obtained from checkout_cache. Safe to call
+        with None (no-op) and safe to call if the entry was evicted while
+        checked out (no-op)."""
+        if checkout_token is None:
+            return
+        model, entry_tokens = checkout_token
+        try:
+            entry = self._trie.get(model, entry_tokens)
+        except KeyError:
+            return
+        entry.checked_out = False
 
     def insert_cache(
         self,

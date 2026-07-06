@@ -733,6 +733,76 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
 
+    def test_checkout_cache_shares_reference_when_uncontested(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        entry = [MockCache("test1")]
+        cache.insert_cache(model, [1, 2], entry)
+
+        c, t, token = cache.checkout_cache(model, [1, 2])
+        # No deep copy: the caller gets the exact same list/object the
+        # cache is storing, not an equal-but-distinct clone.
+        self.assertIs(c, entry)
+        self.assertEqual(t, [])
+        self.assertIsNotNone(token)
+
+        cache.return_cache(token)
+
+    def test_checkout_cache_falls_back_to_copy_when_contended(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        entry = [MockCache("test1")]
+        cache.insert_cache(model, [1, 2], entry)
+
+        c1, _, token1 = cache.checkout_cache(model, [1, 2])
+        self.assertIs(c1, entry)
+        self.assertIsNotNone(token1)
+
+        # entry is already checked out -- must not hand out the same
+        # mutable reference to a second caller.
+        c2, _, token2 = cache.checkout_cache(model, [1, 2])
+        self.assertIsNot(c2, entry)
+        self.assertEqual(c2, entry)  # still correct content, just a copy
+        self.assertIsNone(token2)  # nothing to return for the copy path
+
+        cache.return_cache(token1)
+
+    def test_return_cache_allows_reuse_of_no_copy_path(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        entry = [MockCache("test1")]
+        cache.insert_cache(model, [1, 2], entry)
+
+        _, _, token1 = cache.checkout_cache(model, [1, 2])
+        cache.return_cache(token1)
+
+        # Released -- the next checkout should get the shared reference
+        # again, not fall back to a copy.
+        c2, _, token2 = cache.checkout_cache(model, [1, 2])
+        self.assertIs(c2, entry)
+        self.assertIsNotNone(token2)
+        cache.return_cache(token2)
+
+    def test_return_cache_is_safe_after_eviction(self):
+        cache = LRUPromptCache(max_size=1)
+        model = ("test", None, None)
+        entry = [MockCache("test1")]
+        cache.insert_cache(model, [1, 2], entry)
+
+        _, _, token = cache.checkout_cache(model, [1, 2])
+
+        # Evict the checked-out entry by exceeding max_size.
+        cache.insert_cache(model, [3, 4], [MockCache("test2")])
+        self.assertEqual(len(cache), 1)
+
+        # Returning a checkout for an entry that no longer exists must not
+        # raise.
+        cache.return_cache(token)
+
+    def test_return_cache_noop_on_none(self):
+        cache = LRUPromptCache(max_size=10)
+        cache.return_cache(None)  # must not raise
+
 
 class TestMakeSampler(unittest.TestCase):
     def test_xtc_special_tokens(self):
