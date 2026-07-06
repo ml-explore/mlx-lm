@@ -438,6 +438,35 @@ class TestGenerate(unittest.TestCase):
         generated_token = self.tokenizer.encode(response.texts[0])[0]
         self.assertEqual(generated_token, 0)
 
+    def test_batch_generate_mixed_logits_processors(self):
+        """A request with logits processors joining a batch of requests
+        without them must not break generation (issue #1472)."""
+        tok = self.tokenizer.encode("hello")[-1]
+        batch_gen = BatchGenerator(self.model, max_tokens=5, prefill_step_size=8)
+
+        # Plain request long enough to need two prefill steps
+        (uid0,) = batch_gen.insert([[tok] * 17])
+        batch_gen.next()
+
+        # Request with a logits processor joins while the plain one is
+        # still prefilling
+        processors = make_logits_processors(logit_bias={0: 2000.0})
+        (uid1,) = batch_gen.insert([[tok] * 9], logits_processors=[processors])
+
+        first_logprobs = {}
+        finished = set()
+        while responses := batch_gen.next_generated():
+            for r in responses:
+                first_logprobs.setdefault(r.uid, r.logprobs)
+                if r.finish_reason is not None:
+                    finished.add(r.uid)
+
+        self.assertEqual(finished, {uid0, uid1})
+        # The processor was applied to the request that carries it
+        self.assertEqual(first_logprobs[uid1][0].item(), 0.0)
+        # ... and not to the one that doesn't
+        self.assertNotEqual(first_logprobs[uid0][0].item(), 0.0)
+
     def test_batch_generate_with_samplers(self):
         """Test that batch_generate with logits_processors produces correct results."""
         batch_gen = BatchGenerator(
