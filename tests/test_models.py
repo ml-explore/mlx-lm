@@ -1966,6 +1966,31 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gpt_oss_puzzle(self):
+        from mlx_lm.models import gpt_oss_puzzle
+
+        args = gpt_oss_puzzle.ModelArgs(
+            model_type="gpt_oss_puzzle",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            num_experts_per_tok=2,
+            rope_theta=10000,
+            vocab_size=10_000,
+            block_configs=[
+                {"num_local_experts": 16, "sliding_window": 128},
+                {"num_local_experts": 8, "sliding_window": None},
+                {"num_local_experts": 16, "sliding_window": 128},
+                {"num_local_experts": 8, "sliding_window": None},
+            ],
+        )
+        model = gpt_oss_puzzle.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_all_models(self):
         test_configs = [
             {
