@@ -54,6 +54,11 @@ def parse_arguments() -> argparse.Namespace:
         default="ggml-model-f16.gguf",
         type=str,
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     return parser.parse_args()
 
 
@@ -62,7 +67,10 @@ def main() -> None:
     args = parse_arguments()
 
     model, tokenizer, config = load(
-        args.model, adapter_path=args.adapter_path, return_config=True
+        args.model,
+        adapter_path=args.adapter_path,
+        return_config=True,
+        trust_remote_code=args.trust_remote_code,
     )
 
     fused_linears = [

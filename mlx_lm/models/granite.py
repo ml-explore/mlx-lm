@@ -191,3 +191,8 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        return weights

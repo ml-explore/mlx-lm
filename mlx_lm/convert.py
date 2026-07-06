@@ -115,6 +115,7 @@ def convert(
         return_config=True,
         tokenizer_config={"trust_remote_code": trust_remote_code},
         lazy=True,
+        trust_remote_code=trust_remote_code,
     )
 
     if isinstance(quant_predicate, str):

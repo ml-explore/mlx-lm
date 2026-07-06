@@ -806,6 +806,47 @@ class TestGenerate(unittest.TestCase):
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, KVCache)
 
+    def test_batch_generate_return_logprobs(self):
+        """Test that batch_generate returns per-token logprobs when requested."""
+        prompts = [
+            self.tokenizer.encode("hello"),
+            self.tokenizer.encode("write a poem"),
+        ]
+        max_tokens = 5
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=max_tokens,
+            return_logprobs=True,
+            return_token_ids=True,
+        )
+
+        # Check that logprobs and token_ids are returned
+        self.assertIsNotNone(response.logprobs)
+        self.assertIsNotNone(response.token_ids)
+        self.assertEqual(len(response.logprobs), len(prompts))
+        self.assertEqual(len(response.token_ids), len(prompts))
+
+        for i in range(len(prompts)):
+            # token_ids and logprobs should have same length
+            self.assertEqual(len(response.token_ids[i]), len(response.logprobs[i]))
+            # logprobs should be non-positive (log-probabilities)
+            for lp in response.logprobs[i]:
+                self.assertLessEqual(lp, 0.0)
+
+    def test_batch_generate_no_logprobs_by_default(self):
+        """Test that batch_generate does not return logprobs by default."""
+        prompts = [self.tokenizer.encode("hello")]
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=3,
+        )
+        self.assertIsNone(response.logprobs)
+        self.assertIsNone(response.token_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

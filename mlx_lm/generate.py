@@ -1877,11 +1877,19 @@ class BatchResponse:
     Args:
         texts: (List[str]): The generated text for each prompt.
         stats (BatchStats): Statistics about the generation.
+        caches: Optional prompt caches for each sequence.
+        token_ids (Optional[List[List[int]]]): The generated token IDs for each
+            prompt. Only present when ``return_token_ids=True``.
+        logprobs (Optional[List[List[float]]]): The per-token log-probabilities
+            of the sampled tokens for each prompt. Only present when
+            ``return_logprobs=True``.
     """
 
     texts: List[str]
     stats: BatchStats
     caches: Optional[List[List[Any]]]
+    token_ids: Optional[List[List[int]]] = None
+    logprobs: Optional[List[List[float]]] = None
 
 
 def batch_generate(
@@ -1892,6 +1900,8 @@ def batch_generate(
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     return_prompt_caches: bool = False,
+    return_token_ids: bool = False,
+    return_logprobs: bool = False,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1910,6 +1920,12 @@ def batch_generate(
           can be per prompt if a list is provided.
        return_prompt_caches (bool): Return the prompt caches in the batch
           responses. Default: ``False``.
+       return_token_ids (bool): Return the generated token IDs in the batch
+          responses. Default: ``False``.
+       return_logprobs (bool): Return the per-token log-probability of the
+          sampled token for each generated token. Useful for reinforcement
+          learning (e.g. RLOO, PPO) where behavior log-probabilities are needed
+          for importance weighting. Default: ``False``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
@@ -1929,6 +1945,7 @@ def batch_generate(
 
     uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
     results = {uid: [] for uid in uids}
+    logprob_results = {uid: [] for uid in uids} if return_logprobs else None
     prompt_caches = {}
     with gen.stats() as stats:
         while responses := gen.next_generated():
@@ -1944,6 +1961,8 @@ def batch_generate(
                         )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+                    if return_logprobs:
+                        logprob_results[r.uid].append(r.logprobs[r.token].item())
     gen.close()
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
@@ -1951,6 +1970,8 @@ def batch_generate(
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     caches = [prompt_caches[uid] for uid in uids] if return_prompt_caches else None
+    token_ids = [results[uid] for uid in uids] if return_token_ids else None
+    logprobs = [logprob_results[uid] for uid in uids] if return_logprobs else None
     if verbose:
         print(
             f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
@@ -1960,7 +1981,7 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return BatchResponse(texts, stats, caches)
+    return BatchResponse(texts, stats, caches, token_ids, logprobs)
 
 
 def main():
@@ -1991,7 +2012,7 @@ def main():
     tokenizer_config = (
         {} if not using_cache else json.loads(metadata["tokenizer_config"])
     )
-    tokenizer_config["trust_remote_code"] = True if args.trust_remote_code else None
+    tokenizer_config["trust_remote_code"] = args.trust_remote_code
 
     model_path = args.model
     if using_cache:
@@ -2010,6 +2031,7 @@ def main():
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        trust_remote_code=args.trust_remote_code,
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
