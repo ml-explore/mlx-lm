@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
+from collections import Counter
 from functools import partial
 from typing import Callable, Dict, List, Optional
 
@@ -365,3 +366,132 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return frequency_penalty_processor
+
+
+def _is_token_cycle(ids, max_cycle, min_span, window=800):
+    """True if the tail of ``ids`` is a period-``p`` cycle (1..max_cycle)
+    repeated back-to-back for at least ``min_span`` tokens. Decode-free and
+    not newline-aligned, so it catches loops in flowing prose that a
+    line-based check misses. ``min_span`` scales the required repeat count
+    with the cycle size (a 1-token cycle must repeat many times before it
+    counts, a longer phrase only a few)."""
+    t = ids[-window:]
+    n = len(t)
+    for p in range(1, min(max_cycle, n // 3) + 1):
+        block = t[-p:]
+        reps, i = 1, n - 2 * p
+        while i >= 0 and t[i : i + p] == block:
+            reps += 1
+            i -= p
+        if reps >= 3 and reps * p >= min_span:
+            return True
+    return False
+
+
+def _is_line_repetition(text, min_line=20, max_repeats=3):
+    """True if any substantive line (>= ``min_line`` chars) recurs at least
+    ``max_repeats`` times — the signature of a trace that found its point and
+    is now looping on it."""
+    counts = Counter(
+        ln.strip() for ln in (text or "").splitlines() if len(ln.strip()) >= min_line
+    )
+    return bool(counts) and counts.most_common(1)[0][1] >= max_repeats
+
+
+def make_reasoning_budget(
+    think_close: int,
+    max_think_tokens: int,
+    *,
+    think_open: Optional[int] = None,
+    tokenizer=None,
+    check_every: int = 16,
+    max_cycle: int = 80,
+    min_cycle_span: int = 30,
+):
+    """
+    Make a logits processor that bounds a runaway reasoning channel.
+
+    Reasoning models can enter a "thinking" channel and never leave it —
+    finding an answer, then looping or over-deliberating until the token cap,
+    yielding a long trace and no usable answer. Soft sampling pressure
+    (``repetition_penalty``) does not robustly bound this. This processor is a
+    hard, adaptive cap: it stays out of the way while the model reasons and
+    only intervenes — by forcing the ``think_close`` token, so generation
+    leaves the reasoning channel and produces an answer from what it has —
+    once the reasoning is provably running away.
+
+    A trip fires on any of:
+
+    * a hard budget of ``max_think_tokens`` spent inside the channel;
+    * a repeated token cycle in the tail of the channel (decode-free);
+    * a repeated substantive line (only if a ``tokenizer`` is given).
+
+    Args:
+        think_close (int): Token id that closes the reasoning channel; this is
+            what gets forced on a trip (e.g. the id of ``</think>``).
+        max_think_tokens (int): Hard ceiling on tokens spent inside the
+            channel before the close is forced.
+        think_open (int, optional): Token id that opens the channel. If
+            ``None``, generation is assumed to start inside the channel (as
+            with templates that open it for the model). Default: ``None``.
+        tokenizer (optional): If given, enables the decode-based line-repetition
+            detector. Only its ``decode`` method is used. Default: ``None``.
+        check_every (int): How often (in channel tokens) to run the loop
+            detectors. Default: ``16``.
+        max_cycle (int): Longest token-cycle period considered. Default: ``80``.
+        min_cycle_span (int): Minimum repeated span (in tokens) for a cycle to
+            count. Default: ``30``.
+
+    Returns:
+        Callable[[mx.array, mx.array], mx.array]: The logits processor. It
+        operates on a single sequence (as the other processors here do).
+    """
+    if max_think_tokens <= 0:
+        raise ValueError(f"max_think_tokens must be positive, got {max_think_tokens}")
+
+    state = {
+        "n": 0,  # tokens consumed from the running `tokens` array so far
+        "in_think": think_open is None,
+        "ids": [],  # ids seen inside the current channel
+        "since_check": 0,
+    }
+
+    def reasoning_budget_processor(tokens, logits):
+        new = tokens[state["n"] :].tolist()
+        state["n"] = len(tokens)
+        for tid in new:
+            if tid == think_close:
+                state["in_think"] = False
+                state["ids"] = []
+                state["since_check"] = 0
+            elif think_open is not None and tid == think_open:
+                state["in_think"] = True
+                state["ids"] = []
+                state["since_check"] = 0
+            elif state["in_think"]:
+                state["ids"].append(tid)
+
+        if not state["in_think"]:
+            return logits
+
+        ids = state["ids"]
+        trip = len(ids) >= max_think_tokens
+        if not trip:
+            state["since_check"] += len(new)
+            if state["since_check"] >= check_every:
+                state["since_check"] = 0
+                trip = _is_token_cycle(ids, max_cycle, min_cycle_span) or (
+                    tokenizer is not None
+                    and _is_line_repetition(tokenizer.decode(ids[-1500:]))
+                )
+
+        if not trip:
+            return logits
+
+        # Force the channel-close token: -inf everywhere else so the sampler
+        # (greedy or stochastic) must emit `think_close` next.
+        forced = mx.full(logits.shape, -float("inf"), dtype=logits.dtype)
+        forced[:, think_close] = 0.0
+        return forced
+
+    return reasoning_budget_processor

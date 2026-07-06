@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import mlx.core as mx
@@ -146,6 +147,93 @@ class TestSampleUtils(unittest.TestCase):
         # Tokens not in context not penalized
         self.assertAlmostEqual(result[0, 2].item(), 0.0)
         self.assertAlmostEqual(result[0, 3].item(), 0.0)
+
+    def test_reasoning_budget_hard_cap(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        close, vocab = 5, 10
+        proc = make_reasoning_budget(think_close=close, max_think_tokens=8)
+        logits = mx.zeros((1, vocab))
+
+        toks = []
+        # 7 tokens inside the (implicitly open) channel: under budget, untouched
+        for i in range(7):
+            toks.append(i % 4)  # content ids, never the close id
+            out = proc(mx.array(toks), logits)
+            self.assertTrue(mx.all(out == logits).item())
+        # 8th token hits the budget -> close is forced
+        toks.append(3)
+        out = proc(mx.array(toks), logits)
+        self.assertEqual(int(mx.argmax(out[0]).item()), close)
+        self.assertEqual(out[0, close].item(), 0.0)
+        self.assertTrue(math.isinf(out[0, 0].item()))
+
+    def test_reasoning_budget_resets_on_natural_close(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        proc = make_reasoning_budget(think_close=5, max_think_tokens=4)
+        logits = mx.zeros((1, 8))
+        toks = []
+        # Channel closes on its own after two tokens (id 5)...
+        for t in [0, 1, 5]:
+            toks.append(t)
+            proc(mx.array(toks), logits)
+        # ...so subsequent tokens are outside it and never trigger a force,
+        # even well past the budget.
+        for t in range(10):
+            toks.append(t % 3)
+            out = proc(mx.array(toks), logits)
+            self.assertTrue(mx.all(out == logits).item())
+
+    def test_reasoning_budget_open_token_gates(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        proc = make_reasoning_budget(think_close=5, max_think_tokens=4, think_open=4)
+        logits = mx.zeros((1, 8))
+        toks = []
+        # Before the open token, content does not count toward the budget.
+        for _ in range(6):
+            toks.append(0)
+            out = proc(mx.array(toks), logits)
+            self.assertTrue(mx.all(out == logits).item())
+        # Open the channel, then 4 tokens hit the budget.
+        toks.append(4)
+        proc(mx.array(toks), logits)
+        forced = None
+        for i in range(4):
+            toks.append(i % 2)  # 0/1, not the open/close ids
+            forced = proc(mx.array(toks), logits)
+        self.assertEqual(int(mx.argmax(forced[0]).item()), 5)
+
+    def test_reasoning_budget_token_cycle(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        proc = make_reasoning_budget(
+            think_close=5, max_think_tokens=10_000, check_every=4
+        )
+        logits = mx.zeros((1, 10))
+        toks, out = [], None
+        for _ in range(20):  # a period-2 loop that never terminates
+            toks += [7, 8]
+            out = proc(mx.array(toks), logits)
+        self.assertEqual(int(mx.argmax(out[0]).item()), 5)
+
+    def test_reasoning_budget_line_repetition(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        class _Tok:
+            def decode(self, ids):
+                return "this is the same reasoning line\n" * 4
+
+        proc = make_reasoning_budget(
+            think_close=5, max_think_tokens=10_000, tokenizer=_Tok(), check_every=1
+        )
+        logits = mx.zeros((1, 10))
+        toks, out = [], None
+        for i in range(3):
+            toks.append(i)
+            out = proc(mx.array(toks), logits)
+        self.assertEqual(int(mx.argmax(out[0]).item()), 5)
 
     def test_make_logits_processors(self):
         from mlx_lm.sample_utils import make_logits_processors
