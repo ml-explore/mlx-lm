@@ -15,6 +15,11 @@ from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
+import os as _os
+
+# Kill-switch for the small-L sparse gather path (validation / fallback).
+_NO_SMALL_L_GATHER = _os.environ.get("MLXLM_NO_SMALL_L_GATHER", "") == "1"
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -254,6 +259,48 @@ class DeepseekV32Attention(nn.Module):
                 )
                 if mask is not None:
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+            elif L <= 4 and not _NO_SMALL_L_GATHER:
+                # Small-L sparse path (MTP verify / tiny continuations): gather each
+                # position's top-k keys instead of building a full-key boolean mask.
+                # The mask path costs ~7 plain-steps PER CALL at 2K+ context (21x
+                # argpartition + put_along_axis + full-key attention) — fine when
+                # amortized over a 2048-token prefill chunk, fatal per spec-decode
+                # iteration (measured: long-ctx MTP 0.26x plain). All-gather batched
+                # matmuls instead; k = v = latent, unembed after (as in L == 1).
+                idx = topk_indices[..., None]                       # [B,1,L,K,1]
+                K = topk_indices.shape[-1]
+                kvl_g = mx.take_along_axis(
+                    kv_latent[:, :, None, :, :],
+                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
+                    axis=3,
+                )                                                    # [B,1,L,K,Dl]
+                kpe_g = mx.take_along_axis(
+                    k_pe[:, :, None, :, :],
+                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
+                    axis=3,
+                )                                                    # [B,1,L,K,dpe]
+                pe_g = (q_pe * self.scale)[:, :, :, None, :] @ kpe_g.swapaxes(-1, -2)
+                q_lat = self.embed_q(q_nope)                         # [B,H,L,Dl]
+                scores = (
+                    self.scale * (q_lat[:, :, :, None, :] @ kvl_g.swapaxes(-1, -2))
+                    + pe_g
+                )                                                    # [B,H,L,1,K]
+                if mask is not None:
+                    # Right at the sparse threshold a position can have fewer than K
+                    # causally-valid keys; re-mask the gathered scores to be safe.
+                    mask_g = mx.take_along_axis(
+                        mx.broadcast_to(mask, topk_indices.shape[:-1] + (mask.shape[-1],)),
+                        topk_indices,
+                        axis=-1,
+                    )[:, :, :, None, :]
+                    scores = mx.where(
+                        mask_g, scores, mx.array(mx.finfo(scores.dtype).min, scores.dtype)
+                    )
+                attn = mx.softmax(scores, axis=-1, precise=True)
+                out = (attn @ kvl_g).squeeze(3)                      # [B,H,L,Dl]
+                out = self.unembed_out(out)                          # [B,H,L,Dv]
+                out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(out), topk_indices
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
