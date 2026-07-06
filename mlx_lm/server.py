@@ -368,7 +368,9 @@ class ModelProvider:
                 )
 
         # Compute batchability
-        is_batchable = draft_model is None
+        is_batchable = draft_model is None and not getattr(
+            self.cli_args, "mtp", False
+        )
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
@@ -962,14 +964,25 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+            use_mtp = getattr(self.cli_args, "mtp", False) and getattr(
+                model, "has_mtp", False
             )
+            if use_mtp:
+                # v1: MTP mode skips prompt-cache reuse — the spec loop can end
+                # mid-verify (uncommitted tail entries), which would poison the
+                # shared prefix cache. Fresh caches per request instead.
+                cache, rest = None, prompt
+            else:
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
+                if use_mtp:
+                    cache += [model.make_mtp_cache()]
+                elif self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
@@ -983,6 +996,9 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                mtp=use_mtp,
+                mtp_num_draft_tokens=getattr(self.cli_args, "mtp_num_draft_tokens", 2),
+                mtp_hybrid=getattr(self.cli_args, "mtp_hybrid", False),
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
@@ -1015,10 +1031,12 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            # Save the KV cache again (not in MTP mode: the spec loop can leave
+            # uncommitted tail entries in the caches)
+            if not use_mtp:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
@@ -1789,6 +1807,24 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use the model's native MTP (nextn) module for self-speculative "
+        "decoding (requires a checkpoint with the MTP layer retained). "
+        "Disables batching and prompt-cache reuse.",
+    )
+    parser.add_argument(
+        "--mtp-num-draft-tokens",
+        type=int,
+        help="Chained MTP draft tokens per step when --mtp is set.",
+        default=2,
+    )
+    parser.add_argument(
+        "--mtp-hybrid",
+        action="store_true",
+        help="With --mtp: also enable conservative prompt-lookup drafting.",
     )
     parser.add_argument(
         "--trust-remote-code",

@@ -56,6 +56,9 @@ class ModelArgs(BaseModelArgs):
     # which hardcodes half-split RoPE; we match that empirically-correct behavior.
     indexer_rope_traditional: bool = False
     indexer_norm_eps: float = 1e-6
+    # GLM-5.2 ships one nextn (MTP) layer; kept as an MtpModule when the
+    # checkpoint retains layer 78 (see deepseek_v32.Model.sanitize).
+    num_nextn_predict_layers: int = 0
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters

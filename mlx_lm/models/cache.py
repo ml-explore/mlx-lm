@@ -360,10 +360,8 @@ class KVCache(_BaseCache):
     @property
     def state(self):
         if self.keys is None:
-            # Unwritten cache (e.g. the DSA indexer KV on GLM IndexShare "shared"
-            # layers, which never run the indexer): report empty in-memory state so
-            # mx.eval(cache.state) during generation does not dereference keys=None.
-            # (Round-tripping such a cache to disk is a separate, pre-existing limit.)
+            # Unused cache (e.g. the indexer KV cache on GLM IndexShare "shared"
+            # layers, which never run the indexer). Serialize as empty.
             return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
@@ -779,10 +777,8 @@ class ChunkedKVCache(_BaseCache):
     @property
     def state(self):
         if self.keys is None:
-            # Unwritten cache (e.g. the DSA indexer KV on GLM IndexShare "shared"
-            # layers, which never run the indexer): report empty in-memory state so
-            # mx.eval(cache.state) during generation does not dereference keys=None.
-            # (Round-tripping such a cache to disk is a separate, pre-existing limit.)
+            # Unused cache (e.g. the indexer KV cache on GLM IndexShare "shared"
+            # layers, which never run the indexer). Serialize as empty.
             return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
@@ -829,6 +825,11 @@ class CacheList(_BaseCache):
 
     def __getitem__(self, idx):
         return self.caches[idx]
+
+    @property
+    def offset(self):
+        # token position; generate.maybe_quantize_kv_cache reads cache.offset.
+        return self.caches[0].offset
 
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
@@ -881,6 +882,20 @@ class CacheList(_BaseCache):
             for i in range(len(caches[0].caches))
         )
         return cache
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> "CacheList":
+        # MLA layout is CacheList(latent_KVCache, indexer_KVCache): quantize ONLY the
+        # large compressed-latent cache (caches[0]); the DSA indexer cache (caches[1])
+        # is tiny and drives discrete top-k, so it stays full precision. This is what
+        # makes 1M-context fit (latent KV 90GB fp16 -> ~45GB int8). The MLA attention
+        # dequantizes the latent on read (deepseek_v32.py).
+        first = self.caches[0]
+        q0 = (
+            first.to_quantized(group_size=group_size, bits=bits)
+            if hasattr(first, "to_quantized")
+            else first
+        )
+        return CacheList(q0, *self.caches[1:])
 
     def extract(self, idx):
         return CacheList(*(c.extract(idx) for c in self.caches))
