@@ -192,6 +192,8 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    prompt_lookup_ngram: int = 0
+    prompt_lookup_tokens: int = 8
 
 
 @dataclass
@@ -683,7 +685,14 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        if not self.model_provider.is_batchable:
+            return False
+        if args.seed is not None:
+            return False
+        # Prompt-lookup speculative decoding runs on the single-stream path.
+        if getattr(args, "prompt_lookup_ngram", 0):
+            return False
+        return True
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -983,6 +992,14 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                prompt_lookup=(
+                    {
+                        "ngram_max": args.prompt_lookup_ngram,
+                        "num_draft": args.prompt_lookup_tokens,
+                    }
+                    if getattr(args, "prompt_lookup_ngram", 0)
+                    else None
+                ),
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
@@ -1164,6 +1181,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
+        )
+        self.prompt_lookup_ngram = self.body.get(
+            "prompt_lookup_ngram", self.response_generator.cli_args.prompt_lookup_ngram
+        )
+        self.prompt_lookup_tokens = self.body.get(
+            "prompt_lookup_tokens", self.response_generator.cli_args.prompt_lookup_tokens
         )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
@@ -1399,6 +1422,8 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words=stop_words,
             max_tokens=self.max_tokens,
             num_draft_tokens=self.num_draft_tokens,
+            prompt_lookup_ngram=self.prompt_lookup_ngram,
+            prompt_lookup_tokens=self.prompt_lookup_tokens,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             seed=self.seed,
@@ -1789,6 +1814,20 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--prompt-lookup-ngram",
+        type=int,
+        default=0,
+        help="Enable draft-free prompt-lookup (n-gram) speculative decoding "
+        "with this max n-gram size (0 disables). Great for code editing / "
+        "long verbatim copies.",
+    )
+    parser.add_argument(
+        "--prompt-lookup-tokens",
+        type=int,
+        default=8,
+        help="Max tokens to propose per prompt-lookup step (default: 8).",
     )
     parser.add_argument(
         "--trust-remote-code",

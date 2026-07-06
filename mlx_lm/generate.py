@@ -654,12 +654,263 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def _pld_snapshot(caches):
+    """Pre-forward cache snapshot so a rejected multi-token proposal can be undone.
+
+    - KVCache: recorded by offset and undone with trim().
+    - RotatingKVCache: snapshotted by COPYING its (small, <=window) buffers even
+      when is_trimmable() is True at snapshot time. trim() only adjusts offset/_idx
+      (it does NOT shrink the key buffer), so if the upcoming multi-token forward
+      pushes the cache past the window, a later trim()-rewind desyncs the buffer
+      from the mask and crashes attention (mask K-len != cached K-len). Copying is
+      always correct.
+    - CacheList: recursed element-wise.
+    Any other cache type (e.g. ArraysCache for SSM/Mamba models) is unsupported;
+    prompt-lookup decoding raises rather than risk a silently-wrong rewind."""
+    def snap_one(c):
+        if isinstance(c, CacheList):
+            return ("list", [snap_one(sub) for sub in c.caches])
+        if isinstance(c, RotatingKVCache):
+            k = None if c.keys is None else mx.array(c.keys)
+            v = None if c.values is None else mx.array(c.values)
+            return ("restore", k, v, c.offset, getattr(c, "_idx", None))
+        if isinstance(c, KVCache):
+            return ("trim", c.offset)
+        raise NotImplementedError(
+            f"prompt-lookup decoding does not support cache type "
+            f"'{type(c).__name__}'. Supported: KVCache, RotatingKVCache (and "
+            "CacheList of those). Disable prompt_lookup for this model."
+        )
+    return [snap_one(c) for c in caches]
+
+
+def _pld_rewind(caches, snaps):
+    def rewind_one(c, s):
+        if s[0] == "list":
+            for sub, subsnap in zip(c.caches, s[1]):
+                rewind_one(sub, subsnap)
+        elif s[0] == "trim":
+            c.trim(c.offset - s[1])
+        else:
+            _, k, v, off, idx = s
+            c.keys, c.values, c.offset = k, v, off
+            if idx is not None:
+                c._idx = idx
+    for c, s in zip(caches, snaps):
+        rewind_one(c, s)
+
+
+def _pld_offset(c):
+    """Logical token offset of a possibly-nested cache leaf. A per-layer
+    ``CacheList`` has no offset of its own; its sub-caches advance together, so
+    descend to the first offset-bearing sub-cache."""
+    while isinstance(c, CacheList):
+        c = next((s for s in c.caches if hasattr(s, "offset")), c.caches[0])
+    return c.offset
+
+
+def prompt_lookup_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    backend: Any = "ngram",
+    num_draft: int = 8,
+    ngram_max: int = 3,
+    ngram_min: int = 1,
+    prompt_only: bool = False,
+    adaptive: bool = False,
+    warmup: int = 48,
+    gate: float = 0.12,
+    stats: Optional[Any] = None,
+    **_ignored,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Draft-free (prompt-lookup) speculative decoding.
+
+    A pluggable proposer suggests a continuation of the running sequence and the
+    target verifies it in one batched forward. ``backend`` selects the proposer:
+    ``"ngram"`` (tail n-gram lookup) or ``"suffix_automaton"`` (longest repeated
+    suffix — stronger retrieval), or pass a proposer object with
+    ``observe(token)`` / ``propose(seq, max_span, prompt_len)``.
+
+    Lossless under the given ``sampler``: at each proposed position the target
+    distribution is sampled and the proposal is accepted iff it equals that
+    sample (speculative-sampling acceptance for a deterministic drafter), so the
+    output distribution matches the target's own (batched) greedy/sampled decode.
+    On a partial reject the cache is rewound (handling trimmable and rotating/
+    windowed caches). The prompt_cache is left representing exactly prompt+emitted
+    at every stop boundary.
+
+    ``adaptive`` enables a one-way never-lose latch: after ``warmup`` tokens, if
+    the accepted-proposal fraction is below ``gate`` (i.e. the work isn't
+    copy-heavy), it latches once to a plain ``generate_step`` tail — zero
+    regression on non-copy output; copy-heavy work never latches. ``stats``
+    (a HybridStats) is filled in place. Yields ``(token, logprobs, from_draft)``.
+    """
+    from .prompt_lookup import HybridStats, NgramProposer, make_proposer
+
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(model)
+    # Validate cache types up front so unsupported models (e.g. ArraysCache/SSM)
+    # fail loud immediately, and record the base offset so a non-empty (reused)
+    # cache's existing prefix is preserved by the end-of-run reconciliation.
+    _pld_snapshot(prompt_cache)
+    base_offset = _pld_offset(prompt_cache[0])
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+    stats = stats if stats is not None else HybridStats()
+
+    seq = prompt.tolist() if isinstance(prompt, mx.array) else list(prompt)
+    prompt_len = len(seq)
+
+    if backend == "ngram":
+        proposer = NgramProposer(ngram_max, ngram_min, prompt_only)
+    else:
+        proposer = make_proposer(backend)  # empty; the observe loop below is the
+    for t in seq:                          # single seeding authority (avoids a
+        proposer.observe(t)                # double-seed that desyncs SAM coords)
+
+    # Prefill everything but the last token.
+    with mx.stream(generation_stream):
+        head = seq[:-1]
+        processed = 0
+        prompt_progress_callback(0, prompt_len)
+        while processed < len(head):
+            chunk = head[processed : processed + prefill_step_size]
+            model(mx.array(chunk)[None], cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            processed += len(chunk)
+            prompt_progress_callback(processed, prompt_len)
+            mx.clear_cache()
+        prompt_progress_callback(prompt_len, prompt_len)
+
+    pending = [seq[-1]]
+    generated = 0
+    retrieved = 0  # tokens emitted from accepted proposals
+    latched = False
+    prompt_len = len(seq)
+    last_snap = None  # snapshot before the most recent proposal forward
+    try:
+        while (max_tokens < 0 or generated < max_tokens) and not latched:
+            stats.cycles += 1
+            # Clamp the proposal to the remaining budget so a cycle never forwards
+            # (and commits) more tokens than it will yield -> the cache stays
+            # consistent with the yielded prefix at the max_tokens boundary.
+            span = num_draft
+            if max_tokens >= 0:
+                span = min(num_draft, max(max_tokens - generated - 1, 0))
+            prop = (
+                proposer.propose(seq, span, prompt_len)
+                if (span > 0 and len(pending) <= 2)
+                else []
+            )
+            x = pending + prop
+            snaps = _pld_snapshot(prompt_cache) if prop else None
+            if snaps is not None:
+                last_snap = snaps
+
+            with mx.stream(generation_stream):
+                logits = model(mx.array(x)[None], cache=prompt_cache)[0]
+                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                mx.eval(logprobs)
+
+            base = len(pending) - 1
+            emit = []  # (token, logprobs_row, from_draft)
+            for j in range(len(prop) + 1):
+                row = logprobs[base + j]
+                s = int(sampler(row[None])[0].item())
+                if j < len(prop) and prop[j] == s:
+                    emit.append((prop[j], row, True))
+                else:
+                    emit.append((s, row, False))
+                    break
+            n_acc = len(emit) - 1
+
+            if prop:
+                stats.retrieval_cycles += 1
+                stats.retrieval_proposed += len(prop)
+                stats.retrieval_accepted += n_acc
+                stats.bonus_tokens += 1
+            else:
+                stats.plain_cycles += 1
+                stats.plain_tokens += 1
+
+            if prop and n_acc < len(prop):
+                _pld_rewind(prompt_cache, snaps)
+                pending = pending + [t for t, _, _ in emit]
+            else:
+                pending = [emit[-1][0]]
+
+            for tok, row, from_draft in emit:
+                seq.append(tok)
+                proposer.observe(tok)
+                generated += 1
+                if from_draft:
+                    retrieved += 1
+                yield tok, row, from_draft
+                if max_tokens >= 0 and generated >= max_tokens:
+                    return
+
+            # One-way never-lose latch: once we have enough evidence the work
+            # isn't copy-heavy, switch to a plain generate_step tail (bit-exact,
+            # no per-cycle proposal overhead) for all remaining tokens.
+            if adaptive and generated >= warmup and retrieved / generated < gate:
+                latched = True
+
+        if latched and (max_tokens < 0 or generated < max_tokens):
+            stats.latched = True
+            remaining = -1 if max_tokens < 0 else (max_tokens - generated)
+            for tok, lp in generate_step(
+                mx.array(pending),
+                model,
+                max_tokens=remaining,
+                sampler=sampler,
+                prompt_cache=prompt_cache,
+                prefill_step_size=prefill_step_size,
+            ):
+                seq.append(int(tok))
+                generated += 1
+                stats.plain_tokens += 1
+                yield int(tok), lp, False
+    finally:
+        # Leave prompt_cache representing EXACTLY prompt + emitted tokens (like
+        # generate_step), even though PLD forwards in batches and may stop mid-batch
+        # (e.g. caller breaks on EOS). This keeps callers that persist/reuse the
+        # cache (e.g. an LRU prompt cache) correct.
+        #   behind -> forward the missing emitted tail.
+        #   ahead  -> the extra tokens came from the last proposal forward, so undo
+        #     it via that snapshot (a copy-restore that is safe for rotating caches,
+        #     unlike trim past the window) and forward the emitted tail instead.
+        # Offsets are absolute (include any reused-cache base); seq is local
+        # (prompt+emitted), so index the missing tail by (off - base_offset).
+        target = base_offset + prompt_len + generated
+        off = _pld_offset(prompt_cache[0])
+        if off > target and last_snap is not None:
+            _pld_rewind(prompt_cache, last_snap)
+            off = _pld_offset(prompt_cache[0])
+        if off < target:
+            miss = seq[off - base_offset : prompt_len + generated]
+            if miss:
+                with mx.stream(generation_stream):
+                    model(mx.array(miss)[None], cache=prompt_cache)
+                    mx.eval([c.state for c in prompt_cache])
+        elif off > target:
+            for c in prompt_cache:
+                if c.is_trimmable():
+                    c.trim(off - target)
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    prompt_lookup: Optional[dict] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -698,7 +949,39 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    # Prompt-lookup (draft-free) speculative decoding. Engages only when it is
+    # safe to do losslessly: no draft model, no logits processors, no KV-cache
+    # quantization, and no input embeddings / bounded KV (unsupported by the
+    # rewind path). Otherwise fall through to the standard generators.
+    pld_safe = (
+        prompt_lookup
+        and draft_model is None
+        and not kwargs.get("logits_processors")
+        and kwargs.get("kv_bits") is None
+        and kwargs.get("input_embeddings") is None
+        and kwargs.get("max_kv_size") is None
+    )
+    if pld_safe:
+        for k in (
+            "num_draft_tokens", "relaxed_topk", "relaxed_delta", "speculative_stats",
+            "logits_processors", "kv_bits", "kv_group_size", "quantized_kv_start",
+            "input_embeddings", "max_kv_size",
+        ):
+            kwargs.pop(k, None)
+        token_generator = prompt_lookup_generate_step(
+            prompt,
+            model,
+            backend=prompt_lookup.get("backend", "ngram"),
+            num_draft=prompt_lookup.get("num_draft", 8),
+            ngram_max=prompt_lookup.get("ngram_max", 3),
+            ngram_min=prompt_lookup.get("ngram_min", 1),
+            prompt_only=prompt_lookup.get("prompt_only", False),
+            adaptive=prompt_lookup.get("adaptive", False),
+            warmup=prompt_lookup.get("warmup", 48),
+            gate=prompt_lookup.get("gate", 0.12),
+            **kwargs,
+        )
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
