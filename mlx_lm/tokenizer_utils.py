@@ -257,6 +257,7 @@ def _infer_thinking(tokenizer):
     vocab = tokenizer.get_vocab()
     THINK_TOKENS = [
         ("<think>", "</think>"),
+        ("<think:opensource>", "</think:opensource>"),
         ("<longcat_think>", "</longcat_think>"),
     ]
 
@@ -557,8 +558,8 @@ def _infer_tool_parser(chat_template):
         return "function_gemma"
     elif "<longcat_tool_call>" in chat_template:
         return "longcat"
-    elif "<tool_sep>" in chat_template and "<arg_key>" in chat_template:
-        return "hy_v3"
+    elif "<tool_sep" in chat_template and "<arg_key" in chat_template:
+        return "hy_v3_opensource" if ":opensource" in chat_template else "hy_v3"
     elif "<arg_key>" in chat_template:
         return "glm47"
     elif "<|tool_list_start|>" in chat_template:

@@ -15,6 +15,10 @@ Format:
     </tool_call>
     ...
     </tool_calls>
+
+The full Hy3 release renames every token with a ":opensource" suffix
+(``<tool_call:opensource>`` etc.), which the regexes below also accept;
+see ``hy_v3_opensource`` for the suffixed start/end sentinels.
 """
 
 import ast
@@ -26,11 +30,22 @@ import regex as re
 tool_call_start = "<tool_calls>"
 tool_call_end = "</tool_calls>"
 
-_tool_call_regex = re.compile(r"<tool_call>(.*?)<tool_sep>(.*?)</tool_call>", re.DOTALL)
-_arg_pair_regex = re.compile(
-    r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
+_SUFFIX = r"(?::[\w-]+)?"
+
+_tool_call_regex = re.compile(
+    rf"<tool_call{_SUFFIX}>(.*?)<tool_sep{_SUFFIX}>(.*?)</tool_call{_SUFFIX}>",
     re.DOTALL,
 )
+_arg_pair_regex = re.compile(
+    rf"<arg_key{_SUFFIX}>(.*?)</arg_key{_SUFFIX}>"
+    rf"(?:\\n|\s)*"
+    rf"<arg_value{_SUFFIX}>(.*?)</arg_value{_SUFFIX}>",
+    re.DOTALL,
+)
+_tool_sep_regex = re.compile(
+    rf"(?:\s*<tool_call{_SUFFIX}>)?(.*?)<tool_sep{_SUFFIX}>", re.DOTALL
+)
+_arg_key_regex = re.compile(rf"<arg_key{_SUFFIX}>")
 
 
 def _is_string_type(
@@ -63,12 +78,12 @@ def _deserialize(value: str) -> Any:
 
 
 def _parse_single_call(text: str, tools: list[Any] | None):
-    name_match = re.match(r"(.*?)<tool_sep>", text, re.DOTALL)
+    name_match = _tool_sep_regex.match(text)
     if name_match:
         func_name = name_match.group(1).strip()
         body = text[name_match.end() :]
     else:
-        func_name = text.split("<arg_key>", 1)[0].strip()
+        func_name = _arg_key_regex.split(text, 1)[0].strip()
         body = text
 
     arg_dct: dict[str, Any] = {}
