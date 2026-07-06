@@ -654,6 +654,117 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    max_kv_size: Optional[int] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    """Self-speculative decoding using a model's Multi-Token-Prediction head.
+
+    The model must expose ``num_nextn_predict_layers > 0`` and a
+    ``predict_next_tokens(hidden_state, token_ids, cache)`` method (see
+    ``mlx_lm.models.hy_v3``). Each step drafts one token with the MTP head and
+    verifies it with a single forward pass of the target model, yielding up to
+    two tokens per target pass. Verification is greedy (argmax), so this path
+    ignores ``sampler``/``logits_processors`` and matches temperature-0 output.
+    """
+    y = prompt.astype(mx.uint32)
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        mtp_cache = KVCache()
+    else:
+        model_cache = prompt_cache[:-1]
+        mtp_cache = prompt_cache[-1]
+
+    # Prefill the prompt chunk by chunk, leaving the last token for the
+    # hidden-state pass below.
+    with mx.stream(generation_stream):
+        total = len(y)
+        processed = 0
+        while total - processed > 1:
+            n_to_process = min(prefill_step_size, (total - processed) - 1)
+            model(y[processed : processed + n_to_process][None], cache=model_cache)
+            mx.eval([c.state for c in model_cache])
+            processed += n_to_process
+            mx.clear_cache()
+
+        last_token = y[processed : processed + 1]
+        logits, h_N = model(
+            last_token[None], cache=model_cache, return_hidden_states=True
+        )
+        token_N1 = mx.argmax(logits[:, -1, :], axis=-1)
+        h_N_last = h_N[:, -1:]
+
+    y = token_N1
+    mx.eval(y, h_N_last, [c.state for c in model_cache])
+    yield y.item(), None
+
+    ntoks = 1
+    while max_tokens == -1 or ntoks < max_tokens:
+        with mx.stream(generation_stream):
+            # 1. Draft one token with the MTP head.
+            token_N1_arr = y[..., None]
+            logits_mtp = model.predict_next_tokens(
+                h_N_last, token_N1_arr, cache=mtp_cache
+            )
+            draft_token = mx.argmax(logits_mtp[:, -1, :], axis=-1)
+
+            # 2. Verify the current + drafted token in a single target pass.
+            target_input = mx.concatenate(
+                [token_N1_arr, draft_token[..., None]], axis=-1
+            )
+            logits_target, h_N_target = model(
+                target_input, cache=model_cache, return_hidden_states=True
+            )
+            pred_token_N2 = mx.argmax(logits_target[:, 0, :], axis=-1)
+            token_N3 = mx.argmax(logits_target[:, 1, :], axis=-1)
+            mx.async_eval(draft_token, pred_token_N2, token_N3, h_N_target)
+
+        mx.eval(draft_token, pred_token_N2, token_N3)
+
+        if draft_token.item() == pred_token_N2.item():
+            # Draft accepted: emit two tokens for one target pass.
+            lp = logits_target[:, 0, :] - mx.logsumexp(
+                logits_target[:, 0, :], keepdims=True
+            )
+            yield draft_token.item(), lp.squeeze(0)
+            ntoks += 1
+            if max_tokens != -1 and ntoks >= max_tokens:
+                break
+            lp = logits_target[:, 1, :] - mx.logsumexp(
+                logits_target[:, 1, :], keepdims=True
+            )
+            yield token_N3.item(), lp.squeeze(0)
+            ntoks += 1
+            y = token_N3
+            h_N_last = h_N_target[:, 1:]
+        else:
+            # Draft rejected: emit the verified token and roll back the caches.
+            lp = logits_target[:, 0, :] - mx.logsumexp(
+                logits_target[:, 0, :], keepdims=True
+            )
+            yield pred_token_N2.item(), lp.squeeze(0)
+            ntoks += 1
+            for c in model_cache:
+                c.trim(1)
+            mtp_cache.trim(1)
+            y = pred_token_N2
+            h_N_last = h_N_target[:, 0:1]
+
+        mx.eval(h_N_last, [c.state for c in model_cache], mtp_cache.state)
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -700,11 +811,18 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
+        if getattr(model, "num_nextn_predict_layers", 0) > 0:
+            # Self-speculative decoding via the model's built-in MTP head.
+            token_generator = (
+                (token, logprobs, True)
+                for token, logprobs in mtp_generate_step(prompt, model, **kwargs)
+            )
+        else:
+            token_generator = generate_step(prompt, model, **kwargs)
+            # from_draft always false for non-speculative generation
+            token_generator = (
+                (token, logprobs, False) for token, logprobs in token_generator
+            )
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)

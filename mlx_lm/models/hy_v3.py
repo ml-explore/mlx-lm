@@ -1,4 +1,9 @@
 # Copyright © 2026 Apple Inc.
+#
+# Tencent Hunyuan 3 (hy_v3). Base model support follows the community work in
+# ml-explore/mlx-lm#1211 (kernelpool); this file additionally *keeps and uses*
+# the Multi-Token-Prediction (MTP) layer for self-speculative decoding instead
+# of stripping it.
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -219,6 +224,35 @@ class DecoderLayer(nn.Module):
         return h + r
 
 
+class MTPBlock(nn.Module):
+    """Hy3 Multi-Token-Prediction block (the layer after the main stack).
+
+    Projects concat[norm(next-token embedding), norm(hidden state)] through
+    ``eh_proj`` and one full decoder layer to produce the hidden state for the
+    speculatively-drafted next token.
+    """
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.enorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.eh_proj = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layer = DecoderLayer(args, layer_idx=args.num_hidden_layers)
+        self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        h_N: mx.array,
+        e_N1: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        # Order matters: [normed embedding, normed hidden state].
+        x = mx.concatenate([self.enorm(e_N1), self.hnorm(h_N)], axis=-1)
+        y = self.layer(self.eh_proj(x), mask, cache)
+        return self.final_layernorm(y)
+
+
 class HYV3Model(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -231,6 +265,7 @@ class HYV3Model(PipelineMixin, nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
+        return_hidden_states: bool = False,
     ) -> mx.array:
         h = self.embed_tokens(x)
 
@@ -255,7 +290,10 @@ class HYV3Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(h)
+        out = self.norm(h)
+        if return_hidden_states:
+            return out, h
+        return out
 
 
 class Model(nn.Module):
@@ -267,43 +305,82 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache: Optional[Any] = None,
-    ):
-        out = self.model(inputs, cache)
+        self.num_nextn_predict_layers = getattr(args, "num_nextn_predict_layers", 0)
+        if self.num_nextn_predict_layers > 0:
+            self.mtp = MTPBlock(args)
+
+    def _logits(self, out):
         if self.args.enable_lm_head_fp32:
             out = out.astype(mx.float32)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        return_hidden_states: bool = False,
+    ):
+        if return_hidden_states:
+            out, h = self.model(inputs, cache, return_hidden_states=True)
+            return self._logits(out), h
+        out = self.model(inputs, cache)
+        return self._logits(out)
+
+    def predict_next_tokens(self, h_N: mx.array, token_ids: mx.array, cache=None):
+        """Run the MTP head to draft the next token from a hidden state."""
+        if not hasattr(self, "mtp"):
+            raise ValueError("MTP is not enabled or its weights are not loaded.")
+        e_N1 = self.model.embed_tokens(token_ids)
+        mask = create_attention_mask(e_N1, cache)
+        h_mtp = self.mtp(h_N, e_N1, mask, cache)
+        return self._logits(h_mtp)
+
     def sanitize(self, weights):
         n_layers = self.args.num_hidden_layers
         n_mtp = self.args.num_nextn_predict_layers
 
+        # Keep the MTP layer (the base model drops it). If the checkpoint stores
+        # it under model.layers.{n_layers}.*, remap it onto the mtp.* submodule;
+        # if it is already stored under mtp.*, leave it as-is.
         if n_mtp > 0:
-            mtp_prefixes = tuple(f"model.layers.{n_layers + i}." for i in range(n_mtp))
-            weights = {
-                k: v for k, v in weights.items() if not k.startswith(mtp_prefixes)
-            }
+            mtp_src = f"model.layers.{n_layers}."
+            for k in list(weights.keys()):
+                if k.startswith(mtp_src):
+                    rest = k[len(mtp_src):]
+                    if any(
+                        t in rest
+                        for t in ("enorm", "hnorm", "eh_proj", "final_layernorm")
+                    ):
+                        weights["mtp." + rest] = weights.pop(k)
+                    else:
+                        weights["mtp.layer." + rest] = weights.pop(k)
 
-        for l in range(n_layers):
-            prefix = f"model.layers.{l}"
-
+        def fix_moe(prefix):
             bias_key = f"{prefix}.mlp.expert_bias"
             if bias_key in weights:
                 weights[f"{prefix}.mlp.router.expert_bias"] = weights.pop(bias_key)
-
             for m in ("gate_proj", "down_proj", "up_proj"):
                 for k in ("weight", "scales", "biases"):
-                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+                    per_expert = f"{prefix}.mlp.experts.0.{m}.{k}"
+                    stacked = f"{prefix}.mlp.experts.{m}.{k}"
+                    if per_expert in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
                             for e in range(self.args.num_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+                    elif stacked in weights:
+                        # Already stacked (MLX-converted checkpoint): just rename.
+                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = weights.pop(
+                            stacked
+                        )
+
+        for l in range(n_layers):
+            fix_moe(f"model.layers.{l}")
+        if n_mtp > 0:
+            fix_moe("mtp.layer")
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -343,19 +420,13 @@ class Model(nn.Module):
                 layer.mlp.sharding_group = group
                 if layer.mlp.shared_mlp is not None:
                     shard_inplace(
-                        layer.mlp.shared_mlp.gate_proj,
-                        "all-to-sharded",
-                        group=group,
+                        layer.mlp.shared_mlp.gate_proj, "all-to-sharded", group=group
                     )
                     shard_inplace(
-                        layer.mlp.shared_mlp.down_proj,
-                        "sharded-to-all",
-                        group=group,
+                        layer.mlp.shared_mlp.down_proj, "sharded-to-all", group=group
                     )
                     shard_inplace(
-                        layer.mlp.shared_mlp.up_proj,
-                        "all-to-sharded",
-                        group=group,
+                        layer.mlp.shared_mlp.up_proj, "all-to-sharded", group=group
                     )
                 shard_inplace(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
