@@ -900,6 +900,20 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     if mtp:
+        # MTP drafting is validated in the dense-attention regime only: past
+        # index_topk tokens the DSA sparse path engages and MTP acceptance
+        # collapses (index_skip_topk_offset is not wired yet) — measured 3x
+        # SLOWER than plain decoding. Fall back rather than degrade.
+        index_topk = getattr(getattr(model, "args", None), "index_topk", None)
+        if index_topk is not None and prompt.size + max_tokens > index_topk:
+            print(
+                f"[mtp] prompt+max_tokens ({prompt.size}+{max_tokens}) exceeds "
+                f"index_topk ({index_topk}); MTP is not yet supported in the "
+                "DSA-sparse regime — falling back to standard decoding.",
+                file=sys.stderr,
+            )
+            mtp = False
+    if mtp:
         if draft_model is not None:
             raise ValueError("mtp and draft_model are mutually exclusive.")
         if kwargs.pop("logits_processors", None):
