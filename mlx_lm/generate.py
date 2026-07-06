@@ -758,7 +758,7 @@ def mtp_speculative_generate_step(
         while y.size > 1:
             n_chunk = min(prefill_step_size, y.size - 1)
             model(y[:n_chunk][None], cache=model_cache)
-            h_chunk = model.model.h_prenorm
+            h_chunk = model.model._h_prenorm
             model.mtp_forward(h_chunk, y[1:n_chunk + 1][None], cache=mtp_cache)
             quantize_cache_fn(model_cache)
             mx.eval([c.state for c in model_cache], mtp_cache.state)
@@ -767,7 +767,7 @@ def mtp_speculative_generate_step(
             y = y[n_chunk:]
             mx.clear_cache()
         logits = model(y[None], cache=model_cache)
-        h_last = model.model.h_prenorm[:, -1:, :]
+        h_last = model.model._h_prenorm[:, -1:, :]
         logprobs0 = logits[0, -1] - mx.logsumexp(logits[0, -1])
         t = sampler(logprobs0[None]).squeeze()
         mx.eval(t, h_last)
@@ -800,7 +800,7 @@ def mtp_speculative_generate_step(
             chained = k_mtp - 1
         k = len(drafts)
         lg2 = model(mx.stack([t_next] + drafts).reshape(1, k + 1), cache=model_cache)
-        h2 = model.model.h_prenorm
+        h2 = model.model._h_prenorm
         lps = lg2[0] - mx.logsumexp(lg2[0], axis=-1, keepdims=True)
         trues = sampler(lps)
         quantize_cache_fn(model_cache)
