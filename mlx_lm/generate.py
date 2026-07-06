@@ -383,6 +383,7 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
+    _greedy = sampler is None
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
@@ -416,6 +417,16 @@ def generate_step(
                     logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
+
+            # Fast path: greedy decode without logits processors.
+            # argmax(logits) == argmax(logprobs) since logsumexp is a
+            # constant offset.  Compute argmax first (cheap), then
+            # logprobs async so the next step can start sooner.
+            if _greedy and not logits_processors:
+                sampled = mx.argmax(logits, axis=-1)
+                logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                mx.async_eval(sampled)
+                return sampled, logprobs.squeeze(0)
 
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             sampled = sampler(logprobs)
@@ -1347,6 +1358,24 @@ class GenerationBatch:
                     sample_logits = processor(token_context[e], sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
+
+        # Fast path: single-sequence greedy decode (most common in local serving)
+        # argmax(logits) == argmax(logprobs) since logsumexp is a constant
+        # offset, so we can skip the expensive logsumexp computation entirely.
+        if (
+            len(self.uids) == 1
+            and not any(self.logits_processors)
+            and not any(self.samplers)
+        ):
+            sampled = mx.argmax(logits, axis=-1)
+            self._next_tokens = sampled
+            self._next_logprobs = []
+            mx.async_eval(self._next_tokens)
+            mx.eval(inputs, self._current_logprobs)
+            inputs = inputs.tolist()
+            for sti, ti in zip(self.tokens, inputs):
+                sti.append(ti)
+            return inputs, self._current_logprobs
 
         # Normalize the logits
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
