@@ -2987,6 +2987,17 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 10000.0,
                 "max_position_embeddings": 1000,
             },
+            {
+                "model_type": "talkie",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "intermediate_size": 256,
+                "rope_theta": 1000.0,
+                "max_position_embeddings": 256,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
