@@ -339,6 +339,37 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def test_quantized_sdpa_gqa_batched_mask(self):
+        # Regression test: quantized SDPA with grouped-query attention and a
+        # batched (B >= 2) padding mask used to crash with a broadcast error
+        # because the mask lacked the n_repeats axis introduced by the GQA
+        # reshape of the scores.
+        B, n_q_heads, n_kv_heads, L, D = 2, 8, 2, 16, 32
+
+        cache = KVCache()
+        k = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        v = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        k_up, v_up = cache.update_and_fetch(k, v)
+        quant_cache = cache.to_quantized(group_size=32, bits=8)
+        qk_up, qv_up = quant_cache.state
+
+        q = 1e-1 * mx.random.normal(shape=(B, n_q_heads, L, D))
+
+        # Batched padding mask, shape (B, 1, L, L), as produced by BatchKVCache.
+        mask = mx.ones((B, 1, L, L), dtype=mx.bool_)
+        mask[1, :, :, L // 2 :] = False
+
+        out = scaled_dot_product_attention(
+            q, k_up, v_up, cache=cache, mask=mask, scale=1.0
+        )
+        qout = scaled_dot_product_attention(
+            q, qk_up, qv_up, cache=quant_cache, mask=mask, scale=1.0
+        )
+        mx.eval(out, qout)
+        self.assertEqual(qout.shape, (B, n_q_heads, L, D))
+        self.assertTrue(mx.all(mx.isfinite(qout)).item())
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)

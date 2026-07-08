@@ -90,11 +90,7 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
-        if n_repeats > 1 and mask.ndim >= 3:
-            # GQA reshaped the scores to 5D (B, n_kv_heads, n_repeats, L, L); a
-            # mask carrying leading batch/head dims (e.g. a (B, 1, L, L) padding
-            # mask) must gain the n_repeats axis so it broadcasts over the repeat
-            # groups instead of colliding B against n_kv_heads at batch >= 2.
+        if n_repeats > 1 and mask.ndim > 3:
             mask = mx.expand_dims(mask, -3)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
