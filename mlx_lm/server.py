@@ -1354,6 +1354,8 @@ class APIHandler(BaseHTTPRequestHandler):
             choice[key_name] = {"role": "assistant"}
             if text:
                 choice[key_name]["content"] = text
+            elif tool_calls and not self.stream:
+                choice[key_name]["content"] = None
             if reasoning_text:
                 choice[key_name]["reasoning"] = reasoning_text
             if tool_calls:

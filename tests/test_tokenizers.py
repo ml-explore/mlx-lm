@@ -5,6 +5,7 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
+from mlx_lm.tool_parsers import pythonic
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
@@ -94,6 +95,13 @@ class TestTokenizers(unittest.TestCase):
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
         tokenizer = load_tokenizer(tokenizer_repo)
         self.assertFalse(tokenizer.has_tool_calling)
+
+        tokenizer_repo = "LiquidAI/LFM2.5-1.2B-Instruct-MLX-8bit"
+        tokenizer = load_tokenizer(tokenizer_repo)
+        self.assertTrue(tokenizer.has_tool_calling)
+        self.assertEqual(tokenizer.tool_call_start, "<|tool_call_start|>")
+        self.assertEqual(tokenizer.tool_call_end, "<|tool_call_end|>")
+        self.assertEqual(tokenizer.tool_parser, pythonic.parse_tool_call)
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"

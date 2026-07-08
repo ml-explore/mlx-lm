@@ -543,11 +543,11 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def _infer_tool_parser(chat_template):
-    """Attempt to auto-infer a tool parser from the chat template."""
+def _infer_tool_parser_from_chat_template(chat_template):
     if not isinstance(chat_template, str):
         return None
-    elif "<minimax:tool_call>" in chat_template:
+
+    if "<minimax:tool_call>" in chat_template:
         return "minimax_m2"
     elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
         return "gemma4"
@@ -570,7 +570,26 @@ def _infer_tool_parser(chat_template):
         return "mistral"
     elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
         return "json_tools"
+
     return None
+
+
+def _infer_tool_parser_from_tokenizer(tokenizer):
+    if tokenizer is None:
+        return None
+
+    vocab = tokenizer.get_vocab()
+    if "<|tool_call_start|>" in vocab and "<|tool_call_end|>" in vocab:
+        return "pythonic"
+
+    return None
+
+
+def _infer_tool_parser(chat_template=None, tokenizer=None):
+    """Attempt to auto-infer a tool parser from tokenizer metadata."""
+    return _infer_tool_parser_from_chat_template(
+        chat_template
+    ) or _infer_tool_parser_from_tokenizer(tokenizer)
 
 
 def load(
@@ -620,9 +639,9 @@ def load(
             f"mlx_lm.chat_templates.{chat_template_type}"
         ).apply_chat_template
 
-    tool_parser_type = tokenizer_config.get(
-        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
-    )
+    tool_parser_type = tokenizer_config.get("tool_parser_type")
+    if tool_parser_type is None:
+        tool_parser_type = _infer_tool_parser(tokenizer.chat_template, tokenizer)
 
     if tool_parser_type is not None:
         tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
