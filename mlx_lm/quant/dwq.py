@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import re
 import time
 import types
 from pathlib import Path
@@ -17,13 +18,8 @@ from mlx_lm.tuner.datasets import load_dataset
 from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
-from mlx_lm.utils import (
-    load,
-    load_tokenizer,
-    quantize_model,
-    save,
-    sharded_load,
-)
+from mlx_lm.utils import (load, load_tokenizer, quantize_model, save,
+                          sharded_load)
 
 
 def compute_dwq_targets(
@@ -209,6 +205,190 @@ def dwq_quantize(
     model.update(tree_map(lambda x: x.astype(dtype), params))
 
 
+def dwq_quantize_layerwise(
+    model,
+    target_fn,
+    opt,
+    train_data,
+    valid_data,
+    batch_size,
+    max_seq_length,
+    seed,
+    layers_per_round,
+    dtype: mx.Dtype = mx.bfloat16,
+    gradient_checkpoint: bool = False,
+    temperature: float = 2.0,
+):
+    """DWQ in rounds of at most ``layers_per_round`` layers.
+
+    Only the parameters unfrozen in the current round are differentiated, so
+    the memory needed by the quantized-matmul backward is bounded by the round
+    size instead of by the whole model. This makes DWQ practical for very
+    large students (e.g. multi-hundred-GB MoE models) whose full backward does
+    not fit on a single machine. Rounds run over the deepest layers first
+    (best-conditioned gradients); after each round the validation loss is
+    measured and the round is reverted if it did not improve.
+    """
+    group = mx.distributed.init()
+    world_size = group.size()
+    rank = group.rank()
+
+    def rprint(*args, **kwargs):
+        if rank == 0:
+            tqdm.write(*args, **kwargs)
+
+    def is_quantized(m):
+        return (
+            hasattr(m, "bits")
+            and hasattr(m, "group_size")
+            and m.mode == "affine"
+            and m.bits < 8
+        )
+
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    quant_layers = set()
+    has_extras = False
+
+    def scan(name, m):
+        nonlocal has_extras
+        if is_quantized(m):
+            match = layer_re.search(name)
+            if match:
+                quant_layers.add(int(match.group(1)))
+            else:
+                has_extras = True
+
+    model.apply_to_modules(scan)
+    ordered = sorted(quant_layers, reverse=True)
+    rounds = [
+        ordered[i : i + layers_per_round]
+        for i in range(0, len(ordered), layers_per_round)
+    ]
+    rprint(
+        f"Layerwise DWQ: {len(ordered)} quantized layers in {len(rounds)} "
+        f"rounds of {layers_per_round}"
+        + (" (embeddings/head trained with round 1)" if has_extras else "")
+    )
+
+    model.train()
+    if gradient_checkpoint:
+        grad_checkpoint(model.layers[0])
+
+    scale = 1 / temperature
+
+    def loss_fn(params, x, targets, lengths):
+        model.update(tree_map(lambda x: x.astype(dtype), params))
+        logits = model(x)
+        if isinstance(targets, tuple):
+            targets, ids = targets
+            logits = mx.take_along_axis(logits, ids, axis=-1)
+        losses = kl_div_loss(scale * logits, scale * targets)
+        mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
+        ntoks = mask.sum()
+        loss = (mask * losses).sum() / ntoks
+        return loss, ntoks
+
+    def validate(params, it):
+        v_loss = 0.0
+        v_tokens = 0
+        for i, (batch, lengths) in tqdm(
+            enumerate(
+                iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
+            ),
+            total=len(valid_data) // batch_size,
+            desc="Computing validation loss",
+            leave=False,
+        ):
+            batch = batch[:, :-1]
+            targets = target_fn(batch, i, split="valid")
+            mx.eval(targets)
+            loss, ntoks = loss_fn(params, batch, targets, lengths)
+            mx.eval(loss, ntoks)
+            loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
+            ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
+            v_tokens += ntoks
+            v_loss += loss * ntoks
+        loss = v_loss / v_tokens
+        rprint(f"Validation: {it=}, {loss=:.3f}")
+        return loss
+
+    model.freeze()
+    best_valid = initial_valid_loss = validate(model.trainable_parameters(), it=0)
+
+    for r, subset in enumerate(rounds):
+        model.freeze()
+        sub = set(subset)
+        first = r == 0
+
+        def unfreeze(name, m):
+            if not is_quantized(m):
+                return
+            match = layer_re.search(name)
+            if (match and int(match.group(1)) in sub) or (
+                match is None and first and has_extras
+            ):
+                m.unfreeze(keys=["scales", "biases"], recurse=False)
+
+        model.apply_to_modules(unfreeze)
+        snapshot = tree_map(lambda x: x, model.trainable_parameters())
+        params = tree_map(lambda x: x.astype(mx.float32), model.trainable_parameters())
+        round_opt = optimizers.Adam(
+            learning_rate=opt.learning_rate, bias_correction=True
+        )
+
+        def step(inputs, targets, lengths, params):
+            (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
+                params, inputs, targets, lengths
+            )
+            grads = nn.average_gradients(grads)
+            params = round_opt.apply_gradients(grads, params)
+            return loss, ntoks, params
+
+        total_loss = 0.0
+        tokens = 0
+        for it, (batch, lengths) in (
+            pbar := tqdm(
+                enumerate(
+                    iterate_batches(train_data, batch_size, max_seq_length, seed=seed)
+                ),
+                total=len(train_data) // batch_size,
+                desc=f"Round {r + 1}/{len(rounds)} (layers {subset[-1]}-{subset[0]})",
+            )
+        ):
+            batch = batch[:, :-1]
+            targets = target_fn(batch, it, split="train")
+            mx.eval(targets)
+            loss, ntoks, params = step(batch, targets, lengths, params)
+            mx.eval(loss, params)
+            loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
+            ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
+            tokens += ntoks
+            total_loss += loss * ntoks
+            if rank == 0 and (it + 1) % 20 == 0:
+                pbar.set_description(
+                    f"Round {r + 1}/{len(rounds)} loss={total_loss / tokens:.4f} "
+                    f"peak={mx.get_peak_memory() / 1e9:.0f}GB"
+                )
+
+        model.update(tree_map(lambda x: x.astype(dtype), params))
+        round_valid = validate(model.trainable_parameters(), it=r + 1)
+        if round_valid > best_valid:
+            model.update(snapshot)
+            rprint(
+                f"Round {r + 1}/{len(rounds)} reverted "
+                f"(validation {round_valid:.4f} > best {best_valid:.4f})"
+            )
+        else:
+            best_valid = round_valid
+
+    model.freeze()
+    if initial_valid_loss < best_valid:
+        rprint(
+            f"[WARNING] Final validation loss {best_valid:.3f} is worse than "
+            f"the initial validation loss {initial_valid_loss:.3f}."
+        )
+
+
 def load_data(
     tokenizer,
     data_path: str,
@@ -288,6 +468,16 @@ def main():
         "--grad-checkpoint",
         action="store_true",
         help="Use gradient checkpointing to reduce memory use.",
+    )
+    parser.add_argument(
+        "--layers-per-round",
+        type=int,
+        default=0,
+        help="Train the quantization parameters of at most this many layers at"
+        " a time (deepest layers first, with per-round validation and"
+        " rollback). This bounds the memory of the backward pass so DWQ can"
+        " run on very large students that otherwise run out of memory."
+        " 0 (default) trains all layers at once.",
     )
     parser.add_argument(
         "--target-dir", type=str, default=None, help="Directory to save/load targets."
@@ -408,17 +598,31 @@ def main():
         mx.set_wired_limit(max_rec_size)
 
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)
-    dwq_quantize(
-        q_model,
-        target_fn,
-        opt,
-        train_data,
-        valid_data,
-        batch_size=args.batch_size,
-        max_seq_length=args.max_seq_length,
-        seed=args.seed,
-        gradient_checkpoint=args.grad_checkpoint,
-    )
+    if args.layers_per_round > 0:
+        dwq_quantize_layerwise(
+            q_model,
+            target_fn,
+            opt,
+            train_data,
+            valid_data,
+            batch_size=args.batch_size,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+            layers_per_round=args.layers_per_round,
+            gradient_checkpoint=args.grad_checkpoint,
+        )
+    else:
+        dwq_quantize(
+            q_model,
+            target_fn,
+            opt,
+            train_data,
+            valid_data,
+            batch_size=args.batch_size,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+            gradient_checkpoint=args.grad_checkpoint,
+        )
     save(
         args.mlx_path,
         args.model,
