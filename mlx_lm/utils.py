@@ -216,6 +216,19 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
+DEFAULT_ALLOW_PATTERNS = [
+    "*.json",
+    "model*.safetensors",
+    "*.py",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+]
+
+
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -235,17 +248,7 @@ def _download(
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        allow_patterns = allow_patterns or [
-            "*.json",
-            "model*.safetensors",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ]
+        allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -258,7 +261,16 @@ def _download(
 
 
 def hf_repo_to_path(hf_repo):
-    return Path(snapshot_download(hf_repo, local_files_only=True))
+    # Restrict to the same patterns that `_download` fetches so the snapshot
+    # completeness check does not fail on files that were never downloaded
+    # (e.g. `.gitattributes`), which would raise an IncompleteSnapshotError.
+    return Path(
+        snapshot_download(
+            hf_repo,
+            local_files_only=True,
+            allow_patterns=DEFAULT_ALLOW_PATTERNS,
+        )
+    )
 
 
 def load_config(model_path: Path) -> dict:
