@@ -43,8 +43,20 @@ def make_sampler(
         Callable[mx.array, mx.array]:
             A sampler which takes log-probabilities and returns tokens.
     """
+    def _tag(fn):
+        # Expose the sampling parameters on the returned callable so consumers
+        # that need the processed distribution itself (e.g. the residual
+        # speculative-sampling path in ``mtp_generate_step``) can reconstruct it.
+        fn.temp = temp
+        fn.top_p = top_p
+        fn.top_k = top_k
+        fn.min_p = min_p
+        fn.min_tokens_to_keep = min_tokens_to_keep
+        fn.xtc_probability = xtc_probability
+        return fn
+
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        return _tag(lambda x: mx.argmax(x, axis=-1))
 
     # Create sampler chain
     sampling_methods = []
@@ -66,7 +78,7 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
-    return sampler
+    return _tag(sampler)
 
 
 def make_logits_processors(

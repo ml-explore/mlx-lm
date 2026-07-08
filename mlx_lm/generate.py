@@ -38,7 +38,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import apply_min_p, apply_top_k, apply_top_p, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -678,16 +678,52 @@ def mtp_generate_step(
     two tokens per target pass.
 
     Verification is distribution-preserving. The drafted token and the target's
-    own token are each drawn from their processed distributions (honoring
-    ``sampler`` and ``logits_processors``) and the draft is accepted only when it
-    matches the target's independent sample. Every emitted token is therefore a
-    sample from the target's processed distribution, so temperature / top-p /
-    top-k requests are respected exactly -- this is the same acceptance rule used
-    by :func:`speculative_generate_step`. With a temperature-0 sampler (argmax)
-    it reduces to greedy draft-equals-target matching.
+    own token are drawn from their processed distributions (honoring ``sampler``
+    and ``logits_processors``). By default the draft is accepted only when it
+    matches the target's independent sample -- the same acceptance rule as
+    :func:`speculative_generate_step`, which works with any sampler. When the
+    sampler exposes its parameters (any :func:`make_sampler` output) and no
+    logits processors are active, the higher-acceptance **residual (Leviathan)**
+    rule is used instead: the draft ``x ~ q`` is accepted with probability
+    ``min(1, p(x) / q(x))`` and, on rejection, a token is resampled from the
+    normalized residual ``relu(p - q)``. Both rules emit a token distributed
+    exactly as the target's processed distribution, so temperature / top-p /
+    top-k are respected; a temperature-0 sampler reduces to greedy matching.
     """
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
     logits_processors = logits_processors or []
+
+    # The residual (Leviathan) acceptance rule accepts strictly more often than
+    # plain match sampling while preserving the target distribution, but it needs
+    # the processed draft/target distributions -- reconstructed here from the
+    # sampler's parameters. Fall back to match sampling for temp-0, custom
+    # samplers (no exposed params), XTC (non-deterministic mask), or any active
+    # logits processors.
+    s_temp = getattr(sampler, "temp", None)
+    s_top_p = getattr(sampler, "top_p", 0.0) or 0.0
+    s_top_k = getattr(sampler, "top_k", 0) or 0
+    s_min_p = getattr(sampler, "min_p", 0.0) or 0.0
+    s_min_keep = getattr(sampler, "min_tokens_to_keep", 1) or 1
+    s_xtc = getattr(sampler, "xtc_probability", 0.0) or 0.0
+    use_residual = (
+        s_temp is not None
+        and s_temp > 0.0
+        and s_xtc == 0.0
+        and not logits_processors
+    )
+
+    def _probs(logits):
+        # Reconstruct the categorical distribution make_sampler draws from: mask
+        # temp-1 log-probs (top-p, then min-p, then top-k, matching make_sampler's
+        # order) and apply temperature. Returns a probability row vector [1, V].
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if 0.0 < s_top_p < 1.0:
+            lp = apply_top_p(lp, s_top_p)
+        if s_min_p > 0.0:
+            lp = apply_min_p(lp, s_min_p, s_min_keep)
+        if s_top_k > 0:
+            lp = apply_top_k(lp, s_top_k)
+        return mx.softmax(lp * (1.0 / s_temp), axis=-1)
 
     y = prompt.astype(mx.uint32)
 
@@ -739,30 +775,62 @@ def mtp_generate_step(
     while max_tokens == -1 or ntoks < max_tokens:
         with mx.stream(generation_stream):
             # 1. Draft one token with the MTP head, sampled from its processed
-            #    distribution.
+            #    distribution q.
             y_arr = y[..., None]
             logits_mtp = model.predict_next_tokens(h_N_last, y_arr, cache=mtp_cache)
-            draft_token, _ = _sample(logits_mtp[:, -1, :])
+            mtp_logits = logits_mtp[:, -1, :]
+            draft_token, _ = _sample(mtp_logits)
 
-            # 2. Verify the current + drafted token in a single target pass. The
-            #    target's own sample at the drafted position is what we emit, so
-            #    the target distribution is preserved regardless of the draft.
+            # 2. Verify the current + drafted token in a single target pass.
             target_input = mx.concatenate([y_arr, draft_token[..., None]], axis=-1)
             logits_target, h_N_target = model(
                 target_input, cache=model_cache, return_hidden_states=True
             )
-            verify_token, verify_lp = _sample(logits_target[:, 0, :])
-            mx.async_eval(draft_token, verify_token, h_N_target)
+            tgt_logits = logits_target[:, 0, :]
+            emit_lp = tgt_logits - mx.logsumexp(tgt_logits, axis=-1, keepdims=True)
+            if use_residual:
+                q = _probs(mtp_logits)
+                p = _probs(tgt_logits)
+                mx.async_eval(draft_token, q, p, h_N_target)
+            else:
+                verify_token, _ = _sample(tgt_logits)
+                mx.async_eval(draft_token, verify_token, h_N_target)
 
-        mx.eval(draft_token, verify_token)
+        if use_residual:
+            # Residual/Leviathan: accept x~q with prob min(1, p(x)/q(x)); on
+            # rejection resample the emitted token from relu(p - q). Either way
+            # the emitted token is distributed exactly as the target's p.
+            mx.eval(draft_token, q, p)
+            x = draft_token.item()
+            accepted = mx.random.uniform().item() < min(
+                1.0, (p[0, x] / q[0, x]).item()
+            )
+            if accepted:
+                emit_token = draft_token
+            else:
+                residual = mx.maximum(p - q, 0.0)
+                if residual.sum().item() > 0.0:
+                    emit_token = mx.random.categorical(
+                        mx.log(residual + 1e-20)
+                    ).astype(mx.uint32)
+                else:  # p already dominated by q everywhere (degenerate)
+                    emit_token, _ = _sample(tgt_logits)
+                mx.eval(emit_token)
+        else:
+            # Match: emit the target's own sample; accept when it equals the
+            # draft. Works with any sampler.
+            mx.eval(draft_token, verify_token)
+            accepted = draft_token.item() == verify_token.item()
+            emit_token = verify_token
 
-        if draft_token.item() == verify_token.item():
-            # Accepted: the draft equals the target's own sample, so emit it and
-            # get a bonus token from the second verified position for free.
-            yield verify_token.item(), verify_lp
-            ntoks += 1
-            if logits_processors:
-                history = mx.concatenate([history, verify_token])
+        emit_lp = emit_lp.squeeze(0)
+        yield emit_token.item(), emit_lp
+        ntoks += 1
+        if logits_processors:
+            history = mx.concatenate([history, emit_token])
+
+        if accepted:
+            # Bonus token from the second verified position, for free.
             if max_tokens != -1 and ntoks >= max_tokens:
                 break
             bonus_token, bonus_lp = _sample(logits_target[:, 1, :])
@@ -773,16 +841,11 @@ def mtp_generate_step(
             y = bonus_token
             h_N_last = h_N_target[:, 1:]
         else:
-            # Rejected: emit the target's own sample and roll back the
-            # speculative position from both caches.
-            yield verify_token.item(), verify_lp
-            ntoks += 1
-            if logits_processors:
-                history = mx.concatenate([history, verify_token])
+            # Roll back the speculative position from both caches.
             for c in model_cache:
                 c.trim(1)
             mtp_cache.trim(1)
-            y = verify_token
+            y = emit_token
             h_N_last = h_N_target[:, 0:1]
 
         mx.eval(y, h_N_last, [c.state for c in model_cache], mtp_cache.state)
