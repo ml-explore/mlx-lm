@@ -4,20 +4,14 @@ import http
 import io
 import json
 import threading
-import types
 import unittest
 
 import mlx.core as mx
 import requests
 
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import (
-    APIHandler,
-    LRUPromptCache,
-    Response,
-    ResponseGenerator,
-    _process_control_tokens,
-)
+from mlx_lm.server import APIHandler, LRUPromptCache, Response, ResponseGenerator
 from mlx_lm.utils import load
 
 
@@ -92,69 +86,109 @@ class MockCache:
         return n
 
 
-class TestProcessControlTokens(unittest.TestCase):
-    @staticmethod
-    def _r(text, state, match=None):
-        return Response(text, 0, state, match, 0.0, None, ())
+class TestTextStateMachine(unittest.TestCase):
+    """Test the TextStateMachine buffering and stripping behavior."""
 
-    def test_single_tool_call_passes_body_with_open_and_close_crossings(self):
-        r = self._r
-        stream = [
-            r("hi ", "normal"),
-            r("<tool_call>", "tool", match=(0,)),
-            r("body", "tool"),
-            r("</tool_call>", "normal", match=(1,)),
-            r(" bye", "normal"),
-        ]
-        ctx = types.SimpleNamespace(
-            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
+    def test_strips_control_sequences(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
         )
-        out = list(_process_control_tokens(ctx, iter(stream)))
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, s = sm.flush(state)
+        full = text + rest
+        self.assertEqual(full, "hi body bye")
 
-        self.assertEqual("".join(t.text for t in out), "hi body bye")
-        states = [t.state for t in out]
-        self.assertEqual(sum(1 for a, b in zip(states, states[1:]) if a != b), 2)
-
-    def test_back_to_back_tool_calls_emit_state_crossings(self):
-        r = self._r
-        stream = [
-            r("<tool_call>", "tool", match=(0,)),
-            r("call1_body", "tool"),
-            r("</tool_call>", "normal", match=(1,)),
-            r("<tool_call>", "tool", match=(0,)),
-            r("call2_body", "tool"),
-            r("</tool_call>", "normal", match=(1,)),
-        ]
-        ctx = types.SimpleNamespace(
-            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
+    def test_back_to_back_tool_calls(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
         )
-        out = list(_process_control_tokens(ctx, iter(stream)))
+        state = sm.make_state()
+        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, s = sm.flush(state)
+        full = t1 + t2 + rest
+        self.assertEqual(full, "call1call2")
 
-        self.assertEqual("".join(t.text for t in out), "call1_bodycall2_body")
-        states = [t.state for t in out]
-        crossings = sum(
-            1 for a, b in zip(states, states[1:]) if a == "tool" and b == "normal"
+    def test_partial_match_buffered_then_flushed(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
         )
-        self.assertEqual(crossings, 2)
+        # First enter tool state
+        state = sm.make_state()
+        state, text, s = sm.step(state, "<tool_call>body</")
+        self.assertEqual(s, "tool")
+        # 'body' is emitted, '</' is buffered (partial match of '</tool_call>')
+        self.assertEqual(text, "body")
+        # flush releases the buffered text
+        state, rest, s = sm.flush(state)
+        self.assertEqual(rest, "</")
 
-    def test_multi_token_match_preserves_order(self):
-        r = self._r
-        match = (10, 11, 12)
-        stream = [
-            r("body", "tool"),
-            r("</", "tool"),
-            r("tool", "tool"),
-            r("_call>", "normal", match=match),
-            r(" ok", "normal"),
-        ]
-        ctx = types.SimpleNamespace(sequences={match: "</tool_call>"})
-        out = list(_process_control_tokens(ctx, iter(stream)))
-
-        self.assertEqual([t.text for t in out], ["body", "", "", "", " ok"])
-        self.assertEqual(
-            [t.state for t in out],
-            ["tool", "tool", "tool", "normal", "normal"],
+    def test_discard_drops_buffer(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
         )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello ST")
+        self.assertEqual(text, "hello ")
+        # discard drops the buffered 'ST'
+        state, s = sm.discard(state)
+        self.assertEqual(s, "normal")
+
+    def test_stop_words_stripped(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello STOP world")
+        state, rest, s = sm.flush(state)
+        self.assertEqual(text + rest, "hello  world")
+
+    def test_reasoning_to_tool_transition(self):
+        # A tool call started inside a reasoning block must enter "tool".
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning"), ("<tool>", "tool")],
+                "reasoning": [("</think>", "normal"), ("<tool>", "tool")],
+                "tool": [("</tool>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, _, s = sm.step(state, "<think>hmm")
+        self.assertEqual(s, "reasoning")
+        state, _, s = sm.step(state, "<tool>")
+        self.assertEqual(s, "tool")
+        state, _, s = sm.step(state, "</tool>")
+        self.assertEqual(s, "normal")
+
+    def test_empty_end_marker_stays_in_tool_on_discard(self):
+        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool";
+        # discard on stop must preserve the state so the tool call is flushed.
+        sm = TextStateMachine(
+            {
+                "normal": [("[TOOL_CALLS]", "tool")],
+                "tool": [],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "[TOOL_CALLS]f[ARGS]{}")
+        self.assertEqual(s, "tool")
+        self.assertEqual(text, "f[ARGS]{}")
+        state, s = sm.discard(state)
+        self.assertEqual(s, "tool")
 
 
 class TestServer(unittest.TestCase):
@@ -293,19 +327,26 @@ class TestServer(unittest.TestCase):
             def convert_ids_to_tokens(self, t):
                 return f"<eos{t}>"
 
-        sm, _ = self.response_generator._make_state_machine(
+            def encode(self, text, add_special_tokens=False):
+                return []
+
+        stop_matcher, text_sm = self.response_generator._make_state_machine(
             ("fake-empty-end", None, None),
             FakeTokenizer(),
             stop_words=[],
         )
-        state = sm.make_state()
-        state, _, s = sm.match(state, 100)
+
+        # Verify the text state machine strips tool call markers
+        text_state = text_sm.make_state()
+        text_state, clean_text, s = text_sm.step(text_state, "hello[TOOL_CALLS]body")
         self.assertEqual(s, "tool")
-        for tok in [42, 43, 44]:
-            state, _, s = sm.match(state, tok)
-            self.assertEqual(s, "tool")
-        state, _, s = sm.match(state, 2)
-        self.assertIsNone(s)
+        # 'hello' is before the match, 'body' flows through (no tool_call_end)
+        self.assertEqual(clean_text, "hellobody")
+
+        # Verify EOS stops via the stop matcher
+        stop_state = stop_matcher.make_state()
+        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
+        self.assertTrue(matched)
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
