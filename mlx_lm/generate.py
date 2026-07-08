@@ -675,9 +675,20 @@ def mtp_generate_step(
     ``predict_next_tokens(hidden_state, token_ids, cache)`` method (see
     ``mlx_lm.models.hy_v3``). Each step drafts one token with the MTP head and
     verifies it with a single forward pass of the target model, yielding up to
-    two tokens per target pass. Verification is greedy (argmax), so this path
-    ignores ``sampler``/``logits_processors`` and matches temperature-0 output.
+    two tokens per target pass.
+
+    Verification is distribution-preserving. The drafted token and the target's
+    own token are each drawn from their processed distributions (honoring
+    ``sampler`` and ``logits_processors``) and the draft is accepted only when it
+    matches the target's independent sample. Every emitted token is therefore a
+    sample from the target's processed distribution, so temperature / top-p /
+    top-k requests are respected exactly -- this is the same acceptance rule used
+    by :func:`speculative_generate_step`. With a temperature-0 sampler (argmax)
+    it reduces to greedy draft-equals-target matching.
     """
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    logits_processors = logits_processors or []
+
     y = prompt.astype(mx.uint32)
 
     if prompt_cache is None:
@@ -686,6 +697,18 @@ def mtp_generate_step(
     else:
         model_cache = prompt_cache[:-1]
         mtp_cache = prompt_cache[-1]
+
+    # Running token history, needed only when logits processors are present
+    # since they are functions of the whole sequence generated so far.
+    history = y if logits_processors else None
+
+    def _sample(logits):
+        # logits: [1, vocab] -> (token: [1] uint32, logprobs: [vocab])
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(history, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs).astype(mx.uint32), logprobs.squeeze(0)
 
     # Prefill the prompt chunk by chunk, leaving the last token for the
     # hidden-state pass below.
@@ -703,66 +726,66 @@ def mtp_generate_step(
         logits, h_N = model(
             last_token[None], cache=model_cache, return_hidden_states=True
         )
-        token_N1 = mx.argmax(logits[:, -1, :], axis=-1)
+        token, logprobs = _sample(logits[:, -1, :])
         h_N_last = h_N[:, -1:]
 
-    y = token_N1
-    mx.eval(y, h_N_last, [c.state for c in model_cache])
-    yield y.item(), None
+    y = token
+    mx.eval(y, logprobs, h_N_last, [c.state for c in model_cache])
+    yield y.item(), logprobs
+    if logits_processors:
+        history = mx.concatenate([history, y])
 
     ntoks = 1
     while max_tokens == -1 or ntoks < max_tokens:
         with mx.stream(generation_stream):
-            # 1. Draft one token with the MTP head.
-            token_N1_arr = y[..., None]
-            logits_mtp = model.predict_next_tokens(
-                h_N_last, token_N1_arr, cache=mtp_cache
-            )
-            draft_token = mx.argmax(logits_mtp[:, -1, :], axis=-1)
+            # 1. Draft one token with the MTP head, sampled from its processed
+            #    distribution.
+            y_arr = y[..., None]
+            logits_mtp = model.predict_next_tokens(h_N_last, y_arr, cache=mtp_cache)
+            draft_token, _ = _sample(logits_mtp[:, -1, :])
 
-            # 2. Verify the current + drafted token in a single target pass.
-            target_input = mx.concatenate(
-                [token_N1_arr, draft_token[..., None]], axis=-1
-            )
+            # 2. Verify the current + drafted token in a single target pass. The
+            #    target's own sample at the drafted position is what we emit, so
+            #    the target distribution is preserved regardless of the draft.
+            target_input = mx.concatenate([y_arr, draft_token[..., None]], axis=-1)
             logits_target, h_N_target = model(
                 target_input, cache=model_cache, return_hidden_states=True
             )
-            pred_token_N2 = mx.argmax(logits_target[:, 0, :], axis=-1)
-            token_N3 = mx.argmax(logits_target[:, 1, :], axis=-1)
-            mx.async_eval(draft_token, pred_token_N2, token_N3, h_N_target)
+            verify_token, verify_lp = _sample(logits_target[:, 0, :])
+            mx.async_eval(draft_token, verify_token, h_N_target)
 
-        mx.eval(draft_token, pred_token_N2, token_N3)
+        mx.eval(draft_token, verify_token)
 
-        if draft_token.item() == pred_token_N2.item():
-            # Draft accepted: emit two tokens for one target pass.
-            lp = logits_target[:, 0, :] - mx.logsumexp(
-                logits_target[:, 0, :], keepdims=True
-            )
-            yield draft_token.item(), lp.squeeze(0)
+        if draft_token.item() == verify_token.item():
+            # Accepted: the draft equals the target's own sample, so emit it and
+            # get a bonus token from the second verified position for free.
+            yield verify_token.item(), verify_lp
             ntoks += 1
+            if logits_processors:
+                history = mx.concatenate([history, verify_token])
             if max_tokens != -1 and ntoks >= max_tokens:
                 break
-            lp = logits_target[:, 1, :] - mx.logsumexp(
-                logits_target[:, 1, :], keepdims=True
-            )
-            yield token_N3.item(), lp.squeeze(0)
+            bonus_token, bonus_lp = _sample(logits_target[:, 1, :])
+            yield bonus_token.item(), bonus_lp
             ntoks += 1
-            y = token_N3
+            if logits_processors:
+                history = mx.concatenate([history, bonus_token])
+            y = bonus_token
             h_N_last = h_N_target[:, 1:]
         else:
-            # Draft rejected: emit the verified token and roll back the caches.
-            lp = logits_target[:, 0, :] - mx.logsumexp(
-                logits_target[:, 0, :], keepdims=True
-            )
-            yield pred_token_N2.item(), lp.squeeze(0)
+            # Rejected: emit the target's own sample and roll back the
+            # speculative position from both caches.
+            yield verify_token.item(), verify_lp
             ntoks += 1
+            if logits_processors:
+                history = mx.concatenate([history, verify_token])
             for c in model_cache:
                 c.trim(1)
             mtp_cache.trim(1)
-            y = pred_token_N2
+            y = verify_token
             h_N_last = h_N_target[:, 0:1]
 
-        mx.eval(h_N_last, [c.state for c in model_cache], mtp_cache.state)
+        mx.eval(y, h_N_last, [c.state for c in model_cache], mtp_cache.state)
 
 
 def stream_generate(
