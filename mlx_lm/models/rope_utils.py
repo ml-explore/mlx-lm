@@ -138,6 +138,7 @@ class YarnRoPE(nn.Module):
         beta_slow=1,
         mscale=1,
         mscale_all_dim=0,
+        attention_factor=None,
     ):
         super().__init__()
 
@@ -168,9 +169,15 @@ class YarnRoPE(nn.Module):
             )
             return mx.clip(linear_func, 0, 1)
 
-        self.mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
-            scaling_factor, mscale_all_dim
-        )
+        if attention_factor is not None:
+            # HF semantics: an explicit `attention_factor` in rope_scaling
+            # overrides the computed YaRN attention scaling (e.g. 1.0 disables
+            # it). Without this, models that set the field get the wrong mscale.
+            self.mscale = attention_factor
+        else:
+            self.mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
+                scaling_factor, mscale_all_dim
+            )
         freq_extra = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
         freq_inter = scaling_factor * freq_extra
         low, high = yarn_find_correction_range()
@@ -268,6 +275,7 @@ def initialize_rope(
                 "beta_slow",
                 "mscale",
                 "mscale_all_dim",
+                "attention_factor",
             ]
             if key in scaling_config
         }

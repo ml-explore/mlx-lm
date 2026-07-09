@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import math
 import unittest
 
 import mlx.core as mx
@@ -302,6 +303,33 @@ class TestModels(unittest.TestCase):
         rope(x)
         mx.eval(x)
         self.assertTrue((x == 1).all())
+
+    def test_yarn_rope_attention_factor(self):
+        # Default: mscale is the computed YaRN attention scaling.
+        default = rope_utils.YarnRoPE(dims=8, scaling_factor=16.0)
+        expected = 0.1 * math.log(16.0) + 1.0  # yarn_get_mscale(16, 1) / (…, 0)
+        self.assertAlmostEqual(default.mscale, expected, places=6)
+        self.assertNotAlmostEqual(default.mscale, 1.0, places=3)
+
+        # Explicit attention_factor overrides the computed mscale (HF semantics).
+        overridden = rope_utils.YarnRoPE(
+            dims=8, scaling_factor=16.0, attention_factor=1.0
+        )
+        self.assertEqual(overridden.mscale, 1.0)
+
+        # And it plumbs through initialize_rope from rope_scaling config.
+        rope = rope_utils.initialize_rope(
+            8,
+            base=100,
+            traditional=False,
+            scaling_config={
+                "rope_type": "yarn",
+                "factor": 16.0,
+                "attention_factor": 0.75,
+            },
+        )
+        self.assertIsInstance(rope, rope_utils.YarnRoPE)
+        self.assertEqual(rope.mscale, 0.75)
 
     def test_quantized_sdpa(self):
         cache = KVCache()
