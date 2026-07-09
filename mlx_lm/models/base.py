@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -61,6 +62,26 @@ def create_ssm_mask(h, cache=None):
     return None
 
 
+# Above this many query rows, dequantize K/V and use the fused flash kernel
+# instead of the decomposed qmm->softmax->qmm path. The decomposed path
+# materializes an (n_heads, L, S) scores matrix to memory, which loses to
+# flash attention once L is large (prefill chunks); below the threshold the
+# decomposed path wins because it reads the smaller quantized K/V bytes and
+# skips the full dequant. Measured crossovers on M5 Max (S=2k..32k, bits 4/8
+# identical): L=128 for GQA (n_repeats>=2), L=192 for MHA (n_repeats==1) where
+# the fp16 K/V dequant transient is proportionally larger. These are
+# M5-measured defaults, not universal constants; MLX_LM_QSDPA_FLASH_MIN_L
+# overrides both (0 or negative disables the flash route entirely).
+_QSDPA_ENV = os.environ.get("MLX_LM_QSDPA_FLASH_MIN_L")
+if _QSDPA_ENV is not None and int(_QSDPA_ENV) <= 0:
+    _QUANT_SDPA_FLASH_MIN_L_GQA = _QUANT_SDPA_FLASH_MIN_L_MHA = float("inf")
+elif _QSDPA_ENV is not None:
+    _QUANT_SDPA_FLASH_MIN_L_GQA = _QUANT_SDPA_FLASH_MIN_L_MHA = int(_QSDPA_ENV)
+else:
+    _QUANT_SDPA_FLASH_MIN_L_GQA = 128
+    _QUANT_SDPA_FLASH_MIN_L_MHA = 192
+
+
 def quantized_scaled_dot_product_attention(
     queries: mx.array,
     q_keys: tuple[mx.array, mx.array, mx.array],
@@ -73,6 +94,22 @@ def quantized_scaled_dot_product_attention(
     B, n_q_heads, L, D = queries.shape
     n_kv_heads = q_keys[0].shape[-3]
     n_repeats = n_q_heads // n_kv_heads
+
+    flash_min_l = (
+        _QUANT_SDPA_FLASH_MIN_L_MHA
+        if n_repeats == 1
+        else _QUANT_SDPA_FLASH_MIN_L_GQA
+    )
+    if L >= flash_min_l:
+        # Large-L (prefill-shaped) case: the transient fp16 K/V costs
+        # S * n_kv_heads * D * 4 bytes but avoids the O(L*S) scores
+        # round-trip; measured 1.3-2.5x faster than the decomposed path
+        # beyond the crossover on all repeat/bits combinations.
+        keys = mx.dequantize(*q_keys, group_size=group_size, bits=bits)
+        values = mx.dequantize(*q_values, group_size=group_size, bits=bits)
+        return mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=mask
+        )
 
     queries *= scale
 
