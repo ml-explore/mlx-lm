@@ -391,6 +391,14 @@ def main():
         if "quantization" not in config:
             raise ValueError("Quantized model must already be quantized.")
     else:
+        if "quantization" in config:
+            raise ValueError(
+                "--model is already quantized, so quantizing it again to make "
+                "the student is a no-op and DWQ would have (almost) nothing to "
+                "train. Pass the student explicitly via --quantized-model "
+                "(e.g. a lower-bit quantization of the same base model), or "
+                "use the unquantized base model as --model."
+            )
         q_model = copy.deepcopy(model)
         _, config = quantize_model(
             q_model,
