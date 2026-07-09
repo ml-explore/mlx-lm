@@ -536,6 +536,22 @@ class Model(nn.Module):
     def model(self):
         return self.language_model.model
 
+    # Expose the MTP (nextn) self-speculation interface through the wrapper so
+    # self_mtp_generate_step works on the top-level model (the head lives on the
+    # inner language_model / TextModel, e.g. qwen3_5_moe's language_model.mtp).
+    @property
+    def mtp(self):
+        return self.language_model.mtp
+
+    def logits(self, hidden: mx.array) -> mx.array:
+        return self.language_model.logits(hidden)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    def mtp_step(self, hidden, tokens, mtp_cache):
+        return self.language_model.mtp_step(hidden, tokens, mtp_cache)
+
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
