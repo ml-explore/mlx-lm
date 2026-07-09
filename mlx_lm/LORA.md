@@ -77,6 +77,60 @@ mistralai/Mistral-7B-v0.1`.
 If `--model` points to a quantized model, then the training will use QLoRA,
 otherwise it will use regular LoRA.
 
+#### Qwen3 example on Apple Silicon
+
+The following example shows a minimal QLoRA training command for `Qwen/Qwen3-8B-MLX-4bit` on Apple Silicon.
+
+This is intended as a starting point. Iterations, batch size, and adapter settings should be adjusted for the dataset and available hardware.
+
+```shell
+mlx_lm.lora \
+    --model Qwen/Qwen3-8B-MLX-4bit \
+    --train \
+    --data data \
+    --adapter-path adapters/qwen3-8b-lora \
+    --iters 500 \
+    --batch-size 1 \
+    --num-layers 8 \
+    --grad-checkpoint \
+    --mask-prompt
+```
+
+The `data` directory should contain the standard local dataset files:
+
+```text
+data/
+  train.jsonl
+  valid.jsonl
+  test.jsonl
+```
+
+For example, a chat-style `train.jsonl` row can look like:
+
+```jsonl
+{"messages": [{"role": "user", "content": "Explain DNS resolution."}, {"role": "assistant", "content": "DNS resolution maps a human-readable domain name to an IP address."}]}
+```
+
+After training, generate with the adapter:
+
+```shell
+mlx_lm.generate \
+    --model Qwen/Qwen3-8B-MLX-4bit \
+    --adapter-path adapters/qwen3-8b-lora \
+    --max-tokens 300 \
+    --temp 0.2 \
+    --top-p 0.8 \
+    --chat-template-config '{"enable_thinking": false}' \
+    --prompt "Explain DNS resolution."
+```
+
+For Qwen3 models, disabling thinking mode can be useful when a shorter direct answer is preferred:
+
+```shell
+--chat-template-config '{"enable_thinking": false}'
+```
+
+
 By default, the adapter config and learned weights are saved in `adapters/`.
 You can specify the output location with `--adapter-path`.
 
