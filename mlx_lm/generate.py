@@ -867,11 +867,8 @@ def prompt_lookup_generate_step(
             if prop:
                 stats.retrieval_cycles += 1
                 stats.retrieval_proposed += len(prop)
-                stats.retrieval_accepted += n_acc
-                stats.bonus_tokens += 1
             else:
                 stats.plain_cycles += 1
-                stats.plain_tokens += 1
 
             if prop and n_acc < len(prop):
                 _pld_rewind(prompt_cache, snaps)
@@ -880,6 +877,16 @@ def prompt_lookup_generate_step(
                 pending = [emit[-1][0]]
 
             for tok, row, from_draft in emit:
+                # Count delivered tokens at the yield boundary. The caller may
+                # stop on EOS in the middle of an accepted verify batch; eager
+                # accounting would then overstate retrieval/output telemetry.
+                if prop:
+                    if from_draft:
+                        stats.retrieval_accepted += 1
+                    else:
+                        stats.bonus_tokens += 1
+                else:
+                    stats.plain_tokens += 1
                 seq.append(tok)
                 history_seq.append(tok)
                 proposer.observe(tok)

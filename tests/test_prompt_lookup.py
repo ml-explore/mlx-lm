@@ -217,5 +217,87 @@ class TestPromptLookupGenerate(unittest.TestCase):
         self.assertEqual(_pld_offset(cache[0]), prompt.size + len(out))
 
 
+
+
+class _LifecycleCache:
+    def __init__(self, fail_start=False):
+        self.offset = 0
+        self.speculating = False
+        self.fail_start = fail_start
+        self.start_offsets = []
+        self.stop_calls = 0
+
+    @property
+    def state(self):
+        return []
+
+    def start_speculation(self, rollback_window=None):
+        self.start_offsets.append(self.offset)
+        self.speculating = True
+        if self.fail_start:
+            raise RuntimeError("start failed")
+
+    def stop_speculation(self):
+        self.stop_calls += 1
+        self.speculating = False
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        self.offset -= n
+        return n
+
+
+class _LifecycleModel:
+    def __init__(self, fail_calls=()):
+        self.calls = []
+        self.input_lengths = []
+        self.fail_calls = set(fail_calls)
+
+    def __call__(self, x, cache=None):
+        call_number = len(self.calls) + 1
+        self.calls.append(cache[0].speculating)
+        self.input_lengths.append(x.shape[-1])
+        if call_number in self.fail_calls:
+            raise RuntimeError(f"model call {call_number} failed")
+        cache[0].offset += x.shape[-1]
+        return mx.zeros((x.shape[0], x.shape[1], 8))
+
+
+class TestYieldBoundaryAccounting(unittest.TestCase):
+    def test_early_close_counts_only_yielded_tokens(self):
+        class AcceptAllProposer:
+            def observe(self, token):
+                pass
+
+            def propose(self, seq, max_span, prompt_len):
+                return [0] * max_span
+
+        from mlx_lm.prompt_lookup import PromptLookupStats
+
+        cache = _LifecycleCache()
+        stats = PromptLookupStats()
+        generator = prompt_lookup_generate_step(
+            mx.array([1]),
+            _LifecycleModel(),
+            prompt_cache=[cache],
+            max_tokens=16,
+            num_draft=8,
+            backend=AcceptAllProposer(),
+            stats=stats,
+        )
+        token, _logprobs, from_draft = next(generator)
+        self.assertEqual(token, 0)
+        self.assertTrue(from_draft)
+        generator.close()
+
+        self.assertEqual(stats.retrieval_proposed, 8)
+        self.assertEqual(stats.retrieval_accepted, 1)
+        self.assertEqual(stats.bonus_tokens, 0)
+        self.assertEqual(stats.total_emitted, 1)
+        self.assertEqual(cache.offset, 2)  # one prompt + one delivered token
+
+
 if __name__ == "__main__":
     unittest.main()
