@@ -310,60 +310,6 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
-    def sanitize(self, weights):
-        # Already converted (e.g. re-loading an mlx-quantized checkpoint).
-        if not any(k.endswith(".weight_packed") for k in weights):
-            return weights
-
-        weights, dequantized = _dequantize_compressed_tensors(weights)
-
-        # Stack per-expert weights into the SwitchGLU layout.
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}.mlp"
-            if f"{prefix}.experts.0.gate_proj.weight" not in weights:
-                continue
-            for name in ("gate_proj", "down_proj", "up_proj"):
-                to_join = [
-                    weights.pop(f"{prefix}.experts.{e}.{name}.weight")
-                    for e in range(self.args.num_experts)
-                ]
-                stacked = f"{prefix}.switch_mlp.{name}.weight"
-                weights[stacked] = mx.stack(to_join)
-                dequantized.add(stacked)
-                for e in range(self.args.num_experts):
-                    dequantized.discard(f"{prefix}.experts.{e}.{name}.weight")
-            # The router gate is stored as ``mlp.gate.weight``; the auxiliary
-            # bias lives under ``mlp.experts.e_score_correction_bias``.
-            bias_key = f"{prefix}.experts.e_score_correction_bias"
-            if bias_key in weights:
-                weights[f"{prefix}.gate.e_score_correction_bias"] = weights.pop(
-                    bias_key
-                )
-
-        # Re-quantize the dequantized MLP / expert projections to MLX's native
-        # nvfp4 (group size 16, 4 bits). This keeps the MoE memory footprint
-        # close to the original checkpoint while matching the quantized layers
-        # built during model loading. ``mx.quantize`` operates on the last axis,
-        # so it handles both 2D (dense / shared) and 3D (stacked experts)
-        # weights uniformly. Each tensor is evaluated eagerly so the transient
-        # bfloat16 dequantization is freed before processing the next one.
-        for k in dequantized:
-            w, scales = mx.quantize(weights[k], 16, 4, mode="nvfp4")
-            weights[k] = w
-            weights[k.replace(".weight", ".scales")] = scales
-            mx.eval(w, scales)
-
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-
-        # Drop KV-cache quantization scales (unused by this implementation).
-        weights = {
-            k: v
-            for k, v in weights.items()
-            if not (k.endswith(".k_scale") or k.endswith(".v_scale"))
-        }
-        return weights
-
     @property
     def layers(self):
         return self.model.layers
@@ -378,47 +324,3 @@ class Model(nn.Module):
             for layer in self.layers
         ]
 
-
-def _dequantize_compressed_tensors(weights):
-    """Dequantize compressed-tensors NVFP4 weights to bfloat16.
-
-    The checkpoint stores each quantized ``Linear`` as a triple of
-    ``weight_packed`` (uint8, two fp4 codes per byte), ``weight_scale``
-    (fp8-e4m3 per-group scale, group size 16) and a per-tensor float32
-    ``weight_global_scale``. NVFP4 uses a two-level scale: the true group
-    scale is ``weight_scale / weight_global_scale``.
-
-    Returns the updated weights dict and the set of keys that were
-    dequantized (so callers can re-quantize them to MLX's native nvfp4).
-    """
-    packed_keys = [k for k in weights if k.endswith(".weight_packed")]
-    dequantized = set()
-    if not packed_keys:
-        return weights, dequantized
-
-    new_weights = dict(weights)
-    # Unit fp8 scales (all ones) let ``mx.dequantize`` recover the raw fp4 codes.
-    unit_cache: Dict[Any, mx.array] = {}
-
-    for pk in packed_keys:
-        base = pk[: -len(".weight_packed")]
-        packed = new_weights.pop(pk)
-        scale = new_weights.pop(base + ".weight_scale")
-        global_scale = new_weights.pop(base + ".weight_global_scale")
-        new_weights.pop(base + ".input_global_scale", None)
-
-        codes = packed.view(mx.uint32)
-        n_groups = scale.shape[-1]
-        shape = scale.shape
-        if shape not in unit_cache:
-            unit_cache[shape] = mx.to_fp8(mx.ones(shape, dtype=mx.bfloat16))
-        unit = unit_cache[shape]
-
-        fp4 = mx.dequantize(codes, unit, group_size=16, bits=4, mode="nvfp4")
-        group_scale = mx.from_fp8(scale, dtype=mx.float32) / global_scale
-        out = fp4.shape[0]
-        w = (fp4.reshape(out, n_groups, 16) * group_scale[:, :, None]).reshape(out, -1)
-        new_weights[base + ".weight"] = w.astype(mx.bfloat16)
-        dequantized.add(base + ".weight")
-
-    return new_weights, dequantized
