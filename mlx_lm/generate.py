@@ -38,6 +38,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
+from .prompt_lookup import NgramProposer, PromptLookupStats, make_proposer
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
@@ -652,6 +653,295 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
     finally:
         _rewind_cache(num_draft, n)
+
+
+def _pld_snapshot(caches):
+    """Pre-forward cache snapshot so a rejected multi-token proposal can be undone.
+
+    - KVCache (and any cache exposing ``offset``/``trim``, e.g.
+      QuantizedKVCache): recorded by offset and undone with trim().
+    - RotatingKVCache: snapshotted by COPYING its (small, <=window) buffers even
+      when is_trimmable() is True at snapshot time. trim() only adjusts offset/_idx
+      (it does NOT shrink the key buffer), so if the upcoming multi-token forward
+      pushes the cache past the window, a later trim()-rewind desyncs the buffer
+      from the mask and crashes attention (mask K-len != cached K-len). Copying is
+      always correct.
+    - CacheList: recursed element-wise.
+    Recurrent caches (ArraysCache / SSM) cannot be rewound to an arbitrary
+    earlier token, so they are unsupported and raise. Any other cache type also
+    raises rather than risk a silently-wrong rewind."""
+
+    def snap_one(c):
+        if isinstance(c, CacheList):
+            return ("list", [snap_one(sub) for sub in c.caches])
+        if isinstance(c, ArraysCache):
+            raise NotImplementedError(
+                "prompt-lookup decoding does not support recurrent "
+                "(ArraysCache / SSM) caches: their state cannot be rewound to "
+                "an earlier token after a rejected proposal."
+            )
+        if isinstance(c, RotatingKVCache):
+            k = None if c.keys is None else mx.array(c.keys)
+            v = None if c.values is None else mx.array(c.values)
+            return ("restore", k, v, c.offset, getattr(c, "_idx", None))
+        if isinstance(c, KVCache):
+            return ("trim", c.offset)
+        if hasattr(c, "offset") and hasattr(c, "trim"):
+            return ("trim", c.offset)
+        raise NotImplementedError(
+            f"prompt-lookup decoding does not support cache type "
+            f"'{type(c).__name__}'. Supported: KVCache, RotatingKVCache, "
+            "caches exposing offset/trim, and CacheList of those."
+        )
+
+    return [snap_one(c) for c in caches]
+
+
+def _pld_rewind(caches, snaps):
+    def rewind_one(c, s):
+        if s[0] == "list":
+            for sub, subsnap in zip(c.caches, s[1]):
+                rewind_one(sub, subsnap)
+        elif s[0] == "trim":
+            c.trim(c.offset - s[1])
+        else:
+            _, k, v, off, idx = s
+            c.keys, c.values, c.offset = k, v, off
+            if idx is not None:
+                c._idx = idx
+
+    for c, s in zip(caches, snaps):
+        rewind_one(c, s)
+
+
+def _pld_offset(c):
+    """Logical token offset of a possibly-nested cache leaf. A per-layer
+    ``CacheList`` has no offset of its own; its sub-caches advance together, so
+    descend to the first offset-bearing sub-cache."""
+    if isinstance(c, (list, tuple)):
+        for item in c:
+            try:
+                return _pld_offset(item)
+            except AttributeError:
+                continue
+        raise AttributeError("no offset-bearing cache leaf found")
+    while isinstance(c, CacheList):
+        c = next((s for s in c.caches if hasattr(s, "offset")), c.caches[0])
+    return c.offset
+
+
+def prompt_lookup_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    backend: Any = "ngram",
+    num_draft: int = 8,
+    ngram_max: int = 3,
+    ngram_min: int = 1,
+    prompt_only: bool = False,
+    adaptive: bool = False,
+    warmup: int = 48,
+    gate: float = 0.12,
+    stats: Optional[Any] = None,
+    history_prompt: Optional[mx.array] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Draft-free (prompt-lookup) speculative decoding.
+
+    A pluggable proposer suggests a continuation of the running sequence and the
+    target verifies it in one batched forward. ``backend`` selects the proposer:
+    ``"ngram"`` (tail n-gram lookup) or ``"suffix_automaton"`` (longest repeated
+    suffix — stronger retrieval), or pass a proposer object with
+    ``observe(token)`` / ``propose(seq, max_span, prompt_len)``.
+
+    Lossless under the given ``sampler``: at each proposed position the target
+    distribution is sampled and the proposal is accepted iff it equals that
+    sample (speculative-sampling acceptance for a deterministic drafter), so the
+    output distribution matches the target's own (batched) greedy/sampled decode.
+    On a partial reject the cache is rewound (handling trimmable and rotating/
+    windowed caches). The prompt_cache is left representing exactly prompt+emitted
+    at every stop boundary.
+
+    ``adaptive`` enables a one-way never-lose latch: after ``warmup`` tokens, if
+    the accepted-proposal fraction is below ``gate`` (i.e. the work isn't
+    copy-heavy), it latches once to a plain ``generate_step`` tail — zero
+    regression on non-copy output; copy-heavy work never latches. ``stats``
+    (a PromptLookupStats) is filled in place. Yields ``(token, logprobs,
+    from_draft)``.
+
+    ``history_prompt`` may be the full prompt when ``prompt`` is only an
+    uncached tail backed by a prefilled ``prompt_cache``. Retrieval proposals use
+    the full history, while target verification forwards only the uncached tail.
+    """
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(model)
+    # Validate cache types up front so unsupported models (e.g. ArraysCache/SSM)
+    # fail loud immediately, and record the base offset so a non-empty (reused)
+    # cache's existing prefix is preserved by the end-of-run reconciliation.
+    _pld_snapshot(prompt_cache)
+    base_offset = _pld_offset(prompt_cache)
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+    stats = stats if stats is not None else PromptLookupStats()
+
+    seq = prompt.tolist() if isinstance(prompt, mx.array) else list(prompt)
+    history_seq = (
+        history_prompt.tolist()
+        if isinstance(history_prompt, mx.array)
+        else list(history_prompt) if history_prompt is not None else list(seq)
+    )
+    if not seq:
+        raise ValueError("prompt-lookup decoding requires a non-empty prompt tail")
+    if len(history_seq) < len(seq) or history_seq[-len(seq) :] != seq:
+        raise ValueError("history_prompt must end with the uncached prompt tail")
+    prompt_len = len(seq)
+    history_prompt_len = len(history_seq)
+
+    if backend == "ngram":
+        proposer = NgramProposer(ngram_max, ngram_min, prompt_only)
+    else:
+        proposer = make_proposer(backend)  # empty; the observe loop below is the
+    for t in history_seq:  # single seeding authority (avoids a
+        proposer.observe(t)  # double-seed that desyncs SAM coords)
+
+    # Prefill everything but the last token.
+    with mx.stream(generation_stream):
+        head = seq[:-1]
+        processed = 0
+        prompt_progress_callback(0, prompt_len)
+        while processed < len(head):
+            chunk = head[processed : processed + prefill_step_size]
+            model(mx.array(chunk)[None], cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            processed += len(chunk)
+            prompt_progress_callback(processed, prompt_len)
+            mx.clear_cache()
+        prompt_progress_callback(prompt_len, prompt_len)
+
+    pending = [seq[-1]]
+    generated = 0
+    retrieved = 0  # tokens emitted from accepted proposals
+    latched = False
+    prompt_len = len(seq)
+    last_snap = None  # snapshot before the most recent proposal forward
+    try:
+        while (max_tokens < 0 or generated < max_tokens) and not latched:
+            stats.cycles += 1
+            # Clamp the proposal to the remaining budget so a cycle never forwards
+            # (and commits) more tokens than it will yield -> the cache stays
+            # consistent with the yielded prefix at the max_tokens boundary.
+            span = num_draft
+            if max_tokens >= 0:
+                span = min(num_draft, max(max_tokens - generated - 1, 0))
+            prop = (
+                proposer.propose(history_seq, span, history_prompt_len)
+                if (span > 0 and len(pending) <= 2)
+                else []
+            )
+            x = pending + prop
+            snaps = _pld_snapshot(prompt_cache) if prop else None
+            if snaps is not None:
+                last_snap = snaps
+
+            with mx.stream(generation_stream):
+                logits = model(mx.array(x)[None], cache=prompt_cache)[0]
+                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                mx.eval(logprobs)
+
+            base = len(pending) - 1
+            emit = []  # (token, logprobs_row, from_draft)
+            for j in range(len(prop) + 1):
+                row = logprobs[base + j]
+                s = int(sampler(row[None])[0].item())
+                if j < len(prop) and prop[j] == s:
+                    emit.append((prop[j], row, True))
+                else:
+                    emit.append((s, row, False))
+                    break
+            n_acc = len(emit) - 1
+
+            if prop:
+                stats.retrieval_cycles += 1
+                stats.retrieval_proposed += len(prop)
+                stats.retrieval_accepted += n_acc
+                stats.bonus_tokens += 1
+            else:
+                stats.plain_cycles += 1
+                stats.plain_tokens += 1
+
+            if prop and n_acc < len(prop):
+                _pld_rewind(prompt_cache, snaps)
+                pending = pending + [t for t, _, _ in emit]
+            else:
+                pending = [emit[-1][0]]
+
+            for tok, row, from_draft in emit:
+                seq.append(tok)
+                history_seq.append(tok)
+                proposer.observe(tok)
+                generated += 1
+                if from_draft:
+                    retrieved += 1
+                yield tok, row, from_draft
+                if max_tokens >= 0 and generated >= max_tokens:
+                    return
+
+            # One-way never-lose latch: once we have enough evidence the work
+            # isn't copy-heavy, switch to a plain generate_step tail (bit-exact,
+            # no per-cycle proposal overhead) for all remaining tokens.
+            if adaptive and generated >= warmup and retrieved / generated < gate:
+                latched = True
+
+        if latched and (max_tokens < 0 or generated < max_tokens):
+            stats.latched = True
+            remaining = -1 if max_tokens < 0 else (max_tokens - generated)
+            for tok, lp in generate_step(
+                mx.array(pending),
+                model,
+                max_tokens=remaining,
+                sampler=sampler,
+                prompt_cache=prompt_cache,
+                prefill_step_size=prefill_step_size,
+            ):
+                seq.append(int(tok))
+                generated += 1
+                stats.plain_tokens += 1
+                yield int(tok), lp, False
+    finally:
+        # Leave prompt_cache representing EXACTLY prompt + emitted tokens (like
+        # generate_step), even though PLD forwards in batches and may stop mid-batch
+        # (e.g. caller breaks on EOS). This keeps callers that persist/reuse the
+        # cache (e.g. an LRU prompt cache) correct.
+        #   behind -> forward the missing emitted tail.
+        #   ahead  -> the extra tokens came from the last proposal forward, so undo
+        #     it via that snapshot (a copy-restore that is safe for rotating caches,
+        #     unlike trim past the window) and forward the emitted tail instead.
+        # Offsets are absolute (include any reused-cache base); seq is local
+        # (prompt+emitted), so index the missing tail by (off - base_offset).
+        target = base_offset + prompt_len + generated
+        off = _pld_offset(prompt_cache)
+        if off > target and last_snap is not None:
+            _pld_rewind(prompt_cache, last_snap)
+            off = _pld_offset(prompt_cache)
+        if off < target:
+            miss = seq[off - base_offset : prompt_len + generated]
+            if miss:
+                with mx.stream(generation_stream):
+                    model(mx.array(miss)[None], cache=prompt_cache)
+                    mx.eval([c.state for c in prompt_cache])
+        elif off > target:
+            # Unreachable by construction: any over-advance comes from the last
+            # proposal forward, which the snapshot rewind above undoes. Raise
+            # rather than attempt a partial per-layer trim that could silently
+            # desynchronize mixed cache types.
+            raise RuntimeError(
+                "prompt-lookup decoding: cache advanced past the emitted "
+                f"sequence ({off} > {target}) and could not be rewound"
+            )
 
 
 def stream_generate(
