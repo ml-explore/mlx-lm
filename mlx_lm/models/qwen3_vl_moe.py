@@ -39,12 +39,20 @@ class Model(nn.Module):
     def sanitize(self, weights):
         weights = tree_unflatten(list(weights.items()))
         weights.pop("visual", None)
+        # HF ForConditionalGeneration nests the language model under
+        # ``model.language_model.*`` and vision under ``model.visual.*``.
+        nested = weights.pop("model", None)
+        if isinstance(nested, dict):
+            if isinstance(nested.get("language_model"), dict):
+                weights["language_model"] = nested["language_model"]
+
+        language_model = weights["language_model"]
         weights = dict(
             tree_flatten(
                 {
                     "language_model": {
-                        "model": weights["language_model"]["model"],
-                        "lm_head": weights["language_model"]["lm_head"],
+                        "model": language_model["model"],
+                        "lm_head": language_model["lm_head"],
                     }
                 }
             )
