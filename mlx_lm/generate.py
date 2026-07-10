@@ -19,6 +19,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
+from .batch_admission import AdmissionState, LinearStateCost, StateBudget
 from .models import cache
 from .models.cache import (
     ArraysCache,
@@ -1591,6 +1592,7 @@ class BatchGenerator:
         max_kv_size: Optional[int] = None,
         kv_budget_bytes: Optional[int] = None,
         kv_cost: Optional[Tuple[float, float]] = None,
+        state_budget: Optional[StateBudget] = None,
         stream=None,
     ):
         self.model = model
@@ -1602,6 +1604,12 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        if state_budget is not None and (
+            kv_budget_bytes is not None or kv_cost is not None
+        ):
+            raise ValueError(
+                "state_budget cannot be combined with kv_budget_bytes/kv_cost"
+            )
         if kv_budget_bytes is not None:
             if kv_cost is None:
                 raise ValueError(
@@ -1619,6 +1627,12 @@ class BatchGenerator:
                 raise ValueError("kv_budget_bytes must be positive and kv_cost >= 0")
         self.kv_budget_bytes = kv_budget_bytes
         self.kv_cost = kv_cost
+        self.state_budget = state_budget
+        if kv_budget_bytes is not None:
+            self.state_budget = StateBudget(
+                kv_budget_bytes,
+                LinearStateCost(fixed, per_token, max_units=max_kv_size),
+            )
 
         self._stream = stream or generation_stream
 
@@ -1852,6 +1866,7 @@ class BatchGenerator:
                     0,
                     sum(len(s) for s in sequence[1]),
                     sum(c.nbytes for c in sequence[3]) == 0,
+                    len(sequence[4]) if sequence[4] else 0,
                 ]
             )
 
@@ -1885,9 +1900,17 @@ class BatchGenerator:
         its pre-supplied cache already holds (continued generation), so
         existing bytes are never double counted.
         """
-        if self.kv_budget_bytes is None or n <= 0:
+        if self.state_budget is None or n <= 0:
             return n
-        fixed, per_token = self.kv_cost
+        if (
+            self.kv_budget_bytes is not None
+            and self.state_budget.budget_bytes != self.kv_budget_bytes
+        ):
+            # Preserve the experimental F3 attribute's mutability for callers
+            # while routing its implementation through the generic policy.
+            if not math.isfinite(self.kv_budget_bytes) or self.kv_budget_bytes <= 0:
+                raise ValueError("kv_budget_bytes must be finite and positive")
+            self.state_budget.budget_bytes = self.kv_budget_bytes
 
         committed = self.prompt_cache_nbytes
 
@@ -1896,24 +1919,46 @@ class BatchGenerator:
         for i in range(len(gb)):
             current = len(gb.tokens[i])
             final = current + max(gb.max_tokens[i] - gb._num_tokens[i], 0)
-            growth = self._capped_tokens(final) - min(
-                current, self._capped_tokens(final)
+            resident = self.state_budget.projected_bytes(
+                AdmissionState(
+                    gb.uids[i], current, current, metadata={"phase": "generation"}
+                )
             )
-            committed += per_token * max(growth, 0)
+            committed += self.state_budget.remaining_bytes(
+                AdmissionState(
+                    gb.uids[i],
+                    final,
+                    current,
+                    resident,
+                    {"phase": "generation"},
+                )
+            )
 
         # Remaining growth of rows currently prefilling
         for i, seq in enumerate(self._currently_processing):
             processed = seq[1]
-            final = seq[2] + self._prompt_batch.max_tokens[i]
-            growth = self._capped_tokens(final) - min(
-                processed, self._capped_tokens(final)
+            history = seq[4] if len(seq) > 4 else 0
+            current = history + processed
+            final = history + seq[2] + self._prompt_batch.max_tokens[i]
+            current_state = AdmissionState(
+                self._prompt_batch.uids[i],
+                current,
+                current,
+                metadata={"phase": "prefill"},
             )
-            committed += per_token * max(growth, 0)
+            current_bytes = self.state_budget.projected_bytes(current_state)
             if processed == 0 and (len(seq) < 4 or seq[3]):
-                # Fixed state materializes on the first forward pass —
-                # unless the row entered with a pre-supplied cache whose
-                # fixed state is already in the live byte total.
-                committed += fixed
+                # No state has materialized for a new row yet.
+                current_bytes = 0
+            committed += self.state_budget.remaining_bytes(
+                AdmissionState(
+                    self._prompt_batch.uids[i],
+                    final,
+                    current,
+                    current_bytes,
+                    {"phase": "prefill"},
+                )
+            )
 
         admitted = 0
         for j in range(n):
@@ -1927,8 +1972,15 @@ class BatchGenerator:
                 # the live bytes are still counted in committed).
                 existing = 0
             total = history + new_tokens + seq[2]
-            need = max(fixed + per_token * self._capped_tokens(total) - existing, 0)
-            if committed + need > self.kv_budget_bytes:
+            state = AdmissionState(
+                seq[0],
+                total,
+                history,
+                existing,
+                {"phase": "queued", "prompt_units": new_tokens},
+            )
+            need = self.state_budget.remaining_bytes(state)
+            if committed + need > self.state_budget.budget_bytes:
                 # Liveness contract: a request whose projection alone
                 # exceeds the budget is admitted when nothing else is
                 # running, mirroring count-cap semantics where a single
@@ -1940,13 +1992,13 @@ class BatchGenerator:
                     and len(self._prompt_batch) == 0
                 ):
                     logging.warning(
-                        "Request %s projects above kv_budget_bytes "
+                        "Request %s projects above the state budget "
                         "(%d needed, %d budget) but nothing is running; "
                         "admitting it anyway (best effort, not a guarantee "
                         "against out-of-memory)",
                         seq[0],
                         int(committed + need),
-                        int(self.kv_budget_bytes),
+                        int(self.state_budget.budget_bytes),
                     )
                     admitted = 1
                 break

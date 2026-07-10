@@ -6,6 +6,7 @@ from typing import List
 
 import mlx.core as mx
 
+from mlx_lm.batch_admission import StateBudget
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
@@ -476,6 +477,28 @@ class TestGenerate(unittest.TestCase):
         self.assertIsNone(gen.kv_budget_bytes)
         # _budget_admissible must be the identity when budgeting is off
         self.assertEqual(gen._budget_admissible(5), 5)
+
+    def test_state_budget_accepts_nonlinear_model_family_policy(self):
+        """BatchGenerator can use a non-token-linear peak-state projector."""
+
+        def quadratic_prefill_state(state):
+            return 100 * state.projected_units**2
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            state_budget=StateBudget(6_000, quadratic_prefill_state),
+        )
+        gen.insert([list(range(2)), list(range(8))])
+        self.assertEqual(gen._budget_admissible(2), 1)
+
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
+                kv_budget_bytes=1_000,
+                kv_cost=(0, 1),
+                state_budget=StateBudget(1_000, quadratic_prefill_state),
+            )
 
     def test_kv_budget_requires_kv_cost(self):
         with self.assertRaises(ValueError):
