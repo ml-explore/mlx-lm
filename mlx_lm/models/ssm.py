@@ -160,7 +160,8 @@ def ssm_attn(
     dt_fn = compute_dt if promote_dt else compute_dt_native
     dt = dt_fn(dt, dt_bias, time_step_limit)
     repeats = h // g
-    A = -mx.exp(A_log).astype(dt.dtype)
+    A_dtype = dt.dtype if promote_dt else A_log.dtype
+    A = -mx.exp(A_log).astype(A_dtype)
     dtA = dt * A.reshape(1, 1, -1)
     dtx = dt.reshape(b, l, h, 1) * x
 

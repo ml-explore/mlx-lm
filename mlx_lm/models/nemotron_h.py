@@ -73,10 +73,13 @@ class ModelArgs(BaseModelArgs):
 
     def __post_init__(self):
         if self.time_step_limit is None:
-            self.time_step_limit = (
-                self.time_step_min if self.time_step_min is not None else 0.0,
-                float("inf"),
+            lower_limit = (
+                self.time_step_min
+                if self.model_type == "nemotron_h_puzzle"
+                and self.time_step_min is not None
+                else 0.0
             )
+            self.time_step_limit = (lower_limit, float("inf"))
 
         if self.block_configs is not None:
             if len(self.block_configs) != self.num_hidden_layers:
@@ -183,8 +186,12 @@ class NemotronHMamba2Mixer(nn.Module):
             bias=args.use_conv_bias,
         )
 
+        self.is_puzzle = args.model_type == "nemotron_h_puzzle"
+        projection_bias = args.use_bias if self.is_puzzle else args.mamba_proj_bias
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
-        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.use_bias)
+        self.in_proj = nn.Linear(
+            self.hidden_size, projection_size, bias=projection_bias
+        )
 
         self.dt_bias = mx.ones(self.num_heads)
         self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
@@ -197,7 +204,7 @@ class NemotronHMamba2Mixer(nn.Module):
             group_size=group_size,
         )
         self.out_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=args.use_bias
+            self.intermediate_size, self.hidden_size, bias=projection_bias
         )
 
     def _conv(
@@ -246,14 +253,22 @@ class NemotronHMamba2Mixer(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         output_dtype = hidden_states.dtype
 
-        # NVIDIA promotes the state-space operands and A_log exponentiation to
-        # float32, but computes softplus(dt + dt_bias) in the projected
-        # activation dtype. Puzzle is unusually sensitive to this boundary:
-        # promoting dt before softplus can change a first-layer SSM output by
-        # more than 160 even when every other input is identical.
-        hidden_states = hidden_states.astype(mx.float32)
-        B = B.astype(mx.float32)
-        C = C.astype(mx.float32)
+        if self.is_puzzle:
+            # NVIDIA promotes the state-space operands and A_log
+            # exponentiation to float32, but computes softplus(dt + dt_bias)
+            # in the projected activation dtype. Puzzle is unusually sensitive
+            # to this boundary: promoting dt before softplus can change a
+            # first-layer SSM output by more than 160 with identical inputs.
+            hidden_states = hidden_states.astype(mx.float32)
+            B = B.astype(mx.float32)
+            C = C.astype(mx.float32)
+            A_log = self.A_log.astype(mx.float32)
+            D = self.D.astype(mx.float32)
+            dt_bias = self.dt_bias.astype(dt.dtype)
+        else:
+            A_log = self.A_log
+            D = self.D.astype(hidden_states.dtype)
+            dt_bias = self.dt_bias
 
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
@@ -268,23 +283,23 @@ class NemotronHMamba2Mixer(nn.Module):
 
         y, state = ssm_update(
             hidden_states,
-            self.A_log.astype(mx.float32),
+            A_log,
             B,
             C,
-            self.D.astype(mx.float32),
+            D,
             dt,
-            self.dt_bias.astype(dt.dtype),
+            dt_bias,
             state,
             self.time_step_limit,
             mask=mask,
-            promote_dt=False,
+            promote_dt=not self.is_puzzle,
         )
         if cache:
             cache[1] = state
 
-        return y.astype(output_dtype).reshape(
-            batch_size, seq_len, self.intermediate_size
-        )
+        if self.is_puzzle:
+            y = y.astype(output_dtype)
+        return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
         self,
@@ -436,14 +451,17 @@ class MoEGate(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_group = config.n_group
         self.topk_group = config.topk_group
+        self.is_puzzle = config.model_type == "nemotron_h_puzzle"
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, x):
-        # NVIDIA computes router logits in float32 before expert selection.
-        # Keeping this matmul in the activation dtype can change top-k routing
-        # decisions when hundreds of experts have nearby scores.
-        router_logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        if self.is_puzzle:
+            # Puzzle selects among 512 experts and computes router logits in
+            # float32 before top-k selection.
+            router_logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        else:
+            router_logits = x @ self.weight.T
         return group_expert_select(
             router_logits,
             self.e_score_correction_bias,
@@ -513,7 +531,10 @@ class NemotronHMoE(nn.Module):
 class NemotronHBlock(nn.Module):
     def __init__(self, args: ModelArgs, block_type: str):
         super().__init__()
-        self.norm = NemotronHRMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
+        norm_cls = (
+            NemotronHRMSNorm if args.model_type == "nemotron_h_puzzle" else nn.RMSNorm
+        )
+        self.norm = norm_cls(args.hidden_size, eps=args.layer_norm_epsilon)
 
         self.block_type = block_type
 
@@ -549,7 +570,10 @@ class NemotronHModel(nn.Module):
             NemotronHBlock(args.for_layer(layer_idx), block_type)
             for layer_idx, block_type in enumerate(args.hybrid_override_pattern or [])
         ]
-        self.norm_f = NemotronHRMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
+        norm_cls = (
+            NemotronHRMSNorm if args.model_type == "nemotron_h_puzzle" else nn.RMSNorm
+        )
+        self.norm_f = norm_cls(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0
         self.ssm_idx = 0
         for b in args.hybrid_override_pattern:
