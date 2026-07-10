@@ -762,6 +762,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        prefill_batch_window=self.cli_args.prompt_batch_window,
                         stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -1836,6 +1837,15 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--prompt-batch-window",
+        type=int,
+        default=None,
+        help=(
+            "Maximum queued prompts considered for length-aware admission "
+            "(default: 4 times --prompt-concurrency; set to 1 for FIFO)"
+        ),
     )
     parser.add_argument(
         "--prompt-cache-size",

@@ -45,6 +45,7 @@ class DummyModelProvider:
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
+                "prompt_batch_window": None,
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,

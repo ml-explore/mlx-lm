@@ -2,6 +2,7 @@
 
 import random
 import unittest
+from collections import deque
 from typing import List
 
 import mlx.core as mx
@@ -263,6 +264,95 @@ class TestGenerate(unittest.TestCase):
                 lp = response.logprobs
                 self.assertTrue(mx.allclose(blp, lp))
                 break
+
+    def test_prefill_admission_groups_similar_chunk_lengths(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.model = None
+        gen.sampler = lambda x: x
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_size = 2
+        gen.prefill_batch_window = 4
+        gen._currently_processing = []
+        gen._old_wired_limit = None
+
+        def sequence(uid, length):
+            return (
+                uid,
+                [[0] * length, [1]],
+                1,
+                [],
+                [],
+                None,
+                [],
+                StopSequenceMatcher(),
+            )
+
+        gen._unprocessed_sequences = deque(
+            [
+                sequence(0, 100),
+                sequence(1, 2000),
+                sequence(2, 120),
+                sequence(3, 1900),
+            ]
+        )
+
+        batch = gen._make_batch(2)
+
+        self.assertEqual(batch.uids, [0, 2])
+        self.assertEqual([s[0] for s in gen._unprocessed_sequences], [1, 3])
+
+    def test_prefill_admission_always_selects_oldest_request(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_window = 8
+        gen._currently_processing = []
+        gen._old_wired_limit = None
+        gen._unprocessed_sequences = deque(
+            (uid, [[[0] * length, [1]]])
+            for uid, length in enumerate([2000, 10, 20, 30, 40, 50, 60, 70])
+        )
+
+        selected = gen._select_prefill_indices(3)
+
+        self.assertIn(0, selected)
+
+    def test_prefill_admission_accounts_for_active_prompt_batch(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_window = 4
+        gen._currently_processing = [[[[0] * 1800, [1]], 0, 1801]]
+        gen._old_wired_limit = None
+        gen._unprocessed_sequences = deque(
+            [
+                (0, [[0] * 100, [1]]),
+                (1, [[0] * 1700, [1]]),
+                (2, [[0] * 120, [1]]),
+                (3, [[0] * 1600, [1]]),
+            ]
+        )
+
+        selected = gen._select_prefill_indices(2)
+
+        self.assertEqual(selected, [0, 1])
+
+    def test_prefill_admission_window_one_preserves_fifo(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_window = 1
+        gen._currently_processing = []
+        gen._old_wired_limit = None
+        gen._unprocessed_sequences = deque(
+            [
+                (0, [[0] * 100, [1]]),
+                (1, [[0] * 2000, [1]]),
+                (2, [[0] * 120, [1]]),
+                (3, [[0] * 1900, [1]]),
+            ]
+        )
+
+        selected = gen._select_prefill_indices(2)
+
+        self.assertEqual(selected, [0, 1])
 
     def test_batch_unique_max_toks(self):
         prompts = [

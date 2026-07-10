@@ -1586,6 +1586,7 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        prefill_batch_window: Optional[int] = None,
         max_kv_size: Optional[int] = None,
         stream=None,
     ):
@@ -1596,6 +1597,13 @@ class BatchGenerator:
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
+        self.prefill_batch_window = (
+            4 * prefill_batch_size
+            if prefill_batch_window is None
+            else prefill_batch_window
+        )
+        if self.prefill_batch_window < 1:
+            raise ValueError("prefill_batch_window must be positive")
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
 
@@ -1809,6 +1817,17 @@ class BatchGenerator:
         return total
 
     def _make_batch(self, n: int):
+        selected = self._select_prefill_indices(n)
+        if selected == list(range(n)):
+            sequences = [self._unprocessed_sequences.popleft() for _ in range(n)]
+        else:
+            selected = set(selected)
+            queued = list(self._unprocessed_sequences)
+            sequences = [sequence for i, sequence in enumerate(queued) if i in selected]
+            self._unprocessed_sequences = deque(
+                sequence for i, sequence in enumerate(queued) if i not in selected
+            )
+
         uids = []
         caches = []
         tokens = []
@@ -1816,8 +1835,7 @@ class BatchGenerator:
         logits_processors = []
         max_tokens = []
         stop_matchers = []
-        for _ in range(n):
-            sequence = self._unprocessed_sequences.popleft()
+        for sequence in sequences:
             uids.append(sequence[0])
             caches.append(sequence[3])
             tokens.append(sequence[4])
@@ -1841,6 +1859,59 @@ class BatchGenerator:
             stop_matchers=stop_matchers,
             max_tokens=max_tokens,
         )
+
+    def _prefill_chunk_length(self, segments):
+        if len(segments) == 1 and len(segments[0]) == 1:
+            return 0
+        return min(len(segments[0]), self.prefill_step_size)
+
+    def _select_prefill_indices(self, n: int):
+        """Select a padding-efficient, starvation-bounded admission cohort."""
+        if n <= 0:
+            return []
+
+        window = min(
+            len(self._unprocessed_sequences),
+            max(n, self.prefill_batch_window),
+        )
+        if window == n:
+            return list(range(n))
+
+        candidates = list(self._unprocessed_sequences)[:window]
+        candidate_lengths = [
+            self._prefill_chunk_length(sequence[1]) for sequence in candidates
+        ]
+        active_lengths = [
+            self._prefill_chunk_length(sequence[0])
+            for sequence in self._currently_processing
+            if not (len(sequence[0]) == 1 and len(sequence[0][0]) == 1)
+        ]
+
+        # Always admit the oldest request. This bounds every queued request's
+        # wait even if later requests keep arriving with friendlier lengths.
+        selected = [0]
+        selected_lengths = active_lengths
+        if candidate_lengths[0] > 0:
+            selected_lengths.append(candidate_lengths[0])
+
+        remaining = set(range(1, window))
+        while len(selected) < n:
+
+            def padding_after_adding(i):
+                lengths = selected_lengths
+                if candidate_lengths[i] > 0:
+                    lengths = lengths + [candidate_lengths[i]]
+                if not lengths:
+                    return 0
+                return max(lengths) * len(lengths) - sum(lengths)
+
+            best = min(remaining, key=lambda i: (padding_after_adding(i), i))
+            selected.append(best)
+            if candidate_lengths[best] > 0:
+                selected_lengths.append(candidate_lengths[best])
+            remaining.remove(best)
+
+        return sorted(selected)
 
     def _next(self):
         generation_responses = []
