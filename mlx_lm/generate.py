@@ -1890,7 +1890,7 @@ class BatchGenerator:
         # Always admit the oldest request. This bounds every queued request's
         # wait even if later requests keep arriving with friendlier lengths.
         selected = [0]
-        selected_lengths = active_lengths
+        selected_lengths = list(active_lengths)
         if candidate_lengths[0] > 0:
             selected_lengths.append(candidate_lengths[0])
 
