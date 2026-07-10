@@ -470,11 +470,17 @@ class Model(nn.Module):
                 weights[f"{prefix}.embed_q.weight"] = wk
                 weights[f"{prefix}.unembed_out.weight"] = wv
 
-        # Remove multi-token prediction layer and any unused precomputed rotary freqs
+        # Remove multi-token prediction layer(s) — any layer index at or above
+        # num_hidden_layers — and any unused precomputed rotary freqs.
+        def is_mtp_layer(k):
+            if not k.startswith("model.layers."):
+                return False
+            return int(k.split(".")[2]) >= self.args.num_hidden_layers
+
         return {
             k: v
             for k, v in weights.items()
-            if not k.startswith("model.layers.61") and "rotary_emb.inv_freq" not in k
+            if not is_mtp_layer(k) and "rotary_emb.inv_freq" not in k
         }
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
