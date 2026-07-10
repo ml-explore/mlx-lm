@@ -11,7 +11,13 @@ import requests
 
 from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, Response, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+    _measure_kv_cost,
+)
 from mlx_lm.utils import load
 
 
@@ -729,3 +735,21 @@ class TestLRUPromptCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMeasureKVCost(unittest.TestCase):
+    def test_measures_linear_cache(self):
+        model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        fixed, per_token = _measure_kv_cost(model)
+        self.assertGreater(per_token, 0)
+        self.assertGreaterEqual(fixed, 0)
+        # Cross-check against the analytic per-token KV size
+        cfg = model.args
+        expected = (
+            cfg.num_hidden_layers
+            * 2
+            * cfg.num_key_value_heads
+            * (cfg.hidden_size // cfg.num_attention_heads)
+            * 2  # bf16
+        )
+        self.assertAlmostEqual(per_token, expected, delta=expected * 0.01)

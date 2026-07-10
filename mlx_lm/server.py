@@ -40,7 +40,7 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import LRUPromptCache, RotatingKVCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -269,6 +269,44 @@ class TimeBudget:
             self._loops = 0
             self._time_spent = 0
         raise StopIteration()
+
+
+def _measure_kv_cost(model):
+    """Empirically measure (fixed_bytes_per_row, bytes_per_token) for one
+    sequence row of this model's cache.
+
+    KV caches allocate capacity in 256-token steps, so both probe points are
+    multiples of 256 and the delta divides exactly. Rotating/sliding caches
+    saturate at their window; if the probe range would cross the smallest
+    window the measurement (and byte budgeting) is refused.
+    """
+    caches = make_prompt_cache(model)
+    windows = [
+        c.max_size
+        for c in caches
+        if isinstance(c, RotatingKVCache) and c.max_size is not None
+    ]
+    warm, probe = 256, 1024
+    if windows and warm + probe >= min(windows):
+        raise ValueError(
+            f"--kv-budget-gb needs a linear-growth cache probe, but a "
+            f"rotating cache saturates at {min(windows)} tokens (inside the "
+            f"probe range). Byte budgeting is not supported for this "
+            f"model configuration."
+        )
+
+    def forward(n, start):
+        toks = mx.array([[(start + i) % 100 + 1 for i in range(n)]])
+        model(toks, cache=caches)
+        mx.eval([c.state for c in caches])
+
+    forward(warm, 0)
+    base = sum(c.nbytes for c in caches)
+    forward(probe, warm)
+    grown = sum(c.nbytes for c in caches)
+    per_token = (grown - base) / probe
+    fixed = max(base - per_token * warm, 0.0)
+    return fixed, per_token
 
 
 class ModelProvider:
@@ -757,11 +795,25 @@ class ResponseGenerator:
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
                     batch_results = {}
+                    kv_budget_bytes = None
+                    kv_cost = None
+                    if self.cli_args.kv_budget_gb is not None:
+                        kv_budget_bytes = int(self.cli_args.kv_budget_gb * (1 << 30))
+                        kv_cost = _measure_kv_cost(model)
+                        logging.info(
+                            "KV budget %.2f GB; measured kv_cost: "
+                            "fixed %.0f B/row, %.0f B/token",
+                            self.cli_args.kv_budget_gb,
+                            kv_cost[0],
+                            kv_cost[1],
+                        )
                     batch_generator = BatchGenerator(
                         model,
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        kv_budget_bytes=kv_budget_bytes,
+                        kv_cost=kv_cost,
                         stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -1830,6 +1882,18 @@ def main():
         type=int,
         default=8,
         help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--kv-budget-gb",
+        type=float,
+        default=None,
+        help=(
+            "Cap projected KV-cache bytes across concurrent requests to this "
+            "budget (GiB). The per-model cost is measured with a short probe "
+            "at load. The budget should already account for weights and "
+            "activation headroom; no extra factor is applied. Default: off "
+            "(admission is count-based only)."
+        ),
     )
     parser.add_argument(
         "--prefill-step-size",
