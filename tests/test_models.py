@@ -1453,6 +1453,39 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_sarvam_mla(self):
+        from mlx_lm.models import sarvam_mla
+
+        # Sarvam-105B config-name remap onto DeepSeek-V3: Sarvam-style keys
+        # (num_experts / num_shared_experts, no q_lora_rank -> direct q_proj).
+        args = sarvam_mla.ModelArgs(
+            model_type="sarvam_mla",
+            vocab_size=1024,
+            hidden_size=128,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_experts=4,
+            num_shared_experts=1,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            kv_lora_rank=4,
+            q_lora_rank=None,
+            qk_rope_head_dim=32,
+            v_head_dim=16,
+            qk_nope_head_dim=32,
+        )
+        model = sarvam_mla.Model(args)
+        self.assertEqual(args.n_routed_experts, 4)
+        self.assertEqual(args.n_shared_experts, 1)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
