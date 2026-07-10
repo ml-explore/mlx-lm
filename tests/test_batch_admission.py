@@ -4,7 +4,12 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.batch_admission import AdmissionState, LinearStateCost, StateBudget
+from mlx_lm.batch_admission import (
+    AdmissionState,
+    LinearStateCost,
+    StateBudget,
+    StepStateCost,
+)
 from mlx_lm.models import qwen3_next
 from mlx_lm.models.cache import ArraysCache, KVCache
 
@@ -65,36 +70,30 @@ class TestStateBudget(unittest.TestCase):
         self.assertEqual(policy.projected_bytes(long), 49_000_000 + 6_144 * 32_768)
 
     def test_diffusion_timestep_dependent_peak(self):
-        # A diffusion scheduler can project the largest remaining latent and
-        # activation footprint. No token or KV-cache semantics are involved.
-        activation_factors = (4, 3, 2, 1)
-
-        def diffusion_peak(state):
-            remaining = activation_factors[
-                state.completed_units : state.projected_units
-            ]
-            factor = max(remaining, default=0)
-            return state.metadata["latent_bytes"] * factor
-
-        policy = StateBudget(850, diffusion_peak)
+        # LLaDA-style block diffusion: each entry is the total peak for one
+        # remaining block/denoising quantum, including the full logits canvas
+        # and optional prefix/suffix cache. No token or KV-growth semantics are
+        # imposed by the admission layer.
+        policy = StateBudget(850, StepStateCost())
+        schedule = (400, 300, 200, 100)
         early = AdmissionState(
             "diffusion-active",
             projected_units=4,
             completed_units=0,
             resident_bytes=100,
-            metadata={"latent_bytes": 100},
+            metadata={"state_bytes_by_step": schedule},
         )
         late = AdmissionState(
             "diffusion-active",
             projected_units=4,
             completed_units=2,
             resident_bytes=100,
-            metadata={"latent_bytes": 100},
+            metadata={"state_bytes_by_step": schedule},
         )
         candidate = AdmissionState(
             "candidate",
             projected_units=4,
-            metadata={"latent_bytes": 150},
+            metadata={"state_bytes_by_step": (600, 450, 300, 150)},
         )
 
         self.assertEqual(
@@ -103,6 +102,25 @@ class TestStateBudget(unittest.TestCase):
         self.assertEqual(
             policy.admitted_prefix([candidate], live_bytes=100, active=[late]), 1
         )
+
+    def test_diffusion_schedule_validation(self):
+        cost = StepStateCost()
+        with self.assertRaisesRegex(ValueError, "requires 'state_bytes_by_step'"):
+            cost(AdmissionState("missing", 1))
+        with self.assertRaisesRegex(ValueError, "fewer than projected_units"):
+            cost(
+                AdmissionState(
+                    "short-schedule", 2, metadata={"state_bytes_by_step": (10,)}
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            cost(
+                AdmissionState(
+                    "nonfinite",
+                    2,
+                    metadata={"state_bytes_by_step": (10, float("nan"))},
+                )
+            )
 
     def test_exact_cohort_removal_and_liveness(self):
         policy = StateBudget(1_000, lambda state: state.metadata["peak_bytes"])

@@ -66,6 +66,40 @@ class LinearStateCost:
         return self.fixed_bytes + self.bytes_per_unit * units
 
 
+class StepStateCost:
+    """Peak-state adapter for diffusion and other iterative schedulers.
+
+    The request metadata contains a sequence of total peak byte estimates, one
+    per scheduling unit.  For masked diffusion this is commonly one entry per
+    denoising step or block and includes the latent/token canvas, logits and
+    any prefix/suffix caches.  Admission uses the largest remaining entry, so
+    advancing or removing a request releases headroom without assuming linear
+    growth or a known number of tokens revealed by each forward.
+    """
+
+    def __init__(self, metadata_key: str = "state_bytes_by_step"):
+        self.metadata_key = metadata_key
+
+    def __call__(self, state: AdmissionState) -> float:
+        try:
+            schedule = state.metadata[self.metadata_key]
+        except KeyError as error:
+            raise ValueError(
+                f"AdmissionState.metadata requires {self.metadata_key!r}"
+            ) from error
+        if len(schedule) < state.projected_units:
+            raise ValueError(
+                f"{self.metadata_key!r} has {len(schedule)} entries, fewer than "
+                f"projected_units={state.projected_units}"
+            )
+        remaining = schedule[state.completed_units : state.projected_units]
+        if any(not math.isfinite(value) or value < 0 for value in remaining):
+            raise ValueError(
+                f"{self.metadata_key!r} entries must be finite and non-negative"
+            )
+        return max(remaining, default=state.resident_bytes)
+
+
 class StateBudget:
     """Admission policy over arbitrary model state.
 
