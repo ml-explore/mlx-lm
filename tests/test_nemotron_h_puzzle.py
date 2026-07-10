@@ -5,7 +5,7 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.models import nemotron_h
+from mlx_lm.models import nemotron_h, ssm
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.utils import _get_classes, load_model, quantize_model, save_model
 
@@ -162,6 +162,95 @@ def test_puzzle_preserves_timestep_activation_precision():
         "promote_dt": False,
         "time_step_limit": (0.001, float("inf")),
     }
+
+
+def test_native_timestep_keeps_state_transition_in_float32():
+    hidden = mx.array([[[[0.5]], [[-0.25]]]], dtype=mx.float32)
+    A_log = mx.array([1.234567], dtype=mx.float32)
+    B = mx.array([[[[0.75]], [[-0.5]]]], dtype=mx.float32)
+    C = mx.array([[[[0.25]], [[1.5]]]], dtype=mx.float32)
+    D = mx.array([0.125], dtype=mx.float32)
+    dt = mx.array([[[0.125], [0.25]]], dtype=mx.bfloat16)
+    dt_bias = mx.array([-0.1], dtype=mx.bfloat16)
+    initial_state = mx.ones((1, 1, 1, 1), dtype=mx.float32)
+
+    output, final_state = ssm.ssm_attn(
+        hidden,
+        A_log,
+        B,
+        C,
+        D,
+        dt,
+        dt_bias,
+        initial_state,
+        (0.001, float("inf")),
+        promote_dt=False,
+    )
+
+    reference_dt = nn.softplus(dt + dt_bias).astype(mx.float32)
+    reference_A = -mx.exp(A_log)
+    reference_state = initial_state
+    reference_output = []
+    for position in range(hidden.shape[1]):
+        delta = reference_dt[:, position]
+        reference_state = reference_state * mx.exp(
+            delta[:, :, None, None] * reference_A[None, :, None, None]
+        )
+        reference_state = reference_state + (
+            delta[:, :, None, None]
+            * hidden[:, position, :, :, None]
+            * B[:, position, :, None, :]
+        )
+        current = (reference_state * C[:, position, :, None, :]).sum(axis=-1)
+        current = current + D[None, :, None] * hidden[:, position]
+        reference_output.append(current)
+    reference_output = mx.stack(reference_output, axis=1)
+    mx.eval(output, final_state, reference_output, reference_state)
+
+    assert mx.allclose(output, reference_output, rtol=1e-5, atol=1e-5).item()
+    assert mx.allclose(final_state, reference_state, rtol=1e-5, atol=1e-5).item()
+
+
+def test_puzzle_precision_changes_do_not_change_base_nemotron_h():
+    common = dict(
+        num_hidden_layers=1,
+        hybrid_override_pattern=["M"],
+        layers_block_type=["mamba"],
+        block_configs=[{"block_type": "mamba"}],
+        use_bias=True,
+        mamba_proj_bias=False,
+        time_step_min=0.001,
+        time_step_limit=None,
+    )
+    puzzle = replace(puzzle_args(), **common)
+    base = replace(puzzle_args(), model_type="nemotron_h", **common)
+    puzzle_mixer = nemotron_h.NemotronHMamba2Mixer(puzzle)
+    base_mixer = nemotron_h.NemotronHMamba2Mixer(base)
+    puzzle_block = nemotron_h.NemotronHBlock(puzzle, "M")
+    base_block = nemotron_h.NemotronHBlock(base, "M")
+    router_dtypes = []
+
+    def capture_router_dtype(gates, *_args):
+        router_dtypes.append(gates.dtype)
+        return None, None
+
+    puzzle_gate = nemotron_h.MoEGate(puzzle)
+    base_gate = nemotron_h.MoEGate(base)
+    puzzle_gate.weight = puzzle_gate.weight.astype(mx.bfloat16)
+    base_gate.weight = base_gate.weight.astype(mx.bfloat16)
+    with patch.object(nemotron_h, "group_expert_select", capture_router_dtype):
+        puzzle_gate(mx.ones((1, puzzle.hidden_size), dtype=mx.bfloat16))
+        base_gate(mx.ones((1, base.hidden_size), dtype=mx.bfloat16))
+
+    assert "bias" in puzzle_mixer.in_proj.parameters()
+    assert "bias" in puzzle_mixer.out_proj.parameters()
+    assert "bias" not in base_mixer.in_proj.parameters()
+    assert "bias" not in base_mixer.out_proj.parameters()
+    assert isinstance(puzzle_block.norm, nemotron_h.NemotronHRMSNorm)
+    assert isinstance(base_block.norm, nn.RMSNorm)
+    assert router_dtypes == [mx.float32, mx.bfloat16]
+    assert puzzle.time_step_limit == (0.001, float("inf"))
+    assert base.time_step_limit == (0.0, float("inf"))
 
 
 def test_official_source_model_prefix_is_remapped_to_backbone():
