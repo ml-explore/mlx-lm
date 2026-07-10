@@ -51,9 +51,11 @@ class LinearStateCost:
     """Fixed plus per-unit state cost for dense and hybrid AR caches.
 
     ``allocation_step_units`` describes a shared stepped allocation such as
-    ``BatchKVCache``.  Scalar projections round one request to that step;
-    ``cohort_bytes`` additionally models the shared cohort width, where every
-    row pays for the longest row's rounded allocation.
+    ``BatchKVCache``. A cache resumed from an unaligned logical length can
+    retain up to ``step - 1`` extra units, so projections use the alignment-
+    independent envelope ``units + step - 1`` rather than assuming that total
+    capacity is step-aligned. ``cohort_bytes`` additionally models the shared
+    cohort width, where every row pays for the longest row's allocation.
     """
 
     def __init__(
@@ -94,8 +96,7 @@ class LinearStateCost:
     def _allocated_units(self, units: int) -> int:
         if self.allocation_step_units is None or units == 0:
             return units
-        step = self.allocation_step_units
-        return ((units + step - 1) // step) * step
+        return units + self.allocation_step_units - 1
 
     def __call__(self, state: AdmissionState) -> float:
         units = self._allocated_units(self._capped_units(state))
@@ -105,8 +106,9 @@ class LinearStateCost:
         """Project total bytes for rows sharing one batched allocation width.
 
         Without stepped allocation geometry, rows remain independently linear.
-        With it, the whole cohort is charged at the rounded maximum projected
-        width, matching the storage geometry of ``BatchKVCache``.
+        With it, the whole cohort is charged at the alignment-independent
+        envelope of the maximum projected width, safely covering resumed
+        ``BatchKVCache`` allocations whose existing width is not step-aligned.
         """
 
         states = tuple(states)

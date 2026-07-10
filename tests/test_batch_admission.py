@@ -11,7 +11,7 @@ from mlx_lm.batch_admission import (
     StepStateCost,
 )
 from mlx_lm.models import qwen3_next
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 
 
 class TestStateBudget(unittest.TestCase):
@@ -80,9 +80,9 @@ class TestStateBudget(unittest.TestCase):
         self.assertEqual(kv_257, kv_512)
         self.assertEqual(kv_512 - kv_256, kv_768 - kv_512)
         cost = LinearStateCost(fixed, per_unit, allocation_step_units=256)
-        self.assertEqual(cost(AdmissionState("hybrid", 256)), at_256)
+        self.assertGreaterEqual(cost(AdmissionState("hybrid", 256)), at_256)
         self.assertEqual(cost(AdmissionState("hybrid", 257)), at_257)
-        self.assertEqual(cost(AdmissionState("hybrid", 768)), at_768)
+        self.assertGreaterEqual(cost(AdmissionState("hybrid", 768)), at_768)
 
     def test_hybrid_fixed_and_linear_state(self):
         cost = LinearStateCost(49_000_000, 6_144, max_units=32_768)
@@ -95,25 +95,47 @@ class TestStateBudget(unittest.TestCase):
 
     def test_stepped_projection_covers_allocation_boundaries(self):
         cost = LinearStateCost(7, 3, allocation_step_units=256)
-        for units, allocated in (
+        for units, allocated_upper_bound in (
             (0, 0),
-            (255, 256),
-            (256, 256),
+            (255, 510),
+            (256, 511),
             (257, 512),
-            (511, 512),
-            (512, 512),
+            (511, 766),
+            (512, 767),
             (513, 768),
         ):
-            self.assertEqual(cost(AdmissionState(units, units)), 7 + 3 * allocated)
+            self.assertEqual(
+                cost(AdmissionState(units, units)),
+                7 + 3 * allocated_upper_bound,
+            )
 
     def test_cohort_projection_uses_shared_rounded_maximum(self):
         cost = LinearStateCost(10, 2, allocation_step_units=256)
         short = AdmissionState("short", 1)
         long = AdmissionState("long", 1_000)
 
-        self.assertEqual(cost.cohort_bytes([short, long]), 2 * (10 + 2 * 1_024))
+        self.assertEqual(cost.cohort_bytes([short, long]), 2 * (10 + 2 * 1_255))
         self.assertGreater(cost.cohort_bytes([short, long]), cost(short) + cost(long))
         self.assertEqual(cost.cohort_bytes([]), 0)
+
+    def test_unaligned_continued_cache_uses_step_minus_one_envelope(self):
+        history = KVCache()
+        values = mx.zeros((1, 1, 252, 1), dtype=mx.float16)
+        history.update_and_fetch(values, values)
+        batch = BatchKVCache.merge([history])
+
+        one = mx.zeros((1, 1, 1, 1), dtype=mx.float16)
+        batch.update_and_fetch(one, one)
+        mx.eval(batch.keys, batch.values)
+
+        # Merging preserves logical width 252. Appending one token allocates
+        # another 256-unit block, so logical 253 occupies capacity 508 rather
+        # than round_up(253, 256) == 256.
+        self.assertEqual(batch.keys.shape[2], 508)
+        bytes_per_unit = 2 * mx.float16.size
+        cost = LinearStateCost(0, bytes_per_unit, allocation_step_units=256)
+        self.assertEqual(cost(AdmissionState("continued", 253)), batch.nbytes)
+        self.assertGreater(batch.nbytes, bytes_per_unit * 256)
 
     def test_linear_cost_allocation_geometry_validation(self):
         for invalid in (True, 0, -1, 1.5):
