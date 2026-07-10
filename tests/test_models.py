@@ -399,6 +399,77 @@ class TestModels(unittest.TestCase):
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
 
+    def test_olmo_hils(self):
+        from mlx_lm.models import olmo_hils
+
+        args = olmo_hils.ModelArgs(
+            model_type="olmo_hils",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=257,
+            max_position_embeddings=4096,
+            sliding_window=16,
+            rope_theta=10000.0,
+            chunk_size=8,
+            hils_topk=2,
+            lmk_q_lora_dim=16,
+            rope_context_length=128,
+        )
+        model = olmo_hils.Model(args)
+        self.assertEqual(len(model.layers), args.num_hidden_layers)
+        self.assertEqual(model.model_type, args.model_type)
+
+        # olmo_hils inserts landmark tokens internally and is batch-1 only,
+        # so instead of model_test_runner check that the cache paths agree
+        # with a single full forward (the property generation relies on).
+        # Small weights keep the top-k chunk retrieval decisive so the
+        # comparison is not confounded by near-tie selection flips.
+        mx.random.seed(0)
+        model.update(
+            tree_map(
+                lambda p: mx.random.normal(p.shape, dtype=mx.float32) * 0.05,
+                model.parameters(),
+            )
+        )
+        L = 100
+        tokens = mx.random.randint(0, args.vocab_size, (1, L))
+        full = model(tokens)
+        self.assertEqual(full.shape, (1, L, args.vocab_size))
+
+        # chunked prefill across uneven, boundary-crossing splits
+        cache = make_prompt_cache(model)
+        splits = [0, 7, 8, 30, 63, 64, 90, L]
+        outs = [
+            model(tokens[:, a:b], cache=cache) for a, b in zip(splits[:-1], splits[1:])
+        ]
+        chunked = mx.concatenate(outs, axis=1)
+        self.assertTrue(mx.allclose(full, chunked, atol=1e-3).item())
+
+        # token-by-token decode
+        cache = make_prompt_cache(model)
+        model(tokens[:, :50], cache=cache)
+        outs = [model(tokens[:, i : i + 1], cache=cache) for i in range(50, L)]
+        decoded = mx.concatenate(outs, axis=1)
+        # top-k retrieval near-ties may flip with random weights; require
+        # agreement to a loose tolerance
+        self.assertTrue(mx.allclose(full[:, 50:], decoded, atol=5e-3).item())
+
+        # real-token trim (speculative-decoding rollback) then re-decode
+        cache = make_prompt_cache(model)
+        model(tokens[:, :88], cache=cache)
+        for c in cache:
+            self.assertTrue(c.is_trimmable())
+            c.trim(5)
+        self.assertEqual(cache[0].offset, 83)
+        outs = [model(tokens[:, i : i + 1], cache=cache) for i in range(83, L)]
+        redec = mx.concatenate(outs, axis=1)
+        self.assertTrue(mx.allclose(full[:, 83:], redec, atol=5e-3).item())
+
+        copy.deepcopy(model)
+
     def test_llama(self):
         from mlx_lm.models import llama
 
