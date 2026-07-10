@@ -262,6 +262,31 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
 
+    def test_rotating_cache_trim_fails_closed_after_wrap(self):
+        # Fill a RotatingKVCache past its window so the ring wraps.
+        cache = RotatingKVCache(max_size=6)
+        x = mx.random.uniform(shape=(1, 8, 10, 4))
+        cache.update_and_fetch(x, x)
+
+        # Once wrapped the cache is not trimmable: the public path is a no-op...
+        self.assertFalse(cache.is_trimmable())
+        self.assertEqual(trim_prompt_cache([cache], 4), 0)
+
+        # ...and a direct trim() call fails closed instead of silently
+        # decrementing offset/_idx and corrupting the window.
+        offset_before, idx_before = cache.offset, cache._idx
+        with self.assertRaises(RuntimeError):
+            cache.trim(4)
+        self.assertEqual(cache.offset, offset_before)
+        self.assertEqual(cache._idx, idx_before)
+
+        # An unwrapped rotating cache still trims normally.
+        cache = RotatingKVCache(max_size=6)
+        x = mx.random.uniform(shape=(1, 8, 5, 4))
+        cache.update_and_fetch(x, x)
+        self.assertTrue(cache.is_trimmable())
+        self.assertEqual(cache.trim(4), 4)
+
     def test_trim_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]

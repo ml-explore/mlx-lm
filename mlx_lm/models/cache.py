@@ -543,6 +543,17 @@ class RotatingKVCache(_BaseCache):
         return self.offset < self.max_size
 
     def trim(self, n):
+        if not self.is_trimmable():
+            # Fail closed. Once the ring has wrapped (offset >= max_size) the
+            # evicted entries are gone, so decrementing offset/_idx would
+            # silently corrupt the window rather than trim it. The public
+            # trim_prompt_cache path already guards on is_trimmable(); this
+            # protects direct callers (e.g. speculative rollback) too.
+            raise RuntimeError(
+                f"Cannot trim a RotatingKVCache that has wrapped (offset "
+                f"{self.offset} >= max_size {self.max_size}); the evicted "
+                f"entries are gone. Check is_trimmable() before calling trim()."
+            )
         n = min(self.offset, n)
         self.offset -= n
         self._idx -= n
