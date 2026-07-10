@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import math
 import pickle
 import platform
 import socket
@@ -1142,7 +1143,16 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except ValueError as e:
+            # Parameter validation happens before completion/stream headers are
+            # emitted, so malformed requests receive a normal JSON 400 instead
+            # of a dropped connection after a streaming response has begun.
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1203,10 +1213,23 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("logit_bias", dict, optional=True)
 
         if self.logit_bias is not None:
-            try:
-                self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
-            except ValueError:
-                raise ValueError("logit_bias must be a dict of int to float")
+            # Normalize into {int: float}. Malformed entries (null / non-numeric
+            # values, bool values, non-integer keys) and non-finite values must
+            # all surface as ValueError so the request gets the JSON 400 path,
+            # never an uncaught TypeError.
+            normalized = {}
+            for k, v in self.logit_bias.items():
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError("logit_bias must be a dict of int to float")
+                try:
+                    key = int(str(k))
+                    value = float(v)
+                except (ValueError, TypeError):
+                    raise ValueError("logit_bias must be a dict of int to float")
+                if not math.isfinite(value):
+                    raise ValueError("logit_bias values must be finite")
+                normalized[key] = value
+            self.logit_bias = normalized
 
     def generate_response(
         self,
