@@ -365,6 +365,23 @@ def _measure_kv_cost(model):
             f"{verify_at} tokens exceeds step-rounded projection "
             f"{projected:.0f}; refusing byte budgeting"
         )
+
+    # Independent higher point: the two-point fit is measured on
+    # [256, 1280]; a slope that changes past 1280 would still pass the
+    # 528 check. Measure at 2048 (a step boundary, so the linear
+    # prediction is exact for a consistent model) and refuse on mismatch.
+    third_at = 2048
+    forward(vcaches, third_at - verify_at, verify_at)
+    observed_third = sum(c.nbytes for c in leaves(vcaches))
+    predicted_third = raw_fixed + per_token * third_at
+    tolerance = max(0.01 * predicted_third, float(common_step))
+    if abs(observed_third - predicted_third) > tolerance:
+        raise ValueError(
+            f"state-cost consistency check failed: observed "
+            f"{observed_third} bytes at {third_at} tokens vs predicted "
+            f"{predicted_third:.0f} (fit measured on 256..1280); the "
+            f"cache does not grow linearly, refusing byte budgeting"
+        )
     logging.info(
         "state-cost fit: per_token %.0f B, raw fixed %.0f B, common step %d "
         "(leaves: %s); verified at %d tokens: observed %d <= projected %.0f",

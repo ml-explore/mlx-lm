@@ -823,9 +823,16 @@ class _FakeModel:
 
     def __call__(self, toks, cache=None):
         n = toks.shape[-1]
-        for c in cache:
-            if hasattr(c, "grow"):
-                c.grow(n)
+
+        def grow(cs):
+            for c in cs:
+                inner = getattr(c, "caches", None)
+                if inner:
+                    grow(inner)
+                elif hasattr(c, "grow"):
+                    c.grow(n)
+
+        grow(cache)
         return toks
 
 
@@ -869,6 +876,66 @@ class TestMeasureKVCostRefusals(unittest.TestCase):
         self.assertEqual(step, 256)
         self.assertAlmostEqual(per_tok, 100.0, delta=1.0)
         self.assertGreaterEqual(fixed, 5000 * 0.99)
+
+
+class _SlopeChangeLeaf(_FakeLeaf):
+    """Grows at slope until 1280 tokens, then twice as fast — must be
+    refused by the independent 2048 consistency check."""
+
+    @property
+    def nbytes(self):
+        cap = self._tokens
+        if self.step:
+            cap = -(-cap // self.step) * self.step
+        if cap <= 1280:
+            return int(self._slope * cap)
+        return int(self._slope * 1280 + 2 * self._slope * (cap - 1280))
+
+
+class _FakeComposite:
+    """CacheList-like wrapper exposing .caches."""
+
+    def __init__(self, children):
+        self.caches = children
+        self.state = []
+
+
+class TestMeasureKVCostConsistency(unittest.TestCase):
+    def test_slope_change_after_fit_range_refused(self):
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [_SlopeChangeLeaf(100.0, step=256)]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
+    def test_invalid_step_values_refused(self):
+        for bad in (True, 2.5, 0, -8):
+            leaf = _FakeLeaf(100.0)
+            leaf.step = bad
+            with self.assertRaises(ValueError):
+                _measure_kv_cost(_FakeModel([leaf]))
+
+    def test_nested_composite_recursed(self):
+        """Reviewer nested-CacheList positive case: a composite wrapping a
+        fixed leaf and a stepped growing child measures correctly through
+        recursion."""
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [
+                    _FakeComposite(
+                        [
+                            _FakeLeaf(0, step=None, fixed=4000),
+                            _FakeLeaf(100.0, step=256),
+                        ]
+                    )
+                ]
+
+        fixed, per_tok, step = _measure_kv_cost(_M([]))
+        self.assertEqual(step, 256)
+        self.assertAlmostEqual(per_tok, 100.0, delta=1.0)
+        self.assertGreaterEqual(fixed, 4000 * 0.99)
 
 
 class TestMeasureKVCost(unittest.TestCase):
