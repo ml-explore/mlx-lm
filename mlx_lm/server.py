@@ -295,7 +295,7 @@ def _measure_kv_cost(model):
     warm, probe = 256, 1024
     if windows and warm + probe >= min(windows):
         raise ValueError(
-            f"--kv-budget-gb needs a linear-growth cache probe, but a "
+            f"--state-budget-gb needs a linear-growth cache probe, but a "
             f"rotating cache saturates at {min(windows)} tokens (inside the "
             f"probe range). Byte budgeting is not supported for this "
             f"model configuration."
@@ -804,15 +804,15 @@ class ResponseGenerator:
                     try:
                         kv_budget_bytes = None
                         kv_cost = None
-                        if self.cli_args.kv_budget_gb is not None:
+                        if self.cli_args.state_budget_gb is not None:
                             kv_budget_bytes = int(
-                                self.cli_args.kv_budget_gb * (1 << 30)
+                                self.cli_args.state_budget_gb * (1 << 30)
                             )
                             kv_cost = _measure_kv_cost(model)
                             logging.info(
-                                "KV budget %.2f GB; measured kv_cost: "
+                                "State budget %.2f GB; measured cost: "
                                 "fixed %.0f B/row, %.0f B/token",
-                                self.cli_args.kv_budget_gb,
+                                self.cli_args.state_budget_gb,
                                 kv_cost[0],
                                 kv_cost[1],
                             )
@@ -1900,15 +1900,16 @@ def main():
         help="When a request is batchable then process that many prompts in parallel",
     )
     parser.add_argument(
-        "--kv-budget-gb",
+        "--state-budget-gb",
         type=float,
         default=None,
         help=(
-            "Cap projected KV-cache bytes across concurrent requests to this "
-            "budget (GiB). The per-model cost is measured with a short probe "
-            "at load. The budget should already account for weights and "
-            "activation headroom; no extra factor is applied. Default: off "
-            "(admission is count-based only)."
+            "Cap projected model-state bytes (KV cache and recurrent/hybrid "
+            "state) across concurrent requests to this budget (GiB). The "
+            "per-model cost is measured with a short probe at load. The "
+            "budget should already account for weights and activation "
+            "headroom; no extra factor is applied. Default: off (admission "
+            "is count-based only)."
         ),
     )
     parser.add_argument(
