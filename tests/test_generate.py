@@ -6,7 +6,7 @@ from typing import List
 
 import mlx.core as mx
 
-from mlx_lm.batch_admission import StateBudget
+from mlx_lm.batch_admission import LinearStateCost, StateBudget
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
@@ -489,6 +489,16 @@ class TestGenerate(unittest.TestCase):
                 self.model,
                 max_tokens=0,
                 state_budget=StateBudget(6_000, quadratic_prefill_state),
+            )
+
+        class _NonlinearSubclass(LinearStateCost):
+            def __call__(self, state):
+                return quadratic_prefill_state(state)
+
+        with self.assertRaisesRegex(ValueError, "requires LinearStateCost"):
+            BatchGenerator(
+                self.model,
+                state_budget=StateBudget(6_000, _NonlinearSubclass(0, 1)),
             )
 
         with self.assertRaises(ValueError):

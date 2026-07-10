@@ -1610,8 +1610,9 @@ class BatchGenerator:
             raise ValueError(
                 "state_budget cannot be combined with kv_budget_bytes/kv_cost"
             )
-        if state_budget is not None and not isinstance(
-            state_budget.project, LinearStateCost
+        if (
+            state_budget is not None
+            and type(state_budget.project) is not LinearStateCost
         ):
             raise ValueError(
                 "BatchGenerator state_budget requires LinearStateCost; "
