@@ -849,6 +849,115 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(gen._budget_admissible(1), 1)
         del gen
 
+    def test_w3_shape_active_cache_never_exceeds_budget(self):
+        """Reviewer test 2 — the exact W3 smoke shape as a regression:
+        0.5 GiB budget, eight 512-prompt/16-gen rows, REAL measured cost.
+        The live admitted cache must never exceed the budget at any
+        scheduler step (the original defect admitted 0.70 GB into 0.5 GiB).
+        """
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        budget = int(0.5 * (1 << 30))
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=16,
+            prefill_batch_size=8,
+            kv_budget_bytes=budget,
+            kv_cost=(fixed, per_tok, step),
+        )
+        prompt = [(i % 100) + 1 for i in range(512)]
+        uids = gen.insert([prompt] * 8)
+        done = set()
+        max_live = 0
+        for _ in range(400):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            max_live = max(max_live, live)
+            self.assertLessEqual(live, budget)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == len(uids):
+                break
+        self.assertEqual(len(done), len(uids))
+        self.assertGreater(max_live, 0)
+        del gen
+
+    def test_heterogeneous_cohort_projection_covers_actual(self):
+        """Reviewer test 5 — widely different prompt lengths and unequal
+        max_tokens: the committed projection at admission must cover the
+        ACTUAL merged BatchKVCache bytes reached during processing."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        gen = BatchGenerator(
+            self.model,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,  # generous: measuring, not gating
+            kv_cost=(fixed, per_tok, step),
+        )
+        short = [(i % 100) + 1 for i in range(8)]
+        longer = [(i % 100) + 1 for i in range(300)]
+        uids = gen.insert([short, longer], max_tokens=[4, 40])
+        states = [
+            gen._candidate_admission_state(seq) for seq in gen._unprocessed_sequences
+        ]
+        projected = gen._cohort_committed(states)
+        done = set()
+        max_live = 0
+        for _ in range(200):
+            _, responses = gen.next()
+            max_live = max(max_live, gen.prompt_cache_nbytes)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == len(uids):
+                break
+        self.assertEqual(len(done), len(uids))
+        self.assertGreaterEqual(projected, max_live)
+        del gen
+
+    def test_continued_and_removal_at_capacity_boundary(self):
+        """Reviewer test 6 — continued generation crossing an allocation
+        boundary, then removal: projection covers actual across the
+        boundary, and removing a row releases real headroom."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        gen = BatchGenerator(
+            self.model,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,
+            kv_cost=(fixed, per_tok, step),
+        )
+        # Prompt just below the boundary; generation crosses it
+        prompt = [(i % 100) + 1 for i in range(step - 4)]
+        uid_a, uid_b = gen.insert([prompt, prompt], max_tokens=[12, 12])
+        crossed = False
+        done = set()
+        for _ in range(200):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            states = [
+                gen._candidate_admission_state(seq)
+                for seq in gen._unprocessed_sequences
+            ]
+            projected = gen._cohort_committed(states)
+            self.assertGreaterEqual(projected, live)
+            if live > 2 * (step - 4) * per_tok:
+                crossed = True  # allocation stepped past the boundary
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == 2:
+                break
+        self.assertTrue(crossed)
+        before = gen.prompt_cache_nbytes
+        # rows completed -> removed by the engine; live must have released
+        self.assertLessEqual(before, 2 * per_tok * step)
+        del gen
+
     def test_kv_budget_e2e_generation_completes(self):
         """Budgeted end-to-end run finishes all requests (queued, not lost)."""
         prompt = self.tokenizer.encode("hello world")
