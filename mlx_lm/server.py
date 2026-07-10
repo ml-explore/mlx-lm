@@ -400,9 +400,12 @@ def _measure_kv_cost(model):
         leaf_slope = (g - b) / probe
         predicted = b + leaf_slope * (third_at - warm)
         observed_leaf = c.nbytes
-        # third_at is an exact step boundary: a consistent leaf predicts
-        # exactly, so the tolerance is tight (1% covers dtype/rounding)
-        tolerance = 0.01 * max(predicted, 1.0)
+        # third_at is a step boundary, but REAL leaves deviate slightly
+        # from the pure model (measured: Qwen1.5-0.5B KVCache observes
+        # +0.78% at 2048 — one 64 KiB allocator nuance — so 1e-6 refuses
+        # real hardware). 1% accepts that while still refusing a mild 20%
+        # late-slope change (7.5% underprojection at 2048).
+        tolerance = max(1.0, 0.01 * abs(predicted))
         if abs(observed_leaf - predicted) > tolerance:
             raise ValueError(
                 f"state-cost consistency check failed for leaf "

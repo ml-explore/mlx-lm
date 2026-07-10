@@ -953,6 +953,40 @@ class TestMeasureKVCostConsistency(unittest.TestCase):
         with self.assertRaises(ValueError):
             _measure_kv_cost(_M([]))
 
+    def test_mild_late_growth_refused(self):
+        """Codex P1 regression: slope 100 through 1280 then 120 after —
+        only 7.5% underprojection at 2048 — must be refused (exact-boundary
+        predictions tolerate arithmetic error only, not mild drift)."""
+
+        class _MildLateLeaf(_FakeLeaf):
+            @property
+            def nbytes(self):
+                cap = self._tokens
+                if self.step:
+                    cap = -(-cap // self.step) * self.step
+                if cap <= 1280:
+                    return int(self._slope * cap)
+                return int(self._slope * 1280 + 1.2 * self._slope * (cap - 1280))
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [_MildLateLeaf(100.0, step=256)]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
+    def test_rotating_window_inside_third_point_refused(self):
+        """Codex P2 regression: a rotating window between 1280 and 2048
+        must refuse BEFORE probing (the third point would cross it)."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [RotatingKVCache(max_size=1536)]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
     def test_slope_change_after_fit_range_refused(self):
         class _M(_FakeModel):
             def make_cache(self):
