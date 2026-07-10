@@ -53,6 +53,10 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
+    # Multi-token-prediction (nextn) head. 0 = no head (default; community MLX
+    # repacks strip it). Set >0 (typically 1) to build a head for training or a
+    # grafted/trained "-mtp" checkpoint, enabling self-speculative decoding.
+    mtp_num_hidden_layers: int = 0
 
 
 @partial(mx.compile, shapeless=True)
@@ -455,6 +459,30 @@ class Qwen3NextModel(nn.Module):
         return self.norm(hidden_states)
 
 
+class Qwen3NextMTP(nn.Module):
+    """Multi-token-prediction (nextn) head for qwen3_next — mirrors the upstream
+    Qwen3-Next MTP module and the qwen3_5 port:
+
+        fc([norm(embed(t_{p+1})); norm(hidden_p)]) -> one FULL-ATTENTION decoder
+        layer (own KV cache) -> norm -> the trunk's lm_head.
+
+    Predicts token p+2 from the trunk's hidden at p and the committed token
+    p+1, enabling self-speculative decoding with no external draft model. Built
+    only when args.mtp_num_hidden_layers > 0 (a trained or grafted head)."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        # layer_idx chosen so is_linear=False -> the MTP block is full attention.
+        self.layers = [
+            Qwen3NextDecoderLayer(args, layer_idx=args.full_attention_interval - 1)
+            for _ in range(args.mtp_num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+
 class Model(nn.Module):
     # The GDN layers record exact rollbacks on their ArraysCache during
     # speculative decoding, making the hybrid cache trimmable (see
@@ -468,6 +496,8 @@ class Model(nn.Module):
         self.model = Qwen3NextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = Qwen3NextMTP(args)
 
     def __call__(
         self,
@@ -488,10 +518,42 @@ class Model(nn.Module):
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
+    def logits(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    def make_mtp_cache(self):
+        return [KVCache() for _ in self.mtp.layers]
+
+    def mtp_step(self, hidden, tokens, mtp_cache):
+        """One MTP forward over S positions.
+
+        hidden: [B, S, H] post-final-norm trunk hiddens at positions p..p+S-1.
+        tokens: [B, S] the committed/drafted token FOLLOWING each hidden's
+        position (p+1..p+S). Returns (logits [B, S, V], post_norm_hidden).
+        """
+        e = self.mtp.pre_fc_norm_embedding(self.model.embed_tokens(tokens))
+        h = self.mtp.pre_fc_norm_hidden(hidden)
+        x = self.mtp.fc(mx.concatenate([e, h], axis=-1))
+        mask = create_attention_mask(x, mtp_cache[0])
+        x = self.mtp.layers[0](x, mask=mask, cache=mtp_cache[0])
+        post = self.mtp.norm(x)
+        return self.logits(post), post
+
     def sanitize(self, weights):
+        # MTP (nextn) head: keep its tensors only if the checkpoint has them AND
+        # this model was built with an MTP module (config mtp_num_hidden_layers
+        # > 0); otherwise drop them (and the module) so strict loading stays
+        # consistent. No-op for the common MLX repacks that ship no MTP head.
+        has_mtp_weights = any("mtp." in k for k in weights)
+        if not (has_mtp_weights and getattr(self, "mtp", None) is not None):
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
+            if getattr(self, "mtp", None) is not None:
+                self.mtp = None
+
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
             return weights
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
