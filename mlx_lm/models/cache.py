@@ -3,7 +3,7 @@
 import copy
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1761,3 +1761,572 @@ class LRUPromptCache:
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
         return result
+
+
+# ---------------------------------------------------------------------------
+# SnapKV-D: post-prefill KV eviction with position-preserving decode
+#
+# Long-context decode reads the whole KV cache every step. After the prompt is
+# prefilled, most middle prompt rows contribute little to future attention, so
+# keeping attention sinks + a recent window + the top observation-window-scored
+# middle rows within a budget (SnapKV, arXiv:2404.14469) and evicting the rest
+# cuts the per-token KV read proportionally. The retained rows are a sparse
+# subset of the prompt, so RoPE position and physical row count must diverge:
+# PositionPreservingKVCache tracks the true sequence position in ``offset`` for
+# future rotations while storing only the retained rows, and records each row's
+# true position so a prefix trim (prompt-cache reuse) stays exact.
+# ---------------------------------------------------------------------------
+
+
+def snapkv_keep_indices(
+    seq_len: int,
+    budget: int,
+    scores: Sequence[float],
+    *,
+    sink_tokens: int = 4,
+    recent_tokens: Optional[int] = None,
+    min_tokens: int = 128,
+) -> Tuple[int, ...]:
+    """Return the sorted prompt positions retained by the SnapKV-D policy.
+
+    Keeps ``sink_tokens`` leading rows, a recent window, and the highest-scoring
+    remaining rows up to ``budget``. Returns all positions unchanged when the
+    prompt is at or below ``min_tokens`` or the budget covers it.
+    """
+    if seq_len < 0:
+        raise ValueError("seq_len must be non-negative")
+    if budget <= 0:
+        raise ValueError("budget must be positive")
+    if len(scores) < seq_len:
+        raise ValueError(f"scores length {len(scores)} < seq_len {seq_len}")
+    if seq_len == 0 or seq_len <= min_tokens or budget >= seq_len:
+        return tuple(range(seq_len))
+
+    budget = min(budget, seq_len)
+    sink_count = min(max(0, sink_tokens), max(1, budget // 8), budget)
+    retained = set(range(sink_count))
+
+    remaining = budget - len(retained)
+    if remaining > 0:
+        recent_count = (
+            recent_tokens if recent_tokens is not None else max(1, budget // 8)
+        )
+        recent_count = min(recent_count, remaining)
+        retained.update(range(seq_len - recent_count, seq_len))
+
+    remaining = budget - len(retained)
+    if remaining > 0:
+        ranked = sorted(
+            (i for i in range(seq_len) if i not in retained),
+            key=lambda i: (float(scores[i]), i),
+            reverse=True,
+        )
+        retained.update(ranked[:remaining])
+
+    return tuple(sorted(retained))
+
+
+class PositionPreservingKVCache(_BaseCache):
+    """KV cache with a true-position ``offset`` and compact retained storage.
+
+    Intended for post-prefill eviction followed by single-token decode. The
+    physical K/V rows may be a sparse subset of the logical prompt; the
+    ``positions`` metadata records each row's true sequence position so a prefix
+    trim (prompt-cache reuse) can shorten the logical ``offset`` without
+    pretending sparse rows are contiguous. Speculative rollback trims a
+    generated suffix and is tracked separately.
+    """
+
+    step = 256
+
+    def __init__(
+        self,
+        keys=None,
+        values=None,
+        *,
+        offset: int = 0,
+        protected_stored: Optional[int] = None,
+        positions: Optional[Sequence[int]] = None,
+    ):
+        self.keys = keys
+        self.values = values
+        self.offset = int(offset)
+        self._stored = 0 if keys is None else int(keys.shape[2])
+        self._protected_stored = (
+            self._stored if protected_stored is None else int(protected_stored)
+        )
+        if self._protected_stored < 0 or self._protected_stored > self._stored:
+            raise ValueError("protected_stored must be between 0 and stored rows")
+        self._positions = self._coerce_positions(positions)
+        self._speculating = False
+        self._speculative_appends = deque()
+
+    def _coerce_positions(self, positions):
+        if positions is None:
+            if self._stored == 0:
+                return ()
+            if self.offset == self._stored:
+                return tuple(range(self._stored))
+            return None
+        out = tuple(int(p) for p in positions)
+        if len(out) != self._stored:
+            raise ValueError("positions length must match stored rows")
+        if any(p < 0 for p in out):
+            raise ValueError("positions must be non-negative")
+        if tuple(sorted(out)) != out:
+            raise ValueError("positions must be sorted")
+        return out
+
+    @staticmethod
+    def _encode_positions(positions):
+        if positions is None:
+            return "-"
+        return ",".join(map(str, positions))
+
+    @staticmethod
+    def _decode_positions(raw):
+        if raw == "-":
+            return None
+        if raw == "":
+            return ()
+        return tuple(int(p) for p in raw.split(","))
+
+    def update_and_fetch(self, keys, values):
+        prev = self._stored
+        n_new = int(keys.shape[2])
+        start_pos = self.offset
+        required = prev + n_new
+        if self.keys is None or required > self.keys.shape[2]:
+            bsz, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            grow = ((required - prev + self.step - 1) // self.step) * self.step
+            new_k = mx.zeros((bsz, n_kv_heads, grow, k_head_dim), keys.dtype)
+            new_v = mx.zeros((bsz, n_kv_heads, grow, v_head_dim), values.dtype)
+            if self.keys is not None:
+                self.keys = mx.concatenate([self.keys[..., :prev, :], new_k], axis=2)
+                self.values = mx.concatenate(
+                    [self.values[..., :prev, :], new_v], axis=2
+                )
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.keys[..., prev:required, :] = keys
+        self.values[..., prev:required, :] = values
+        self._stored = required
+        self.offset += n_new
+        if self._positions is not None:
+            self._positions = self._positions + tuple(
+                range(start_pos, start_pos + n_new)
+            )
+        if self._speculating and n_new:
+            self._speculative_appends.append(n_new)
+        return (
+            self.keys[..., : self._stored, :],
+            self.values[..., : self._stored, :],
+        )
+
+    def size(self):
+        return self._stored
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None
+        return (
+            self.keys[..., : self._stored, :],
+            self.values[..., : self._stored, :],
+        )
+
+    @state.setter
+    def state(self, v):
+        if v is None:
+            self.keys = None
+            self.values = None
+            self._stored = 0
+            self.offset = 0
+            self._protected_stored = 0
+            self._positions = ()
+            self._speculating = False
+            self._speculative_appends = deque()
+            return
+        self.keys, self.values = v
+        self._stored = int(self.keys.shape[2])
+        self.offset = self._stored
+        self._protected_stored = self._stored
+        self._positions = tuple(range(self._stored))
+        self._speculating = False
+        self._speculative_appends = deque()
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.offset,
+                    self._stored,
+                    self._protected_stored,
+                    self._encode_positions(self._positions),
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        vals = tuple(v)
+        ints = tuple(map(int, vals[:3]))
+        if len(ints) == 2:
+            self.offset, self._stored = ints
+            self._protected_stored = self._stored
+        else:
+            self.offset, self._stored, self._protected_stored = ints
+        if len(vals) >= 4:
+            self._positions = self._decode_positions(str(vals[3]))
+            if self._positions is not None and len(self._positions) != self._stored:
+                raise ValueError("stored row count does not match position metadata")
+        elif self.offset == self._stored:
+            self._positions = tuple(range(self._stored))
+        else:
+            self._positions = None
+        self._speculating = False
+        self._speculative_appends = deque()
+
+    def is_trimmable(self):
+        return self._speculating or self._positions is not None
+
+    @property
+    def protected_stored(self):
+        return self._protected_stored
+
+    @property
+    def positions(self):
+        return self._positions
+
+    def start_speculation(self):
+        self._speculating = True
+        self._speculative_appends.clear()
+
+    def stop_speculation(self):
+        self._speculating = False
+        self._speculative_appends.clear()
+
+    def _trim_speculative_suffix(self, n):
+        if not self._speculative_appends:
+            raise RuntimeError("No speculative append is available to trim")
+        latest = self._speculative_appends.pop()
+        if n > latest:
+            self._speculative_appends.append(latest)
+            raise RuntimeError(
+                f"Cannot trim {n} tokens from PositionPreservingKVCache: "
+                f"latest speculative append has {latest} tokens."
+            )
+        removable = self._stored - self._protected_stored
+        if n > removable:
+            self._speculative_appends.append(latest)
+            raise RuntimeError(
+                f"Cannot trim {n} tokens from PositionPreservingKVCache: "
+                f"only {removable} appended rows are removable."
+            )
+        self._stored -= n
+        self.offset -= n
+        if self._positions is not None and n:
+            self._positions = self._positions[:-n]
+        if n < latest:
+            self._speculative_appends.append(latest - n)
+        if self.offset < 0:
+            raise ValueError("trim would make true offset negative")
+        return n
+
+    def _trim_logical_prefix(self, n):
+        if self._positions is None:
+            raise RuntimeError(
+                "PositionPreservingKVCache has no position metadata for prefix trim"
+            )
+        n = min(int(n), self.offset)
+        if n <= 0:
+            return 0
+        new_offset = self.offset - n
+        old_positions = self._positions
+        keep_physical = [i for i, pos in enumerate(old_positions) if pos < new_offset]
+        new_positions = tuple(old_positions[i] for i in keep_physical)
+        if len(keep_physical) != self._stored:
+            if keep_physical:
+                self.keys = _take_positions(
+                    self.keys[..., : self._stored, :], keep_physical
+                )
+                self.values = _take_positions(
+                    self.values[..., : self._stored, :], keep_physical
+                )
+            else:
+                self.keys = self.keys[..., :0, :]
+                self.values = self.values[..., :0, :]
+        self._protected_stored = sum(
+            1 for pos in old_positions[: self._protected_stored] if pos < new_offset
+        )
+        self._stored = len(new_positions)
+        self._positions = new_positions
+        self.offset = new_offset
+        return n
+
+    def trim(self, n):
+        if n <= 0:
+            return 0
+        n = int(n)
+        if self._speculating:
+            return self._trim_speculative_suffix(n)
+        return self._trim_logical_prefix(n)
+
+    def make_mask(self, n_tokens, window_size=None, return_array: bool = False):
+        if window_size is not None:
+            raise ValueError(
+                "PositionPreservingKVCache does not support sliding-window masks"
+            )
+        if n_tokens == 1 and not return_array:
+            return None
+        prefix = mx.ones((n_tokens, self._stored), dtype=mx.bool_)
+        causal = mx.tril(mx.ones((n_tokens, n_tokens), dtype=mx.bool_))
+        return mx.concatenate([prefix, causal], axis=1)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return (
+            self.keys[..., : self._stored, :].nbytes
+            + self.values[..., : self._stored, :].nbytes
+        )
+
+
+def _take_positions(x, keep: Sequence[int]):
+    return mx.take(x, mx.array(keep, dtype=mx.int32), axis=2)
+
+
+@dataclass(frozen=True)
+class SnapKVEvictionResult:
+    cache: list
+    evicted: bool
+    true_offset: int
+    retained_tokens: int
+    original_tokens: int
+    kv_layers: int
+    compact_cache_nbytes: int
+
+
+def evict_prompt_cache(
+    prompt_cache: List[Any],
+    keep_indices: Sequence[int],
+    *,
+    true_offset: int,
+) -> SnapKVEvictionResult:
+    """Replace plain ``KVCache`` layers with position-preserving compact caches.
+
+    ``keep_indices`` are the sorted prompt positions to retain (see
+    ``snapkv_keep_indices``); every other layer type is left untouched.
+    """
+    keep = tuple(int(i) for i in keep_indices)
+    if any(i < 0 for i in keep):
+        raise ValueError("keep_indices must be non-negative")
+    if tuple(sorted(keep)) != keep:
+        raise ValueError("keep_indices must be sorted")
+
+    out = list(prompt_cache)
+    original_tokens = int(true_offset)
+    kv_layers = 0
+    for idx, cache in enumerate(prompt_cache):
+        if type(cache) is not KVCache or cache.keys is None:
+            continue
+        if keep and keep[-1] >= cache.offset:
+            raise ValueError("keep index exceeds KV cache offset")
+        keys, values = cache.state
+        new_keys = _take_positions(keys, keep) if keep else keys[..., :0, :]
+        new_values = _take_positions(values, keep) if keep else values[..., :0, :]
+        out[idx] = PositionPreservingKVCache(
+            new_keys,
+            new_values,
+            offset=true_offset,
+            positions=keep,
+        )
+        original_tokens = max(original_tokens, int(cache.offset))
+        kv_layers += 1
+
+    retained = len(keep)
+    compact_cache_nbytes = sum(int(getattr(cache, "nbytes", 0) or 0) for cache in out)
+    return SnapKVEvictionResult(
+        cache=out,
+        evicted=kv_layers > 0 and retained < original_tokens,
+        true_offset=int(true_offset),
+        retained_tokens=retained,
+        original_tokens=original_tokens,
+        kv_layers=kv_layers,
+        compact_cache_nbytes=compact_cache_nbytes,
+    )
+
+
+class SnapKVAttentionCapture:
+    """Capture windowed attention scores by wrapping ``mx.fast`` SDPA.
+
+    Used as a context manager around a prefill. The model output still uses the
+    original fused kernel; this hook separately scores only the final
+    ``window`` observation-window query rows, in small chunks reduced
+    immediately to a per-key vector, so it never retains a prompt-sized dense
+    attention matrix. ``snap_scores`` then returns a per-prompt-position score.
+
+    The patch is process-global for the duration of the ``with`` block, so a
+    prefill scored this way should not run concurrently with unscored prefills.
+    """
+
+    def __init__(self, window: int = 24, score_chunk_size: int = 8):
+        if window <= 0:
+            raise ValueError("window must be positive")
+        if score_chunk_size <= 0:
+            raise ValueError("score_chunk_size must be positive")
+        self.window = int(window)
+        self.score_chunk_size = int(score_chunk_size)
+        self._orig = None
+        self.snap = None
+
+    def __enter__(self):
+        self._orig = mx.fast.scaled_dot_product_attention
+        mx.fast.scaled_dot_product_attention = self._capture
+        return self
+
+    def __exit__(self, *_exc):
+        mx.fast.scaled_dot_product_attention = self._orig
+
+    def _align_add(self, current, vec):
+        if current is None:
+            return vec
+        if current.shape[0] < vec.shape[0]:
+            current = mx.concatenate(
+                [current, mx.zeros((vec.shape[0] - current.shape[0],), current.dtype)]
+            )
+        elif vec.shape[0] < current.shape[0]:
+            vec = mx.concatenate(
+                [vec, mx.zeros((current.shape[0] - vec.shape[0],), vec.dtype)]
+            )
+        return current + vec
+
+    @staticmethod
+    def _causal_chunk_mask(q_start, q_end, q_len, key_len):
+        key_positions = mx.arange(key_len)
+        query_positions = key_len - q_len + mx.arange(q_start, q_end)
+        return key_positions[None, :] <= query_positions[:, None]
+
+    @staticmethod
+    def _slice_mask(mask, q_start, q_end, q_len):
+        if mask is None or isinstance(mask, str):
+            return mask
+        if len(mask.shape) >= 2 and mask.shape[-2] == q_len:
+            prefix = (slice(None),) * (len(mask.shape) - 2)
+            return mask[prefix + (slice(q_start, q_end), slice(None))]
+        return mask
+
+    @staticmethod
+    def _slice_query_heads(mask, start, end):
+        if mask is None or isinstance(mask, str):
+            return mask
+        if len(mask.shape) >= 4 and mask.shape[-3] >= end:
+            prefix = (slice(None),) * (len(mask.shape) - 3)
+            return mask[prefix + (slice(start, end), slice(None), slice(None))]
+        return mask
+
+    @staticmethod
+    def _apply_mask(scores, mask):
+        if mask is None or isinstance(mask, str):
+            return scores
+        return mx.where(mask, scores, -1e9) if mask.dtype == mx.bool_ else scores + mask
+
+    def _score_chunk(self, q_chunk, k, scale, chunk_mask):
+        _bsz, q_heads, _chunk, _dim = q_chunk.shape
+        kv_heads = k.shape[1]
+        if kv_heads == q_heads:
+            scores = (q_chunk @ k.swapaxes(-1, -2)) * scale
+            return self._apply_mask(scores, chunk_mask)
+        if q_heads % kv_heads != 0:
+            raise ValueError("query heads must be a multiple of KV heads")
+        repeats = q_heads // kv_heads
+        groups = []
+        for kv_head in range(kv_heads):
+            q_start = kv_head * repeats
+            q_end = q_start + repeats
+            q_group = q_chunk[:, q_start:q_end, :, :]
+            k_group = k[:, kv_head : kv_head + 1, :, :]
+            scores = (q_group @ k_group.swapaxes(-1, -2)) * scale
+            scores = self._apply_mask(
+                scores, self._slice_query_heads(chunk_mask, q_start, q_end)
+            )
+            groups.append(scores)
+        return mx.concatenate(groups, axis=1)
+
+    def _capture(self, q, k, v, *, scale, mask=None, **kwargs):
+        out = self._orig(q, k, v, scale=scale, mask=mask, **kwargs)
+        _bsz, q_heads, q_len, _dim = q.shape
+        key_len = k.shape[2]
+        snap_window = min(self.window, q_len)
+        q_start = q_len - snap_window
+        for chunk_start in range(q_start, q_len, self.score_chunk_size):
+            chunk_end = min(q_len, chunk_start + self.score_chunk_size)
+            q_chunk = q[:, :, chunk_start:chunk_end, :]
+            chunk_mask = self._slice_mask(mask, chunk_start, chunk_end, q_len)
+            if isinstance(chunk_mask, str) and chunk_mask == "causal":
+                chunk_mask = self._causal_chunk_mask(
+                    chunk_start, chunk_end, q_len, key_len
+                )
+            scores = self._score_chunk(q_chunk, k, scale, chunk_mask)
+            weights = mx.softmax(scores.astype(mx.float32), axis=-1)
+            snap = weights.sum(axis=(0, 1, 2))
+            mx.eval(snap)
+            self.snap = self._align_add(self.snap, snap)
+            mx.eval(self.snap)
+        return out
+
+    def snap_scores(self, seq_len: int) -> List[float]:
+        if self.snap is None:
+            return [0.0] * seq_len
+        mx.eval(self.snap)
+        vals = self.snap.tolist()
+        if len(vals) < seq_len:
+            vals.extend([0.0] * (seq_len - len(vals)))
+        return [float(v) for v in vals[:seq_len]]
+
+
+def compact_prompt_cache(
+    model,
+    prompt,
+    *,
+    budget: int,
+    window: int = 24,
+    sink_tokens: int = 4,
+    recent_tokens: Optional[int] = None,
+    min_tokens: int = 128,
+    score_chunk_size: int = 8,
+) -> SnapKVEvictionResult:
+    """Prefill ``prompt`` and return a SnapKV-D-compacted prompt cache.
+
+    Convenience wrapper: prefills ``prompt`` (a 1-D token sequence) under a
+    ``SnapKVAttentionCapture``, scores it, and evicts every full-attention
+    ``KVCache`` layer down to ``budget`` retained rows. The returned
+    ``SnapKVEvictionResult.cache`` is ready to decode from at the true prompt
+    offset. No-op (all rows kept) for prompts at or below ``min_tokens``.
+    """
+    prompt = list(int(t) for t in prompt)
+    cache = make_prompt_cache(model)
+    with SnapKVAttentionCapture(
+        window=window, score_chunk_size=score_chunk_size
+    ) as capture:
+        logits = model(mx.array([prompt]), cache=cache)
+        mx.eval(logits, [c.state for c in cache])
+    seq_len = len(prompt)
+    scores = capture.snap_scores(seq_len)
+    keep = snapkv_keep_indices(
+        seq_len,
+        budget,
+        scores,
+        sink_tokens=sink_tokens,
+        recent_tokens=recent_tokens,
+        min_tokens=min_tokens,
+    )
+    return evict_prompt_cache(cache, keep, true_offset=seq_len)
