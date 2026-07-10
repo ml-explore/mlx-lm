@@ -359,15 +359,11 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
-        # Anchor-stride prefix reuse captures per-request prefill snapshots via
-        # the single-request generation path's progress callback, which the
-        # batched path does not expose. Trimmable models already reuse the full
-        # prefix via trim_prompt_cache (anchor-stride is a no-op for them), so
-        # only route non-trimmable models off the batched path when it is on.
-        if self.cli_args.prompt_cache_anchor_stride > 0 and not can_trim_prompt_cache(
-            make_prompt_cache(model)
-        ):
-            is_batchable = False
+        # Anchor-stride prefix reuse only does work for non-trimmable caches
+        # (recurrent/hybrid models); trimmable models already reuse the full
+        # prefix via trim_prompt_cache. Both the batched and single-request
+        # paths capture anchors, so batchability is unaffected.
+        non_trimmable = not can_trim_prompt_cache(make_prompt_cache(model))
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -375,6 +371,7 @@ class ModelProvider:
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.is_batchable = is_batchable
+        self.non_trimmable = non_trimmable
 
     def load_default(self):
         if self._model_map["default_model"] is not None:
@@ -776,6 +773,11 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        prompt_cache_anchor_stride=(
+                            self.cli_args.prompt_cache_anchor_stride
+                            if self.model_provider.non_trimmable
+                            else 0
+                        ),
                         stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -869,6 +871,17 @@ class ResponseGenerator:
                                 r.prompt_cache,
                                 cache_type="assistant",
                             )
+                            # Store anchors captured during this request's
+                            # prefill (non-trimmable models only; empty
+                            # otherwise). Drained here so they cannot leak.
+                            anchors = batch_generator.pop_anchors([r.uid])[r.uid]
+                            if anchors:
+                                self.prompt_cache.insert_anchors(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    anchors,
+                                    cache_type="assistant",
+                                )
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
