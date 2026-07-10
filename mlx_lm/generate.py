@@ -1610,6 +1610,15 @@ class BatchGenerator:
             raise ValueError(
                 "state_budget cannot be combined with kv_budget_bytes/kv_cost"
             )
+        if state_budget is not None and not isinstance(
+            state_budget.project, LinearStateCost
+        ):
+            raise ValueError(
+                "BatchGenerator state_budget requires LinearStateCost; "
+                "peak-only iterative policies such as StepStateCost must be "
+                "driven by their model-native scheduler with actual resident "
+                "request state"
+            )
         if kv_budget_bytes is not None:
             if kv_cost is None:
                 raise ValueError(

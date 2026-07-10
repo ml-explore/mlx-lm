@@ -49,16 +49,28 @@ class TestStateBudget(unittest.TestCase):
         model(mx.ones((1, 256), dtype=mx.int32), cache=caches)
         mx.eval([c.state for c in caches])
         at_256 = sum(c.nbytes for c in caches)
+        arrays_256 = sum(c.nbytes for c in caches if isinstance(c, ArraysCache))
+        kv_256 = sum(c.nbytes for c in caches if isinstance(c, KVCache))
         model(mx.ones((1, 256), dtype=mx.int32), cache=caches)
         mx.eval([c.state for c in caches])
         at_512 = sum(c.nbytes for c in caches)
+        arrays_512 = sum(c.nbytes for c in caches if isinstance(c, ArraysCache))
+        kv_512 = sum(c.nbytes for c in caches if isinstance(c, KVCache))
+        model(mx.ones((1, 256), dtype=mx.int32), cache=caches)
+        mx.eval([c.state for c in caches])
+        at_768 = sum(c.nbytes for c in caches)
+        arrays_768 = sum(c.nbytes for c in caches if isinstance(c, ArraysCache))
+        kv_768 = sum(c.nbytes for c in caches if isinstance(c, KVCache))
 
         per_unit = (at_512 - at_256) / 256
         fixed = at_256 - per_unit * 256
         self.assertGreater(fixed, 0)
         self.assertGreater(per_unit, 0)
+        self.assertEqual(arrays_256, arrays_512)
+        self.assertEqual(arrays_512, arrays_768)
+        self.assertEqual(kv_512 - kv_256, kv_768 - kv_512)
         cost = LinearStateCost(fixed, per_unit)
-        self.assertEqual(cost(AdmissionState("hybrid", 512)), at_512)
+        self.assertEqual(cost(AdmissionState("hybrid", 768)), at_768)
 
     def test_hybrid_fixed_and_linear_state(self):
         cost = LinearStateCost(49_000_000, 6_144, max_units=32_768)
@@ -121,6 +133,11 @@ class TestStateBudget(unittest.TestCase):
                     metadata={"state_bytes_by_step": (10, float("nan"))},
                 )
             )
+
+    def test_work_units_require_integers(self):
+        for value in (True, 1.5):
+            with self.assertRaises((TypeError, ValueError)):
+                AdmissionState("invalid", value)
 
     def test_exact_cohort_removal_and_liveness(self):
         policy = StateBudget(1_000, lambda state: state.metadata["peak_bytes"])

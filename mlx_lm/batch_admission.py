@@ -12,6 +12,7 @@ tokens or that state grows linearly.
 
 import math
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Any, Callable, Dict, Iterable, Optional
 
 
@@ -33,6 +34,11 @@ class AdmissionState:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral)
+            for value in (self.projected_units, self.completed_units)
+        ):
+            raise TypeError("work units must be non-bool integers")
         if self.projected_units < 0 or self.completed_units < 0:
             raise ValueError("work units must be non-negative")
         if self.completed_units > self.projected_units:
