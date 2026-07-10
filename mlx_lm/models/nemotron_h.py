@@ -56,6 +56,12 @@ class ModelArgs(BaseModelArgs):
     time_step_limit: Optional[Tuple[float, float]] = None
     time_step_min: Optional[float] = None
     time_step_max: Optional[float] = None
+    # Multi-token-prediction head (Nemotron 3 Super checkpoints). The module
+    # is built when num_nextn_predict_layers > 0 and dropped again in
+    # sanitize() if the checkpoint carries no mtp.* tensors.
+    num_nextn_predict_layers: int = 0
+    mtp_layers_block_type: Optional[List[str]] = None
+    mtp_hybrid_override_pattern: Optional[List[str]] = None
 
     # Map from layers_block_type names to single-char pattern codes
     _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
@@ -71,6 +77,16 @@ class ModelArgs(BaseModelArgs):
             ]
         if self.hybrid_override_pattern is not None:
             self.num_hidden_layers = len(self.hybrid_override_pattern)
+
+        if (
+            self.mtp_hybrid_override_pattern is None
+            and self.mtp_layers_block_type is not None
+        ):
+            self.mtp_hybrid_override_pattern = [
+                self._block_type_to_char[t] for t in self.mtp_layers_block_type
+            ]
+        if isinstance(self.mtp_hybrid_override_pattern, str):
+            self.mtp_hybrid_override_pattern = list(self.mtp_hybrid_override_pattern)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -136,7 +152,7 @@ class NemotronHMamba2Mixer(nn.Module):
         conv_input: mx.array,
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
-    ) -> mx.array:
+    ) -> Tuple[mx.array, mx.array]:
         if mask is not None:
             conv_input = mx.where(mask[..., None], conv_input, 0)
 
@@ -163,7 +179,7 @@ class NemotronHMamba2Mixer(nn.Module):
             )
 
         conv_output = self.conv1d(padded_input)
-        return nn.silu(conv_output)
+        return nn.silu(conv_output), padded_input
 
     def _ssm(
         self,
@@ -209,6 +225,7 @@ class NemotronHMamba2Mixer(nn.Module):
         hidden_states: mx.array,
         mask: Optional[mx.array],
         cache: Optional[ArraysCache] = None,
+        ssm_sink: Optional[list] = None,
     ) -> mx.array:
 
         projected = self.in_proj(hidden_states)
@@ -218,7 +235,7 @@ class NemotronHMamba2Mixer(nn.Module):
             [self.intermediate_size, self.intermediate_size + self.conv_dim],
             axis=-1,
         )
-        conv_output = self._conv(conv_input, cache, mask)
+        conv_output, padded_input = self._conv(conv_input, cache, mask)
         hidden_states_ssm, B, C = mx.split(
             conv_output,
             [
@@ -227,6 +244,28 @@ class NemotronHMamba2Mixer(nn.Module):
             ],
             axis=-1,
         )
+        if ssm_sink is not None:
+            # Everything needed to replay this update on an accepted prefix
+            # during speculative rollback; tuple layout consumed by
+            # Model.rollback_speculative_cache. Captured pre-_ssm so `state`
+            # is the value before this update overwrites cache[1].
+            bsz, S, _ = hidden_states_ssm.shape
+            ssm_sink.append(
+                (
+                    hidden_states_ssm.reshape(bsz, S, self.num_heads, self.head_dim),
+                    B.reshape(bsz, S, self.n_groups, self.ssm_state_size),
+                    C.reshape(bsz, S, self.n_groups, self.ssm_state_size),
+                    dt,
+                    self.A_log,
+                    self.D,
+                    self.dt_bias,
+                    self.time_step_limit,
+                    cache[1] if cache else None,
+                    mask,
+                    padded_input,
+                    self.conv_kernel_size,
+                )
+            )
         y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
         if cache:
             cache.advance(y.shape[1])
@@ -445,14 +484,48 @@ class NemotronHBlock(nn.Module):
         x,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        ssm_sink: Optional[list] = None,
     ):
         hidden_states = self.norm(x)
-        if self.block_type == "M" or self.block_type == "*":
+        if self.block_type == "M":
+            hidden_states = self.mixer(
+                hidden_states, mask=mask, cache=cache, ssm_sink=ssm_sink
+            )
+        elif self.block_type == "*":
             hidden_states = self.mixer(hidden_states, mask=mask, cache=cache)
         else:
             hidden_states = self.mixer(hidden_states)
 
         return x + hidden_states
+
+
+class NemotronHMTPBlock(NemotronHBlock):
+    """One layer of the DeepSeek-style multi-token-prediction head shipped
+    in Nemotron 3 Super checkpoints (config: num_nextn_predict_layers,
+    mtp_layers_block_type). The first layer carries the embed/hidden fusion
+    (eh_proj / enorm / hnorm), the last carries final_layernorm; the block
+    itself is a standard NemotronHBlock."""
+
+    def __init__(self, args: ModelArgs, block_type: str, is_first: bool, is_last: bool):
+        super().__init__(args, block_type)
+        eps = args.layer_norm_epsilon
+        if is_first:
+            self.eh_proj = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+            self.enorm = nn.RMSNorm(args.hidden_size, eps=eps)
+            self.hnorm = nn.RMSNorm(args.hidden_size, eps=eps)
+        if is_last:
+            self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
+
+
+class NemotronHMTP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        pattern = args.mtp_hybrid_override_pattern
+        n = len(pattern)
+        self.layers = [
+            NemotronHMTPBlock(args, bt, i == 0, i == n - 1)
+            for i, bt in enumerate(pattern)
+        ]
 
 
 class NemotronHModel(nn.Module):
@@ -481,6 +554,7 @@ class NemotronHModel(nn.Module):
         self,
         inputs,
         cache: Optional[Any] = None,
+        ssm_sink: Optional[list] = None,
     ):
         hidden_states = self.embeddings(inputs)
 
@@ -501,7 +575,7 @@ class NemotronHModel(nn.Module):
                 mask = attn_mask
             else:
                 mask = ssm_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(hidden_states, mask=mask, cache=c, ssm_sink=ssm_sink)
 
         return self.norm_f(hidden_states)
 
@@ -513,6 +587,8 @@ class Model(nn.Module):
         self.backbone = NemotronHModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.model_type = args.model_type
+        if args.num_nextn_predict_layers > 0 and args.mtp_hybrid_override_pattern:
+            self.mtp = NemotronHMTP(args)
 
     def __call__(
         self,
@@ -535,15 +611,116 @@ class Model(nn.Module):
                 caches.append(KVCache())
         return caches
 
+    def logits(self, hidden: mx.array) -> mx.array:
+        return self.lm_head(hidden)
+
+    def make_mtp_cache(self):
+        caches = []
+        for l in self.mtp.layers:
+            if l.block_type == "M":
+                caches.append(ArraysCache(size=2))
+            elif l.block_type == "*":
+                caches.append(KVCache())
+            else:
+                caches.append(None)
+        return caches
+
+    def mtp_step(self, hidden, tokens, mtp_cache):
+        """One MTP forward over S positions.
+
+        hidden: [B, S, H] post-norm_f hiddens at positions p..p+S-1 (from
+        the backbone, or from a previous mtp_step when chaining draft
+        depth). tokens: [B, S] the tokens at positions p+1..p+S (the
+        committed or drafted token FOLLOWING each hidden's position).
+        Returns (logits [B, S, V], post_final_layernorm hidden [B, S, H]).
+
+        The MTP KV cache offset counts pairs fed, i.e. positions are
+        uniformly shifted by -1 vs absolute; the attention layer only
+        attends within its own cache so the shift is harmless (NemotronH
+        attention uses no rope)."""
+        first = self.mtp.layers[0]
+        e = first.enorm(self.backbone.embeddings(tokens))
+        h = first.hnorm(hidden)
+        x = first.eh_proj(mx.concatenate([e, h], axis=-1))
+        fa_cache = next((c for c in mtp_cache if isinstance(c, KVCache)), None)
+        mask = create_attention_mask(x, fa_cache)
+        for layer, c in zip(self.mtp.layers, mtp_cache):
+            x = layer(x, mask=mask, cache=c)
+        post = self.mtp.layers[-1].final_layernorm(x)
+        return self.lm_head(post), post
+
+    def rollback_speculative_cache(self, caches, ssm_states, keep, block_size):
+        """Rewind target caches after a speculative verify forward of
+        `block_size` tokens of which the first `keep` are kept.
+
+        KV caches trim normally. Mamba2 caches (ArraysCache) hold a
+        recurrent state that cannot trim, so they are rebuilt by replaying
+        the captured verify inputs (`ssm_states`, from an `ssm_sink` passed
+        to the verify forward) on the kept prefix — one ssm_update per
+        Mamba layer since A_log/D/dt_bias are per-layer vectors.
+        Single-sequence (B=1, unpadded) only."""
+        trim = block_size - keep
+        ssm_caches = []
+        for c in caches:
+            if c is None:
+                continue
+            if c.is_trimmable():
+                if trim > 0:
+                    c.trim(trim)
+            else:
+                if c.lengths is not None or c.left_padding is not None:
+                    raise ValueError(
+                        "rollback_speculative_cache supports single-sequence "
+                        "caches only (lengths/left_padding must be None)"
+                    )
+                ssm_caches.append(c)
+        if not ssm_caches or trim == 0:
+            return
+        if len(ssm_caches) != len(ssm_states):
+            raise ValueError(
+                f"ssm_states has {len(ssm_states)} entries for "
+                f"{len(ssm_caches)} Mamba caches"
+            )
+
+        for c, st in zip(ssm_caches, ssm_states):
+            x, B, C, dt, A_log, D, dt_bias, tsl, state, mask, padded, K = st
+            if keep == 0:
+                # Nothing kept: restore the pre-verify state verbatim.
+                c[1] = state
+                c[0] = padded[:, : K - 1]
+                continue
+            _, new_state = ssm_update(
+                x[:, :keep],
+                A_log,
+                B[:, :keep],
+                C[:, :keep],
+                D.astype(x.dtype),
+                dt[:, :keep],
+                dt_bias,
+                state,
+                tsl,
+                None if mask is None else mask[:, :keep],
+            )
+            c[1] = new_state
+            c[0] = mx.contiguous(padded[:, keep : keep + K - 1])
+
     def sanitize(self, weights):
-        weights = {k: v for (k, v) in weights.items() if not k.startswith("mtp.")}
+        has_mtp_weights = any(k.startswith("mtp.") for k in weights)
+        if not (has_mtp_weights and hasattr(self, "mtp")):
+            # Checkpoint has no MTP tensors (or config declared no MTP
+            # layers): drop both the weights and the module so strict
+            # loading stays consistent.
+            weights = {k: v for (k, v) in weights.items() if not k.startswith("mtp.")}
+            if hasattr(self, "mtp"):
+                self.mtp = None
+
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
-        # Stack experts
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"backbone.layers.{l}.mixer"
+        # Stack experts (backbone and mtp layers alike)
+        prefixes = {k.rsplit(".experts.", 1)[0] for k in weights if ".experts." in k}
+        for prefix in prefixes:
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
                 if f"{prefix}.experts.0.{m}.weight" in weights:
                     to_join = [
