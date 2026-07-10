@@ -416,6 +416,46 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_glm4v_moe(self):
+        from mlx_lm.models import glm4v_moe
+
+        config = {
+            "model_type": "glm4v_moe",
+            "tie_word_embeddings": False,
+            "text_config": {
+                "model_type": "glm4v_moe_text",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "max_position_embeddings": 1000,
+                "moe_intermediate_size": 128,
+                "norm_topk_prob": True,
+                "num_attention_heads": 4,
+                "n_group": 2,
+                "head_dim": 32,
+                "topk_group": 1,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "routed_scaling_factor": 1.0,
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 1,
+                "num_hidden_layers": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "use_qk_norm": False,
+                "attention_bias": True,
+                "partial_rotary_factor": 0.5,
+            },
+        }
+        model = glm4v_moe.Model(glm4v_moe.ModelArgs.from_dict(config))
+        self.model_test_runner(
+            model,
+            "glm4v_moe",
+            config["text_config"]["vocab_size"],
+            config["text_config"]["num_hidden_layers"],
+        )
+
     def test_lfm2(self):
         from mlx_lm.models import lfm2
 
