@@ -1736,6 +1736,40 @@ class LRUPromptCache:
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
+    def insert_anchors(
+        self,
+        model: Any,
+        tokens: List[int],
+        anchors: List["PrefixAnchor"],
+        *,
+        cache_type: str = "assistant",
+    ):
+        """Insert exact shorter-prefix anchor snapshots for a prompt.
+
+        For a non-trimmable cache (recurrent/hybrid models, or a sliding-window
+        cache outside its window) ``fetch_nearest_cache`` cannot reuse a longer
+        stored prompt across a divergent tail, because that path needs
+        ``can_trim_prompt_cache``. Storing exact snapshots captured at stride
+        boundaries of this prompt (see ``PrefixAnchorCapture``) gives a later,
+        divergent prompt a reuse point at the nearest anchor below the shared
+        prefix. Each anchor is inserted as a normal shorter entry, so the
+        existing trie ``shorter`` lookup finds it with no change to retrieval.
+
+        Anchors whose cache is trimmable are skipped: for those the full-prefix
+        trim path already covers reuse and the anchors would only take space.
+        """
+        for anchor in anchors:
+            if anchor.length <= 0 or anchor.length >= len(tokens):
+                continue
+            if can_trim_prompt_cache(anchor.prompt_cache):
+                continue
+            self.insert_cache(
+                model,
+                tokens[: anchor.length],
+                anchor.prompt_cache,
+                cache_type=cache_type,
+            )
+
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
     ):
@@ -1761,3 +1795,54 @@ class LRUPromptCache:
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
         return result
+
+
+@dataclass
+class PrefixAnchor:
+    length: int  # number of prompt tokens this snapshot covers
+    prompt_cache: List[Any]  # deep-copied cache state at that prefix length
+
+
+class PrefixAnchorCapture:
+    """Capture exact prompt-cache snapshots at stride boundaries during prefill.
+
+    Wire an instance as (part of) the ``prompt_progress_callback`` passed to
+    ``generate_step``/``stream_generate``. On each call it deep-copies the live
+    cache once its processed length has advanced at least ``stride`` tokens past
+    the previous anchor, recording a ``PrefixAnchor`` at the true processed
+    prefix. The snapshots are amortized into the prefill the caller is doing
+    anyway; ``insert_anchors`` then stores them in an ``LRUPromptCache`` so a
+    later, divergent prompt can reuse up to the nearest anchor.
+
+    Capture is a no-op for trimmable caches -- those already get full-prefix
+    reuse through ``trim_prompt_cache`` -- so enabling it is safe regardless of
+    model architecture; it only does work for non-trimmable caches.
+
+    Args:
+        cache: the prompt cache being filled (the same object generation uses).
+        stride: minimum token spacing between anchors. ``<= 0`` disables capture.
+        max_anchors: cap on stored anchors per prompt (oldest kept first).
+    """
+
+    def __init__(self, cache: List[Any], stride: int, max_anchors: int = 32):
+        self.cache = cache
+        self.stride = stride
+        self.max_anchors = max_anchors
+        self.anchors: List[PrefixAnchor] = []
+        self._enabled = stride > 0 and not can_trim_prompt_cache(cache)
+        self._next = stride
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def __call__(self, processed: int, total: int):
+        # Signature matches prompt_progress_callback(processed, total).
+        if not self._enabled or len(self.anchors) >= self.max_anchors:
+            return
+        # Only snapshot strictly-shorter prefixes: the full prompt is stored
+        # separately by the caller via insert_cache.
+        if processed <= 0 or processed >= total or processed < self._next:
+            return
+        self.anchors.append(PrefixAnchor(processed, copy.deepcopy(self.cache)))
+        self._next = processed + self.stride

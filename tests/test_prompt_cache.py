@@ -16,6 +16,8 @@ from mlx_lm.models.cache import (
     CacheList,
     ChunkedKVCache,
     KVCache,
+    LRUPromptCache,
+    PrefixAnchorCapture,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -261,6 +263,91 @@ class TestPromptCache(unittest.TestCase):
         # Trim more tokens than remain
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
+
+    def _arrays_cache(self, tag):
+        # A minimal non-trimmable cache (as recurrent/hybrid models produce).
+        c = ArraysCache(size=1)
+        c[0] = mx.array([float(tag)])
+        return [c]
+
+    def test_prefix_anchor_capture_boundaries(self):
+        cache = self._arrays_cache(0)
+        cap = PrefixAnchorCapture(cache, stride=4)
+        self.assertTrue(cap.enabled)
+
+        total = 20
+        # Simulate a prefill that processes 4 tokens per step and mutates the
+        # cache each step; the capture should snapshot at each stride boundary.
+        for processed in range(0, total, 4):
+            cache[0][0] = mx.array([float(processed)])
+            cap(processed, total)
+
+        lengths = [a.length for a in cap.anchors]
+        self.assertEqual(lengths, [4, 8, 12, 16])
+        # Snapshots are independent copies frozen at capture time.
+        self.assertEqual(float(cap.anchors[0].prompt_cache[0][0].item()), 4.0)
+        self.assertEqual(float(cap.anchors[2].prompt_cache[0][0].item()), 12.0)
+        # The full length is never captured as an anchor.
+        self.assertTrue(all(a.length < total for a in cap.anchors))
+
+    def test_prefix_anchor_capture_noop_for_trimmable(self):
+        # Trimmable caches already reuse the full prefix via trim; capture off.
+        cache = [KVCache()]
+        x = mx.random.uniform(shape=(1, 8, 4, 4))
+        cache[0].update_and_fetch(x, x)
+        cap = PrefixAnchorCapture(cache, stride=4)
+        self.assertFalse(cap.enabled)
+        for processed in range(0, 20, 4):
+            cap(processed, 20)
+        self.assertEqual(cap.anchors, [])
+
+        # stride <= 0 disables capture regardless of cache type.
+        cap = PrefixAnchorCapture(self._arrays_cache(0), stride=0)
+        self.assertFalse(cap.enabled)
+
+    def test_anchor_stride_enables_reuse_for_non_trimmable(self):
+        model = "m"
+        req_a = list(range(1, 21))  # 20 tokens
+        # req_b shares a 13-token prefix with req_a, then diverges.
+        req_b = req_a[:13] + [900, 901, 902]
+
+        # Baseline: upstream store with only the full prompt -> no reuse across
+        # the divergent tail for a non-trimmable cache.
+        base = LRUPromptCache(max_size=8)
+        base.insert_cache(model, req_a, self._arrays_cache(1))
+        cache, rest = base.fetch_nearest_cache(model, req_b)
+        self.assertIsNone(cache)
+        self.assertEqual(rest, req_b)  # reused 0 tokens
+
+        # With anchors captured at stride 4 (lengths 4, 8, 12, 16), req_b reuses
+        # up to the nearest anchor <= its 13-token shared prefix, i.e. 12.
+        store = LRUPromptCache(max_size=8)
+        cap = PrefixAnchorCapture(self._arrays_cache(1), stride=4)
+        for processed in range(0, 20, 4):
+            cap(processed, 20)
+        store.insert_cache(model, req_a, self._arrays_cache(1))
+        store.insert_anchors(model, req_a, cap.anchors)
+
+        cache, rest = store.fetch_nearest_cache(model, req_b)
+        self.assertIsNotNone(cache)
+        reused = len(req_b) - len(rest)
+        self.assertEqual(reused, 12)
+        self.assertEqual(rest, req_b[12:])
+        # The reused prefix is an exact prefix of req_b (next-token-safe).
+        self.assertEqual(req_b[:reused], req_a[:reused])
+
+    def test_insert_anchors_skips_trimmable_snapshots(self):
+        from mlx_lm.models.cache import PrefixAnchor
+
+        model = "m"
+        tokens = list(range(1, 21))
+        kv = [KVCache()]
+        x = mx.random.uniform(shape=(1, 8, 8, 4))
+        kv[0].update_and_fetch(x, x)
+        store = LRUPromptCache(max_size=8)
+        store.insert_anchors(model, tokens, [PrefixAnchor(8, kv)])
+        # Trimmable anchor was skipped: nothing stored.
+        self.assertEqual(len(store), 0)
 
     def test_trim_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
