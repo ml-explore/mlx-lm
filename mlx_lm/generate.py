@@ -10,7 +10,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import (Any, Callable, Generator, List, Optional, Sequence, Tuple,
+                    Union)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -18,17 +19,9 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .models import cache
-from .models.cache import (
-    ArraysCache,
-    BatchKVCache,
-    BatchRotatingKVCache,
-    CacheList,
-    KVCache,
-    QuantizedKVCache,
-    RotatingKVCache,
-    TokenBuffer,
-    load_prompt_cache,
-)
+from .models.cache import (ArraysCache, BatchKVCache, BatchRotatingKVCache,
+                           CacheList, KVCache, QuantizedKVCache,
+                           RotatingKVCache, TokenBuffer, load_prompt_cache)
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
@@ -1435,12 +1428,22 @@ class GenerationBatch:
 
         # Sample
         if any(self.samplers):
-            all_samples = []
+            # Group rows sharing the same sampler so each unique sampler runs
+            # once, vectorized over its rows, instead of once per row.
+            groups = {}
             for e in range(len(self.uids)):
                 sample_sampler = self.samplers[e] or self.fallback_sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            sampled = mx.concatenate(all_samples, axis=0)
+                groups.setdefault(id(sample_sampler), (sample_sampler, []))[1].append(e)
+            if len(groups) == 1:
+                ((sample_sampler, _),) = groups.values()
+                sampled = sample_sampler(logprobs)
+            else:
+                all_samples = [None] * len(self.uids)
+                for sample_sampler, rows in groups.values():
+                    group_sampled = sample_sampler(logprobs[mx.array(rows)])
+                    for j, e in enumerate(rows):
+                        all_samples[e] = group_sampled[j : j + 1]
+                sampled = mx.concatenate(all_samples, axis=0)
         else:
             sampled = self.fallback_sampler(logprobs)
 

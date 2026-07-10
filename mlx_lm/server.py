@@ -15,31 +15,16 @@ from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Thread
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Literal,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-)
+from typing import (Any, Callable, Dict, List, Literal, NamedTuple, Optional,
+                    Sequence, Tuple, Union)
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import (
-    BatchGenerator,
-    StopSequenceMatcher,
-    TextStateMachine,
-    make_stop_matcher,
-    make_text_state_machine,
-    stream_generate,
-)
+from .generate import (BatchGenerator, StopSequenceMatcher, TextStateMachine,
+                       make_stop_matcher, make_text_state_machine,
+                       stream_generate)
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -378,7 +363,32 @@ class ModelProvider:
         return self.model, self.tokenizer
 
 
+_sampler_cache = {}
+
+
 def _make_sampler(args, tokenizer):
+    # Memoize on the sampling parameters so concurrent requests with identical
+    # settings share one sampler object. GenerationBatch groups rows by sampler
+    # identity, letting a whole batch sample in a single vectorized call.
+    key = (
+        id(tokenizer),
+        args.sampling.temperature,
+        args.sampling.top_p,
+        args.sampling.top_k,
+        args.sampling.min_p,
+        args.sampling.xtc_probability,
+        args.sampling.xtc_threshold,
+    )
+    if key in _sampler_cache:
+        return _sampler_cache[key]
+    if len(_sampler_cache) > 64:
+        _sampler_cache.clear()
+    sampler = _uncached_make_sampler(args, tokenizer)
+    _sampler_cache[key] = sampler
+    return sampler
+
+
+def _uncached_make_sampler(args, tokenizer):
     return make_sampler(
         args.sampling.temperature,
         top_p=args.sampling.top_p,
