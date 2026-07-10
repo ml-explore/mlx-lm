@@ -470,6 +470,52 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
+    def test_batch_shared_sampler_matches_fallback(self):
+        """Rows sharing one sampler object must match the fallback path."""
+        from mlx_lm.sample_utils import make_sampler
+
+        prompt = self.tokenizer.encode("hello world")
+        shared = make_sampler(temp=0.7, top_p=0.9)
+
+        mx.random.seed(11)
+        gen_a = BatchGenerator(self.model, max_tokens=16, sampler=shared)
+        uids_a = gen_a.insert([prompt] * 4)
+        tokens_a = {u: [] for u in uids_a}
+        done = set()
+        while len(done) < len(uids_a):
+            for r in gen_a.next_generated():
+                tokens_a[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+        del gen_a
+
+        mx.random.seed(11)
+        gen_b = BatchGenerator(self.model, max_tokens=16)
+        uids_b = gen_b.insert([prompt] * 4, samplers=[shared] * 4)
+        tokens_b = {u: [] for u in uids_b}
+        done = set()
+        while len(done) < len(uids_b):
+            for r in gen_b.next_generated():
+                tokens_b[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+        del gen_b
+
+        for ua, ub in zip(uids_a, uids_b):
+            self.assertEqual(tokens_a[ua], tokens_b[ub])
+
+    def test_batch_shared_nonvectorizing_sampler(self):
+        """A shared sampler that always returns one token still works per-row."""
+        prompt = self.tokenizer.encode("hello")
+        constant = lambda _: mx.array([5])
+
+        batch_gen = BatchGenerator(self.model, max_tokens=1)
+        uids = batch_gen.insert([prompt] * 3, samplers=[constant] * 3)
+        responses = {r.uid: r for r in batch_gen.next_generated()}
+        for uid in uids:
+            self.assertEqual(responses[uid].token, 5)
+        del batch_gen
+
     def test_batch_generate_with_stop_matchers(self):
         """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
         batch_gen = BatchGenerator(
