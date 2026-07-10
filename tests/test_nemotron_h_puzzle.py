@@ -211,6 +211,18 @@ def test_native_timestep_keeps_state_transition_in_float32():
     assert mx.allclose(final_state, reference_state, rtol=1e-5, atol=1e-5).item()
 
 
+def test_explicit_time_step_limit_is_preserved():
+    explicit_limit = (0.001, 100.0)
+    for model_type in ("nemotron_h", "nemotron_h_puzzle"):
+        args = replace(
+            puzzle_args(),
+            model_type=model_type,
+            time_step_min=0.002,
+            time_step_limit=explicit_limit,
+        )
+        assert args.time_step_limit == explicit_limit
+
+
 def test_puzzle_precision_changes_do_not_change_base_nemotron_h():
     common = dict(
         num_hidden_layers=1,
