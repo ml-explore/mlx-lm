@@ -575,7 +575,7 @@ class TestGenerate(unittest.TestCase):
             max_tokens=0,
             max_kv_size=16,
             kv_budget_bytes=17_000,
-            kv_cost=(0.0, 1_000.0),
+            kv_cost=(0.0, 1_000.0, 1),
         )
         gen._prompt_batch = _StubPromptBatch()
         # 10 cached history + 10 new prompt tokens, none processed yet.
