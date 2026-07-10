@@ -602,6 +602,14 @@ def speculative_generate_step(
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
+            # Until this round's verify step has advanced the caches there is
+            # nothing to rewind. Keep ``n == num_draft`` so that if an exception
+            # (or a generator ``close()``) fires before ``n`` is recomputed
+            # below, the finally-block rewind is a no-op instead of trimming
+            # with a stale ``n`` from the previous round -- which can go
+            # negative when ``num_draft`` shrinks near ``max_tokens`` and
+            # corrupt the cache offset.
+            n = num_draft
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
