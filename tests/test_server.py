@@ -780,6 +780,97 @@ class TestKVBudgetProbeFailure(unittest.TestCase):
             gen.stop_and_join()
 
 
+class _FakeLeaf:
+    """Synthetic stepped-capacity cache leaf for probe refusal tests."""
+
+    def __init__(self, slope, step=256, fixed=0):
+        self._slope = slope
+        self._fixed = fixed
+        self._tokens = 0
+        self.step = step
+        self.state = []
+
+    def grow(self, n):
+        self._tokens += n
+
+    @property
+    def nbytes(self):
+        if self._slope == 0:
+            return self._fixed
+        cap = self._tokens
+        if self.step:
+            cap = -(-cap // self.step) * self.step
+        return self._fixed + int(self._slope * cap)
+
+
+class _FakeModel:
+    """Model stand-in: make_cache returns crafted leaves; forwards grow them."""
+
+    def __init__(self, leaf_specs):
+        # (slope, step, fixed) specs — make_cache mints FRESH leaves each
+        # call, matching real make_prompt_cache semantics
+        self._specs = leaf_specs
+
+    def make_cache(self):
+        out = []
+        for spec in self._specs:
+            if isinstance(spec, tuple):
+                leaf = _FakeLeaf(spec[0], step=spec[1], fixed=spec[2])
+            else:
+                leaf = spec  # pre-built object (opaque/step-less cases)
+            out.append(leaf)
+        return out
+
+    def __call__(self, toks, cache=None):
+        n = toks.shape[-1]
+        for c in cache:
+            if hasattr(c, "grow"):
+                c.grow(n)
+        return toks
+
+
+class TestMeasureKVCostRefusals(unittest.TestCase):
+    def test_growing_leaf_without_step_refused(self):
+        leaf = _FakeLeaf(slope=100.0)
+        leaf.step = None
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_FakeModel([leaf]))
+
+    def test_mixed_steps_refused(self):
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(
+                _FakeModel([_FakeLeaf(100.0, step=256), _FakeLeaf(100.0, step=128)])
+            )
+
+    def test_opaque_composite_refused(self):
+        class _Opaque:
+            state = []
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_FakeModel([_Opaque()]))
+
+    def test_consistent_stepped_fit_accepted(self):
+        """Per-leaf consistency: a well-behaved stepped linear cache yields
+        the raw slope, near-zero fixed, and the validated common step; the
+        internal 528-token verification passes."""
+        fixed, per_tok, step = _measure_kv_cost(
+            _FakeModel([(100.0, 256, 0), (50.0, 256, 0)])
+        )
+        self.assertEqual(step, 256)
+        self.assertAlmostEqual(per_tok, 150.0, delta=1.0)
+        self.assertLessEqual(fixed, per_tok * 2)
+
+    def test_fixed_only_leaf_adds_no_step_requirement(self):
+        """A fixed-size leaf (ArraysCache-like) alongside stepped growth is
+        fine; its bytes appear in fixed, not slope."""
+        fixed, per_tok, step = _measure_kv_cost(
+            _FakeModel([(100.0, 256, 0), (0, None, 5000)])
+        )
+        self.assertEqual(step, 256)
+        self.assertAlmostEqual(per_tok, 100.0, delta=1.0)
+        self.assertGreaterEqual(fixed, 5000 * 0.99)
+
+
 class TestMeasureKVCost(unittest.TestCase):
     def test_measures_linear_cache(self):
         model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
