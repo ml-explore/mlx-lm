@@ -272,19 +272,17 @@ class TimeBudget:
 
 
 def _measure_kv_cost(model):
-    """Measure a conservative (fixed_bytes_per_row, bytes_per_token) for one
+    """Measure (raw_fixed_bytes, bytes_per_token, common_step_units) for one
     sequence row of this model's cache.
 
-    Cache leaves allocate capacity in steps (``KVCache.step`` = 256), so a
-    row's live bytes exceed ``slope * tokens`` by up to ``slope * (step-1)``
-    per stepped leaf. The raw two-point fit (chunk-aligned probes, exact at
-    boundaries) is therefore padded with that rounding slack in the FIXED
-    component, upper-bounding stepped capacity while keeping the linear
-    policy contract. The safe projection is verified at a deliberately
-    non-boundary point (528 tokens): observed live bytes must not exceed it.
-
-    Rotating/sliding caches saturate at their window; measurement (and byte
-    budgeting) is refused if the probe range would cross the smallest window.
+    Returns the RAW linear fit plus the validated COMMON allocation step of
+    all growing stepped leaves; step-aware (cohort-level) rounding is applied
+    by the admission layer, not here — returning padded values would double
+    count once the cohort projector rounds. Budgeting is refused when:
+    growing leaves disagree on step, a growing leaf lacks a usable step, a
+    composite cache cannot be recursed, or a rotating cache saturates inside
+    the probe range. A non-boundary verification (528 tokens) checks the
+    step-rounded projection covers observed bytes.
     """
     caches = make_prompt_cache(model)
 
@@ -293,8 +291,13 @@ def _measure_kv_cost(model):
             inner = getattr(c, "caches", None)
             if inner:
                 yield from leaves(inner)
-            else:
+            elif hasattr(c, "nbytes"):
                 yield c
+            else:
+                raise ValueError(
+                    f"opaque cache component {type(c).__name__}: cannot "
+                    f"verify allocation growth, refusing byte budgeting"
+                )
 
     def rotating_windows(cs):
         for c in leaves(cs):
@@ -326,43 +329,54 @@ def _measure_kv_cost(model):
     per_token = sum(g - b for g, b in zip(grown_per_leaf, base_per_leaf)) / probe
     raw_fixed = max(sum(base_per_leaf) - per_token * warm, 0.0)
 
-    # Conservative rounding slack: one (step-1) worth of slope per GROWING
-    # stepped leaf per row. Fixed-size leaves (e.g. ArraysCache) add none.
-    rounding_slack = 0.0
+    # Validate ONE common allocation step across all growing leaves;
+    # fail closed on anything unverifiable (reviewer requirements).
+    steps = set()
     for c, b, g in zip(leaf_list, base_per_leaf, grown_per_leaf):
-        step = getattr(c, "step", None)
-        if step and g > b:
-            leaf_slope = (g - b) / probe
-            rounding_slack += leaf_slope * (step - 1)
-    safe_fixed = raw_fixed + rounding_slack
+        if g > b:
+            step = getattr(c, "step", None)
+            if (
+                step is None
+                or isinstance(step, bool)
+                or not isinstance(step, int)
+                or step <= 0
+            ):
+                raise ValueError(
+                    f"growing cache leaf {type(c).__name__} has no usable "
+                    f"allocation step ({step!r}); refusing byte budgeting"
+                )
+            steps.add(step)
+    if len(steps) > 1:
+        raise ValueError(
+            f"growing cache leaves disagree on allocation step {sorted(steps)}; "
+            f"mixed-step budgeting is not supported"
+        )
+    common_step = steps.pop() if steps else 1
 
-    # Verification at a non-boundary point: safe projection must cover the
-    # OBSERVED live bytes (over-projection is fine and is reported).
+    # Non-boundary verification: step-rounded projection must cover reality
     vcaches = make_prompt_cache(model)
     forward(vcaches, verify_at, 0)
     observed = sum(c.nbytes for c in leaves(vcaches))
-    projected = safe_fixed + per_token * verify_at
+    rounded_units = -(-verify_at // common_step) * common_step
+    projected = raw_fixed + per_token * rounded_units
     if observed > projected:
         raise ValueError(
             f"state-cost safety check failed: observed {observed} bytes at "
-            f"{verify_at} tokens exceeds safe projection {projected:.0f}; "
-            f"cache allocation behavior does not match the stepped-linear "
-            f"model, refusing byte budgeting"
+            f"{verify_at} tokens exceeds step-rounded projection "
+            f"{projected:.0f}; refusing byte budgeting"
         )
     logging.info(
-        "state-cost fit: per_token %.0f B, raw fixed %.0f B, rounding "
-        "slack %.0f B (leaves: %s); verified at %d tokens: observed %d <= "
-        "projected %.0f (overprojection %.1f%%)",
+        "state-cost fit: per_token %.0f B, raw fixed %.0f B, common step %d "
+        "(leaves: %s); verified at %d tokens: observed %d <= projected %.0f",
         per_token,
         raw_fixed,
-        rounding_slack,
+        common_step,
         sorted({type(c).__name__ for c in leaf_list}),
         verify_at,
         observed,
         projected,
-        (projected - observed) / max(observed, 1) * 100,
     )
-    return safe_fixed, per_token
+    return raw_fixed, per_token, common_step
 
 
 class ModelProvider:
@@ -855,16 +869,18 @@ class ResponseGenerator:
                         kv_budget_bytes = None
                         kv_cost = None
                         if self.cli_args.state_budget_gb is not None:
-                            kv_budget_bytes = int(
-                                self.cli_args.state_budget_gb * (1 << 30)
-                            )
-                            kv_cost = _measure_kv_cost(model)
-                            logging.info(
-                                "State budget %.2f GB; measured cost: "
-                                "fixed %.0f B/row, %.0f B/token",
-                                self.cli_args.state_budget_gb,
-                                kv_cost[0],
-                                kv_cost[1],
+                            # INTERIM SAFETY DISABLE: shared batch caches
+                            # allocate every row at the cohort-max width, so
+                            # per-row linear projection can admit above
+                            # budget for heterogeneous cohorts (reviewer
+                            # P1). The flag refuses until cohort-aware
+                            # accounting lands; _measure_kv_cost stays
+                            # exercised by tests for the coming rework.
+                            raise ValueError(
+                                "--state-budget-gb is disabled: cohort-"
+                                "aware state accounting is not yet safe "
+                                "for shared batch caches (see "
+                                "batch_admission cohort_bytes work)"
                             )
                         batch_generator = BatchGenerator(
                             model,

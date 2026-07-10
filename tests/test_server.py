@@ -783,8 +783,12 @@ class TestKVBudgetProbeFailure(unittest.TestCase):
 class TestMeasureKVCost(unittest.TestCase):
     def test_measures_linear_cache(self):
         model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
-        fixed, per_token = _measure_kv_cost(model)
+        fixed, per_token, step = _measure_kv_cost(model)
         self.assertGreater(per_token, 0)
+        self.assertEqual(step, 256)  # validated common KVCache step
+        # RAW fit: no slack folded in (rounding is the admission layer's
+        # job at cohort level — folding it here would double count)
+        self.assertLessEqual(fixed, per_token * 8)
         # Cross-check against the analytic per-token KV size
         cfg = model.args
         expected = (
@@ -795,10 +799,6 @@ class TestMeasureKVCost(unittest.TestCase):
             * 2  # bf16
         )
         self.assertAlmostEqual(per_token, expected, delta=expected * 0.01)
-        # Fixed now carries the conservative rounding slack: one (step-1)
-        # of slope per stepped leaf — for a homogeneous KVCache model that
-        # is per_token * 255 (raw fixed is ~0 for pure attention).
-        self.assertAlmostEqual(fixed, per_token * 255, delta=expected * 3)
 
     def test_safe_projection_covers_non_boundary_allocation(self):
         """528-token regression (codex safety design): step-rounded live
@@ -808,18 +808,19 @@ class TestMeasureKVCost(unittest.TestCase):
         from mlx_lm.models.cache import make_prompt_cache
 
         model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
-        fixed, per_token = _measure_kv_cost(model)
+        fixed, per_token, step = _measure_kv_cost(model)
 
         caches = make_prompt_cache(model)
         toks = mx.array([[(i % 100) + 1 for i in range(528)]])
         model(toks, cache=caches)
         mx.eval([c.state for c in caches])
         observed = sum(c.nbytes for c in caches)
-        projected = fixed + per_token * 528
+        rounded = -(-528 // step) * step
+        projected = fixed + per_token * rounded
         self.assertLessEqual(observed, projected)
-        # And the OLD (unsafe) exact projection must be shown insufficient,
-        # proving the slack is load-bearing, not slackness for its own sake
-        self.assertGreater(observed, per_token * 528)
+        # And the UNROUNDED exact projection must be shown insufficient,
+        # proving step-rounding is load-bearing
+        self.assertGreater(observed, fixed + per_token * 528)
 
 
 if __name__ == "__main__":
