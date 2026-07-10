@@ -160,6 +160,8 @@ def ssm_attn(
     dt_fn = compute_dt if promote_dt else compute_dt_native
     dt = dt_fn(dt, dt_bias, time_step_limit)
     repeats = h // g
+    # In native-dt mode the state transition follows A_log's dtype. Callers
+    # that require an FP32 recurrence must therefore pass FP32 A_log.
     A_dtype = dt.dtype if promote_dt else A_log.dtype
     A = -mx.exp(A_log).astype(A_dtype)
     dtA = dt * A.reshape(1, 1, -1)
