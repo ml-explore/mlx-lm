@@ -40,7 +40,12 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    PrefixAnchorCapture,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+)
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -354,6 +359,15 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+        # Anchor-stride prefix reuse captures per-request prefill snapshots via
+        # the single-request generation path's progress callback, which the
+        # batched path does not expose. Trimmable models already reuse the full
+        # prefix via trim_prompt_cache (anchor-stride is a no-op for them), so
+        # only route non-trimmable models off the batched path when it is on.
+        if self.cli_args.prompt_cache_anchor_stride > 0 and not can_trim_prompt_cache(
+            make_prompt_cache(model)
+        ):
+            is_batchable = False
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -915,10 +929,28 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
+            made_fresh = cache is None
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            # Capture anchor snapshots during this prefill for a non-trimmable
+            # cache, so a later divergent request can reuse up to the nearest
+            # anchor. Only on a full miss, where processed prefill length equals
+            # the absolute prompt prefix length. No-op for trimmable caches.
+            anchor_stride = self.cli_args.prompt_cache_anchor_stride
+            anchor_capture = None
+            progress_callback = progress
+            prefill_step_size = self.cli_args.prefill_step_size
+            if anchor_stride > 0 and made_fresh:
+                anchor_capture = PrefixAnchorCapture(cache, anchor_stride)
+                if anchor_capture.enabled:
+                    prefill_step_size = min(prefill_step_size, anchor_stride)
+
+                    def progress_callback(processed, total, _cap=anchor_capture):
+                        _cap(processed, total)
+                        progress(processed, total)
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
@@ -932,8 +964,8 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
-                prompt_progress_callback=progress,
-                prefill_step_size=self.cli_args.prefill_step_size,
+                prompt_progress_callback=progress_callback,
+                prefill_step_size=prefill_step_size,
             ):
                 finish_reason = gen.finish_reason
 
@@ -971,6 +1003,10 @@ class ResponseGenerator:
             self.prompt_cache.insert_cache(
                 self.model_provider.model_key, cache_key, cache
             )
+            if anchor_capture is not None:
+                self.prompt_cache.insert_anchors(
+                    self.model_provider.model_key, cache_key, anchor_capture.anchors
+                )
 
         except Exception as e:
             rqueue.put(e)
@@ -1847,6 +1883,19 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-anchor-stride",
+        type=int,
+        default=0,
+        help=(
+            "Enable anchor-stride prefix reuse for non-trimmable caches "
+            "(recurrent/hybrid models). Captures exact prompt-prefix snapshots "
+            "every N tokens so a later divergent request reuses up to the "
+            "nearest anchor. 0 disables it (default). No effect on trimmable "
+            "models. Enabling it routes non-trimmable models through the "
+            "single-request generation path."
+        ),
     )
     parser.add_argument(
         "--pipeline",

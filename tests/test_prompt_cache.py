@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
@@ -20,6 +21,7 @@ from mlx_lm.models.cache import (
     PrefixAnchorCapture,
     QuantizedKVCache,
     RotatingKVCache,
+    can_trim_prompt_cache,
     load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
@@ -28,6 +30,43 @@ from mlx_lm.models.cache import (
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+
+
+class _TinyRecurrentModel(nn.Module):
+    """A tiny non-trimmable recurrent LM for anchor-capture tests.
+
+    ``make_cache`` returns one single-slot ``ArraysCache`` per layer
+    (``can_trim_prompt_cache`` is False), and the final hidden state is a pure
+    function of the entire processed prefix, so continuing from a shorter-prefix
+    snapshot is identical to a cold full prefill regardless of prefill chunking.
+    """
+
+    def __init__(self, vocab=64, dim=16, n_layers=2):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, dim)
+        self.wx = [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        self.wh = [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        self.out = nn.Linear(dim, vocab, bias=False)
+        self.n_layers = n_layers
+
+    def make_cache(self):
+        return [ArraysCache(1) for _ in range(self.n_layers)]
+
+    def __call__(self, inputs, cache=None):
+        x = self.embed(inputs)
+        if cache is None:
+            cache = [None] * self.n_layers
+        for wx, wh, c in zip(self.wx, self.wh, cache):
+            B, T, D = x.shape
+            h = c[0] if (c is not None and c[0] is not None) else mx.zeros((B, D))
+            outs = []
+            for t in range(T):
+                h = mx.tanh(wx(x[:, t]) + wh(h))
+                outs.append(h)
+            if c is not None:
+                c[0] = h
+            x = mx.stack(outs, axis=1)
+        return self.out(x)
 
 
 class TestPromptCache(unittest.TestCase):
@@ -335,6 +374,55 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(rest, req_b[12:])
         # The reused prefix is an exact prefix of req_b (next-token-safe).
         self.assertEqual(req_b[:reused], req_a[:reused])
+
+    def test_anchor_capture_during_real_prefill_enables_exact_reuse(self):
+        # End-to-end: capture anchors during a real generate_step prefill (the
+        # path the server uses), then reuse from an anchor for a divergent
+        # request and confirm the continuation is next-token-identical to cold.
+        mx.random.seed(0)
+        model = _TinyRecurrentModel(vocab=64, dim=16, n_layers=2)
+        mx.eval(model.parameters())
+
+        import random
+
+        rng = random.Random(0)
+        shared = [rng.randrange(64) for _ in range(40)]
+        req_a = shared + [rng.randrange(64) for _ in range(6)]
+        req_b = shared + [63, 0, 62]  # diverges right after the 40-token prefix
+        stride = 8
+
+        # Serve req_a, capturing anchors as a byproduct of its prefill.
+        cache = make_prompt_cache(model)
+        self.assertFalse(can_trim_prompt_cache(cache))
+        capture = PrefixAnchorCapture(cache, stride)
+        self.assertTrue(capture.enabled)
+        gen = generate_step(
+            mx.array(req_a),
+            model,
+            max_tokens=1,
+            prompt_cache=cache,
+            prompt_progress_callback=capture,
+            prefill_step_size=stride,
+        )
+        next(gen)
+        mx.eval([c.state for c in cache])
+        self.assertEqual([a.length for a in capture.anchors], [8, 16, 24, 32, 40])
+
+        store = LRUPromptCache(max_size=8)
+        store.insert_cache("m", req_a, cache)
+        store.insert_anchors("m", req_a, capture.anchors)
+
+        reuse_cache, rest = store.fetch_nearest_cache("m", req_b)
+        self.assertIsNotNone(reuse_cache)
+        reused = len(req_b) - len(rest)
+        self.assertEqual(reused, 40)  # nearest anchor <= the 40-token prefix
+        self.assertEqual(rest, req_b[40:])
+
+        # Next token from the reused cache must equal a cold full prefill.
+        warm_tok = int(mx.argmax(model(mx.array([rest]), cache=reuse_cache)[0, -1]))
+        cold_cache = make_prompt_cache(model)
+        cold_tok = int(mx.argmax(model(mx.array([req_b]), cache=cold_cache)[0, -1]))
+        self.assertEqual(warm_tok, cold_tok)
 
     def test_insert_anchors_skips_trimmable_snapshots(self):
         from mlx_lm.models.cache import PrefixAnchor
