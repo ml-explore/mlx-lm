@@ -470,6 +470,127 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
+    def test_kv_budget_none_is_current_behavior(self):
+        """kv_budget_bytes=None must leave admission purely count-based."""
+        gen = BatchGenerator(self.model, max_tokens=4)
+        self.assertIsNone(gen.kv_budget_bytes)
+        # _budget_admissible must be the identity when budgeting is off
+        self.assertEqual(gen._budget_admissible(5), 5)
+
+    def test_kv_budget_requires_kv_cost(self):
+        with self.assertRaises(ValueError):
+            BatchGenerator(self.model, kv_budget_bytes=1 << 30)
+
+    def test_kv_budget_limits_admission(self):
+        """Only as many rows admit as the projected bytes allow."""
+        prompt = self.tokenizer.encode("hello world")
+        per_tok = 1000.0
+        # Each row projects to ~(len(prompt)+4)*1000 bytes; budget fits 2 rows
+        row = (len(prompt) + 4) * per_tok
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            kv_budget_bytes=int(2.5 * row),
+            kv_cost=(0.0, per_tok),
+        )
+        gen.insert([prompt] * 4)
+        self.assertEqual(gen._budget_admissible(4), 2)
+
+    def test_kv_budget_counts_fixed_row_state(self):
+        """Hybrid-style fixed per-row bytes gate admission too."""
+        prompt = self.tokenizer.encode("hello")
+        fixed = 10_000.0
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            kv_budget_bytes=int(2.5 * fixed),
+            kv_cost=(fixed, 0.0),
+        )
+        gen.insert([prompt] * 4)
+        self.assertEqual(gen._budget_admissible(4), 2)
+
+    def test_kv_budget_caps_projection_at_max_kv_size(self):
+        """max_kv_size bounds the projected per-row growth."""
+        prompt = self.tokenizer.encode("hello world " * 20)
+        per_tok = 1000.0
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=10_000,
+            max_kv_size=8,
+            kv_budget_bytes=int(2.5 * 8 * per_tok),
+            kv_cost=(0.0, per_tok),
+        )
+        gen.insert([prompt] * 4)
+        # Uncapped projection would admit 0; capped admits 2
+        self.assertEqual(gen._budget_admissible(4), 2)
+
+    def test_kv_budget_oversized_single_request_liveness(self):
+        """A request alone over budget still admits when nothing is active."""
+        prompt = self.tokenizer.encode("hello world " * 50)
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=64,
+            kv_budget_bytes=10,  # absurdly small
+            kv_cost=(0.0, 1000.0),
+        )
+        gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 1)
+
+    def test_kv_budget_continued_generation_not_double_counted(self):
+        """A pre-supplied cache's existing bytes reduce the candidate's need."""
+        from mlx_lm.models import cache as cache_mod
+
+        prompt = self.tokenizer.encode("hello world")
+        per_tok = 1000.0
+        row = (len(prompt) + 4) * per_tok
+
+        # Prime a real cache by running one request to completion
+        gen0 = BatchGenerator(self.model, max_tokens=4)
+        (uid,) = gen0.insert([prompt])
+        primed = None
+        while primed is None:
+            for r in gen0.next_generated():
+                if r.finish_reason is not None:
+                    primed = r.prompt_cache
+        del gen0
+
+        existing = sum(c.nbytes for c in primed)
+        self.assertGreater(existing, 0)
+
+        # Budget covers 1.5 fresh rows: a fresh candidate + a fully-primed
+        # candidate must BOTH admit (primed one costs ~0 incremental), while
+        # two fresh ones would not.
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            kv_budget_bytes=int(existing + 1.5 * row),
+            kv_cost=(0.0, per_tok),
+        )
+        gen.insert([prompt])  # fresh
+        gen.insert([prompt], caches=[primed])  # continued, bytes exist
+        self.assertEqual(gen._budget_admissible(2), 2)
+
+    def test_kv_budget_e2e_generation_completes(self):
+        """Budgeted end-to-end run finishes all requests (queued, not lost)."""
+        prompt = self.tokenizer.encode("hello world")
+        per_tok = 1000.0
+        row = (len(prompt) + 4) * per_tok
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            kv_budget_bytes=int(200 * row),  # generous; smoke the wiring
+            kv_cost=(0.0, per_tok),
+        )
+        uids = gen.insert([prompt] * 4)
+        done = set()
+        for _ in range(200):
+            for r in gen.next_generated():
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == len(uids):
+                break
+        self.assertEqual(len(done), len(uids))
+
     def test_batch_generate_with_stop_matchers(self):
         """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
         batch_gen = BatchGenerator(

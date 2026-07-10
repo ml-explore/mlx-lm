@@ -1587,6 +1587,8 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        kv_budget_bytes: Optional[int] = None,
+        kv_cost: Optional[Tuple[float, float]] = None,
         stream=None,
     ):
         self.model = model
@@ -1598,6 +1600,17 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        if kv_budget_bytes is not None:
+            if kv_cost is None:
+                raise ValueError(
+                    "kv_budget_bytes requires kv_cost=(fixed_bytes_per_row, "
+                    "bytes_per_token) measured for this model"
+                )
+            fixed, per_token = kv_cost
+            if kv_budget_bytes <= 0 or fixed < 0 or per_token < 0:
+                raise ValueError("kv_budget_bytes must be positive and kv_cost >= 0")
+        self.kv_budget_bytes = kv_budget_bytes
+        self.kv_cost = kv_cost
 
         self._stream = stream or generation_stream
 
@@ -1842,6 +1855,74 @@ class BatchGenerator:
             max_tokens=max_tokens,
         )
 
+    def _capped_tokens(self, tokens):
+        if self.max_kv_size is not None:
+            return min(tokens, self.max_kv_size)
+        return tokens
+
+    def _budget_admissible(self, n):
+        """How many of the first n queued sequences fit the KV byte budget.
+
+        Recomputed from live state on every call, so removals free headroom
+        automatically. Committed bytes = all live cache bytes (queued,
+        prefilling, and generating rows) plus the projected REMAINING growth
+        of every active row: per-token growth up to each row's capped final
+        length, plus fixed per-row state for rows that have not yet run a
+        forward pass. A candidate's cost is its full projection minus bytes
+        its pre-supplied cache already holds (continued generation), so
+        existing bytes are never double counted.
+        """
+        if self.kv_budget_bytes is None or n <= 0:
+            return n
+        fixed, per_token = self.kv_cost
+
+        committed = self.prompt_cache_nbytes
+
+        # Remaining growth of rows currently generating
+        gb = self._generation_batch
+        for i in range(len(gb)):
+            current = len(gb.tokens[i])
+            final = current + max(gb.max_tokens[i] - gb._num_tokens[i], 0)
+            growth = self._capped_tokens(final) - min(
+                current, self._capped_tokens(final)
+            )
+            committed += per_token * max(growth, 0)
+
+        # Remaining growth of rows currently prefilling
+        for i, seq in enumerate(self._currently_processing):
+            processed = seq[1]
+            final = seq[2] + self._prompt_batch.max_tokens[i]
+            growth = self._capped_tokens(final) - min(
+                processed, self._capped_tokens(final)
+            )
+            committed += per_token * max(growth, 0)
+            if processed == 0:
+                # Fixed state materializes on the first forward pass
+                committed += fixed
+
+        admitted = 0
+        for j in range(n):
+            seq = self._unprocessed_sequences[j]
+            total = sum(len(s) for s in seq[1]) + seq[2]
+            existing = sum(c.nbytes for c in seq[3])
+            need = max(fixed + per_token * self._capped_tokens(total) - existing, 0)
+            if committed + need > self.kv_budget_bytes:
+                # Liveness contract: a request whose projection alone
+                # exceeds the budget is admitted when nothing else is
+                # running, mirroring count-cap semantics where a single
+                # request always proceeds. Best effort, not a guarantee
+                # against out-of-memory.
+                if (
+                    admitted == 0
+                    and len(self._generation_batch) == 0
+                    and len(self._prompt_batch) == 0
+                ):
+                    admitted = 1
+                break
+            committed += need
+            admitted += 1
+        return admitted
+
     def _next(self):
         generation_responses = []
         prompt_responses = []
@@ -1864,6 +1945,7 @@ class BatchGenerator:
             self.completion_batch_size - len(self._generation_batch),
             len(self._unprocessed_sequences),
         )
+        n = self._budget_admissible(n)
         if n > 0:
             self._prompt_batch.extend(self._make_batch(n))
 
