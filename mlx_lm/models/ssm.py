@@ -11,6 +11,12 @@ def compute_dt(dt, dt_bias, time_step_limit):
     return mx.clip(dt, time_step_limit[0], time_step_limit[1])
 
 
+@mx.compile
+def compute_dt_native(dt, dt_bias, time_step_limit):
+    dt = nn.softplus(dt + dt_bias)
+    return mx.clip(dt, time_step_limit[0], time_step_limit[1])
+
+
 def make_ssm_kernel():
     if not mx.metal.is_available():
         return None
@@ -74,12 +80,14 @@ def ssm_update_kernel(
     dt_bias: mx.array,
     state: mx.array,
     time_step_limit: Tuple[float, float],
+    promote_dt: bool = True,
 ):
     n, _, h, d = hidden_states.shape
     input_type = hidden_states.dtype
     state_type = state.dtype
     hb, ds = B.shape[-2:]
-    dt = compute_dt(dt, dt_bias, time_step_limit)
+    dt_fn = compute_dt if promote_dt else compute_dt_native
+    dt = dt_fn(dt, dt_bias, time_step_limit)
     return _ssm_kernel(
         inputs=[hidden_states, A_log, B, C, D, dt, state],
         template=[
@@ -125,6 +133,7 @@ def ssm_attn(
     mask: Optional[mx.array] = None,
     lengths: Optional[mx.array] = None,
     step: int = 256,
+    promote_dt: bool = True,
 ) -> Tuple[mx.array, mx.array]:
     """SSD-SSM forward pass.
 
@@ -148,7 +157,8 @@ def ssm_attn(
     b, l, h, dh = x.shape
     _, _, g, d = B.shape
 
-    dt = compute_dt(dt, dt_bias, time_step_limit)
+    dt_fn = compute_dt if promote_dt else compute_dt_native
+    dt = dt_fn(dt, dt_bias, time_step_limit)
     repeats = h // g
     A = -mx.exp(A_log).astype(dt.dtype)
     dtA = dt * A.reshape(1, 1, -1)
@@ -226,6 +236,7 @@ def ssm_update(
     time_step_limit: Tuple[float, float] = (0.001, 100.0),
     mask: Optional[mx.array] = None,
     lengths: Optional[mx.array] = None,
+    promote_dt: bool = True,
 ):
     seq_len = hidden_states.shape[1]
     if (
@@ -246,6 +257,7 @@ def ssm_update(
             time_step_limit,
             mask=mask,
             lengths=lengths,
+            promote_dt=promote_dt,
         )
     else:
         return ssm_update_kernel(
@@ -258,4 +270,5 @@ def ssm_update(
             dt_bias,
             state,
             time_step_limit,
+            promote_dt,
         )
