@@ -1002,6 +1002,72 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(gen._budget_admissible(1), 1)
         del gen
 
+    def test_continued_caches_merge_filter_and_boundary(self):
+        """Codex-prescribed continued-cache coverage: two individually
+        primed caches (real forwards of step-4 tokens) inserted as
+        one-token continuations with matching all_tokens and unequal
+        max_tokens [1, 12]. The short row finishes while the long one
+        remains — live bytes must drop across that exact next() — and the
+        long row crosses the allocation boundary and completes. Exercises
+        _merge_caches of supplied history, continued generation,
+        filtering, and boundary growth in one reachable path."""
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        history_len = step - 4
+
+        def primed_cache():
+            caches = make_prompt_cache(self.model)
+            toks = mx.array([[(i % 100) + 1 for i in range(history_len)]])
+            self.model(toks, cache=caches)
+            mx.eval([c.state for c in caches])
+            return caches
+
+        history_tokens = [(i % 100) + 1 for i in range(history_len)]
+        gen = BatchGenerator(
+            self.model,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,  # generous: behavior, not gating
+            kv_cost=(fixed, per_tok, step),
+        )
+        uid_short, uid_long = gen.insert(
+            [[1], [1]],  # one-token continuations
+            max_tokens=[1, 12],
+            caches=[primed_cache(), primed_cache()],
+            all_tokens=[list(history_tokens), list(history_tokens)],
+        )
+        done = {}
+        live_before_finish = live_after_finish = None
+        prev_live = None
+        crossed = False
+        for _ in range(200):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            states = [
+                gen._candidate_admission_state(seq)
+                for seq in gen._unprocessed_sequences
+            ]
+            self.assertGreaterEqual(gen._cohort_committed(states), live)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done[r.uid] = True
+                    if r.uid == uid_short and uid_long not in done:
+                        live_before_finish = prev_live
+                        live_after_finish = live
+            if live > 2 * history_len * per_tok + fixed:
+                crossed = True  # boundary growth materialized
+            prev_live = live
+            if len(done) == 2:
+                break
+        self.assertIn(uid_short, done)
+        self.assertIn(uid_long, done)
+        # The short row finished first and its removal dropped live bytes
+        self.assertIsNotNone(live_before_finish)
+        self.assertLess(live_after_finish, live_before_finish)
+        self.assertTrue(crossed)
+        del gen
+
     def test_kv_budget_e2e_generation_completes(self):
         """Budgeted end-to-end run finishes all requests (queued, not lost)."""
         prompt = self.tokenizer.encode("hello world")

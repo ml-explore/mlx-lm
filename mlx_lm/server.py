@@ -327,7 +327,16 @@ def _measure_kv_cost(model):
     grown_per_leaf = [c.nbytes for c in leaf_list]
 
     per_token = sum(g - b for g, b in zip(grown_per_leaf, base_per_leaf)) / probe
-    raw_fixed = max(sum(base_per_leaf) - per_token * warm, 0.0)
+    raw_fixed = sum(base_per_leaf) - per_token * warm
+    if raw_fixed < -(0.01 * sum(base_per_leaf) + per_token):
+        # A materially negative intercept means the growth is not linear
+        # from zero (silently clamping would hide superlinear early growth)
+        raise ValueError(
+            f"state-cost fit has a materially negative intercept "
+            f"({raw_fixed:.0f} bytes); the cache does not fit "
+            f"fixed+linear growth, refusing byte budgeting"
+        )
+    raw_fixed = max(raw_fixed, 0.0)
 
     # Validate ONE common allocation step across all growing leaves;
     # fail closed on anything unverifiable (reviewer requirements).
