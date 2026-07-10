@@ -523,7 +523,7 @@ class TestGenerate(unittest.TestCase):
             self.model,
             max_tokens=4,
             kv_budget_bytes=int(2.5 * row),
-            kv_cost=(0.0, per_tok),
+            kv_cost=(0.0, per_tok, 1),
         )
         gen.insert([prompt] * 4)
         self.assertEqual(gen._budget_admissible(4), 2)
@@ -536,7 +536,7 @@ class TestGenerate(unittest.TestCase):
             self.model,
             max_tokens=4,
             kv_budget_bytes=int(2.5 * fixed),
-            kv_cost=(fixed, 0.0),
+            kv_cost=(fixed, 0.0, 1),
         )
         gen.insert([prompt] * 4)
         self.assertEqual(gen._budget_admissible(4), 2)
@@ -550,7 +550,7 @@ class TestGenerate(unittest.TestCase):
             max_tokens=10_000,
             max_kv_size=8,
             kv_budget_bytes=int(2.5 * 8 * per_tok),
-            kv_cost=(0.0, per_tok),
+            kv_cost=(0.0, per_tok, 1),
         )
         gen.insert([prompt] * 4)
         # Uncapped projection would admit 0; capped admits 2
@@ -592,7 +592,7 @@ class TestGenerate(unittest.TestCase):
             self.model,
             max_tokens=64,
             kv_budget_bytes=10,  # absurdly small
-            kv_cost=(0.0, 1000.0),
+            kv_cost=(0.0, 1000.0, 1),
         )
         gen.insert([prompt])
         self.assertEqual(gen._budget_admissible(1), 1)
@@ -623,7 +623,7 @@ class TestGenerate(unittest.TestCase):
             self.model,
             max_tokens=5,
             kv_budget_bytes=20_000,
-            kv_cost=(0.0, 1000.0),
+            kv_cost=(0.0, 1000.0, 1),
         )
         gen.insert(
             [prompt],
@@ -658,18 +658,18 @@ class TestGenerate(unittest.TestCase):
             self.model,
             max_tokens=0,
             kv_budget_bytes=18_000,
-            kv_cost=(0.0, 1000.0),
+            kv_cost=(0.0, 1000.0, 1),
         )
         gen.insert([prompt], caches=[[_FakeCache(9_000)]])
         gen._generation_batch = _StubGenBatch()  # suppress liveness escape
-        # Cohort accounting at FINAL extents: stub active row projects
-        # 5 * 1000 = 5000; candidate projects 10 * 1000 = 10000; its
-        # 9000 supplied-cache bytes carry NO history → unverifiable →
-        # charged ON TOP (never credited): 24000 > 18000 rejects. (With
-        # an unverified credit the total would drop to 15000 and wrongly
-        # admit.)
+        # Two-phase accounting: merge phase dominates — stub (5-unit done
+        # row) and the 10-unit candidate share one allocation at the
+        # cohort-max width: 2 x 10 x 1000 = 20000. The candidate's 9000
+        # unverifiable supplied-cache bytes appear in the stale-width
+        # floors (2 x 9000 = 18000 < 20000), never as credit.
+        # 20000 > 18000 rejects; 20000 <= 20000 admits.
         self.assertEqual(gen._budget_admissible(1), 0)
-        gen.kv_budget_bytes = 24_000
+        gen.kv_budget_bytes = 20_000
         self.assertEqual(gen._budget_admissible(1), 1)
 
     def test_kv_budget_remove_releases_headroom(self):
@@ -686,7 +686,7 @@ class TestGenerate(unittest.TestCase):
             self.model,
             max_tokens=0,
             kv_budget_bytes=13_000,
-            kv_cost=(0.0, 1000.0),
+            kv_cost=(0.0, 1000.0, 1),
         )
 
         class _StubGenBatch:
@@ -706,12 +706,16 @@ class TestGenerate(unittest.TestCase):
         )
         gen.insert([cheap, cheap])
         # Suppress the liveness escape: pretend one row is generating
+        empty_gen_batch = gen._generation_batch
         gen._generation_batch = _StubGenBatch()
-        # committed starts at 10000 (primed row's live bytes):
-        # primed need = (10+10)*1000 - 10000 = 10000 → 20000 > 13000 reject
+        # Primed row projects 20 units x 1000 shared with the stub →
+        # merge 2 x 20000 = 40000 >> 13000: rejected (its 10000 live
+        # bytes also appear in floors, never as credit)
         self.assertEqual(gen._budget_admissible(3), 0)
         gen.remove([uid_primed])
-        # Its live bytes are gone from committed: 2 cheap rows = 4000 fit
+        gen._generation_batch = empty_gen_batch
+        # Primed row's live bytes and width are gone entirely: the two
+        # cheap rows share a 2-unit width: 2 x 2000 = 4000 <= 13000
         self.assertEqual(gen._budget_admissible(2), 2)
 
     def test_kv_budget_rejects_nonfinite(self):
@@ -727,6 +731,68 @@ class TestGenerate(unittest.TestCase):
                     kv_cost=bad_cost,
                 )
 
+    def test_stale_wide_allocation_dominates_merge_projection(self):
+        """Codex stale-width regression: one stale row holding a 1024-wide
+        allocation + one 1-unit newcomer must project the MERGED allocation
+        at >= 2 x 1024 units (the merge pads the newcomer to the stale
+        width), never max(2 x rounded-new, stale)."""
+
+        class _StaleBatch:
+            """One row, 300 units of tokens, but a 1024-wide allocation."""
+
+            class _C:
+                nbytes = 1024 * 1000  # actual allocated width in bytes
+
+            uids = [7]
+            tokens = [[1] * 300]
+            max_tokens = [300]
+            _num_tokens = [300]  # done growing
+            prompt_cache = [_C()]
+
+            def __len__(self):
+                return 1
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=10_000_000,
+            kv_cost=(0.0, 1000.0, 256),
+        )
+        gen._generation_batch = _StaleBatch()
+        gen.insert([[1]])  # 1-token newcomer
+        state = gen._candidate_admission_state(gen._unprocessed_sequences[0])
+        committed = gen._cohort_committed([state], [0.0])
+        # Real merged allocation: 2 rows x 1024-unit width x 1000 B/unit
+        self.assertGreaterEqual(committed, 2 * 1024 * 1000)
+        del gen
+
+    def test_budget_requires_allocation_step(self):
+        """Fail closed: growing state without a validated step is rejected
+        at construction — both the kv_cost 2-tuple path and a direct
+        LinearStateCost without allocation geometry."""
+        from mlx_lm.batch_admission import LinearStateCost, StateBudget
+
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
+                kv_budget_bytes=1 << 30,
+                kv_cost=(0.0, 1000.0),  # 2-tuple: no step
+            )
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
+                state_budget=StateBudget(
+                    1 << 30, LinearStateCost(0.0, 1000.0)  # growing, no step
+                ),
+            )
+        # Fixed-only state may omit the step
+        gen = BatchGenerator(
+            self.model,
+            state_budget=StateBudget(1 << 30, LinearStateCost(1000.0, 0.0)),
+        )
+        self.assertIsNotNone(gen.state_budget)
+        del gen
+
     def test_kv_budget_e2e_generation_completes(self):
         """Budgeted end-to-end run finishes all requests (queued, not lost)."""
         prompt = self.tokenizer.encode("hello world")
@@ -735,8 +801,11 @@ class TestGenerate(unittest.TestCase):
         gen = BatchGenerator(
             self.model,
             max_tokens=4,
-            kv_budget_bytes=int(200 * row),  # generous; smoke the wiring
-            kv_cost=(0.0, per_tok),
+            # Generous REAL-scale budget: stale-width floors read actual
+            # cache nbytes (~114 KB/token on this model), so the budget
+            # must be sized to reality, not the synthetic per-token cost
+            kv_budget_bytes=int(100e6),
+            kv_cost=(0.0, per_tok, 1),
         )
         uids = gen.insert([prompt] * 4)
         done = set()
