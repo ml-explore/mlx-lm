@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import contextlib
@@ -1435,37 +1435,35 @@ class GenerationBatch:
 
         # Sample
         if any(self.samplers):
-            # Group rows sharing the same sampler so each unique sampler runs
-            # once, vectorized over its rows, instead of once per row.
+            # Group rows sharing the same sampler object so each unique
+            # sampler runs once, vectorized over its rows. Only samplers
+            # that declare themselves row-independent (batch_groupable, set
+            # by make_sampler) are grouped: an arbitrary callable may be
+            # stateful or draw shared randomness, so it keeps the original
+            # one-call-per-row contract.
             groups = {}
+            order = []
             for e in range(len(self.uids)):
                 sample_sampler = self.samplers[e] or self.fallback_sampler
-                groups.setdefault(id(sample_sampler), (sample_sampler, []))[1].append(e)
-
-            def sample_group(sample_sampler, rows, group_logprobs):
-                group_sampled = sample_sampler(group_logprobs)
-                if group_sampled.shape[0] == len(rows):
-                    return group_sampled
-                # The sampler doesn't vectorize over rows (e.g. a closure
-                # that always returns one token) — fall back to per-row
-                # calls to preserve the original per-row contract.
-                return mx.concatenate(
-                    [
-                        sample_sampler(group_logprobs[j : j + 1])
-                        for j in range(len(rows))
-                    ],
-                    axis=0,
-                )
-
+                if getattr(sample_sampler, "batch_groupable", False):
+                    key = id(sample_sampler)
+                else:
+                    key = (e,)
+                if key not in groups:
+                    groups[key] = (sample_sampler, [])
+                    order.append(key)
+                groups[key][1].append(e)
             if len(groups) == 1:
                 ((sample_sampler, rows),) = groups.values()
-                sampled = sample_group(sample_sampler, rows, logprobs)
+                sampled = sample_sampler(logprobs)
             else:
                 all_samples = [None] * len(self.uids)
-                for sample_sampler, rows in groups.values():
-                    group_sampled = sample_group(
-                        sample_sampler, rows, logprobs[mx.array(rows)]
-                    )
+                for key in order:
+                    sample_sampler, rows = groups[key]
+                    if len(rows) == 1:
+                        group_sampled = sample_sampler(logprobs[rows[0] : rows[0] + 1])
+                    else:
+                        group_sampled = sample_sampler(logprobs[mx.array(rows)])
                     for j, e in enumerate(rows):
                         all_samples[e] = group_sampled[j : j + 1]
                 sampled = mx.concatenate(all_samples, axis=0)

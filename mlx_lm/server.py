@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import json
@@ -15,16 +15,31 @@ from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Thread
-from typing import (Any, Callable, Dict, List, Literal, NamedTuple, Optional,
-                    Sequence, Tuple, Union)
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import (BatchGenerator, StopSequenceMatcher, TextStateMachine,
-                       make_stop_matcher, make_text_state_machine,
-                       stream_generate)
+from .generate import (
+    BatchGenerator,
+    StopSequenceMatcher,
+    TextStateMachine,
+    make_stop_matcher,
+    make_text_state_machine,
+    stream_generate,
+)
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -370,8 +385,12 @@ def _make_sampler(args, tokenizer):
     # Memoize on the sampling parameters so concurrent requests with identical
     # settings share one sampler object. GenerationBatch groups rows by sampler
     # identity, letting a whole batch sample in a single vectorized call.
+    xtc_special_tokens = (
+        tokenizer.eos_token_id,
+        tuple(tokenizer.encode("\n")),
+    )
     key = (
-        id(tokenizer),
+        xtc_special_tokens,
         args.sampling.temperature,
         args.sampling.top_p,
         args.sampling.top_k,

@@ -1,4 +1,4 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2024-2026 Apple Inc.
 
 import random
 import unittest
@@ -503,6 +503,35 @@ class TestGenerate(unittest.TestCase):
 
         for ua, ub in zip(uids_a, uids_b):
             self.assertEqual(tokens_a[ua], tokens_b[ub])
+
+    def test_batch_shared_stateful_sampler_keeps_per_row_calls(self):
+        """An unmarked stateful callable must be called once per row."""
+        calls = []
+
+        def stateful(logprobs):
+            calls.append(logprobs.shape[0])
+            return mx.array([len(calls)])
+
+        prompt = self.tokenizer.encode("hello")
+        batch_gen = BatchGenerator(self.model, max_tokens=1)
+        uids = batch_gen.insert([prompt] * 3, samplers=[stateful] * 3)
+        responses = {r.uid: r for r in batch_gen.next_generated()}
+        # One call per row per step, each on a single row
+        self.assertTrue(all(width == 1 for width in calls))
+        tokens = [responses[uid].token for uid in uids]
+        self.assertEqual(len(set(tokens)), 3)
+        del batch_gen
+
+    def test_xtc_sampler_not_batch_groupable(self):
+        """XTC's scalar random gate must not be shared across rows."""
+        from mlx_lm.sample_utils import make_sampler
+
+        with_xtc = make_sampler(
+            temp=0.7, xtc_probability=0.5, xtc_threshold=0.1, xtc_special_tokens=[0]
+        )
+        without = make_sampler(temp=0.7, top_p=0.9)
+        self.assertFalse(getattr(with_xtc, "batch_groupable", False))
+        self.assertTrue(getattr(without, "batch_groupable", False))
 
     def test_batch_shared_nonvectorizing_sampler(self):
         """A shared sampler that always returns one token still works per-row."""

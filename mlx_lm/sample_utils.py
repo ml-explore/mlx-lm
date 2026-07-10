@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import math
 from functools import partial
@@ -44,7 +44,9 @@ def make_sampler(
             A sampler which takes log-probabilities and returns tokens.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        argmax_sampler = lambda x: mx.argmax(x, axis=-1)
+        argmax_sampler.batch_groupable = True
+        return argmax_sampler
 
     # Create sampler chain
     sampling_methods = []
@@ -66,6 +68,10 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
+    # Every component above transforms each row independently, except XTC:
+    # its scalar random gate would be shared across rows if the sampler were
+    # applied to several rows in one call, correlating requests.
+    sampler.batch_groupable = xtc_probability <= 0.0
     return sampler
 
 
