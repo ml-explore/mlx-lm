@@ -930,6 +930,29 @@ class TestMeasureKVCostConsistency(unittest.TestCase):
         with self.assertRaises(ValueError):
             _measure_kv_cost(_M([]))
 
+    def test_negative_per_leaf_intercept_refused(self):
+        """A leaf whose growth is superlinear before the warm point has a
+        materially negative fitted intercept and must refuse — even when
+        another leaf's positive intercept cancels it in aggregate."""
+
+        class _LateStartLeaf(_FakeLeaf):
+            @property
+            def nbytes(self):
+                cap = self._tokens
+                if self.step:
+                    cap = -(-cap // self.step) * self.step
+                return int(self._slope * max(cap - 128, 0) * 1.5)
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [
+                    _LateStartLeaf(100.0, step=256),
+                    _FakeLeaf(0, step=None, fixed=50_000),  # cancels aggregate
+                ]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
     def test_slope_change_after_fit_range_refused(self):
         class _M(_FakeModel):
             def make_cache(self):

@@ -307,7 +307,8 @@ def _measure_kv_cost(model):
     windows = list(rotating_windows(caches))
     warm, probe = 256, 1024
     verify_at = 528  # deliberately NOT a step boundary
-    if windows and max(warm + probe, verify_at) >= min(windows):
+    third_at = 2048  # independent consistency point (step boundary)
+    if windows and max(warm + probe, verify_at, third_at) >= min(windows):
         raise ValueError(
             f"--state-budget-gb needs a linear-growth cache probe, but a "
             f"rotating cache saturates at {min(windows)} tokens (inside the "
@@ -327,6 +328,19 @@ def _measure_kv_cost(model):
     grown_per_leaf = [c.nbytes for c in leaf_list]
 
     per_token = sum(g - b for g, b in zip(grown_per_leaf, base_per_leaf)) / probe
+    for c, b, g in zip(leaf_list, base_per_leaf, grown_per_leaf):
+        leaf_slope = (g - b) / probe
+        leaf_intercept = b - leaf_slope * warm
+        if leaf_intercept < -(0.01 * max(b, 1.0) + leaf_slope):
+            # Aggregate intercepts can cancel across leaves; a materially
+            # negative PER-LEAF intercept means that leaf's growth is not
+            # linear from zero
+            raise ValueError(
+                f"state-cost fit for leaf {type(c).__name__} has a "
+                f"materially negative intercept ({leaf_intercept:.0f} "
+                f"bytes); the cache does not fit fixed+linear growth, "
+                f"refusing byte budgeting"
+            )
     raw_fixed = sum(base_per_leaf) - per_token * warm
     if raw_fixed < -(0.01 * sum(base_per_leaf) + per_token):
         # A materially negative intercept means the growth is not linear
@@ -380,14 +394,15 @@ def _measure_kv_cost(model):
     # 528 check. Verify PER LEAF at 2048 (a step boundary, so linear
     # prediction is exact for a consistent leaf) — an aggregate check
     # can be defeated by two leaves whose deviations cancel.
-    third_at = 2048
     forward(vcaches, third_at - verify_at, verify_at)
     vleaves = list(leaves(vcaches))
     for c, b, g in zip(vleaves, base_per_leaf, grown_per_leaf):
         leaf_slope = (g - b) / probe
         predicted = b + leaf_slope * (third_at - warm)
         observed_leaf = c.nbytes
-        tolerance = max(0.01 * max(predicted, 1.0), leaf_slope * common_step)
+        # third_at is an exact step boundary: a consistent leaf predicts
+        # exactly, so the tolerance is tight (1% covers dtype/rounding)
+        tolerance = 0.01 * max(predicted, 1.0)
         if abs(observed_leaf - predicted) > tolerance:
             raise ValueError(
                 f"state-cost consistency check failed for leaf "

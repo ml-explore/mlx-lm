@@ -1002,6 +1002,48 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(gen._budget_admissible(1), 1)
         del gen
 
+    def test_rejected_candidate_auto_admits_after_removal(self):
+        """Codex variant of the removal transition: the queued candidate is
+        NOT withdrawn — the engine must auto-admit it in the very step
+        where the blocking row finishes, under one unchanged budget, with
+        live state within budget throughout."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        one_row = fixed + per_tok * 768
+        budget = int(1.5 * one_row)
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=8,
+            prefill_batch_size=4,
+            kv_budget_bytes=budget,
+            kv_cost=(fixed, per_tok, step),
+        )
+        prompt = [(i % 100) + 1 for i in range(512)]
+        (uid_a,) = gen.insert([prompt])
+        for _ in range(4):
+            gen.next()
+        (uid_b,) = gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 0)  # rejected while A holds
+        a_done = b_done = False
+        for _ in range(400):
+            _, responses = gen.next()
+            self.assertLessEqual(gen.prompt_cache_nbytes, budget)
+            for r in responses:
+                if r.finish_reason is not None and r.uid == uid_a:
+                    a_done = True
+                if r.finish_reason is not None and r.uid == uid_b:
+                    b_done = True
+            if a_done and not b_done:
+                # B must have left the queue (auto-admitted) once A freed it
+                queued_uids = {s[0] for s in gen._unprocessed_sequences}
+                self.assertNotIn(uid_b, queued_uids)
+            if b_done:
+                break
+        self.assertTrue(a_done)
+        self.assertTrue(b_done)
+        del gen
+
     def test_continued_caches_merge_filter_and_boundary(self):
         """Codex-prescribed continued-cache coverage: two individually
         primed caches (real forwards of step-4 tokens) inserted as
