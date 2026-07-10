@@ -1637,10 +1637,11 @@ class BatchGenerator:
                     "kv_budget_bytes requires kv_cost=(fixed_bytes_per_row, "
                     "bytes_per_token) measured for this model"
                 )
-            if len(kv_cost) < 3:
+            if len(kv_cost) < 3 or (kv_cost[1] > 0 and kv_cost[2] is None):
                 raise ValueError(
                     "kv_cost must be (fixed_bytes, bytes_per_token, "
-                    "allocation_step_units): unrounded per-token cost "
+                    "allocation_step_units) with a validated step whenever "
+                    "bytes_per_token > 0: unrounded per-token cost "
                     "cannot budget shared stepped batch caches safely"
                 )
             fixed, per_token = kv_cost[0], kv_cost[1]
@@ -1936,8 +1937,149 @@ class BatchGenerator:
         self._sync_budget_mutation()
         queued = list(self._unprocessed_sequences)[:n]
         return self._admit_states(
-            [self._candidate_admission_state(seq) for seq in queued],
-            [sum(c.nbytes for c in seq[3]) for seq in queued],
+            [self._candidate_admission_state(seq) for seq in queued]
+        )
+
+    def _sync_budget_mutation(self):
+        if (
+            self.kv_budget_bytes is not None
+            and self.state_budget.budget_bytes != self.kv_budget_bytes
+        ):
+            # Preserve the experimental F3 attribute's mutability for callers
+            # while routing its implementation through the generic policy.
+            if not math.isfinite(self.kv_budget_bytes) or self.kv_budget_bytes <= 0:
+                raise ValueError("kv_budget_bytes must be finite and positive")
+            self.state_budget.budget_bytes = self.kv_budget_bytes
+
+    def _candidate_admission_state(self, seq):
+        new_tokens = sum(len(s) for s in seq[1])
+        history = len(seq[4]) if seq[4] else 0
+        total = history + new_tokens + seq[2]
+        existing = sum(c.nbytes for c in seq[3])
+        # Reviewer constraint: credit only against verifiable geometry.
+        # A supplied cache WITH history is inside the projection target;
+        # one WITHOUT history is unverifiable — its bytes sit OUTSIDE the
+        # projection and are charged on top, never credited.
+        unverified = float(existing) if (existing > 0 and history == 0) else 0.0
+        return AdmissionState(
+            seq[0],
+            total,
+            history,
+            metadata={
+                "phase": "queued",
+                "prompt_units": new_tokens,
+                "unverified_bytes": unverified,
+            },
+        )
+
+    def _final_extent_states(self):
+        """AdmissionStates of every admitted row at FINAL extent, for the
+        shared-width cohort projection."""
+        states = []
+        gb = self._generation_batch
+        for i in range(len(gb)):
+            current = len(gb.tokens[i])
+            final = current + max(gb.max_tokens[i] - gb._num_tokens[i], 0)
+            states.append(
+                AdmissionState(
+                    gb.uids[i], final, current, metadata={"phase": "generation"}
+                )
+            )
+        for i, seq in enumerate(self._currently_processing):
+            history = seq[4] if len(seq) > 4 else 0
+            final = history + seq[2] + self._prompt_batch.max_tokens[i]
+            states.append(
+                AdmissionState(
+                    self._prompt_batch.uids[i],
+                    final,
+                    history + seq[1],
+                    metadata={"phase": "prefill"},
+                )
+            )
+        return states
+
+    def _cohort_committed(self, candidate_states):
+        """Projected committed bytes with the exact ``candidate_states``
+        prefix admitted.
+
+        The global cohort projection (all admitted rows + the selected
+        prefix, at final extents, at the shared cohort-max rounded width)
+        dominates both the current separate prompt/generation allocations
+        and their eventual merge. Resident bytes of still-UNSELECTED queued
+        rows are simultaneous with that future growth and are ADDED — never
+        folded into a max — as are unverifiable supplied-cache bytes of
+        selected candidates. The result is floored by admitted-batch actual
+        live bytes (a stale wide allocation never assumed smaller than
+        reality). State admission budget only; not a total process
+        peak-memory guarantee (split/extend allocator transients are out of
+        scope).
+        """
+        cost = self.state_budget.project
+        cands = list(candidate_states)
+        all_states = self._final_extent_states() + cands
+        if hasattr(cost, "cohort_bytes"):
+            projected = cost.cohort_bytes(all_states)
+        else:
+            projected = sum(self.state_budget.projected_bytes(s) for s in all_states)
+        projected += sum(s.metadata.get("unverified_bytes", 0.0) for s in cands)
+        selected_uids = {s.uid for s in cands}
+        unselected_live = sum(
+            float(sum(c.nbytes for c in seq[3]))
+            for seq in self._unprocessed_sequences
+            if seq[0] not in selected_uids
+        )
+        admitted_live = float(
+            sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        ) + float(sum(c.nbytes for c in self._prompt_batch.prompt_cache))
+        return max(projected, admitted_live) + unselected_live
+
+    def _admit_states(self, states):
+        """How many of ``states`` fit, in order — recomputing the full
+        non-additive cohort cost for each exact prefix length."""
+        states = list(states)
+        admitted = 0
+        for k in range(1, len(states) + 1):
+            if self._cohort_committed(states[:k]) > self.state_budget.budget_bytes:
+                break
+            admitted = k
+        if (
+            admitted == 0
+            and states
+            and len(self._generation_batch) == 0
+            and len(self._prompt_batch) == 0
+        ):
+            # Liveness contract: a request whose projection alone exceeds
+            # the budget is admitted when nothing else is running, mirroring
+            # count-cap semantics where a single request always proceeds.
+            # Best effort, not a guarantee against out-of-memory.
+            logging.warning(
+                "Request %s projects above the state budget "
+                "(%d needed, %d budget) but nothing is running; "
+                "admitting it anyway (best effort, not a guarantee "
+                "against out-of-memory)",
+                states[0].uid,
+                int(self._cohort_committed(states[:1])),
+                int(self.state_budget.budget_bytes),
+            )
+            admitted = 1
+        return admitted
+
+    def _budget_admissible(self, n):
+        """How many of the first n queued sequences fit the state budget.
+
+        Shared batch caches (BatchKVCache) allocate every row at the
+        cohort-max step-rounded width, so cost is NON-ADDITIVE: each prefix
+        length is evaluated by recomputing the full cohort projection at
+        final extents (via the policy's ``cohort_bytes``), floored by actual
+        live bytes. No per-row resident credit is granted under stepped
+        geometry — a supplied cache's bytes cannot reduce the shared width.
+        """
+        if self.state_budget is None or n <= 0:
+            return n
+        self._sync_budget_mutation()
+        queued = list(self._unprocessed_sequences)[:n]
+        return self._admit_states(
+            [self._candidate_admission_state(seq) for seq in queued]
         )
 
     def _sync_budget_mutation(self):

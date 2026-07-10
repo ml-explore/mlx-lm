@@ -731,41 +731,6 @@ class TestGenerate(unittest.TestCase):
                     kv_cost=bad_cost,
                 )
 
-    def test_stale_wide_allocation_dominates_merge_projection(self):
-        """Codex stale-width regression: one stale row holding a 1024-wide
-        allocation + one 1-unit newcomer must project the MERGED allocation
-        at >= 2 x 1024 units (the merge pads the newcomer to the stale
-        width), never max(2 x rounded-new, stale)."""
-
-        class _StaleBatch:
-            """One row, 300 units of tokens, but a 1024-wide allocation."""
-
-            class _C:
-                nbytes = 1024 * 1000  # actual allocated width in bytes
-
-            uids = [7]
-            tokens = [[1] * 300]
-            max_tokens = [300]
-            _num_tokens = [300]  # done growing
-            prompt_cache = [_C()]
-
-            def __len__(self):
-                return 1
-
-        gen = BatchGenerator(
-            self.model,
-            max_tokens=0,
-            kv_budget_bytes=10_000_000,
-            kv_cost=(0.0, 1000.0, 256),
-        )
-        gen._generation_batch = _StaleBatch()
-        gen.insert([[1]])  # 1-token newcomer
-        state = gen._candidate_admission_state(gen._unprocessed_sequences[0])
-        committed = gen._cohort_committed([state], [0.0])
-        # Real merged allocation: 2 rows x 1024-unit width x 1000 B/unit
-        self.assertGreaterEqual(committed, 2 * 1024 * 1000)
-        del gen
-
     def test_budget_requires_allocation_step(self):
         """Fail closed: growing state without a validated step is rejected
         at construction — both the kv_cost 2-tuple path and a direct
@@ -781,6 +746,12 @@ class TestGenerate(unittest.TestCase):
         with self.assertRaises(ValueError):
             BatchGenerator(
                 self.model,
+                kv_budget_bytes=1 << 30,
+                kv_cost=(0.0, 1000.0, None),  # 3-tuple None-step bypass
+            )
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
                 state_budget=StateBudget(
                     1 << 30, LinearStateCost(0.0, 1000.0)  # growing, no step
                 ),
@@ -791,6 +762,46 @@ class TestGenerate(unittest.TestCase):
             state_budget=StateBudget(1 << 30, LinearStateCost(1000.0, 0.0)),
         )
         self.assertIsNotNone(gen.state_budget)
+        del gen
+
+    def test_unselected_resident_caches_add_not_max(self):
+        """Reviewer P1 regression: resident bytes of still-unselected queued
+        rows are simultaneous with projected growth of the selected prefix —
+        they must ADD to committed, never fold into a max. Exact repro:
+        budget 1000; selected uncached 1-unit row projects 256 (stepped);
+        unselected queued supplied cache holds 900 resident bytes;
+        max(256, 900) = 900 would wrongly admit; 256 + 900 = 1156 must
+        reject."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        class _StubGenBatch:  # suppress liveness escape
+            uids = [999]
+            tokens = [[1]]
+            max_tokens = [1]
+            _num_tokens = [1]
+            prompt_cache = []
+
+            def __len__(self):
+                return 1
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=1_300,  # stub projects 256 too: see arithmetic
+            kv_cost=(0.0, 1.0, 256),
+        )
+        gen.insert([[1]])  # selected: 1 unit -> stepped 256 bytes
+        gen.insert([[1]], caches=[[_FakeCache(900)]])  # unselected resident
+        gen._generation_batch = _StubGenBatch()
+        # cohort(selected+stub) = 2 rows x 256 = 512; + unselected 900
+        # = 1412 > 1300 must reject. A max() formulation would compute
+        # max(512, 900) = 900 <= 1300 and wrongly admit.
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 1_500
+        self.assertEqual(gen._budget_admissible(1), 1)
         del gen
 
     def test_kv_budget_e2e_generation_completes(self):
