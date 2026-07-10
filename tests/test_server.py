@@ -733,8 +733,50 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [3, 4])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestKVBudgetProbeFailure(unittest.TestCase):
+    def test_probe_failure_reaches_requester_and_thread_survives(self):
+        """A probe error must be delivered to the requesting queue, and the
+        generation thread must remain usable afterwards."""
+        from queue import Queue
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import mlx_lm.server as server_mod
+
+        provider = DummyModelProvider()
+        provider.cli_args.kv_budget_gb = 1.0  # budget mode on → probe runs
+        provider.cli_args.decode_concurrency = 32
+        provider.cli_args.prompt_concurrency = 8
+        provider.cli_args.prefill_step_size = 2048
+
+        gen = ResponseGenerator(provider, LRUPromptCache())
+        try:
+
+            def request():
+                rqueue = Queue()
+                args = SimpleNamespace(
+                    model=SimpleNamespace(
+                        model="default_model", adapter=None, draft=None
+                    ),
+                    seed=None,
+                )
+                gen.requests.put((rqueue, {"prompt": "hello"}, args))
+                return rqueue
+
+            with patch.object(
+                server_mod,
+                "_measure_kv_cost",
+                side_effect=ValueError("probe refused"),
+            ):
+                result = request().get(timeout=30)
+                self.assertIsInstance(result, ValueError)
+
+                # Thread must still be alive and serving further requests
+                self.assertTrue(gen._generation_thread.is_alive())
+                second = request().get(timeout=30)
+                self.assertIsInstance(second, ValueError)
+        finally:
+            gen.stop_and_join()
 
 
 class TestMeasureKVCost(unittest.TestCase):
@@ -753,3 +795,7 @@ class TestMeasureKVCost(unittest.TestCase):
             * 2  # bf16
         )
         self.assertAlmostEqual(per_token, expected, delta=expected * 0.01)
+
+
+if __name__ == "__main__":
+    unittest.main()

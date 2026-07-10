@@ -281,11 +281,17 @@ def _measure_kv_cost(model):
     window the measurement (and byte budgeting) is refused.
     """
     caches = make_prompt_cache(model)
-    windows = [
-        c.max_size
-        for c in caches
-        if isinstance(c, RotatingKVCache) and c.max_size is not None
-    ]
+
+    def rotating_windows(cs):
+        for c in cs:
+            if isinstance(c, RotatingKVCache) and c.max_size is not None:
+                yield c.max_size
+            # Composite caches (e.g. CacheList) wrap per-component caches
+            inner = getattr(c, "caches", None)
+            if inner:
+                yield from rotating_windows(inner)
+
+    windows = list(rotating_windows(caches))
     warm, probe = 256, 1024
     if windows and warm + probe >= min(windows):
         raise ValueError(
@@ -795,27 +801,37 @@ class ResponseGenerator:
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
                     batch_results = {}
-                    kv_budget_bytes = None
-                    kv_cost = None
-                    if self.cli_args.kv_budget_gb is not None:
-                        kv_budget_bytes = int(self.cli_args.kv_budget_gb * (1 << 30))
-                        kv_cost = _measure_kv_cost(model)
-                        logging.info(
-                            "KV budget %.2f GB; measured kv_cost: "
-                            "fixed %.0f B/row, %.0f B/token",
-                            self.cli_args.kv_budget_gb,
-                            kv_cost[0],
-                            kv_cost[1],
+                    try:
+                        kv_budget_bytes = None
+                        kv_cost = None
+                        if self.cli_args.kv_budget_gb is not None:
+                            kv_budget_bytes = int(
+                                self.cli_args.kv_budget_gb * (1 << 30)
+                            )
+                            kv_cost = _measure_kv_cost(model)
+                            logging.info(
+                                "KV budget %.2f GB; measured kv_cost: "
+                                "fixed %.0f B/row, %.0f B/token",
+                                self.cli_args.kv_budget_gb,
+                                kv_cost[0],
+                                kv_cost[1],
+                            )
+                        batch_generator = BatchGenerator(
+                            model,
+                            completion_batch_size=self.cli_args.decode_concurrency,
+                            prefill_batch_size=self.cli_args.prompt_concurrency,
+                            prefill_step_size=self.cli_args.prefill_step_size,
+                            kv_budget_bytes=kv_budget_bytes,
+                            kv_cost=kv_cost,
+                            stream=generation_stream,
                         )
-                    batch_generator = BatchGenerator(
-                        model,
-                        completion_batch_size=self.cli_args.decode_concurrency,
-                        prefill_batch_size=self.cli_args.prompt_concurrency,
-                        prefill_step_size=self.cli_args.prefill_step_size,
-                        kv_budget_bytes=kv_budget_bytes,
-                        kv_cost=kv_cost,
-                        stream=generation_stream,
-                    )
+                    except Exception as e:
+                        # Probe or constructor failure (rotating-cache
+                        # refusal, invalid budget, ...) must reach the
+                        # requester, not kill the generation thread.
+                        batch_generator = None
+                        rqueue.put(e)
+                        continue
                     unprocessed_requests.append((rqueue, request, args))
                     continue
 
