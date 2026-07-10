@@ -10,7 +10,17 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,9 +34,11 @@ from .models.cache import (
     BatchRotatingKVCache,
     CacheList,
     KVCache,
+    PrefixAnchor,
     QuantizedKVCache,
     RotatingKVCache,
     TokenBuffer,
+    can_trim_prompt_cache,
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
@@ -1114,6 +1126,7 @@ class PromptProcessingBatch:
         ] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
         max_tokens: Optional[List[int]] = None,
+        anchor_stride: int = 0,
     ):
         self.model = model
         self.uids = uids
@@ -1121,6 +1134,10 @@ class PromptProcessingBatch:
         self.tokens = tokens if tokens is not None else [[] for _ in uids]
 
         self.prefill_step_size = prefill_step_size
+        # Anchor-stride prefix reuse: exact per-request prompt-prefix snapshots
+        # captured during prefill, keyed by uid, drained by the scheduler.
+        self.anchor_stride = anchor_stride
+        self.anchors: Dict[int, List[PrefixAnchor]] = {}
         self.samplers = samplers if samplers is not None else []
         self.fallback_sampler = fallback_sampler or (lambda x: mx.argmax(x, axis=-1))
         self.logits_processors = (
@@ -1175,6 +1192,10 @@ class PromptProcessingBatch:
         new_batch.logits_processors = list(self.logits_processors)
         new_batch.stop_matchers = list(self.stop_matchers)
         new_batch.max_tokens = list(self.max_tokens)
+        new_batch.anchor_stride = self.anchor_stride
+        # Anchors are drained by the scheduler right after each prompt() call,
+        # so they are empty at split/copy time; start the copy clean.
+        new_batch.anchors = {}
         return new_batch
 
     def split(self, indices: List[int]):
@@ -1229,6 +1250,20 @@ class PromptProcessingBatch:
         padding = [max_length - l for l in lengths]
         max_padding = max(padding)
 
+        # Anchor capture is only well-defined for an unpadded batch: with right
+        # padding, a request's cache state past its real length is polluted by
+        # padding until finalize(), so mid-prefill snapshots there would be
+        # wrong. Skip capture for padded (mixed-length) batches and for
+        # trimmable caches (which already reuse the full prefix via trim).
+        capture = (
+            self.anchor_stride > 0
+            and max_padding == 0
+            and not can_trim_prompt_cache(self.prompt_cache)
+        )
+        # Absolute prefix length already in each request's cache before this
+        # call (a prompt may be prefilled across several prompt() calls).
+        bases = [len(self.tokens[i]) - lengths[i] for i in range(len(lengths))]
+
         # Prepare the caches and inputs. Right pad if needed otherwise just
         # cast to array.
         if max_padding > 0:
@@ -1239,12 +1274,16 @@ class PromptProcessingBatch:
             tokens = mx.array(tokens)
 
         # Actual prompt processing loop
+        processed = 0
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
+            processed += n_to_process
+            if capture:
+                self._capture_anchors(bases, lengths, processed)
 
         # Finalize the cache if there was any padding
         if max_padding > 0:
@@ -1252,6 +1291,30 @@ class PromptProcessingBatch:
                 c.finalize()
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
+
+    def _capture_anchors(self, bases, lengths, processed):
+        # Snapshot each request's exact prefix at stride boundaries as prefill
+        # advances. A prompt is fed to the model in prefill_step_size chunks
+        # (possibly across several prompt() calls), so we capture at chunk
+        # boundaries spaced at least anchor_stride apart; the caller keeps
+        # prefill_step_size <= anchor_stride so boundaries are stride-granular.
+        # An anchor equal to the full stored prompt is dropped later by
+        # LRUPromptCache.insert_anchors. Called only for an unpadded,
+        # non-trimmable batch.
+        for i, uid in enumerate(self.uids):
+            abs_len = bases[i] + processed
+            captured = self.anchors.get(uid)
+            last = captured[-1].length if captured else bases[i]
+            if abs_len < last + self.anchor_stride:
+                continue
+            snapshot = [c.extract(i) for c in self.prompt_cache]
+            mx.eval([c.state for c in snapshot])
+            self.anchors.setdefault(uid, []).append(PrefixAnchor(abs_len, snapshot))
+
+    def drain_anchors(self) -> Dict[int, List[PrefixAnchor]]:
+        """Return captured anchors keyed by uid and clear them."""
+        anchors, self.anchors = self.anchors, {}
+        return anchors
 
     def generate(self, tokens: List[List[int]]):
         """
@@ -1295,6 +1358,7 @@ class PromptProcessingBatch:
         model: nn.Module,
         fallback_sampler: Callable[[mx.array], mx.array],
         prefill_step_size: int = 2048,
+        anchor_stride: int = 0,
     ):
         return cls(
             model=model,
@@ -1307,6 +1371,7 @@ class PromptProcessingBatch:
             logits_processors=[],
             max_tokens=[],
             stop_matchers=[],
+            anchor_stride=anchor_stride,
         )
 
 
@@ -1587,6 +1652,7 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        prompt_cache_anchor_stride: int = 0,
         stream=None,
     ):
         self.model = model
@@ -1598,6 +1664,12 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self.prompt_cache_anchor_stride = prompt_cache_anchor_stride
+        # Anchors can only be snapshotted at prefill chunk boundaries, so keep
+        # chunks no larger than the stride when capture is on.
+        if prompt_cache_anchor_stride > 0:
+            self.prefill_step_size = min(prefill_step_size, prompt_cache_anchor_stride)
+            prefill_step_size = self.prefill_step_size
 
         self._stream = stream or generation_stream
 
@@ -1609,7 +1681,11 @@ class BatchGenerator:
             self.model,
             self.sampler,
             prefill_step_size=prefill_step_size,
+            anchor_stride=prompt_cache_anchor_stride,
         )
+        # Anchors captured during prompt prefill, keyed by uid, until the
+        # caller extracts the finished cache.
+        self._anchors: Dict[int, List[PrefixAnchor]] = {}
         self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
         self._currently_processing = []
@@ -1774,10 +1850,23 @@ class BatchGenerator:
                 )
         return results
 
+    def pop_anchors(self, uids):
+        """Take (and clear) the anchor snapshots captured for the given uids.
+
+        Returns ``{uid: [PrefixAnchor, ...]}`` (empty list if none) and removes
+        them, so the caller drains them once when a request finishes. Only
+        populated when the generator was created with
+        ``prompt_cache_anchor_stride > 0`` and the model's cache is
+        non-trimmable; see ``LRUPromptCache.insert_anchors``.
+        """
+        return {uid: self._anchors.pop(uid, []) for uid in uids}
+
     def remove(self, uids, return_prompt_caches=False):
         caches = {}
         if return_prompt_caches:
             caches = self.extract_cache(uids)
+        for uid in uids:
+            self._anchors.pop(uid, None)
 
         keep = (
             set(range(len(self._unprocessed_sequences))),
@@ -1917,6 +2006,11 @@ class BatchGenerator:
         self._prompt_batch.prompt(prompts)
         toc = time.perf_counter()
         self._prompt_time_counter += toc - tic
+
+        # Collect anchors captured during this prefill, keyed by uid, so they
+        # survive the split/generate lifecycle until the cache is extracted.
+        for uid, anchors in self._prompt_batch.drain_anchors().items():
+            self._anchors.setdefault(uid, []).extend(anchors)
 
         return prompt_responses, generation_responses
 

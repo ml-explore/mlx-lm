@@ -8,7 +8,7 @@ import unittest
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.generate import generate_step
+from mlx_lm.generate import PromptProcessingBatch, generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
@@ -423,6 +423,104 @@ class TestPromptCache(unittest.TestCase):
         cold_cache = make_prompt_cache(model)
         cold_tok = int(mx.argmax(model(mx.array([req_b]), cache=cold_cache)[0, -1]))
         self.assertEqual(warm_tok, cold_tok)
+
+    def test_batched_prompt_captures_anchors_unpadded(self):
+        # PromptProcessingBatch captures per-request anchors during a batched,
+        # unpadded prefill; offsets track prompts prefilled across calls; padded
+        # (mixed-length) batches skip capture.
+        mx.random.seed(0)
+        model = _TinyRecurrentModel(vocab=64, dim=16, n_layers=2)
+        mx.eval(model.parameters())
+
+        # Batch of one, stride 4, 20-token prompt -> anchors at 4,8,12,16.
+        batch = PromptProcessingBatch(
+            model, [7], [model.make_cache()], prefill_step_size=4, anchor_stride=4
+        )
+        prompt = list(range(1, 21))
+        batch.prompt([prompt])
+        mx.eval([c.state for c in batch.prompt_cache])
+        anchors = batch.drain_anchors()
+        # Boundaries at every stride; the length-20 anchor equals the full
+        # prompt and is dropped by insert_anchors below.
+        self.assertEqual([a.length for a in anchors[7]], [4, 8, 12, 16, 20])
+        self.assertEqual(batch.drain_anchors(), {})  # drained
+
+        # Those anchors give a divergent request reuse up to the nearest anchor.
+        store = LRUPromptCache(max_size=8)
+        store.insert_cache("m", prompt, batch.extract_cache(0))
+        store.insert_anchors("m", prompt, anchors[7])
+        req_b = prompt[:13] + [63, 0, 62]
+        _, rest = store.fetch_nearest_cache("m", req_b)
+        self.assertEqual(len(req_b) - len(rest), 12)
+
+        # A prompt prefilled across two calls: absolute offsets are honored.
+        split = PromptProcessingBatch(
+            model, [9], [model.make_cache()], prefill_step_size=4, anchor_stride=4
+        )
+        split.prompt([list(range(1, 9))])
+        first = split.drain_anchors()
+        split.prompt([list(range(9, 17))])
+        second = split.drain_anchors()
+        self.assertEqual([a.length for a in first[9]], [4, 8])
+        self.assertEqual([a.length for a in second[9]], [12, 16])
+
+        # Mixed-length (padded) batch: capture is skipped.
+        padded = PromptProcessingBatch(
+            model,
+            [1, 2],
+            [model.make_cache(), model.make_cache()],
+            prefill_step_size=4,
+            anchor_stride=4,
+        )
+        padded.prompt([list(range(1, 21)), list(range(1, 9))])
+        self.assertEqual(padded.drain_anchors(), {})
+
+    def test_batch_generator_captures_and_reuses_anchors(self):
+        # End-to-end through the continuous-batching scheduler: a request is
+        # prefilled and generated; its captured anchors are available at the
+        # finish response (before removal) and give a divergent request reuse.
+        from mlx_lm.generate import BatchGenerator
+
+        mx.random.seed(0)
+        model = _TinyRecurrentModel(vocab=64, dim=16, n_layers=2)
+        mx.eval(model.parameters())
+
+        gen = BatchGenerator(
+            model,
+            max_tokens=2,
+            prefill_step_size=2048,
+            prompt_cache_anchor_stride=4,
+        )
+        # prefill step is clamped down to the stride so anchors are captured.
+        self.assertEqual(gen.prefill_step_size, 4)
+
+        prompt = list(range(1, 21))
+        (uid,) = gen.insert_segments([[prompt]])
+        finish = None
+        for _ in range(40):
+            _, gen_responses = gen.next()
+            for r in gen_responses:
+                if r.finish_reason is not None:
+                    # Mirror the server: drain anchors + cache at finish.
+                    finish = (
+                        gen.pop_anchors([r.uid])[r.uid],
+                        r.prompt_cache,
+                        r.all_tokens,
+                    )
+            if finish is not None:
+                break
+        self.assertIsNotNone(finish)
+        anchors, cache, all_tokens = finish
+        self.assertEqual([a.length for a in anchors], [4, 8, 12, 16])
+        # Draining is one-shot: no leak after the request finishes.
+        self.assertEqual(gen.pop_anchors([uid])[uid], [])
+
+        store = LRUPromptCache(max_size=8)
+        store.insert_cache("m", all_tokens, cache)
+        store.insert_anchors("m", all_tokens, anchors)
+        req_b = prompt[:13] + [63, 0, 62]
+        _, rest = store.fetch_nearest_cache("m", req_b)
+        self.assertEqual(len(req_b) - len(rest), 12)
 
     def test_insert_anchors_skips_trimmable_snapshots(self):
         from mlx_lm.models.cache import PrefixAnchor
