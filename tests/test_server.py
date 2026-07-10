@@ -785,7 +785,6 @@ class TestMeasureKVCost(unittest.TestCase):
         model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
         fixed, per_token = _measure_kv_cost(model)
         self.assertGreater(per_token, 0)
-        self.assertGreaterEqual(fixed, 0)
         # Cross-check against the analytic per-token KV size
         cfg = model.args
         expected = (
@@ -796,6 +795,31 @@ class TestMeasureKVCost(unittest.TestCase):
             * 2  # bf16
         )
         self.assertAlmostEqual(per_token, expected, delta=expected * 0.01)
+        # Fixed now carries the conservative rounding slack: one (step-1)
+        # of slope per stepped leaf — for a homogeneous KVCache model that
+        # is per_token * 255 (raw fixed is ~0 for pure attention).
+        self.assertAlmostEqual(fixed, per_token * 255, delta=expected * 3)
+
+    def test_safe_projection_covers_non_boundary_allocation(self):
+        """528-token regression (codex safety design): step-rounded live
+        bytes at a NON-boundary length must not exceed the safe projection.
+        This is the exact shape of the W3 smoke defect (projection admitted
+        more live cache than the budget)."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        fixed, per_token = _measure_kv_cost(model)
+
+        caches = make_prompt_cache(model)
+        toks = mx.array([[(i % 100) + 1 for i in range(528)]])
+        model(toks, cache=caches)
+        mx.eval([c.state for c in caches])
+        observed = sum(c.nbytes for c in caches)
+        projected = fixed + per_token * 528
+        self.assertLessEqual(observed, projected)
+        # And the OLD (unsafe) exact projection must be shown insufficient,
+        # proving the slack is load-bearing, not slackness for its own sake
+        self.assertGreater(observed, per_token * 528)
 
 
 if __name__ == "__main__":

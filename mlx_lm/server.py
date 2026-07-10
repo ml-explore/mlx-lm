@@ -272,28 +272,39 @@ class TimeBudget:
 
 
 def _measure_kv_cost(model):
-    """Empirically measure (fixed_bytes_per_row, bytes_per_token) for one
+    """Measure a conservative (fixed_bytes_per_row, bytes_per_token) for one
     sequence row of this model's cache.
 
-    KV caches allocate capacity in 256-token steps, so both probe points are
-    multiples of 256 and the delta divides exactly. Rotating/sliding caches
-    saturate at their window; if the probe range would cross the smallest
-    window the measurement (and byte budgeting) is refused.
+    Cache leaves allocate capacity in steps (``KVCache.step`` = 256), so a
+    row's live bytes exceed ``slope * tokens`` by up to ``slope * (step-1)``
+    per stepped leaf. The raw two-point fit (chunk-aligned probes, exact at
+    boundaries) is therefore padded with that rounding slack in the FIXED
+    component, upper-bounding stepped capacity while keeping the linear
+    policy contract. The safe projection is verified at a deliberately
+    non-boundary point (528 tokens): observed live bytes must not exceed it.
+
+    Rotating/sliding caches saturate at their window; measurement (and byte
+    budgeting) is refused if the probe range would cross the smallest window.
     """
     caches = make_prompt_cache(model)
 
-    def rotating_windows(cs):
+    def leaves(cs):
         for c in cs:
-            if isinstance(c, RotatingKVCache) and c.max_size is not None:
-                yield c.max_size
-            # Composite caches (e.g. CacheList) wrap per-component caches
             inner = getattr(c, "caches", None)
             if inner:
-                yield from rotating_windows(inner)
+                yield from leaves(inner)
+            else:
+                yield c
+
+    def rotating_windows(cs):
+        for c in leaves(cs):
+            if isinstance(c, RotatingKVCache) and c.max_size is not None:
+                yield c.max_size
 
     windows = list(rotating_windows(caches))
     warm, probe = 256, 1024
-    if windows and warm + probe >= min(windows):
+    verify_at = 528  # deliberately NOT a step boundary
+    if windows and max(warm + probe, verify_at) >= min(windows):
         raise ValueError(
             f"--state-budget-gb needs a linear-growth cache probe, but a "
             f"rotating cache saturates at {min(windows)} tokens (inside the "
@@ -301,18 +312,57 @@ def _measure_kv_cost(model):
             f"model configuration."
         )
 
-    def forward(n, start):
+    def forward(cs, n, start):
         toks = mx.array([[(start + i) % 100 + 1 for i in range(n)]])
-        model(toks, cache=caches)
-        mx.eval([c.state for c in caches])
+        model(toks, cache=cs)
+        mx.eval([c.state for c in cs])
 
-    forward(warm, 0)
-    base = sum(c.nbytes for c in caches)
-    forward(probe, warm)
-    grown = sum(c.nbytes for c in caches)
-    per_token = (grown - base) / probe
-    fixed = max(base - per_token * warm, 0.0)
-    return fixed, per_token
+    leaf_list = list(leaves(caches))
+    forward(caches, warm, 0)
+    base_per_leaf = [c.nbytes for c in leaf_list]
+    forward(caches, probe, warm)
+    grown_per_leaf = [c.nbytes for c in leaf_list]
+
+    per_token = sum(g - b for g, b in zip(grown_per_leaf, base_per_leaf)) / probe
+    raw_fixed = max(sum(base_per_leaf) - per_token * warm, 0.0)
+
+    # Conservative rounding slack: one (step-1) worth of slope per GROWING
+    # stepped leaf per row. Fixed-size leaves (e.g. ArraysCache) add none.
+    rounding_slack = 0.0
+    for c, b, g in zip(leaf_list, base_per_leaf, grown_per_leaf):
+        step = getattr(c, "step", None)
+        if step and g > b:
+            leaf_slope = (g - b) / probe
+            rounding_slack += leaf_slope * (step - 1)
+    safe_fixed = raw_fixed + rounding_slack
+
+    # Verification at a non-boundary point: safe projection must cover the
+    # OBSERVED live bytes (over-projection is fine and is reported).
+    vcaches = make_prompt_cache(model)
+    forward(vcaches, verify_at, 0)
+    observed = sum(c.nbytes for c in leaves(vcaches))
+    projected = safe_fixed + per_token * verify_at
+    if observed > projected:
+        raise ValueError(
+            f"state-cost safety check failed: observed {observed} bytes at "
+            f"{verify_at} tokens exceeds safe projection {projected:.0f}; "
+            f"cache allocation behavior does not match the stepped-linear "
+            f"model, refusing byte budgeting"
+        )
+    logging.info(
+        "state-cost fit: per_token %.0f B, raw fixed %.0f B, rounding "
+        "slack %.0f B (leaves: %s); verified at %d tokens: observed %d <= "
+        "projected %.0f (overprojection %.1f%%)",
+        per_token,
+        raw_fixed,
+        rounding_slack,
+        sorted({type(c).__name__ for c in leaf_list}),
+        verify_at,
+        observed,
+        projected,
+        (projected - observed) / max(observed, 1) * 100,
+    )
+    return safe_fixed, per_token
 
 
 class ModelProvider:
