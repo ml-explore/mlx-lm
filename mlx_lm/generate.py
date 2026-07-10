@@ -5,6 +5,8 @@ import contextlib
 import copy
 import functools
 import json
+import logging
+import math
 import sys
 import time
 from collections import deque
@@ -1607,6 +1609,12 @@ class BatchGenerator:
                     "bytes_per_token) measured for this model"
                 )
             fixed, per_token = kv_cost
+            if not (
+                math.isfinite(kv_budget_bytes)
+                and math.isfinite(fixed)
+                and math.isfinite(per_token)
+            ):
+                raise ValueError("kv_budget_bytes and kv_cost must be finite")
             if kv_budget_bytes <= 0 or fixed < 0 or per_token < 0:
                 raise ValueError("kv_budget_bytes must be positive and kv_cost >= 0")
         self.kv_budget_bytes = kv_budget_bytes
@@ -1644,7 +1652,7 @@ class BatchGenerator:
         return self._stream
 
     def close(self):
-        if self._old_wired_limit is not None:
+        if getattr(self, "_old_wired_limit", None) is not None:
             mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
@@ -1839,7 +1847,12 @@ class BatchGenerator:
             max_tokens.append(sequence[2])
             stop_matchers.append(sequence[7])
             self._currently_processing.append(
-                [sequence[1], 0, sum(len(s) for s in sequence[1])]
+                [
+                    sequence[1],
+                    0,
+                    sum(len(s) for s in sequence[1]),
+                    sum(c.nbytes for c in sequence[3]) == 0,
+                ]
             )
 
         return PromptProcessingBatch(
@@ -1896,15 +1909,24 @@ class BatchGenerator:
                 processed, self._capped_tokens(final)
             )
             committed += per_token * max(growth, 0)
-            if processed == 0:
-                # Fixed state materializes on the first forward pass
+            if processed == 0 and (len(seq) < 4 or seq[3]):
+                # Fixed state materializes on the first forward pass —
+                # unless the row entered with a pre-supplied cache whose
+                # fixed state is already in the live byte total.
                 committed += fixed
 
         admitted = 0
         for j in range(n):
             seq = self._unprocessed_sequences[j]
-            total = sum(len(s) for s in seq[1]) + seq[2]
+            new_tokens = sum(len(s) for s in seq[1])
+            history = len(seq[4]) if seq[4] else 0
             existing = sum(c.nbytes for c in seq[3])
+            if existing > 0 and history == 0:
+                # Cache bytes with no token history: what the bytes cover
+                # cannot be verified, so grant no credit (conservative —
+                # the live bytes are still counted in committed).
+                existing = 0
+            total = history + new_tokens + seq[2]
             need = max(fixed + per_token * self._capped_tokens(total) - existing, 0)
             if committed + need > self.kv_budget_bytes:
                 # Liveness contract: a request whose projection alone
@@ -1917,6 +1939,15 @@ class BatchGenerator:
                     and len(self._generation_batch) == 0
                     and len(self._prompt_batch) == 0
                 ):
+                    logging.warning(
+                        "Request %s projects above kv_budget_bytes "
+                        "(%d needed, %d budget) but nothing is running; "
+                        "admitting it anyway (best effort, not a guarantee "
+                        "against out-of-memory)",
+                        seq[0],
+                        int(committed + need),
+                        int(self.kv_budget_bytes),
+                    )
                     admitted = 1
                 break
             committed += need

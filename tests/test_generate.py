@@ -536,39 +536,132 @@ class TestGenerate(unittest.TestCase):
         gen.insert([prompt])
         self.assertEqual(gen._budget_admissible(1), 1)
 
-    def test_kv_budget_continued_generation_not_double_counted(self):
-        """A pre-supplied cache's existing bytes reduce the candidate's need."""
-        from mlx_lm.models import cache as cache_mod
+    def test_kv_budget_continued_generation_full_projection(self):
+        """A primed row still costs its full final length minus existing
+        bytes; history tokens are part of the projection (codex repro:
+        26KB projection must NOT fit a 20KB budget when a row is active)."""
 
-        prompt = self.tokenizer.encode("hello world")
-        per_tok = 1000.0
-        row = (len(prompt) + 4) * per_tok
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
 
-        # Prime a real cache by running one request to completion
-        gen0 = BatchGenerator(self.model, max_tokens=4)
-        (uid,) = gen0.insert([prompt])
-        primed = None
-        while primed is None:
-            for r in gen0.next_generated():
-                if r.finish_reason is not None:
-                    primed = r.prompt_cache
-        del gen0
+        class _StubGenBatch:
+            """Minimal active-batch stand-in: one row, no remaining growth."""
 
-        existing = sum(c.nbytes for c in primed)
-        self.assertGreater(existing, 0)
+            uids = [999]
+            tokens = [[1] * 5]
+            max_tokens = [5]
+            _num_tokens = [5]
+            prompt_cache = []
 
-        # Budget covers 1.5 fresh rows: a fresh candidate + a fully-primed
-        # candidate must BOTH admit (primed one costs ~0 incremental), while
-        # two fresh ones would not.
+            def __len__(self):
+                return 1
+
+        prompt = list(range(11))  # 11 new tokens
         gen = BatchGenerator(
             self.model,
-            max_tokens=4,
-            kv_budget_bytes=int(existing + 1.5 * row),
-            kv_cost=(0.0, per_tok),
+            max_tokens=5,
+            kv_budget_bytes=20_000,
+            kv_cost=(0.0, 1000.0),
         )
-        gen.insert([prompt])  # fresh
-        gen.insert([prompt], caches=[primed])  # continued, bytes exist
+        gen.insert(
+            [prompt],
+            caches=[[_FakeCache(10_000)]],
+            all_tokens=[list(range(10))],  # 10 history tokens in the cache
+        )
+        gen._generation_batch = _StubGenBatch()
+        # Full projection = (10 + 11 + 5) * 1000 = 26000; credit 10000 →
+        # need 16000; committed already holds the 10000 live bytes →
+        # 26000 > 20000 must reject, and liveness must NOT fire (row active).
+        self.assertEqual(gen._budget_admissible(1), 0)
+
+    def test_kv_budget_no_credit_without_history(self):
+        """Cache bytes with no all_tokens history grant no byte credit."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        class _StubGenBatch:
+            uids = [999]
+            tokens = [[1] * 5]
+            max_tokens = [5]
+            _num_tokens = [5]
+            prompt_cache = []
+
+            def __len__(self):
+                return 1
+
+        prompt = list(range(10))
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=18_000,
+            kv_cost=(0.0, 1000.0),
+        )
+        gen.insert([prompt], caches=[[_FakeCache(9_000)]])
+        gen._generation_batch = _StubGenBatch()  # suppress liveness escape
+        # No history → no credit: need = 10 * 1000 = 10000 on top of the
+        # 9000 live bytes → 19000 > 18000 rejects. (With an unverified
+        # credit the need would be 1000 and it would wrongly admit.)
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 19_000
+        self.assertEqual(gen._budget_admissible(1), 1)
+
+    def test_kv_budget_remove_releases_headroom(self):
+        """H4: removing a queued row frees its committed bytes (mixed
+        cached/uncached queue)."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        expensive = list(range(10))
+        cheap = list(range(2))
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=13_000,
+            kv_cost=(0.0, 1000.0),
+        )
+
+        class _StubGenBatch:
+            uids = [999]
+            tokens = [[1] * 5]
+            max_tokens = [5]
+            _num_tokens = [5]
+            prompt_cache = []
+
+            def __len__(self):
+                return 1
+
+        (uid_primed,) = gen.insert(
+            [expensive],
+            caches=[[_FakeCache(10_000)]],
+            all_tokens=[list(range(10))],
+        )
+        gen.insert([cheap, cheap])
+        # Suppress the liveness escape: pretend one row is generating
+        gen._generation_batch = _StubGenBatch()
+        # committed starts at 10000 (primed row's live bytes):
+        # primed need = (10+10)*1000 - 10000 = 10000 → 20000 > 13000 reject
+        self.assertEqual(gen._budget_admissible(3), 0)
+        gen.remove([uid_primed])
+        # Its live bytes are gone from committed: 2 cheap rows = 4000 fit
         self.assertEqual(gen._budget_admissible(2), 2)
+
+    def test_kv_budget_rejects_nonfinite(self):
+        for bad_budget, bad_cost in (
+            (float("inf"), (0.0, 1.0)),
+            (1 << 30, (float("nan"), 1.0)),
+            (1 << 30, (0.0, float("inf"))),
+        ):
+            with self.assertRaises(ValueError):
+                BatchGenerator(
+                    self.model,
+                    kv_budget_bytes=bad_budget,
+                    kv_cost=bad_cost,
+                )
 
     def test_kv_budget_e2e_generation_completes(self):
         """Budgeted end-to-end run finishes all requests (queued, not lost)."""
