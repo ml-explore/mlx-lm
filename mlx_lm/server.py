@@ -40,7 +40,13 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    SnapKVAttentionCapture,
+    evict_prompt_cache,
+    make_prompt_cache,
+    snapkv_keep_indices,
+)
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -354,6 +360,11 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+        # SnapKV-D scores a prefill with a process-global attention hook, which
+        # cannot separate per-request scores in a shared batch, so it runs on
+        # the single-request path.
+        if self.cli_args.kv_eviction == "snapkv":
+            is_batchable = False
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -868,6 +879,38 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
+    def _maybe_snapkv_compact(self, model, cache, rest, made_fresh):
+        """Post-prefill SnapKV-D eviction for a fresh full prefill.
+
+        Returns ``(cache, decode_prompt)``. When ``--kv-eviction snapkv`` is on
+        and the fresh prompt is longer than the floor, this prefills
+        ``rest[:-1]`` under a scoring hook, compacts every full-attention layer
+        to ``--kv-budget`` retained rows, and returns the last prompt token to
+        decode from. Otherwise it returns ``(cache, rest)`` unchanged.
+        """
+        args = self.cli_args
+        if (
+            getattr(args, "kv_eviction", "none") != "snapkv"
+            or not made_fresh
+            or len(rest) <= args.kv_min_tokens
+        ):
+            return cache, rest
+
+        prefill_ids = rest[:-1]
+        with SnapKVAttentionCapture(window=args.kv_window) as capture:
+            model(mx.array([prefill_ids]), cache=cache)
+            mx.eval([c.state for c in cache])
+        scores = capture.snap_scores(len(prefill_ids))
+        keep = snapkv_keep_indices(
+            len(prefill_ids),
+            args.kv_budget,
+            scores,
+            sink_tokens=args.kv_sink_tokens,
+            min_tokens=args.kv_min_tokens,
+        )
+        result = evict_prompt_cache(cache, keep, true_offset=len(prefill_ids))
+        return result.cache, rest[-1:]
+
     def _serve_single(self, request):
         rqueue, request, args = request
 
@@ -915,10 +958,17 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
+            made_fresh = cache is None
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            # Post-prefill SnapKV-D eviction (opt-in): on a full miss, prefill
+            # the prompt under a scoring hook, compact the cache to the budget,
+            # and decode from the last token. Only for a fresh full prefill so
+            # the scored/retained positions are exact.
+            cache, rest = self._maybe_snapkv_compact(model, cache, rest, made_fresh)
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
@@ -1847,6 +1897,42 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--kv-eviction",
+        type=str,
+        default="none",
+        choices=["none", "snapkv"],
+        help=(
+            "Post-prefill KV cache eviction policy. 'snapkv' compacts each "
+            "full-attention layer to --kv-budget retained rows (sinks + recent "
+            "+ top attention-scored) after a fresh prefill, cutting long-context "
+            "decode KV reads. Default 'none'. Runs on the single-request path."
+        ),
+    )
+    parser.add_argument(
+        "--kv-budget",
+        type=int,
+        default=512,
+        help="Retained KV rows per layer when --kv-eviction is snapkv",
+    )
+    parser.add_argument(
+        "--kv-window",
+        type=int,
+        default=24,
+        help="SnapKV observation window (final prompt query rows used to score)",
+    )
+    parser.add_argument(
+        "--kv-sink-tokens",
+        type=int,
+        default=4,
+        help="Leading attention-sink rows always retained by SnapKV eviction",
+    )
+    parser.add_argument(
+        "--kv-min-tokens",
+        type=int,
+        default=128,
+        help="Prompts at or below this length are never SnapKV-compacted",
     )
     parser.add_argument(
         "--pipeline",
