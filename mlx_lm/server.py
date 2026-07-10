@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import json
@@ -1844,7 +1844,7 @@ def main():
         default=None,
         help=(
             "Maximum queued prompts considered for length-aware admission "
-            "(default: 4 times --prompt-concurrency; set to 1 for FIFO)"
+            "(default: 1, preserves FIFO; try 4 times --prompt-concurrency)"
         ),
     )
     parser.add_argument(

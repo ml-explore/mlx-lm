@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import contextlib
@@ -1598,9 +1598,7 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.prefill_batch_window = (
-            4 * prefill_batch_size
-            if prefill_batch_window is None
-            else prefill_batch_window
+            1 if prefill_batch_window is None else prefill_batch_window
         )
         if self.prefill_batch_window < 1:
             raise ValueError("prefill_batch_window must be positive")
