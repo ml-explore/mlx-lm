@@ -163,6 +163,15 @@ class TestStateBudget(unittest.TestCase):
             policy.admitted_prefix([oversized], live_bytes=0, active=[active]), 0
         )
 
+    def test_budget_mutation_remains_validated(self):
+        policy = StateBudget(1_000, lambda state: 0)
+        policy.budget_bytes = 2_000
+        self.assertEqual(policy.budget_bytes, 2_000)
+        for invalid in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                policy.budget_bytes = invalid
+            self.assertEqual(policy.budget_bytes, 2_000)
+
 
 if __name__ == "__main__":
     unittest.main()

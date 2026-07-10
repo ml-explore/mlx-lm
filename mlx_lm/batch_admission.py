@@ -116,12 +116,20 @@ class StateBudget:
     """
 
     def __init__(self, budget_bytes: float, project: Callable[[AdmissionState], float]):
-        if not math.isfinite(budget_bytes) or budget_bytes <= 0:
-            raise ValueError("budget_bytes must be finite and positive")
         if not callable(project):
             raise TypeError("project must be callable")
         self.budget_bytes = budget_bytes
         self.project = project
+
+    @property
+    def budget_bytes(self) -> float:
+        return self._budget_bytes
+
+    @budget_bytes.setter
+    def budget_bytes(self, value: float):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("budget_bytes must be finite and positive")
+        self._budget_bytes = value
 
     def projected_bytes(self, state: AdmissionState) -> float:
         projected = self.project(state)
