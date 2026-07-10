@@ -1,5 +1,6 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2025-2026 Apple Inc.
 
+import copy
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, List, Optional, Tuple
@@ -42,6 +43,10 @@ class ModelArgs(BaseModelArgs):
     use_conv_bias: bool
     hybrid_override_pattern: Optional[List[str]] = None
     layers_block_type: Optional[List[str]] = None
+    # nemotron_h_puzzle (Puzzle-NAS): heterogeneous MoE. Per-layer list aligned
+    # with layers_block_type; MoE entries carry their own `moe_intermediate_size`
+    # and `num_experts_per_tok`. Absent (plain nemotron_h) => uniform dims.
+    block_configs: Optional[List[dict]] = None
     head_dim: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     moe_shared_expert_intermediate_size: Optional[int] = None
@@ -351,9 +356,12 @@ class MoEGate(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
+        # Puzzle configs omit group routing / scaling; default to the identity
+        # (no grouping, unit scale) so group_expert_select's `n_group > 1`
+        # guard doesn't hit a `None > 1` TypeError.
+        self.routed_scaling_factor = config.routed_scaling_factor or 1.0
+        self.n_group = config.n_group or 1
+        self.topk_group = config.topk_group or 1
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
@@ -455,13 +463,31 @@ class NemotronHBlock(nn.Module):
         return x + hidden_states
 
 
+def _moe_layer_args(args: ModelArgs, block_cfg: Optional[dict]) -> ModelArgs:
+    """Shallow per-layer view overriding this MoE layer's heterogeneous dims
+    (nemotron_h_puzzle). `n_routed_experts` / `moe_latent_size` stay global;
+    only `moe_intermediate_size` and `num_experts_per_tok` vary per layer."""
+    if not block_cfg:
+        return args
+    lc = copy.copy(args)
+    if block_cfg.get("moe_intermediate_size") is not None:
+        lc.moe_intermediate_size = block_cfg["moe_intermediate_size"]
+    if block_cfg.get("num_experts_per_tok") is not None:
+        lc.num_experts_per_tok = block_cfg["num_experts_per_tok"]
+    return lc
+
+
 class NemotronHModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
+        pattern = args.hybrid_override_pattern
+        block_configs = args.block_configs or [None] * len(pattern)
         self.layers = [
-            NemotronHBlock(args, block_type)
-            for block_type in args.hybrid_override_pattern
+            NemotronHBlock(
+                _moe_layer_args(args, bc) if bt == "E" else args, bt
+            )
+            for bt, bc in zip(pattern, block_configs)
         ]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0

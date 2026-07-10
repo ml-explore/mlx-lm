@@ -53,6 +53,7 @@ MODEL_REMAPPING = {
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "nemotron_h_puzzle": "nemotron_h",  # Puzzle-NAS heterogeneous MoE on the Nemotron-H hybrid; per-layer dims via block_configs
 }
 
 MAX_FILE_SIZE_GB = 5
