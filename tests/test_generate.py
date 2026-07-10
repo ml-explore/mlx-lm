@@ -662,11 +662,14 @@ class TestGenerate(unittest.TestCase):
         )
         gen.insert([prompt], caches=[[_FakeCache(9_000)]])
         gen._generation_batch = _StubGenBatch()  # suppress liveness escape
-        # No history → no credit: need = 10 * 1000 = 10000 on top of the
-        # 9000 live bytes → 19000 > 18000 rejects. (With an unverified
-        # credit the need would be 1000 and it would wrongly admit.)
+        # Cohort accounting at FINAL extents: stub active row projects
+        # 5 * 1000 = 5000; candidate projects 10 * 1000 = 10000; its
+        # 9000 supplied-cache bytes carry NO history → unverifiable →
+        # charged ON TOP (never credited): 24000 > 18000 rejects. (With
+        # an unverified credit the total would drop to 15000 and wrongly
+        # admit.)
         self.assertEqual(gen._budget_admissible(1), 0)
-        gen.kv_budget_bytes = 19_000
+        gen.kv_budget_bytes = 24_000
         self.assertEqual(gen._budget_admissible(1), 1)
 
     def test_kv_budget_remove_releases_headroom(self):

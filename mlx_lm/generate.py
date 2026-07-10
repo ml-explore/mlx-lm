@@ -1626,7 +1626,7 @@ class BatchGenerator:
                     "kv_budget_bytes requires kv_cost=(fixed_bytes_per_row, "
                     "bytes_per_token) measured for this model"
                 )
-            fixed, per_token = kv_cost
+            fixed, per_token = kv_cost[0], kv_cost[1]
             if not (
                 math.isfinite(kv_budget_bytes)
                 and math.isfinite(fixed)
@@ -1639,9 +1639,15 @@ class BatchGenerator:
         self.kv_cost = kv_cost
         self.state_budget = state_budget
         if kv_budget_bytes is not None:
+            step = kv_cost[2] if len(kv_cost) > 2 else None
             self.state_budget = StateBudget(
                 kv_budget_bytes,
-                LinearStateCost(fixed, per_token, max_units=max_kv_size),
+                LinearStateCost(
+                    fixed,
+                    per_token,
+                    max_units=max_kv_size,
+                    allocation_step_units=step,
+                ),
             )
 
         self._stream = stream or generation_stream
@@ -1899,19 +1905,24 @@ class BatchGenerator:
         return tokens
 
     def _budget_admissible(self, n):
-        """How many of the first n queued sequences fit the KV byte budget.
+        """How many of the first n queued sequences fit the state budget.
 
-        Recomputed from live state on every call, so removals free headroom
-        automatically. Committed bytes = all live cache bytes (queued,
-        prefilling, and generating rows) plus the projected REMAINING growth
-        of every active row: per-token growth up to each row's capped final
-        length, plus fixed per-row state for rows that have not yet run a
-        forward pass. A candidate's cost is its full projection minus bytes
-        its pre-supplied cache already holds (continued generation), so
-        existing bytes are never double counted.
+        Shared batch caches (BatchKVCache) allocate every row at the
+        cohort-max step-rounded width, so cost is NON-ADDITIVE: each prefix
+        length is evaluated by recomputing the full cohort projection at
+        final extents (via the policy's ``cohort_bytes``), floored by actual
+        live bytes. No per-row resident credit is granted under stepped
+        geometry — a supplied cache's bytes cannot reduce the shared width.
         """
         if self.state_budget is None or n <= 0:
             return n
+        self._sync_budget_mutation()
+        queued = list(self._unprocessed_sequences)[:n]
+        return self._admit_states(
+            [self._candidate_admission_state(seq) for seq in queued]
+        )
+
+    def _sync_budget_mutation(self):
         if (
             self.kv_budget_bytes is not None
             and self.state_budget.budget_bytes != self.kv_budget_bytes
@@ -1922,98 +1933,95 @@ class BatchGenerator:
                 raise ValueError("kv_budget_bytes must be finite and positive")
             self.state_budget.budget_bytes = self.kv_budget_bytes
 
-        committed = self.prompt_cache_nbytes
+    def _candidate_admission_state(self, seq):
+        new_tokens = sum(len(s) for s in seq[1])
+        history = len(seq[4]) if seq[4] else 0
+        total = history + new_tokens + seq[2]
+        existing = sum(c.nbytes for c in seq[3])
+        # Reviewer constraint: credit only against verifiable geometry.
+        # A supplied cache WITH history is inside the projection target;
+        # one WITHOUT history is unverifiable — its bytes sit OUTSIDE the
+        # projection and are charged on top, never credited.
+        unverified = float(existing) if (existing > 0 and history == 0) else 0.0
+        return AdmissionState(
+            seq[0],
+            total,
+            history,
+            metadata={
+                "phase": "queued",
+                "prompt_units": new_tokens,
+                "unverified_bytes": unverified,
+            },
+        )
 
-        # Remaining growth of rows currently generating
+    def _final_extent_states(self):
+        """AdmissionStates of every admitted row at FINAL extent, for the
+        shared-width cohort projection."""
+        states = []
         gb = self._generation_batch
         for i in range(len(gb)):
             current = len(gb.tokens[i])
             final = current + max(gb.max_tokens[i] - gb._num_tokens[i], 0)
-            resident = self.state_budget.projected_bytes(
+            states.append(
                 AdmissionState(
-                    gb.uids[i], current, current, metadata={"phase": "generation"}
+                    gb.uids[i], final, current, metadata={"phase": "generation"}
                 )
             )
-            committed += self.state_budget.remaining_bytes(
-                AdmissionState(
-                    gb.uids[i],
-                    final,
-                    current,
-                    resident,
-                    {"phase": "generation"},
-                )
-            )
-
-        # Remaining growth of rows currently prefilling
         for i, seq in enumerate(self._currently_processing):
-            processed = seq[1]
             history = seq[4] if len(seq) > 4 else 0
-            current = history + processed
             final = history + seq[2] + self._prompt_batch.max_tokens[i]
-            current_state = AdmissionState(
-                self._prompt_batch.uids[i],
-                current,
-                current,
-                metadata={"phase": "prefill"},
-            )
-            current_bytes = self.state_budget.projected_bytes(current_state)
-            if processed == 0 and (len(seq) < 4 or seq[3]):
-                # No state has materialized for a new row yet.
-                current_bytes = 0
-            committed += self.state_budget.remaining_bytes(
+            states.append(
                 AdmissionState(
                     self._prompt_batch.uids[i],
                     final,
-                    current,
-                    current_bytes,
-                    {"phase": "prefill"},
+                    history + seq[1],
+                    metadata={"phase": "prefill"},
                 )
             )
+        return states
 
+    def _cohort_committed(self, candidate_states):
+        """Projected total bytes with ``candidate_states`` admitted, floored
+        by actual live bytes (a stale wide allocation never shrinks below
+        reality)."""
+        cost = self.state_budget.project
+        all_states = self._final_extent_states() + list(candidate_states)
+        if hasattr(cost, "cohort_bytes"):
+            projected = cost.cohort_bytes(all_states)
+        else:
+            projected = sum(self.state_budget.projected_bytes(s) for s in all_states)
+        projected += sum(s.metadata.get("unverified_bytes", 0.0) for s in all_states)
+        return max(projected, float(self.prompt_cache_nbytes))
+
+    def _admit_states(self, states):
+        """How many of ``states`` fit, in order — recomputing the full
+        non-additive cohort cost for each exact prefix length."""
+        states = list(states)
         admitted = 0
-        for j in range(n):
-            seq = self._unprocessed_sequences[j]
-            new_tokens = sum(len(s) for s in seq[1])
-            history = len(seq[4]) if seq[4] else 0
-            existing = sum(c.nbytes for c in seq[3])
-            if existing > 0 and history == 0:
-                # Cache bytes with no token history: what the bytes cover
-                # cannot be verified, so grant no credit (conservative —
-                # the live bytes are still counted in committed).
-                existing = 0
-            total = history + new_tokens + seq[2]
-            state = AdmissionState(
-                seq[0],
-                total,
-                history,
-                existing,
-                {"phase": "queued", "prompt_units": new_tokens},
-            )
-            need = self.state_budget.remaining_bytes(state)
-            if committed + need > self.state_budget.budget_bytes:
-                # Liveness contract: a request whose projection alone
-                # exceeds the budget is admitted when nothing else is
-                # running, mirroring count-cap semantics where a single
-                # request always proceeds. Best effort, not a guarantee
-                # against out-of-memory.
-                if (
-                    admitted == 0
-                    and len(self._generation_batch) == 0
-                    and len(self._prompt_batch) == 0
-                ):
-                    logging.warning(
-                        "Request %s projects above the state budget "
-                        "(%d needed, %d budget) but nothing is running; "
-                        "admitting it anyway (best effort, not a guarantee "
-                        "against out-of-memory)",
-                        seq[0],
-                        int(committed + need),
-                        int(self.state_budget.budget_bytes),
-                    )
-                    admitted = 1
+        for k in range(1, len(states) + 1):
+            if self._cohort_committed(states[:k]) > self.state_budget.budget_bytes:
                 break
-            committed += need
-            admitted += 1
+            admitted = k
+        if (
+            admitted == 0
+            and states
+            and len(self._generation_batch) == 0
+            and len(self._prompt_batch) == 0
+        ):
+            # Liveness contract: a request whose projection alone exceeds
+            # the budget is admitted when nothing else is running, mirroring
+            # count-cap semantics where a single request always proceeds.
+            # Best effort, not a guarantee against out-of-memory.
+            logging.warning(
+                "Request %s projects above the state budget "
+                "(%d needed, %d budget) but nothing is running; "
+                "admitting it anyway (best effort, not a guarantee "
+                "against out-of-memory)",
+                states[0].uid,
+                int(self._cohort_committed(states[:1])),
+                int(self.state_budget.budget_bytes),
+            )
+            admitted = 1
         return admitted
 
     def _next(self):
