@@ -547,6 +547,35 @@ class TestGenerate(unittest.TestCase):
         # Uncapped projection would admit 0; capped admits 2
         self.assertEqual(gen._budget_admissible(4), 2)
 
+    def test_state_budget_caps_active_continued_history(self):
+        """A primed prefill row's capped growth starts after its history."""
+
+        class _FakeCache:
+            nbytes = 10_000
+
+        class _StubPromptBatch:
+            uids = [123]
+            max_tokens = [0]
+            prompt_cache = [_FakeCache()]
+
+            def __len__(self):
+                return 1
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            max_kv_size=16,
+            kv_budget_bytes=17_000,
+            kv_cost=(0.0, 1_000.0),
+        )
+        gen._prompt_batch = _StubPromptBatch()
+        # 10 cached history + 10 new prompt tokens, none processed yet.
+        # Only 6 more token slots can materialize before the size-16 cap.
+        gen._currently_processing = [[[list(range(10))], 0, 10, False, 10]]
+        gen.insert([[1]])
+        # 10K resident + 6K active growth + 1K candidate = 17K exactly.
+        self.assertEqual(gen._budget_admissible(1), 1)
+
     def test_kv_budget_oversized_single_request_liveness(self):
         """A request alone over budget still admits when nothing is active."""
         prompt = self.tokenizer.encode("hello world " * 50)
