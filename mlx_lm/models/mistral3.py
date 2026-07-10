@@ -46,6 +46,26 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        # transformers >= 5 checkpoints nest everything under a top-level
+        # "model." (model.language_model.*, model.vision_tower.*) with
+        # lm_head.weight at the root. Remap to the older layout
+        # (language_model.model.*, language_model.lm_head.*) expected below.
+        if any(k.startswith("model.language_model.") for k in weights):
+            remapped = {}
+            for k, v in weights.items():
+                if k.startswith("model.language_model."):
+                    remapped[
+                        "language_model.model." + k[len("model.language_model.") :]
+                    ] = v
+                elif k.startswith(
+                    ("model.vision_tower.", "model.multi_modal_projector.")
+                ):
+                    continue
+                elif k.startswith("lm_head."):
+                    remapped["language_model." + k] = v
+                else:
+                    remapped[k] = v
+            weights = remapped
         weights = tree_unflatten(list(weights.items()))
         weights.pop("vision_tower", None)
         weights.pop("multi_modal_projector", None)
