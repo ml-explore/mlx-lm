@@ -368,20 +368,31 @@ def _measure_kv_cost(model):
 
     # Independent higher point: the two-point fit is measured on
     # [256, 1280]; a slope that changes past 1280 would still pass the
-    # 528 check. Measure at 2048 (a step boundary, so the linear
-    # prediction is exact for a consistent model) and refuse on mismatch.
+    # 528 check. Verify PER LEAF at 2048 (a step boundary, so linear
+    # prediction is exact for a consistent leaf) — an aggregate check
+    # can be defeated by two leaves whose deviations cancel.
     third_at = 2048
     forward(vcaches, third_at - verify_at, verify_at)
-    observed_third = sum(c.nbytes for c in leaves(vcaches))
-    predicted_third = raw_fixed + per_token * third_at
-    tolerance = max(0.01 * predicted_third, float(common_step))
-    if abs(observed_third - predicted_third) > tolerance:
-        raise ValueError(
-            f"state-cost consistency check failed: observed "
-            f"{observed_third} bytes at {third_at} tokens vs predicted "
-            f"{predicted_third:.0f} (fit measured on 256..1280); the "
-            f"cache does not grow linearly, refusing byte budgeting"
-        )
+    vleaves = list(leaves(vcaches))
+    for c, b, g in zip(vleaves, base_per_leaf, grown_per_leaf):
+        leaf_slope = (g - b) / probe
+        predicted = b + leaf_slope * (third_at - warm)
+        observed_leaf = c.nbytes
+        tolerance = max(0.01 * max(predicted, 1.0), leaf_slope * common_step)
+        if abs(observed_leaf - predicted) > tolerance:
+            raise ValueError(
+                f"state-cost consistency check failed for leaf "
+                f"{type(c).__name__}: observed {observed_leaf} bytes at "
+                f"{third_at} tokens vs predicted {predicted:.0f} (fit "
+                f"measured on 256..1280); the cache does not grow "
+                f"linearly, refusing byte budgeting"
+            )
+    logging.info(
+        "state-cost third-point verification passed: %d leaves at %d "
+        "tokens, all within tolerance of the 256..1280 linear fit",
+        len(vleaves),
+        third_at,
+    )
     logging.info(
         "state-cost fit: per_token %.0f B, raw fixed %.0f B, common step %d "
         "(leaves: %s); verified at %d tokens: observed %d <= projected %.0f",

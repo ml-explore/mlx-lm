@@ -900,7 +900,36 @@ class _FakeComposite:
         self.state = []
 
 
+class _CancellingLeaf(_FakeLeaf):
+    """Grows slower after 1280 — pairs with _SlopeChangeLeaf so aggregate
+    bytes match the linear fit while each leaf individually deviates."""
+
+    @property
+    def nbytes(self):
+        cap = self._tokens
+        if self.step:
+            cap = -(-cap // self.step) * self.step
+        if cap <= 1280:
+            return int(self._slope * cap)
+        return int(self._slope * 1280)  # stops growing entirely
+
+
 class TestMeasureKVCostConsistency(unittest.TestCase):
+    def test_two_leaf_cancellation_refused(self):
+        """Per-leaf verification: one leaf doubles and another stalls after
+        1280 so AGGREGATE 2048 bytes match the fit exactly — each leaf
+        individually deviates and must be refused."""
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [
+                    _SlopeChangeLeaf(100.0, step=256),
+                    _CancellingLeaf(100.0, step=256),
+                ]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
     def test_slope_change_after_fit_range_refused(self):
         class _M(_FakeModel):
             def make_cache(self):

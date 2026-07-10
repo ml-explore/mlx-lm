@@ -958,6 +958,50 @@ class TestGenerate(unittest.TestCase):
         self.assertLessEqual(before, 2 * per_tok * step)
         del gen
 
+    def test_removal_transition_rejects_then_admits(self):
+        """Reviewer test 6 strengthened (codex): a REAL transition — the
+        same candidate is REJECTED while an admitted row holds the budget,
+        and ADMITTED after that row completes and is removed, under one
+        unchanged budget."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        # Budget fits ONE 512+8 row (rounded 768 units) plus margin, but
+        # not two such rows.
+        one_row = fixed + per_tok * 768
+        budget = int(1.5 * one_row)
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=8,
+            prefill_batch_size=4,
+            kv_budget_bytes=budget,
+            kv_cost=(fixed, per_tok, step),
+        )
+        prompt = [(i % 100) + 1 for i in range(512)]
+        (uid_a,) = gen.insert([prompt])
+        # Drive A into the engine (admitted via liveness-free path: it fits)
+        for _ in range(4):
+            gen.next()
+        # B arrives while A is active: two rows cannot fit -> rejected
+        (uid_b,) = gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 0)
+        # Withdraw B (else the engine would auto-admit it the moment A
+        # frees capacity, inside the same next() call), then run A out.
+        gen.remove([uid_b])
+        done = set()
+        for _ in range(200):
+            _, responses = gen.next()
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if uid_a in done:
+                break
+        self.assertIn(uid_a, done)
+        # Same budget, identical fresh candidate: now admissible
+        gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 1)
+        del gen
+
     def test_kv_budget_e2e_generation_completes(self):
         """Budgeted end-to-end run finishes all requests (queued, not lost)."""
         prompt = self.tokenizer.encode("hello world")
