@@ -48,28 +48,75 @@ class AdmissionState:
 
 
 class LinearStateCost:
-    """Fixed plus per-unit state cost for dense and hybrid AR caches."""
+    """Fixed plus per-unit state cost for dense and hybrid AR caches.
+
+    ``allocation_step_units`` describes a shared stepped allocation such as
+    ``BatchKVCache``.  Scalar projections round one request to that step;
+    ``cohort_bytes`` additionally models the shared cohort width, where every
+    row pays for the longest row's rounded allocation.
+    """
 
     def __init__(
         self,
         fixed_bytes: float,
         bytes_per_unit: float,
         max_units: Optional[int] = None,
+        allocation_step_units: Optional[int] = None,
     ):
         values = (fixed_bytes, bytes_per_unit)
         if not all(math.isfinite(x) and x >= 0 for x in values):
             raise ValueError("state costs must be finite and non-negative")
-        if max_units is not None and max_units <= 0:
-            raise ValueError("max_units must be positive")
+        if max_units is not None and (
+            isinstance(max_units, bool)
+            or not isinstance(max_units, Integral)
+            or max_units <= 0
+        ):
+            raise ValueError("max_units must be a positive non-bool integer")
+        if allocation_step_units is not None and (
+            isinstance(allocation_step_units, bool)
+            or not isinstance(allocation_step_units, Integral)
+            or allocation_step_units <= 0
+        ):
+            raise ValueError(
+                "allocation_step_units must be a positive non-bool integer"
+            )
         self.fixed_bytes = fixed_bytes
         self.bytes_per_unit = bytes_per_unit
         self.max_units = max_units
+        self.allocation_step_units = allocation_step_units
 
-    def __call__(self, state: AdmissionState) -> float:
+    def _capped_units(self, state: AdmissionState) -> int:
         units = state.projected_units
         if self.max_units is not None:
             units = min(units, self.max_units)
+        return units
+
+    def _allocated_units(self, units: int) -> int:
+        if self.allocation_step_units is None or units == 0:
+            return units
+        step = self.allocation_step_units
+        return ((units + step - 1) // step) * step
+
+    def __call__(self, state: AdmissionState) -> float:
+        units = self._allocated_units(self._capped_units(state))
         return self.fixed_bytes + self.bytes_per_unit * units
+
+    def cohort_bytes(self, states: Iterable[AdmissionState]) -> float:
+        """Project total bytes for rows sharing one batched allocation width.
+
+        Without stepped allocation geometry, rows remain independently linear.
+        With it, the whole cohort is charged at the rounded maximum projected
+        width, matching the storage geometry of ``BatchKVCache``.
+        """
+
+        states = tuple(states)
+        if not states:
+            return 0.0
+        if self.allocation_step_units is None:
+            return sum(self(state) for state in states)
+        max_units = max(self._capped_units(state) for state in states)
+        allocated_units = self._allocated_units(max_units)
+        return len(states) * (self.fixed_bytes + self.bytes_per_unit * allocated_units)
 
 
 class StepStateCost:

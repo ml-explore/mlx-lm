@@ -81,6 +81,35 @@ class TestStateBudget(unittest.TestCase):
         self.assertEqual(policy.projected_bytes(short), 49_000_000 + 6_144 * 4_096)
         self.assertEqual(policy.projected_bytes(long), 49_000_000 + 6_144 * 32_768)
 
+    def test_stepped_projection_covers_allocation_boundaries(self):
+        cost = LinearStateCost(7, 3, allocation_step_units=256)
+        for units, allocated in (
+            (0, 0),
+            (255, 256),
+            (256, 256),
+            (257, 512),
+            (511, 512),
+            (512, 512),
+            (513, 768),
+        ):
+            self.assertEqual(cost(AdmissionState(units, units)), 7 + 3 * allocated)
+
+    def test_cohort_projection_uses_shared_rounded_maximum(self):
+        cost = LinearStateCost(10, 2, allocation_step_units=256)
+        short = AdmissionState("short", 1)
+        long = AdmissionState("long", 1_000)
+
+        self.assertEqual(cost.cohort_bytes([short, long]), 2 * (10 + 2 * 1_024))
+        self.assertGreater(cost.cohort_bytes([short, long]), cost(short) + cost(long))
+        self.assertEqual(cost.cohort_bytes([]), 0)
+
+    def test_linear_cost_allocation_geometry_validation(self):
+        for invalid in (True, 0, -1, 1.5):
+            with self.assertRaises(ValueError):
+                LinearStateCost(0, 1, allocation_step_units=invalid)
+            with self.assertRaises(ValueError):
+                LinearStateCost(0, 1, max_units=invalid)
+
     def test_diffusion_timestep_dependent_peak(self):
         # LLaDA-style block diffusion: each entry is the total peak for one
         # remaining block/denoising quantum, including the full logits canvas
