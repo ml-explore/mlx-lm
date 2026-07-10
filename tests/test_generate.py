@@ -582,7 +582,13 @@ class TestGenerate(unittest.TestCase):
         # Only 6 more token slots can materialize before the size-16 cap.
         gen._currently_processing = [[[list(range(10))], 0, 10, False, 10]]
         gen.insert([[1]])
-        # 10K resident + 6K active growth + 1K candidate = 17K exactly.
+        # Global-cohort semantics: the active row's final extent caps at
+        # max_kv_size=16 (its 10 history + 10 new would exceed it), and the
+        # 1-unit candidate shares the cohort width: 2 rows x capped-16 x
+        # 1000 = 32K. The cap is what keeps this finite — uncapped it
+        # would be 2 x 20 x 1000 = 40K.
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 32_000
         self.assertEqual(gen._budget_admissible(1), 1)
 
     def test_kv_budget_oversized_single_request_liveness(self):
