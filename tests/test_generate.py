@@ -662,14 +662,13 @@ class TestGenerate(unittest.TestCase):
         )
         gen.insert([prompt], caches=[[_FakeCache(9_000)]])
         gen._generation_batch = _StubGenBatch()  # suppress liveness escape
-        # Two-phase accounting: merge phase dominates — stub (5-unit done
-        # row) and the 10-unit candidate share one allocation at the
-        # cohort-max width: 2 x 10 x 1000 = 20000. The candidate's 9000
-        # unverifiable supplied-cache bytes appear in the stale-width
-        # floors (2 x 9000 = 18000 < 20000), never as credit.
-        # 20000 > 18000 rejects; 20000 <= 20000 admits.
+        # Global cohort: stub (5-unit done row) and the 10-unit candidate
+        # share one allocation at the cohort-max width: 2 x 10 x 1000 =
+        # 20000. The candidate's 9000 unverifiable supplied-cache bytes
+        # are ADDED on top (never credited, never absorbed by the live
+        # floor): committed = 29000. 18000 rejects; 29000 admits.
         self.assertEqual(gen._budget_admissible(1), 0)
-        gen.kv_budget_bytes = 20_000
+        gen.kv_budget_bytes = 29_000
         self.assertEqual(gen._budget_admissible(1), 1)
 
     def test_kv_budget_remove_releases_headroom(self):
@@ -801,6 +800,46 @@ class TestGenerate(unittest.TestCase):
         # max(512, 900) = 900 <= 1300 and wrongly admit.
         self.assertEqual(gen._budget_admissible(1), 0)
         gen.kv_budget_bytes = 1_500
+        self.assertEqual(gen._budget_admissible(1), 1)
+        del gen
+
+    def test_live_floor_never_absorbs_unverified_bytes(self):
+        """Codex order-of-operations regression: the live floor applies to
+        the base projection only. Active admitted live 1000, base global
+        projection below 1000, selected unverified cache 900: committed
+        must be at least 1900 — max(base + 900, 1000) would lose the
+        unverified charge into the floor."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        class _StubGenBatch:
+            uids = [999]
+            tokens = [[1]]
+            max_tokens = [1]
+            _num_tokens = [1]
+            prompt_cache = [_FakeCache(1000)]  # admitted live = 1000
+
+            def __len__(self):
+                return 1
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=1_800,
+            kv_cost=(0.0, 1.0, 1),
+        )
+        # Selected candidate: 1 unit projected (base cohort tiny), with a
+        # 900-byte unverifiable supplied cache (no history)
+        gen.insert([[1]], caches=[[_FakeCache(900)]])
+        gen._generation_batch = _StubGenBatch()
+        state = gen._candidate_admission_state(gen._unprocessed_sequences[0])
+        committed = gen._cohort_committed([state])
+        self.assertGreaterEqual(committed, 1_900)
+        # And the budget decision agrees: 1800 rejects, 1900 admits
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 1_900
         self.assertEqual(gen._budget_admissible(1), 1)
         del gen
 
