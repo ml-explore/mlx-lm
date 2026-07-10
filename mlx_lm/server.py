@@ -391,21 +391,22 @@ def _measure_kv_cost(model):
 
     # Independent higher point: the two-point fit is measured on
     # [256, 1280]; a slope that changes past 1280 would still pass the
-    # 528 check. Verify PER LEAF at 2048 (a step boundary, so linear
-    # prediction is exact for a consistent leaf) — an aggregate check
-    # can be defeated by two leaves whose deviations cancel.
-    forward(vcaches, third_at - verify_at, verify_at)
-    vleaves = list(leaves(vcaches))
+    # 528 check. Verify PER LEAF at 2048 with a FRESH cache and a SINGLE
+    # aligned chunk: capacity after unaligned multi-chunk growth is
+    # previous_logical + round_up(chunk, step), which exceeds
+    # round_up(total) (root cause of the +16-token capacity observation
+    # on the earlier two-stage path) — a fresh aligned forward removes
+    # that term, so a consistent leaf predicts EXACTLY.
+    third_caches = make_prompt_cache(model)
+    forward(third_caches, third_at, 0)
+    vleaves = list(leaves(third_caches))
     for c, b, g in zip(vleaves, base_per_leaf, grown_per_leaf):
         leaf_slope = (g - b) / probe
         predicted = b + leaf_slope * (third_at - warm)
         observed_leaf = c.nbytes
-        # third_at is a step boundary, but REAL leaves deviate slightly
-        # from the pure model (measured: Qwen1.5-0.5B KVCache observes
-        # +0.78% at 2048 — one 64 KiB allocator nuance — so 1e-6 refuses
-        # real hardware). 1% accepts that while still refusing a mild 20%
-        # late-slope change (7.5% underprojection at 2048).
-        tolerance = max(1.0, 0.01 * abs(predicted))
+        # Single aligned chunk on a fresh cache: exact prediction expected;
+        # tolerance covers arithmetic error only
+        tolerance = max(1.0, 1e-6 * abs(predicted))
         if abs(observed_leaf - predicted) > tolerance:
             raise ValueError(
                 f"state-cost consistency check failed for leaf "

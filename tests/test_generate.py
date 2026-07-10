@@ -1110,6 +1110,47 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(crossed)
         del gen
 
+    def test_unaligned_continuation_capacity_covered(self):
+        """Codex chunk-alignment regression: a real cache primed with 252
+        tokens then continued grows capacity to previous_logical +
+        round_up(chunk) — up to 508 units for 253 logical tokens. The
+        projection must cover that ACTUAL capacity, not round_up(logical).
+        """
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        caches = make_prompt_cache(self.model)
+        toks = mx.array([[(i % 100) + 1 for i in range(252)]])
+        self.model(toks, cache=caches)
+        mx.eval([c.state for c in caches])
+        history = [(i % 100) + 1 for i in range(252)]
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,
+            kv_cost=(fixed, per_tok, step),
+        )
+        (uid,) = gen.insert([[1]], caches=[caches], all_tokens=[history])
+        done = False
+        for _ in range(100):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            states = [
+                gen._candidate_admission_state(seq)
+                for seq in gen._unprocessed_sequences
+            ]
+            self.assertGreaterEqual(gen._cohort_committed(states), live)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done = True
+            if done:
+                break
+        self.assertTrue(done)
+        del gen
+
     def test_kv_budget_e2e_generation_completes(self):
         """Budgeted end-to-end run finishes all requests (queued, not lost)."""
         prompt = self.tokenizer.encode("hello world")
