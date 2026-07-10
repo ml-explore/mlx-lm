@@ -2187,6 +2187,7 @@ class SnapKVAttentionCapture:
         self.score_chunk_size = int(score_chunk_size)
         self._orig = None
         self.snap = None
+        self.snap_by_head = None
 
     def __enter__(self):
         self._orig = mx.fast.scaled_dot_product_attention
@@ -2278,10 +2279,28 @@ class SnapKVAttentionCapture:
             scores = self._score_chunk(q_chunk, k, scale, chunk_mask)
             weights = mx.softmax(scores.astype(mx.float32), axis=-1)
             snap = weights.sum(axis=(0, 1, 2))
+            # ``_score_chunk`` already returns logical query-head scores for GQA,
+            # so summing over batch and query rows yields per-query-head-by-key.
+            snap_by_head = weights.sum(axis=(0, 2))
             mx.eval(snap)
             self.snap = self._align_add(self.snap, snap)
-            mx.eval(self.snap)
+            self.snap_by_head = self._align_head_add(self.snap_by_head, snap_by_head)
+            mx.eval(self.snap, self.snap_by_head)
         return out
+
+    def _align_head_add(self, current, mat):
+        if current is None:
+            return mat
+        if current.shape[1] < mat.shape[1]:
+            pad = mx.zeros(
+                (current.shape[0], mat.shape[1] - current.shape[1]),
+                current.dtype,
+            )
+            current = mx.concatenate([current, pad], axis=1)
+        elif mat.shape[1] < current.shape[1]:
+            pad = mx.zeros((mat.shape[0], current.shape[1] - mat.shape[1]), mat.dtype)
+            mat = mx.concatenate([mat, pad], axis=1)
+        return current + mat
 
     def snap_scores(self, seq_len: int) -> List[float]:
         if self.snap is None:
@@ -2291,6 +2310,24 @@ class SnapKVAttentionCapture:
         if len(vals) < seq_len:
             vals.extend([0.0] * (seq_len - len(vals)))
         return [float(v) for v in vals[:seq_len]]
+
+    def snap_scores_by_head(self, seq_len: int) -> List[List[float]]:
+        """Return one accumulated score row per query head (length ``seq_len``).
+
+        Each row is the per-key attention mass summed over the observation
+        window for that logical query head; retrieval heads concentrate mass on
+        distant keys, streaming heads on sinks plus the recent window.
+        """
+        if self.snap_by_head is None:
+            return []
+        mx.eval(self.snap_by_head)
+        rows = self.snap_by_head.tolist()
+        out = []
+        for row in rows:
+            if len(row) < seq_len:
+                row = row + [0.0] * (seq_len - len(row))
+            out.append([float(v) for v in row[:seq_len]])
+        return out
 
 
 def compact_prompt_cache(
@@ -2781,3 +2818,167 @@ def evict_prompt_cache_by_head(
         kv_layers=kv_layers,
         compact_cache_nbytes=compact_cache_nbytes,
     )
+
+
+# DuoAttention: retrieval-vs-streaming head classification
+#
+# DuoAttention (arXiv:2410.10819) splits attention heads into "retrieval" heads
+# that need the full long context and "streaming" heads that attend well with
+# only attention sinks plus a recent window. The split is decided offline from
+# per-head attention scores: heads that place a large share of their mass on
+# keys OUTSIDE the sink+recent regions ("distant mass") are retrieval heads.
+#
+# ``SnapKVAttentionCapture.snap_scores_by_head`` produces exactly those per-head
+# score rows. ``classify_retrieval_heads`` turns them into a head split, and
+# ``duoattention_head_keep_indices`` builds the per-head keep lists that
+# ``evict_prompt_cache_by_head`` consumes. These are pure library primitives:
+# the model-loading capture runner lives outside the package.
+
+
+def _tail_mass(scores: Sequence[float], recent_tokens: int) -> float:
+    """Attention mass on the most recent ``recent_tokens`` keys."""
+    if recent_tokens <= 0:
+        return 0.0
+    return float(sum(scores[-recent_tokens:]))
+
+
+def _distant_mass(
+    scores: Sequence[float], sink_tokens: int, recent_tokens: int
+) -> float:
+    """Attention mass on keys outside the sink and recent regions."""
+    if len(scores) <= sink_tokens + recent_tokens:
+        return 0.0
+    if recent_tokens <= 0:
+        return float(sum(scores[sink_tokens:]))
+    return float(sum(scores[sink_tokens:-recent_tokens]))
+
+
+@dataclass(frozen=True)
+class HeadClassification:
+    """Result of splitting heads into retrieval vs streaming sets.
+
+    ``retrieval_heads`` and ``streaming_heads`` are sorted head indices; the
+    per-head ``distant_ratios`` (distant mass / total mass) are kept for
+    inspection. The classification parameters are recorded for reproducibility.
+    """
+
+    head_count: int
+    retrieval_heads: Tuple[int, ...]
+    streaming_heads: Tuple[int, ...]
+    distant_ratios: Tuple[float, ...]
+    distant_masses: Tuple[float, ...]
+    sink_tokens: int
+    recent_tokens: int
+    retrieval_fraction: float
+    min_distant_ratio: float
+
+
+def classify_retrieval_heads(
+    scores_by_head: Sequence[Sequence[float]],
+    *,
+    sink_tokens: int = 4,
+    recent_tokens: int = 64,
+    retrieval_fraction: float = 0.25,
+    min_distant_ratio: float = 0.35,
+) -> HeadClassification:
+    """Split heads into retrieval and streaming sets by distant-token mass.
+
+    Each head is scored by the fraction of its attention mass that falls
+    outside the ``sink_tokens`` leading keys and the ``recent_tokens`` trailing
+    keys. Heads are ranked by that distant ratio (breaking ties on distant
+    mass); the top ``retrieval_fraction`` of heads that also clear
+    ``min_distant_ratio`` become retrieval heads, and the rest become streaming
+    heads. Ported from the lab DuoAttention classifier (arXiv:2410.10819).
+    """
+    if not scores_by_head:
+        raise ValueError("scores_by_head must not be empty")
+    if not (0.0 < retrieval_fraction <= 1.0):
+        raise ValueError("retrieval_fraction must be in (0, 1]")
+    if sink_tokens < 0:
+        raise ValueError("sink_tokens must be non-negative")
+    if recent_tokens < 0:
+        raise ValueError("recent_tokens must be non-negative")
+    if min_distant_ratio < 0.0:
+        raise ValueError("min_distant_ratio must be non-negative")
+
+    rows = []
+    for head, scores in enumerate(scores_by_head):
+        total = float(sum(scores))
+        distant = _distant_mass(scores, sink_tokens, recent_tokens)
+        ratio = distant / total if total > 0 else 0.0
+        rows.append({"head": head, "distant": distant, "ratio": ratio})
+
+    ranked = sorted(rows, key=lambda r: (r["ratio"], r["distant"]), reverse=True)
+    target_count = max(1, round(len(rows) * retrieval_fraction))
+    retrieval = [r["head"] for r in ranked if r["ratio"] >= min_distant_ratio][
+        :target_count
+    ]
+    retrieval_set = set(retrieval)
+    streaming = [r["head"] for r in rows if r["head"] not in retrieval_set]
+    return HeadClassification(
+        head_count=len(rows),
+        retrieval_heads=tuple(sorted(retrieval)),
+        streaming_heads=tuple(sorted(streaming)),
+        distant_ratios=tuple(r["ratio"] for r in rows),
+        distant_masses=tuple(r["distant"] for r in rows),
+        sink_tokens=sink_tokens,
+        recent_tokens=recent_tokens,
+        retrieval_fraction=retrieval_fraction,
+        min_distant_ratio=min_distant_ratio,
+    )
+
+
+def _sink_recent_indices(
+    seq_len: int, sink_tokens: int, recent_tokens: int
+) -> Tuple[int, ...]:
+    keep = set(range(min(max(sink_tokens, 0), seq_len)))
+    if recent_tokens > 0:
+        keep.update(range(max(0, seq_len - recent_tokens), seq_len))
+    return tuple(sorted(keep))
+
+
+def duoattention_head_keep_indices(
+    scores_by_head: Sequence[Sequence[float]],
+    seq_len: int,
+    *,
+    budget: int,
+    sink_tokens: int = 4,
+    recent_tokens: int = 64,
+    retrieval_fraction: float = 0.25,
+    min_distant_ratio: float = 0.35,
+    min_tokens: int = 128,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Build per-head keep indices for ``evict_prompt_cache_by_head``.
+
+    Classifies heads with :func:`classify_retrieval_heads`, then for each head
+    returns the prompt positions it retains: retrieval heads keep the SnapKV-D
+    keep-set of their own scores (:func:`snapkv_keep_indices` at ``budget``),
+    streaming heads keep only the sink and recent windows. The result is a tuple
+    of sorted per-head tuples, one per row in ``scores_by_head``, ready to pass
+    straight to ``evict_prompt_cache_by_head``.
+    """
+    classified = classify_retrieval_heads(
+        scores_by_head,
+        sink_tokens=sink_tokens,
+        recent_tokens=recent_tokens,
+        retrieval_fraction=retrieval_fraction,
+        min_distant_ratio=min_distant_ratio,
+    )
+    retrieval_set = set(classified.retrieval_heads)
+    streaming_keep = _sink_recent_indices(seq_len, sink_tokens, recent_tokens)
+    head_keep_indices = []
+    for head, scores in enumerate(scores_by_head):
+        if head in retrieval_set:
+            head_keep_indices.append(
+                snapkv_keep_indices(
+                    seq_len,
+                    budget,
+                    scores,
+                    sink_tokens=sink_tokens,
+                    recent_tokens=recent_tokens,
+                    min_tokens=min_tokens,
+                )
+            )
+        else:
+            head_keep_indices.append(streaming_keep)
+    return tuple(head_keep_indices)
