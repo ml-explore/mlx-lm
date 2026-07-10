@@ -2330,3 +2330,454 @@ def compact_prompt_cache(
         min_tokens=min_tokens,
     )
     return evict_prompt_cache(cache, keep, true_offset=seq_len)
+
+
+# DuoAttention: head-partitioned KV eviction (retrieval vs streaming heads)
+#
+# DuoAttention (arXiv:2410.10819) observes that only a subset of attention
+# heads ("retrieval heads") need the full long context; the remaining
+# ("streaming heads") attend well with just attention sinks plus a recent
+# window. Keeping the full KV only for retrieval heads and a sink+recent slice
+# for streaming heads cuts the decode-time KV read further than a uniform
+# SnapKV-D budget, at no quality cost on the streaming heads.
+#
+# This is the SnapKV-D second stage: after the caller decides which prompt
+# positions each KV head keeps, ``HeadPartitionedKVCache`` stores the union of
+# retained positions once and exposes a per-head prefix mask so each head
+# attends only to its own retained rows. ``offset`` still tracks the true
+# sequence position for future RoPE. The head-CLASSIFICATION policy (which heads
+# are retrieval vs streaming) is intentionally out of scope here: this module
+# only provides the cache representation and the eviction op that applies a
+# caller-supplied ``head_keep_indices``.
+# ---------------------------------------------------------------------------
+
+
+class HeadPartitionedKVCache(_BaseCache):
+    """Sparse KV cache with independent retained positions per KV head.
+
+    This is the representation DuoAttention eviction needs. Storage uses the
+    union of all retained prefix positions, but ``make_mask`` exposes a per-head
+    prefix mask so retrieval heads can attend long-range retained rows while
+    streaming heads attend only their own recency rows. ``offset`` remains the
+    true logical sequence position for future RoPE.
+    """
+
+    def __init__(
+        self,
+        keys=None,
+        values=None,
+        *,
+        offset: int = 0,
+        positions: Optional[Sequence[int]] = None,
+        head_positions: Optional[Sequence[Sequence[int]]] = None,
+        query_heads: Optional[int] = None,
+        protected_stored: Optional[int] = None,
+    ):
+        self.keys = keys
+        self.values = values
+        self.offset = int(offset)
+        self._stored = 0 if keys is None else int(keys.shape[2])
+        self._positions = self._coerce_positions(positions)
+        self._head_positions = self._coerce_head_positions(head_positions)
+        self.query_heads = None if query_heads is None else int(query_heads)
+        self._head_position_mask = self._build_head_position_mask()
+        self._protected_stored = (
+            self._stored if protected_stored is None else int(protected_stored)
+        )
+        if self._protected_stored < 0 or self._protected_stored > self._stored:
+            raise ValueError("protected_stored must be between 0 and stored rows")
+        self._speculating = False
+        self._speculative_appends = deque()
+
+    def _coerce_positions(self, positions: Optional[Sequence[int]]):
+        if positions is None:
+            if self._stored == 0:
+                return ()
+            if self.offset == self._stored:
+                return tuple(range(self._stored))
+            raise ValueError("positions are required for sparse head-partitioned KV")
+        out = tuple(int(p) for p in positions)
+        if len(out) != self._stored:
+            raise ValueError("positions length must match stored rows")
+        if any(p < 0 for p in out):
+            raise ValueError("positions must be non-negative")
+        if tuple(sorted(out)) != out:
+            raise ValueError("positions must be sorted")
+        return out
+
+    def _coerce_head_positions(self, head_positions):
+        if self.keys is None:
+            n_heads = 0
+        else:
+            n_heads = int(self.keys.shape[1])
+        if head_positions is None:
+            return tuple(self._positions for _ in range(n_heads))
+        out = []
+        valid = set(self._positions)
+        for row in head_positions:
+            vals = tuple(int(p) for p in row)
+            if tuple(sorted(vals)) != vals:
+                raise ValueError("head positions must be sorted")
+            if any(p not in valid for p in vals):
+                raise ValueError("head positions must be a subset of positions")
+            out.append(vals)
+        if n_heads and len(out) != n_heads:
+            raise ValueError("head_positions length must match KV heads")
+        return tuple(out)
+
+    def _build_head_position_mask(self):
+        rows = []
+        for row in self._head_positions:
+            keep = set(row)
+            rows.append([pos in keep for pos in self._positions])
+        return tuple(tuple(row) for row in rows)
+
+    @staticmethod
+    def _encode_positions(positions):
+        return ",".join(map(str, positions))
+
+    @staticmethod
+    def _decode_positions(raw: str):
+        if raw == "":
+            return ()
+        return tuple(int(p) for p in raw.split(","))
+
+    @staticmethod
+    def _encode_head_positions(head_positions):
+        return "|".join(",".join(map(str, positions)) for positions in head_positions)
+
+    @classmethod
+    def _decode_head_positions(cls, raw: str):
+        if raw == "":
+            return ()
+        return tuple(cls._decode_positions(part) for part in raw.split("|"))
+
+    @property
+    def positions(self):
+        return self._positions
+
+    @property
+    def head_positions(self):
+        return self._head_positions
+
+    @property
+    def protected_stored(self):
+        return self._protected_stored
+
+    def size(self):
+        return self._stored
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None
+        return self.keys[..., : self._stored, :], self.values[..., : self._stored, :]
+
+    @state.setter
+    def state(self, v):
+        if v is None:
+            self.keys = None
+            self.values = None
+            self._stored = 0
+            self.offset = 0
+            self._positions = ()
+            self._head_positions = ()
+            self.query_heads = None
+            self._head_position_mask = ()
+            self._protected_stored = 0
+            self._speculating = False
+            self._speculative_appends = deque()
+            return
+        self.keys, self.values = v
+        self._stored = int(self.keys.shape[2])
+        self.offset = self._stored
+        self._positions = tuple(range(self._stored))
+        self._head_positions = tuple(
+            self._positions for _ in range(int(self.keys.shape[1]))
+        )
+        self.query_heads = None
+        self._head_position_mask = self._build_head_position_mask()
+        self._protected_stored = self._stored
+        self._speculating = False
+        self._speculative_appends = deque()
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.offset,
+                    self._stored,
+                    self._protected_stored,
+                    self._encode_positions(self._positions),
+                    self._encode_head_positions(self._head_positions),
+                    "" if self.query_heads is None else self.query_heads,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        vals = tuple(v)
+        if len(vals) < 5:
+            raise ValueError("HeadPartitionedKVCache meta_state is incomplete")
+        self.offset, self._stored, self._protected_stored = map(int, vals[:3])
+        self._positions = self._decode_positions(str(vals[3]))
+        self._head_positions = self._decode_head_positions(str(vals[4]))
+        self.query_heads = None if len(vals) < 6 or str(vals[5]) == "" else int(vals[5])
+        if len(self._positions) != self._stored:
+            raise ValueError("stored row count does not match position metadata")
+        if self.keys is not None and len(self._head_positions) != int(
+            self.keys.shape[1]
+        ):
+            raise ValueError("head position count does not match KV heads")
+        self._head_position_mask = self._build_head_position_mask()
+        self._speculating = False
+        self._speculative_appends = deque()
+
+    def update_and_fetch(self, keys, values):
+        n_new = int(keys.shape[2])
+        start_pos = self.offset
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+            self._stored = n_new
+            self.offset = n_new
+            self._positions = tuple(range(n_new))
+            self._head_positions = tuple(
+                self._positions for _ in range(int(keys.shape[1]))
+            )
+            self.query_heads = None
+            self._head_position_mask = self._build_head_position_mask()
+            self._protected_stored = self._stored
+            return self.state
+
+        if int(keys.shape[1]) != int(self.keys.shape[1]):
+            raise ValueError("new keys must have the same KV head count")
+        self.keys = mx.concatenate([self.keys[..., : self._stored, :], keys], axis=2)
+        self.values = mx.concatenate(
+            [self.values[..., : self._stored, :], values], axis=2
+        )
+        new_positions = tuple(range(start_pos, start_pos + n_new))
+        self._stored += n_new
+        self.offset += n_new
+        self._positions = self._positions + new_positions
+        self._head_positions = tuple(
+            row + new_positions for row in self._head_positions
+        )
+        self._head_position_mask = self._build_head_position_mask()
+        if self._speculating and n_new:
+            self._speculative_appends.append(n_new)
+        return self.state
+
+    def make_mask(
+        self,
+        n_tokens: int,
+        window_size=None,
+        return_array: bool = False,
+        *,
+        query_heads: Optional[int] = None,
+    ):
+        if window_size is not None:
+            raise ValueError(
+                "HeadPartitionedKVCache does not support sliding-window masks"
+            )
+        if n_tokens <= 0:
+            raise ValueError("n_tokens must be positive")
+        prefix = mx.array(self._head_position_mask, dtype=mx.bool_)
+        if query_heads is not None:
+            effective_query_heads = int(query_heads)
+        elif self.query_heads is not None:
+            effective_query_heads = int(self.query_heads)
+        else:
+            effective_query_heads = None
+        if effective_query_heads is not None:
+            kv_heads = prefix.shape[0]
+            if effective_query_heads % kv_heads != 0:
+                raise ValueError("query_heads must be a multiple of KV heads")
+            prefix = mx.repeat(prefix, effective_query_heads // kv_heads, axis=0)
+        prefix = mx.broadcast_to(
+            prefix[:, None, :],
+            (prefix.shape[0], n_tokens, self._stored),
+        )
+        causal = mx.tril(mx.ones((n_tokens, n_tokens), dtype=mx.bool_))
+        causal = mx.broadcast_to(
+            causal[None, :, :],
+            (prefix.shape[0], n_tokens, n_tokens),
+        )
+        return mx.concatenate([prefix, causal], axis=2)[None, ...]
+
+    def is_trimmable(self):
+        return self._speculating or self._positions is not None
+
+    def start_speculation(self):
+        self._speculating = True
+        self._speculative_appends.clear()
+
+    def stop_speculation(self):
+        self._speculating = False
+        self._speculative_appends.clear()
+
+    def trim(self, n):
+        if n <= 0:
+            return 0
+        n = int(n)
+        old_positions = self._positions
+        if self._speculating:
+            if not self._speculative_appends:
+                raise RuntimeError("No speculative append is available to trim")
+            latest = self._speculative_appends.pop()
+            if n > latest:
+                self._speculative_appends.append(latest)
+                raise RuntimeError("trim exceeds latest speculative append")
+            removable = self._stored - self._protected_stored
+            if n > removable:
+                self._speculative_appends.append(latest)
+                raise RuntimeError("trim exceeds removable speculative rows")
+            if n < latest:
+                self._speculative_appends.append(latest - n)
+        n = min(n, self.offset)
+        new_offset = self.offset - n
+        keep_physical = [i for i, pos in enumerate(self._positions) if pos < new_offset]
+        if len(keep_physical) != self._stored:
+            if keep_physical:
+                self.keys = _take_positions(
+                    self.keys[..., : self._stored, :], keep_physical
+                )
+                self.values = _take_positions(
+                    self.values[..., : self._stored, :], keep_physical
+                )
+            else:
+                self.keys = self.keys[..., :0, :]
+                self.values = self.values[..., :0, :]
+        self._positions = tuple(old_positions[i] for i in keep_physical)
+        self._head_positions = tuple(
+            tuple(pos for pos in row if pos < new_offset)
+            for row in self._head_positions
+        )
+        self._stored = len(self._positions)
+        self._protected_stored = sum(
+            1 for pos in old_positions[: self._protected_stored] if pos < new_offset
+        )
+        self.offset = new_offset
+        self._head_position_mask = self._build_head_position_mask()
+        return n
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return (
+            self.keys[..., : self._stored, :].nbytes
+            + self.values[..., : self._stored, :].nbytes
+        )
+
+
+def _union_positions(
+    head_keep_indices: Sequence[Sequence[int]],
+) -> Tuple[int, ...]:
+    out = sorted({int(pos) for row in head_keep_indices for pos in row})
+    return tuple(out)
+
+
+def _validate_head_keep_indices(head_keep_indices, n_heads: int, offset: int):
+    if len(head_keep_indices) != n_heads:
+        raise ValueError("head_keep_indices length must match KV heads")
+    out = []
+    for row in head_keep_indices:
+        vals = tuple(int(pos) for pos in row)
+        if tuple(sorted(vals)) != vals:
+            raise ValueError("head keep indices must be sorted")
+        if any(pos < 0 or pos >= offset for pos in vals):
+            raise ValueError("head keep index exceeds KV cache offset")
+        out.append(vals)
+    return tuple(out)
+
+
+def _take_head_partitioned(x, union_keep, head_keep_indices):
+    bsz, n_heads, _tokens, dim = x.shape
+    zero = mx.zeros((bsz, 1, 1, dim), dtype=x.dtype)
+    head_chunks = []
+    for head, keep in enumerate(head_keep_indices):
+        keep_set = set(keep)
+        rows = []
+        for pos in union_keep:
+            rows.append(
+                x[:, head : head + 1, pos : pos + 1, :] if pos in keep_set else zero
+            )
+        if rows:
+            head_chunks.append(mx.concatenate(rows, axis=2))
+        else:
+            head_chunks.append(x[:, head : head + 1, :0, :])
+    return mx.concatenate(head_chunks, axis=1) if head_chunks else x[:, :0, :0, :]
+
+
+@dataclass(frozen=True)
+class HeadPartitionedEvictionResult:
+    cache: list
+    evicted: bool
+    true_offset: int
+    union_retained_tokens: int
+    per_head_retained_tokens: Tuple[int, ...]
+    original_tokens: int
+    kv_layers: int
+    compact_cache_nbytes: int
+
+
+def evict_prompt_cache_by_head(
+    prompt_cache: List[Any],
+    head_keep_indices: Sequence[Sequence[int]],
+    *,
+    true_offset: int,
+    query_heads: Optional[int] = None,
+) -> HeadPartitionedEvictionResult:
+    """Replace plain ``KVCache`` layers with a DuoAttention-ready cache.
+
+    ``head_keep_indices`` gives, per KV head, the sorted prompt positions that
+    head retains (retrieval heads typically keep everything; streaming heads
+    keep only sinks + a recent window). Every other layer type is left
+    untouched. The head-classification decision is the caller's responsibility.
+    """
+    out = list(prompt_cache)
+    original_tokens = int(true_offset)
+    kv_layers = 0
+    union_keep = _union_positions(head_keep_indices)
+    per_head_counts = tuple(len(row) for row in head_keep_indices)
+    for idx, cache in enumerate(prompt_cache):
+        if type(cache) is not KVCache or cache.keys is None:
+            continue
+        keys, values = cache.state
+        n_heads = int(keys.shape[1])
+        head_keep = _validate_head_keep_indices(
+            head_keep_indices, n_heads, int(cache.offset)
+        )
+        union_keep = _union_positions(head_keep)
+        new_keys = _take_head_partitioned(keys, union_keep, head_keep)
+        new_values = _take_head_partitioned(values, union_keep, head_keep)
+        out[idx] = HeadPartitionedKVCache(
+            new_keys,
+            new_values,
+            offset=true_offset,
+            positions=union_keep,
+            head_positions=head_keep,
+            query_heads=query_heads,
+        )
+        original_tokens = max(original_tokens, int(cache.offset))
+        kv_layers += 1
+
+    compact_cache_nbytes = sum(int(getattr(cache, "nbytes", 0) or 0) for cache in out)
+    return HeadPartitionedEvictionResult(
+        cache=out,
+        evicted=kv_layers > 0
+        and any(count < original_tokens for count in per_head_counts),
+        true_offset=int(true_offset),
+        union_retained_tokens=len(union_keep),
+        per_head_retained_tokens=per_head_counts,
+        original_tokens=original_tokens,
+        kv_layers=kv_layers,
+        compact_cache_nbytes=compact_cache_nbytes,
+    )
