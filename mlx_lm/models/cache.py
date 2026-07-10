@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import inspect
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -24,11 +25,17 @@ def make_prompt_cache(
 
     Args:
         model (nn.Module): The language model.
-        max_kv_size (Optional[int]): If provided and the model does not have a
-            ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
-            size of ``max_kv_size``
+        max_kv_size (Optional[int]): If provided, the attention KV cache is
+            bounded to ``max_kv_size`` tokens via a ``RotatingKVCache``. Models
+            with a ``make_cache`` method honor this only if their ``make_cache``
+            accepts a ``max_kv_size`` argument (e.g. hybrid models cap their
+            full-attention layers and leave recurrent layers unbounded);
+            otherwise the model's own cache policy is used unchanged.
     """
     if hasattr(model, "make_cache"):
+        params = inspect.signature(model.make_cache).parameters
+        if max_kv_size is not None and "max_kv_size" in params:
+            return model.make_cache(max_kv_size=max_kv_size)
         return model.make_cache()
 
     num_layers = len(model.layers)

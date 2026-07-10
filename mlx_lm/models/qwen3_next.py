@@ -17,7 +17,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import ArraysCache, KVCache
+from .cache import ArraysCache, KVCache, RotatingKVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -446,8 +446,21 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
-    def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+    def make_cache(self, max_kv_size: Optional[int] = None):
+        # Recurrent (GDN) layers keep a fixed-size ArraysCache regardless. Only
+        # the full-attention layers grow unbounded, so cap just those with a
+        # RotatingKVCache when a budget is given (keep=4 preserves the sink
+        # tokens). Quantized KV is not compatible with RotatingKVCache
+        # (toQuantized NYI), so callers must not combine --max-kv-size with
+        # --kv-bits on this model.
+        def attn_cache():
+            if max_kv_size is not None:
+                return RotatingKVCache(max_size=max_kv_size, keep=4)
+            return KVCache()
+
+        return [
+            ArraysCache(size=2) if l.is_linear else attn_cache() for l in self.layers
+        ]
 
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
