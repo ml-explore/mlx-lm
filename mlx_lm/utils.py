@@ -349,9 +349,24 @@ def load_model(
                 "is disabled by default. Pass trust_remote_code=True if you "
                 "trust this model."
             )
+        model_file_path = Path(model_file)
+        if model_file_path.is_absolute() or model_file_path.suffix != ".py":
+            raise ValueError(
+                "The custom model_file must be a relative Python file inside "
+                f"the model directory (got {model_file!r})."
+            )
+        model_path_resolved = model_path.resolve()
+        custom_model_path = (model_path_resolved / model_file_path).resolve()
+        if custom_model_path == model_path_resolved or (
+            model_path_resolved not in custom_model_path.parents
+        ):
+            raise ValueError(
+                "The custom model_file must stay inside the model directory "
+                f"(got {model_file!r})."
+            )
         spec = importlib.util.spec_from_file_location(
             "custom_model",
-            model_path / model_file,
+            custom_model_path,
         )
         arch = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(arch)
