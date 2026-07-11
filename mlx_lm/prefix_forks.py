@@ -419,7 +419,12 @@ class PrefixForkRegistry:
     def pinned_nbytes(self):
         """Bytes of snapshots kept resident by live forks — including ones
         already evicted/invalidated (discoverability and residency are
-        deliberately decoupled; see class docstring)."""
+        deliberately decoupled; see class docstring).
+
+        NOTE: a snapshot that is both discoverable and pinned is counted in
+        BOTH ``nbytes`` and ``pinned_nbytes`` — the two are overlapping
+        views (discoverable set vs resident set), not additive; do not sum
+        them to estimate memory."""
         total = 0
         with self._lock:
             dead = []
@@ -477,22 +482,32 @@ class PrefixForkRegistry:
     def _dedup_spot_check(
         snapshot: FrozenPrefixSnapshot, tokens: List[int], prompt_cache: List[Any]
     ):
-        """Cheap content check on a cid-dedup hit: compare a small slice of
-        layer-0 KV. Cannot prove equality (it is a spot check), but catches
-        the realistic failure — same key + tokens over CHANGED weights —
-        and raises instead of silently serving stale KV."""
+        """Cheap content check on a cid-dedup hit: compare the last-4-token
+        KV slice of EVERY layer (a layer-N-only weight change — e.g. a LoRA
+        that leaves embeddings and early attention untouched — produces
+        bit-identical early-layer KV, so a single-layer check is blind to
+        it). Cannot prove equality (position window is limited), but
+        catches per-layer-visible changes at freeze time and raises instead
+        of silently serving stale KV. Freeze-time backstop only: fetch_fork
+        under a stale key has nothing to compare against — the model-key
+        contract is the primary defense."""
         if (
-            not prompt_cache
-            or type(prompt_cache[0]) is not KVCache
+            len(prompt_cache) != len(snapshot.keys)
+            or any(type(c) is not KVCache for c in prompt_cache)
             or prompt_cache[0].offset != len(tokens)
         ):
             return  # not comparable; a fresh freeze() would reject it too
-        k_new = prompt_cache[0].state[0]
-        k_old = snapshot.keys[0]
-        ok = k_new.shape == k_old.shape and k_new.dtype == k_old.dtype
-        if ok:
+        ok = True
+        for layer, c in enumerate(prompt_cache):
+            k_new = c.state[0]
+            k_old = snapshot.keys[layer]
+            if k_new.shape != k_old.shape or k_new.dtype != k_old.dtype:
+                ok = False
+                break
             w = min(4, k_old.shape[2])
-            ok = bool(mx.array_equal(k_old[..., -w:, :], k_new[..., -w:, :]))
+            if not bool(mx.array_equal(k_old[..., -w:, :], k_new[..., -w:, :])):
+                ok = False
+                break
         if not ok:
             raise ValueError(
                 f"prefix-fork dedup mismatch for cid {snapshot.cid}: same "

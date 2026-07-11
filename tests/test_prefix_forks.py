@@ -263,6 +263,27 @@ class TestPrefixForkRegistry(unittest.TestCase):
         self.assertIsNone(forks)
         self.assertEqual(remaining, tokens)
 
+    def test_dedup_mismatch_beyond_layer0_raises(self):
+        """A layer-1-only KV difference (layer 0 bit-identical — the
+        realistic LoRA-that-skips-early-layers shape) must be caught by
+        the all-layer dedup spot-check."""
+        registry = PrefixForkRegistry()
+        tokens = list(range(40))
+        mx.random.seed(31)
+        base = _prime_cache(tokens)
+        registry.freeze("m@v1", tokens, base)
+
+        # Rebuild with layer 0 bit-identical and layer 1 perturbed only
+        mx.random.seed(31)
+        altered = _prime_cache(tokens)  # same seed -> same content
+        k1, v1 = altered[1].state
+        k1_mod = mx.array(k1)
+        k1_mod[..., -1, :] = 123.0
+        altered[1].keys[..., : altered[1].offset, :] = k1_mod
+        mx.eval(altered[1].keys)
+        with self.assertRaises(ValueError):
+            registry.freeze("m@v1", tokens, altered)
+
     def test_dedup_content_mismatch_raises(self):
         # F3 regression: same key + tokens but DIFFERENT KV content (weights
         # changed under a stale key) must raise, not silently dedup.
