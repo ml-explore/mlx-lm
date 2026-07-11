@@ -1,17 +1,25 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2024-2026 Apple Inc.
 
 import http
 import io
 import json
 import threading
+import time
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, Response, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    CacheEvictor,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+)
 from mlx_lm.utils import load
 
 
@@ -48,6 +56,7 @@ class DummyModelProvider:
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
+                "cache_idle_evict_s": 0.0,
                 "allowed_origins": ["*"],
             },
         )
@@ -347,6 +356,13 @@ class TestServer(unittest.TestCase):
         stop_state = stop_matcher.make_state()
         stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
         self.assertTrue(matched)
+
+    def test_no_idle_eviction_when_disabled(self):
+        # --cache-idle-evict-s defaults to 0 (off): the generation loop keeps
+        # polling while idle but must never call mx.clear_cache().
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            time.sleep(0.6)
+            clear_cache.assert_not_called()
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
@@ -725,6 +741,248 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestCacheEvictor(unittest.TestCase):
+    """Unit tests for the idle/on-demand eviction state machine."""
+
+    def _make_evictor(self, idle_s, prompt_cache=None):
+        clock = FakeClock()
+        evictor = CacheEvictor(
+            prompt_cache or LRUPromptCache(), idle_s=idle_s, clock=clock
+        )
+        return evictor, clock
+
+    def _request_evict_async(self, evictor, **kwargs):
+        """Call request_evict on a helper thread (it blocks until the
+        generation-loop side services it via step)."""
+        results = []
+        thread = threading.Thread(
+            target=lambda: results.append(evictor.request_evict(**kwargs))
+        )
+        thread.start()
+        # Wait until the request is enqueued before stepping
+        while evictor._requests.empty():
+            time.sleep(0.005)
+        return thread, results
+
+    def test_disabled_never_evicts(self):
+        evictor, clock = self._make_evictor(idle_s=0.0)
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            for _ in range(3):
+                clock.advance(1e6)
+                evictor.step(busy=False)
+            clear_cache.assert_not_called()
+
+    def test_idle_eviction_fires_once_after_threshold(self):
+        evictor, clock = self._make_evictor(idle_s=60.0)
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            evictor.step(busy=False)
+            clear_cache.assert_not_called()
+
+            clock.advance(59.0)
+            evictor.step(busy=False)
+            clear_cache.assert_not_called()
+
+            clock.advance(2.0)
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 1)
+
+            # Only once per idle period, no matter how long the idle lasts
+            clock.advance(1e6)
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 1)
+
+            # Activity re-arms the timer
+            evictor.touch()
+            clock.advance(61.0)
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 2)
+
+    def test_no_eviction_while_busy(self):
+        evictor, clock = self._make_evictor(idle_s=60.0)
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            # Way past the threshold, but there is active work
+            clock.advance(120.0)
+            evictor.step(busy=True)
+            clear_cache.assert_not_called()
+
+            # The busy step re-armed the timer, so going idle does not evict
+            evictor.step(busy=False)
+            clear_cache.assert_not_called()
+
+            # Only after a full idle period does the eviction fire
+            clock.advance(61.0)
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 1)
+
+    def test_on_demand_eviction_returns_stats(self):
+        prompt_cache = LRUPromptCache()
+        prompt_cache.insert_cache(("test", None, None), [1, 2], [MockCache("abcd")])
+        evictor, _ = self._make_evictor(idle_s=0.0, prompt_cache=prompt_cache)
+
+        # Plain eviction keeps the prompt cache
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            thread, results = self._request_evict_async(evictor)
+            evictor.step(busy=False)
+            thread.join()
+            self.assertEqual(clear_cache.call_count, 1)
+        result = results[0]
+        self.assertTrue(result["evicted"])
+        for key in ("cache_bytes", "active_bytes", "prompt_cache_bytes"):
+            self.assertIn(key, result["before"])
+            self.assertIn(key, result["after"])
+        self.assertEqual(result["before"]["prompt_cache_bytes"], 4)
+        self.assertEqual(result["after"]["prompt_cache_bytes"], 4)
+
+        # clear_prompt_cache=True also drops the stored prompt caches
+        with mock.patch.object(mx, "clear_cache"):
+            thread, results = self._request_evict_async(
+                evictor, clear_prompt_cache=True
+            )
+            evictor.step(busy=False)
+            thread.join()
+        result = results[0]
+        self.assertTrue(result["evicted"])
+        self.assertEqual(result["before"]["prompt_cache_bytes"], 4)
+        self.assertEqual(result["after"]["prompt_cache_bytes"], 0)
+        self.assertEqual(len(prompt_cache), 0)
+
+    def test_on_demand_eviction_refused_while_busy(self):
+        prompt_cache = LRUPromptCache()
+        prompt_cache.insert_cache(("test", None, None), [1, 2], [MockCache("abcd")])
+        evictor, _ = self._make_evictor(idle_s=0.0, prompt_cache=prompt_cache)
+
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            thread, results = self._request_evict_async(
+                evictor, clear_prompt_cache=True
+            )
+            evictor.step(busy=True)
+            thread.join()
+            clear_cache.assert_not_called()
+        result = results[0]
+        self.assertFalse(result["evicted"])
+        self.assertEqual(result["reason"], "busy")
+        # Nothing was touched
+        self.assertEqual(len(prompt_cache), 1)
+        self.assertEqual(prompt_cache.nbytes, 4)
+
+
+class TestIdleEviction(unittest.TestCase):
+    """Integration tests: eviction wired into the server's generation loop."""
+
+    @classmethod
+    def setUpClass(cls):
+        provider = DummyModelProvider()
+        provider.cli_args.cache_idle_evict_s = 0.25
+        cls.response_generator = ResponseGenerator(provider, LRUPromptCache())
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def _completion(self, max_tokens=5):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(
+            url,
+            json={
+                "model": "default_model",
+                "prompt": "Once upon a time",
+                "max_tokens": max_tokens,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_idle_timer_fires_in_generation_loop(self):
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            self._completion()
+            # Generation itself may call mx.clear_cache; only count calls
+            # made after the request completed (i.e. while idle).
+            clear_cache.reset_mock()
+
+            deadline = time.time() + 5.0
+            while clear_cache.call_count == 0 and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(clear_cache.call_count, 1)
+
+            # Once per idle period: staying idle must not evict again
+            time.sleep(0.6)
+            self.assertEqual(clear_cache.call_count, 1)
+
+    def test_evict_endpoint_returns_before_after_stats(self):
+        # Populate the prompt cache with a completed request
+        self._completion()
+
+        url = f"http://localhost:{self.port}/v1/cache/evict"
+        response = requests.post(url, json={})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["evicted"])
+        for key in (
+            "cache_bytes",
+            "active_bytes",
+            "prompt_cache_sequences",
+            "prompt_cache_bytes",
+        ):
+            self.assertIsInstance(body["before"][key], int)
+            self.assertIsInstance(body["after"][key], int)
+        # The prompt cache is kept by default
+        self.assertGreater(body["after"]["prompt_cache_bytes"], 0)
+
+        # An empty body works too, and clear_prompt_cache drops the KV caches
+        response = requests.post(url, json={"clear_prompt_cache": True})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["evicted"])
+        self.assertGreater(body["before"]["prompt_cache_bytes"], 0)
+        self.assertEqual(body["after"]["prompt_cache_bytes"], 0)
+
+        response = requests.post(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["evicted"])
+
+    def test_evict_endpoint_rejects_invalid_body(self):
+        url = f"http://localhost:{self.port}/v1/cache/evict"
+        response = requests.post(url, data=b"not json")
+        self.assertEqual(response.status_code, 400)
+        response = requests.post(url, json=["not", "a", "dict"])
+        self.assertEqual(response.status_code, 400)
+
+    def test_cache_stats_endpoint(self):
+        url = f"http://localhost:{self.port}/v1/cache/stats"
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        for key in (
+            "cache_bytes",
+            "active_bytes",
+            "prompt_cache_sequences",
+            "prompt_cache_bytes",
+        ):
+            self.assertIsInstance(body[key], int)
 
 
 if __name__ == "__main__":

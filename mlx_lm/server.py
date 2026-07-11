@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import json
@@ -271,6 +271,117 @@ class TimeBudget:
         raise StopIteration()
 
 
+class CacheEvictor:
+    """Release MLX's pooled buffer memory when the server is idle.
+
+    MLX's allocator pools freed buffers instead of returning them to the OS,
+    so the process keeps holding the memory of completed requests (KV caches,
+    prefill activations) indefinitely. This tracks generation-loop activity
+    and calls ``mx.clear_cache()`` once the server has been idle for
+    ``idle_s`` seconds (opt-in via ``--cache-idle-evict-s``). It also services
+    on-demand evictions coming from the ``POST /v1/cache/evict`` endpoint.
+
+    Evictions run on the generation thread (via :meth:`step`, called once per
+    generation-loop iteration) and only when the server is quiescent: no
+    incoming or queued requests and no active batch. Releasing the pool never
+    invalidates live arrays, so this gate is a safety margin ensuring an
+    eviction can never interleave with in-flight generation.
+    """
+
+    def __init__(
+        self,
+        prompt_cache: LRUPromptCache,
+        idle_s: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self._prompt_cache = prompt_cache
+        self._idle_s = idle_s
+        self._clock = clock
+        self._last_activity = clock()
+        self._idle_evicted = False
+        self._requests = Queue()
+
+    def stats(self) -> dict:
+        """Current memory stats. Byte counts throughout, as reported by MLX
+        (allocator pool and live arrays) and the prompt cache."""
+        return {
+            "cache_bytes": mx.get_cache_memory(),
+            "active_bytes": mx.get_active_memory(),
+            "prompt_cache_sequences": len(self._prompt_cache),
+            "prompt_cache_bytes": self._prompt_cache.nbytes,
+        }
+
+    def touch(self):
+        """Mark the server as active, re-arming the idle timer."""
+        self._last_activity = self._clock()
+        self._idle_evicted = False
+
+    def _evict(self, clear_prompt_cache: bool = False, reason: str = "") -> dict:
+        before = self.stats()
+        if clear_prompt_cache:
+            self._prompt_cache.trim_to(n_sequences=0, n_bytes=0)
+        mx.clear_cache()
+        after = self.stats()
+        self._idle_evicted = True
+        released_gb = (before["cache_bytes"] - after["cache_bytes"]) / 1e9
+        logging.info(
+            f"Cache eviction ({reason}): released {released_gb:.2f} GB of "
+            "pooled buffer memory"
+        )
+        return {"evicted": True, "reason": reason, "before": before, "after": after}
+
+    def request_evict(
+        self, clear_prompt_cache: bool = False, timeout: float = 10.0
+    ) -> dict:
+        """Ask the generation thread to evict now. Called from HTTP handler
+        threads; the eviction itself runs in :meth:`step` on the generation
+        thread. Returns ``{"evicted": False, ...}`` without evicting if the
+        server is busy (or stays busy past ``timeout``)."""
+        response_queue = Queue()
+        self._requests.put((response_queue, bool(clear_prompt_cache)))
+        try:
+            result = response_queue.get(timeout=timeout)
+        except QueueEmpty:
+            result = None
+            reason = "timeout"
+        else:
+            reason = "busy"
+        if result is None:
+            return {"evicted": False, "reason": reason, "stats": self.stats()}
+        return result
+
+    def step(self, busy: bool):
+        """Run once per generation-loop iteration, on the generation thread.
+
+        ``busy`` is True whenever there is any in-flight or queued work; it
+        re-arms the idle timer and blocks evictions for that iteration.
+        """
+        if busy:
+            self.touch()
+
+        # Service on-demand evictions from `POST /v1/cache/evict`. When busy,
+        # answer immediately with None (mapped to `evicted: false`) instead of
+        # deferring: an eviction must never run alongside active requests.
+        while True:
+            try:
+                response_queue, clear_prompt_cache = self._requests.get_nowait()
+            except QueueEmpty:
+                break
+            if busy:
+                response_queue.put(None)
+            else:
+                response_queue.put(self._evict(clear_prompt_cache, "on demand"))
+
+        # Idle timer: evict once per idle period after `idle_s` seconds.
+        if (
+            not busy
+            and self._idle_s > 0
+            and not self._idle_evicted
+            and self._clock() - self._last_activity >= self._idle_s
+        ):
+            self._evict(reason=f"idle for {self._idle_s:g}s")
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -425,6 +536,12 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
+        self.cache_evictor = CacheEvictor(
+            prompt_cache,
+            idle_s=float(
+                getattr(model_provider.cli_args, "cache_idle_evict_s", 0) or 0
+            ),
+        )
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -663,6 +780,21 @@ class ResponseGenerator:
                 )
                 request = get_next_request(timeout=timeout)
 
+            # Idle/on-demand cache eviction. Evictions only run when the
+            # server is quiescent: no incoming request, no queued requests,
+            # and no active or draining batch.
+            busy = (
+                request is not None
+                or drain_batch
+                or bool(unprocessed_requests)
+                or (batch_generator is not None and len(batch_results) > 0)
+            )
+            try:
+                self.cache_evictor.step(busy)
+            except Exception:
+                # Fail-safe: eviction must never take down the generation loop
+                logging.exception("Cache eviction failed")
+
             # We got a request
             if request is not None:
                 rqueue, request, args = request
@@ -751,6 +883,9 @@ class ResponseGenerator:
 
                     if not self._is_batchable(args):
                         self._serve_single((rqueue, request, args))
+                        # Generation just finished; restart the idle clock so
+                        # long generations don't count toward the idle time.
+                        self.cache_evictor.touch()
                         continue
 
                     current_model = args.model
@@ -1054,6 +1189,10 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
+        if self.path == "/v1/cache/evict":
+            self.handle_cache_evict()
+            return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
@@ -1586,12 +1725,65 @@ class APIHandler(BaseHTTPRequestHandler):
             None,
         )
 
+    def handle_cache_evict(self):
+        """
+        Handle a POST request for the /v1/cache/evict endpoint.
+
+        Asks the generation thread to release MLX's pooled buffer memory
+        (``mx.clear_cache()``) now, without waiting for the idle timer. The
+        optional JSON body may set ``{"clear_prompt_cache": true}`` to also
+        drop all stored prompt (KV) caches first, so their memory is part of
+        what gets released. Responds with before/after byte stats, or with
+        ``{"evicted": false}`` if the server is busy — evictions only run
+        when no requests are queued or in flight.
+        """
+        content_length = int(self.headers.get("Content-Length") or 0)
+        body = {}
+        if content_length > 0:
+            try:
+                body = json.loads(self.rfile.read(content_length).decode())
+            except json.JSONDecodeError as e:
+                self._set_completion_headers(400)
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+                )
+                return
+        if not isinstance(body, dict):
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
+            )
+            return
+
+        result = self.response_generator.cache_evictor.request_evict(
+            clear_prompt_cache=bool(body.get("clear_prompt_cache", False))
+        )
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode())
+        self.wfile.flush()
+
+    def handle_cache_stats(self):
+        """
+        Handle a GET request for the /v1/cache/stats endpoint.
+        """
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(
+            json.dumps(self.response_generator.cache_evictor.stats()).encode()
+        )
+        self.wfile.flush()
+
     def do_GET(self):
         """
         Respond to a GET request from a client.
         """
         if self.path.startswith("/v1/models"):
             self.handle_models_request()
+        elif self.path == "/v1/cache/stats":
+            self.handle_cache_stats()
         elif self.path == "/health":
             self.handle_health_check()
         else:
@@ -1847,6 +2039,16 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--cache-idle-evict-s",
+        type=float,
+        default=0.0,
+        help="Release MLX's pooled buffer memory (mx.clear_cache()) after the "
+        "server has been idle for this many seconds (default: 0, disabled). "
+        "MLX pools freed buffers instead of returning them to the OS, so the "
+        "process keeps holding the memory of completed requests; this returns "
+        "that memory once the server goes idle.",
     )
     parser.add_argument(
         "--pipeline",
