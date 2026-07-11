@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import copy
+import hashlib
 import json
 import os
 import socket
@@ -71,6 +72,49 @@ def _save_with_payload_digests(path, arrays, metadata):
         metadata[f"sha256_k_{layer}"] = key_digest
         metadata[f"sha256_v_{layer}"] = value_digest
     mx.save_safetensors(str(path), arrays, metadata)
+
+
+def _rewrite_header(path, mutate):
+    raw = path.read_bytes()
+    header_size = int.from_bytes(raw[:8], "little")
+    header = json.loads(raw[8 : 8 + header_size])
+    payload = raw[8 + header_size :]
+    mutate(header)
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    padding = (-len(encoded)) % 8
+    encoded += b" " * padding
+    path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + payload)
+
+
+def _save_legacy_v1(path, snapshot):
+    tensors = {}
+    metadata = {
+        "format_version": "1",
+        "features": json.dumps(["delta-chain", "payload-sha256"]),
+        "model_key": snapshot.model_key,
+        "token_ids": json.dumps(list(snapshot.tokens), separators=(",", ":")),
+        "created_at": "1.0",
+        "parent_cid": "",
+        "parent_length": "0",
+        "chain_depth": "0",
+        "logical_nbytes": str(snapshot.nbytes),
+        "layers": str(len(snapshot.keys)),
+    }
+    for layer, (key, value) in enumerate(zip(snapshot.keys, snapshot.values)):
+        tensors[f"k.{layer}"] = key
+        tensors[f"v.{layer}"] = value
+        metadata[f"sha256_k_{layer}"] = "0" * 64
+        metadata[f"sha256_v_{layer}"] = "0" * 64
+    mx.save_safetensors(str(path), tensors, metadata)
+    header, data_start = _read_header(path)
+    raw = path.read_bytes()
+    for layer in range(len(snapshot.keys)):
+        for side in "kv":
+            start, end = header[f"{side}.{layer}"]["data_offsets"]
+            metadata[f"sha256_{side}_{layer}"] = hashlib.sha256(
+                raw[data_start + start : data_start + end]
+            ).hexdigest()
+    mx.save_safetensors(str(path), tensors, metadata)
 
 
 def _freeze(registry, model_key, tokens, seed=1):
@@ -175,6 +219,149 @@ class TestSnapshotStore(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertEqual(len(restarted), 0)
 
+    def test_two_pass_failure_windows_leave_no_visible_or_transient_snapshot(self):
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "m@r", list(range(8)))
+        original_save = mx.save_safetensors
+        original_digests = _payload_digests
+        original_replace = os.replace
+
+        def exercise(label, save_effect=None, digest_effect=None, replace_effect=None):
+            directory = self.path / label
+            store = SnapshotStore(directory)
+            save_calls = 0
+            digest_calls = 0
+
+            def save_wrapper(*args, **kwargs):
+                nonlocal save_calls
+                save_calls += 1
+                if save_effect is not None:
+                    save_effect(save_calls)
+                return original_save(*args, **kwargs)
+
+            def digest_wrapper(*args, **kwargs):
+                nonlocal digest_calls
+                digest_calls += 1
+                result = original_digests(*args, **kwargs)
+                return digest_effect(digest_calls, result) if digest_effect else result
+
+            def replace_wrapper(source, target):
+                if replace_effect is not None:
+                    replace_effect(Path(source), Path(target))
+                return original_replace(source, target)
+
+            with patch(
+                "mlx_lm.snapshot_store.mx.save_safetensors", side_effect=save_wrapper
+            ), patch(
+                "mlx_lm.snapshot_store._payload_digests",
+                side_effect=digest_wrapper,
+            ), patch(
+                "mlx_lm.snapshot_store.os.replace", side_effect=replace_wrapper
+            ), self.assertRaises(
+                (OSError, RuntimeError, SnapshotCorruptError)
+            ):
+                store.save(snapshot)
+            self.assertFalse((directory / f"{snapshot.cid}.safetensors").exists())
+            self.assertNotIn(snapshot.cid, store._records)
+            self.assertFalse(
+                [
+                    path
+                    for path in directory.iterdir()
+                    if ".digest-" in path.name or ".tmp-" in path.name
+                ]
+            )
+            store.close()
+
+        exercise(
+            "stage-save",
+            save_effect=lambda call: (
+                (_ for _ in ()).throw(RuntimeError("stage")) if call == 1 else None
+            ),
+        )
+        exercise(
+            "stage-digest",
+            digest_effect=lambda call, result: (
+                (_ for _ in ()).throw(SnapshotCorruptError("stage digest"))
+                if call == 1
+                else result
+            ),
+        )
+        exercise(
+            "final-save",
+            save_effect=lambda call: (
+                (_ for _ in ()).throw(RuntimeError("final")) if call == 2 else None
+            ),
+        )
+
+        def mismatch(call, result):
+            if call != 2:
+                return result
+            altered = [list(pair) for pair in result]
+            altered[0][0] = "f" * 64
+            return tuple(tuple(pair) for pair in altered)
+
+        exercise("final-digest", digest_effect=mismatch)
+        exercise(
+            "final-digest-error",
+            digest_effect=lambda call, result: (
+                (_ for _ in ()).throw(SnapshotCorruptError("final digest"))
+                if call == 2
+                else result
+            ),
+        )
+        exercise(
+            "replace",
+            replace_effect=lambda source, target: (
+                (_ for _ in ()).throw(OSError("replace"))
+                if ".tmp-" in source.name
+                else None
+            ),
+        )
+
+    def test_transient_unlink_retry_cleans_stage(self):
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "m@r", list(range(8)))
+        store = SnapshotStore(self.path)
+        original = Path.unlink
+        failures = 0
+
+        def flaky(path, *args, **kwargs):
+            nonlocal failures
+            if ".digest-" in path.name and failures == 0:
+                failures += 1
+                raise PermissionError("retry me")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", flaky):
+            store.save(snapshot)
+        self.assertEqual(failures, 1)
+        self.assertFalse([p for p in self.path.iterdir() if ".digest-" in p.name])
+
+    def test_persistent_transient_unlink_failure_is_cleaned_on_restart(self):
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "m@r", list(range(8)))
+        store = SnapshotStore(self.path)
+        original = Path.unlink
+
+        def refuse_stage(path, *args, **kwargs):
+            if ".digest-" in path.name:
+                raise PermissionError("persistent injected failure")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", refuse_stage), self.assertRaises(
+            RuntimeError
+        ):
+            store.save(snapshot)
+        self.assertFalse((self.path / f"{snapshot.cid}.safetensors").exists())
+        self.assertNotIn(snapshot.cid, store._records)
+        self.assertEqual(len(list(self.path.glob("*.digest-*.safetensors"))), 1)
+        store.close()
+
+        restarted = SnapshotStore(self.path)
+        self.assertFalse(list(self.path.glob("*.digest-*.safetensors")))
+        self.assertEqual(restarted.stats["temps_cleaned"], 1)
+        restarted.close()
+
     def test_filename_mismatch_and_unknown_feature_quarantine(self):
         registry = PrefixForkRegistry()
         snapshot = _freeze(registry, "m@r", list(range(8)))
@@ -192,7 +379,7 @@ class TestSnapshotStore(unittest.TestCase):
             str(other),
             {"k.0": mx.zeros((1, 1, 8, 1)), "v.0": mx.zeros((1, 1, 8, 1))},
             {
-                "format_version": "1",
+                "format_version": "2",
                 "features": json.dumps(["future-feature"]),
                 "model_key": "m@r",
                 "token_ids": json.dumps(list(range(8))),
@@ -200,6 +387,110 @@ class TestSnapshotStore(unittest.TestCase):
         )
         SnapshotStore(self.path)
         self.assertFalse(other.exists())
+
+    def test_legacy_v1_old_writer_is_deliberate_safe_miss(self):
+        registry = PrefixForkRegistry()
+        tokens = list(range(8))
+        snapshot = _freeze(registry, "legacy@r", tokens)
+        path = self.path / f"{snapshot.cid}.safetensors"
+        _save_legacy_v1(path, snapshot)
+        restarted = PrefixForkRegistry()
+        store = SnapshotStore(self.path, registry=restarted)
+        forks, remaining = restarted.fetch_fork("legacy@r", tokens)
+        self.assertIsNone(forks)
+        self.assertEqual(remaining, tokens)
+        self.assertFalse(path.exists())
+        self.assertGreaterEqual(store.stats["quarantines"], 1)
+
+    def test_malformed_descriptors_quarantine_at_startup_and_restore(self):
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "m@r", list(range(8)))
+        store = SnapshotStore(self.path)
+        store.save(snapshot)
+        path = self.path / f"{snapshot.cid}.safetensors"
+        store.close()
+        _rewrite_header(path, lambda header: header["k.0"].pop("dtype"))
+        restarted = PrefixForkRegistry()
+        reopened = SnapshotStore(self.path, registry=restarted)
+        self.assertEqual(len(restarted), 0)
+        self.assertFalse(path.exists())
+        reopened.close()
+
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "bad-dtype@r", list(range(8)))
+        store = SnapshotStore(self.path)
+        store.save(snapshot)
+        path = self.path / f"{snapshot.cid}.safetensors"
+        store.close()
+        _rewrite_header(path, lambda header: header["k.0"].update(dtype=7))
+        restarted = PrefixForkRegistry()
+        reopened = SnapshotStore(self.path, registry=restarted)
+        self.assertEqual(len(restarted), 0)
+        self.assertFalse(path.exists())
+        reopened.close()
+
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "m2@r", list(range(8)))
+        store = SnapshotStore(self.path)
+        store.save(snapshot)
+        path = self.path / f"{snapshot.cid}.safetensors"
+        store.close()
+        restarted = PrefixForkRegistry()
+        reopened = SnapshotStore(self.path, registry=restarted)
+        _rewrite_header(path, lambda header: header["v.0"].update(shape=[1, 2, 9, 4]))
+        forks, remaining = restarted.fetch_fork("m2@r", list(range(8)))
+        self.assertIsNone(forks)
+        self.assertEqual(remaining, list(range(8)))
+        self.assertFalse(path.exists())
+        reopened.close()
+
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "bad-layers@r", list(range(8)))
+        store = SnapshotStore(self.path)
+        store.save(snapshot)
+        path = self.path / f"{snapshot.cid}.safetensors"
+        store.close()
+        _rewrite_header(
+            path,
+            lambda header: header["__metadata__"].update(layers="1000000000"),
+        )
+        restarted = PrefixForkRegistry()
+        reopened = SnapshotStore(self.path, registry=restarted)
+        self.assertEqual(len(restarted), 0)
+        self.assertFalse(path.exists())
+        reopened.close()
+
+        registry = PrefixForkRegistry()
+        snapshot = _freeze(registry, "bad-shape@r", list(range(8)))
+        store = SnapshotStore(self.path)
+        store.save(snapshot)
+        path = self.path / f"{snapshot.cid}.safetensors"
+        store.close()
+        restarted = PrefixForkRegistry()
+        reopened = SnapshotStore(self.path, registry=restarted)
+        _rewrite_header(path, lambda header: header["v.0"].update(shape="oops"))
+        forks, remaining = restarted.fetch_fork("bad-shape@r", list(range(8)))
+        self.assertIsNone(forks)
+        self.assertEqual(remaining, list(range(8)))
+        self.assertFalse(path.exists())
+        reopened.close()
+
+    def test_over_limit_json_integer_is_normalized_to_corruption(self):
+        path = self.path / "malicious.safetensors"
+        encoded = (
+            b'{"x":{"dtype":"F32","shape":[' + b"9" * 5000 + b'],"data_offsets":[0,0]}}'
+        )
+        path.write_bytes(len(encoded).to_bytes(8, "little") + encoded)
+
+        with self.assertRaises(SnapshotCorruptError):
+            _read_header(path)
+
+        nested = self.path / "deeply-nested.safetensors"
+        depth = 2000
+        encoded = b"[" * depth + b"0" + b"]" * depth
+        nested.write_bytes(len(encoded).to_bytes(8, "little") + encoded)
+        with self.assertRaises(SnapshotCorruptError):
+            _read_header(nested)
 
     def test_digest_guard_on_fetch_and_scrub(self):
         registry = PrefixForkRegistry()
@@ -328,7 +619,81 @@ class TestSnapshotStore(unittest.TestCase):
         store.gc()
         self.assertIn(root.cid, store._records)
         self.assertNotIn(child.cid, store._records)
+        store.max_bytes = 32 << 30
         self.assertEqual(store.save(child), child.cid)
+
+    def test_reservation_evicts_deterministic_lru_leaf(self):
+        registry = PrefixForkRegistry()
+        older = _freeze(registry, "older@r", list(range(8)), seed=1)
+        newer = _freeze(registry, "newer@r", list(range(100, 108)), seed=2)
+        incoming = _freeze(registry, "incoming@r", list(range(200, 208)), seed=3)
+        store = SnapshotStore(self.path)
+        store.save(older)
+        store.save(newer)
+        # Make recency disagree with insertion order so this detects a
+        # first-eligible implementation instead of explicit LRU selection.
+        store._records[older.cid].last_use = 2.0
+        store._records[newer.cid].last_use = 1.0
+        store.max_files = 2
+
+        store.save(incoming)
+
+        self.assertIn(older.cid, store._records)
+        self.assertNotIn(newer.cid, store._records)
+        self.assertIn(incoming.cid, store._records)
+
+    def test_impossible_reservation_does_not_evict_existing_snapshot(self):
+        registry = PrefixForkRegistry()
+        existing = _freeze(registry, "existing@r", list(range(8)), seed=1)
+        incoming = _freeze(registry, "incoming@r", list(range(100, 108)), seed=2)
+        store = SnapshotStore(self.path)
+        store.save(existing)
+        existing_path = self.path / f"{existing.cid}.safetensors"
+        store.max_bytes = 1
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds max_bytes"):
+            store.save(incoming)
+
+        self.assertTrue(existing_path.exists())
+        self.assertIn(existing.cid, store._records)
+        self.assertFalse((self.path / f"{incoming.cid}.safetensors").exists())
+
+        store.close()
+        file_cap_path = self.path / "file-cap"
+        store = SnapshotStore(file_cap_path)
+        store.save(existing)
+        existing_path = file_cap_path / f"{existing.cid}.safetensors"
+        store.max_files = 0
+
+        with self.assertRaisesRegex(RuntimeError, "max_files >= 1"):
+            store.save(incoming)
+
+        self.assertTrue(existing_path.exists())
+        self.assertIn(existing.cid, store._records)
+        self.assertFalse((file_cap_path / f"{incoming.cid}.safetensors").exists())
+
+    def test_reservation_protects_incoming_parent_chain(self):
+        registry = PrefixForkRegistry()
+        root = registry.get(registry.freeze("m@r", list(range(8)), _prefix_cache(8)))
+        child = registry.get(registry.freeze("m@r", list(range(16)), _prefix_cache(16)))
+        store = SnapshotStore(self.path)
+        store.save(root)
+        root_path = self.path / f"{root.cid}.safetensors"
+        store.max_files = 1
+
+        with self.assertRaisesRegex(RuntimeError, "no evictable leaf"):
+            store.save(child)
+
+        self.assertTrue(root_path.exists())
+        self.assertIn(root.cid, store._records)
+        self.assertNotIn(child.cid, store._records)
+        self.assertFalse(
+            [
+                path
+                for path in self.path.iterdir()
+                if ".digest-" in path.name or ".tmp-" in path.name
+            ]
+        )
 
     def test_missing_parent_poisons_descendant(self):
         registry = PrefixForkRegistry()

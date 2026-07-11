@@ -14,10 +14,10 @@ depth cap of eight this can transiently allocate several times the final KV
 size; representative-scale benchmarks must include that state-budget cost.
 
 Save is intentionally two-pass: a staged safetensors write establishes the
-canonical raw tensor bytes (including bfloat16), then the final atomic write
-embeds those digests. This costs roughly 2x write bandwidth and temporarily
-one extra snapshot file; both dot-temporary paths are cleaned on failure and
-startup and remain subject to directory-cap GC after the atomic commit.
+canonical raw tensor bytes (including bfloat16), then it is removed before the
+final atomic write embeds those digests. This costs roughly 2x write bandwidth
+but only one extra snapshot file at a time; reservation uses leaf-safe LRU
+eviction without deleting the incoming delta's parent chain.
 """
 
 import fcntl
@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -41,8 +42,28 @@ import mlx.core as mx
 
 from .prefix_forks import FrozenPrefixSnapshot, compute_cid
 
-FORMAT_VERSION = "1"
-KNOWN_FEATURES = frozenset({"delta-chain", "payload-sha256"})
+FORMAT_VERSION = "2"
+CANONICAL_DIGEST_FEATURE = "canonical-tensor-sha256-v2"
+DIGEST_DOMAIN = b"mlx-lm-snapshot-tensor-v2"
+KNOWN_FEATURES = frozenset({"delta-chain", CANONICAL_DIGEST_FEATURE})
+_DTYPE_BYTES = {
+    "BOOL": 1,
+    "I8": 1,
+    "U8": 1,
+    "I16": 2,
+    "U16": 2,
+    "I32": 4,
+    "U32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F16": 2,
+    "BF16": 2,
+    "F32": 4,
+    "F64": 8,
+    "C64": 8,
+}
 _PROCESS_OWNERS = {}
 _OWNERS_LOCK = threading.Lock()
 
@@ -63,8 +84,12 @@ def _owned_operation(method):
 
 def _tensor_hasher(dtype: str, shape: List[int]):
     """Domain-separated canonical tensor digest, independent of PEP-3118."""
+    if dtype not in _DTYPE_BYTES or not isinstance(shape, (list, tuple)):
+        raise SnapshotCorruptError("invalid tensor digest descriptor")
+    if any(type(dimension) is not int or dimension < 0 for dimension in shape):
+        raise SnapshotCorruptError("invalid tensor digest shape")
     hasher = hashlib.sha256()
-    hasher.update(b"mlx-lm-snapshot-tensor-v1")
+    hasher.update(DIGEST_DOMAIN)
     dtype_bytes = dtype.encode()
     hasher.update(len(dtype_bytes).to_bytes(8, "big"))
     hasher.update(dtype_bytes)
@@ -73,8 +98,11 @@ def _tensor_hasher(dtype: str, shape: List[int]):
 
 
 def _file_tensor_digest(path: Path, tensor: dict, data_start: int) -> str:
-    hasher = _tensor_hasher(tensor["dtype"], tensor["shape"])
-    start, end = tensor["data_offsets"]
+    try:
+        hasher = _tensor_hasher(tensor["dtype"], tensor["shape"])
+        start, end = tensor["data_offsets"]
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise SnapshotCorruptError("invalid tensor digest descriptor") from exc
     position = data_start + start
     end = data_start + end
     with path.open("rb") as handle:
@@ -90,13 +118,31 @@ def _file_tensor_digest(path: Path, tensor: dict, data_start: int) -> str:
 
 def _payload_digests(path: Path, layers: int):
     header, data_start = _read_header(path)
-    return tuple(
-        (
-            _file_tensor_digest(path, header[f"k.{layer}"], data_start),
-            _file_tensor_digest(path, header[f"v.{layer}"], data_start),
+    try:
+        return tuple(
+            (
+                _file_tensor_digest(path, header[f"k.{layer}"], data_start),
+                _file_tensor_digest(path, header[f"v.{layer}"], data_start),
+            )
+            for layer in range(layers)
         )
-        for layer in range(layers)
-    )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise SnapshotCorruptError("invalid tensor payload descriptors") from exc
+
+
+def _remove_transient(path: Path):
+    """Best-effort retry for temp cleanup; startup/GC remain the backstop."""
+    last_error = None
+    for _ in range(2):
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            last_error = exc
+    logging.warning("Could not remove snapshot transient %s: %s", path, last_error)
+    return False
 
 
 def _read_header(path: Path) -> Tuple[dict, int]:
@@ -111,7 +157,7 @@ def _read_header(path: Path) -> Tuple[dict, int]:
             raise SnapshotCorruptError("invalid safetensors header length")
         try:
             header = json.loads(handle.read(header_size))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise SnapshotCorruptError("invalid safetensors header JSON") from exc
     if not isinstance(header, dict):
         raise SnapshotCorruptError("safetensors header is not an object")
@@ -120,10 +166,25 @@ def _read_header(path: Path) -> Tuple[dict, int]:
     for name, tensor in header.items():
         if name == "__metadata__":
             continue
+        if not isinstance(name, str) or not isinstance(tensor, dict):
+            raise SnapshotCorruptError("invalid tensor descriptor")
         try:
+            dtype = tensor["dtype"]
+            shape = tensor["shape"]
             start, end = tensor["data_offsets"]
         except (KeyError, TypeError, ValueError) as exc:
-            raise SnapshotCorruptError("invalid tensor offsets") from exc
+            raise SnapshotCorruptError("incomplete tensor descriptor") from exc
+        if not isinstance(dtype, str) or dtype not in _DTYPE_BYTES:
+            raise SnapshotCorruptError("unsupported tensor dtype")
+        if (
+            not isinstance(shape, list)
+            or len(shape) > 64
+            or any(
+                type(dimension) is not int or dimension < 0 or dimension > (1 << 63) - 1
+                for dimension in shape
+            )
+        ):
+            raise SnapshotCorruptError("invalid tensor shape")
         if (
             type(start) is not int
             or type(end) is not int
@@ -132,6 +193,9 @@ def _read_header(path: Path) -> Tuple[dict, int]:
             or end > size - data_start
         ):
             raise SnapshotCorruptError("tensor payload extends past file")
+        elements = math.prod(shape)
+        if end - start != elements * _DTYPE_BYTES[dtype]:
+            raise SnapshotCorruptError("tensor shape does not match payload span")
         spans.append((start, end))
     cursor = 0
     for start, end in sorted(spans):
@@ -321,11 +385,17 @@ class SnapshotStore:
         metadata = header.get("__metadata__")
         if not isinstance(metadata, dict):
             raise SnapshotCorruptError("missing metadata")
-        if metadata.get("format_version") != FORMAT_VERSION:
+        format_version = metadata.get("format_version")
+        if format_version == "1":
+            raise SnapshotCorruptError(
+                "legacy format v1 payload digests are intentionally unsupported; "
+                "safe miss requires re-prefill"
+            )
+        if format_version != FORMAT_VERSION:
             raise SnapshotCorruptError("unknown format version")
         try:
             raw_features = json.loads(metadata.get("features", "[]"))
-        except (TypeError, json.JSONDecodeError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             raise SnapshotCorruptError("invalid feature flags") from exc
         if not isinstance(raw_features, list) or any(
             not isinstance(feature, str) for feature in raw_features
@@ -335,6 +405,8 @@ class SnapshotStore:
         unknown = features - KNOWN_FEATURES
         if unknown:
             raise SnapshotCorruptError(f"unknown features: {sorted(unknown)}")
+        if CANONICAL_DIGEST_FEATURE not in features:
+            raise SnapshotCorruptError("missing canonical tensor digest feature")
         try:
             model_key = metadata["model_key"]
             tokens = tuple(json.loads(metadata["token_ids"]))
@@ -344,8 +416,9 @@ class SnapshotStore:
             depth = int(metadata.get("chain_depth", "0"))
             logical_nbytes = int(metadata["logical_nbytes"])
             layers = int(metadata["layers"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError, RecursionError) as exc:
             raise SnapshotCorruptError("invalid snapshot metadata") from exc
+        tensor_count = len(header) - int("__metadata__" in header)
         if not isinstance(model_key, str) or any(type(t) is not int for t in tokens):
             raise SnapshotCorruptError("invalid identity metadata")
         if (
@@ -353,6 +426,7 @@ class SnapshotStore:
             or created_at < 0
             or logical_nbytes < 0
             or layers <= 0
+            or layers * 2 != tensor_count
             or depth < 0
         ):
             raise SnapshotCorruptError("invalid numeric metadata")
@@ -533,7 +607,7 @@ class SnapshotStore:
         try:
             data = json.loads(path.read_text())
             lru = data.get("last_use", {})
-        except (OSError, json.JSONDecodeError, AttributeError):
+        except (OSError, ValueError, RecursionError, AttributeError):
             return
         for cid, stamp in lru.items():
             if (
@@ -583,6 +657,80 @@ class SnapshotStore:
         # Do not silently fall back to a shorter ancestor: once the natural
         # longest chain reaches the cap, this write is a new whole root.
         return None if best is not None and best.depth >= self.max_chain_depth else best
+
+    def _reserve_space(self, reservation: int, protected_cids=None):
+        """Make room for one transient/final file without evicting parents."""
+        protected_cids = set(protected_cids or ())
+        if self.max_files < 1:
+            raise RuntimeError("snapshot reservation requires max_files >= 1")
+        if reservation > self.max_bytes:
+            raise RuntimeError("snapshot reservation exceeds max_bytes")
+
+        def files():
+            return [
+                path
+                for path in self.directory.iterdir()
+                if path.is_file() and path.name != ".writer.lock"
+            ]
+
+        while True:
+            live_files = files()
+            live_bytes = sum(path.stat().st_size for path in live_files)
+            if (
+                len(live_files) + 1 <= self.max_files
+                and live_bytes + reservation <= self.max_bytes
+            ):
+                break
+            known_paths = {record.path for record in self._records.values()}
+            disposable = [
+                path
+                for path in live_files
+                if path.suffix != ".safetensors" or path not in known_paths
+            ]
+            if disposable:
+                victim = min(disposable, key=lambda path: path.stat().st_mtime)
+                try:
+                    victim.unlink()
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"snapshot reservation could not unlink {victim}"
+                    ) from exc
+                continue
+            parents = {
+                record.parent_cid
+                for record in self._records.values()
+                if record.parent_cid
+            }
+            leaves = [
+                record
+                for record in self._records.values()
+                if record.cid not in parents and record.cid not in protected_cids
+            ]
+            leaf = min(
+                leaves,
+                key=lambda record: (record.last_use, record.cid),
+                default=None,
+            )
+            if leaf is None:
+                raise RuntimeError(
+                    "snapshot reservation exceeds cap with no evictable leaf"
+                )
+            try:
+                leaf.path.unlink()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"snapshot reservation could not unlink {leaf.path}"
+                ) from exc
+            self._records.pop(leaf.cid, None)
+            self._index_dirty = True
+            self._disk_ghosts.append((leaf.model_key, leaf.tokens, leaf.cid))
+            self._stats["gc_files"] += 1
+            if self.registry is not None and isinstance(
+                self.registry.get(leaf.cid), DiskBackedSnapshot
+            ):
+                self.registry.invalidate(leaf.cid)
+        if shutil.disk_usage(self.directory).free < reservation:
+            raise RuntimeError("insufficient free disk space for snapshot reservation")
 
     @_owned_operation
     def save(self, snapshot: FrozenPrefixSnapshot) -> str:
@@ -638,6 +786,21 @@ class SnapshotStore:
             # supported MLX dtype without NumPy/PEP-3118 conversion).
             metadata[f"sha256_k_{layer}"] = "0" * 64
             metadata[f"sha256_v_{layer}"] = "0" * 64
+        payload_bytes = sum(tensor.nbytes for tensor in tensors.values())
+        metadata_bytes = len(json.dumps(metadata, sort_keys=True).encode())
+        reservation = (
+            payload_bytes + 4 * metadata_bytes + 1024 * len(tensors) + (64 << 10)
+        )
+        protected = set()
+        current_parent = parent
+        while current_parent is not None:
+            protected.add(current_parent.cid)
+            current_parent = (
+                self._records.get(current_parent.parent_cid)
+                if current_parent.parent_cid
+                else None
+            )
+        self._reserve_space(reservation, protected)
         # Keep the safetensors suffix: MLX otherwise appends one, which would
         # make the path passed to chmod/replace differ from the file written.
         temp = self.directory / f".{cid}.tmp-{uuid.uuid4().hex}.safetensors"
@@ -645,21 +808,24 @@ class SnapshotStore:
         try:
             mx.save_safetensors(str(stage), tensors, metadata)
             os.chmod(stage, 0o600)
+            if stage.stat().st_size > reservation:
+                raise RuntimeError("snapshot stage exceeded reserved disk bytes")
             digests = _payload_digests(stage, len(keys))
+            if not _remove_transient(stage):
+                raise RuntimeError("could not release staged snapshot reservation")
             for layer, (key_digest, value_digest) in enumerate(digests):
                 metadata[f"sha256_k_{layer}"] = key_digest
                 metadata[f"sha256_v_{layer}"] = value_digest
             mx.save_safetensors(str(temp), tensors, metadata)
             os.chmod(temp, 0o600)
+            if temp.stat().st_size > reservation:
+                raise RuntimeError("snapshot final exceeded reserved disk bytes")
             if _payload_digests(temp, len(keys)) != digests:
                 raise SnapshotCorruptError("staged/final tensor payload mismatch")
             os.replace(temp, final)
         finally:
             for transient in (stage, temp):
-                try:
-                    transient.unlink()
-                except FileNotFoundError:
-                    pass
+                _remove_transient(transient)
         os.chmod(final, 0o600)
         record = self._parse_record(final)
         self._records[cid] = record
