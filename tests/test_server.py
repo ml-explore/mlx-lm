@@ -803,6 +803,39 @@ class TestLRUPromptCache(unittest.TestCase):
         cache = LRUPromptCache(max_size=10)
         cache.return_cache(None)  # must not raise
 
+    def test_fetch_nearest_cache_still_copies_without_checkout(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        def get_kv(n):
+            keys = mx.arange(n).reshape(1, 1, n, 1)
+            return keys, keys
+
+        entry = [KVCache()]
+        entry[0].update_and_fetch(*get_kv(8))
+        cache.insert_cache(model, [1, 2], entry)
+
+        # The default path must keep handing out a copy -- never the stored
+        # reference -- for callers that don't opt in to checkout_cache.
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(t, [])
+        self.assertIsNot(c, entry)
+        self.assertIsNot(c[0], entry[0])
+
+        # Mutate the fetched copy's KV state in place -- the same
+        # update_and_fetch buffer write generation performs, which the
+        # default path's deep copy exists to isolate.
+        c[0].update_and_fetch(*get_kv(4))
+        self.assertEqual(c[0].offset, 12)
+
+        # The stored entry must not see the mutation.
+        c2, t2 = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(t2, [])
+        self.assertEqual(c2[0].offset, 8)
+        k, v = c2[0].state
+        self.assertTrue((k == v).all().item())
+        self.assertTrue((k.flatten() == mx.arange(8)).all().item())
+
 
 class TestMakeSampler(unittest.TestCase):
     def test_xtc_special_tokens(self):
