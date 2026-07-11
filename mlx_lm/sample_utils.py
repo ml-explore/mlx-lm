@@ -4,6 +4,7 @@ import math
 import time
 from collections import Counter
 from functools import partial
+from numbers import Integral, Real
 from typing import Callable, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -442,8 +443,8 @@ def make_reasoning_budget(
             callable returning the current ceiling, evaluated at every
             generation step until a trip fires — this makes the budget
             *dynamic*, e.g. one that tightens under live host cost (see
-            ``make_cost_braked_budget``). The callable must return a finite
-            positive number; anything else raises a labeled ``ValueError``.
+            ``make_cost_braked_budget``). The callable must return a positive
+            integer; anything else raises a labeled ``ValueError``.
             Once a trip fires it latches until a ``think_close`` token is
             actually emitted: a budget that later grows — or an in-channel
             ``think_open`` seen before any close — cannot undo a forced
@@ -465,8 +466,18 @@ def make_reasoning_budget(
         operates on a single sequence (as the other processors here do).
     """
     dynamic_budget = callable(max_think_tokens)
-    if not dynamic_budget and max_think_tokens <= 0:
-        raise ValueError(f"max_think_tokens must be positive, got {max_think_tokens}")
+    if not dynamic_budget:
+        if isinstance(max_think_tokens, bool) or not isinstance(
+            max_think_tokens, Integral
+        ):
+            raise ValueError(
+                "max_think_tokens must be a positive integer or a zero-arg "
+                f"callable, got {max_think_tokens!r}"
+            )
+        if max_think_tokens <= 0:
+            raise ValueError(
+                f"max_think_tokens must be positive, got {max_think_tokens}"
+            )
 
     state = {
         "n": 0,  # tokens consumed from the running `tokens` array so far
@@ -508,13 +519,13 @@ def make_reasoning_budget(
             trip = True
         else:
             if dynamic_budget:
-                try:
-                    budget = int(max_think_tokens())
-                except (TypeError, ValueError, OverflowError) as e:
+                raw_budget = max_think_tokens()
+                if isinstance(raw_budget, bool) or not isinstance(raw_budget, Integral):
                     raise ValueError(
                         "make_reasoning_budget: the max_think_tokens callable "
-                        f"must return a finite number ({e})"
-                    ) from e
+                        f"must return a positive integer, got {raw_budget!r}"
+                    )
+                budget = int(raw_budget)
                 if budget <= 0:
                     raise ValueError(
                         "make_reasoning_budget: the max_think_tokens callable "
@@ -630,15 +641,34 @@ def make_cost_braked_budget(
         Callable[[], int]: A zero-arg callable returning the current budget;
         pass it as ``max_think_tokens`` to ``make_reasoning_budget``.
     """
+    integer_args = {
+        "floor": floor,
+        "ceil": ceil,
+        "short_prompt": short_prompt,
+        "long_prompt": long_prompt,
+    }
+    if prompt_len is not None:
+        integer_args["prompt_len"] = prompt_len
+    for name, value in integer_args.items():
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+
     if floor < 1:
         raise ValueError(f"floor must be positive, got {floor}")
     if ceil < floor:
         raise ValueError(f"ceil must be >= floor, got ceil={ceil}, floor={floor}")
-    if not (0 <= cost_brake <= 1):
+    if isinstance(cost_brake, bool) or not isinstance(cost_brake, Real):
+        raise ValueError(f"cost_brake must be a number in [0, 1], got {cost_brake!r}")
+    if not math.isfinite(cost_brake) or not (0 <= cost_brake <= 1):
         raise ValueError(f"cost_brake must be in [0, 1], got {cost_brake}")
-    if difficulty not in REASONING_DIFF_MULT:
+    if not isinstance(difficulty, str) or difficulty not in REASONING_DIFF_MULT:
         raise ValueError(
             f"difficulty must be one of {sorted(REASONING_DIFF_MULT)}, got {difficulty!r}"
+        )
+    if short_prompt < 0 or long_prompt < 0:
+        raise ValueError(
+            "short_prompt and long_prompt must be non-negative, got "
+            f"short_prompt={short_prompt}, long_prompt={long_prompt}"
         )
     if short_prompt >= long_prompt:
         raise ValueError(
@@ -655,7 +685,7 @@ def make_cost_braked_budget(
             length_class = "long"
         else:
             length_class = "medium"
-    elif length_class not in REASONING_LEN_BASE:
+    elif not isinstance(length_class, str) or length_class not in REASONING_LEN_BASE:
         raise ValueError(
             f"length_class must be one of {sorted(REASONING_LEN_BASE)}, got {length_class!r}"
         )
@@ -663,24 +693,59 @@ def make_cost_braked_budget(
     base = REASONING_LEN_BASE[length_class] * REASONING_DIFF_MULT[difficulty]
 
     if cost_fn is None:
-        if brake_horizon <= 0:
-            raise ValueError(f"brake_horizon must be positive, got {brake_horizon}")
+        if isinstance(brake_horizon, bool) or not isinstance(brake_horizon, Real):
+            raise ValueError(
+                f"brake_horizon must be a positive finite number, got {brake_horizon!r}"
+            )
+        if not math.isfinite(brake_horizon) or brake_horizon <= 0:
+            raise ValueError(
+                f"brake_horizon must be positive and finite, got {brake_horizon}"
+            )
+        if clock is not None and not callable(clock):
+            raise ValueError(f"clock must be callable, got {clock!r}")
         read_clock = clock if clock is not None else time.monotonic
         start = None
+        previous = None
 
         def cost_fn():
-            nonlocal start
-            now = read_clock()
+            nonlocal previous, start
+            raw_now = read_clock()
+            if isinstance(raw_now, bool) or not isinstance(raw_now, Real):
+                raise ValueError(
+                    "make_cost_braked_budget: clock must return a real number, "
+                    f"got {raw_now!r}"
+                )
+            now = float(raw_now)
+            if not math.isfinite(now):
+                raise ValueError(
+                    "make_cost_braked_budget: clock must return a finite number, "
+                    f"got {raw_now!r}"
+                )
             if start is None:
                 start = now
+            elif now < previous:
+                raise ValueError(
+                    "make_cost_braked_budget: clock moved backwards, "
+                    f"from {previous} to {now}"
+                )
+            previous = now
             return (now - start) / brake_horizon
 
+    elif not callable(cost_fn):
+        raise ValueError(f"cost_fn must be callable, got {cost_fn!r}")
+
     def cost_braked_budget():
-        cost = float(cost_fn())
+        raw_cost = cost_fn()
+        if isinstance(raw_cost, bool) or not isinstance(raw_cost, Real):
+            raise ValueError(
+                "make_cost_braked_budget: cost_fn must return a real number, "
+                f"got {raw_cost!r}"
+            )
+        cost = float(raw_cost)
         if math.isnan(cost):
             raise ValueError("make_cost_braked_budget: cost_fn returned NaN")
         cost = max(0.0, min(1.0, cost))
         brake = 1.0 - cost_brake * cost
-        return max(floor, min(ceil, int(base * brake)))
+        return int(max(floor, min(ceil, int(base * brake))))
 
     return cost_braked_budget

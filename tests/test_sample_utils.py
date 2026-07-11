@@ -374,16 +374,58 @@ class TestSampleUtils(unittest.TestCase):
         self.assertEqual(int(mx.argmax(out[0]).item()), close)
 
     def test_reasoning_budget_callable_return_validation(self):
-        # F4: a dynamic budget must return a finite positive number, matching
+        # F4: a dynamic budget must return a positive integer, matching
         # the static constructor's positivity check; failures are labeled.
         from mlx_lm.sample_utils import make_reasoning_budget
 
         logits = mx.zeros((1, 10))
-        for bad in (0, -5, float("inf"), float("nan")):
+        for bad in (0, -5, True, 1.5, "3", float("inf"), float("nan")):
             proc = make_reasoning_budget(think_close=5, max_think_tokens=lambda: bad)
             with self.assertRaises(ValueError) as ctx:
                 proc(mx.array([0]), logits)
             self.assertIn("max_think_tokens", str(ctx.exception))
+
+        # Integer scalar types remain valid; only lossy/coercive conversions
+        # are rejected.
+        import numpy as np
+
+        proc = make_reasoning_budget(
+            think_close=5, max_think_tokens=lambda: np.int64(1)
+        )
+        out = proc(mx.array([0]), logits)
+        self.assertEqual(int(mx.argmax(out[0]).item()), 5)
+
+    def test_reasoning_budget_static_validation_matches_callable(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        for bad in (True, 1.5, "3", float("inf"), float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as ctx:
+                make_reasoning_budget(think_close=5, max_think_tokens=bad)
+            self.assertIn("max_think_tokens", str(ctx.exception))
+
+        import numpy as np
+
+        # Valid integer scalars preserve static-vs-callable parity.
+        logits = mx.zeros((1, 10))
+        static = make_reasoning_budget(5, np.int64(2), check_every=10**9)
+        dynamic = make_reasoning_budget(5, lambda: np.int64(2), check_every=10**9)
+        for tokens in (mx.array([0]), mx.array([0, 1])):
+            self.assertTrue(
+                mx.array_equal(static(tokens, logits), dynamic(tokens, logits))
+            )
+
+    def test_reasoning_budget_callable_failure_propagates(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        failure = ValueError("cost sensor offline")
+
+        def budget():
+            raise failure
+
+        proc = make_reasoning_budget(think_close=5, max_think_tokens=budget)
+        with self.assertRaises(ValueError) as ctx:
+            proc(mx.array([0]), mx.zeros((1, 10)))
+        self.assertIs(ctx.exception, failure)
 
     def test_cost_braked_budget_brake(self):
         from mlx_lm.sample_utils import make_cost_braked_budget
@@ -451,6 +493,23 @@ class TestSampleUtils(unittest.TestCase):
         t["now"] = 1000.0  # far past the horizon -> cost clamps at 1
         self.assertEqual(b(), 1040)
 
+    def test_cost_braked_budget_clock_validation(self):
+        from mlx_lm.sample_utils import make_cost_braked_budget
+
+        for bad in (True, "100", float("nan"), float("inf")):
+            budget = make_cost_braked_budget(clock=lambda bad=bad: bad)
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as ctx:
+                budget()
+            self.assertIn("clock", str(ctx.exception))
+
+        t = {"now": 100.0}
+        budget = make_cost_braked_budget(clock=lambda: t["now"])
+        budget()
+        t["now"] = 99.0
+        with self.assertRaises(ValueError) as ctx:
+            budget()
+        self.assertIn("backwards", str(ctx.exception))
+
     def test_cost_braked_budget_validation(self):
         from mlx_lm.sample_utils import make_cost_braked_budget
 
@@ -470,6 +529,51 @@ class TestSampleUtils(unittest.TestCase):
             make_cost_braked_budget(short_prompt=2048, long_prompt=256)
         with self.assertRaises(ValueError):
             make_cost_braked_budget(prompt_len=-1)
+        for kwargs in (
+            {"floor": 256.5},
+            {"ceil": 4096.5},
+            {"floor": float("nan")},
+            {"ceil": float("nan")},
+            {"prompt_len": float("nan")},
+            {"prompt_len": 10.5},
+            {"floor": True},
+            {"cost_brake": True},
+            {"brake_horizon": float("inf")},
+            {"cost_fn": True},
+            {"clock": True},
+            {"short_prompt": -1},
+            {"short_prompt": 256.5},
+            {"long_prompt": 2048.5},
+            {"difficulty": []},
+            {"length_class": []},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                make_cost_braked_budget(**kwargs)
+
+        # NumPy integer/real scalars honor the numeric contract without
+        # forcing callers to convert otherwise-valid measurements manually.
+        import numpy as np
+
+        budget = make_cost_braked_budget(
+            length_class="long",
+            difficulty="hard",
+            prompt_len=np.int64(10),
+            floor=np.int64(1),
+            ceil=np.int64(4095),
+            cost_brake=np.float64(0.35),
+            cost_fn=lambda: np.float64(0.0),
+        )
+        self.assertEqual(budget(), 4095)
+        self.assertIsInstance(budget(), int)
+
+    def test_cost_braked_budget_rejects_non_numeric_cost(self):
+        from mlx_lm.sample_utils import make_cost_braked_budget
+
+        for bad in (True, "0.5", None, complex(0.5, 0)):
+            budget = make_cost_braked_budget(cost_fn=lambda bad=bad: bad)
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as ctx:
+                budget()
+            self.assertIn("cost_fn", str(ctx.exception))
 
     def test_reasoning_budget_with_cost_braked_budget(self):
         # End to end: a cost-braked budget drives the processor, and a cost
