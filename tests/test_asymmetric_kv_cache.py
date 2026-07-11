@@ -106,6 +106,19 @@ class TestAsymmetricKVCache(unittest.TestCase):
             migrated = load_prompt_cache(migrated_path)[0]
             self.assertEqual(migrated.meta_state, ("2", "2", "32", "4", "4"))
 
+            for name, invalid_meta, message in (
+                ("bad-bits", ("2", "2", "32", "8", "7"), "Unsupported value bits"),
+                ("bad-group", ("2", "2", "16", "8", "4"), "Unsupported group size"),
+                ("bad-layout", ("2", "2", "32", "8"), "expected 3 legacy fields or 5"),
+            ):
+                corrupt_path = os.path.join(directory, f"{name}.safetensors")
+                corrupt_metadata = dict(
+                    tree_flatten([[invalid_meta], {}, ["QuantizedKVCache"]])
+                )
+                mx.save_safetensors(corrupt_path, legacy_arrays, corrupt_metadata)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_prompt_cache(corrupt_path)
+
     def test_quantization_resolution_is_fail_closed(self):
         cache = KVCache()
         maybe_quantize_kv_cache([cache], 0, 64, None)

@@ -231,6 +231,17 @@ class ConcatenateKVCache(_BaseCache):
 
 class QuantizedKVCache(_BaseCache):
     step = 256
+    _supported_bits = {2, 3, 4, 5, 6, 8}
+    _supported_group_sizes = {32, 64, 128}
+
+    @classmethod
+    def _validate_config(cls, group_size, key_bits, value_bits):
+        if key_bits not in cls._supported_bits:
+            raise ValueError(f"Unsupported key bits: {key_bits}")
+        if value_bits not in cls._supported_bits:
+            raise ValueError(f"Unsupported value bits: {value_bits}")
+        if group_size not in cls._supported_group_sizes:
+            raise ValueError(f"Unsupported group size: {group_size}")
 
     def __init__(
         self,
@@ -240,21 +251,13 @@ class QuantizedKVCache(_BaseCache):
         key_bits: Optional[int] = None,
         value_bits: Optional[int] = None,
     ):
-        supported_bits = {2, 3, 4, 5, 6, 8}
-        if key_bits is not None and key_bits not in supported_bits:
-            raise ValueError(f"Unsupported key bits: {key_bits}")
-        if value_bits is not None and value_bits not in supported_bits:
-            raise ValueError(f"Unsupported value bits: {value_bits}")
-        if bits not in supported_bits:
-            raise ValueError(f"Unsupported bits: {bits}")
-        if group_size not in {32, 64, 128}:
-            raise ValueError(f"Unsupported group size: {group_size}")
         self.keys = None
         self.values = None
         self.offset = 0
         self.group_size = group_size
         self.key_bits = bits if key_bits is None else key_bits
         self.value_bits = bits if value_bits is None else value_bits
+        self._validate_config(group_size, self.key_bits, self.value_bits)
         # ``bits`` is retained for callers inspecting legacy symmetric caches.
         self.bits = self.key_bits if self.key_bits == self.value_bits else None
 
@@ -330,7 +333,14 @@ class QuantizedKVCache(_BaseCache):
             # Legacy symmetric cache metadata: offset, group_size, bits.
             self.offset, self.group_size, bits = map(int, v)
             self.key_bits = self.value_bits = self.bits = bits
+            self._validate_config(self.group_size, self.key_bits, self.value_bits)
             return
+
+        if len(v) != 5:
+            raise ValueError(
+                "Invalid QuantizedKVCache metadata: expected 3 legacy fields "
+                "or 5 versioned fields."
+            )
 
         version, self.offset, self.group_size, self.key_bits, self.value_bits = map(
             int, v
@@ -339,6 +349,7 @@ class QuantizedKVCache(_BaseCache):
             raise ValueError(
                 f"Unsupported QuantizedKVCache metadata version: {version}"
             )
+        self._validate_config(self.group_size, self.key_bits, self.value_bits)
         self.bits = self.key_bits if self.key_bits == self.value_bits else None
 
     def is_trimmable(self):
