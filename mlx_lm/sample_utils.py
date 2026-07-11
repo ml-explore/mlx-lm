@@ -1,9 +1,10 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import math
+import time
 from collections import Counter
 from functools import partial
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import mlx.core as mx
 
@@ -400,7 +401,7 @@ def _is_line_repetition(text, min_line=20, max_repeats=3):
 
 def make_reasoning_budget(
     think_close: int,
-    max_think_tokens: int,
+    max_think_tokens: Union[int, Callable[[], int]],
     *,
     think_open: Optional[int] = None,
     tokenizer=None,
@@ -426,11 +427,28 @@ def make_reasoning_budget(
     * a repeated token cycle in the tail of the channel (decode-free);
     * a repeated substantive line (only if a ``tokenizer`` is given).
 
+    .. note::
+        The processor tracks channel state from the running token stream and
+        never rewinds it, so it does not support speculative decoding's
+        draft-token rejection: tokens it has ingested are counted even if the
+        generator later discards them. Use it with standard (non-speculative)
+        generation.
+
     Args:
         think_close (int): Token id that closes the reasoning channel; this is
             what gets forced on a trip (e.g. the id of ``</think>``).
-        max_think_tokens (int): Hard ceiling on tokens spent inside the
-            channel before the close is forced.
+        max_think_tokens (int or callable): Hard ceiling on tokens spent
+            inside the channel before the close is forced. May be a zero-arg
+            callable returning the current ceiling, evaluated at every
+            generation step until a trip fires — this makes the budget
+            *dynamic*, e.g. one that tightens under live host cost (see
+            ``make_cost_braked_budget``). The callable must return a finite
+            positive number; anything else raises a labeled ``ValueError``.
+            Once a trip fires it latches until a ``think_close`` token is
+            actually emitted: a budget that later grows — or an in-channel
+            ``think_open`` seen before any close — cannot undo a forced
+            close, and the callable is not invoked again while the latch
+            holds.
         think_open (int, optional): Token id that opens the channel. If
             ``None``, generation is assumed to start inside the channel (as
             with templates that open it for the model). Default: ``None``.
@@ -446,7 +464,8 @@ def make_reasoning_budget(
         Callable[[mx.array, mx.array], mx.array]: The logits processor. It
         operates on a single sequence (as the other processors here do).
     """
-    if max_think_tokens <= 0:
+    dynamic_budget = callable(max_think_tokens)
+    if not dynamic_budget and max_think_tokens <= 0:
         raise ValueError(f"max_think_tokens must be positive, got {max_think_tokens}")
 
     state = {
@@ -454,6 +473,12 @@ def make_reasoning_budget(
         "in_think": think_open is None,
         "ids": [],  # ids seen inside the current channel
         "since_check": 0,
+        # Trip latch: with a *dynamic* budget the ceiling can grow between
+        # steps (e.g. host cost dropped), which would otherwise "un-trip" a
+        # budget trip before the forced close token is actually emitted. Once
+        # tripped, keep forcing until a close token is actually seen — an
+        # in-channel re-open does NOT release it (only a real close does).
+        "tripped": False,
     }
 
     def reasoning_budget_processor(tokens, logits):
@@ -464,6 +489,7 @@ def make_reasoning_budget(
                 state["in_think"] = False
                 state["ids"] = []
                 state["since_check"] = 0
+                state["tripped"] = False
             elif think_open is not None and tid == think_open:
                 state["in_think"] = True
                 state["ids"] = []
@@ -475,7 +501,28 @@ def make_reasoning_budget(
             return logits
 
         ids = state["ids"]
-        trip = len(ids) >= max_think_tokens
+        if state["tripped"]:
+            # Latched: do not re-evaluate the budget (a dynamic callable is
+            # not invoked again — a sensor failing after the trip cannot
+            # crash the forced close).
+            trip = True
+        else:
+            if dynamic_budget:
+                try:
+                    budget = int(max_think_tokens())
+                except (TypeError, ValueError, OverflowError) as e:
+                    raise ValueError(
+                        "make_reasoning_budget: the max_think_tokens callable "
+                        f"must return a finite number ({e})"
+                    ) from e
+                if budget <= 0:
+                    raise ValueError(
+                        "make_reasoning_budget: the max_think_tokens callable "
+                        f"must return a positive budget, got {budget}"
+                    )
+            else:
+                budget = max_think_tokens
+            trip = len(ids) >= budget
         if not trip:
             state["since_check"] += len(new)
             if state["since_check"] >= check_every:
@@ -488,6 +535,7 @@ def make_reasoning_budget(
         if not trip:
             return logits
 
+        state["tripped"] = True
         # Force the channel-close token: -inf everywhere else so the sampler
         # (greedy or stochastic) must emit `think_close` next.
         forced = mx.full(logits.shape, -float("inf"), dtype=logits.dtype)
@@ -495,3 +543,144 @@ def make_reasoning_budget(
         return forced
 
     return reasoning_budget_processor
+
+
+# Base think-token budget by expected task size, and the difficulty scaling
+# hard reasoning earns. Used by ``make_cost_braked_budget``.
+REASONING_LEN_BASE = {"short": 512, "medium": 1280, "long": 3200}
+REASONING_DIFF_MULT = {"easy": 1.0, "medium": 1.25, "hard": 1.5}
+
+
+def make_cost_braked_budget(
+    prompt_len: Optional[int] = None,
+    difficulty: str = "medium",
+    *,
+    length_class: Optional[str] = None,
+    floor: int = 256,
+    ceil: int = 4096,
+    cost_brake: float = 0.35,
+    cost_fn: Optional[Callable[[], float]] = None,
+    brake_horizon: float = 120.0,
+    clock: Optional[Callable[[], float]] = None,
+    short_prompt: int = 256,
+    long_prompt: int = 2048,
+) -> Callable[[], int]:
+    """
+    Make a dynamic, cost-braked think-token budget for ``make_reasoning_budget``.
+
+    A static reasoning budget must be sized for the worst case; a dynamic one
+    can be thin by default and spend where the task earns it. This helper
+    builds the budget as::
+
+        budget = clamp(base(length) * difficulty_mult * brake(cost), floor, ceil)
+
+    * **base** comes from the task's expected size: an explicit
+      ``length_class`` (``"short"``/``"medium"``/``"long"``), or one derived
+      from ``prompt_len`` (below ``short_prompt`` tokens is short, at or above
+      ``long_prompt`` is long, otherwise medium).
+    * **difficulty** scales it — hard reasoning earns more room
+      (easy 1.0x / medium 1.25x / hard 1.5x).
+    * **brake** tightens the budget under live cost: with cost in ``[0, 1]``,
+      ``brake = 1 - cost_brake * cost``, so at full cost the budget shrinks by
+      ``cost_brake`` (default 35%). The cost signal is an injected zero-arg
+      callable so any host metric can drive it (load, memory, GPU
+      contention, ...); out-of-range values are clamped to ``[0, 1]`` and a
+      NaN cost raises a labeled ``ValueError``. The default is a wall-clock
+      brake: cost ramps 0 -> 1 over ``brake_horizon`` seconds from the first
+      evaluation, so long generations progressively tighten.
+    * **clamp** bounds it: a hard ``ceil`` is the anti-runaway guard (a loop
+      cannot burn a worst-case flat cap), and ``floor`` guarantees even short
+      tasks room to answer — the brake is discretionary, never below floor.
+
+    The returned zero-arg callable is re-evaluated at every generation step by
+    ``make_reasoning_budget``, so the brake is live, not sampled once.
+
+    Build one budget per generation: the default wall-clock brake anchors on
+    the first evaluation and never resets, so a callable reused across
+    generations starts the later ones already braked.
+
+    Args:
+        prompt_len (int, optional): Prompt length in tokens, used to derive
+            the length class when ``length_class`` is not given. ``None``
+            means medium. Default: ``None``.
+        difficulty (str): ``"easy"``, ``"medium"``, or ``"hard"``.
+            Default: ``"medium"``.
+        length_class (str, optional): Explicit ``"short"``/``"medium"``/
+            ``"long"`` override; takes precedence over ``prompt_len``.
+            Default: ``None``.
+        floor (int): Minimum budget; the brake never cuts below it.
+            Default: ``256``.
+        ceil (int): Hard maximum budget. Default: ``4096``.
+        cost_brake (float): Maximum fractional budget reduction at full cost,
+            in ``[0, 1]``. Default: ``0.35``.
+        cost_fn (callable, optional): Zero-arg callable returning the live
+            cost in ``[0, 1]`` (out-of-range values are clamped; NaN raises).
+            If ``None``, a wall-clock-elapsed brake is used. Default: ``None``.
+        brake_horizon (float): Seconds over which the default wall-clock cost
+            ramps from 0 to 1. Ignored when ``cost_fn`` is given.
+            Default: ``120.0``.
+        clock (callable, optional): Zero-arg monotonic time source for the
+            default wall-clock brake (for testing). Ignored when ``cost_fn``
+            is given. Default: ``time.monotonic``.
+        short_prompt (int): ``prompt_len`` below this is short. Default: ``256``.
+        long_prompt (int): ``prompt_len`` at or above this is long.
+            Default: ``2048``.
+
+    Returns:
+        Callable[[], int]: A zero-arg callable returning the current budget;
+        pass it as ``max_think_tokens`` to ``make_reasoning_budget``.
+    """
+    if floor < 1:
+        raise ValueError(f"floor must be positive, got {floor}")
+    if ceil < floor:
+        raise ValueError(f"ceil must be >= floor, got ceil={ceil}, floor={floor}")
+    if not (0 <= cost_brake <= 1):
+        raise ValueError(f"cost_brake must be in [0, 1], got {cost_brake}")
+    if difficulty not in REASONING_DIFF_MULT:
+        raise ValueError(
+            f"difficulty must be one of {sorted(REASONING_DIFF_MULT)}, got {difficulty!r}"
+        )
+    if short_prompt >= long_prompt:
+        raise ValueError(
+            f"short_prompt must be < long_prompt, got {short_prompt} >= {long_prompt}"
+        )
+    if prompt_len is not None and prompt_len < 0:
+        raise ValueError(f"prompt_len must be non-negative, got {prompt_len}")
+    if length_class is None:
+        if prompt_len is None:
+            length_class = "medium"
+        elif prompt_len < short_prompt:
+            length_class = "short"
+        elif prompt_len >= long_prompt:
+            length_class = "long"
+        else:
+            length_class = "medium"
+    elif length_class not in REASONING_LEN_BASE:
+        raise ValueError(
+            f"length_class must be one of {sorted(REASONING_LEN_BASE)}, got {length_class!r}"
+        )
+
+    base = REASONING_LEN_BASE[length_class] * REASONING_DIFF_MULT[difficulty]
+
+    if cost_fn is None:
+        if brake_horizon <= 0:
+            raise ValueError(f"brake_horizon must be positive, got {brake_horizon}")
+        read_clock = clock if clock is not None else time.monotonic
+        start = None
+
+        def cost_fn():
+            nonlocal start
+            now = read_clock()
+            if start is None:
+                start = now
+            return (now - start) / brake_horizon
+
+    def cost_braked_budget():
+        cost = float(cost_fn())
+        if math.isnan(cost):
+            raise ValueError("make_cost_braked_budget: cost_fn returned NaN")
+        cost = max(0.0, min(1.0, cost))
+        brake = 1.0 - cost_brake * cost
+        return max(floor, min(ceil, int(base * brake)))
+
+    return cost_braked_budget
