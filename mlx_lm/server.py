@@ -399,12 +399,35 @@ class ModelProvider:
 def _persistent_model_key(model_key) -> str:
     """Build the mandatory stable-string identity for persisted KV.
 
-    Hugging Face cache paths already contain immutable snapshot revisions.
-    For local paths, include a deterministic manifest of weight/config file
-    names, sizes, and nanosecond mtimes so an ordinary weight or adapter swap
-    changes identity.  Callers that mutate bytes while preserving all three
-    violate the same explicit model-key contract documented by prefix_forks.
+    Loader-resolved Hugging Face cache paths contain an immutable
+    ``snapshots/<revision>`` component, so their trusted revision and resolved
+    path identify the loaded bytes without reopening multi-gigabyte payloads.
+    Ordinary local paths have no immutable revision authority and therefore
+    hash every file byte; same-size/mtime-preserving weight or adapter swaps
+    still change identity.
     """
+
+    def hf_snapshot_identity(path):
+        parts = path.parts
+        for index in range(len(parts) - 2, -1, -1):
+            if parts[index] != "snapshots" or index + 1 >= len(parts):
+                continue
+            revision = parts[index + 1]
+            if len(revision) < 7 or any(
+                char not in "0123456789abcdef" for char in revision.lower()
+            ):
+                continue
+            snapshot_root = Path(*parts[: index + 2])
+            try:
+                subpath = path.relative_to(snapshot_root)
+            except ValueError:
+                continue
+            return {
+                "hf_snapshot_path": str(snapshot_root),
+                "revision": revision,
+                "subpath": str(subpath),
+            }
+        return None
 
     def identify(value):
         if value is None:
@@ -416,6 +439,9 @@ def _persistent_model_key(model_key) -> str:
                 "persistent prompt caching is disabled"
             )
         path = path.resolve()
+        hf_identity = hf_snapshot_identity(path)
+        if hf_identity is not None:
+            return hf_identity
         files = (
             [path]
             if path.is_file()

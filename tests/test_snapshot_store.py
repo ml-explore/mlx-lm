@@ -511,6 +511,27 @@ class TestPersistentServerBridge(unittest.TestCase):
         second = _persistent_model_key((str(self.model_dir), None, None))
         self.assertNotEqual(first, second)
 
+    def test_hf_snapshot_identity_opens_no_payload_and_tracks_revision(self):
+        repo = Path(self.temp.name) / "models--org--model" / "snapshots"
+        revision_a = "a" * 40
+        revision_b = "b" * 40
+        snapshot_a = repo / revision_a
+        snapshot_b = repo / revision_b
+        snapshot_a.mkdir(parents=True)
+        snapshot_b.mkdir()
+        (snapshot_a / "weights.safetensors").write_bytes(b"A" * 4096)
+        (snapshot_b / "weights.safetensors").write_bytes(b"A" * 4096)
+        with patch.object(
+            Path,
+            "open",
+            side_effect=AssertionError("HF payload must not be opened for identity"),
+        ):
+            identity_a = _persistent_model_key((str(snapshot_a), None, None))
+            identity_b = _persistent_model_key((str(snapshot_b), None, None))
+        self.assertNotEqual(identity_a, identity_b)
+        self.assertIn(revision_a, identity_a)
+        self.assertIn(revision_b, identity_b)
+
     def test_unresolved_hf_identity_fails_closed(self):
         with self.assertRaises(ValueError):
             _persistent_model_key(("org/not-loader-resolved", None, None))
