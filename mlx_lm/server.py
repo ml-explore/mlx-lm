@@ -336,9 +336,18 @@ class CacheEvictor:
         """Ask the generation thread to evict now. Called from HTTP handler
         threads; the eviction itself runs in :meth:`step` on the generation
         thread. Returns ``{"evicted": False, ...}`` without evicting if the
-        server is busy (or stays busy past ``timeout``)."""
+        server is busy (or stays busy past ``timeout``).
+
+        The queued message carries its deadline: if the generation thread
+        only gets to it after ``timeout`` has expired (e.g. it was blocked in
+        a long non-batched generation), the caller has already been answered
+        ``evicted: false``, so :meth:`step` discards the stale message
+        without servicing it — an eviction must never run after the client
+        was told it didn't.
+        """
         response_queue = Queue()
-        self._requests.put((response_queue, bool(clear_prompt_cache)))
+        deadline = self._clock() + timeout
+        self._requests.put((response_queue, bool(clear_prompt_cache), deadline))
         try:
             result = response_queue.get(timeout=timeout)
         except QueueEmpty:
@@ -364,9 +373,16 @@ class CacheEvictor:
         # deferring: an eviction must never run alongside active requests.
         while True:
             try:
-                response_queue, clear_prompt_cache = self._requests.get_nowait()
+                response_queue, clear_prompt_cache, deadline = (
+                    self._requests.get_nowait()
+                )
             except QueueEmpty:
                 break
+            if self._clock() >= deadline:
+                # The handler timed out and already answered `evicted: false`;
+                # never service (or reply to) a stale request, otherwise the
+                # eviction would run after the client was told it didn't.
+                continue
             if busy:
                 response_queue.put(None)
             else:
@@ -1737,7 +1753,26 @@ class APIHandler(BaseHTTPRequestHandler):
         ``{"evicted": false}`` if the server is busy — evictions only run
         when no requests are queued or in flight.
         """
-        content_length = int(self.headers.get("Content-Length") or 0)
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            # Mirror the completion endpoints: chunked or length-less bodies
+            # are not read, and silently ignoring one could drop a
+            # `clear_prompt_cache` the client asked for.
+            self._set_completion_headers(411)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Content-Length header is required"}).encode()
+            )
+            return
+        try:
+            content_length = int(content_length)
+        except ValueError:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Invalid Content-Length header"}).encode()
+            )
+            return
         body = {}
         if content_length > 0:
             try:

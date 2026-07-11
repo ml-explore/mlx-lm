@@ -3,6 +3,7 @@
 import http
 import io
 import json
+import socket
 import threading
 import time
 import unittest
@@ -878,6 +879,44 @@ class TestCacheEvictor(unittest.TestCase):
         self.assertEqual(len(prompt_cache), 1)
         self.assertEqual(prompt_cache.nbytes, 4)
 
+    def test_timed_out_evict_request_is_discarded(self):
+        # Regression: if the generation thread only reaches a queued evict
+        # request after the handler's timeout expired (e.g. it was blocked in
+        # a long non-batched generation), the client was already answered
+        # `evicted: false` — servicing the stale message anyway would be a
+        # ghost eviction the client was told did not happen.
+        prompt_cache = LRUPromptCache()
+        prompt_cache.insert_cache(("test", None, None), [1, 2], [MockCache("abcd")])
+        evictor, clock = self._make_evictor(idle_s=0.0, prompt_cache=prompt_cache)
+
+        with mock.patch.object(mx, "clear_cache") as clear_cache:
+            # No step() runs while the handler waits: the "loop" is blocked.
+            thread, results = self._request_evict_async(
+                evictor, clear_prompt_cache=True, timeout=0.05
+            )
+            thread.join()
+            result = results[0]
+            self.assertFalse(result["evicted"])
+            self.assertEqual(result["reason"], "timeout")
+
+            # The loop unblocks after the deadline: the stale message must be
+            # discarded, not serviced.
+            clock.advance(1.0)
+            evictor.step(busy=False)
+            clear_cache.assert_not_called()
+            self.assertEqual(len(prompt_cache), 1)
+            self.assertEqual(prompt_cache.nbytes, 4)
+            self.assertTrue(evictor._requests.empty())
+
+            # A fresh request afterwards works normally.
+            thread, results = self._request_evict_async(
+                evictor, clear_prompt_cache=True
+            )
+            evictor.step(busy=False)
+            thread.join()
+            self.assertTrue(results[0]["evicted"])
+            self.assertEqual(clear_cache.call_count, 1)
+
 
 class TestIdleEviction(unittest.TestCase):
     """Integration tests: eviction wired into the server's generation loop."""
@@ -888,7 +927,9 @@ class TestIdleEviction(unittest.TestCase):
         provider.cli_args.cache_idle_evict_s = 0.25
         cls.response_generator = ResponseGenerator(provider, LRUPromptCache())
         cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
+        # ThreadingHTTPServer (as in production) so that /v1/cache/evict can
+        # be exercised while a completion request is streaming.
+        cls.httpd = http.server.ThreadingHTTPServer(
             cls.server_address,
             lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
         )
@@ -970,6 +1011,86 @@ class TestIdleEviction(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         response = requests.post(url, json=["not", "a", "dict"])
         self.assertEqual(response.status_code, 400)
+
+    def _raw_status(self, raw_request: bytes) -> bytes:
+        """Send a raw HTTP request and return the response status line."""
+        with socket.create_connection(("localhost", self.port), timeout=5) as sock:
+            sock.sendall(raw_request)
+            sock.settimeout(5)
+            data = b""
+            while b"\r\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        return data.split(b"\r\n", 1)[0]
+
+    def test_evict_endpoint_invalid_content_length(self):
+        # A malformed Content-Length must get a 400, not a connection reset
+        status = self._raw_status(
+            b"POST /v1/cache/evict HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: abc\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        self.assertIn(b" 400 ", status + b" ")
+
+    def test_evict_endpoint_requires_content_length(self):
+        # A chunked (length-less) body is never read, so silently treating it
+        # as empty would drop a `clear_prompt_cache` the client asked for:
+        # require Content-Length like the completion endpoints do (411).
+        status = self._raw_status(
+            b"POST /v1/cache/evict HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n"
+            b'1c\r\n{"clear_prompt_cache": true}\r\n0\r\n\r\n'
+        )
+        self.assertIn(b" 411 ", status + b" ")
+
+    def test_cache_endpoints_wrong_method(self):
+        response = requests.get(f"http://localhost:{self.port}/v1/cache/evict")
+        self.assertEqual(response.status_code, 404)
+        response = requests.post(f"http://localhost:{self.port}/v1/cache/stats")
+        self.assertEqual(response.status_code, 404)
+
+    def test_evict_endpoint_busy_refusal_over_http(self):
+        # While a batched request is generating, the endpoint must refuse
+        # immediately with `evicted: false` and touch nothing.
+        completion_url = f"http://localhost:{self.port}/v1/completions"
+        evict_url = f"http://localhost:{self.port}/v1/cache/evict"
+        started = threading.Event()
+
+        def long_request():
+            with requests.post(
+                completion_url,
+                json={
+                    "model": "default_model",
+                    "prompt": "Once upon a time",
+                    "max_tokens": 1000,
+                    "stream": True,
+                },
+                stream=True,
+            ) as response:
+                # Streaming headers are sent only after the request has been
+                # inserted into the batch, so the server is busy from here
+                # until the (long) generation finishes.
+                started.set()
+                for _ in response.iter_content(chunk_size=None):
+                    pass
+
+        thread = threading.Thread(target=long_request)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(timeout=15))
+            response = requests.post(evict_url, json={"clear_prompt_cache": True})
+            body = response.json()
+        finally:
+            thread.join()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(body["evicted"])
+        self.assertEqual(body["reason"], "busy")
 
     def test_cache_stats_endpoint(self):
         url = f"http://localhost:{self.port}/v1/cache/stats"
