@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import contextlib
@@ -186,6 +186,18 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--kv-key-bits",
+        type=int,
+        help="Number of bits for key-cache quantization. Overrides --kv-bits.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=int,
+        help="Number of bits for value-cache quantization. Overrides --kv-bits.",
+        default=None,
+    )
+    parser.add_argument(
         "--kv-group-size",
         type=int,
         help="Group size for KV cache quantization.",
@@ -287,12 +299,38 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
-    if kv_bits is None:
+def _resolve_kv_bits(kv_bits, key_bits, value_bits):
+    if kv_bits is None and key_bits is None and value_bits is None:
+        return None, None
+    key_bits = kv_bits if key_bits is None else key_bits
+    value_bits = kv_bits if value_bits is None else value_bits
+    if key_bits is None or value_bits is None:
+        raise ValueError(
+            "Both key and value bits are required; set --kv-bits as a fallback "
+            "or provide both --kv-key-bits and --kv-value-bits."
+        )
+    return key_bits, value_bits
+
+
+def maybe_quantize_kv_cache(
+    prompt_cache,
+    quantized_kv_start,
+    kv_group_size,
+    kv_bits,
+    kv_key_bits=None,
+    kv_value_bits=None,
+):
+    key_bits, value_bits = _resolve_kv_bits(kv_bits, kv_key_bits, kv_value_bits)
+    if key_bits is None:
         return
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+            prompt_cache[e] = c.to_quantized(
+                group_size=kv_group_size,
+                bits=kv_bits if kv_bits is not None else key_bits,
+                key_bits=key_bits,
+                value_bits=value_bits,
+            )
 
 
 def generate_step(
@@ -308,6 +346,8 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_key_bits: Optional[int] = None,
+    kv_value_bits: Optional[int] = None,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -331,6 +371,10 @@ def generate_step(
         prefill_step_size (int): Step size for processing the prompt.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
+        kv_key_bits (int, optional): Number of bits for key-cache quantization.
+          Overrides ``kv_bits`` for keys. Default: ``None``.
+        kv_value_bits (int, optional): Number of bits for value-cache quantization.
+          Overrides ``kv_bits`` for values. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
@@ -372,6 +416,8 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -475,6 +521,8 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_key_bits: Optional[int] = None,
+    kv_value_bits: Optional[int] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -497,6 +545,10 @@ def speculative_generate_step(
         prefill_step_size (int): Step size for processing the prompt.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
+        kv_key_bits (int, optional): Number of bits for key-cache quantization.
+          Overrides ``kv_bits`` for keys. Default: ``None``.
+        kv_value_bits (int, optional): Number of bits for value-cache quantization.
+          Overrides ``kv_bits`` for values. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
@@ -530,6 +582,8 @@ def speculative_generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
     )
 
     def _process_and_sample(tokens, logits):
@@ -2075,9 +2129,16 @@ def main():
             return_metadata=True,
         )
         if isinstance(prompt_cache[0], QuantizedKVCache):
-            if args.kv_bits is not None and args.kv_bits != prompt_cache[0].bits:
+            key_bits, value_bits = _resolve_kv_bits(
+                args.kv_bits, args.kv_key_bits, args.kv_value_bits
+            )
+            if key_bits is not None and (
+                key_bits != prompt_cache[0].key_bits
+                or value_bits != prompt_cache[0].value_bits
+            ):
                 raise ValueError(
-                    "--kv-bits does not match the kv cache loaded from --prompt-cache-file."
+                    "KV quantization bits do not match the cache loaded from "
+                    "--prompt-cache-file."
                 )
             if args.kv_group_size != prompt_cache[0].group_size:
                 raise ValueError(
@@ -2179,6 +2240,8 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        kv_key_bits=args.kv_key_bits,
+        kv_value_bits=args.kv_value_bits,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )

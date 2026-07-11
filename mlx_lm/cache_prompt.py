@@ -1,4 +1,4 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2024-2026 Apple Inc.
 
 import argparse
 import json
@@ -62,6 +62,18 @@ def setup_arg_parser():
         type=int,
         help="Number of bits for KV cache quantization. "
         "Defaults to no quantization.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-key-bits",
+        type=int,
+        help="Number of bits for key-cache quantization. Overrides --kv-bits.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=int,
+        help="Number of bits for value-cache quantization. Overrides --kv-bits.",
         default=None,
     )
     parser.add_argument(
@@ -132,6 +144,8 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        kv_key_bits=args.kv_key_bits,
+        kv_value_bits=args.kv_value_bits,
         prompt_progress_callback=callback,
     ):
         pass

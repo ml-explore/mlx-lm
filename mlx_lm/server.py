@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import json
@@ -33,6 +33,7 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     StopSequenceMatcher,
     TextStateMachine,
@@ -353,6 +354,16 @@ class ModelProvider:
         is_batchable = draft_model is None
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
+        )
+        # QuantizedKVCache does not implement batched merge/extract. Keep
+        # quantized-cache serving on the supported sequential generation path.
+        is_batchable = is_batchable and all(
+            bits is None
+            for bits in (
+                getattr(self.cli_args, "kv_bits", None),
+                getattr(self.cli_args, "kv_key_bits", None),
+                getattr(self.cli_args, "kv_value_bits", None),
+            )
         )
 
         # Update the member variables
@@ -934,6 +945,15 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=getattr(self.cli_args, "kv_bits", None),
+                kv_key_bits=getattr(self.cli_args, "kv_key_bits", None),
+                kv_value_bits=getattr(self.cli_args, "kv_value_bits", None),
+                kv_group_size=getattr(self.cli_args, "kv_group_size", 64),
+                quantized_kv_start=getattr(
+                    self.cli_args,
+                    "quantized_kv_start",
+                    DEFAULT_QUANTIZED_KV_START,
+                ),
             ):
                 finish_reason = gen.finish_reason
 
@@ -1717,7 +1737,7 @@ def run(
         response_generator.join()
 
 
-def main():
+def setup_arg_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -1849,11 +1869,45 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--kv-bits",
+        type=int,
+        help="Number of bits for KV cache quantization. Defaults to no quantization.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-key-bits",
+        type=int,
+        help="Number of bits for key-cache quantization. Overrides --kv-bits.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=int,
+        help="Number of bits for value-cache quantization. Overrides --kv-bits.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        help="Group size for KV cache quantization.",
+        default=64,
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        help="When KV bits are set, start quantizing the cache from this step.",
+        default=DEFAULT_QUANTIZED_KV_START,
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = setup_arg_parser().parse_args()
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)

@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import copy
 from collections import deque
@@ -232,12 +232,31 @@ class ConcatenateKVCache(_BaseCache):
 class QuantizedKVCache(_BaseCache):
     step = 256
 
-    def __init__(self, group_size: int = 64, bits: int = 8):
+    def __init__(
+        self,
+        group_size: int = 64,
+        bits: int = 8,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+    ):
+        supported_bits = {2, 3, 4, 5, 6, 8}
+        if key_bits is not None and key_bits not in supported_bits:
+            raise ValueError(f"Unsupported key bits: {key_bits}")
+        if value_bits is not None and value_bits not in supported_bits:
+            raise ValueError(f"Unsupported value bits: {value_bits}")
+        if bits not in supported_bits:
+            raise ValueError(f"Unsupported bits: {bits}")
+        if group_size not in {32, 64, 128}:
+            raise ValueError(f"Unsupported group size: {group_size}")
         self.keys = None
         self.values = None
         self.offset = 0
         self.group_size = group_size
-        self.bits = bits
+        self.key_bits = bits if key_bits is None else key_bits
+        self.value_bits = bits if value_bits is None else value_bits
+        # ``bits`` is retained for callers inspecting legacy symmetric caches.
+        self.bits = self.key_bits if self.key_bits == self.value_bits else None
 
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
@@ -245,15 +264,15 @@ class QuantizedKVCache(_BaseCache):
         prev = self.offset
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
-            el_per_int = 8 * mx.uint32.size // self.bits
             new_steps = (self.step + num_steps - 1) // self.step * self.step
             shape = (B, n_kv_heads, new_steps)
 
-            def init_quant(dim):
+            def init_quant(dim, bits, dtype):
+                el_per_int = 8 * mx.uint32.size // bits
                 return (
                     mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
-                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
-                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // self.group_size), dtype=dtype),
+                    mx.zeros((*shape, dim // self.group_size), dtype=dtype),
                 )
 
             def expand_quant(x):
@@ -270,12 +289,13 @@ class QuantizedKVCache(_BaseCache):
                     expand_quant, (self.keys, self.values)
                 )
             else:
-                self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+                self.keys = init_quant(k_head_dim, self.key_bits, keys.dtype)
+                self.values = init_quant(v_head_dim, self.value_bits, values.dtype)
 
         self.offset += num_steps
 
-        keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
-        values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        keys = mx.quantize(keys, group_size=self.group_size, bits=self.key_bits)
+        values = mx.quantize(values, group_size=self.group_size, bits=self.value_bits)
         for i in range(len(self.keys)):
             self.keys[i][..., prev : self.offset, :] = keys[i]
             self.values[i][..., prev : self.offset, :] = values[i]
@@ -297,11 +317,29 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.group_size, self.bits)))
+        return tuple(
+            map(
+                str,
+                (2, self.offset, self.group_size, self.key_bits, self.value_bits),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset, self.group_size, self.bits = map(int, v)
+        if len(v) == 3:
+            # Legacy symmetric cache metadata: offset, group_size, bits.
+            self.offset, self.group_size, bits = map(int, v)
+            self.key_bits = self.value_bits = self.bits = bits
+            return
+
+        version, self.offset, self.group_size, self.key_bits, self.value_bits = map(
+            int, v
+        )
+        if version != 2:
+            raise ValueError(
+                f"Unsupported QuantizedKVCache metadata version: {version}"
+            )
+        self.bits = self.key_bits if self.key_bits == self.value_bits else None
 
     def is_trimmable(self):
         return True
@@ -380,13 +418,27 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
-        quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
+    def to_quantized(
+        self,
+        group_size: int = 64,
+        bits: int = 4,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+    ) -> QuantizedKVCache:
+        quant_cache = QuantizedKVCache(
+            group_size=group_size,
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+        )
         quant_cache.offset = self.offset
         if self.keys is not None:
-            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+            quant_cache.keys = mx.quantize(
+                self.keys, group_size=group_size, bits=quant_cache.key_bits
+            )
             quant_cache.values = mx.quantize(
-                self.values, group_size=group_size, bits=bits
+                self.values, group_size=group_size, bits=quant_cache.value_bits
             )
         return quant_cache
 
