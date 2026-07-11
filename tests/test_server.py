@@ -887,7 +887,7 @@ class TestCacheEvictor(unittest.TestCase):
         # ghost eviction the client was told did not happen.
         prompt_cache = LRUPromptCache()
         prompt_cache.insert_cache(("test", None, None), [1, 2], [MockCache("abcd")])
-        evictor, clock = self._make_evictor(idle_s=0.0, prompt_cache=prompt_cache)
+        evictor, _ = self._make_evictor(idle_s=0.0, prompt_cache=prompt_cache)
 
         with mock.patch.object(mx, "clear_cache") as clear_cache:
             # No step() runs while the handler waits: the "loop" is blocked.
@@ -899,9 +899,8 @@ class TestCacheEvictor(unittest.TestCase):
             self.assertFalse(result["evicted"])
             self.assertEqual(result["reason"], "timeout")
 
-            # The loop unblocks after the deadline: the stale message must be
+            # The loop unblocks later: the abandoned message must be
             # discarded, not serviced.
-            clock.advance(1.0)
             evictor.step(busy=False)
             clear_cache.assert_not_called()
             self.assertEqual(len(prompt_cache), 1)
@@ -916,6 +915,49 @@ class TestCacheEvictor(unittest.TestCase):
             thread.join()
             self.assertTrue(results[0]["evicted"])
             self.assertEqual(clear_cache.call_count, 1)
+
+    def test_boundary_race_exactly_one_side_wins(self):
+        # Regression (real clock): a slow eviction that starts right at the
+        # handler's timeout boundary must never produce `evicted: false`
+        # while the eviction actually ran. The claim/abandon handshake makes
+        # exactly one side win: either the loop claims first and the handler
+        # waits out the reply (`evicted: true`), or the handler abandons
+        # first and the eviction does not run at all.
+        def run_race(step_delay, timeout):
+            prompt_cache = LRUPromptCache()
+            prompt_cache.insert_cache(("test", None, None), [1, 2], [MockCache("abcd")])
+            evictor = CacheEvictor(prompt_cache, idle_s=0.0)  # real clock
+            with mock.patch.object(
+                mx, "clear_cache", side_effect=lambda: time.sleep(0.15)
+            ) as clear_cache:
+                thread, results = self._request_evict_async(
+                    evictor, clear_prompt_cache=True, timeout=timeout
+                )
+                time.sleep(step_delay)
+                evictor.step(busy=False)
+                thread.join()
+                result = results[0]
+                if result["evicted"]:
+                    # Loop won: the handler waited out the reply
+                    self.assertEqual(clear_cache.call_count, 1)
+                    self.assertEqual(len(prompt_cache), 0)
+                else:
+                    # Handler won: the eviction must not have run at all
+                    self.assertEqual(result["reason"], "timeout")
+                    clear_cache.assert_not_called()
+                    self.assertEqual(len(prompt_cache), 1)
+                return result["evicted"]
+
+        # Loop reaches the message just before the deadline; the eviction
+        # (0.15 s) finishes well after it. The claim must force the handler
+        # to wait and report it truthfully.
+        self.assertTrue(run_race(step_delay=0.25, timeout=0.3))
+        # Loop reaches the message after the deadline: handler abandoned it.
+        self.assertFalse(run_race(step_delay=0.3, timeout=0.1))
+        # Genuinely racy step timings: either side may win, but the outcome
+        # asserted inside run_race must always be self-consistent.
+        for step_delay in (0.08, 0.1, 0.12):
+            run_race(step_delay=step_delay, timeout=0.1)
 
 
 class TestIdleEviction(unittest.TestCase):

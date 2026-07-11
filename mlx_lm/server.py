@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -271,6 +271,44 @@ class TimeBudget:
         raise StopIteration()
 
 
+class _EvictMessage:
+    """One on-demand eviction request with an atomic claim/abandon handshake.
+
+    Exactly one side wins each message: the generation loop must :meth:`claim`
+    it before servicing, and a timed-out HTTP handler must :meth:`abandon` it
+    before answering ``evicted: false``. If the loop claims first, the handler
+    keeps waiting for the (guaranteed) reply and reports the eviction
+    truthfully; if the handler abandons first, the loop discards the message
+    unserviced. There is no window in which an eviction runs after the client
+    was told it didn't.
+    """
+
+    def __init__(self, clear_prompt_cache: bool):
+        self.clear_prompt_cache = clear_prompt_cache
+        self.response_queue = Queue()
+        self._lock = Lock()
+        self._state = "pending"
+
+    def claim(self) -> bool:
+        """Generation-loop side: atomically take ownership before servicing.
+        Returns False if the handler already abandoned the message."""
+        with self._lock:
+            if self._state == "pending":
+                self._state = "claimed"
+                return True
+            return False
+
+    def abandon(self) -> bool:
+        """Handler side: atomically give up after a timeout, before answering
+        ``evicted: false``. Returns False if the loop already claimed the
+        message (a reply is coming and must be reported instead)."""
+        with self._lock:
+            if self._state == "pending":
+                self._state = "abandoned"
+                return True
+            return False
+
+
 class CacheEvictor:
     """Release MLX's pooled buffer memory when the server is idle.
 
@@ -338,25 +376,31 @@ class CacheEvictor:
         thread. Returns ``{"evicted": False, ...}`` without evicting if the
         server is busy (or stays busy past ``timeout``).
 
-        The queued message carries its deadline: if the generation thread
-        only gets to it after ``timeout`` has expired (e.g. it was blocked in
-        a long non-batched generation), the caller has already been answered
-        ``evicted: false``, so :meth:`step` discards the stale message
-        without servicing it — an eviction must never run after the client
-        was told it didn't.
+        The claim/abandon handshake on the message (see
+        :class:`_EvictMessage`) makes the answer exact even at the timeout
+        boundary: on timeout we atomically abandon the message; if the loop
+        already claimed it (it is servicing right now), we instead wait out
+        the reply and report it — never ``evicted: false`` while an eviction
+        actually ran.
         """
-        response_queue = Queue()
-        deadline = self._clock() + timeout
-        self._requests.put((response_queue, bool(clear_prompt_cache), deadline))
+        message = _EvictMessage(bool(clear_prompt_cache))
+        self._requests.put(message)
         try:
-            result = response_queue.get(timeout=timeout)
+            result = message.response_queue.get(timeout=timeout)
         except QueueEmpty:
-            result = None
-            reason = "timeout"
-        else:
-            reason = "busy"
+            if message.abandon():
+                # We won: the loop will discard the message unserviced.
+                return {"evicted": False, "reason": "timeout", "stats": self.stats()}
+            # The loop claimed the message right at the boundary and a reply
+            # is guaranteed (claim -> put, see step()). Wait it out; the long
+            # backstop only guards against the generation thread dying
+            # mid-service.
+            try:
+                result = message.response_queue.get(timeout=60.0)
+            except QueueEmpty:  # pragma: no cover
+                return {"evicted": False, "reason": "timeout", "stats": self.stats()}
         if result is None:
-            return {"evicted": False, "reason": reason, "stats": self.stats()}
+            return {"evicted": False, "reason": "busy", "stats": self.stats()}
         return result
 
     def step(self, busy: bool):
@@ -373,20 +417,23 @@ class CacheEvictor:
         # deferring: an eviction must never run alongside active requests.
         while True:
             try:
-                response_queue, clear_prompt_cache, deadline = (
-                    self._requests.get_nowait()
-                )
+                message = self._requests.get_nowait()
             except QueueEmpty:
                 break
-            if self._clock() >= deadline:
-                # The handler timed out and already answered `evicted: false`;
-                # never service (or reply to) a stale request, otherwise the
+            if not message.claim():
+                # The handler timed out and abandoned the message (it already
+                # answered `evicted: false`): never service it, otherwise the
                 # eviction would run after the client was told it didn't.
                 continue
-            if busy:
-                response_queue.put(None)
-            else:
-                response_queue.put(self._evict(clear_prompt_cache, "on demand"))
+            # A claimed message is always replied to.
+            result = None
+            if not busy:
+                try:
+                    result = self._evict(message.clear_prompt_cache, "on demand")
+                except Exception:
+                    logging.exception("Cache eviction failed")
+                    result = {"evicted": False, "reason": "error"}
+            message.response_queue.put(result)
 
         # Idle timer: evict once per idle period after `idle_s` seconds.
         if (
