@@ -177,10 +177,57 @@ Padding and quantization metadata can outweigh the packed-weight savings for
 small ranks. The conversion command rejects adapters whose parameter memory
 would increase unless `--allow-larger` is supplied.
 
-The generic benchmark can be run from a source checkout with:
+For mixed-precision adapters, select per-layer bit widths from representative
+layer inputs, then quantize only the layers that satisfy both the numerical
+error and memory-reduction thresholds:
+
+```python
+from mlx_lm.tuner import select_lora_layer_bits
+
+layer_bits, report = select_lora_layer_bits(
+    model,
+    layer_inputs,
+    candidate_bits=(4, 5, 6, 8),
+    max_relative_l2=0.01,
+    min_cosine=0.9999,
+)
+quantize_lora_layers(model, layer_bits=layer_bits)
+```
+
+Layers omitted from `layer_bits` stay in their original floating-point
+precision. Saved adapters preserve this per-layer precision configuration.
+
+Quantized adapters with the same layer and quantization configuration can be
+loaded into a shared adapter bank without loading or duplicating the base
+model:
+
+```python
+from mlx_lm.tuner import load_quantized_lora_adapter_bank
+
+bank = load_quantized_lora_adapter_bank(
+    {
+        "adapter-a": "<path_to_quantized_adapter_a>",
+        "adapter-b": "<path_to_quantized_adapter_b>",
+    }
+)
+pack = bank.packs["model.layers.0.self_attn.q_proj"]
+
+# One adapter for all token rows in a request.
+delta = pack.delta_for_adapter(x, bank.adapter_index("adapter-a"))
+
+# A different adapter index for each flattened token row.
+delta = pack.delta(x, adapter_indices)
+```
+
+The mixed-row path uses `mx.gather_qmm`; packed weights remain quantized for
+both request-level switching and token-level routing. Adapter banks currently
+require affine quantization and a common per-layer bit configuration.
+
+The generic benchmarks can be run from a source checkout with:
 
 ```shell
 PYTHONPATH=. python benchmarks/quantized_lora.py
+PYTHONPATH=. python benchmarks/quantized_lora_bank.py
 ```
 
 ## Fuse

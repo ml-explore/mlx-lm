@@ -33,6 +33,11 @@ def configure_parser():
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--ranks", type=comma_separated_ints, default=(8, 16, 32, 64))
     parser.add_argument("--bits", type=comma_separated_ints, default=(8, 6, 5, 4))
+    parser.add_argument(
+        "--adapter-counts",
+        type=comma_separated_ints,
+        default=(1, 8, 32, 64),
+    )
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--rank-group-size", type=int, default=32)
     parser.add_argument("--base-bits", type=int, choices=(0, 4, 8), default=8)
@@ -160,6 +165,9 @@ def benchmark_rank(args, rank, dtype):
             "layer_latency_ratio_vs_fp": (
                 layer_latency["median_ms"] / fp_layer_latency["median_ms"]
             ),
+            "multi_adapter_bytes": {
+                str(count): count * size for count in args.adapter_counts
+            },
         }
     return result
 
@@ -209,6 +217,7 @@ def main():
             "tokens": args.tokens,
             "ranks": args.ranks,
             "bits": args.bits,
+            "adapter_counts": args.adapter_counts,
             "group_size": args.group_size,
             "rank_group_size": args.rank_group_size,
             "base_bits": args.base_bits,

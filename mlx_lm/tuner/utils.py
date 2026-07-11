@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import types
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -222,6 +222,105 @@ def quantize_lora_layers(
     if replacements:
         model.update_modules(tree_unflatten(replacements))
     return model
+
+
+def select_lora_layer_bits(
+    model: nn.Module,
+    layer_inputs: Dict[str, mx.array],
+    candidate_bits: Sequence[int] = (4, 5, 6, 8),
+    group_size: int = 64,
+    rank_group_size: int = 32,
+    mode: str = "affine",
+    max_relative_l2: float = 0.01,
+    min_cosine: float = 0.9999,
+    min_memory_reduction: float = 0.0,
+) -> Tuple[Dict[str, int], Dict[str, Dict]]:
+    """Select the lowest acceptable precision from real layer activations.
+
+    Layers that do not satisfy both error thresholds remain unquantized and
+    are omitted from the returned bit mapping.
+    """
+    candidate_bits = tuple(sorted(set(candidate_bits)))
+    if not candidate_bits:
+        raise ValueError("candidate_bits must not be empty")
+
+    lora_layers = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, LoRALinear)
+    }
+    missing = sorted(set(layer_inputs) - set(lora_layers))
+    if missing:
+        raise ValueError(
+            "Calibration inputs reference missing LoRA linear layers: "
+            + ", ".join(missing)
+        )
+
+    selected = {}
+    report = {}
+    for name, x in layer_inputs.items():
+        layer = lora_layers[name]
+        if x.shape[-1] != layer.lora_a.shape[0]:
+            raise ValueError(
+                f"Calibration input for {name} has dimension {x.shape[-1]}, "
+                f"expected {layer.lora_a.shape[0]}"
+            )
+
+        reference = ((x @ layer.lora_a) @ layer.lora_b).astype(mx.float32)
+        mx.eval(reference)
+        reference_norm = float(mx.linalg.norm(reference))
+        float_bytes = layer.lora_a.nbytes + layer.lora_b.nbytes
+        candidates = {}
+        selected_bits = None
+        for bits in candidate_bits:
+            quantized = layer.to_quantized(
+                group_size=group_size,
+                bits=bits,
+                rank_group_size=rank_group_size,
+                mode=mode,
+            )
+            candidate = quantized.lora_delta(x).astype(mx.float32)
+            difference = candidate - reference
+            mx.eval(candidate, difference)
+            candidate_norm = float(mx.linalg.norm(candidate))
+            difference_norm = float(mx.linalg.norm(difference))
+            quantized_bytes = sum(
+                value.nbytes
+                for parameter_name, value in tree_flatten(quantized.parameters())
+                if parameter_name.startswith("lora_")
+            )
+            memory_reduction = 1 - quantized_bytes / float_bytes
+            if reference_norm == 0.0:
+                relative_l2 = 0.0 if difference_norm == 0.0 else float("inf")
+                cosine = 1.0 if candidate_norm == 0.0 else 0.0
+            else:
+                relative_l2 = difference_norm / reference_norm
+                cosine = float(
+                    mx.sum(reference * candidate)
+                    / (mx.linalg.norm(reference) * mx.linalg.norm(candidate) + 1e-12)
+                )
+            candidates[str(bits)] = {
+                "relative_l2": relative_l2,
+                "cosine": cosine,
+                "adapter_bytes": quantized_bytes,
+                "memory_reduction": memory_reduction,
+            }
+            if (
+                selected_bits is None
+                and relative_l2 <= max_relative_l2
+                and cosine >= min_cosine
+                and memory_reduction >= min_memory_reduction
+            ):
+                selected_bits = bits
+
+        if selected_bits is not None:
+            selected[name] = selected_bits
+        report[name] = {
+            "selected_bits": selected_bits,
+            "float_adapter_bytes": float_bytes,
+            "candidates": candidates,
+        }
+    return selected, report
 
 
 def save_quantized_adapter(
