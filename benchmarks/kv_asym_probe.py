@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import platform
+import shlex
 import statistics
 import subprocess
 import sys
@@ -255,7 +256,8 @@ def main():
             "platform": platform.platform(),
             "device": mx.device_info(),
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "command": " ".join(sys.argv),
+            "command": shlex.join([sys.executable, *sys.argv]),
+            "pythonpath": os.environ.get("PYTHONPATH"),
             "seed": None,
             "determinism": "greedy generation; fixed token corpus; no sampling RNG",
             "contention_statement": "two clean process checks before and after; no overlapping model, benchmark, server, or pytest process",
