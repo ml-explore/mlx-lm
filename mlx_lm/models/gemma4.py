@@ -65,6 +65,7 @@ class Model(nn.Module):
                     "audio_tower",
                     "embed_audio",
                     "embed_vision",
+                    "vision_embedder",  # gemma4_unified encoder-free vision
                 )
             ):
                 continue

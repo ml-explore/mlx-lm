@@ -35,6 +35,9 @@ class TestConvertToGGUFWithoutMocks(unittest.TestCase):
         mock_tokenizer.get_vocab.return_value = {"<pad>": 0, "hello": 1, "world": 2}
         mock_tokenizer.all_special_tokens = ["<pad>"]
         mock_tokenizer.all_special_ids = [0]
+        mock_tokenizer.bos_token_id = None
+        mock_tokenizer.eos_token_id = None
+        mock_tokenizer.unk_token_id = None
         mock_from_pretrained.return_value = mock_tokenizer
 
         model_path = Path(self.test_dir)

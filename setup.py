@@ -10,7 +10,7 @@ sys.path.append(str(package_dir))
 
 from _version import __version__
 
-MIN_MLX_VERSION = "0.30.4"
+MIN_MLX_VERSION = "0.31.2"
 
 setup(
     name="mlx-lm",
@@ -26,7 +26,7 @@ setup(
     install_requires=[
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
         "numpy",
-        "transformers>=5.0.0",
+        "transformers>=5.7.0",
         "sentencepiece",
         "protobuf",
         "pyyaml",

@@ -5,7 +5,7 @@ import unittest
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
@@ -337,6 +337,37 @@ class TestModels(unittest.TestCase):
             mask=mask,
             scale=1.0,
         )
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
+    def test_quantized_sdpa_gqa_batched_mask(self):
+        # Regression test: quantized SDPA with grouped-query attention and a
+        # batched (B >= 2) padding mask used to crash with a broadcast error
+        # because the mask lacked the n_repeats axis introduced by the GQA
+        # reshape of the scores.
+        B, n_q_heads, n_kv_heads, L, D = 2, 8, 2, 16, 32
+
+        cache = KVCache()
+        k = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        v = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        k_up, v_up = cache.update_and_fetch(k, v)
+        quant_cache = cache.to_quantized(group_size=32, bits=8)
+        qk_up, qv_up = quant_cache.state
+
+        q = 1e-1 * mx.random.normal(shape=(B, n_q_heads, L, D))
+
+        # Batched padding mask, shape (B, 1, L, L), as produced by BatchKVCache.
+        mask = mx.ones((B, 1, L, L), dtype=mx.bool_)
+        mask[1, :, :, L // 2 :] = False
+
+        out = scaled_dot_product_attention(
+            q, k_up, v_up, cache=cache, mask=mask, scale=1.0
+        )
+        qout = scaled_dot_product_attention(
+            q, qk_up, qv_up, cache=quant_cache, mask=mask, scale=1.0
+        )
+        mx.eval(out, qout)
+        self.assertEqual(qout.shape, (B, n_q_heads, L, D))
+        self.assertTrue(mx.all(mx.isfinite(qout)).item())
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
@@ -1546,6 +1577,78 @@ class TestModels(unittest.TestCase):
         self.assertTrue(
             mx.allclose(logits, mx.ones((1, 1, 4), dtype=mx.float32) * 32.0)
         )
+
+    def test_gemma4_kv_shared_layers_omit_kv_projections(self):
+        """KV-shared layers must not create k_proj/v_proj/k_norm/v_norm so that
+        models saved without redundant weights (e.g. via transformers
+        save_pretrained) can be loaded with strict=True."""
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=10,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=4,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                },
+            },
+        )
+        model = gemma4_text.Model(args)
+
+        # Non-shared layers (0-5) should have KV projections
+        for i in range(6):
+            attn = model.model.layers[i].self_attn
+            self.assertTrue(attn.has_kv)
+            self.assertTrue(hasattr(attn, "k_proj"))
+            self.assertTrue(hasattr(attn, "k_norm"))
+
+        # Shared layers (6-9) should NOT have KV projections
+        for i in range(6, 10):
+            attn = model.model.layers[i].self_attn
+            self.assertFalse(attn.has_kv)
+            self.assertFalse(hasattr(attn, "k_proj"))
+            self.assertFalse(hasattr(attn, "k_norm"))
+            self.assertFalse(hasattr(attn, "v_proj"))
+
+        # Verify the model can load weights that omit shared-layer KV params
+        weights = dict(tree_flatten(model.parameters()))
+        kv_keys = [
+            k for k in weights if "k_proj" in k or "v_proj" in k or "k_norm" in k
+        ]
+        for k in kv_keys:
+            # All KV keys should belong to non-shared layers (0-5)
+            layer_idx = int(k.split("layers.")[1].split(".")[0])
+            self.assertLess(layer_idx, 6)
 
     def test_gemma4_input_embeddings_reconstruct_per_layer_inputs(self):
         from mlx_lm.models import gemma4_text

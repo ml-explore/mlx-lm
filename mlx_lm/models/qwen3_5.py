@@ -15,6 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -240,7 +241,7 @@ class DecoderLayer(nn.Module):
         return out
 
 
-class Qwen3_5TextModel(nn.Module):
+class Qwen3_5TextModel(PipelineMixin, nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -250,6 +251,18 @@ class Qwen3_5TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
+
+    def pipeline(self, group):
+        super().pipeline(group)
+        self.ssm_idx = None
+        self.fa_idx = None
+        for e, l in enumerate(self.pipeline_layers):
+            if self.ssm_idx is None and l.is_linear:
+                self.ssm_idx = e
+            elif self.fa_idx is None and not l.is_linear:
+                self.fa_idx = e
+            if self.ssm_idx is not None and self.fa_idx is not None:
+                break
 
     def __call__(
         self,
@@ -262,15 +275,43 @@ class Qwen3_5TextModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(hidden_states, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         return self.norm(hidden_states)
 
@@ -299,7 +340,7 @@ class TextModel(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
@@ -380,6 +421,10 @@ class Model(nn.Module):
         return self.language_model(
             inputs, cache=cache, input_embeddings=input_embeddings
         )
+
+    @property
+    def model(self):
+        return self.language_model.model
 
     def sanitize(self, weights):
         sanitized = {}
@@ -517,7 +562,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.language_model.model.pipeline_layers
 
     def make_cache(self):
         return self.language_model.make_cache()

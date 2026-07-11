@@ -4,11 +4,11 @@ import types
 from pathlib import Path
 from typing import Dict
 
-import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
+from ..cli_ui import rprint
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from ..utils import get_total_parameters
 from .dora import DoRAEmbedding, DoRALinear
@@ -162,7 +162,7 @@ def print_trainable_parameters(model):
     trainable_p = (
         sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 1e6
     )
-    print(
+    rprint(
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
         f"({trainable_p:.3f}M/{total_p:.3f}M)"
     )

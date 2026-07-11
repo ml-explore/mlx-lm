@@ -182,10 +182,19 @@ def main():
         choices=["float32", "bfloat16"],
         help="What type to use to accumulate the gradients for the sensitivities",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
-    model, tokenizer, config = load(args.model, return_config=True)
+    model, tokenizer, config = load(
+        args.model,
+        return_config=True,
+        trust_remote_code=args.trust_remote_code,
+    )
 
     if args.sensitivities is None:
         mx.random.seed(args.seed)

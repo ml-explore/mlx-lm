@@ -717,6 +717,47 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(batch_full.keys.shape[0], 5)
         self.assertEqual(batch_full.offset.shape[0], 5)
 
+    def test_arrays_cache_extend_with_empty(self):
+        # test simple merge
+        c1 = ArraysCache(2)
+        c2 = ArraysCache(2)
+        c1[0] = mx.zeros((1, 4, 8))
+        c1[1] = mx.zeros((1, 4))
+        c2[0] = mx.zeros((1, 4, 8))
+        c2[1] = mx.zeros((1, 4))
+        full = ArraysCache.merge((c1, c2))
+        self.assertEqual(full[0].shape, (2, 4, 8))
+
+        # extend with empty
+        empty = ArraysCache.merge((ArraysCache(2),))
+        full.extend(empty)
+        self.assertEqual(full[0].shape, (3, 4, 8))
+        self.assertEqual(full[1].shape, (3, 4))
+        self.assertTrue(mx.all(full[0][2:] == 0))
+
+        # making an empty cache with 2 sequences and merging it with
+        # another one with 2 sequences
+        empty2 = ArraysCache.merge((ArraysCache(2), ArraysCache(2)))
+        content = ArraysCache.merge((c1, c2))
+        empty2.extend(content)
+        self.assertEqual(empty2[0].shape, (4, 4, 8))
+        self.assertEqual(empty2[1].shape, (4, 4))
+
+        # Extend content with empty
+        content = ArraysCache.merge((c1, c2))
+        empty2 = ArraysCache.merge((ArraysCache(2), ArraysCache(2)))
+        content.extend(empty2)
+        self.assertEqual(content[0].shape, (4, 4, 8))
+        self.assertEqual(content[1].shape, (4, 4))
+        self.assertEqual(content.make_mask(10).shape, (4, 10))
+
+        # multiple empty extensions accumulate correctly
+        stepwise = ArraysCache.merge((c1,))
+        stepwise.extend(ArraysCache(2))
+        stepwise.extend(ArraysCache.merge((ArraysCache(2), ArraysCache(2))))
+        self.assertEqual(stepwise[0].shape, (4, 4, 8))
+        self.assertEqual(stepwise[1].shape, (4, 4))
+
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()
         kv = mx.zeros((1, 1, 32, 128))

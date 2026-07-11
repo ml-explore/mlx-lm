@@ -83,9 +83,11 @@ class MLXLM(LM):
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ) -> None:
         super().__init__()
-        tokenizer_config = {"trust_remote_code": True if trust_remote_code else None}
+        tokenizer_config = {"trust_remote_code": trust_remote_code}
         self._model, self.tokenizer = load(
-            path_or_hf_repo, tokenizer_config=tokenizer_config
+            path_or_hf_repo,
+            tokenizer_config=tokenizer_config,
+            trust_remote_code=trust_remote_code,
         )
         self._max_tokens = max_tokens
         self._batch_size = batch_size

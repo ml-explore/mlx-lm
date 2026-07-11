@@ -5,10 +5,19 @@ from typing import Any, Optional
 
 import regex as re
 
+# Matches <|"|>...<|"|> string literals (Gemma 4's string delimiter).
+_GEMMA4_STR = r'<\|"\|>(?:(?!<\|"\|>)[\s\S])*?<\|"\|>'
+
 # Matches call:name{...} with balanced braces via the regex module's
-# recursive (?R)-style support.  (\{(?:[^{}]|(?2))*\}) recurses on the
-# second capture group so nested objects like {a:{b:1}} are captured whole.
-_tool_call_regex = re.compile(r"call:(\w+)(\{(?:[^{}]|(?2))*\})", re.DOTALL)
+# recursive (?R)-style support.  The inner alternatives handle:
+#   [^{}<]          – any char that is not a brace or start of <|"|>
+#   <(?!\|"\|>)     – a lone '<' that is NOT the start of <|"|>
+#   <|"|>...<|"|>   – a complete string literal (braces inside are ignored)
+#   (?2)            – recursively balanced nested brace group
+_tool_call_regex = re.compile(
+    r"call:([\w-]+)(\{(?:[^{}<]|<(?!\|\"\|>)|" + _GEMMA4_STR + r"|(?2))*\})",
+    re.DOTALL,
+)
 
 
 def _gemma4_args_to_json(text: str) -> str:
