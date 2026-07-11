@@ -356,9 +356,12 @@ class CacheEvictor:
 
     def _evict(self, clear_prompt_cache: bool = False, reason: str = "") -> dict:
         before = self.stats()
+        # clear_cache first: it is the riskier operation, so a failure
+        # there leaves the prompt cache untouched and the error reply
+        # exact rather than partially applied
+        mx.clear_cache()
         if clear_prompt_cache:
             self._prompt_cache.trim_to(n_sequences=0, n_bytes=0)
-        mx.clear_cache()
         after = self.stats()
         self._idle_evicted = True
         released_gb = (before["cache_bytes"] - after["cache_bytes"]) / 1e9
@@ -432,7 +435,11 @@ class CacheEvictor:
                     result = self._evict(message.clear_prompt_cache, "on demand")
                 except Exception:
                     logging.exception("Cache eviction failed")
-                    result = {"evicted": False, "reason": "error"}
+                    result = {
+                        "evicted": False,
+                        "reason": "error",
+                        "stats": self.stats(),
+                    }
             message.response_queue.put(result)
 
         # Idle timer: evict once per idle period after `idle_s` seconds.
