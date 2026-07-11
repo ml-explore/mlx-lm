@@ -523,8 +523,7 @@ class PrefixForkRegistry:
             len(tokens) == 0
             or len(prompt_cache) == 0
             or any(
-                type(c) is not KVCache or c.offset != len(tokens)
-                for c in prompt_cache
+                type(c) is not KVCache or c.offset != len(tokens) for c in prompt_cache
             )
         ):
             return None
@@ -555,6 +554,57 @@ class PrefixForkRegistry:
             ):
                 self._evict_lru_locked()
         return snapshot.cid
+
+    def register_snapshot(self, snapshot: FrozenPrefixSnapshot) -> bool:
+        """Register a trusted snapshot-like object without materializing it.
+
+        This is the disk-tier startup hook.  ``SnapshotStore`` supplies a
+        header-validated proxy implementing the immutable snapshot interface;
+        its KV arrays are not loaded until :meth:`fetch_fork` calls ``fork``.
+        Existing RAM snapshots win, so a startup rescan can never replace hot
+        data with a disk proxy.
+        """
+        _require_model_key(snapshot.model_key)
+        tokens = tuple(_normalize_tokens(snapshot.tokens))
+        if snapshot.cid != compute_cid(snapshot.model_key, tokens):
+            raise ValueError("snapshot cid does not match model_key and tokens")
+        with self._lock:
+            if snapshot.cid in self._snapshots:
+                return False
+            self._snapshots[snapshot.cid] = snapshot
+            self._tracked.append(weakref.ref(snapshot))
+            self._trie.add(snapshot.model_key, list(tokens), snapshot.cid)
+            self._n_bytes += snapshot.nbytes
+            while self._snapshots and (
+                len(self._snapshots) > self.max_snapshots
+                or self._n_bytes > self.max_bytes
+            ):
+                self._evict_lru_locked()
+        return True
+
+    def snapshots(self) -> List[FrozenPrefixSnapshot]:
+        """Return the discoverable snapshots in LRU order."""
+        with self._lock:
+            return list(self._snapshots.values())
+
+    def replace_snapshot(self, snapshot: FrozenPrefixSnapshot) -> bool:
+        """Replace a same-identity proxy with a materialized snapshot."""
+        _require_model_key(snapshot.model_key)
+        if snapshot.cid != compute_cid(snapshot.model_key, snapshot.tokens):
+            raise ValueError("snapshot cid does not match model_key and tokens")
+        with self._lock:
+            previous = self._snapshots.get(snapshot.cid)
+            if previous is None:
+                return False
+            if previous.model_key != snapshot.model_key or tuple(
+                previous.tokens
+            ) != tuple(snapshot.tokens):
+                raise ValueError("replacement snapshot identity mismatch")
+            self._n_bytes += snapshot.nbytes - previous.nbytes
+            self._snapshots[snapshot.cid] = snapshot
+            self._snapshots.move_to_end(snapshot.cid)
+            self._tracked.append(weakref.ref(snapshot))
+        return True
 
     @staticmethod
     def _dedup_spot_check(
@@ -626,7 +676,13 @@ class PrefixForkRegistry:
             if snapshot is None:  # stale trie entry: treat as a miss
                 return None, tokens
             self._snapshots.move_to_end(cid)
-        return snapshot.fork(), tokens[len(matched) :]
+        forks = snapshot.fork()
+        if forks is None:
+            # A disk-backed snapshot discovered corruption while lazily
+            # materializing.  Integrity doubt is always a full safe miss.
+            self.invalidate(cid)
+            return None, tokens
+        return forks, tokens[len(matched) :]
 
     def get(self, cid: str) -> Optional[FrozenPrefixSnapshot]:
         with self._lock:

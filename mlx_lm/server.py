@@ -1,6 +1,7 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
+import hashlib
 import json
 import logging
 import pickle
@@ -41,7 +42,9 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
+from .prefix_forks import FrozenPrefixSnapshot, PrefixForkRegistry, compute_cid
 from .sample_utils import make_logits_processors, make_sampler
+from .snapshot_store import SnapshotStore
 from .utils import _parse_size, load, sharded_load
 
 
@@ -378,6 +381,184 @@ class ModelProvider:
         return self.model, self.tokenizer
 
 
+def _persistent_model_key(model_key) -> str:
+    """Build the mandatory stable-string identity for persisted KV.
+
+    Hugging Face cache paths already contain immutable snapshot revisions.
+    For local paths, include a deterministic manifest of weight/config file
+    names, sizes, and nanosecond mtimes so an ordinary weight or adapter swap
+    changes identity.  Callers that mutate bytes while preserving all three
+    violate the same explicit model-key contract documented by prefix_forks.
+    """
+
+    def identify(value):
+        if value is None:
+            return None
+        path = Path(str(value)).expanduser()
+        if not path.exists():
+            source = str(value)
+            try:
+                cache_info = scan_cache_dir()
+                repo = next(
+                    repo
+                    for repo in cache_info.repos
+                    if repo.repo_type == "model" and repo.repo_id == source
+                )
+                revision = max(
+                    repo.revisions, key=lambda item: item.last_modified
+                ).commit_hash
+                return {"source": source, "revision": revision}
+            except (OSError, StopIteration, ValueError):
+                raise ValueError(
+                    f"cannot resolve an immutable cached revision for {source!r}; "
+                    "persistent prompt caching is disabled for this model"
+                ) from None
+        path = path.resolve()
+        files = (
+            [path]
+            if path.is_file()
+            else sorted(p for p in path.rglob("*") if p.is_file())
+        )
+        manifest = []
+        for item in files:
+            if item.suffix in {".safetensors", ".json"} or "adapter" in item.name:
+                stat = item.stat()
+                manifest.append(
+                    [
+                        str(item.relative_to(path) if path.is_dir() else item.name),
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                    ]
+                )
+        digest = hashlib.sha256(
+            json.dumps(manifest, separators=(",", ":")).encode()
+        ).hexdigest()
+        return {"path": str(path), "revision_manifest": digest}
+
+    parts = model_key if isinstance(model_key, tuple) else (model_key,)
+    return json.dumps(
+        {"mlx_lm_persistent_model_key": 1, "parts": [identify(x) for x in parts]},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+class PersistentPromptCache:
+    """Server bridge combining COW RAM forks with the restart disk tier.
+
+    Unsupported cache types safely fall back to the existing LRU cache.  A
+    successful forkable insert is held once in the prefix registry and is
+    flushed on the generation thread's next quiescent tick.  Before a later
+    insert could evict unsaved RAM state, all prior state is written back.
+    """
+
+    def __init__(self, max_size, directory, *, max_bytes, max_files):
+        self._fallback = LRUPromptCache(max_size)
+        self._max_ram_snapshots = max_size
+        self._registry = PrefixForkRegistry(max_snapshots=max_files)
+        self._store = SnapshotStore(
+            directory,
+            max_bytes=max_bytes,
+            max_files=max_files,
+            registry=self._registry,
+        )
+        self._last_scrub = 0.0
+        self._stable_keys = {}
+
+    def _model_key(self, model):
+        try:
+            cache_key = model
+            hash(cache_key)
+        except TypeError:
+            cache_key = repr(model)
+        if cache_key not in self._stable_keys:
+            self._stable_keys[cache_key] = _persistent_model_key(model)
+        return self._stable_keys[cache_key]
+
+    def __len__(self):
+        return len(self._registry) + len(self._fallback)
+
+    @property
+    def nbytes(self):
+        return self._registry.nbytes + self._fallback.nbytes
+
+    @property
+    def persistent_stats(self):
+        return self._store.stats
+
+    def stats_by_type(self):
+        stats = self._fallback.stats_by_type()
+        stats["persistent-prefix"] = {
+            "n_sequences": len(self._registry),
+            "n_bytes": self._registry.nbytes,
+        }
+        return stats
+
+    def fetch_nearest_cache(self, model, tokens):
+        try:
+            stable_key = self._model_key(model)
+        except ValueError as exc:
+            logging.warning("Persistent prompt cache safe miss: %s", exc)
+            return self._fallback.fetch_nearest_cache(model, tokens)
+        self._store.note_request_cid(compute_cid(stable_key, tokens))
+        forks, rest = self._registry.fetch_fork(stable_key, tokens)
+        if forks is not None:
+            self._enforce_ram_limit()
+            return forks, rest
+        return self._fallback.fetch_nearest_cache(model, tokens)
+
+    def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
+        self._store.flush_registry(self._registry)
+        offsets = [getattr(cache, "offset", None) for cache in prompt_cache]
+        if (
+            offsets
+            and offsets[0] is not None
+            and all(offset == offsets[0] for offset in offsets)
+        ):
+            length = int(offsets[0])
+            if 0 < length <= len(tokens):
+                try:
+                    stable_key = self._model_key(model)
+                except ValueError as exc:
+                    logging.warning("Persistent prompt cache not written: %s", exc)
+                    self._fallback.insert_cache(
+                        model, tokens, prompt_cache, cache_type=cache_type
+                    )
+                    return
+                cid = compute_cid(stable_key, tokens[:length])
+                existing = self._registry.get(cid)
+                if existing is not None and not isinstance(
+                    existing, FrozenPrefixSnapshot
+                ):
+                    self._store.restore(cid)
+                cid = self._registry.freeze(stable_key, tokens[:length], prompt_cache)
+                if cid is not None:
+                    self._enforce_ram_limit()
+                    return
+        self._fallback.insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
+
+    def trim_to(self, **kwargs):
+        self._fallback.trim_to(**kwargs)
+
+    def _enforce_ram_limit(self):
+        materialized = [
+            snapshot
+            for snapshot in self._registry.snapshots()
+            if isinstance(snapshot, FrozenPrefixSnapshot)
+        ]
+        while len(materialized) > self._max_ram_snapshots:
+            victim = materialized.pop(0)
+            self._store.demote_from_ram(victim.cid)
+
+    def flush_persistent(self, *, scrub=True):
+        count = self._store.flush_registry(self._registry)
+        now = time.monotonic()
+        if scrub and now - self._last_scrub >= 1.0:
+            self._store.scrub_one()
+            self._last_scrub = now
+        return count
+
+
 def _make_sampler(args, tokenizer):
     return make_sampler(
         args.sampling.temperature,
@@ -436,6 +617,8 @@ class ResponseGenerator:
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
+        if hasattr(self.prompt_cache, "flush_persistent"):
+            self.prompt_cache.flush_persistent(scrub=False)
 
     def join(self):
         self._generation_thread.join()
@@ -449,6 +632,10 @@ class ResponseGenerator:
             n_bytes = stats["n_bytes"]
             logging.info(
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
+            )
+        if hasattr(self.prompt_cache, "persistent_stats"):
+            logging.info(
+                "Persistent Prompt Cache: %s", self.prompt_cache.persistent_stats
             )
 
     def _next_request(self, timeout=None):
@@ -622,7 +809,16 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        # ForkedKVCache intentionally has no batch ``merge`` operation on the
+        # COW base branch.  Persistence is opt-in, so route it through the
+        # fully wired sequential path instead of handing an incompatible
+        # cache to BatchGenerator or silently bypassing disk hits.
+        persistence_off = not getattr(
+            self.model_provider.cli_args, "prompt_cache_persist_dir", None
+        )
+        return (
+            self.model_provider.is_batchable and args.seed is None and persistence_off
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -662,6 +858,15 @@ class ResponseGenerator:
                     else 0.1
                 )
                 request = get_next_request(timeout=timeout)
+
+            if (
+                request is None
+                and (batch_generator is None or len(batch_results) == 0)
+                and hasattr(self.prompt_cache, "flush_persistent")
+            ):
+                # Generation-thread-only, quiescent hook.  One bounded scrub
+                # follows write-back; no background thread can race a cache.
+                self.prompt_cache.flush_persistent(scrub=True)
 
             # We got a request
             if request is not None:
@@ -1709,7 +1914,25 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    persist_dir = getattr(model_provider.cli_args, "prompt_cache_persist_dir", None)
+    if persist_dir:
+        prompt_cache = PersistentPromptCache(
+            model_provider.cli_args.prompt_cache_size,
+            persist_dir,
+            max_bytes=getattr(
+                model_provider.cli_args, "prompt_cache_persist_bytes", 32 << 30
+            ),
+            max_files=getattr(
+                model_provider.cli_args, "prompt_cache_persist_files", 4096
+            ),
+        )
+        logging.info(
+            "%d snapshots / %.2f GiB indexed (no data loaded)",
+            prompt_cache.persistent_stats["files"],
+            prompt_cache.persistent_stats["bytes"] / (1 << 30),
+        )
+    else:
+        prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1847,6 +2070,23 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-persist-dir",
+        type=str,
+        help="Opt-in directory for restart-persistent prefix snapshots",
+    )
+    parser.add_argument(
+        "--prompt-cache-persist-bytes",
+        type=_parse_size,
+        default=32 << 30,
+        help="Maximum persistent-cache disk usage (default: 32 GiB)",
+    )
+    parser.add_argument(
+        "--prompt-cache-persist-files",
+        type=int,
+        default=4096,
+        help="Maximum files in the persistent-cache directory",
     )
     parser.add_argument(
         "--pipeline",
