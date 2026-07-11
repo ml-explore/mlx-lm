@@ -914,7 +914,9 @@ class TestCacheEvictor(unittest.TestCase):
             evictor.step(busy=False)
             thread.join()
             self.assertTrue(results[0]["evicted"])
-            self.assertEqual(clear_cache.call_count, 1)
+            # clear_prompt_cache evictions clear the pool twice: once up
+            # front, once after the trim to collect the freed entries
+            self.assertEqual(clear_cache.call_count, 2)
 
     def test_boundary_race_exactly_one_side_wins(self):
         # Regression (real clock): a slow eviction that starts right at the
@@ -938,8 +940,9 @@ class TestCacheEvictor(unittest.TestCase):
                 thread.join()
                 result = results[0]
                 if result["evicted"]:
-                    # Loop won: the handler waited out the reply
-                    self.assertEqual(clear_cache.call_count, 1)
+                    # Loop won: the handler waited out the reply (two pool
+                    # clears per clear_prompt_cache eviction by design)
+                    self.assertEqual(clear_cache.call_count, 2)
                     self.assertEqual(len(prompt_cache), 0)
                 else:
                     # Handler won: the eviction must not have run at all

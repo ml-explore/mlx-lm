@@ -362,6 +362,9 @@ class CacheEvictor:
         mx.clear_cache()
         if clear_prompt_cache:
             self._prompt_cache.trim_to(n_sequences=0, n_bytes=0)
+            # Trimmed entries free their arrays INTO the pool; collect them
+            # in the same call instead of leaving them for the next cycle
+            mx.clear_cache()
         after = self.stats()
         self._idle_evicted = True
         released_gb = (before["cache_bytes"] - after["cache_bytes"]) / 1e9
