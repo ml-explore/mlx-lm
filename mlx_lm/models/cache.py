@@ -271,9 +271,9 @@ class QuantizedKVCache(_BaseCache):
             shape = (B, n_kv_heads, new_steps)
 
             def init_quant(dim, bits, dtype):
-                el_per_int = 8 * mx.uint32.size // bits
+                packed_dim = dim * bits // (8 * mx.uint32.size)
                 return (
-                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, packed_dim), dtype=mx.uint32),
                     mx.zeros((*shape, dim // self.group_size), dtype=dtype),
                     mx.zeros((*shape, dim // self.group_size), dtype=dtype),
                 )

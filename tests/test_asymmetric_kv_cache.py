@@ -131,6 +131,12 @@ class TestAsymmetricKVCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported group size"):
             QuantizedKVCache(group_size=16)
 
+        x = mx.arange(128, dtype=mx.float32).reshape(1, 1, 1, 128)
+        for bits in (2, 3, 4, 5, 6, 8):
+            supported = QuantizedKVCache(bits=bits, group_size=32)
+            supported.update_and_fetch(x, x)
+            self.assertEqual(supported.keys[0].shape[-1], 128 * bits // 32)
+
     def test_cli_compatibility_and_defaults(self):
         generate_args = generate_arg_parser().parse_args(
             ["--kv-bits", "8", "--kv-value-bits", "4"]
