@@ -139,14 +139,11 @@ class TestAsymmetricKVCache(unittest.TestCase):
             geometry_path = os.path.join(directory, "cross-side-geometry.safetensors")
             key_state, value_state = asymmetric.state
             bad_values = tuple(
-                mx.broadcast_to(array, (2, *array.shape[1:]))
-                for array in value_state
+                mx.broadcast_to(array, (2, *array.shape[1:])) for array in value_state
             )
             geometry_arrays = dict(tree_flatten([(key_state, bad_values)]))
             geometry_metadata = dict(
-                tree_flatten(
-                    [[("2", "2", "32", "8", "4")], {}, ["QuantizedKVCache"]]
-                )
+                tree_flatten([[("2", "2", "32", "8", "4")], {}, ["QuantizedKVCache"]])
             )
             mx.save_safetensors(geometry_path, geometry_arrays, geometry_metadata)
             with self.assertRaisesRegex(ValueError, "batch, head, or length mismatch"):
