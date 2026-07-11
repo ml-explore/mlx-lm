@@ -314,11 +314,7 @@ def main():
 
     if args.target_dir is not None:
         target_dir = Path(args.target_dir)
-        has_targets = (
-            target_dir.is_dir()
-            and any((target_dir / "train").glob("*.safetensors"))
-            and any((target_dir / "valid").glob("*.safetensors"))
-        )
+        has_targets = target_dir.exists()
     else:
         has_targets = False
         target_dir = None
