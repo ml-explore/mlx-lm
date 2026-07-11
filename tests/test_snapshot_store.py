@@ -513,6 +513,7 @@ class TestPersistentServerBridge(unittest.TestCase):
 
     def test_hf_snapshot_identity_opens_no_payload_and_tracks_revision(self):
         repo = Path(self.temp.name) / "models--org--model" / "snapshots"
+        (repo.parent / "blobs").mkdir(parents=True)
         revision_a = "a" * 40
         revision_b = "b" * 40
         snapshot_a = repo / revision_a
@@ -531,6 +532,18 @@ class TestPersistentServerBridge(unittest.TestCase):
         self.assertNotEqual(identity_a, identity_b)
         self.assertIn(revision_a, identity_a)
         self.assertIn(revision_b, identity_b)
+
+    def test_local_snapshots_lookalike_still_hashes_bytes(self):
+        lookalike = Path(self.temp.name) / "ordinary-local" / "snapshots" / ("c" * 40)
+        lookalike.mkdir(parents=True)
+        weights = lookalike / "adapter.safetensors"
+        weights.write_bytes(b"A" * 4096)
+        stamp = weights.stat().st_mtime_ns
+        first = _persistent_model_key((str(lookalike), None, None))
+        weights.write_bytes(b"B" * 4096)
+        os.utime(weights, ns=(stamp, stamp))
+        second = _persistent_model_key((str(lookalike), None, None))
+        self.assertNotEqual(first, second)
 
     def test_unresolved_hf_identity_fails_closed(self):
         with self.assertRaises(ValueError):

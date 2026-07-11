@@ -410,7 +410,21 @@ def _persistent_model_key(model_key) -> str:
     def hf_snapshot_identity(path):
         parts = path.parts
         for index in range(len(parts) - 2, -1, -1):
-            if parts[index] != "snapshots" or index + 1 >= len(parts):
+            if parts[index] != "snapshots" or index < 1 or index + 1 >= len(parts):
+                continue
+            # Hugging Face encodes a model repo as
+            # models--<namespace>--<name>/snapshots/<commit>. A generic local
+            # directory named snapshots/<hex> has no immutable-revision
+            # authority and must fall through to byte hashing.
+            repo_parts = parts[index - 1].split("--")
+            if (
+                len(repo_parts) < 3
+                or repo_parts[0] != "models"
+                or any(not part for part in repo_parts[1:])
+            ):
+                continue
+            repo_root = Path(*parts[:index])
+            if not (repo_root / "blobs").is_dir():
                 continue
             revision = parts[index + 1]
             if len(revision) < 7 or any(
