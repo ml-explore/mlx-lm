@@ -100,6 +100,13 @@ class TestForkedKVCache(unittest.TestCase):
         self.assertEqual(fork.offset, 70)  # untouched by the failed trim
         self.assertEqual(fork.trim(0), 0)
 
+        # A negative rollback must not flow through to KVCache.trim(), where
+        # subtracting a negative value grows the logical offset into
+        # uninitialised capacity.
+        with self.assertRaises(ValueError):
+            fork.trim(-1)
+        self.assertEqual(fork.offset, 70)
+
     def test_trim_prompt_cache_fails_loudly_not_skewed(self):
         # F1 regression (reviewer's exact scenario): a fork inside the
         # trim-longer path of a request-level cache. trim_prompt_cache used
@@ -189,6 +196,35 @@ class TestForkedKVCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(snapshot.keys[0], before))
         self.assertTrue(mx.array_equal(fork.state[0], before))
 
+    def test_registry_snapshot_views_cannot_corrupt_future_forks(self):
+        # registry.get() is a public boundary too.  Mutating an array obtained
+        # from it must not rewrite the snapshot used by forks created later.
+        tokens = list(range(16))
+        registry = PrefixForkRegistry()
+        cid = registry.freeze("m", tokens, _prime_cache(tokens))
+        snapshot = registry.get(cid)
+        before = mx.array(snapshot.keys[0])
+        mx.eval(before)
+
+        exposed = snapshot.keys[0]
+        exposed[..., 0, :] = 777.0
+        mx.eval(exposed)
+
+        future = registry.fetch_fork("m", tokens)[0][0]
+        self.assertTrue(mx.array_equal(future.state[0], before))
+
+        # Registry bookkeeping metadata is part of the immutable snapshot too.
+        for name, value in (
+            ("cid", "wrong"),
+            ("model_key", "wrong"),
+            ("tokens", (999,)),
+            ("nbytes", 0),
+        ):
+            with self.assertRaises(AttributeError):
+                setattr(snapshot, name, value)
+        self.assertTrue(registry.invalidate(cid))
+        self.assertEqual(registry.nbytes, 0)
+
     def test_meta_state_and_save_refuse(self):
         # N4: save_prompt_cache would write a file load_prompt_cache cannot
         # reconstruct (class lookup is models/cache.py globals); refuse loudly.
@@ -215,6 +251,25 @@ class TestForkedKVCache(unittest.TestCase):
 
 
 class TestPrefixForkRegistry(unittest.TestCase):
+
+    def test_cid_framing_separates_model_key_from_tokens(self):
+        # Without length/domain framing these serialize to the same bytes:
+        # b"m" + b"\\0" + b"1" + b"\\0" + b"2".
+        self.assertNotEqual(
+            compute_cid("m", [1, 2]), compute_cid("m\x001", [2])
+        )
+        self.assertEqual(len(compute_cid("m", [1, 2])), 64)
+
+    def test_token_identity_rejects_lossy_coercions(self):
+        registry = PrefixForkRegistry()
+        cache = _prime_cache([1])
+        for bad in ([1.9], ["1"], [True]):
+            with self.assertRaises(TypeError):
+                compute_cid("m", bad)
+            with self.assertRaises(TypeError):
+                registry.freeze("m", bad, cache)
+            with self.assertRaises(TypeError):
+                registry.fetch_fork("m", bad)
 
     def test_model_key_must_be_str(self):
         # B1 regression: id()-derived and object keys are forbidden. An
@@ -284,6 +339,24 @@ class TestPrefixForkRegistry(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.freeze("m@v1", tokens, altered)
 
+    def test_dedup_value_only_mismatch_raises(self):
+        # A V-projection-only change can leave every key bit-identical.  The
+        # advertised KV-content check must inspect values on every layer too.
+        registry = PrefixForkRegistry()
+        tokens = list(range(40))
+        mx.random.seed(41)
+        registry.freeze("m@v1", tokens, _prime_cache(tokens))
+
+        mx.random.seed(41)
+        altered = _prime_cache(tokens)
+        _, v1 = altered[1].state
+        v1_mod = mx.array(v1)
+        v1_mod[..., -1, :] = 321.0
+        altered[1].values[..., : altered[1].offset, :] = v1_mod
+        mx.eval(altered[1].values)
+        with self.assertRaises(ValueError):
+            registry.freeze("m@v1", tokens, altered)
+
     def test_dedup_content_mismatch_raises(self):
         # F3 regression: same key + tokens but DIFFERENT KV content (weights
         # changed under a stale key) must raise, not silently dedup.
@@ -310,6 +383,19 @@ class TestPrefixForkRegistry(unittest.TestCase):
         # Empty
         self.assertIsNone(registry.freeze("m", [], []))
         self.assertEqual(len(registry), 0)
+
+    def test_existing_cid_does_not_turn_unsupported_freeze_into_success(self):
+        registry = PrefixForkRegistry()
+        tokens = list(range(16))
+        cid = registry.freeze("m", tokens, _prime_cache(tokens))
+
+        rotating = RotatingKVCache(max_size=32)
+        rotating.update_and_fetch(*_random_kv(len(tokens)))
+        self.assertIsNone(registry.freeze("m", tokens, [rotating]))
+
+        wrong_offset = _prime_cache(tokens[:-1])
+        self.assertIsNone(registry.freeze("m", tokens, wrong_offset))
+        self.assertEqual(registry.get(cid).cid, cid)
 
     def test_cid_dedup(self):
         registry = PrefixForkRegistry()
@@ -396,6 +482,48 @@ class TestPrefixForkRegistry(unittest.TestCase):
         del forks
         gc.collect()
         self.assertEqual(registry.pinned_nbytes, 0)
+
+    def test_pinned_nbytes_survives_same_cid_reinsertion(self):
+        registry = PrefixForkRegistry()
+        tokens = list(range(40))
+        cache = _prime_cache(tokens)
+        cid = registry.freeze("m", tokens, cache)
+        old_bytes = registry.get(cid).nbytes
+        old_forks, _ = registry.fetch_fork("m", tokens)
+        registry.invalidate(cid)
+
+        # Reinserting the same CID must not overwrite tracking for the older,
+        # still-live snapshot held by old_forks.
+        self.assertEqual(registry.freeze("m", tokens, cache), cid)
+        self.assertEqual(registry.pinned_nbytes, old_bytes)
+        del old_forks
+        gc.collect()
+        self.assertEqual(registry.pinned_nbytes, 0)
+
+    def test_max_bytes_is_a_strict_discoverable_cap(self):
+        registry = PrefixForkRegistry(max_bytes=1)
+        tokens = list(range(8))
+        cid = registry.freeze("m", tokens, _prime_cache(tokens))
+        self.assertGreater(cid is not None, 0)
+        self.assertEqual(registry.nbytes, 0)
+        self.assertEqual(len(registry), 0)
+        self.assertIsNone(registry.fetch_fork("m", tokens)[0])
+
+    def test_registry_limits_reject_negative_values_and_allow_zero(self):
+        with self.assertRaises(ValueError):
+            PrefixForkRegistry(max_snapshots=-1)
+        with self.assertRaises(ValueError):
+            PrefixForkRegistry(max_bytes=-1)
+        for bad in (True, 1.5, float("nan"), "1"):
+            with self.assertRaises(TypeError):
+                PrefixForkRegistry(max_snapshots=bad)
+            with self.assertRaises(TypeError):
+                PrefixForkRegistry(max_bytes=bad)
+        registry = PrefixForkRegistry(max_snapshots=0, max_bytes=0)
+        tokens = list(range(8))
+        registry.freeze("m", tokens, _prime_cache(tokens))
+        self.assertEqual(len(registry), 0)
+        self.assertEqual(registry.nbytes, 0)
 
 
 class TestPrefixForksWithModel(unittest.TestCase):

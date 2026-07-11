@@ -103,7 +103,8 @@ import hashlib
 import threading
 import weakref
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from numbers import Integral
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 
@@ -125,6 +126,22 @@ def _require_model_key(model_key: Any) -> str:
     return model_key
 
 
+def _normalize_tokens(tokens: List[int]) -> Tuple[int, ...]:
+    """Validate exact token IDs without lossy ``int(...)`` coercion."""
+    normalized = []
+    for token in tokens:
+        if isinstance(token, bool):
+            raise TypeError("token IDs must be integers, not bool")
+        try:
+            value = token.__index__()
+        except (AttributeError, TypeError):
+            raise TypeError(
+                f"token IDs must be integers; got {type(token).__name__}"
+            ) from None
+        normalized.append(int(value))
+    return tuple(normalized)
+
+
 def compute_cid(model_key: str, tokens: List[int]) -> str:
     """Content-hash identity for a prefix: (model key, exact token ids).
 
@@ -133,11 +150,19 @@ def compute_cid(model_key: str, tokens: List[int]) -> str:
     model key is subject to the module-level MODEL-KEY CONTRACT.
     """
     model_key = _require_model_key(model_key)
+    tokens = _normalize_tokens(tokens)
     h = hashlib.sha256()
-    h.update(model_key.encode("utf-8", "replace"))
+    # Length-frame every field. A delimiter alone is ambiguous because a
+    # model key is an arbitrary string and may itself contain that delimiter.
+    h.update(b"mlx-lm-prefix-fork-cid-v1")
+    model_key_bytes = model_key.encode("utf-8", "surrogatepass")
+    h.update(len(model_key_bytes).to_bytes(8, "big"))
+    h.update(model_key_bytes)
     for t in tokens:
-        h.update(b"\x00" + str(int(t)).encode())
-    return h.hexdigest()[:16]
+        token_bytes = str(t).encode()
+        h.update(len(token_bytes).to_bytes(8, "big"))
+        h.update(token_bytes)
+    return h.hexdigest()
 
 
 class FrozenPrefixSnapshot:
@@ -166,21 +191,47 @@ class FrozenPrefixSnapshot:
         keys: List[mx.array],
         values: List[mx.array],
     ):
-        self.cid = cid
-        self.model_key = model_key
-        self.tokens = tokens
+        self._cid = cid
+        self._model_key = model_key
+        self._tokens = tokens
         # Fresh slice OBJECTS (zero-copy): a later __setitem__ through the
         # caller's original references rebinds the caller's objects, never
         # these pre-write nodes.
-        self.keys = [k[:] for k in keys]
-        self.values = [v[:] for v in values]
-        self.nbytes = sum(k.nbytes + v.nbytes for k, v in zip(keys, values))
+        self._keys = [k[:] for k in keys]
+        self._values = [v[:] for v in values]
+        self._nbytes = sum(k.nbytes + v.nbytes for k, v in zip(keys, values))
         # Live forks referencing this snapshot (weak: forks hold the strong
         # edge). Lets the registry report pinned-but-undiscoverable bytes.
         self._forks = weakref.WeakSet()
 
     def __len__(self):
         return len(self.tokens)
+
+    @property
+    def cid(self):
+        return self._cid
+
+    @property
+    def model_key(self):
+        return self._model_key
+
+    @property
+    def tokens(self):
+        return self._tokens
+
+    @property
+    def nbytes(self):
+        return self._nbytes
+
+    @property
+    def keys(self):
+        """Fresh sealed views; the stored MLX array objects never escape."""
+        return [k[:] for k in self._keys]
+
+    @property
+    def values(self):
+        """Fresh sealed views; the stored MLX array objects never escape."""
+        return [v[:] for v in self._values]
 
     @property
     def pinned(self) -> bool:
@@ -198,6 +249,7 @@ class FrozenPrefixSnapshot:
         quantized, and stateful (Mamba) caches are not COW-forkable in v1.
         """
         model_key = _require_model_key(model_key)
+        tokens = list(_normalize_tokens(tokens))
         if len(tokens) == 0 or len(prompt_cache) == 0:
             return None
         for c in prompt_cache:
@@ -214,14 +266,14 @@ class FrozenPrefixSnapshot:
             values.append(mx.array(v))
         mx.eval(*keys, *values)
         cid = compute_cid(model_key, tokens)
-        return cls(cid, model_key, tuple(int(t) for t in tokens), keys, values)
+        return cls(cid, model_key, tuple(tokens), keys, values)
 
     def fork(self) -> List["ForkedKVCache"]:
         """A fresh per-layer cache stack referencing this snapshot. O(1):
         no prefix bytes are copied or materialized."""
         forks = [
-            ForkedKVCache(self.keys[l], self.values[l], snapshot=self)
-            for l in range(len(self.keys))
+            ForkedKVCache(self._keys[l], self._values[l], snapshot=self)
+            for l in range(len(self._keys))
         ]
         for f in forks:
             self._forks.add(f)
@@ -351,6 +403,8 @@ class ForkedKVCache(_BaseCache):
         # not. Trimming past the tail must FAIL LOUDLY: trim_prompt_cache
         # callers ignore the returned count, so a silent clamp would leave
         # them generating against KV at the wrong offset.
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise ValueError(f"trim count must be a non-negative integer; got {n!r}")
         if n > self.tail.offset:
             raise ValueError(
                 f"Cannot trim {n} tokens from a ForkedKVCache with a private "
@@ -397,23 +451,35 @@ class PrefixForkRegistry:
     """
 
     def __init__(self, max_snapshots: int = 16, max_bytes: int = 1 << 63):
-        self.max_snapshots = max_snapshots
-        self.max_bytes = max_bytes
+        for name, value in (
+            ("max_snapshots", max_snapshots),
+            ("max_bytes", max_bytes),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{name} must be a non-negative integer")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        self.max_snapshots = int(max_snapshots)
+        self.max_bytes = int(max_bytes)
         self._snapshots: "OrderedDict[str, FrozenPrefixSnapshot]" = OrderedDict()
         self._trie = PromptTrie()  # namespaced by the model-key string
         # Weak refs to every snapshot ever inserted, for pinned_nbytes: a
         # snapshot evicted here stays alive exactly as long as forks pin it.
-        self._tracked: Dict[str, "weakref.ref[FrozenPrefixSnapshot]"] = {}
+        # Track instances, not CIDs: the same CID can be reinserted while an
+        # older invalidated snapshot remains pinned by live forks.
+        self._tracked: List["weakref.ref[FrozenPrefixSnapshot]"] = []
         self._n_bytes = 0
         self._lock = threading.Lock()
 
     def __len__(self):
-        return len(self._snapshots)
+        with self._lock:
+            return len(self._snapshots)
 
     @property
     def nbytes(self):
         """Bytes of the DISCOVERABLE snapshots (what max_bytes bounds)."""
-        return self._n_bytes
+        with self._lock:
+            return self._n_bytes
 
     @property
     def pinned_nbytes(self):
@@ -427,15 +493,14 @@ class PrefixForkRegistry:
         them to estimate memory."""
         total = 0
         with self._lock:
-            dead = []
-            for cid, ref in self._tracked.items():
+            alive = []
+            for ref in self._tracked:
                 snapshot = ref()
-                if snapshot is None:
-                    dead.append(cid)
-                elif snapshot.pinned:
+                if snapshot is not None:
+                    alive.append(ref)
+                if snapshot is not None and snapshot.pinned:
                     total += snapshot.nbytes
-            for cid in dead:
-                del self._tracked[cid]
+            self._tracked = alive
         return total
 
     def freeze(
@@ -451,6 +516,18 @@ class PrefixForkRegistry:
         matching (model_key, tokens) with different KV means the key contract
         was violated (weights changed under a stale key)."""
         model_key = _require_model_key(model_key)
+        tokens = list(_normalize_tokens(tokens))
+        # Validate before the CID fast path. Otherwise an existing entry turns
+        # an unsupported or offset-skewed cache into a false success.
+        if (
+            len(tokens) == 0
+            or len(prompt_cache) == 0
+            or any(
+                type(c) is not KVCache or c.offset != len(tokens)
+                for c in prompt_cache
+            )
+        ):
+            return None
         cid = compute_cid(model_key, tokens)
         existing = self.get(cid)
         if existing is not None:
@@ -469,11 +546,12 @@ class PrefixForkRegistry:
                 self._snapshots.move_to_end(snapshot.cid)
                 return snapshot.cid
             self._snapshots[snapshot.cid] = snapshot
-            self._tracked[snapshot.cid] = weakref.ref(snapshot)
+            self._tracked.append(weakref.ref(snapshot))
             self._trie.add(snapshot.model_key, list(snapshot.tokens), snapshot.cid)
             self._n_bytes += snapshot.nbytes
-            while len(self._snapshots) > self.max_snapshots or (
-                self._n_bytes > self.max_bytes and len(self._snapshots) > 1
+            while self._snapshots and (
+                len(self._snapshots) > self.max_snapshots
+                or self._n_bytes > self.max_bytes
             ):
                 self._evict_lru_locked()
         return snapshot.cid
@@ -492,20 +570,29 @@ class PrefixForkRegistry:
         under a stale key has nothing to compare against — the model-key
         contract is the primary defense."""
         if (
-            len(prompt_cache) != len(snapshot.keys)
+            len(prompt_cache) != len(snapshot._keys)
             or any(type(c) is not KVCache for c in prompt_cache)
             or prompt_cache[0].offset != len(tokens)
         ):
             return  # not comparable; a fresh freeze() would reject it too
         ok = True
         for layer, c in enumerate(prompt_cache):
-            k_new = c.state[0]
-            k_old = snapshot.keys[layer]
-            if k_new.shape != k_old.shape or k_new.dtype != k_old.dtype:
+            k_new, v_new = c.state
+            k_old = snapshot._keys[layer]
+            v_old = snapshot._values[layer]
+            if (
+                k_new.shape != k_old.shape
+                or k_new.dtype != k_old.dtype
+                or v_new.shape != v_old.shape
+                or v_new.dtype != v_old.dtype
+            ):
                 ok = False
                 break
             w = min(4, k_old.shape[2])
-            if not bool(mx.array_equal(k_old[..., -w:, :], k_new[..., -w:, :])):
+            if not (
+                bool(mx.array_equal(k_old[..., -w:, :], k_new[..., -w:, :]))
+                and bool(mx.array_equal(v_old[..., -w:, :], v_new[..., -w:, :]))
+            ):
                 ok = False
                 break
         if not ok:
@@ -528,8 +615,9 @@ class PrefixForkRegistry:
         is deliberately a miss (false-MISS-only invariant).
         """
         model_key = _require_model_key(model_key)
+        normalized_tokens = list(_normalize_tokens(tokens))
         with self._lock:
-            result = self._trie.search(model_key, tokens)
+            result = self._trie.search(model_key, normalized_tokens)
             matched = result.exact if result.exact is not None else result.shorter
             if matched is None:
                 return None, tokens
