@@ -1,12 +1,21 @@
 # Copyright © 2026 Apple Inc.
 
 import copy
+import gc
+import os
+import tempfile
 import unittest
 
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+    save_prompt_cache,
+    trim_prompt_cache,
+)
 from mlx_lm.prefix_forks import (
     ForkedKVCache,
     FrozenPrefixSnapshot,
@@ -73,17 +82,36 @@ class TestForkedKVCache(unittest.TestCase):
         self.assertEqual(detached.offset, full.offset)
         self.assertTrue(mx.array_equal(detached.state[0], full.state[0]))
 
-    def test_trim_is_clamped_to_tail(self):
+    def test_trim_within_tail_and_raises_beyond(self):
         pk, pv = _random_kv(64)
         fork = ForkedKVCache(pk, pv)
         k, v = _random_kv(10)
         fork.update_and_fetch(k, v)
         self.assertEqual(fork.offset, 74)
-        # Trim deeper than the tail: only the 10 private tokens go
         self.assertTrue(fork.is_trimmable())
-        self.assertEqual(fork.trim(30), 10)
-        self.assertEqual(fork.offset, 64)
-        self.assertEqual(fork.trim(5), 0)
+        # Rollback within the private tail works like KVCache
+        self.assertEqual(fork.trim(4), 4)
+        self.assertEqual(fork.offset, 70)
+        # Trimming into the frozen prefix must FAIL LOUDLY (F1): callers of
+        # trim_prompt_cache ignore the return value, so a silent clamp would
+        # leave generation running against skewed KV.
+        with self.assertRaises(ValueError):
+            fork.trim(30)
+        self.assertEqual(fork.offset, 70)  # untouched by the failed trim
+        self.assertEqual(fork.trim(0), 0)
+
+    def test_trim_prompt_cache_fails_loudly_not_skewed(self):
+        # F1 regression (reviewer's exact scenario): a fork inside the
+        # trim-longer path of a request-level cache. trim_prompt_cache used
+        # to under-trim silently (offset skew); now it raises.
+        tokens = list(range(300))
+        registry = PrefixForkRegistry()
+        registry.freeze("m", tokens, _prime_cache(tokens))
+        forks, _ = registry.fetch_fork("m", tokens)
+        for f in forks:
+            f.update_and_fetch(*_random_kv(10))
+        with self.assertRaises(ValueError):
+            trim_prompt_cache(forks, 50)  # 50 > tail of 10
 
     def test_nbytes_counts_private_tail_only(self):
         pk, pv = _random_kv(128)
@@ -122,6 +150,56 @@ class TestForkedKVCache(unittest.TestCase):
         with self.assertRaises(ValueError):
             fork.state = (pk, pv)
 
+    def test_empty_tail_state_is_sealed(self):
+        # F2 regression: .state with an EMPTY tail must never hand out the
+        # raw frozen array objects — a consumer __setitem__ would corrupt
+        # the snapshot and every sibling fork.
+        tokens = list(range(32))
+        registry = PrefixForkRegistry()
+        cid = registry.freeze("m", tokens, _prime_cache(tokens))
+        snapshot = registry.get(cid)
+        fork_a = registry.fetch_fork("m", tokens)[0]
+        fork_b = registry.fetch_fork("m", tokens)[0]
+        before_k = mx.array(snapshot.keys[0])
+        before_v = mx.array(snapshot.values[0])
+        mx.eval(before_k, before_v)
+
+        k, v = fork_a[0].state  # tail empty
+        self.assertIsNot(k, snapshot.keys[0])
+        k[..., 0, :] = 999.0  # hostile consumer edits .state in place
+        v[..., 0, :] = -999.0
+        mx.eval(k, v)
+
+        self.assertTrue(mx.array_equal(snapshot.keys[0], before_k))
+        self.assertTrue(mx.array_equal(snapshot.values[0], before_v))
+        kb, vb = fork_b[0].state  # sibling unaffected
+        self.assertTrue(mx.array_equal(kb, before_k))
+        self.assertTrue(mx.array_equal(vb, before_v))
+
+    def test_snapshot_init_seals_caller_arrays(self):
+        # F2 (defensive): a caller that retains its arrays and later mutates
+        # them via __setitem__ must not reach the snapshot's stored nodes.
+        pk, pv = _random_kv(16)
+        before = mx.array(pk)
+        mx.eval(before)
+        snapshot = FrozenPrefixSnapshot("cid", "m", tuple(range(16)), [pk], [pv])
+        fork = ForkedKVCache(pk, pv)
+        pk[..., 0, :] = 123.0  # caller scribbles its own reference
+        mx.eval(pk)
+        self.assertTrue(mx.array_equal(snapshot.keys[0], before))
+        self.assertTrue(mx.array_equal(fork.state[0], before))
+
+    def test_meta_state_and_save_refuse(self):
+        # N4: save_prompt_cache would write a file load_prompt_cache cannot
+        # reconstruct (class lookup is models/cache.py globals); refuse loudly.
+        pk, pv = _random_kv(8)
+        forks = [ForkedKVCache(pk, pv)]
+        with self.assertRaises(ValueError):
+            _ = forks[0].meta_state
+        path = os.path.join(tempfile.mkdtemp(), "fork.safetensors")
+        with self.assertRaises(ValueError):
+            save_prompt_cache(path, forks)
+
     def test_parent_arrays_untouched_by_tail_writes(self):
         prefix_len = 260
         pk, pv = _random_kv(prefix_len)
@@ -137,6 +215,65 @@ class TestForkedKVCache(unittest.TestCase):
 
 
 class TestPrefixForkRegistry(unittest.TestCase):
+
+    def test_model_key_must_be_str(self):
+        # B1 regression: id()-derived and object keys are forbidden. An
+        # in-place weight swap keeps the same object, and CPython recycles
+        # addresses of dead objects — both turned into stale-KV false HITs.
+        registry = PrefixForkRegistry()
+        tokens = list(range(8))
+        cache = _prime_cache(tokens)
+
+        class FakeModel:
+            pass
+
+        for bad in (FakeModel(), ("path", "adapter", None), 42, None, b"key"):
+            with self.assertRaises(TypeError):
+                registry.freeze(bad, tokens, cache)
+            with self.assertRaises(TypeError):
+                registry.fetch_fork(bad, tokens)
+            with self.assertRaises(TypeError):
+                compute_cid(bad, tokens)
+        self.assertEqual(len(registry), 0)
+
+    def test_distinct_string_keys_never_collide(self):
+        registry = PrefixForkRegistry()
+        tokens = list(range(16))
+        mx.random.seed(11)
+        cache_a = _prime_cache(tokens)
+        mx.random.seed(12)
+        cache_b = _prime_cache(tokens)
+        cid_a = registry.freeze("org/model@rev1", tokens, cache_a)
+        cid_b = registry.freeze("org/model@rev2", tokens, cache_b)
+        self.assertNotEqual(cid_a, cid_b)
+        self.assertEqual(len(registry), 2)
+        got_a = registry.fetch_fork("org/model@rev1", tokens)[0]
+        got_b = registry.fetch_fork("org/model@rev2", tokens)[0]
+        self.assertTrue(mx.array_equal(got_a[0].state[0], cache_a[0].state[0]))
+        self.assertTrue(mx.array_equal(got_b[0].state[0], cache_b[0].state[0]))
+
+    def test_key_contract_weight_swap_misses(self):
+        # B1 contract, documented: the key MUST change when the weights
+        # change (adapter load). The caller changing the key converts what
+        # was a deterministic stale-KV HIT into a safe MISS.
+        registry = PrefixForkRegistry()
+        tokens = list(range(24))
+        registry.freeze("org/model@base", tokens, _prime_cache(tokens))
+        forks, remaining = registry.fetch_fork("org/model@base+adapterX", tokens)
+        self.assertIsNone(forks)
+        self.assertEqual(remaining, tokens)
+
+    def test_dedup_content_mismatch_raises(self):
+        # F3 regression: same key + tokens but DIFFERENT KV content (weights
+        # changed under a stale key) must raise, not silently dedup.
+        registry = PrefixForkRegistry()
+        tokens = list(range(32))
+        mx.random.seed(21)
+        registry.freeze("org/model@base", tokens, _prime_cache(tokens))
+        mx.random.seed(22)
+        post_adapter = _prime_cache(tokens)
+        with self.assertRaises(ValueError):
+            registry.freeze("org/model@base", tokens, post_adapter)
 
     def test_freeze_rejects_unsupported_caches(self):
         registry = PrefixForkRegistry()
@@ -156,20 +293,19 @@ class TestPrefixForkRegistry(unittest.TestCase):
     def test_cid_dedup(self):
         registry = PrefixForkRegistry()
         tokens = list(range(32))
-        mx.random.seed(3)
         cache_a = _prime_cache(tokens)
-        mx.random.seed(4)
-        cache_b = _prime_cache(tokens)
+        cache_b = copy.deepcopy(cache_a)  # same content, different arrays
 
         cid_a = registry.freeze("m", tokens, cache_a)
         nbytes = registry.nbytes
         cid_b = registry.freeze("m", tokens, cache_b)
-        # Same content (model, tokens) -> same cid, ONE snapshot, bytes once
+        # Same content (model key, tokens, KV) -> same cid, ONE snapshot,
+        # bytes counted once
         self.assertEqual(cid_a, cid_b)
         self.assertEqual(len(registry), 1)
         self.assertEqual(registry.nbytes, nbytes)
 
-        # Different tokens or model namespace -> different cid
+        # Different tokens or model key -> different cid
         self.assertNotEqual(compute_cid("m", tokens), compute_cid("m", tokens[:-1]))
         self.assertNotEqual(compute_cid("m", tokens), compute_cid("m2", tokens))
 
@@ -190,7 +326,7 @@ class TestPrefixForkRegistry(unittest.TestCase):
         self.assertIsNotNone(forks2)  # falls back to the shorter snapshot
         self.assertEqual(forks2[0].prefix_length, len(short))
 
-        # Unknown model / tokens: miss returns the tokens unchanged
+        # Unknown model key / tokens: miss returns the tokens unchanged
         forks3, remaining3 = registry.fetch_fork("other", request)
         self.assertIsNone(forks3)
         self.assertEqual(remaining3, request)
@@ -217,11 +353,38 @@ class TestPrefixForkRegistry(unittest.TestCase):
         self.assertIsNotNone(registry.fetch_fork("m", toks[1])[0])
         self.assertIsNotNone(registry.fetch_fork("m", toks[2])[0])
 
+    def test_pinned_nbytes_tracks_live_forks(self):
+        # F4 regression: nbytes drops on invalidate while live forks still
+        # pin the snapshot's memory. pinned_nbytes reports that residency.
+        registry = PrefixForkRegistry()
+        tokens = list(range(400))
+        cid = registry.freeze("m", tokens, _prime_cache(tokens))
+        snap_bytes = registry.get(cid).nbytes
+        self.assertEqual(registry.nbytes, snap_bytes)
+        self.assertEqual(registry.pinned_nbytes, 0)  # no forks yet
+
+        forks, _ = registry.fetch_fork("m", tokens)
+        self.assertEqual(registry.pinned_nbytes, snap_bytes)
+
+        registry.invalidate(cid)
+        # Discoverability gone, residency not: max_bytes bounds the
+        # discoverable set only.
+        self.assertEqual(registry.nbytes, 0)
+        self.assertEqual(registry.pinned_nbytes, snap_bytes)
+
+        del forks
+        gc.collect()
+        self.assertEqual(registry.pinned_nbytes, 0)
+
 
 class TestPrefixForksWithModel(unittest.TestCase):
     """End-to-end correctness against the real model used by the prompt-cache
     suite. Bar: a fork must be indistinguishable (greedy, token-exact) from a
     full deepcopy of the same cache, while never touching the parent."""
+
+    # The stable weight-identity string the registry requires (see the
+    # MODEL-KEY CONTRACT in prefix_forks.py).
+    MODEL_KEY = HF_MODEL_PATH + "@main"
 
     @classmethod
     def setUpClass(cls):
@@ -232,7 +395,11 @@ class TestPrefixForksWithModel(unittest.TestCase):
         )
         cls.tokens = cls.tokenizer.encode(text)
         assert len(cls.tokens) > 300  # prefix must cross the step=256 boundary
-        cls.prefix = cls.tokens[:-1]
+        # Multi-token suffix: N>1 prefill through the fork exercises the
+        # causal mask / position handling (a flipped prefix/tail concat is
+        # invisible to N=1 decode, which is permutation-invariant over keys).
+        cls.prefix = cls.tokens[:-4]
+        cls.suffix = cls.tokens[-4:]
         cls.cache = make_prompt_cache(cls.model)
         cls.model(mx.array(cls.prefix)[None], cache=cls.cache)
         mx.eval(*(x for c in cls.cache for x in c.state))
@@ -247,17 +414,20 @@ class TestPrefixForksWithModel(unittest.TestCase):
 
     def test_fork_generation_matches_deepcopy(self):
         registry = PrefixForkRegistry()
-        cid = registry.freeze(self.model, self.prefix, self.cache)
+        cid = registry.freeze(self.MODEL_KEY, self.prefix, self.cache)
         self.assertIsNotNone(cid)
         snapshot = registry.get(cid)
 
-        # Fork creation must be O(tail): no prefix-sized materialization
+        # Fork creation must be O(tail): no prefix-sized materialization.
+        # Measure AFTER evaluating everything the fork exposes, so a lazy
+        # O(prefix) copy cannot hide behind deferred execution.
         mx.eval(*(a for s in [snapshot] for a in s.keys + s.values))
         base_mem = mx.get_active_memory()
-        forks, remaining = registry.fetch_fork(self.model, self.tokens)
-        fork_mem = mx.get_active_memory() - base_mem
+        forks, remaining = registry.fetch_fork(self.MODEL_KEY, self.tokens)
         self.assertIsNotNone(forks)
-        self.assertEqual(remaining, [self.tokens[-1]])
+        self.assertEqual(remaining, self.suffix)
+        mx.eval(*(a for f in forks for a in f.state))
+        fork_mem = mx.get_active_memory() - base_mem
         self.assertLess(fork_mem, max(1 << 20, snapshot.nbytes // 20))
         self.assertEqual(sum(f.nbytes for f in forks), 0)
 
@@ -265,7 +435,8 @@ class TestPrefixForksWithModel(unittest.TestCase):
         before = [mx.array(a) for a in snapshot.keys + snapshot.values]
         mx.eval(*before)
 
-        # (1) Token-exact equivalence with a full deepcopy continuation
+        # (1) Token-exact equivalence with a full deepcopy continuation,
+        # through an N>1 prefill (position-sensitive) then 110 decode steps
         ref_cache = copy.deepcopy(self.cache)
         ref = self._greedy(remaining, ref_cache, 110)
         got = self._greedy(remaining, forks, 110)
@@ -280,14 +451,14 @@ class TestPrefixForksWithModel(unittest.TestCase):
 
     def test_sibling_forks_do_not_contaminate(self):
         registry = PrefixForkRegistry()
-        cid = registry.freeze(self.model, self.prefix, self.cache)
+        cid = registry.freeze(self.MODEL_KEY, self.prefix, self.cache)
         snapshot = registry.get(cid)
 
-        suffix_a = [self.tokens[-1]]
+        suffix_a = self.suffix
         suffix_b = self.tokenizer.encode(" thunder shook the")
 
-        forks_a, _ = registry.fetch_fork(self.model, self.prefix + suffix_a)
-        forks_b, _ = registry.fetch_fork(self.model, self.prefix + suffix_b)
+        forks_a, _ = registry.fetch_fork(self.MODEL_KEY, self.prefix + suffix_a)
+        forks_b, _ = registry.fetch_fork(self.MODEL_KEY, self.prefix + suffix_b)
 
         # Independent single-user references for both continuations
         ref_a = self._greedy(suffix_a, copy.deepcopy(self.cache), 40)
@@ -301,10 +472,12 @@ class TestPrefixForksWithModel(unittest.TestCase):
         self.assertEqual(ref_b, got_b)
         self.assertNotEqual(got_a, got_b)  # sanity: they really diverged
 
-        # And the shared parent still froze exactly the prefix
+        # And the shared parent still froze exactly the prefix, with both
+        # forks referencing the SAME snapshot (no per-fork copies)
         self.assertEqual(len(snapshot), len(self.prefix))
         for f_a, f_b in zip(forks_a, forks_b):
-            self.assertIs(f_a._prefix_keys, f_b._prefix_keys)  # truly shared
+            self.assertIs(f_a._snapshot, f_b._snapshot)
+            self.assertIs(f_a._snapshot, snapshot)
 
 
 if __name__ == "__main__":
