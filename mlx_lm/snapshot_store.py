@@ -8,16 +8,23 @@ uncompressed because compression prevents ``mx.load`` from memory mapping the
 payload.  The store provides no repair, redundancy, lossy re-quantization,
 OS-sleep handling, or adaptive sizing: cached KV is recomputable, so every
 integrity doubt becomes quarantine plus a safe miss.
+
+Chain restore concatenates cumulative root-to-leaf state. At the default
+depth cap of eight this can transiently allocate several times the final KV
+size; representative-scale benchmarks must include that state-budget cost.
 """
 
 import fcntl
+import functools
 import hashlib
 import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
+import weakref
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from numbers import Integral
@@ -31,11 +38,22 @@ from .prefix_forks import FrozenPrefixSnapshot, compute_cid
 
 FORMAT_VERSION = "1"
 KNOWN_FEATURES = frozenset({"delta-chain", "payload-sha256"})
-_PROCESS_LOCKS = {}
+_PROCESS_OWNERS = {}
+_OWNERS_LOCK = threading.Lock()
 
 
 class SnapshotCorruptError(RuntimeError):
     """A snapshot cannot be trusted and must be treated as a miss."""
+
+
+def _owned_operation(method):
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        self._assert_owner()
+        with self._operation_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 def _array_digest(array: mx.array) -> str:
@@ -97,16 +115,18 @@ class SnapshotRecord:
     parent_length: int
     depth: int
     logical_nbytes: int
+    payload_nbytes: int
     file_bytes: int
     last_use: float
     digests: Tuple[Tuple[str, str], ...]
+    tensor_offsets: Tuple[Tuple[Tuple[int, int], Tuple[int, int]], ...]
 
 
 class DiskBackedSnapshot:
     """Header-only registry entry; KV payload is restored on first fork."""
 
     def __init__(self, store: "SnapshotStore", record: SnapshotRecord):
-        self._store = store
+        self._store_ref = weakref.ref(store)
         self._record = record
         self._forks = ()
 
@@ -134,8 +154,15 @@ class DiskBackedSnapshot:
         return len(self.tokens)
 
     def fork(self):
-        snapshot = self._store.restore(self.cid)
+        store = self._store_ref()
+        if store is None:
+            return None
+        snapshot = store.restore(self.cid)
         return None if snapshot is None else snapshot.fork()
+
+    def materialize(self):
+        store = self._store_ref()
+        return None if store is None else store.restore(self.cid)
 
 
 class SnapshotStore:
@@ -162,9 +189,16 @@ class SnapshotStore:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.directory, 0o700)
-        lock_key = str(self.directory.resolve())
-        lock_fd = _PROCESS_LOCKS.get(lock_key)
-        if lock_fd is None:
+        self._lock_key = str(self.directory.resolve())
+        self._owner_pid = os.getpid()
+        self._closed = False
+        with _OWNERS_LOCK:
+            owner_ref = _PROCESS_OWNERS.get(self._lock_key)
+            owner = owner_ref() if owner_ref is not None else None
+            if owner is not None:
+                raise RuntimeError(
+                    f"snapshot directory already has a live writer: {self.directory}"
+                )
             lock_path = self.directory / ".writer.lock"
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
@@ -175,8 +209,9 @@ class SnapshotStore:
                     f"snapshot directory already has a live writer: {self.directory}"
                 ) from exc
             os.chmod(lock_path, 0o600)
-            _PROCESS_LOCKS[lock_key] = lock_fd
+            _PROCESS_OWNERS[self._lock_key] = weakref.ref(self)
         self._lock_fd = lock_fd
+        self._operation_lock = threading.RLock()
         self.max_bytes = int(max_bytes)
         self.max_files = int(max_files)
         self.max_chain_depth = int(max_chain_depth)
@@ -185,8 +220,49 @@ class SnapshotStore:
         self._ram_ghosts = deque(maxlen=256)
         self._disk_ghosts = deque(maxlen=256)
         self._scrub_cursor = 0
+        self._scrub_state = None
+        self._index_dirty = False
         self._stats = Counter()
-        self.rebuild(registry)
+        self._blocked_cids = set()
+        try:
+            self.rebuild(registry)
+        except Exception:
+            self.close()
+            raise
+
+    def _assert_owner(self):
+        if self._closed or os.getpid() != self._owner_pid:
+            raise RuntimeError("snapshot store is closed or inherited across fork")
+
+    def close(self):
+        if getattr(self, "_closed", True):
+            return
+        if os.getpid() != self._owner_pid:
+            # A fork inherited the descriptor but not ownership. Closing the
+            # child copy is safe; LOCK_UN would release the parent's flock.
+            os.close(self._lock_fd)
+            self._closed = True
+            return
+        try:
+            if getattr(self, "_index_dirty", False):
+                self._write_index()
+        except Exception:
+            logging.exception("Failed to flush snapshot LRU index during close")
+        with _OWNERS_LOCK:
+            owner_ref = _PROCESS_OWNERS.get(self._lock_key)
+            if owner_ref is not None and owner_ref() is self:
+                _PROCESS_OWNERS.pop(self._lock_key, None)
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._lock_fd)
+            self._closed = True
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @property
     def stats(self):
@@ -199,7 +275,7 @@ class SnapshotStore:
 
     def _parse_record(self, path: Path) -> SnapshotRecord:
         os.chmod(path, 0o600)
-        header, _ = _read_header(path)
+        header, data_start = _read_header(path)
         metadata = header.get("__metadata__")
         if not isinstance(metadata, dict):
             raise SnapshotCorruptError("missing metadata")
@@ -251,6 +327,7 @@ class SnapshotStore:
         ):
             raise SnapshotCorruptError("invalid parent cid")
         digests = []
+        tensor_offsets = []
         expected_names = {f"{side}.{layer}" for layer in range(layers) for side in "kv"}
         actual_names = {name for name in header if name != "__metadata__"}
         if actual_names != expected_names:
@@ -274,6 +351,15 @@ class SnapshotStore:
             ):
                 raise SnapshotCorruptError("invalid payload digest")
             digests.append(pair)
+            tensor_offsets.append(
+                (
+                    tuple(data_start + x for x in header[k_name]["data_offsets"]),
+                    tuple(data_start + x for x in header[v_name]["data_offsets"]),
+                )
+            )
+        payload_nbytes = sum(
+            end - start for pair in tensor_offsets for start, end in pair
+        )
         return SnapshotRecord(
             cid=cid,
             path=path,
@@ -284,14 +370,16 @@ class SnapshotStore:
             parent_length=parent_length,
             depth=depth,
             logical_nbytes=logical_nbytes,
+            payload_nbytes=payload_nbytes,
             file_bytes=path.stat().st_size,
             last_use=created_at,
             digests=tuple(digests),
+            tensor_offsets=tuple(tensor_offsets),
         )
 
-    def _quarantine(self, path: Path, reason: str):
+    def _quarantine(self, path: Path, reason: str) -> bool:
         if not path.exists():
-            return
+            return False
         target = path.with_suffix(".quarantined")
         if target.exists():
             target = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.quarantined")
@@ -300,14 +388,18 @@ class SnapshotStore:
             os.chmod(target, 0o600)
         except OSError:
             logging.warning("Snapshot quarantine failed for %s", path)
+            return False
         self._stats["quarantines"] += 1
         logging.warning("Snapshot %s quarantined: %s", path.stem, reason)
+        return True
 
+    @_owned_operation
     def rebuild(self, registry=None):
         """Header-only directory scan; tensor payloads remain untouched."""
         if registry is not None:
             self.registry = registry
         self._records.clear()
+        self._blocked_cids.clear()
         # A temp is never authoritative.  A previous crash may leave one.
         for path in self.directory.iterdir():
             if ".tmp-" in path.name:
@@ -328,7 +420,8 @@ class SnapshotStore:
         self._load_index_lru()
         if self.registry is not None:
             for record in self._records.values():
-                self.registry.register_snapshot(DiskBackedSnapshot(self, record))
+                if record.cid not in self._blocked_cids:
+                    self.registry.register_snapshot(DiskBackedSnapshot(self, record))
         self._write_index()
         self.gc()
         return len(self._records)
@@ -350,6 +443,16 @@ class SnapshotStore:
                     or record.depth > self.max_chain_depth
                 ):
                     bad.add(cid)
+                elif (
+                    record.logical_nbytes
+                    != parent.logical_nbytes + record.payload_nbytes
+                ):
+                    bad.add(cid)
+            if (
+                record.parent_cid is None
+                and record.logical_nbytes != record.payload_nbytes
+            ):
+                bad.add(cid)
             seen = set()
             current = cid
             while current:
@@ -367,9 +470,13 @@ class SnapshotStore:
                     bad.add(cid)
                     changed = True
         for cid in bad:
-            record = self._records.pop(cid, None)
+            record = self._records.get(cid)
             if record is not None:
-                self._quarantine(record.path, "missing or cyclic parent chain")
+                self._blocked_cids.add(cid)
+                if self._quarantine(
+                    record.path, "invalid parent chain or logical byte count"
+                ):
+                    self._records.pop(cid, None)
 
     def _load_index_lru(self):
         path = self.directory / "index.json"
@@ -396,6 +503,7 @@ class SnapshotStore:
                 path.unlink()
             except FileNotFoundError:
                 pass
+            self._index_dirty = False
             return
         temp = self.directory / f"index.json.tmp-{uuid.uuid4().hex}"
         data = {
@@ -409,6 +517,7 @@ class SnapshotStore:
         os.chmod(temp, 0o600)
         os.replace(temp, path)
         os.chmod(path, 0o600)
+        self._index_dirty = False
 
     def _choose_parent(self, snapshot) -> Optional[SnapshotRecord]:
         best = None
@@ -425,13 +534,21 @@ class SnapshotStore:
         # longest chain reaches the cap, this write is a new whole root.
         return None if best is not None and best.depth >= self.max_chain_depth else best
 
+    @_owned_operation
     def save(self, snapshot: FrozenPrefixSnapshot) -> str:
         """Atomically save one RAM snapshot, delta-chained when profitable."""
+        self._assert_owner()
         cid = snapshot.cid
+        final = self.directory / f"{cid}.safetensors"
+        # The pathname is authoritative under the exclusive writer lock; a
+        # stale private index may never overwrite an already-visible cid.
+        if final.exists() and cid not in self._records:
+            self._records[cid] = self._parse_record(final)
         if cid in self._records:
             stored = self._restore(cid, record_hit=False, promote=False)
             if stored is None or not self._snapshots_equal(snapshot, stored):
-                raise ValueError(
+                self.quarantine_cid(cid, "same-cid KV payload mismatch")
+                raise SnapshotCorruptError(
                     f"snapshot content mismatch for existing cid {cid}; "
                     "the model key must change whenever weights change"
                 )
@@ -470,7 +587,6 @@ class SnapshotStore:
         # Keep the safetensors suffix: MLX otherwise appends one, which would
         # make the path passed to chmod/replace differ from the file written.
         temp = self.directory / f".{cid}.tmp-{uuid.uuid4().hex}.safetensors"
-        final = self.directory / f"{cid}.safetensors"
         try:
             mx.save_safetensors(str(temp), tensors, metadata)
             os.chmod(temp, 0o600)
@@ -483,7 +599,10 @@ class SnapshotStore:
         os.chmod(final, 0o600)
         record = self._parse_record(final)
         self._records[cid] = record
-        self._stats["demotions"] += 1
+        self._blocked_cids.discard(cid)
+        self._disk_ghosts = deque(
+            (ghost for ghost in self._disk_ghosts if ghost[2] != cid), maxlen=256
+        )
         self._write_index()
         self.gc()
         return cid
@@ -562,6 +681,7 @@ class SnapshotStore:
         ) as exc:
             raise SnapshotCorruptError(str(exc)) from exc
 
+    @_owned_operation
     def restore(self, cid: str) -> Optional[FrozenPrefixSnapshot]:
         """Walk and verify root→leaf, returning a materialized snapshot."""
         return self._restore(cid, record_hit=True, promote=True)
@@ -569,10 +689,8 @@ class SnapshotStore:
     def _restore(
         self, cid: str, *, record_hit: bool, promote: bool
     ) -> Optional[FrozenPrefixSnapshot]:
-        if cid in self._disk_ghosts:
-            self._stats["ghost_hits"] += 1
         record = self._records.get(cid)
-        if record is None:
+        if record is None or cid in self._blocked_cids:
             return None
         chain, seen = [], set()
         current = record
@@ -641,6 +759,9 @@ class SnapshotStore:
             self._stats["disk_hits"] += 1
         if promote:
             self._stats["promotions"] += 1
+            self._ram_ghosts = deque(
+                (ghost for ghost in self._ram_ghosts if ghost[2] != cid), maxlen=256
+            )
         snapshot = FrozenPrefixSnapshot(
             cid, record.model_key, record.tokens, keys, values
         )
@@ -650,9 +771,12 @@ class SnapshotStore:
 
     def _quarantine_chain(self, chain, reason):
         for record in chain:
-            self._records.pop(record.cid, None)
-            self._quarantine(record.path, reason)
-            if self.registry is not None:
+            self._blocked_cids.add(record.cid)
+            if self._quarantine(record.path, reason):
+                self._records.pop(record.cid, None)
+            if self.registry is not None and isinstance(
+                self.registry.get(record.cid), DiskBackedSnapshot
+            ):
                 self.registry.invalidate(record.cid)
         self._write_index()
         self.gc()
@@ -670,27 +794,61 @@ class SnapshotStore:
             [self._records[x] for x in poisoned if x in self._records], reason
         )
 
+    @_owned_operation
+    def quarantine_cid(self, cid: str, reason: str):
+        """Quarantine an ambiguous disk identity and force a full RAM miss."""
+        self._quarantine_descendants(cid, reason)
+        if self.registry is not None:
+            self.registry.invalidate(cid)
+
     def _touch(self, cid):
         record = self._records.pop(cid, None)
         if record is not None:
             record.last_use = time.time()
             self._records[cid] = record
+            self._index_dirty = True
 
-    def flush_registry(self, registry=None):
-        """Write every unsaved RAM snapshot; safe to call only while idle."""
+    @_owned_operation
+    def flush_registry(
+        self,
+        registry=None,
+        *,
+        max_snapshots=None,
+        max_bytes=None,
+        deadline=None,
+    ):
+        """Write a bounded batch of unsaved RAM snapshots while quiescent."""
+        self._assert_owner()
         registry = registry or self.registry
         if registry is None:
             return 0
         count = 0
+        spent = 0
         for snapshot in registry.snapshots():
+            if max_snapshots is not None and count >= max_snapshots:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             if (
                 isinstance(snapshot, FrozenPrefixSnapshot)
                 and snapshot.cid not in self._records
             ):
+                if max_bytes is not None and spent + snapshot.nbytes > max_bytes:
+                    continue
                 self.save(snapshot)
                 count += 1
+                spent += snapshot.nbytes
+        if self._index_dirty:
+            self._write_index()
         return count
 
+    @_owned_operation
+    def flush_index(self):
+        self._assert_owner()
+        if self._index_dirty:
+            self._write_index()
+
+    @_owned_operation
     def demote_from_ram(self, cid: str) -> bool:
         """Replace a discoverable RAM snapshot with its header-only proxy."""
         if self.registry is None:
@@ -706,36 +864,113 @@ class SnapshotStore:
             return False
         replaced = self.registry.replace_snapshot(DiskBackedSnapshot(self, record))
         if replaced:
-            self._ram_ghosts.append(cid)
-            if already_on_disk:
-                self._stats["demotions"] += 1
+            self._ram_ghosts.append((record.model_key, record.tokens, cid))
+            self._stats["demotions"] += 1
         return replaced
 
     def scrub_one(self) -> bool:
         """Verify one snapshot's complete per-layer payload, round-robin."""
-        if not self._records:
+        while self._records:
+            completed = self.scrub_increment(max_bytes=64 << 20)
+            if completed:
+                return True
+            if self._scrub_state is None:
+                return False
+        return False
+
+    @_owned_operation
+    def scrub_increment(self, *, max_bytes=8 << 20, deadline=None) -> bool:
+        """Hash at most ``max_bytes`` of one tensor and resume next tick."""
+        self._assert_owner()
+        if not self._records or max_bytes <= 0:
             return False
-        cids = list(self._records)
-        cid = cids[self._scrub_cursor % len(cids)]
-        self._scrub_cursor += 1
-        record = self._records[cid]
+        if self._scrub_state is None:
+            cids = list(self._records)
+            cid = cids[self._scrub_cursor % len(cids)]
+            self._scrub_state = {
+                "cid": cid,
+                "layer": 0,
+                "side": 0,
+                "position": None,
+                "hasher": hashlib.sha256(),
+            }
+        state = self._scrub_state
+        record = self._records.get(state["cid"])
+        if record is None:
+            self._scrub_state = None
+            return False
+        remaining = max_bytes
         try:
-            self._load_delta(record)
-            self._stats["scrubs"] += 1
-            return True
-        except SnapshotCorruptError as exc:
+            while remaining > 0 and (deadline is None or time.monotonic() < deadline):
+                start, end = record.tensor_offsets[state["layer"]][state["side"]]
+                position = state["position"] if state["position"] is not None else start
+                amount = min(1 << 20, remaining, end - position)
+                with record.path.open("rb") as handle:
+                    handle.seek(position)
+                    chunk = handle.read(amount)
+                if len(chunk) != amount:
+                    raise SnapshotCorruptError("truncated payload during scrub")
+                state["hasher"].update(chunk)
+                position += amount
+                remaining -= amount
+                state["position"] = position
+                if position == end:
+                    expected = record.digests[state["layer"]][state["side"]]
+                    if state["hasher"].hexdigest() != expected:
+                        raise SnapshotCorruptError(
+                            f"payload digest mismatch at layer {state['layer']}"
+                        )
+                    state["side"] += 1
+                    state["position"] = None
+                    state["hasher"] = hashlib.sha256()
+                    if state["side"] == 2:
+                        state["side"] = 0
+                        state["layer"] += 1
+                    if state["layer"] == len(record.digests):
+                        self._stats["scrubs"] += 1
+                        self._scrub_cursor += 1
+                        self._scrub_state = None
+                        return True
+        except (OSError, SnapshotCorruptError) as exc:
+            self._scrub_state = None
             self._quarantine_descendants(record.cid, str(exc))
-            return False
+        return False
 
     def note_ram_eviction(self, cid: str):
         """Record ARC-style RAM ghost telemetry (sizing remains static)."""
-        self._ram_ghosts.append(cid)
+        self._assert_owner()
+        if self._operation_lock.acquire(blocking=False):
+            try:
+                record = self._records.get(cid)
+                if record is not None:
+                    self._ram_ghosts.append((record.model_key, record.tokens, cid))
+            finally:
+                self._operation_lock.release()
 
-    def note_request_cid(self, cid: str):
-        """Count requests that would have hit either telemetry ghost list."""
-        if cid in self._ram_ghosts or cid in self._disk_ghosts:
-            self._stats["ghost_hits"] += 1
+    def note_ram_hit(self, cid: str):
+        """Keep disk LRU aligned with accesses served from promoted RAM."""
+        self._assert_owner()
+        if self._operation_lock.acquire(blocking=False):
+            try:
+                self._touch(cid)
+            finally:
+                self._operation_lock.release()
 
+    def note_request(self, model_key: str, tokens: List[int]):
+        """Count requests whose longest prefix was recently evicted."""
+        self._assert_owner()
+        if self._operation_lock.acquire(blocking=False):
+            try:
+                ghosts = list(self._ram_ghosts) + list(self._disk_ghosts)
+                if any(
+                    key == model_key and tuple(tokens[: len(prefix)]) == prefix
+                    for key, prefix, _ in ghosts
+                ):
+                    self._stats["ghost_hits"] += 1
+            finally:
+                self._operation_lock.release()
+
+    @_owned_operation
     def gc(self):
         """Enforce both caps, evicting least-recently-used leaves first."""
 
@@ -753,27 +988,37 @@ class SnapshotStore:
                 break
             # Rebuildable/transient artifacts never deserve eviction
             # protection over valid KV data.
-            candidates = [p for p in files if p.suffix != ".safetensors"]
+            known_paths = {record.path for record in self._records.values()}
+            candidates = [
+                p for p in files if p.suffix != ".safetensors" or p not in known_paths
+            ]
             if candidates:
                 victim = min(candidates, key=lambda p: p.stat().st_mtime)
                 try:
                     victim.unlink()
                     continue
-                except OSError:
-                    pass
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"snapshot cap enforcement could not unlink {victim}"
+                    ) from exc
             parents = {r.parent_cid for r in self._records.values() if r.parent_cid}
             leaf = next(
                 (r for r in self._records.values() if r.cid not in parents), None
             )
             if leaf is not None:
-                self._records.pop(leaf.cid, None)
                 try:
                     leaf.path.unlink()
-                except OSError:
-                    pass
-                self._disk_ghosts.append(leaf.cid)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"snapshot cap enforcement could not unlink {leaf.path}"
+                    ) from exc
+                self._records.pop(leaf.cid, None)
+                self._index_dirty = True
+                self._disk_ghosts.append((leaf.model_key, leaf.tokens, leaf.cid))
                 self._stats["gc_files"] += 1
-                if self.registry is not None:
+                if self.registry is not None and isinstance(
+                    self.registry.get(leaf.cid), DiskBackedSnapshot
+                ):
                     self.registry.invalidate(leaf.cid)
                 continue
             break

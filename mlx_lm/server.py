@@ -6,16 +6,18 @@ import json
 import logging
 import pickle
 import platform
+import signal
 import socket
 import time
 import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -45,7 +47,7 @@ from .models.cache import LRUPromptCache, make_prompt_cache
 from .prefix_forks import FrozenPrefixSnapshot, PrefixForkRegistry, compute_cid
 from .sample_utils import make_logits_processors, make_sampler
 from .snapshot_store import SnapshotStore
-from .utils import _parse_size, load, sharded_load
+from .utils import _download, _parse_size, load, sharded_load
 
 
 def get_system_fingerprint():
@@ -279,6 +281,7 @@ class ModelProvider:
         """Load models on demand and persist them across the whole process."""
         self.cli_args = cli_args
         self.model_key = None
+        self._request_model_key = None
         self.model = None
         self.tokenizer = None
         self.draft_model = None
@@ -316,9 +319,20 @@ class ModelProvider:
 
         # Remove the old model if it exists.
         self.model_key = None
+        self._request_model_key = None
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+
+        # Resolve the exact immutable snapshot paths through the SAME helper
+        # used by the loader. Persistent identity must describe loaded bytes,
+        # never whichever unrelated revision was downloaded most recently.
+        request_key = (model_path, adapter_path, draft_model_path)
+        model_path = str(_download(model_path))
+        if draft_model_path is not None:
+            draft_model_path = str(_download(draft_model_path))
+        if adapter_path is not None:
+            adapter_path = str(Path(adapter_path).expanduser().resolve())
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -360,6 +374,7 @@ class ModelProvider:
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
+        self._request_model_key = request_key
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
@@ -375,7 +390,7 @@ class ModelProvider:
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
-        if self.model_key != model_key:
+        if self._request_model_key != model_key:
             self._load(*model_key)
 
         return self.model, self.tokenizer
@@ -396,44 +411,25 @@ def _persistent_model_key(model_key) -> str:
             return None
         path = Path(str(value)).expanduser()
         if not path.exists():
-            source = str(value)
-            try:
-                cache_info = scan_cache_dir()
-                repo = next(
-                    repo
-                    for repo in cache_info.repos
-                    if repo.repo_type == "model" and repo.repo_id == source
-                )
-                revision = max(
-                    repo.revisions, key=lambda item: item.last_modified
-                ).commit_hash
-                return {"source": source, "revision": revision}
-            except (OSError, StopIteration, ValueError):
-                raise ValueError(
-                    f"cannot resolve an immutable cached revision for {source!r}; "
-                    "persistent prompt caching is disabled for this model"
-                ) from None
+            raise ValueError(
+                f"model identity path {str(value)!r} was not loader-resolved; "
+                "persistent prompt caching is disabled"
+            )
         path = path.resolve()
         files = (
             [path]
             if path.is_file()
             else sorted(p for p in path.rglob("*") if p.is_file())
         )
-        manifest = []
+        h = hashlib.sha256()
         for item in files:
-            if item.suffix in {".safetensors", ".json"} or "adapter" in item.name:
-                stat = item.stat()
-                manifest.append(
-                    [
-                        str(item.relative_to(path) if path.is_dir() else item.name),
-                        stat.st_size,
-                        stat.st_mtime_ns,
-                    ]
-                )
-        digest = hashlib.sha256(
-            json.dumps(manifest, separators=(",", ":")).encode()
-        ).hexdigest()
-        return {"path": str(path), "revision_manifest": digest}
+            relative = str(item.relative_to(path) if path.is_dir() else item.name)
+            h.update(len(relative.encode()).to_bytes(8, "big"))
+            h.update(relative.encode())
+            with item.open("rb") as handle:
+                while chunk := handle.read(4 << 20):
+                    h.update(chunk)
+        return {"path": str(path), "content_sha256": h.hexdigest()}
 
     parts = model_key if isinstance(model_key, tuple) else (model_key,)
     return json.dumps(
@@ -455,7 +451,9 @@ class PersistentPromptCache:
     def __init__(self, max_size, directory, *, max_bytes, max_files):
         self._fallback = LRUPromptCache(max_size)
         self._max_ram_snapshots = max_size
-        self._registry = PrefixForkRegistry(max_snapshots=max_files)
+        # Disk proxies remain indexed independently of the RAM promotion cap;
+        # store GC owns the actual file bound.
+        self._registry = PrefixForkRegistry(max_snapshots=1 << 63)
         self._store = SnapshotStore(
             directory,
             max_bytes=max_bytes,
@@ -464,6 +462,11 @@ class PersistentPromptCache:
         )
         self._last_scrub = 0.0
         self._stable_keys = {}
+        self._registry.on_evict = self._store.save
+        self._maintenance_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-kv-persist"
+        )
+        self._maintenance_future = None
 
     def _model_key(self, model):
         try:
@@ -500,15 +503,17 @@ class PersistentPromptCache:
         except ValueError as exc:
             logging.warning("Persistent prompt cache safe miss: %s", exc)
             return self._fallback.fetch_nearest_cache(model, tokens)
-        self._store.note_request_cid(compute_cid(stable_key, tokens))
+        self._store.note_request(stable_key, tokens)
         forks, rest = self._registry.fetch_fork(stable_key, tokens)
         if forks is not None:
+            snapshot = getattr(forks[0], "_snapshot", None) if forks else None
+            if snapshot is not None:
+                self._store.note_ram_hit(snapshot.cid)
             self._enforce_ram_limit()
             return forks, rest
         return self._fallback.fetch_nearest_cache(model, tokens)
 
     def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
-        self._store.flush_registry(self._registry)
         offsets = [getattr(cache, "offset", None) for cache in prompt_cache]
         if (
             offsets
@@ -531,7 +536,18 @@ class PersistentPromptCache:
                     existing, FrozenPrefixSnapshot
                 ):
                     self._store.restore(cid)
-                cid = self._registry.freeze(stable_key, tokens[:length], prompt_cache)
+                try:
+                    cid = self._registry.freeze(
+                        stable_key, tokens[:length], prompt_cache
+                    )
+                except ValueError:
+                    # A recomputed disk prefix disagrees with the persisted
+                    # bytes (kernel/runtime drift): quarantine and re-freeze,
+                    # never kill serving or preserve an ambiguous HIT.
+                    self._store.quarantine_cid(cid, "recomputed KV mismatch")
+                    cid = self._registry.freeze(
+                        stable_key, tokens[:length], prompt_cache
+                    )
                 if cid is not None:
                     self._enforce_ram_limit()
                     return
@@ -550,13 +566,46 @@ class PersistentPromptCache:
             victim = materialized.pop(0)
             self._store.demote_from_ram(victim.cid)
 
-    def flush_persistent(self, *, scrub=True):
-        count = self._store.flush_registry(self._registry)
+    def flush_persistent(self, *, scrub=True, shutdown=False):
+        """Best-effort maintenance; persistence can never kill serving."""
+        try:
+            if shutdown:
+                if self._maintenance_future is not None:
+                    self._maintenance_future.result()
+                count = self._store.flush_registry(self._registry)
+                self._store.flush_index()
+                return count
+            if self._maintenance_future is not None:
+                if not self._maintenance_future.done():
+                    return 0
+                self._maintenance_future.result()
+            self._maintenance_future = self._maintenance_pool.submit(
+                self._maintenance_tick, scrub
+            )
+            return 0
+        except Exception:
+            logging.exception("Persistent prompt-cache maintenance failed; continuing")
+            self._maintenance_future = None
+            return 0
+
+    def _maintenance_tick(self, scrub):
+        deadline = time.monotonic() + 0.02
+        count = self._store.flush_registry(
+            self._registry,
+            max_snapshots=1,
+            max_bytes=8 << 20,
+            deadline=deadline,
+        )
         now = time.monotonic()
         if scrub and now - self._last_scrub >= 1.0:
-            self._store.scrub_one()
+            self._store.scrub_increment(max_bytes=1 << 20, deadline=deadline)
             self._last_scrub = now
         return count
+
+    def close(self):
+        self.flush_persistent(scrub=False, shutdown=True)
+        self._maintenance_pool.shutdown(wait=True)
+        self._store.close()
 
 
 def _make_sampler(args, tokenizer):
@@ -611,14 +660,24 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
+        self._joined = False
+        self._stop_lock = Lock()
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
     def stop_and_join(self):
-        self._stop = True
-        self._generation_thread.join()
-        if hasattr(self.prompt_cache, "flush_persistent"):
-            self.prompt_cache.flush_persistent(scrub=False)
+        with self._stop_lock:
+            if self._joined:
+                return
+            self._stop = True
+            if self._generation_thread.is_alive():
+                self._generation_thread.join()
+            if hasattr(self.prompt_cache, "close"):
+                try:
+                    self.prompt_cache.close()
+                except Exception:
+                    logging.exception("Persistent prompt-cache shutdown failed")
+            self._joined = True
 
     def join(self):
         self._generation_thread.join()
@@ -1902,8 +1961,16 @@ def _run_http_server(
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        httpd.shutdown()
-        response_generator.stop_and_join()
+        pass
+    finally:
+        try:
+            httpd.shutdown()
+        except Exception:
+            logging.exception("HTTP server shutdown failed")
+        try:
+            response_generator.stop_and_join()
+        except Exception:
+            logging.exception("Response generator shutdown failed")
 
 
 def run(
@@ -1934,10 +2001,16 @@ def run(
     else:
         prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
-    if group.rank() == 0:
-        _run_http_server(host, port, response_generator)
-    else:
-        response_generator.join()
+    try:
+        if group.rank() == 0:
+            _run_http_server(host, port, response_generator)
+        else:
+            response_generator.join()
+    finally:
+        try:
+            response_generator.stop_and_join()
+        except Exception:
+            logging.exception("Response generator shutdown failed")
 
 
 def main():
@@ -2102,6 +2175,10 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    # SIGINT/SIGTERM take the same graceful path. SIGKILL cannot flush; at
+    # worst it loses unsaved recomputable snapshots, never exposes a partial
+    # cid because writes are temp+replace.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     run(args.host, args.port, ModelProvider(args))
 
 

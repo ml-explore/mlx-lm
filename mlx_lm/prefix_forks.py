@@ -450,7 +450,12 @@ class PrefixForkRegistry:
       an evicted snapshot are reported by ``pinned_nbytes``.
     """
 
-    def __init__(self, max_snapshots: int = 16, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_snapshots: int = 16,
+        max_bytes: int = 1 << 63,
+        on_evict=None,
+    ):
         for name, value in (
             ("max_snapshots", max_snapshots),
             ("max_bytes", max_bytes),
@@ -469,7 +474,8 @@ class PrefixForkRegistry:
         # older invalidated snapshot remains pinned by live forks.
         self._tracked: List["weakref.ref[FrozenPrefixSnapshot]"] = []
         self._n_bytes = 0
-        self._lock = threading.Lock()
+        self.on_evict = on_evict
+        self._lock = threading.RLock()
 
     def __len__(self):
         with self._lock:
@@ -530,6 +536,14 @@ class PrefixForkRegistry:
         cid = compute_cid(model_key, tokens)
         existing = self.get(cid)
         if existing is not None:
+            if not isinstance(existing, FrozenPrefixSnapshot):
+                materialize = getattr(existing, "materialize", None)
+                if materialize is None:
+                    return None
+                existing = materialize()
+                if existing is None:
+                    self.invalidate(cid)
+                    return None
             self._dedup_spot_check(existing, tokens, prompt_cache)
             with self._lock:
                 if cid in self._snapshots:
@@ -541,6 +555,11 @@ class PrefixForkRegistry:
         with self._lock:
             existing = self._snapshots.get(snapshot.cid)
             if existing is not None:  # lost a freeze race: dedup
+                if not isinstance(existing, FrozenPrefixSnapshot):
+                    materialize = getattr(existing, "materialize", None)
+                    existing = materialize() if materialize is not None else None
+                    if existing is None:
+                        return None
                 self._dedup_spot_check(existing, tokens, prompt_cache)
                 self._snapshots.move_to_end(snapshot.cid)
                 return snapshot.cid
@@ -707,4 +726,10 @@ class PrefixForkRegistry:
 
     def _evict_lru_locked(self):
         cid, snapshot = self._snapshots.popitem(last=False)
+        if self.on_evict is not None and isinstance(snapshot, FrozenPrefixSnapshot):
+            try:
+                self.on_evict(snapshot)
+            except Exception:
+                self._snapshots[cid] = snapshot
+                raise
         self._remove_locked(snapshot)
