@@ -349,6 +349,18 @@ class CacheEvictor:
             "prompt_cache_bytes": self._prompt_cache.nbytes,
         }
 
+    def _safe_stats(self) -> dict:
+        """Best-effort stats for refusal/error replies.
+
+        Stats are useful diagnostics, but failure to collect them must not
+        turn a bounded refusal into an exception or strand a claimed request.
+        """
+        try:
+            return self.stats()
+        except Exception:
+            logging.exception("Cache stats collection failed")
+            return {}
+
     def touch(self):
         """Mark the server as active, re-arming the idle timer."""
         self._last_activity = self._clock()
@@ -396,7 +408,11 @@ class CacheEvictor:
         except QueueEmpty:
             if message.abandon():
                 # We won: the loop will discard the message unserviced.
-                return {"evicted": False, "reason": "timeout", "stats": self.stats()}
+                return {
+                    "evicted": False,
+                    "reason": "timeout",
+                    "stats": self._safe_stats(),
+                }
             # The loop claimed the message right at the boundary and a reply
             # is guaranteed (claim -> put, see step()). Wait it out; the long
             # backstop only guards against the generation thread dying
@@ -404,9 +420,13 @@ class CacheEvictor:
             try:
                 result = message.response_queue.get(timeout=60.0)
             except QueueEmpty:  # pragma: no cover
-                return {"evicted": False, "reason": "timeout", "stats": self.stats()}
+                return {
+                    "evicted": False,
+                    "reason": "timeout",
+                    "stats": self._safe_stats(),
+                }
         if result is None:
-            return {"evicted": False, "reason": "busy", "stats": self.stats()}
+            return {"evicted": False, "reason": "busy", "stats": self._safe_stats()}
         return result
 
     def step(self, busy: bool):
@@ -438,10 +458,16 @@ class CacheEvictor:
                     result = self._evict(message.clear_prompt_cache, "on demand")
                 except Exception:
                     logging.exception("Cache eviction failed")
+                    # The endpoint request is activity. Re-arm the idle timer
+                    # after a failed attempt so the idle path cannot retry in
+                    # this same step and evict just after reporting failure.
+                    self.touch()
                     result = {
                         "evicted": False,
                         "reason": "error",
-                        "stats": self.stats(),
+                        # A claimed message must always receive a reply, even
+                        # when the failure is in the stats backend itself.
+                        "stats": self._safe_stats(),
                     }
             message.response_queue.put(result)
 
@@ -452,7 +478,13 @@ class CacheEvictor:
             and not self._idle_evicted
             and self._clock() - self._last_activity >= self._idle_s
         ):
-            self._evict(reason=f"idle for {self._idle_s:g}s")
+            try:
+                self._evict(reason=f"idle for {self._idle_s:g}s")
+            except Exception:
+                logging.exception("Cache eviction failed")
+                # Back off for a full idle interval instead of retrying and
+                # logging on every generation-loop poll.
+                self.touch()
 
 
 class ModelProvider:
@@ -1810,8 +1842,8 @@ class APIHandler(BaseHTTPRequestHandler):
         ``{"evicted": false}`` if the server is busy — evictions only run
         when no requests are queued or in flight.
         """
-        content_length = self.headers.get("Content-Length")
-        if content_length is None:
+        content_lengths = self.headers.get_all("Content-Length", [])
+        if not content_lengths:
             # Mirror the completion endpoints: chunked or length-less bodies
             # are not read, and silently ignoring one could drop a
             # `clear_prompt_cache` the client asked for.
@@ -1821,20 +1853,42 @@ class APIHandler(BaseHTTPRequestHandler):
                 json.dumps({"error": "Content-Length header is required"}).encode()
             )
             return
-        try:
-            content_length = int(content_length)
-        except ValueError:
+        if len(content_lengths) != 1:
+            # Never choose one value from ambiguous request framing on a
+            # destructive endpoint, even when duplicate values agree.
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Multiple Content-Length headers"}).encode()
+            )
+            return
+        content_length = content_lengths[0]
+        if self.headers.get("Transfer-Encoding") is not None:
+            # This server does not decode transfer codings. Reject an
+            # ambiguous CL+TE request instead of accepting Content-Length: 0
+            # and silently ignoring a chunked clear_prompt_cache option.
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Transfer-Encoding is not supported"}).encode()
+            )
+            return
+        # Content-Length is one or more ASCII decimal digits (RFC 9110).
+        # Python's int() also accepts signs and underscores, which would make
+        # malformed framing look valid.
+        if not content_length.isascii() or not content_length.isdigit():
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
                 json.dumps({"error": "Invalid Content-Length header"}).encode()
             )
             return
+        content_length = int(content_length)
         body = {}
         if content_length > 0:
             try:
                 body = json.loads(self.rfile.read(content_length).decode())
-            except json.JSONDecodeError as e:
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
                 self._set_completion_headers(400)
                 self.end_headers()
                 self.wfile.write(
@@ -1849,8 +1903,19 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        clear_prompt_cache = body.get("clear_prompt_cache", False)
+        if not isinstance(clear_prompt_cache, bool):
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {"error": "clear_prompt_cache must be a JSON boolean"}
+                ).encode()
+            )
+            return
+
         result = self.response_generator.cache_evictor.request_evict(
-            clear_prompt_cache=bool(body.get("clear_prompt_cache", False))
+            clear_prompt_cache=clear_prompt_cache
         )
         self._set_completion_headers(200)
         self.end_headers()

@@ -828,6 +828,23 @@ class TestCacheEvictor(unittest.TestCase):
             evictor.step(busy=False)
             self.assertEqual(clear_cache.call_count, 1)
 
+    def test_failed_idle_eviction_backs_off(self):
+        evictor, clock = self._make_evictor(idle_s=60.0)
+        clock.advance(61.0)
+        with mock.patch.object(
+            mx, "clear_cache", side_effect=RuntimeError("boom")
+        ) as clear_cache:
+            # A backend failure is contained and does not become a hot retry
+            # loop while the server remains idle.
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 1)
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 1)
+
+            clock.advance(61.0)
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 2)
+
     def test_on_demand_eviction_returns_stats(self):
         prompt_cache = LRUPromptCache()
         prompt_cache.insert_cache(("test", None, None), [1, 2], [MockCache("abcd")])
@@ -878,6 +895,52 @@ class TestCacheEvictor(unittest.TestCase):
         # Nothing was touched
         self.assertEqual(len(prompt_cache), 1)
         self.assertEqual(prompt_cache.nbytes, 4)
+
+    def test_on_demand_error_cannot_trigger_same_step_idle_eviction(self):
+        evictor, clock = self._make_evictor(idle_s=60.0)
+        clock.advance(61.0)
+
+        # If the on-demand attempt fails at an already-due idle deadline, the
+        # idle path must not immediately retry after queuing an error reply.
+        with mock.patch.object(
+            mx, "clear_cache", side_effect=[RuntimeError("boom"), None]
+        ) as clear_cache:
+            thread, results = self._request_evict_async(evictor)
+            evictor.step(busy=False)
+            thread.join()
+            self.assertEqual(results[0]["reason"], "error")
+            self.assertEqual(clear_cache.call_count, 1)
+
+            clock.advance(61.0)
+            evictor.step(busy=False)
+            self.assertEqual(clear_cache.call_count, 2)
+
+    def test_stats_failure_still_replies_to_claimed_request(self):
+        evictor, _ = self._make_evictor(idle_s=0.0)
+        thread, results = self._request_evict_async(evictor)
+        with mock.patch.object(evictor, "stats", side_effect=RuntimeError("boom")):
+            evictor.step(busy=False)
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            results, [{"evicted": False, "reason": "error", "stats": {}}]
+        )
+
+    def test_stats_failure_does_not_break_busy_or_timeout_refusal(self):
+        evictor, _ = self._make_evictor(idle_s=0.0)
+        with mock.patch.object(evictor, "stats", side_effect=RuntimeError("boom")):
+            thread, results = self._request_evict_async(evictor)
+            evictor.step(busy=True)
+            thread.join(timeout=1.0)
+            self.assertEqual(
+                results, [{"evicted": False, "reason": "busy", "stats": {}}]
+            )
+
+            result = evictor.request_evict(timeout=0.01)
+            self.assertEqual(
+                result, {"evicted": False, "reason": "timeout", "stats": {}}
+            )
 
     def test_timed_out_evict_request_is_discarded(self):
         # Regression: if the generation thread only reaches a queued evict
@@ -1056,6 +1119,11 @@ class TestIdleEviction(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         response = requests.post(url, json=["not", "a", "dict"])
         self.assertEqual(response.status_code, 400)
+        # Do not truthiness-coerce malformed values: in particular, the
+        # non-empty string "false" must never clear the prompt cache.
+        response = requests.post(url, json={"clear_prompt_cache": "false"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("JSON boolean", response.json()["error"])
 
     def _raw_status(self, raw_request: bytes) -> bytes:
         """Send a raw HTTP request and return the response status line."""
@@ -1080,6 +1148,49 @@ class TestIdleEviction(unittest.TestCase):
         )
         self.assertIn(b" 400 ", status + b" ")
 
+        # Do not pick the first value from duplicate request framing. Reject
+        # both identical duplicates and directly conflicting lengths.
+        for second_value in (b"0", b"1"):
+            status = self._raw_status(
+                b"POST /v1/cache/evict HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Content-Length: 0\r\n"
+                b"Content-Length: " + second_value + b"\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            self.assertIn(b" 400 ", status + b" ")
+
+        # int() accepts these, but HTTP Content-Length permits decimal digits
+        # only; accepting either would normalize malformed framing.
+        for value in (b"+1", b"1_0"):
+            status = self._raw_status(
+                b"POST /v1/cache/evict HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Content-Length: " + value + b"\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            self.assertIn(b" 400 ", status + b" ")
+
+        # A negative length is not an empty body. Accepting it would perform
+        # the eviction while silently discarding any requested options.
+        status = self._raw_status(
+            b"POST /v1/cache/evict HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: -1\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        self.assertIn(b" 400 ", status + b" ")
+
+    def test_evict_endpoint_rejects_non_utf8_body(self):
+        status = self._raw_status(
+            b"POST /v1/cache/evict HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 1\r\n"
+            b"Connection: close\r\n\r\n"
+            b"\xff"
+        )
+        self.assertIn(b" 400 ", status + b" ")
+
     def test_evict_endpoint_requires_content_length(self):
         # A chunked (length-less) body is never read, so silently treating it
         # as empty would drop a `clear_prompt_cache` the client asked for:
@@ -1092,6 +1203,19 @@ class TestIdleEviction(unittest.TestCase):
             b'1c\r\n{"clear_prompt_cache": true}\r\n0\r\n\r\n'
         )
         self.assertIn(b" 411 ", status + b" ")
+
+        # Supplying both headers must not bypass the guard: this server does
+        # not decode chunked bodies, so trusting Content-Length: 0 would
+        # silently discard the requested option.
+        status = self._raw_status(
+            b"POST /v1/cache/evict HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 0\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n"
+            b'1c\r\n{"clear_prompt_cache": true}\r\n0\r\n\r\n'
+        )
+        self.assertIn(b" 400 ", status + b" ")
 
     def test_cache_endpoints_wrong_method(self):
         response = requests.get(f"http://localhost:{self.port}/v1/cache/evict")
