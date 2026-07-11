@@ -52,6 +52,8 @@ class DynamicNTKScalingRoPE(nn.Module):
         traditional: bool = False,
         base: float = 10000,
         scale: float = 1.0,
+        rope_type: str = "default",
+        ntk_factor: float = 1.0,
     ):
         super().__init__()
         self.max_position_embeddings = max_position_embeddings
@@ -59,15 +61,23 @@ class DynamicNTKScalingRoPE(nn.Module):
         self.dims = dims
         self.traditional = traditional
         self.scale = scale
+        self.rope_type = rope_type
+        self.ntk_factor = ntk_factor
 
     def extra_repr(self):
-        return f"{self.dims}, traditional={self.traditional}, max_position_embeddings={self.max_position_embeddings}, scaling_factor={self.scaling_factor}"
+        return f"{self.dims}, traditional={self.traditional}, max_position_embeddings={self.max_position_embeddings}, rope_type={self.rope_type}"
 
     def __call__(self, x, offset: int = 0):
-        seq_len = x.shape[1] + offset
-        if seq_len > self.max_position_embeddings:
+        # x is [B, n_heads, L, head_dim] by the time it reaches rope() -- the
+        # sequence axis is 2, not 1.
+        seq_len = x.shape[2] + offset
+        # Only "dynamic" NTK recomputes the base, and only off the config
+        # factor -- self.scale is the *position* scale (only nonzero for
+        # "linear"), a different knob from the NTK base-growth factor.
+        if self.rope_type == "dynamic" and seq_len > self.max_position_embeddings:
             base = self.original_base * (
-                (self.scale * seq_len / self.max_position_embeddings) - (self.scale - 1)
+                (self.ntk_factor * seq_len / self.max_position_embeddings)
+                - (self.ntk_factor - 1)
             ) ** (self.dims / (self.dims - 2))
         else:
             base = self.original_base
@@ -99,11 +109,12 @@ class Attention(nn.Module):
         )
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=args.bias)
 
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-            else 2.0
-        )
+        rope_type = args.rope_scaling["type"] if args.rope_scaling is not None else None
+        # Position scale: only "linear" mode scales positions (1/factor).
+        # "dynamic" mode leaves positions alone and instead grows the base
+        # (see DynamicNTKScalingRoPE.__call__).
+        rope_scale = 1 / args.rope_scaling["factor"] if rope_type == "linear" else 1.0
+        ntk_factor = args.rope_scaling["factor"] if rope_type == "dynamic" else 1.0
 
         self.rope = DynamicNTKScalingRoPE(
             head_dim,
@@ -111,6 +122,8 @@ class Attention(nn.Module):
             traditional=args.rope_traditional,
             base=args.rope_theta,
             scale=rope_scale,
+            rope_type=rope_type or "default",
+            ntk_factor=ntk_factor,
         )
 
     def __call__(

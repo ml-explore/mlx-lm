@@ -1339,6 +1339,82 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_internlm2_dynamic_ntk_rope(self):
+        # Same defect class as #1545 (internlm3): dynamic-NTK RoPE conflated
+        # the position scale with the NTK base-growth factor, defaulted the
+        # position scale to 2.0 whenever scaling wasn't "linear", and read
+        # the sequence length off the wrong axis (post-transpose, seq is
+        # axis 2, not 1). internlm2.py has an identical copy-pasted class.
+        from mlx_lm.models import internlm2
+
+        def make_attn(rope_scaling):
+            args = internlm2.ModelArgs(
+                model_type="internlm2",
+                hidden_size=64,
+                num_hidden_layers=1,
+                intermediate_size=64,
+                num_attention_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=100,
+                max_position_embeddings=32768,
+                rope_scaling=rope_scaling,
+            )
+            return internlm2.Attention(args)
+
+        # No scaling config at all: positions must be left unscaled (was 2.0).
+        self.assertEqual(make_attn(None).rope.scale, 1.0)
+
+        # Dynamic: positions unscaled, and the config factor reaches the NTK
+        # base formula as `ntk_factor` (was silently discarded / hard-coded).
+        dyn = make_attn({"factor": 6.0, "type": "dynamic"})
+        self.assertEqual(dyn.rope.scale, 1.0)
+        self.assertEqual(dyn.rope.ntk_factor, 6.0)
+
+        # Linear: only the position scale (1/factor) applies.
+        lin = make_attn({"factor": 4.0, "type": "linear"})
+        self.assertEqual(lin.rope.scale, 0.25)
+
+        # Sequence length must come from the post-transpose axis (2), so a
+        # long prompt actually triggers the dynamic NTK recompute even though
+        # the head-count axis (1) is small. Detect the recompute by its
+        # effect: a rotated non-zero vector changes when the base changes.
+        mx.random.seed(0)
+        x = mx.random.normal((1, 4, 100, 8))  # n_heads=4 < 64, real seq_len=100 > 64
+
+        def make_rope(max_position_embeddings, rope_type, ntk_factor):
+            return internlm2.DynamicNTKScalingRoPE(
+                dims=8,
+                max_position_embeddings=max_position_embeddings,
+                base=10000.0,
+                scale=1.0,
+                rope_type=rope_type,
+                ntk_factor=ntk_factor,
+            )
+
+        recomputed = make_rope(64, "dynamic", 6.0)(x)  # 100 > 64 -> base grows
+        static = make_rope(1_000_000, "dynamic", 6.0)(x)  # 100 < 1e6 -> unchanged
+        self.assertFalse(mx.array_equal(recomputed, static))
+
+        # Linear mode must never rewrite the base, even past
+        # max_position_embeddings -- only the position scale applies there.
+        lin_short = internlm2.DynamicNTKScalingRoPE(
+            dims=8,
+            max_position_embeddings=1_000_000,
+            base=10000.0,
+            scale=0.25,
+            rope_type="linear",
+            ntk_factor=1.0,
+        )(x)
+        lin_long = internlm2.DynamicNTKScalingRoPE(
+            dims=8,
+            max_position_embeddings=8,  # real seq_len=100 > 8
+            base=10000.0,
+            scale=0.25,
+            rope_type="linear",
+            ntk_factor=1.0,
+        )(x)
+        self.assertTrue(mx.array_equal(lin_short, lin_long))
+
     def test_llama3_1(self):
         from mlx_lm.models import llama
 
