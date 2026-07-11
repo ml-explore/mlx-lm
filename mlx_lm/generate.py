@@ -325,12 +325,20 @@ def maybe_quantize_kv_cache(
         return
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            prompt_cache[e] = c.to_quantized(
-                group_size=kv_group_size,
-                bits=kv_bits if kv_bits is not None else key_bits,
-                key_bits=key_bits,
-                value_bits=value_bits,
-            )
+            if key_bits == value_bits:
+                # Preserve the public duck-typed protocol used by third-party
+                # caches: to_quantized(group_size, bits). Side-specific kwargs
+                # are a new extension and are only required for mixed precision.
+                prompt_cache[e] = c.to_quantized(
+                    group_size=kv_group_size, bits=key_bits
+                )
+            else:
+                prompt_cache[e] = c.to_quantized(
+                    group_size=kv_group_size,
+                    bits=kv_bits if kv_bits is not None else key_bits,
+                    key_bits=key_bits,
+                    value_bits=value_bits,
+                )
 
 
 def generate_step(

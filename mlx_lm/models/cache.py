@@ -318,13 +318,33 @@ class QuantizedKVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values = v
 
+    def _validate_state_geometry(self):
+        for name, state, bits in (
+            ("keys", self.keys, self.key_bits),
+            ("values", self.values, self.value_bits),
+        ):
+            if state is None:
+                continue
+            if len(state) != 3:
+                raise ValueError(f"Invalid quantized {name} state: expected 3 arrays")
+            packed, scales, biases = state
+            if scales.shape != biases.shape or packed.shape[:-1] != scales.shape[:-1]:
+                raise ValueError(f"Invalid quantized {name} state geometry")
+            if packed.shape[-1] * 32 != scales.shape[-1] * self.group_size * bits:
+                raise ValueError(
+                    f"Quantized {name} state does not match {bits}-bit metadata"
+                )
+            if packed.shape[-2] != self.offset:
+                raise ValueError(
+                    f"Quantized {name} state length does not match cache offset"
+                )
+
     @property
     def meta_state(self):
+        if self.key_bits == self.value_bits:
+            return tuple(map(str, (self.offset, self.group_size, self.key_bits)))
         return tuple(
-            map(
-                str,
-                (2, self.offset, self.group_size, self.key_bits, self.value_bits),
-            )
+            map(str, (2, self.offset, self.group_size, self.key_bits, self.value_bits))
         )
 
     @meta_state.setter
@@ -334,6 +354,7 @@ class QuantizedKVCache(_BaseCache):
             self.offset, self.group_size, bits = map(int, v)
             self.key_bits = self.value_bits = self.bits = bits
             self._validate_config(self.group_size, self.key_bits, self.value_bits)
+            self._validate_state_geometry()
             return
 
         if len(v) != 5:
@@ -351,6 +372,7 @@ class QuantizedKVCache(_BaseCache):
             )
         self._validate_config(self.group_size, self.key_bits, self.value_bits)
         self.bits = self.key_bits if self.key_bits == self.value_bits else None
+        self._validate_state_geometry()
 
     def is_trimmable(self):
         return True

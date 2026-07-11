@@ -112,7 +112,9 @@ def measure_nll(model, tokens, key_bits, value_bits, step_size):
     for start in range(0, len(inputs), step_size):
         input_chunk = mx.array(inputs[start : start + step_size])[None]
         target_chunk = mx.array(targets[start : start + step_size])
-        logits = model(input_chunk, cache=cache)[0]
+        # Accumulate quality evidence in float32. The cache precision is the
+        # variable under test; fp16 reduction noise must not decide parity.
+        logits = model(input_chunk, cache=cache)[0].astype(mx.float32)
         selected = mx.take_along_axis(logits, target_chunk[:, None], axis=-1).squeeze(
             -1
         )

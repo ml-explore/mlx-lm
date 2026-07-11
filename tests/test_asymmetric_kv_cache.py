@@ -23,6 +23,7 @@ from mlx_lm.models.cache import (
     save_prompt_cache,
 )
 from mlx_lm.server import setup_arg_parser as server_arg_parser
+from mlx_lm.server import validate_kv_args
 
 
 class TestAsymmetricKVCache(unittest.TestCase):
@@ -106,7 +107,15 @@ class TestAsymmetricKVCache(unittest.TestCase):
             migrated_path = os.path.join(directory, "migrated.safetensors")
             save_prompt_cache(migrated_path, [legacy_loaded])
             migrated = load_prompt_cache(migrated_path)[0]
-            self.assertEqual(migrated.meta_state, ("2", "2", "32", "4", "4"))
+            self.assertEqual(migrated.meta_state, ("2", "32", "4"))
+
+            lying_path = os.path.join(directory, "lying-geometry.safetensors")
+            lying_metadata = dict(
+                tree_flatten([[("2", "2", "32", "8", "8")], {}, ["QuantizedKVCache"]])
+            )
+            mx.save_safetensors(lying_path, legacy_arrays, lying_metadata)
+            with self.assertRaisesRegex(ValueError, "does not match 8-bit metadata"):
+                load_prompt_cache(lying_path)
 
             for name, invalid_meta, message in (
                 ("bad-bits", ("2", "2", "32", "8", "7"), "Unsupported value bits"),
@@ -138,6 +147,16 @@ class TestAsymmetricKVCache(unittest.TestCase):
             supported = QuantizedKVCache(bits=bits, group_size=32)
             supported.update_and_fetch(x, x)
             self.assertEqual(supported.keys[0].shape[-1], 128 * bits // 32)
+
+        class LegacyDuckCache:
+            offset = 0
+
+            def to_quantized(self, group_size, bits):
+                return (group_size, bits)
+
+        legacy = [LegacyDuckCache()]
+        maybe_quantize_kv_cache(legacy, 0, 64, 4)
+        self.assertEqual(legacy, [(64, 4)])
 
     def test_cli_compatibility_and_defaults(self):
         parameters = list(signature(generate_step).parameters)
@@ -172,6 +191,10 @@ class TestAsymmetricKVCache(unittest.TestCase):
         self.assertIsNone(server_args.kv_key_bits)
         self.assertIsNone(server_args.kv_value_bits)
         self.assertEqual(server_args.quantized_kv_start, DEFAULT_QUANTIZED_KV_START)
+
+        server_args.kv_key_bits = 8
+        with self.assertRaisesRegex(ValueError, "Both key and value bits"):
+            validate_kv_args(server_args)
 
 
 if __name__ == "__main__":

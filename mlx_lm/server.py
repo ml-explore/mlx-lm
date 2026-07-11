@@ -37,6 +37,7 @@ from .generate import (
     BatchGenerator,
     StopSequenceMatcher,
     TextStateMachine,
+    _resolve_kv_bits,
     make_stop_matcher,
     make_text_state_machine,
     stream_generate,
@@ -44,6 +45,11 @@ from .generate import (
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
+
+
+def validate_kv_args(args):
+    """Fail at server startup for incomplete per-side KV precision flags."""
+    return _resolve_kv_bits(args.kv_bits, args.kv_key_bits, args.kv_value_bits)
 
 
 def get_system_fingerprint():
@@ -1907,7 +1913,12 @@ def setup_arg_parser():
 
 
 def main():
-    args = setup_arg_parser().parse_args()
+    parser = setup_arg_parser()
+    args = parser.parse_args()
+    try:
+        validate_kv_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
