@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from inspect import signature
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -10,6 +11,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.cache_prompt import setup_arg_parser as cache_prompt_arg_parser
 from mlx_lm.generate import (
     DEFAULT_QUANTIZED_KV_START,
+    generate_step,
     maybe_quantize_kv_cache,
 )
 from mlx_lm.generate import setup_arg_parser as generate_arg_parser
@@ -44,7 +46,7 @@ class TestAsymmetricKVCache(unittest.TestCase):
 
     def test_asymmetric_allocation_and_quantization(self):
         keys = mx.arange(128, dtype=mx.float32).reshape(1, 1, 2, 64)
-        values = mx.arange(128, dtype=mx.float32).reshape(1, 1, 2, 64) * 0.5
+        values = mx.arange(64, dtype=mx.float32).reshape(1, 1, 2, 32) * 0.5
         cache = QuantizedKVCache(group_size=32, key_bits=8, value_bits=4)
 
         cache.update_and_fetch(keys, values)
@@ -53,7 +55,7 @@ class TestAsymmetricKVCache(unittest.TestCase):
         self.assertEqual(cache.value_bits, 4)
         self.assertIsNone(cache.bits)
         self.assertEqual(cache.keys[0].shape[-1], 16)
-        self.assertEqual(cache.values[0].shape[-1], 8)
+        self.assertEqual(cache.values[0].shape[-1], 4)
         for actual, expected in zip(
             cache.keys, mx.quantize(keys, group_size=32, bits=8)
         ):
@@ -73,7 +75,7 @@ class TestAsymmetricKVCache(unittest.TestCase):
             mask=None,
         )
         mx.eval(output)
-        self.assertEqual(output.shape, (1, 1, 1, 64))
+        self.assertEqual(output.shape, (1, 1, 1, 32))
 
     def test_serialization_round_trip_and_legacy_migration(self):
         x = mx.arange(128, dtype=mx.float32).reshape(1, 1, 2, 64)
@@ -138,6 +140,11 @@ class TestAsymmetricKVCache(unittest.TestCase):
             self.assertEqual(supported.keys[0].shape[-1], 128 * bits // 32)
 
     def test_cli_compatibility_and_defaults(self):
+        parameters = list(signature(generate_step).parameters)
+        self.assertLess(
+            parameters.index("input_embeddings"), parameters.index("kv_key_bits")
+        )
+
         generate_args = generate_arg_parser().parse_args(
             ["--kv-bits", "8", "--kv-value-bits", "4"]
         )
