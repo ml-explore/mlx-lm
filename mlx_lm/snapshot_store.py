@@ -12,6 +12,12 @@ integrity doubt becomes quarantine plus a safe miss.
 Chain restore concatenates cumulative root-to-leaf state. At the default
 depth cap of eight this can transiently allocate several times the final KV
 size; representative-scale benchmarks must include that state-budget cost.
+
+Save is intentionally two-pass: a staged safetensors write establishes the
+canonical raw tensor bytes (including bfloat16), then the final atomic write
+embeds those digests. This costs roughly 2x write bandwidth and temporarily
+one extra snapshot file; both dot-temporary paths are cleaned on failure and
+startup and remain subject to directory-cap GC after the atomic commit.
 """
 
 import fcntl
@@ -32,7 +38,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
-import numpy as np
 
 from .prefix_forks import FrozenPrefixSnapshot, compute_cid
 
@@ -56,8 +61,42 @@ def _owned_operation(method):
     return wrapped
 
 
-def _array_digest(array: mx.array) -> str:
-    return hashlib.sha256(np.asarray(array).tobytes(order="C")).hexdigest()
+def _tensor_hasher(dtype: str, shape: List[int]):
+    """Domain-separated canonical tensor digest, independent of PEP-3118."""
+    hasher = hashlib.sha256()
+    hasher.update(b"mlx-lm-snapshot-tensor-v1")
+    dtype_bytes = dtype.encode()
+    hasher.update(len(dtype_bytes).to_bytes(8, "big"))
+    hasher.update(dtype_bytes)
+    hasher.update(json.dumps(shape, separators=(",", ":")).encode())
+    return hasher
+
+
+def _file_tensor_digest(path: Path, tensor: dict, data_start: int) -> str:
+    hasher = _tensor_hasher(tensor["dtype"], tensor["shape"])
+    start, end = tensor["data_offsets"]
+    position = data_start + start
+    end = data_start + end
+    with path.open("rb") as handle:
+        handle.seek(position)
+        while position < end:
+            chunk = handle.read(min(4 << 20, end - position))
+            if not chunk:
+                raise SnapshotCorruptError("truncated tensor payload")
+            hasher.update(chunk)
+            position += len(chunk)
+    return hasher.hexdigest()
+
+
+def _payload_digests(path: Path, layers: int):
+    header, data_start = _read_header(path)
+    return tuple(
+        (
+            _file_tensor_digest(path, header[f"k.{layer}"], data_start),
+            _file_tensor_digest(path, header[f"v.{layer}"], data_start),
+        )
+        for layer in range(layers)
+    )
 
 
 def _read_header(path: Path) -> Tuple[dict, int]:
@@ -120,6 +159,9 @@ class SnapshotRecord:
     last_use: float
     digests: Tuple[Tuple[str, str], ...]
     tensor_offsets: Tuple[Tuple[Tuple[int, int], Tuple[int, int]], ...]
+    tensor_specs: Tuple[
+        Tuple[Tuple[str, Tuple[int, ...]], Tuple[str, Tuple[int, ...]]], ...
+    ]
 
 
 class DiskBackedSnapshot:
@@ -328,6 +370,7 @@ class SnapshotStore:
             raise SnapshotCorruptError("invalid parent cid")
         digests = []
         tensor_offsets = []
+        tensor_specs = []
         expected_names = {f"{side}.{layer}" for layer in range(layers) for side in "kv"}
         actual_names = {name for name in header if name != "__metadata__"}
         if actual_names != expected_names:
@@ -357,6 +400,12 @@ class SnapshotStore:
                     tuple(data_start + x for x in header[v_name]["data_offsets"]),
                 )
             )
+            tensor_specs.append(
+                (
+                    (header[k_name]["dtype"], tuple(header[k_name]["shape"])),
+                    (header[v_name]["dtype"], tuple(header[v_name]["shape"])),
+                )
+            )
         payload_nbytes = sum(
             end - start for pair in tensor_offsets for start, end in pair
         )
@@ -375,6 +424,7 @@ class SnapshotStore:
             last_use=created_at,
             digests=tuple(digests),
             tensor_offsets=tuple(tensor_offsets),
+            tensor_specs=tuple(tensor_specs),
         )
 
     def _quarantine(self, path: Path, reason: str) -> bool:
@@ -402,7 +452,7 @@ class SnapshotStore:
         self._blocked_cids.clear()
         # A temp is never authoritative.  A previous crash may leave one.
         for path in self.directory.iterdir():
-            if ".tmp-" in path.name:
+            if ".tmp-" in path.name or ".digest-" in path.name:
                 try:
                     path.unlink()
                     self._stats["temps_cleaned"] += 1
@@ -582,20 +632,34 @@ class SnapshotStore:
             mx.eval(key, value)
             tensors[f"k.{layer}"] = key
             tensors[f"v.{layer}"] = value
-            metadata[f"sha256_k_{layer}"] = _array_digest(key)
-            metadata[f"sha256_v_{layer}"] = _array_digest(value)
+            # Fixed-width placeholders keep the staged/final header geometry
+            # stable while canonical digests are derived from safetensors'
+            # exact contiguous payload bytes (works for bfloat16 and every
+            # supported MLX dtype without NumPy/PEP-3118 conversion).
+            metadata[f"sha256_k_{layer}"] = "0" * 64
+            metadata[f"sha256_v_{layer}"] = "0" * 64
         # Keep the safetensors suffix: MLX otherwise appends one, which would
         # make the path passed to chmod/replace differ from the file written.
         temp = self.directory / f".{cid}.tmp-{uuid.uuid4().hex}.safetensors"
+        stage = self.directory / f".{cid}.digest-{uuid.uuid4().hex}.safetensors"
         try:
+            mx.save_safetensors(str(stage), tensors, metadata)
+            os.chmod(stage, 0o600)
+            digests = _payload_digests(stage, len(keys))
+            for layer, (key_digest, value_digest) in enumerate(digests):
+                metadata[f"sha256_k_{layer}"] = key_digest
+                metadata[f"sha256_v_{layer}"] = value_digest
             mx.save_safetensors(str(temp), tensors, metadata)
             os.chmod(temp, 0o600)
+            if _payload_digests(temp, len(keys)) != digests:
+                raise SnapshotCorruptError("staged/final tensor payload mismatch")
             os.replace(temp, final)
         finally:
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
+            for transient in (stage, temp):
+                try:
+                    transient.unlink()
+                except FileNotFoundError:
+                    pass
         os.chmod(final, 0o600)
         record = self._parse_record(final)
         self._records[cid] = record
@@ -645,9 +709,21 @@ class SnapshotStore:
 
     def _load_delta(self, record: SnapshotRecord):
         try:
+            observed_digests = _payload_digests(record.path, len(record.digests))
+            if observed_digests != record.digests:
+                bad_layer = next(
+                    layer
+                    for layer, (observed, expected) in enumerate(
+                        zip(observed_digests, record.digests)
+                    )
+                    if observed != expected
+                )
+                raise SnapshotCorruptError(
+                    f"payload digest mismatch at layer {bad_layer}"
+                )
             arrays, _ = mx.load(str(record.path), return_metadata=True)
             keys, values = [], []
-            for layer, (expected_k, expected_v) in enumerate(record.digests):
+            for layer in range(len(record.digests)):
                 key, value = arrays[f"k.{layer}"], arrays[f"v.{layer}"]
                 tail_length = len(record.tokens) - record.parent_length
                 if (
@@ -659,16 +735,9 @@ class SnapshotStore:
                     raise SnapshotCorruptError(
                         f"invalid tensor geometry at layer {layer}"
                     )
-                # Verification is layer-incremental and occurs only when this
-                # disk hit is materialized, never during startup indexing.
+                # Payload verification occurs only on this disk hit, never
+                # during startup indexing; MLX materialization stays per-layer.
                 mx.eval(key, value)
-                if (
-                    _array_digest(key) != expected_k
-                    or _array_digest(value) != expected_v
-                ):
-                    raise SnapshotCorruptError(
-                        f"payload digest mismatch at layer {layer}"
-                    )
                 keys.append(key)
                 values.append(value)
             return keys, values
@@ -892,7 +961,7 @@ class SnapshotStore:
                 "layer": 0,
                 "side": 0,
                 "position": None,
-                "hasher": hashlib.sha256(),
+                "hasher": None,
             }
         state = self._scrub_state
         record = self._records.get(state["cid"])
@@ -903,6 +972,9 @@ class SnapshotStore:
         try:
             while remaining > 0 and (deadline is None or time.monotonic() < deadline):
                 start, end = record.tensor_offsets[state["layer"]][state["side"]]
+                if state["hasher"] is None:
+                    dtype, shape = record.tensor_specs[state["layer"]][state["side"]]
+                    state["hasher"] = _tensor_hasher(dtype, list(shape))
                 position = state["position"] if state["position"] is not None else start
                 amount = min(1 << 20, remaining, end - position)
                 with record.path.open("rb") as handle:
@@ -922,7 +994,7 @@ class SnapshotStore:
                         )
                     state["side"] += 1
                     state["position"] = None
-                    state["hasher"] = hashlib.sha256()
+                    state["hasher"] = None
                     if state["side"] == 2:
                         state["side"] = 0
                         state["layer"] += 1

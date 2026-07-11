@@ -28,7 +28,7 @@ from mlx_lm.server import (
 from mlx_lm.snapshot_store import (
     SnapshotCorruptError,
     SnapshotStore,
-    _array_digest,
+    _payload_digests,
     _read_header,
 )
 from mlx_lm.utils import load
@@ -49,16 +49,28 @@ def _cache(length, seed=1, layers=2):
     return out
 
 
-def _prefix_cache(length):
+def _prefix_cache(length, dtype=mx.float32):
     cache = KVCache()
     positions = mx.arange(length, dtype=mx.float32)[None, None, :, None]
     heads = mx.arange(2, dtype=mx.float32)[None, :, None, None] * 100
     dims = mx.arange(4, dtype=mx.float32)[None, None, None, :]
-    key = mx.broadcast_to(positions + heads + dims, (1, 2, length, 4))
+    key = mx.broadcast_to(positions + heads + dims, (1, 2, length, 4)).astype(dtype)
     value = key + 1000
     cache.update_and_fetch(key, value)
     mx.eval(*cache.state)
     return [cache]
+
+
+def _save_with_payload_digests(path, arrays, metadata):
+    layers = int(metadata["layers"])
+    for layer in range(layers):
+        metadata[f"sha256_k_{layer}"] = "0" * 64
+        metadata[f"sha256_v_{layer}"] = "0" * 64
+    mx.save_safetensors(str(path), arrays, metadata)
+    for layer, (key_digest, value_digest) in enumerate(_payload_digests(path, layers)):
+        metadata[f"sha256_k_{layer}"] = key_digest
+        metadata[f"sha256_v_{layer}"] = value_digest
+    mx.save_safetensors(str(path), arrays, metadata)
 
 
 def _freeze(registry, model_key, tokens, seed=1):
@@ -224,6 +236,55 @@ class TestSnapshotStore(unittest.TestCase):
         self.assertFalse(clean_store.scrub_one())
         self.assertFalse(clean_path.exists())
 
+    def test_bfloat16_round_trip_corruption_and_incremental_scrub(self):
+        registry = PrefixForkRegistry()
+        tokens = list(range(8))
+        cid = registry.freeze("bf16@r", tokens, _prefix_cache(8, mx.bfloat16))
+        snapshot = registry.get(cid)
+        store = SnapshotStore(self.path)
+        store.save(snapshot)
+        while not store.scrub_increment(max_bytes=13):
+            self.assertIsNotNone(store._scrub_state)
+        store.close()
+
+        restarted = PrefixForkRegistry()
+        reopened = SnapshotStore(self.path, registry=restarted)
+        forks, rest = restarted.fetch_fork("bf16@r", tokens + [9])
+        self.assertEqual(rest, [9])
+        self.assertEqual(forks[0].state[0].dtype, mx.bfloat16)
+        self.assertTrue(mx.array_equal(forks[0].state[0], snapshot.keys[0]))
+        reopened.demote_from_ram(cid)
+        path = self.path / f"{cid}.safetensors"
+        header, data_start = _read_header(path)
+        offset = data_start + header["v.0"]["data_offsets"][0]
+        with path.open("r+b") as handle:
+            handle.seek(offset)
+            byte = handle.read(1)
+            handle.seek(offset)
+            handle.write(bytes([byte[0] ^ 1]))
+        corrupt, remaining = restarted.fetch_fork("bf16@r", tokens)
+        self.assertIsNone(corrupt)
+        self.assertEqual(remaining, tokens)
+
+    def test_payload_digest_distinguishes_dtype_with_same_zero_bytes(self):
+        bf_registry = PrefixForkRegistry()
+        u16_registry = PrefixForkRegistry()
+        tokens = list(range(8))
+        bf_cache = _prefix_cache(8, mx.bfloat16)
+        u16_cache = _prefix_cache(8, mx.uint16)
+        # Force identical all-zero payload bytes; only dtype metadata differs.
+        for cache in bf_cache + u16_cache:
+            cache.keys = mx.zeros_like(cache.keys)
+            cache.values = mx.zeros_like(cache.values)
+        bf_cid = bf_registry.freeze("bf@r", tokens, bf_cache)
+        u16_cid = u16_registry.freeze("u16@r", tokens, u16_cache)
+        store = SnapshotStore(self.path)
+        store.save(bf_registry.get(bf_cid))
+        store.save(u16_registry.get(u16_cid))
+        self.assertNotEqual(
+            store._records[bf_cid].digests, store._records[u16_cid].digests
+        )
+
     def test_quarantine_rename_failure_blocks_proxy_without_losing_record(self):
         registry = PrefixForkRegistry()
         snapshot = _freeze(registry, "m@r", list(range(8)))
@@ -312,8 +373,7 @@ class TestSnapshotStore(unittest.TestCase):
         path = self.path / f"{child.cid}.safetensors"
         arrays, metadata = mx.load(str(path), return_metadata=True)
         arrays["k.0"] = mx.zeros((1, 3, 8, 4))
-        metadata["sha256_k_0"] = _array_digest(arrays["k.0"])
-        mx.save_safetensors(str(path), arrays, metadata)
+        _save_with_payload_digests(path, arrays, metadata)
         store.close()
         restarted = PrefixForkRegistry()
         rebuilt = SnapshotStore(self.path, registry=restarted)
