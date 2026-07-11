@@ -78,6 +78,25 @@ class TestAsymmetricKVCache(unittest.TestCase):
         mx.eval(output)
         self.assertEqual(output.shape, (1, 1, 1, 32))
 
+    def test_legacy_quantized_attention_duck(self):
+        x = mx.arange(64, dtype=mx.float32).reshape(1, 1, 1, 64)
+        state = mx.quantize(x, group_size=32, bits=4)
+
+        class LegacyQuantizedDuck:
+            bits = 4
+            group_size = 32
+
+        output = scaled_dot_product_attention(
+            mx.ones_like(x),
+            state,
+            state,
+            LegacyQuantizedDuck(),
+            scale=64**-0.5,
+            mask=None,
+        )
+        mx.eval(output)
+        self.assertEqual(output.shape, x.shape)
+
     def test_serialization_round_trip_and_legacy_migration(self):
         x = mx.arange(128, dtype=mx.float32).reshape(1, 1, 2, 64)
         asymmetric = QuantizedKVCache(group_size=32, key_bits=8, value_bits=4)
@@ -116,6 +135,22 @@ class TestAsymmetricKVCache(unittest.TestCase):
             mx.save_safetensors(lying_path, legacy_arrays, lying_metadata)
             with self.assertRaisesRegex(ValueError, "does not match 8-bit metadata"):
                 load_prompt_cache(lying_path)
+
+            geometry_path = os.path.join(directory, "cross-side-geometry.safetensors")
+            key_state, value_state = asymmetric.state
+            bad_values = tuple(
+                mx.broadcast_to(array, (2, *array.shape[1:]))
+                for array in value_state
+            )
+            geometry_arrays = dict(tree_flatten([(key_state, bad_values)]))
+            geometry_metadata = dict(
+                tree_flatten(
+                    [[("2", "2", "32", "8", "4")], {}, ["QuantizedKVCache"]]
+                )
+            )
+            mx.save_safetensors(geometry_path, geometry_arrays, geometry_metadata)
+            with self.assertRaisesRegex(ValueError, "batch, head, or length mismatch"):
+                load_prompt_cache(geometry_path)
 
             for name, invalid_meta, message in (
                 ("bad-bits", ("2", "2", "32", "8", "7"), "Unsupported value bits"),
@@ -194,6 +229,14 @@ class TestAsymmetricKVCache(unittest.TestCase):
 
         server_args.kv_key_bits = 8
         with self.assertRaisesRegex(ValueError, "Both key and value bits"):
+            validate_kv_args(server_args)
+        server_args.kv_key_bits = None
+        server_args.kv_bits = 7
+        with self.assertRaisesRegex(ValueError, "Unsupported key bits"):
+            validate_kv_args(server_args)
+        server_args.kv_bits = 4
+        server_args.kv_group_size = 16
+        with self.assertRaisesRegex(ValueError, "Unsupported group size"):
             validate_kv_args(server_args)
 
 

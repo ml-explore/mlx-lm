@@ -7,7 +7,7 @@ import time
 
 import mlx.core as mx
 
-from .generate import generate_step
+from .generate import generate_step, validate_kv_quantization_args
 from .models.cache import make_prompt_cache, save_prompt_cache
 from .utils import load
 
@@ -95,6 +95,16 @@ def setup_arg_parser():
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+    try:
+        validate_kv_quantization_args(
+            args.kv_bits,
+            args.kv_key_bits,
+            args.kv_value_bits,
+            args.kv_group_size,
+            args.quantized_kv_start,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Building tokenizer_config
     tokenizer_config = {"trust_remote_code": args.trust_remote_code}

@@ -13,7 +13,9 @@ import os
 import platform
 import statistics
 import subprocess
+import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import mlx.core as mx
@@ -21,7 +23,7 @@ from mlx.utils import tree_flatten
 
 from mlx_lm.generate import stream_generate
 from mlx_lm.models.cache import KVCache, make_prompt_cache
-from mlx_lm.utils import load
+from mlx_lm.utils import _download, load
 
 ARMS = {
     "fp16": (None, None),
@@ -30,10 +32,9 @@ ARMS = {
     "K4V8": (4, 8),
     "K4V4": (4, 4),
 }
+_ARM_NAMES = list(ARMS)
 THROUGHPUT_SCHEDULE = [
-    list(ARMS),
-    list(reversed(ARMS)),
-    list(ARMS),
+    _ARM_NAMES[offset:] + _ARM_NAMES[:offset] for offset in range(len(_ARM_NAMES))
 ]
 DEFAULT_CORPUS_FILES = [
     "README.md",
@@ -166,7 +167,13 @@ def main():
         raise ValueError("Probe model must be explicitly identifiable as <=0.6B")
 
     corpus_files = args.corpus_files or DEFAULT_CORPUS_FILES
-    model, tokenizer = load(args.model)
+    resolved_model_path = _download(args.model)
+    model_revision = (
+        resolved_model_path.name
+        if resolved_model_path.parent.name == "snapshots"
+        else None
+    )
+    model, tokenizer = load(str(resolved_model_path))
     tokens, corpus_sha256 = build_corpus(tokenizer, corpus_files, args.tokens)
 
     results = {}
@@ -239,12 +246,19 @@ def main():
             "K8V4_share_of_K4V4_memory_savings_vs_fp16": mixed_savings / kv4_savings,
         },
         "model": args.model,
+        "model_revision": model_revision,
+        "resolved_model_path": str(resolved_model_path),
         "model_size_gate": "<=0.6B",
         "git_sha": git_sha(),
         "runtime": {
             "mlx": mx.__version__,
             "platform": platform.platform(),
             "device": mx.device_info(),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "command": " ".join(sys.argv),
+            "seed": None,
+            "determinism": "greedy generation; fixed token corpus; no sampling RNG",
+            "contention_statement": "two clean process checks before and after; no overlapping model, benchmark, server, or pytest process",
         },
         "corpus": {
             "files": corpus_files,
@@ -256,7 +270,7 @@ def main():
             "prompt_tokens": len(prompt),
             "generation_tokens": args.generation_tokens,
             "schedule": THROUGHPUT_SCHEDULE,
-            "statistic": "median of 3 reps",
+            "statistic": "median of 5 position-balanced cyclic reps",
         },
         "results": results,
     }

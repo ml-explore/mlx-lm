@@ -312,6 +312,22 @@ def _resolve_kv_bits(kv_bits, key_bits, value_bits):
     return key_bits, value_bits
 
 
+def validate_kv_quantization_args(
+    kv_bits, key_bits, value_bits, group_size, quantized_kv_start
+):
+    """Validate all KV quantization CLI fields before model loading."""
+    key_bits, value_bits = _resolve_kv_bits(kv_bits, key_bits, value_bits)
+    if key_bits is not None:
+        QuantizedKVCache._validate_config(group_size, key_bits, value_bits)
+    if (
+        isinstance(quantized_kv_start, bool)
+        or not isinstance(quantized_kv_start, int)
+        or quantized_kv_start < 0
+    ):
+        raise ValueError("quantized_kv_start must be a non-negative integer")
+    return key_bits, value_bits
+
+
 def maybe_quantize_kv_cache(
     prompt_cache,
     quantized_kv_start,
@@ -2125,6 +2141,16 @@ def batch_generate(
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+    try:
+        validate_kv_quantization_args(
+            args.kv_bits,
+            args.kv_key_bits,
+            args.kv_value_bits,
+            args.kv_group_size,
+            args.quantized_kv_start,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.seed is not None:
         mx.random.seed(args.seed)

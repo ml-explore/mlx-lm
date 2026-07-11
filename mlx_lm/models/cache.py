@@ -328,6 +328,8 @@ class QuantizedKVCache(_BaseCache):
             if len(state) != 3:
                 raise ValueError(f"Invalid quantized {name} state: expected 3 arrays")
             packed, scales, biases = state
+            if packed.dtype != mx.uint32 or scales.dtype != biases.dtype:
+                raise ValueError(f"Invalid quantized {name} state dtypes")
             if scales.shape != biases.shape or packed.shape[:-1] != scales.shape[:-1]:
                 raise ValueError(f"Invalid quantized {name} state geometry")
             if packed.shape[-1] * 32 != scales.shape[-1] * self.group_size * bits:
@@ -338,6 +340,9 @@ class QuantizedKVCache(_BaseCache):
                 raise ValueError(
                     f"Quantized {name} state length does not match cache offset"
                 )
+        if self.keys is not None and self.values is not None:
+            if self.keys[0].shape[:-1] != self.values[0].shape[:-1]:
+                raise ValueError("Quantized key/value batch, head, or length mismatch")
 
     @property
     def meta_state(self):

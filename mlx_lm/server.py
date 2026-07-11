@@ -37,7 +37,7 @@ from .generate import (
     BatchGenerator,
     StopSequenceMatcher,
     TextStateMachine,
-    _resolve_kv_bits,
+    validate_kv_quantization_args,
     make_stop_matcher,
     make_text_state_machine,
     stream_generate,
@@ -49,7 +49,13 @@ from .utils import _parse_size, load, sharded_load
 
 def validate_kv_args(args):
     """Fail at server startup for incomplete per-side KV precision flags."""
-    return _resolve_kv_bits(args.kv_bits, args.kv_key_bits, args.kv_value_bits)
+    return validate_kv_quantization_args(
+        args.kv_bits,
+        args.kv_key_bits,
+        args.kv_value_bits,
+        args.kv_group_size,
+        args.quantized_kv_start,
+    )
 
 
 def get_system_fingerprint():
