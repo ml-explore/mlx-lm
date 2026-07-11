@@ -260,13 +260,14 @@ def _download(
     return model_path
 
 
-def hf_repo_to_path(hf_repo):
+def hf_repo_to_path(hf_repo, revision: Optional[str] = None):
     # Restrict to the same patterns that `_download` fetches so the snapshot
     # completeness check does not fail on files that were never downloaded
     # (e.g. `.gitattributes`), which would raise an IncompleteSnapshotError.
     return Path(
         snapshot_download(
             hf_repo,
+            revision=revision,
             local_files_only=True,
             allow_patterns=DEFAULT_ALLOW_PATTERNS,
         )

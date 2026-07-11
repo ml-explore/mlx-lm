@@ -1,10 +1,12 @@
 # Copyright © 2024 Apple Inc.
 
+import hashlib
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -182,6 +184,176 @@ class TestUtils(unittest.TestCase):
             logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
+
+class TestPreserveMTP(unittest.TestCase):
+    def setUp(self):
+        self.test_dir_fid = tempfile.TemporaryDirectory()
+        self.test_dir = Path(self.test_dir_fid.name)
+
+    def tearDown(self):
+        self.test_dir_fid.cleanup()
+
+    def _write_source(self):
+        """Write a tiny model whose source weights include dropped MTP weights."""
+        from mlx_lm.models import mimo
+
+        config = {
+            "model_type": "mimo",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 320,
+            "tie_word_embeddings": False,
+            "num_nextn_predict_layers": 1,
+        }
+        model = mimo.Model(mimo.ModelArgs(**config))
+        weights = dict(tree_flatten(model.parameters()))
+        # MTP weights that `mimo.sanitize` drops, in mixed dtypes so the test
+        # also covers that preservation keeps the source dtype.
+        mtp_weights = {
+            "model.mtp_layers.0.input_layernorm.weight": mx.random.normal((64,)).astype(
+                mx.bfloat16
+            ),
+            "model.mtp_layers.0.token_layernorm.weight": mx.random.normal((64,)).astype(
+                mx.float32
+            ),
+        }
+        weights.update(mtp_weights)
+
+        source = self.test_dir / "source"
+        source.mkdir()
+        mx.save_safetensors(str(source / "model.safetensors"), weights)
+        with open(source / "config.json", "w") as f:
+            json.dump(config, f)
+        tokenizer = {
+            "version": "1.0",
+            "added_tokens": [],
+            "pre_tokenizer": {"type": "Whitespace"},
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0, "a": 1, "b": 2},
+                "unk_token": "<unk>",
+            },
+        }
+        with open(source / "tokenizer.json", "w") as f:
+            json.dump(tokenizer, f)
+        with open(source / "tokenizer_config.json", "w") as f:
+            json.dump(
+                {"tokenizer_class": "PreTrainedTokenizerFast", "unk_token": "<unk>"}, f
+            )
+        return source, mtp_weights
+
+    def test_mtp_weight_matcher(self):
+        """The MTP matcher covers each architecture's dropped weights."""
+        from mlx_lm.convert import _is_mtp_weight
+
+        mtp_names = [
+            "model.mtp.embed_tokens.weight",  # qwen3_5, qwen3_next
+            "mtp.layers.0.self_attn.q_proj.weight",  # nemotron_h, exaone_moe
+            "model.mtp_layers.0.input_layernorm.weight",  # mimo
+            "model.mtp.0.eh_proj.weight",  # mimo_v2_flash, kimi_linear, longcat_flash
+            "model.layers.30.mtp.enorm.weight",  # step3p5
+            "mtp_block.0.self_attn.qkv_proj.weight",  # ernie4_5_moe
+            "model.mtp_hidden_norm.weight",  # ernie4_5_moe
+        ]
+        for name in mtp_names:
+            self.assertTrue(_is_mtp_weight(name, None, None), name)
+
+        # Trailing decoder layers past the dense stack.
+        for model_type in [
+            "deepseek_v3",
+            "deepseek_v32",
+            "glm4_moe",
+            "glm4_moe_lite",
+            "step3p5",
+        ]:
+            self.assertTrue(
+                _is_mtp_weight(
+                    "model.layers.30.self_attn.kv_b_proj.weight", model_type, 30
+                ),
+                model_type,
+            )
+        self.assertTrue(
+            _is_mtp_weight("model.layers.61.eh_proj.weight", "deepseek_v3", 61)
+        )
+
+        # The trailing-layer rule only applies to the listed architectures.
+        self.assertFalse(
+            _is_mtp_weight("model.layers.30.self_attn.q_proj.weight", "llama", 30)
+        )
+
+        # Dense weights are never treated as MTP.
+        for name in [
+            "model.layers.29.self_attn.q_proj.weight",
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.rotary_emb.inv_freq",
+        ]:
+            self.assertFalse(_is_mtp_weight(name, "glm4_moe_lite", 30), name)
+
+    def test_hf_repo_to_path_propagates_revision(self):
+        """The preservation path resolves the source at the converted revision."""
+        with mock.patch.object(
+            utils, "snapshot_download", return_value=str(self.test_dir)
+        ) as snapshot_download:
+            path = utils.hf_repo_to_path("some/repo", revision="abc123")
+        self.assertEqual(path, self.test_dir)
+        self.assertEqual(snapshot_download.call_args.kwargs["revision"], "abc123")
+
+    def test_convert_preserves_mtp_weights(self):
+        """`preserve_mtp` writes the dropped MTP weights byte-identically."""
+        source, mtp_weights = self._write_source()
+        mlx_path = self.test_dir / "mlx_model"
+        convert(str(source), mlx_path=str(mlx_path), dtype="float32", preserve_mtp=True)
+
+        preserved = mx.load(str(mlx_path / "mtp.safetensors"))
+        self.assertEqual(set(preserved), set(mtp_weights))
+        for name, value in mtp_weights.items():
+            self.assertEqual(preserved[name].dtype, value.dtype)  # source dtype kept
+            self.assertTrue(mx.array_equal(preserved[name], value))
+
+        # The sidecar has its own index covering exactly the preserved weights.
+        with open(mlx_path / "mtp.safetensors.index.json") as f:
+            index = json.load(f)
+        self.assertEqual(set(index["weight_map"]), set(mtp_weights))
+        for name in mtp_weights:
+            self.assertEqual(index["weight_map"][name], "mtp.safetensors")
+
+        # The converted model still loads and carries no MTP weights.
+        model, _ = utils.load(str(mlx_path))
+        loaded = dict(tree_flatten(model.parameters()))
+        self.assertFalse(any("mtp" in name for name in loaded))
+
+    def test_convert_without_flag_is_unchanged(self):
+        """The output directory is identical with and without `preserve_mtp`."""
+        source, _ = self._write_source()
+        with_mtp = self.test_dir / "with_mtp"
+        without_mtp = self.test_dir / "without_mtp"
+        convert(str(source), mlx_path=str(with_mtp), dtype="float32", preserve_mtp=True)
+        convert(
+            str(source), mlx_path=str(without_mtp), dtype="float32", preserve_mtp=False
+        )
+
+        def digests(path):
+            return {
+                f.name: hashlib.sha256(f.read_bytes()).hexdigest()
+                for f in path.iterdir()
+                if f.is_file()
+            }
+
+        with_digests = digests(with_mtp)
+        without_digests = digests(without_mtp)
+
+        # The flag only adds the mtp sidecar and its index; every other file,
+        # model.safetensors.index.json included, is byte-identical.
+        extra = set(with_digests) - set(without_digests)
+        self.assertEqual(extra, {"mtp.safetensors", "mtp.safetensors.index.json"})
+        for name, digest in without_digests.items():
+            self.assertEqual(with_digests[name], digest, name)
 
 
 CUSTOM_MODEL_FILE = """\
