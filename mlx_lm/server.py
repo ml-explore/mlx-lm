@@ -32,6 +32,7 @@ from typing import (
 )
 
 import mlx.core as mx
+from huggingface_hub import constants as hf_constants
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
@@ -399,15 +400,21 @@ class ModelProvider:
 def _persistent_model_key(model_key) -> str:
     """Build the mandatory stable-string identity for persisted KV.
 
-    Loader-resolved Hugging Face cache paths contain an immutable
-    ``snapshots/<revision>`` component, so their trusted revision and resolved
-    path identify the loaded bytes without reopening multi-gigabyte payloads.
+    Loader-resolved Hugging Face paths beneath the configured ``HF_HUB_CACHE``
+    contain an immutable ``models--.../snapshots/<revision>`` component, so
+    their trusted revision and resolved path identify loaded bytes without
+    reopening multi-gigabyte payloads.
     Ordinary local paths have no immutable revision authority and therefore
     hash every file byte; same-size/mtime-preserving weight or adapter swaps
     still change identity.
     """
 
     def hf_snapshot_identity(path):
+        cache_root = Path(hf_constants.HF_HUB_CACHE).expanduser().resolve()
+        try:
+            path.relative_to(cache_root)
+        except ValueError:
+            return None
         parts = path.parts
         for index in range(len(parts) - 2, -1, -1):
             if parts[index] != "snapshots" or index < 1 or index + 1 >= len(parts):

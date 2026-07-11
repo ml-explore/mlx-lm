@@ -522,7 +522,9 @@ class TestPersistentServerBridge(unittest.TestCase):
         snapshot_b.mkdir()
         (snapshot_a / "weights.safetensors").write_bytes(b"A" * 4096)
         (snapshot_b / "weights.safetensors").write_bytes(b"A" * 4096)
-        with patch.object(
+        with patch(
+            "mlx_lm.server.hf_constants.HF_HUB_CACHE", str(Path(self.temp.name))
+        ), patch.object(
             Path,
             "open",
             side_effect=AssertionError("HF payload must not be opened for identity"),
@@ -534,15 +536,25 @@ class TestPersistentServerBridge(unittest.TestCase):
         self.assertIn(revision_b, identity_b)
 
     def test_local_snapshots_lookalike_still_hashes_bytes(self):
-        lookalike = Path(self.temp.name) / "ordinary-local" / "snapshots" / ("c" * 40)
+        lookalike = (
+            Path(self.temp.name)
+            / "ordinary-local"
+            / "models--org--model"
+            / "snapshots"
+            / ("c" * 40)
+        )
         lookalike.mkdir(parents=True)
+        (lookalike.parent.parent / "blobs").mkdir()
         weights = lookalike / "adapter.safetensors"
         weights.write_bytes(b"A" * 4096)
         stamp = weights.stat().st_mtime_ns
-        first = _persistent_model_key((str(lookalike), None, None))
-        weights.write_bytes(b"B" * 4096)
-        os.utime(weights, ns=(stamp, stamp))
-        second = _persistent_model_key((str(lookalike), None, None))
+        trusted_root = Path(self.temp.name) / "configured-hf-cache"
+        trusted_root.mkdir()
+        with patch("mlx_lm.server.hf_constants.HF_HUB_CACHE", str(trusted_root)):
+            first = _persistent_model_key((str(lookalike), None, None))
+            weights.write_bytes(b"B" * 4096)
+            os.utime(weights, ns=(stamp, stamp))
+            second = _persistent_model_key((str(lookalike), None, None))
         self.assertNotEqual(first, second)
 
     def test_unresolved_hf_identity_fails_closed(self):
