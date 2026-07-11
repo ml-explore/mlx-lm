@@ -65,6 +65,7 @@ setup(
             "mlx_lm.generate = mlx_lm.generate:main",
             "mlx_lm.lora = mlx_lm.lora:main",
             "mlx_lm.perplexity = mlx_lm.perplexity:main",
+            "mlx_lm.quantize_adapter = mlx_lm.quantize_adapter:main",
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.share = mlx_lm.share:main",
             "mlx_lm.manage = mlx_lm.manage:main",

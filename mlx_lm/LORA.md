@@ -20,6 +20,7 @@ LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
   - [Fine-tune](#Fine-tune)
   - [Evaluate](#Evaluate)
   - [Generate](#Generate)
+  - [Quantize adapters](#Quantize-adapters)
 - [Fuse](#Fuse)
 - [Data](#Data)
 - [Memory Issues](#Memory-Issues)
@@ -123,6 +124,63 @@ mlx_lm.generate \
     --model <path_to_model> \
     --adapter-path <path_to_adapters> \
     --prompt "<your_model_prompt>"
+```
+
+### Quantize adapters
+
+LoRA matrices on linear layers can be quantized after loading to reduce their
+inference-time memory footprint. The base model is left unchanged, so it may
+be either a floating-point or quantized model. LoRA embedding and
+switch-linear layers remain in their original precision.
+
+To create a directly loadable quantized adapter, run:
+
+```shell
+mlx_lm.quantize_adapter \
+    --model <path_to_model> \
+    --adapter-path <path_to_adapters> \
+    --output-path <path_to_quantized_adapters> \
+    --bits 8
+```
+
+The output contains packed quantized adapter weights and quantization metadata.
+It can be loaded through the normal adapter interface without materializing a
+floating-point copy of the saved LoRA matrices:
+
+```shell
+mlx_lm.generate \
+    --model <path_to_model> \
+    --adapter-path <path_to_quantized_adapters> \
+    --prompt "<your_model_prompt>"
+```
+
+You can also quantize an already loaded adapter in memory:
+
+```python
+from mlx_lm import load
+from mlx_lm.tuner import quantize_lora_layers
+
+model, tokenizer = load(
+    "<path_to_model>",
+    adapter_path="<path_to_adapters>",
+)
+quantize_lora_layers(model, bits=8)
+```
+
+Quantized adapters are inference-only. Their dimensions are padded when
+needed to satisfy MLX quantization group-size requirements. The default uses
+8-bit affine quantization with group size 64 for the input dimension and 32
+for the LoRA rank dimension. You can select lower precision with `bits`, for
+example `quantize_lora_layers(model, bits=4)`.
+
+Padding and quantization metadata can outweigh the packed-weight savings for
+small ranks. The conversion command rejects adapters whose parameter memory
+would increase unless `--allow-larger` is supplied.
+
+The generic benchmark can be run from a source checkout with:
+
+```shell
+PYTHONPATH=. python benchmarks/quantized_lora.py
 ```
 
 ## Fuse

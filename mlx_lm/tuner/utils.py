@@ -1,9 +1,12 @@
 # Copyright © 2024 Apple Inc.
 import json
+import shutil
+import tempfile
 import types
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
+import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
@@ -12,7 +15,72 @@ from ..cli_ui import rprint
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from ..utils import get_total_parameters
 from .dora import DoRAEmbedding, DoRALinear
-from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
+from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear, QuantizedLoRALinear
+
+QUANTIZED_LORA_FORMAT = "mlx_lm.quantized_lora"
+QUANTIZED_LORA_VERSION = 1
+
+
+def _parse_quantized_lora_layers(quantization: Dict) -> Dict[str, Dict[str, int]]:
+    try:
+        group_size = int(quantization["group_size"])
+        rank_group_size = int(quantization["rank_group_size"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Quantized LoRA adapter has invalid group sizes") from error
+    if group_size not in (32, 64, 128):
+        raise ValueError(f"Unsupported LoRA group size: {group_size}")
+    if rank_group_size not in (32, 64, 128):
+        raise ValueError(f"Unsupported LoRA rank group size: {rank_group_size}")
+
+    layers = quantization.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        raise ValueError("Quantized LoRA adapter has no layer metadata")
+
+    required = {
+        "bits",
+        "input_dims",
+        "output_dims",
+        "rank",
+        "padded_input_dims",
+        "padded_rank",
+    }
+    parsed = {}
+    for name, metadata in layers.items():
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Quantized LoRA layer '{name}' has invalid metadata")
+        missing = sorted(required - set(metadata))
+        if missing:
+            raise ValueError(
+                f"Quantized LoRA layer '{name}' is missing metadata: "
+                + ", ".join(missing)
+            )
+        values = {key: int(metadata[key]) for key in required}
+        if any(value <= 0 for value in values.values()):
+            raise ValueError(f"Quantized LoRA layer '{name}' metadata must be positive")
+        if values["padded_input_dims"] < values["input_dims"]:
+            raise ValueError(f"Quantized LoRA layer '{name}' has invalid input padding")
+        if values["padded_rank"] < values["rank"]:
+            raise ValueError(f"Quantized LoRA layer '{name}' has invalid rank padding")
+        if values["bits"] not in (2, 3, 4, 5, 6, 8):
+            raise ValueError(f"Quantized LoRA layer '{name}' has unsupported bit width")
+        expected_input = (
+            (values["input_dims"] + group_size - 1) // group_size * group_size
+        )
+        expected_rank = (
+            (values["rank"] + rank_group_size - 1) // rank_group_size * rank_group_size
+        )
+        if values["padded_input_dims"] != expected_input:
+            raise ValueError(
+                f"Quantized LoRA layer '{name}' input padding does not match "
+                "the group size"
+            )
+        if values["padded_rank"] != expected_rank:
+            raise ValueError(
+                f"Quantized LoRA layer '{name}' rank padding does not match "
+                "the rank group size"
+            )
+        parsed[name] = values
+    return parsed
 
 
 def build_schedule(schedule_config: Dict):
@@ -110,6 +178,138 @@ def linear_to_lora_layers(
         model.update_modules(tree_unflatten(lora_modules))
 
 
+def quantize_lora_layers(
+    model: nn.Module,
+    group_size: int = 64,
+    bits: int = 8,
+    rank_group_size: int = 32,
+    mode: str = "affine",
+    layer_bits: Optional[Dict[str, int]] = None,
+):
+    """Replace all LoRA linear layers with quantized inference layers.
+
+    LoRA embedding and switch-linear layers are left unchanged.
+    """
+    lora_layers = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, LoRALinear)
+    }
+    if layer_bits is None:
+        selected_layers = {name: bits for name in lora_layers}
+    else:
+        missing = sorted(set(layer_bits) - set(lora_layers))
+        if missing:
+            raise ValueError(
+                "Quantized LoRA metadata references missing linear layers: "
+                + ", ".join(missing)
+            )
+        selected_layers = layer_bits
+
+    replacements = []
+    for name, layer_bits_value in selected_layers.items():
+        replacements.append(
+            (
+                name,
+                lora_layers[name].to_quantized(
+                    group_size=group_size,
+                    bits=layer_bits_value,
+                    rank_group_size=rank_group_size,
+                    mode=mode,
+                ),
+            )
+        )
+    if replacements:
+        model.update_modules(tree_unflatten(replacements))
+    return model
+
+
+def save_quantized_adapter(
+    model: nn.Module,
+    source_adapter_path: str,
+    output_path: str,
+) -> Path:
+    """Save a model's quantized LoRA layers as a directly loadable adapter."""
+    source_adapter_path = Path(source_adapter_path)
+    output_path = Path(output_path)
+    if output_path.exists():
+        raise FileExistsError(f"Output path already exists: {output_path}")
+
+    config_path = source_adapter_path / "adapter_config.json"
+    with open(config_path, "r", encoding="utf-8") as fid:
+        config = json.load(fid)
+    if config.get("fine_tune_type", "lora") != "lora":
+        raise ValueError("Only LoRA adapters can be quantized")
+    if "adapter_quantization" in config:
+        raise ValueError("The source adapter is already quantized")
+
+    quantized_layers = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, QuantizedLoRALinear)
+    }
+    if not quantized_layers:
+        raise ValueError("The model has no quantized LoRA linear layers")
+
+    settings = {
+        (module.group_size, module.rank_group_size, module.mode)
+        for module in quantized_layers.values()
+    }
+    if len(settings) != 1:
+        raise ValueError(
+            "All persisted LoRA layers must use the same group sizes and mode"
+        )
+    group_size, rank_group_size, mode = settings.pop()
+    if mode != "affine":
+        raise ValueError("Persisted quantized LoRA currently supports affine mode")
+
+    adapter_weights = {
+        name: value
+        for name, value in tree_flatten(model.parameters())
+        if any(part.startswith("lora_") for part in name.split("."))
+    }
+    if not adapter_weights:
+        raise ValueError("No LoRA adapter parameters were found")
+
+    config["adapter_quantization"] = {
+        "format": QUANTIZED_LORA_FORMAT,
+        "version": QUANTIZED_LORA_VERSION,
+        "group_size": group_size,
+        "rank_group_size": rank_group_size,
+        "mode": mode,
+        "layers": {
+            name: {
+                "bits": module.bits,
+                "input_dims": module.input_dims,
+                "output_dims": module.output_dims,
+                "rank": module.rank,
+                "padded_input_dims": module.padded_input_dims,
+                "padded_rank": module.padded_rank,
+            }
+            for name, module in sorted(quantized_layers.items())
+        },
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = Path(
+        tempfile.mkdtemp(prefix=f".{output_path.name}.", dir=output_path.parent)
+    )
+    try:
+        mx.save_safetensors(
+            str(temporary_path / "adapters.safetensors"),
+            adapter_weights,
+        )
+        (temporary_path / "adapter_config.json").write_text(
+            json.dumps(config, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(output_path)
+    except Exception:
+        shutil.rmtree(temporary_path, ignore_errors=True)
+        raise
+    return output_path
+
+
 def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     """
     Load any fine-tuned adapters / layers.
@@ -124,8 +324,9 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     adapter_path = Path(adapter_path)
     if not adapter_path.exists():
         raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
-    with open(adapter_path / "adapter_config.json", "r") as fid:
-        config = types.SimpleNamespace(**json.load(fid))
+    with open(adapter_path / "adapter_config.json", "r", encoding="utf-8") as fid:
+        config_dict = json.load(fid)
+    config = types.SimpleNamespace(**config_dict)
     fine_tune_type = getattr(config, "fine_tune_type", "lora")
     if fine_tune_type != "full":
         linear_to_lora_layers(
@@ -134,7 +335,63 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
             config.lora_parameters,
             use_dora=(fine_tune_type == "dora"),
         )
-    model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+    quantization = config_dict.get("adapter_quantization")
+    adapter_file = adapter_path / "adapters.safetensors"
+    if quantization is not None:
+        if quantization.get("format") != QUANTIZED_LORA_FORMAT:
+            raise ValueError("Unsupported quantized LoRA adapter format")
+        if quantization.get("version") != QUANTIZED_LORA_VERSION:
+            raise ValueError("Unsupported quantized LoRA adapter version")
+        if quantization.get("mode") != "affine":
+            raise ValueError("Persisted quantized LoRA currently supports affine mode")
+        layers = _parse_quantized_lora_layers(quantization)
+        layer_bits = {name: metadata["bits"] for name, metadata in layers.items()}
+        quantize_lora_layers(
+            model,
+            group_size=int(quantization["group_size"]),
+            rank_group_size=int(quantization["rank_group_size"]),
+            mode=quantization["mode"],
+            layer_bits=layer_bits,
+        )
+        model_layers = dict(model.named_modules())
+        for name, metadata in layers.items():
+            layer = model_layers[name]
+            actual = {
+                "bits": layer.bits,
+                "input_dims": layer.input_dims,
+                "output_dims": layer.output_dims,
+                "rank": layer.rank,
+                "padded_input_dims": layer.padded_input_dims,
+                "padded_rank": layer.padded_rank,
+            }
+            if actual != metadata:
+                raise ValueError(
+                    f"Quantized LoRA layer '{name}' metadata does not match "
+                    "the base model"
+                )
+        adapter_weights = mx.load(str(adapter_file))
+        suffixes = (
+            "lora_a",
+            "lora_a_scales",
+            "lora_a_biases",
+            "lora_b",
+            "lora_b_scales",
+            "lora_b_biases",
+        )
+        missing_weights = [
+            f"{name}.{suffix}"
+            for name in layer_bits
+            for suffix in suffixes
+            if f"{name}.{suffix}" not in adapter_weights
+        ]
+        if missing_weights:
+            raise ValueError(
+                "Quantized LoRA adapter is missing weights: "
+                + ", ".join(missing_weights)
+            )
+        model.load_weights(list(adapter_weights.items()), strict=False)
+    else:
+        model.load_weights(str(adapter_file), strict=False)
     return model
 
 
@@ -150,7 +407,7 @@ def remove_lora_layers(model: nn.Module) -> nn.Module:
     """
     reset_layers = []
     for name, module in model.named_modules():
-        if isinstance(module, LoRALinear):
+        if isinstance(module, (LoRALinear, QuantizedLoRALinear)):
             reset_layers.append((name, module.linear))
     if len(reset_layers) > 0:
         model.update_modules(tree_unflatten(reset_layers))

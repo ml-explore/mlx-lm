@@ -14,9 +14,9 @@ from mlx.utils import tree_flatten
 
 from mlx_lm import lora, tuner
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
-from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
+from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear, QuantizedLoRALinear
 from mlx_lm.tuner.trainer import evaluate
-from mlx_lm.tuner.utils import build_schedule
+from mlx_lm.tuner.utils import build_schedule, quantize_lora_layers, remove_lora_layers
 
 
 @contextmanager
@@ -28,6 +28,85 @@ def swapped_with_identity(obj, func):
 
 
 class TestLora(unittest.TestCase):
+    def test_quantize_and_remove_lora_layers(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = LoRALinear.from_base(
+                    nn.Linear(64, 32),
+                    r=8,
+                    dropout=0.0,
+                    scale=2.0,
+                )
+
+        model = Model()
+        base = model.proj.linear
+        quantize_lora_layers(
+            model,
+            group_size=32,
+            bits=8,
+            rank_group_size=32,
+        )
+        self.assertIsInstance(model.proj, QuantizedLoRALinear)
+        self.assertIs(model.proj.linear, base)
+
+        remove_lora_layers(model)
+        self.assertIs(model.proj, base)
+
+    def test_quantized_lora_linear(self):
+        mx.random.seed(7)
+        linear = nn.Linear(70, 45, bias=False)
+        linear.weight = mx.zeros_like(linear.weight)
+        lora = LoRALinear.from_base(linear, r=7, dropout=0.0, scale=2.0)
+        lora.lora_a = mx.random.normal(lora.lora_a.shape)
+        lora.lora_b = mx.random.normal(lora.lora_b.shape)
+        x = mx.random.normal((2, 3, 70))
+
+        reference = lora(x)
+        thresholds = {8: 0.999, 6: 0.999, 5: 0.995, 4: 0.99}
+        for bits, threshold in thresholds.items():
+            with self.subTest(bits=bits):
+                quantized = lora.to_quantized(
+                    group_size=32,
+                    bits=bits,
+                    rank_group_size=32,
+                )
+                candidate = quantized(x)
+                mx.eval(reference, candidate)
+
+                self.assertIsInstance(quantized, QuantizedLoRALinear)
+                self.assertEqual(candidate.shape, reference.shape)
+                self.assertEqual(quantized.padded_input_dims, 96)
+                self.assertEqual(quantized.padded_rank, 32)
+                cosine = mx.sum(reference * candidate) / (
+                    mx.linalg.norm(reference) * mx.linalg.norm(candidate)
+                )
+                self.assertGreater(float(cosine), threshold)
+
+    def test_quantized_lora_with_quantized_base(self):
+        mx.random.seed(11)
+        linear = nn.Linear(64, 32, bias=False)
+        base = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=8)
+        lora = LoRALinear.from_base(base, r=8, dropout=0.0, scale=2.0)
+        lora.lora_a = mx.random.normal(lora.lora_a.shape)
+        lora.lora_b = mx.random.normal(lora.lora_b.shape)
+        quantized = lora.to_quantized(group_size=32, bits=4, rank_group_size=32)
+        x = mx.random.normal((2, 64))
+        output = quantized(x)
+        mx.eval(output)
+
+        self.assertEqual(output.shape, (2, 32))
+        self.assertIsInstance(quantized.linear, nn.QuantizedLinear)
+
+        fused = quantized.fuse(dequantize=True)
+        fused_output = fused(x)
+        mx.eval(fused_output)
+        self.assertEqual(fused_output.shape, (2, 32))
+        cosine = mx.sum(output * fused_output) / (
+            mx.linalg.norm(output) * mx.linalg.norm(fused_output)
+        )
+        self.assertGreater(float(cosine), 0.999)
+
     def test_llama(self):
         from mlx_lm.models import llama
 
