@@ -1486,6 +1486,43 @@ class TestModels(unittest.TestCase):
         last_row = set(topk_indices[0, 0, -1].tolist())
         self.assertEqual(last_row & set(range(4)), set(range(4)))
 
+    def test_deepseek_v32_indexer_keeps_padded_batch_sinks(self):
+        # Under BatchKVCache, offset/left_padding are per-sequence arrays, not
+        # a python scalar, and "sink" means the first real tokens of each
+        # sequence rather than buffer column 0 once left-padding shifts them.
+        from mlx_lm.models import deepseek_v32
+        from mlx_lm.models.base import create_causal_mask
+        from mlx_lm.models.cache import BatchKVCache
+
+        mx.random.seed(0)
+
+        args = deepseek_v32.ModelArgs(
+            model_type="deepseek_v32",
+            hidden_size=32,
+            index_head_dim=8,
+            index_n_heads=2,
+            index_topk=200,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+        )
+        indexer = deepseek_v32.Indexer(args)
+
+        b, s_total = 2, 400
+        left_padding = [0, 30]
+        x = mx.random.normal((b, s_total, args.hidden_size)) * 0.05
+        x = mx.concatenate([x[:, :50], x[:, 50:150] * 20.0, x[:, 150:]], axis=1)
+        qr = mx.random.normal((b, s_total, args.q_lora_rank))
+        mask = create_causal_mask(s_total, left_padding=mx.array(left_padding))
+
+        cache = BatchKVCache(left_padding)
+        topk_indices = indexer(x, qr, mask, cache=cache)
+        self.assertEqual(topk_indices.shape[0], b)
+
+        for i, pad in enumerate(left_padding):
+            real_sinks = set(range(pad, pad + 4))
+            last_row = set(topk_indices[i, 0, -1].tolist())
+            self.assertEqual(last_row & real_sinks, real_sinks)
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
