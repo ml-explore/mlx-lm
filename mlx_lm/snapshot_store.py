@@ -659,52 +659,55 @@ class SnapshotStore:
         return None if best is not None and best.depth >= self.max_chain_depth else best
 
     def _reserve_space(self, reservation: int, protected_cids=None):
-        """Make room for one transient/final file without evicting parents."""
+        """Plan then make room for one file without evicting parents."""
         protected_cids = set(protected_cids or ())
         if self.max_files < 1:
             raise RuntimeError("snapshot reservation requires max_files >= 1")
         if reservation > self.max_bytes:
             raise RuntimeError("snapshot reservation exceeds max_bytes")
+        if shutil.disk_usage(self.directory).free < reservation:
+            raise RuntimeError("insufficient free disk space for snapshot reservation")
 
-        def files():
-            return [
-                path
-                for path in self.directory.iterdir()
-                if path.is_file() and path.name != ".writer.lock"
-            ]
-
+        file_stats = {
+            path: path.stat()
+            for path in self.directory.iterdir()
+            if path.is_file() and path.name != ".writer.lock"
+        }
+        simulated_files = dict(file_stats)
+        simulated_records = dict(self._records)
+        victims = []
         while True:
-            live_files = files()
-            live_bytes = sum(path.stat().st_size for path in live_files)
+            live_bytes = sum(stat.st_size for stat in simulated_files.values())
             if (
-                len(live_files) + 1 <= self.max_files
+                len(simulated_files) + 1 <= self.max_files
                 and live_bytes + reservation <= self.max_bytes
             ):
                 break
-            known_paths = {record.path for record in self._records.values()}
+            known_paths = {record.path for record in simulated_records.values()}
             disposable = [
                 path
-                for path in live_files
+                for path in simulated_files
                 if path.suffix != ".safetensors" or path not in known_paths
             ]
             if disposable:
-                victim = min(disposable, key=lambda path: path.stat().st_mtime)
-                try:
-                    victim.unlink()
-                except OSError as exc:
-                    raise RuntimeError(
-                        f"snapshot reservation could not unlink {victim}"
-                    ) from exc
+                victim = min(
+                    disposable,
+                    key=lambda path: (simulated_files[path].st_mtime, path.name),
+                )
+                victims.append((victim, None))
+                simulated_files.pop(victim)
                 continue
             parents = {
                 record.parent_cid
-                for record in self._records.values()
+                for record in simulated_records.values()
                 if record.parent_cid
             }
             leaves = [
                 record
-                for record in self._records.values()
-                if record.cid not in parents and record.cid not in protected_cids
+                for record in simulated_records.values()
+                if record.path in simulated_files
+                and record.cid not in parents
+                and record.cid not in protected_cids
             ]
             leaf = min(
                 leaves,
@@ -715,22 +718,27 @@ class SnapshotStore:
                 raise RuntimeError(
                     "snapshot reservation exceeds cap with no evictable leaf"
                 )
+            victims.append((leaf.path, leaf))
+            simulated_files.pop(leaf.path)
+            simulated_records.pop(leaf.cid)
+
+        for path, record in victims:
             try:
-                leaf.path.unlink()
+                path.unlink()
             except OSError as exc:
                 raise RuntimeError(
-                    f"snapshot reservation could not unlink {leaf.path}"
+                    f"snapshot reservation could not unlink {path}"
                 ) from exc
-            self._records.pop(leaf.cid, None)
+            if record is None:
+                continue
+            self._records.pop(record.cid, None)
             self._index_dirty = True
-            self._disk_ghosts.append((leaf.model_key, leaf.tokens, leaf.cid))
+            self._disk_ghosts.append((record.model_key, record.tokens, record.cid))
             self._stats["gc_files"] += 1
             if self.registry is not None and isinstance(
-                self.registry.get(leaf.cid), DiskBackedSnapshot
+                self.registry.get(record.cid), DiskBackedSnapshot
             ):
-                self.registry.invalidate(leaf.cid)
-        if shutil.disk_usage(self.directory).free < reservation:
-            raise RuntimeError("insufficient free disk space for snapshot reservation")
+                self.registry.invalidate(record.cid)
 
     @_owned_operation
     def save(self, snapshot: FrozenPrefixSnapshot) -> str:
@@ -989,7 +997,8 @@ class SnapshotStore:
         ):
             self._quarantine_chain(chain, "restored length mismatch")
             return None
-        self._touch(cid)
+        if record_hit or promote:
+            self._touch(cid)
         if record_hit:
             self._stats["disk_hits"] += 1
         if promote:

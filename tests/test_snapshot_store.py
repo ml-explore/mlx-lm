@@ -672,6 +672,113 @@ class TestSnapshotStore(unittest.TestCase):
         self.assertIn(existing.cid, store._records)
         self.assertFalse((file_cap_path / f"{incoming.cid}.safetensors").exists())
 
+    def test_infeasible_child_reservation_preserves_all_existing_state(self):
+        source = PrefixForkRegistry()
+        root = source.get(source.freeze("m@r", list(range(8)), _prefix_cache(8)))
+        child = source.get(source.freeze("m@r", list(range(16)), _prefix_cache(16)))
+        unrelated = source.get(
+            source.freeze("other@r", list(range(100, 108)), _prefix_cache(8))
+        )
+        first = SnapshotStore(self.path)
+        first.save(root)
+        first.save(unrelated)
+        first.close()
+
+        registry = PrefixForkRegistry()
+        store = SnapshotStore(self.path, registry=registry)
+        captured = {}
+
+        class ReservationProbe(RuntimeError):
+            pass
+
+        def capture_reservation(reservation, protected_cids=None):
+            captured["reservation"] = reservation
+            captured["protected"] = set(protected_cids or ())
+            raise ReservationProbe
+
+        with patch.object(
+            store, "_reserve_space", side_effect=capture_reservation
+        ), self.assertRaises(ReservationProbe):
+            store.save(child)
+        self.assertEqual(captured["protected"], {root.cid})
+        store.max_bytes = captured["reservation"]
+
+        low_free_files = {
+            path.name: path.read_bytes()
+            for path in self.path.iterdir()
+            if path.is_file()
+        }
+        low_free_records = copy.deepcopy(tuple(store._records.items()))
+        low_free_ghosts = tuple(store._disk_ghosts)
+        low_free_stats = store.stats
+        low_free_index_dirty = store._index_dirty
+        with patch(
+            "mlx_lm.snapshot_store.shutil.disk_usage",
+            return_value=Namespace(total=100, used=100, free=0),
+        ), self.assertRaisesRegex(RuntimeError, "insufficient free disk space"):
+            store._reserve_space(captured["reservation"], {root.cid})
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in self.path.iterdir()
+                if path.is_file()
+            },
+            low_free_files,
+        )
+        self.assertEqual(tuple(store._records.items()), low_free_records)
+        self.assertEqual(tuple(store._disk_ghosts), low_free_ghosts)
+        self.assertEqual(store.stats, low_free_stats)
+        self.assertEqual(store._index_dirty, low_free_index_dirty)
+
+        files_before = {
+            path.name: path.read_bytes()
+            for path in self.path.iterdir()
+            if path.is_file()
+        }
+        records_before = copy.deepcopy(tuple(store._records.items()))
+        proxies_before = {cid: registry.get(cid) for cid in (root.cid, unrelated.cid)}
+        index_before = (self.path / "index.json").read_bytes()
+        ghosts_before = tuple(store._disk_ghosts)
+        stats_before = store.stats
+        index_dirty_before = store._index_dirty
+
+        original_reserve = store._reserve_space
+
+        def reserve_at_exact_cap(reservation, protected_cids=None):
+            store.max_bytes = reservation
+            return original_reserve(reservation, protected_cids)
+
+        with patch.object(
+            store, "_reserve_space", side_effect=reserve_at_exact_cap
+        ), self.assertRaisesRegex(RuntimeError, "no evictable leaf"):
+            store.save(child)
+
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in self.path.iterdir()
+                if path.is_file()
+            },
+            files_before,
+        )
+        self.assertEqual(tuple(store._records.items()), records_before)
+        for cid, proxy in proxies_before.items():
+            self.assertIs(registry.get(cid), proxy)
+        self.assertEqual((self.path / "index.json").read_bytes(), index_before)
+        self.assertEqual(tuple(store._disk_ghosts), ghosts_before)
+        self.assertEqual(store.stats, stats_before)
+        self.assertEqual(store._index_dirty, index_dirty_before)
+        self.assertNotIn(child.cid, store._records)
+        self.assertFalse((self.path / f"{child.cid}.safetensors").exists())
+        self.assertFalse(
+            [
+                path
+                for path in self.path.iterdir()
+                if ".digest-" in path.name or ".tmp-" in path.name
+            ]
+        )
+        store.close()
+
     def test_reservation_protects_incoming_parent_chain(self):
         registry = PrefixForkRegistry()
         root = registry.get(registry.freeze("m@r", list(range(8)), _prefix_cache(8)))
