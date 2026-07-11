@@ -109,6 +109,26 @@ class Indexer(nn.Module):
         scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
+
+        # The learned top-k does not reliably keep the first few key positions
+        # (attention sinks). Once sparse attention starts (past index_topk),
+        # losing a sink collapses generation into repetition (StreamingLLM
+        # effect, Xiao et al. 2023). Force sinks + a small recency window into
+        # the selection; non-causal picks for early rows are harmless since the
+        # caller ANDs this selection with the real causal mask before use.
+        n_sinks, local_window = 4, 128
+        num_keys = scores.shape[-1]
+        query_pos = (mx.arange(scores.shape[2]) + offset).reshape(-1, 1)
+        key_pos = mx.arange(num_keys).reshape(1, num_keys)
+        force_keep = (key_pos < n_sinks) | (
+            (key_pos <= query_pos) & (key_pos > query_pos - local_window)
+        )
+        scores = mx.where(
+            force_keep.reshape(1, 1, scores.shape[2], num_keys),
+            mx.array(float("inf"), scores.dtype),
+            scores,
+        )
+
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
             ..., -self.index_topk :
         ]
