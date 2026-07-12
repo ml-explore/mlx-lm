@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
-from .base import create_causal_mask
+from .base import create_causal_mask, hadamard_size_ok, rotate_last
 
 
 def make_prompt_cache(
@@ -232,12 +232,13 @@ class ConcatenateKVCache(_BaseCache):
 class QuantizedKVCache(_BaseCache):
     step = 256
 
-    def __init__(self, group_size: int = 64, bits: int = 8):
+    def __init__(self, group_size: int = 64, bits: int = 8, rotate: bool = False):
         self.keys = None
         self.values = None
         self.offset = 0
         self.group_size = group_size
         self.bits = bits
+        self.rotate = rotate
 
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
@@ -274,6 +275,8 @@ class QuantizedKVCache(_BaseCache):
 
         self.offset += num_steps
 
+        if self.rotate and hadamard_size_ok(keys.shape[-1]):
+            keys = rotate_last(keys)
         keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
         values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
         for i in range(len(self.keys)):
@@ -297,11 +300,16 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.group_size, self.bits)))
+        return tuple(
+            map(str, (self.offset, self.group_size, self.bits, int(self.rotate)))
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset, self.group_size, self.bits = map(int, v)
+        vals = list(map(int, v))
+        self.offset, self.group_size, self.bits = vals[:3]
+        # Backward compatible with caches saved before `rotate` existed.
+        self.rotate = bool(vals[3]) if len(vals) > 3 else False
 
     def is_trimmable(self):
         return True
@@ -380,11 +388,16 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
-        quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4, rotate: bool = False
+    ) -> QuantizedKVCache:
+        quant_cache = QuantizedKVCache(group_size=group_size, bits=bits, rotate=rotate)
         quant_cache.offset = self.offset
         if self.keys is not None:
-            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+            keys = self.keys
+            if rotate and hadamard_size_ok(keys.shape[-1]):
+                keys = rotate_last(keys)
+            quant_cache.keys = mx.quantize(keys, group_size=group_size, bits=bits)
             quant_cache.values = mx.quantize(
                 self.values, group_size=group_size, bits=bits
             )

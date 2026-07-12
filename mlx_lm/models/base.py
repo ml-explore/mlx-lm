@@ -1,11 +1,36 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
 from mlx.utils import tree_map
+
+_HADAMARD_BASES = (1, 12, 20, 28)
+
+
+def hadamard_size_ok(n: int) -> bool:
+    """True if ``mx.hadamard_transform`` supports a last-dim of size ``n``
+    (i.e. ``n = m * 2**k`` for ``m`` in {1, 12, 20, 28})."""
+    for m in _HADAMARD_BASES:
+        if n % m == 0 and ((n // m) & (n // m - 1)) == 0:
+            return True
+    return False
+
+
+def rotate_last(x: mx.array) -> mx.array:
+    """Orthonormal Walsh–Hadamard transform along the last axis.
+
+    Normalized by ``1/sqrt(D)`` so the transform is orthonormal (``R^T R = I``).
+    Applying it to *both* queries and keys leaves every ``q·k`` inner product —
+    and hence the attention scores — unchanged in exact arithmetic, while
+    spreading per-channel outliers into a near-Gaussian marginal that low-bit
+    affine quantization handles far more gracefully. Only orthonormality is
+    relied on here; the transform is additionally self-inverse only for
+    power-of-two ``D``."""
+    return mx.hadamard_transform(x, scale=1.0 / math.sqrt(x.shape[-1]))
 
 
 @dataclass
@@ -119,6 +144,11 @@ def scaled_dot_product_attention(
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
+        # Rotated KV: keys were Hadamard-rotated before quantization, so rotate
+        # the queries by the same orthonormal transform. (R q)·(R k) = q·k, so
+        # scores are preserved while the stored keys quantize far more cleanly.
+        if getattr(cache, "rotate", False) and hadamard_size_ok(queries.shape[-1]):
+            queries = rotate_last(queries)
         return quantized_scaled_dot_product_attention(
             queries,
             keys,
