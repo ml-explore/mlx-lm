@@ -3251,6 +3251,36 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def test_quantized_sdpa_gqa_float_mask(self):
+        # Per-head float masks (e.g. the absorbed-MLA pe_scores) must be
+        # unflattened to (B, n_kv_heads, n_repeats, L, S) for GQA, not
+        # expanded on the kv axis.
+        from mlx_lm.models.base import quantized_scaled_dot_product_attention
+
+        B, n_q, n_kv, L, S, D = 1, 8, 2, 4, 64, 64
+        group_size, bits = 64, 8
+        mx.random.seed(0)
+        q = mx.random.normal((B, n_q, L, D))
+        k = mx.random.normal((B, n_kv, S, D))
+        v = mx.random.normal((B, n_kv, S, D))
+        mask = 0.1 * mx.random.normal((B, n_q, L, S))
+
+        q_k = mx.quantize(k, group_size=group_size, bits=bits)
+        q_v = mx.quantize(v, group_size=group_size, bits=bits)
+        out = quantized_scaled_dot_product_attention(
+            q, q_k, q_v, scale=1.0, mask=mask, group_size=group_size, bits=bits
+        )
+        self.assertEqual(out.shape, (B, n_q, L, D))
+
+        kd = mx.dequantize(*q_k, group_size=group_size, bits=bits)
+        vd = mx.dequantize(*q_v, group_size=group_size, bits=bits)
+        n_repeats = n_q // n_kv
+        kd = mx.repeat(kd, n_repeats, axis=1)
+        vd = mx.repeat(vd, n_repeats, axis=1)
+        scores = q @ kd.swapaxes(-1, -2) + mask
+        ref = mx.softmax(scores, axis=-1, precise=True) @ vd
+        self.assertTrue(mx.allclose(out, ref, rtol=1e-3, atol=1e-3))
+
 
 if __name__ == "__main__":
     unittest.main()
