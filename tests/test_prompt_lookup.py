@@ -217,8 +217,6 @@ class TestPromptLookupGenerate(unittest.TestCase):
         self.assertEqual(_pld_offset(cache[0]), prompt.size + len(out))
 
 
-
-
 class _LifecycleCache:
     def __init__(self, fail_start=False):
         self.offset = 0
@@ -297,6 +295,123 @@ class TestYieldBoundaryAccounting(unittest.TestCase):
         self.assertEqual(stats.bonus_tokens, 0)
         self.assertEqual(stats.total_emitted, 1)
         self.assertEqual(cache.offset, 2)  # one prompt + one delivered token
+
+
+def _fake_clock(values):
+    """A deterministic time.perf_counter: returns the scripted values in order,
+    then holds the last value (so extra downstream calls are harmless)."""
+    it = iter(values)
+    last = [values[-1] if values else 0.0]
+
+    def _now():
+        try:
+            last[0] = next(it)
+        except StopIteration:
+            pass
+        return last[0]
+
+    return _now
+
+
+class TestRateGate(unittest.TestCase):
+    """Measured never-slower-than-plain gate (rate_gate=True)."""
+
+    def _tiny(self):
+        mx.random.seed(0)
+        model = _TinyCacheListModel()
+        mx.eval(model.parameters())
+        return model
+
+    def _run(self, model, prompt, **kw):
+        cache = make_prompt_cache(model)
+        return [
+            int(t)
+            for t, _, _ in prompt_lookup_generate_step(
+                prompt,
+                model,
+                sampler=GREEDY,
+                prompt_cache=cache,
+                backend="suffix_automaton",
+                **kw,
+            )
+        ]
+
+    def test_probe_runs_and_is_lossless(self):
+        from mlx_lm.prompt_lookup import PromptLookupStats
+
+        model = self._tiny()
+        prompt = mx.array([3, 7, 1, 3, 7])
+        base = self._run(model, prompt, max_tokens=24)  # plain PLD (lossless)
+        stats = PromptLookupStats()
+        gated = self._run(
+            model,
+            prompt,
+            max_tokens=24,
+            rate_gate=True,
+            warmup=2,
+            rate_gate_probe=4,
+            stats=stats,
+        )
+        self.assertTrue(stats.rate_gate_probed)
+        self.assertGreaterEqual(stats.rate_gate_spec_ms_per_tok, 0.0)
+        self.assertGreaterEqual(stats.rate_gate_plain_ms_per_tok, 0.0)
+        # the gate only decides *when to stop speculating*, never *what* to emit
+        self.assertEqual(gated, base)
+        self.assertEqual(len(gated), 24)
+
+    def test_delatches_when_speculation_is_slower(self):
+        from unittest import mock
+
+        from mlx_lm.prompt_lookup import PromptLookupStats
+
+        model = self._tiny()
+        prompt = mx.array([3, 7, 1, 3, 7])
+        base = self._run(model, prompt, max_tokens=24)
+        stats = PromptLookupStats()
+        # spec window huge (0 -> 10s), probe window tiny (10 -> 10.001s) => de-latch
+        clock = _fake_clock([0.0, 10.0, 10.0, 10.001])
+        with mock.patch("mlx_lm.generate.time.perf_counter", clock):
+            out = self._run(
+                model,
+                prompt,
+                max_tokens=24,
+                rate_gate=True,
+                warmup=2,
+                rate_gate_probe=4,
+                stats=stats,
+            )
+        self.assertTrue(stats.rate_gate_probed)
+        self.assertTrue(stats.rate_gate_delatched)
+        self.assertTrue(stats.latched)  # fell through to the plain tail
+        self.assertEqual(out, base)  # still lossless after de-latch
+        self.assertEqual(len(out), 24)
+
+    def test_stays_latched_off_when_speculation_is_faster(self):
+        from unittest import mock
+
+        from mlx_lm.prompt_lookup import PromptLookupStats
+
+        model = self._tiny()
+        prompt = mx.array([3, 7, 1, 3, 7])
+        base = self._run(model, prompt, max_tokens=24)
+        stats = PromptLookupStats()
+        # spec window tiny, probe window huge => keep speculating
+        clock = _fake_clock([0.0, 0.001, 0.001, 10.001, 10.001])
+        with mock.patch("mlx_lm.generate.time.perf_counter", clock):
+            out = self._run(
+                model,
+                prompt,
+                max_tokens=24,
+                rate_gate=True,
+                warmup=2,
+                rate_gate_probe=4,
+                stats=stats,
+            )
+        self.assertTrue(stats.rate_gate_probed)
+        self.assertFalse(stats.rate_gate_delatched)
+        self.assertFalse(stats.latched)
+        self.assertEqual(out, base)
+        self.assertEqual(len(out), 24)
 
 
 if __name__ == "__main__":

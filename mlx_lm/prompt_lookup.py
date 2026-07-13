@@ -174,6 +174,11 @@ class PromptLookupStats:
     bonus_tokens: int = 0
     plain_tokens: int = 0
     latched: bool = False
+    # measured-rate gate (rate_gate=True)
+    rate_gate_probed: bool = False
+    rate_gate_delatched: bool = False
+    rate_gate_spec_ms_per_tok: float = 0.0
+    rate_gate_plain_ms_per_tok: float = 0.0
 
     @property
     def total_emitted(self) -> int:
