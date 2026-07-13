@@ -5,7 +5,6 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-
 # For the shapes it supports, the packed kernel is bitwise-identical by
 # construction to an explicit-tree comparator kernel that the tests pin it
 # against (see _make_gated_delta_packed_kernel). Every other shape (masks,
@@ -514,9 +513,7 @@ def gated_delta_kernel_unpacked(
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """Run the original one-value-row-per-SIMD-group kernel."""
-    return _gated_delta_kernel_impl(
-        q, k, v, g, beta, state, mask, allow_packed=False
-    )
+    return _gated_delta_kernel_impl(q, k, v, g, beta, state, mask, allow_packed=False)
 
 
 def gated_delta_kernel(
@@ -528,9 +525,7 @@ def gated_delta_kernel(
     state: mx.array,
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
-    return _gated_delta_kernel_impl(
-        q, k, v, g, beta, state, mask, allow_packed=True
-    )
+    return _gated_delta_kernel_impl(q, k, v, g, beta, state, mask, allow_packed=True)
 
 
 def gated_delta_ops(

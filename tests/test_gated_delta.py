@@ -130,9 +130,7 @@ class TestGatedDelta(unittest.TestCase):
         if mx.default_device() != mx.gpu:
             raise unittest.SkipTest("gated delta kernels are GPU only")
         q, k, v, _, beta, state = self._inputs(1, 65, 4, 8, 128, 128, mx.bfloat16)
-        g = mx.exp(-mx.random.uniform(shape=(1, 65, 8, 128)) * 0.2).astype(
-            mx.float32
-        )
+        g = mx.exp(-mx.random.uniform(shape=(1, 65, 8, 128)) * 0.2).astype(mx.float32)
         mx.eval(g)
         y_k, s_k = gated_delta_kernel(q, k, v, g, beta, state, None)
         y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, None)
