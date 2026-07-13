@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -1626,7 +1627,10 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
-        checked_out: bool = False
+        # Nonce identifying the currently active checkout, or None when the
+        # entry isn't checked out. Comparing identities in return_cache means
+        # only the checkout that set it can clear it.
+        checked_out: Optional[object] = None
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1664,6 +1668,9 @@ class LRUPromptCache:
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        # Serializes the checked_out check-then-set/clear so two concurrent
+        # checkout_cache calls can never both take the no-copy path.
+        self._checkout_lock = threading.Lock()
 
     def __len__(self):
         return len(self._lru)
@@ -1701,10 +1708,15 @@ class LRUPromptCache:
         # sharing that reference would corrupt the first's history. Only
         # hand out the shared reference (skipping the copy) when nothing
         # else currently holds it; otherwise fall back to the safe copy.
-        if cache_entry.checked_out:
-            return copy.deepcopy(cache_entry.prompt_cache), None
-        cache_entry.checked_out = True
-        return cache_entry.prompt_cache, (model, entry_tokens)
+        # The lock makes the check-then-set atomic, and the per-checkout
+        # nonce means a stale or doubled return_cache can't release a
+        # checkout it doesn't own. The deep copy happens outside the lock.
+        with self._checkout_lock:
+            if cache_entry.checked_out is None:
+                nonce = object()
+                cache_entry.checked_out = nonce
+                return cache_entry.prompt_cache, (model, entry_tokens, nonce)
+        return copy.deepcopy(cache_entry.prompt_cache), None
 
     def checkout_cache(self, model: Any, tokens: List[int]):
         """Like fetch_nearest_cache, but avoids deep-copying the returned KV
@@ -1721,7 +1733,10 @@ class LRUPromptCache:
         Returns (prompt_cache, rest_tokens, checkout_token). checkout_token
         is None whenever nothing was actually checked out (no match, or the
         deep-copy fallback was used) -- passing None to return_cache is
-        always a safe no-op.
+        always a safe no-op. Tokens are single-use and scoped to the
+        checkout that produced them; returning one twice is a no-op, not a
+        release of some later caller's checkout. Safe to call from multiple
+        threads.
         """
         result = self._trie.search(model, tokens)
         if result.exact is not None:
@@ -1750,17 +1765,23 @@ class LRUPromptCache:
         return None, tokens, None
 
     def return_cache(self, checkout_token):
-        """Release a checkout obtained from checkout_cache. Safe to call
-        with None (no-op) and safe to call if the entry was evicted while
-        checked out (no-op)."""
+        """Release a checkout obtained from checkout_cache.
+
+        Tokens are single-use and scoped to the specific checkout that
+        produced them: a token that has already been returned, or that
+        belongs to an entry evicted (and possibly reinserted under the same
+        tokens) since the checkout, is a safe no-op and cannot release a
+        checkout held by another caller. Passing None is also a no-op."""
         if checkout_token is None:
             return
-        model, entry_tokens = checkout_token
-        try:
-            entry = self._trie.get(model, entry_tokens)
-        except KeyError:
-            return
-        entry.checked_out = False
+        model, entry_tokens, nonce = checkout_token
+        with self._checkout_lock:
+            try:
+                entry = self._trie.get(model, entry_tokens)
+            except KeyError:
+                return
+            if entry.checked_out is nonce:
+                entry.checked_out = None
 
     def insert_cache(
         self,

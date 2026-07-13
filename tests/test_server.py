@@ -803,6 +803,62 @@ class TestLRUPromptCache(unittest.TestCase):
         cache = LRUPromptCache(max_size=10)
         cache.return_cache(None)  # must not raise
 
+    def test_double_return_does_not_release_a_later_checkout(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        entry = [MockCache("test1")]
+        cache.insert_cache(model, [1, 2], entry)
+
+        # A checks out and returns once -- normal lifecycle.
+        _, _, token_a = cache.checkout_cache(model, [1, 2])
+        cache.return_cache(token_a)
+
+        # B legitimately checks out the same entry.
+        c_b, _, token_b = cache.checkout_cache(model, [1, 2])
+        self.assertIs(c_b, entry)
+        self.assertIsNotNone(token_b)
+
+        # A's stale token gets returned a second time (e.g. a double-release
+        # bug in a finally block). It must NOT release B's checkout.
+        cache.return_cache(token_a)
+
+        # C must therefore get a copy, not the live reference B holds.
+        c_c, _, token_c = cache.checkout_cache(model, [1, 2])
+        self.assertIsNot(c_c, entry)
+        self.assertEqual(c_c, entry)
+        self.assertIsNone(token_c)
+
+        cache.return_cache(token_b)
+
+    def test_stale_token_after_evict_and_reinsert_is_noop(self):
+        cache = LRUPromptCache(max_size=1)
+        model = ("test", None, None)
+        entry = [MockCache("test1")]
+        cache.insert_cache(model, [1, 2], entry)
+
+        _, _, stale_token = cache.checkout_cache(model, [1, 2])
+
+        # Evict the checked-out entry, then reinsert the same tokens as a
+        # brand-new entry.
+        cache.insert_cache(model, [3, 4], [MockCache("test2")])
+        new_entry = [MockCache("test3")]
+        cache.insert_cache(model, [1, 2], new_entry)
+
+        # B checks out the new entry.
+        c_b, _, token_b = cache.checkout_cache(model, [1, 2])
+        self.assertIs(c_b, new_entry)
+        self.assertIsNotNone(token_b)
+
+        # The pre-eviction token must not release B's checkout on the new
+        # entry that happens to share the same key.
+        cache.return_cache(stale_token)
+
+        c_c, _, token_c = cache.checkout_cache(model, [1, 2])
+        self.assertIsNot(c_c, new_entry)
+        self.assertIsNone(token_c)
+
+        cache.return_cache(token_b)
+
     def test_fetch_nearest_cache_still_copies_without_checkout(self):
         cache = LRUPromptCache(max_size=10)
         model = ("test", None, None)
