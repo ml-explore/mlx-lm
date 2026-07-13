@@ -1147,12 +1147,16 @@ class PromptProcessingBatch:
         if not any(self.samplers):
             self.samplers = [None] * len(self.uids)
         if not any(self.logits_processors):
-            self.logits_processors = [None] * len(self.uids)
+            # Placeholder must stay an iterable ([]), never None: _step iterates
+            # each entry (``for processor in self.logits_processors[e]``), so a
+            # None planted here would crash a mixed [[], [proc]] batch. Matches
+            # the filter() path, which already uses []. (cf. upstream #1513)
+            self.logits_processors = [[] for _ in self.uids]
         samplers = batch.samplers if any(batch.samplers) else [None] * len(batch.uids)
         logits_processors = (
             batch.logits_processors
             if any(batch.logits_processors)
-            else [None] * len(batch.uids)
+            else [[] for _ in batch.uids]
         )
 
         self.uids.extend(batch.uids)
