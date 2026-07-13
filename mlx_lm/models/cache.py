@@ -1786,12 +1786,24 @@ def snapkv_keep_indices(
     sink_tokens: int = 4,
     recent_tokens: Optional[int] = None,
     min_tokens: int = 128,
+    guarantee_sinks: bool = True,
 ) -> Tuple[int, ...]:
     """Return the sorted prompt positions retained by the SnapKV-D policy.
 
     Keeps ``sink_tokens`` leading rows, a recent window, and the highest-scoring
     remaining rows up to ``budget``. Returns all positions unchanged when the
     prompt is at or below ``min_tokens`` or the budget covers it.
+
+    Sink-preservation guard (default on): the first ``sink_tokens`` positions
+    are attention sinks. Evicting them collapses decode into repetition — the
+    same failure DeepSeek's DSA indexer hit in mlx-lm #1552, where learned
+    top-k selection dropped the sinks. The sinks and the recent window are
+    staged into the keep set *before* the score-ranked fill, so a high-scoring
+    middle row can never crowd them out. With ``guarantee_sinks`` the sink
+    floor is clamped only by what physically fits (``budget``, ``seq_len``);
+    pass ``guarantee_sinks=False`` for the older ``budget // 8``-capped floor
+    that could silently keep fewer than ``sink_tokens`` sinks under a tight
+    budget.
     """
     if seq_len < 0:
         raise ValueError("seq_len must be non-negative")
@@ -1803,7 +1815,12 @@ def snapkv_keep_indices(
         return tuple(range(seq_len))
 
     budget = min(budget, seq_len)
-    sink_count = min(max(0, sink_tokens), max(1, budget // 8), budget)
+    if guarantee_sinks:
+        # Hard floor: never let a fraction of the budget shrink the sink set
+        # below the requested count — a sink dropped is a repetition collapse.
+        sink_count = min(max(0, sink_tokens), budget)
+    else:
+        sink_count = min(max(0, sink_tokens), max(1, budget // 8), budget)
     retained = set(range(sink_count))
 
     remaining = budget - len(retained)

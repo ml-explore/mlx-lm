@@ -79,6 +79,37 @@ class TestSnapKVKeepIndices(unittest.TestCase):
         self.assertIn(100, keep)  # top-scored middle tokens survive
         self.assertIn(150, keep)
 
+    def test_sink_guard_survives_tight_budget_and_distractors(self):
+        # #1552-style adversary: a tight budget plus middle rows scored far
+        # higher than the sinks. The sink guard must still keep all N sinks and
+        # the most-recent row — eviction can never drop them.
+        seq_len = 300
+        budget = 16  # budget // 8 == 2 < sink_tokens, the old cap's weak spot
+        scores = [0.0] * seq_len
+        for i in range(4, seq_len - 1):  # every middle row screams to be kept
+            scores[i] = 1e9
+        keep = snapkv_keep_indices(
+            seq_len, budget, scores, sink_tokens=4, min_tokens=128
+        )
+        self.assertEqual(len(keep), budget)
+        for s in range(4):  # all four sinks survive despite tiny budget
+            self.assertIn(s, keep)
+        self.assertIn(seq_len - 1, keep)  # recency window survives too
+
+    def test_guarantee_sinks_flag_toggles_floor(self):
+        # With the guard off, the budget//8 cap keeps fewer than N sinks; with
+        # it on (default) all N survive.
+        scores = [0.0] * 300
+        capped = snapkv_keep_indices(
+            300, 16, scores, sink_tokens=4, min_tokens=128, guarantee_sinks=False
+        )
+        self.assertNotIn(3, capped)  # 4th sink dropped by the budget//8 cap
+        guarded = snapkv_keep_indices(
+            300, 16, scores, sink_tokens=4, min_tokens=128, guarantee_sinks=True
+        )
+        for s in range(4):
+            self.assertIn(s, guarded)
+
     def test_noop_paths(self):
         # budget covers the prompt, or prompt <= min_tokens -> keep everything.
         self.assertEqual(
