@@ -256,8 +256,8 @@ class NemotronHMamba2Mixer(nn.Module):
         if self.is_puzzle:
             # NVIDIA promotes the state-space operands and A_log
             # exponentiation to float32, but computes softplus(dt + dt_bias)
-            # in the projected activation dtype. Puzzle generation is
-            # sensitive to promoting dt before this softplus boundary.
+            # in the projected activation dtype. Preserve that boundary to
+            # match the Puzzle reference implementation.
             hidden_states = hidden_states.astype(mx.float32)
             B = B.astype(mx.float32)
             C = C.astype(mx.float32)
