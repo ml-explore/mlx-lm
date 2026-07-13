@@ -561,6 +561,16 @@ class Model(nn.Module):
                 caches.append(KVCache())
         return caches
 
+    @property
+    def quant_predicate(self):
+        if self.model_type != "nemotron_h_puzzle":
+            return lambda _path, _module: True
+        # Puzzle's 131k-token output projection is unusually sensitive to
+        # low-bit affine quantization. Quantizing it at 4 bits produced
+        # unrelated and repetitive generations while the same checkpoint
+        # generated correctly with the BF16 head restored.
+        return lambda path, _: path != "lm_head"
+
     def sanitize(self, weights):
         weights = {k: v for (k, v) in weights.items() if not k.startswith("mtp.")}
         for k, v in weights.items():
