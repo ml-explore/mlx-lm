@@ -29,8 +29,12 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
         from modelscope import snapshot_download
     except ImportError:
         raise ImportError("Run `pip install modelscope` to use ModelScope.")
+    _try_local_files_only = False
 else:
     from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    _try_local_files_only = True
 
 # For large models with lots of files
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
@@ -249,6 +253,22 @@ def _download(
 
     if not model_path.exists():
         allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
+        if _try_local_files_only:
+            # The common case is a repo that's already fully cached locally.
+            # Skip the network round-trip snapshot_download otherwise makes
+            # (an API call to check for repo updates) and only fall back to
+            # the online path if the local cache doesn't have everything.
+            try:
+                return Path(
+                    snapshot_download(
+                        path_or_hf_repo,
+                        revision=revision,
+                        allow_patterns=allow_patterns,
+                        local_files_only=True,
+                    )
+                )
+            except LocalEntryNotFoundError:
+                pass
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
