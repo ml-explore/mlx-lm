@@ -421,6 +421,37 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(hasattr(seen[0], "shape"))
         self.assertEqual(seen[0].tolist(), prompt)
 
+    def test_batch_presence_penalty_sees_immediately_previous_sample(self):
+        """Exercise the real two-step pump, including its one-token lookahead.
+
+        The first token is forced to ``preferred``. On the very next sampling
+        step, presence penalty must already see it and select ``alternate``.
+        Reading only the externally emitted token list would be one token stale
+        at that point.
+        """
+        prompt = self.tokenizer.encode("hello")
+        preferred = self.tokenizer.vocab_size - 1
+        alternate = preferred - 1
+        self.assertNotIn(preferred, prompt)
+        self.assertNotIn(alternate, prompt)
+        processors = make_logits_processors(
+            {preferred: 2000.0, alternate: 1999.0},
+            presence_penalty=10.0,
+            presence_context_size=64,
+        )
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=2,
+            logits_processors=processors,
+        )
+        batch_gen.insert([prompt])
+
+        first = batch_gen.next_generated()[0]
+        second = batch_gen.next_generated()[0]
+
+        self.assertEqual(first.token, preferred)
+        self.assertEqual(second.token, alternate)
+
     def test_batch_generate_function_with_logits_processors(self):
         """Test that batch_generate function with logits_processors produces correct results."""
         logit_bias = {0: 2000.0, 1: -2000.0}
