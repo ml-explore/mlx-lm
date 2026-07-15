@@ -9,7 +9,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -307,7 +306,7 @@ def generate_step(
     prefill_step_size: int = 2048,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
-    quantized_kv_start: int = 0,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -333,7 +332,11 @@ def generate_step(
           None implies no cache quantization. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
-           when ``kv_bits`` is non-None. Default: ``0``.
+           when ``kv_bits`` is non-None. Default: ``DEFAULT_QUANTIZED_KV_START``
+           (``5000``) — quantizing from the first token measurably slows down
+           decoding (no fused kernel for quantized attention), so quantization
+           only kicks in once the cache is long enough that the memory
+           savings are worth that cost.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -474,7 +477,7 @@ def speculative_generate_step(
     prefill_step_size: int = 512,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
-    quantized_kv_start: int = 0,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -499,7 +502,8 @@ def speculative_generate_step(
           None implies no cache quantization. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
-           when ``kv_bits`` is non-None. Default: ``0``.
+           when ``kv_bits`` is non-None. Default: ``DEFAULT_QUANTIZED_KV_START``
+           (``5000``), see ``generate_step``.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
@@ -520,7 +524,7 @@ def speculative_generate_step(
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            f"Speculative decoding requires a trimmable prompt cache (got {types})."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
