@@ -54,14 +54,14 @@ class LoRALinear(nn.Module):
         if bias:
             fused_linear.bias = linear.bias
 
-        if is_quantized and not dequantize:
-            fused_linear = nn.QuantizedLinear.from_linear(
-                fused_linear,
-                linear.group_size,
-                linear.bits,
-                mode=linear.mode,
-            )
-
+        # Historically, when ``dequantize=False`` the fused layer was requantized
+        # back to the base's bit-width via ``QuantizedLinear.from_linear``. At
+        # low bit-widths the quantization step is much larger than a typical
+        # LoRA delta, so requantization discards the adapter effect and the
+        # fused model behaves like the unadapted base (issue #1172). We keep
+        # the adapted layer in full precision instead; non-adapted layers
+        # elsewhere in the model stay quantized as before, and ``fuse.py``
+        # still honours ``--dequantize`` for dequantizing the whole model.
         return fused_linear
 
     def __init__(
@@ -141,11 +141,9 @@ class LoRASwitchLinear(nn.Module):
         if bias:
             fused_linear.bias = linear.bias
 
-        if is_quantized and not dequantize:
-            fused_linear = fused_linear.to_quantized(
-                group_size=linear.group_size, bits=linear.bits, mode=linear.mode
-            )
-
+        # See LoRALinear.fuse: requantizing the fused weight at the base's
+        # bit-width silently discards the LoRA delta (issue #1172), so keep
+        # the adapted expert layer in full precision.
         return fused_linear
 
     def __init__(
@@ -237,14 +235,9 @@ class LoRAEmbedding(nn.Module):
         lora_b = self.lora_b
         fused_embedding.weight = weight + (lora_a @ lora_b).astype(weight.dtype)
 
-        if is_quantized and not dequantize:
-            fused_embedding = nn.QuantizedEmbedding.from_embedding(
-                fused_embedding,
-                group_size=embedding.group_size,
-                bits=embedding.bits,
-                mode=embedding.mode,
-            )
-
+        # See LoRALinear.fuse: requantizing the fused weight at the base's
+        # bit-width silently discards the LoRA delta (issue #1172), so keep
+        # the adapted embedding in full precision.
         return fused_embedding
 
     def __init__(

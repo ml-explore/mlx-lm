@@ -46,13 +46,9 @@ class DoRALinear(nn.Module):
         if bias:
             fused_linear.bias = linear.bias
 
-        if self._is_quantized() and not dequantize:
-            fused_linear = nn.QuantizedLinear.from_linear(
-                fused_linear,
-                group_size=linear.group_size,
-                bits=linear.bits,
-                mode=linear.mode,
-            )
+        # See LoRALinear.fuse: requantizing the fused weight at the base's
+        # bit-width silently discards the adapter delta (issue #1172), so keep
+        # the adapted layer in full precision.
         return fused_linear
 
     def __init__(

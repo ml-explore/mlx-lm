@@ -141,6 +141,46 @@ class TestLora(unittest.TestCase):
         self.assertFalse(mx.array_equal(dequantized_weight, new_embedding.weight))
         self.assertFalse(mx.array_equal(embedding(tokens), lora_emb(tokens)))
 
+    def test_lora_fuse_quantized_preserves_adapter(self):
+        # Regression test for issue #1172: fusing a LoRA adapter into a
+        # quantized base used to requantize the fused weight at the base's
+        # bit-width, which silently discarded LoRA deltas smaller than the
+        # quantization step size — the fused model then behaved like the
+        # unadapted base.
+        mx.random.seed(0)
+        in_dims, out_dims, r = 512, 512, 8
+        x = mx.random.normal(shape=(4, in_dims))
+
+        base = nn.Linear(in_dims, out_dims, bias=False)
+        quantized = nn.QuantizedLinear.from_linear(base, group_size=64, bits=4)
+        base_out = quantized(x)
+
+        lora_lin = LoRALinear.from_base(quantized, r=r, dropout=0, scale=20.0)
+        # A realistic, small trained delta — the case that used to silently
+        # collapse during requantization.
+        lora_lin.lora_b = mx.random.uniform(
+            low=-1e-3, high=1e-3, shape=lora_lin.lora_b.shape
+        )
+        lora_out = lora_lin(x)
+
+        # Sanity: the LoRA delta actually changes the output, but only by a
+        # small amount (typical of trained adapters).
+        adapter_signal = mx.linalg.norm(lora_out - base_out)
+        self.assertGreater(float(adapter_signal), 0.0)
+
+        # Fusing without dequantization must reproduce the LoRA output. Before
+        # the fix, `fused_q_out` matched `base_out` (adapter dropped) or was
+        # dominated by requantization noise, so the following relative check
+        # against the adapter signal would fail.
+        fused_q = lora_lin.fuse(dequantize=False)
+        residual = mx.linalg.norm(fused_q(x) - lora_out)
+        self.assertLess(float(residual), 0.1 * float(adapter_signal))
+
+        # And the dequantize path stays equivalent to the adapter output.
+        fused_fp = lora_lin.fuse(dequantize=True)
+        residual_fp = mx.linalg.norm(fused_fp(x) - lora_out)
+        self.assertLess(float(residual_fp), 0.1 * float(adapter_signal))
+
 
 class TestDora(unittest.TestCase):
     def test_dora_embedding(self):
