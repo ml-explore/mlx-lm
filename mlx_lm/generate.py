@@ -303,6 +303,22 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+def validate_prompt_and_embeddings(model, prompt, input_embeddings):
+    if input_embeddings is not None:
+        if not does_model_support_input_embeddings(model):
+            raise ValueError("Model does not support input embeddings.")
+        elif len(prompt) > 0 and len(prompt) != len(input_embeddings):
+            raise ValueError(
+                f"When providing input_embeddings, their sequence length ({len(input_embeddings)}) "
+                f"must match the sequence length of the prompt ({len(prompt)}), or the "
+                "prompt must be empty."
+            )
+    elif len(prompt) == 0:
+        raise ValueError(
+            "Either input_embeddings or prompt (or both) must be provided."
+        )
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -350,19 +366,7 @@ def generate_step(
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
     """
-    if input_embeddings is not None:
-        if not does_model_support_input_embeddings(model):
-            raise ValueError("Model does not support input embeddings.")
-        elif len(prompt) > 0 and len(prompt) != len(input_embeddings):
-            raise ValueError(
-                f"When providing input_embeddings, their sequence length ({len(input_embeddings)}) "
-                f"must match the sequence length of the prompt ({len(prompt)}), or the "
-                "prompt must be empty."
-            )
-    elif len(prompt) == 0:
-        raise ValueError(
-            "Either input_embeddings or prompt (or both) must be provided."
-        )
+    validate_prompt_and_embeddings(model, prompt, input_embeddings)
 
     tokens = None
 
@@ -688,6 +692,8 @@ def mtp_generate_step(
         Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
             ``from_draft`` is ``True`` when the token came from the MTP head.
     """
+    validate_prompt_and_embeddings(model, prompt, input_embeddings)
+
     y = prompt.astype(mx.uint32)
     prev_tokens = None
 
