@@ -1205,7 +1205,9 @@ class PromptProcessingBatch:
         if any(self.logits_processors):
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
         else:
-            self.logits_processors = [[]] * len(keep)
+            # Independent [] per lane -- [[]] * n aliases one list object, so an
+            # in-place append on one lane would mutate all lanes.
+            self.logits_processors = [[] for _ in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
@@ -1501,9 +1503,13 @@ class GenerationBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
-        if any(self.samplers):
+        # Re-index whenever a per-lane list exists (len == old uids), even if
+        # every entry is falsy (all-None samplers / all-[] processors). any()
+        # skips the all-falsy case, leaving the list longer than uids so a later
+        # extend() binds lanes to the wrong request (silent greedy/wrong-sampler).
+        if self.samplers:
             self.samplers = [self.samplers[idx] for idx in keep]
-        if any(self.logits_processors):
+        if self.logits_processors:
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
