@@ -197,11 +197,21 @@ def main():
         help="Sequence length for the calibration data.",
     )
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
 
-    model, tokenizer, config = load(args.model, lazy=True, return_config=True)
+    model, tokenizer, config = load(
+        args.model,
+        lazy=True,
+        return_config=True,
+        trust_remote_code=args.trust_remote_code,
+    )
     calibration_data = load_data(tokenizer, args.num_samples, args.sequence_length)
 
     model, config["quantization"] = gptq_quantize(
