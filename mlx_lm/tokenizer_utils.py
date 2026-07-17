@@ -450,7 +450,24 @@ class TokenizerWrapper:
         """
         Get a stateful streaming detokenizer.
         """
-        return self._detokenizer_class(self)
+        try:
+            return self._detokenizer_class(self)
+        except AttributeError as e:
+            # An AttributeError escaping a property falls through to
+            # __getattr__ and gets masked, so handle it here.
+            if self._detokenizer_class is NaiveStreamingDetokenizer:
+                raise RuntimeError(
+                    f"Failed to create the streaming detokenizer: {e}"
+                ) from e
+            # The fast detokenizer needs attributes the loaded backend
+            # does not provide; the naive one only needs decode, so
+            # degrade to it instead of failing.
+            warnings.warn(
+                f"Could not create {self._detokenizer_class} ({e}). "
+                "Falling back to NaiveStreamingDetokenizer."
+            )
+            self._detokenizer_class = NaiveStreamingDetokenizer
+            return self._detokenizer_class(self)
 
     def __getattr__(self, attr):
         if attr == "detokenizer":
@@ -612,6 +629,12 @@ def load(
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, **(tokenizer_config_extra or {})
     )
+
+    if not hasattr(tokenizer, "vocab"):
+        # The detokenizer was selected from tokenizer.json, but AutoTokenizer
+        # may load a different backend (e.g. MistralCommonBackend for models
+        # with a tekken.json) which lacks the vocab the fast ones need.
+        detokenizer_class = NaiveStreamingDetokenizer
 
     tokenizer_config = tokenizer.init_kwargs
 

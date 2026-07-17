@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import unittest
+import warnings
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
@@ -94,6 +95,68 @@ class TestTokenizers(unittest.TestCase):
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
         tokenizer = load_tokenizer(tokenizer_repo)
         self.assertFalse(tokenizer.has_tool_calling)
+
+    def test_detokenizer_fallback_without_vocab(self):
+        # A tokenizer backend that exposes get_vocab and decode but not
+        # vocab, like transformers' MistralCommonBackend. The fast
+        # streaming detokenizers need vocab, so the wrapper should fall
+        # back to the naive detokenizer instead of raising a masked
+        # error.
+        class VocablessTokenizer:
+            chat_template = None
+            eos_token_id = 0
+            clean_up_tokenization_spaces = False
+
+            def get_vocab(self):
+                return {}
+
+            def encode(self, text, **kwargs):
+                return [1, 2]
+
+            def decode(self, ids):
+                return "".join(f"<{i}>" for i in ids)
+
+        tokenizer = TokenizerWrapper(
+            VocablessTokenizer(), BPEStreamingDetokenizer
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            detokenizer = tokenizer.detokenizer
+        self.assertIsInstance(detokenizer, NaiveStreamingDetokenizer)
+        self.assertTrue(
+            any("NaiveStreamingDetokenizer" in str(w.message) for w in caught)
+        )
+
+        for t in [1, 2, 3]:
+            detokenizer.add_token(t)
+        detokenizer.finalize()
+        self.assertEqual(detokenizer.text, "<1><2><3>")
+
+        # The fallback is cached for subsequent accesses
+        self.assertIsInstance(tokenizer.detokenizer, NaiveStreamingDetokenizer)
+
+    def test_detokenizer_error_not_masked(self):
+        # An AttributeError raised while constructing a detokenizer used to be
+        # swallowed by the property/__getattr__ protocol and resurface as a
+        # confusing "no attribute '_detokenizer'" error. The original failure
+        # should be surfaced instead.
+        class BrokenTokenizer:
+            chat_template = None
+            eos_token_id = 0
+
+            def get_vocab(self):
+                return {}
+
+            def encode(self, text, **kwargs):
+                return [0]
+
+            def decode(self, ids):
+                raise AttributeError("original decode failure")
+
+        tokenizer = TokenizerWrapper(BrokenTokenizer(), NaiveStreamingDetokenizer)
+        with self.assertRaises(RuntimeError) as cm:
+            tokenizer.detokenizer
+        self.assertIn("original decode failure", str(cm.exception))
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
