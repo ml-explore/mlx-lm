@@ -13,11 +13,13 @@ from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
+    BatchRotatingQuantizedKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    RotatingQuantizedKVCache,
     load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
@@ -363,6 +365,96 @@ class TestPromptCache(unittest.TestCase):
             i += 1
             self.assertEqual(tok, toks[i])
             self.assertTrue(mx.allclose(logits, all_logits[i], rtol=4e-2))
+
+    def test_rotating_cache_to_quantized(self):
+        """RotatingKVCache.to_quantized() — previously NotImplementedError.
+        Build up a rotating cache past its max_size (forcing rotation) with a
+        real model, convert to quantized mid-stream, and confirm generation
+        continues producing sane (numerically close) logits."""
+        model, tokenizer = self.model, self.tokenizer
+        prompt = tokenizer.encode(
+            "Once upon a time in a small town", return_tensors="mlx"
+        )[0]
+
+        prompt_cache = [RotatingKVCache(max_size=4) for _ in model.layers]
+        toks = []
+        for _, (tok, logits) in zip(
+            range(8), generate_step(prompt, model, prompt_cache=prompt_cache)
+        ):
+            toks.append(tok)
+        self.assertIsInstance(prompt_cache[0], RotatingKVCache)
+
+        quant_cache = [c.to_quantized(bits=8, group_size=32) for c in prompt_cache]
+        for c in quant_cache:
+            self.assertEqual(c.offset, prompt_cache[0].offset)
+
+        # Generation must continue without error after the mid-stream swap.
+        next_toks = []
+        for _, (tok, logits) in zip(
+            range(3),
+            generate_step(mx.array([toks[-1]]), model, prompt_cache=quant_cache),
+        ):
+            self.assertFalse(bool(mx.any(mx.isnan(logits))))
+            next_toks.append(tok)
+        self.assertEqual(len(next_toks), 3)
+
+    def test_rotating_quantized_cache_save_load(self):
+        cache = [
+            RotatingKVCache(max_size=4).to_quantized(bits=8, group_size=32)
+            for _ in range(2)
+        ]
+        for c in cache:
+            for _ in range(10):  # forces rotation
+                x = mx.random.uniform(shape=(1, 4, 1, 32))
+                c.update_and_fetch(x, x)
+
+        cache_file = os.path.join(self.test_dir, "rotating_quant_cache.safetensors")
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self.assertEqual(len(cache), len(loaded_cache))
+        for c, lc in zip(cache, loaded_cache):
+            self.assertIsInstance(lc, RotatingQuantizedKVCache)
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c.max_size, lc.max_size)
+            self.assertEqual(c.group_size, lc.group_size)
+            self.assertEqual(c.bits, lc.bits)
+            for i in range(3):
+                self.assertTrue(mx.array_equal(c.state[0][i], lc.state[0][i]))
+                self.assertTrue(mx.array_equal(c.state[1][i], lc.state[1][i]))
+
+    def test_batch_rotating_quantized_kv_cache_merge_filter_extend_extract(self):
+        """The batching-facing surface BatchGenerator actually relies on."""
+        jobs = []
+        for j in range(3):
+            c = RotatingQuantizedKVCache(max_size=8, group_size=32, bits=8)
+            for _ in range(3 + j * 4):  # some jobs exceed max_size, forcing rotation
+                x = mx.random.uniform(shape=(1, 4, 1, 32))
+                c.update_and_fetch(x, x)
+            jobs.append(c)
+
+        batch = RotatingQuantizedKVCache.merge(jobs)
+        self.assertIsInstance(batch, BatchRotatingQuantizedKVCache)
+        self.assertEqual(batch.keys[0].shape[0], 3)
+        for j, c in enumerate(jobs):
+            self.assertEqual(int(batch.offset[j]), c.offset)
+
+        k = mx.random.uniform(shape=(3, 4, 1, 32))
+        bk, bv = batch.update_and_fetch(k, k)
+        self.assertEqual(bk[0].shape[0], 3)
+
+        batch.filter(mx.array([0, 2]))
+        self.assertEqual(batch.keys[0].shape[0], 2)
+
+        extracted = batch.extract(0)
+        self.assertIsInstance(extracted, RotatingQuantizedKVCache)
+        self.assertEqual(extracted.offset, int(batch.offset[0]))
+
+        new_job = RotatingQuantizedKVCache(max_size=8, group_size=32, bits=8)
+        for _ in range(2):
+            x = mx.random.uniform(shape=(1, 4, 1, 32))
+            new_job.update_and_fetch(x, x)
+        batch.extend(RotatingQuantizedKVCache.merge([new_job]))
+        self.assertEqual(batch.keys[0].shape[0], 3)
 
     def test_cache_list(self):
         c = CacheList(KVCache(), KVCache())

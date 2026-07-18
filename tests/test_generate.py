@@ -359,6 +359,67 @@ class TestGenerate(unittest.TestCase):
 
         del self.model.make_cache
 
+    def test_batch_sliding_window_quantized(self):
+        """BatchGenerator with max_kv_size AND kv_bits set together — the exact
+        combination mira-mlx always uses (--max-kv-size is always passed), which
+        used to be blocked by BatchRotatingKVCache.to_quantized() raising
+        NotImplementedError. Forces rotation (max_tokens > max_kv_size) and
+        mid-stream job insertion (jobs finish at different times) to exercise
+        RotatingQuantizedKVCache/BatchRotatingQuantizedKVCache's merge/filter/
+        extend/extract paths under real generation, not synthetic tensors."""
+        prompts = [
+            "Write a story about Einstein",
+            "Hi",
+            "What time is it?",
+            "How tall is Mt Everest?",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=10,
+            max_kv_size=4,
+            kv_bits=8,
+            kv_group_size=32,
+            prefill_batch_size=1,
+            prefill_step_size=8,
+            completion_batch_size=2,
+        )
+        uids = batch_gen.insert(prompts)
+        batch_responses = {uid: [] for uid in uids}
+        while responses := batch_gen.next_generated():
+            for r in responses:
+                batch_responses[r.uid].append(r.token)
+
+        for uid in uids:
+            self.assertGreater(
+                len(batch_responses[uid]),
+                0,
+                "quantized+rotating job produced no tokens",
+            )
+            for tok in batch_responses[uid]:
+                self.assertFalse(mx.isnan(mx.array(float(tok))))
+
+    def test_batch_generator_rejects_delayed_quantized_kv_start(self):
+        """quantized_kv_start > 0 isn't supported for the batching path (per-job
+        caches are created once, empty, at insertion — there's no per-step
+        re-check that would ever trigger a delayed threshold)."""
+        with self.assertRaises(NotImplementedError):
+            BatchGenerator(
+                self.model,
+                max_kv_size=8,
+                kv_bits=8,
+                quantized_kv_start=4,
+            )
+
     def test_batch_generate_with_logits_processors(self):
         """Test that batch_generate with logits_processors produces correct results."""
         logit_bias = {0: 2000.0, 1: -2000.0}
