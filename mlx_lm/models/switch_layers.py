@@ -14,7 +14,26 @@ def _gather_sort(x, indices):
     indices = indices.flatten()
     order = mx.argsort(indices)
     inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
+    x = x.flatten(0, -3)[order // M]
+    indices = indices[order]
+    n = indices.size
+    # Metal mishandles the ragged tail tile in the sorted gather_qmm path
+    # (ml-explore/mlx#3856, still open as of mlx 0.32.x): when the flattened
+    # sorted row count exceeds 32768 and is not a multiple of 64, expert
+    # outputs come out wrong for affine-quantized experts (4/8-bit; only the
+    # mxfp4 path was fixed) — silent MoE corruption at long single-shot
+    # prefill. Pad the sorted rows up to a multiple of 64 (duplicating the
+    # last row, which keeps the indices sorted); _scatter_unsort gathers only
+    # the original rows, so the padding never reaches the output.
+    if n > 32768 and n % 64 != 0:
+        pad = 64 - n % 64
+        x = mx.concatenate(
+            [x, mx.broadcast_to(x[-1:], (pad,) + x.shape[1:])], axis=0
+        )
+        indices = mx.concatenate(
+            [indices, mx.broadcast_to(indices[-1:], (pad,))], axis=0
+        )
+    return x, indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
