@@ -59,7 +59,9 @@ class ToolCallFormatter:
 
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
-        tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
+        # A malformed generation can produce a tool call without an arguments key;
+        # render it as an empty-arguments call instead of crashing the handler.
+        tc["arguments"] = json.dumps(tc.get("arguments", {}), ensure_ascii=False)
         out = {
             "function": tc,
             "type": "function",
