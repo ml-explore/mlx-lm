@@ -64,6 +64,107 @@ def make_ssm_kernel():
 _ssm_kernel = make_ssm_kernel()
 
 
+def make_ssm_seq_kernel():
+    """Sequential-scan variant of the step kernel for short sequences
+    (speculative verify blocks): one launch, the state slice stays in
+    registers across the S positions instead of bouncing through the SSD
+    chunked path, which for S in [2, 8] costs ~3x a single step."""
+    if not mx.metal.is_available():
+        return None
+    source = """
+        auto n = thread_position_in_grid.z;
+        auto h_idx = n % H;
+        auto b_idx = n / H;
+        auto grp = (h_idx / G);
+        constexpr int n_per_t = Ds / 32;
+        constexpr int HB = H / G;
+
+        auto i_state = state_in + n * Dh * Ds;
+        auto o_state = state_out + n * Dh * Ds;
+
+        auto ds_idx = thread_position_in_threadgroup.x;
+        auto d_idx = thread_position_in_grid.y;
+
+        auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+        float st[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            st[i] = i_state[d_idx * Ds + n_per_t * ds_idx + i];
+        }
+
+        for (int s = 0; s < S; ++s) {
+            auto x_ = static_cast<float>(
+                X[((b_idx * S + s) * H + h_idx) * Dh + d_idx]);
+            auto dt_ = static_cast<float>(dt[(b_idx * S + s) * H + h_idx]);
+            auto dA = fast::exp(A * dt_);
+            auto B_ = B + ((b_idx * S + s) * HB + grp) * Ds;
+            auto C_ = C + ((b_idx * S + s) * HB + grp) * Ds;
+
+            float acc = 0.0;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * ds_idx + i;
+                auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                st[i] = dA * st[i] + dB_by_x;
+                acc += st[i] * C_[s_idx];
+            }
+            acc = simd_sum(acc);
+            if (thread_index_in_simdgroup == 0) {
+                out[((b_idx * S + s) * H + h_idx) * Dh + d_idx] =
+                    static_cast<T>(acc + x_ * D[h_idx]);
+            }
+        }
+
+        for (int i = 0; i < n_per_t; ++i) {
+            o_state[d_idx * Ds + n_per_t * ds_idx + i] = static_cast<U>(st[i]);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="ssm_seq_kernel",
+        input_names=["X", "A_log", "B", "C", "D", "dt", "state_in"],
+        output_names=["out", "state_out"],
+        source=source,
+    )
+
+
+_ssm_seq_kernel = make_ssm_seq_kernel()
+
+# Above this length the SSD chunked path wins over the sequential scan.
+_SEQ_KERNEL_MAX_LEN = 8
+
+
+def ssm_update_seq_kernel(
+    hidden_states: mx.array,
+    A_log: mx.array,
+    B: mx.array,
+    C: mx.array,
+    D: mx.array,
+    dt: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    time_step_limit: Tuple[float, float],
+):
+    n, S, h, d = hidden_states.shape
+    input_type = hidden_states.dtype
+    state_type = state.dtype
+    hb, ds = B.shape[-2:]
+    dt = compute_dt(dt, dt_bias, time_step_limit)
+    return _ssm_seq_kernel(
+        inputs=[hidden_states, A_log, B, C, D, dt, state],
+        template=[
+            ("T", input_type),
+            ("U", state_type),
+            ("Dh", d),
+            ("Ds", ds),
+            ("H", h),
+            ("G", h // hb),
+            ("S", S),
+        ],
+        grid=(32, d, h * n),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(n, S, h, d), state.shape],
+        output_dtypes=[input_type, state_type],
+    )
+
+
 def ssm_update_kernel(
     hidden_states: mx.array,
     A_log: mx.array,
@@ -228,26 +329,9 @@ def ssm_update(
     lengths: Optional[mx.array] = None,
 ):
     seq_len = hidden_states.shape[1]
-    if (
-        seq_len > 1
-        or state is None
-        or mx.default_device() != mx.gpu
-        or not mx.metal.is_available()
-    ):
-        return ssm_attn(
-            hidden_states,
-            A_log,
-            B,
-            C,
-            D,
-            dt,
-            dt_bias,
-            state,
-            time_step_limit,
-            mask=mask,
-            lengths=lengths,
-        )
-    else:
+    state_dim = B.shape[-1]
+    on_gpu = mx.default_device() == mx.gpu and mx.metal.is_available()
+    if seq_len == 1 and state is not None and on_gpu:
         return ssm_update_kernel(
             hidden_states,
             A_log,
@@ -259,3 +343,38 @@ def ssm_update(
             state,
             time_step_limit,
         )
+    if (
+        1 < seq_len <= _SEQ_KERNEL_MAX_LEN
+        and state is not None
+        and mask is None
+        and lengths is None
+        and on_gpu
+        and state_dim >= 32
+        and state_dim % 32 == 0
+    ):
+        # Short multi-token updates (speculative verify blocks): sequential
+        # scan in one launch instead of the SSD chunked path.
+        return ssm_update_seq_kernel(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            time_step_limit,
+        )
+    return ssm_attn(
+        hidden_states,
+        A_log,
+        B,
+        C,
+        D,
+        dt,
+        dt_bias,
+        state,
+        time_step_limit,
+        mask=mask,
+        lengths=lengths,
+    )
