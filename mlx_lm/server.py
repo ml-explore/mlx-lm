@@ -40,7 +40,12 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -621,6 +626,25 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         return self.model_provider.is_batchable and args.seed is None
 
+    def _fetch_prompt_cache(self, model_key, prompt):
+        """Fetch the nearest prompt cache, guarding against exact hits.
+
+        An exact trie hit returns an empty remainder, but generation needs
+        at least one prompt token to process (``stream_generate`` raises on
+        an empty prompt and ``insert_segments`` cannot take empty
+        segments). Trim the last prompt token off the cached sequence so it
+        is re-processed; if the cache cannot be trimmed, recompute from
+        scratch.
+        """
+        cache, rest = self.prompt_cache.fetch_nearest_cache(model_key, prompt)
+        if cache is not None and len(rest) == 0 and len(prompt) > 0:
+            if can_trim_prompt_cache(cache):
+                trim_prompt_cache(cache, 1)
+                rest = prompt[-1:]
+            else:
+                cache, rest = None, prompt
+        return cache, rest
+
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
         # sure that all generation runs in the same stream as the
@@ -685,9 +709,7 @@ class ResponseGenerator:
                     )
 
                     self._log_cache_stats()
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
-                    )
+                    cache, rest = self._fetch_prompt_cache(current_model_key, prompt)
                     prompt_cache_count = len(prompt) - len(rest)
                     N = prompt_cache_count
                     while N > 0:
@@ -907,7 +929,7 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
+            cache, rest = self._fetch_prompt_cache(
                 self.model_provider.model_key, prompt
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
