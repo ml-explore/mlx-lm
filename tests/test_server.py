@@ -750,7 +750,7 @@ class TestMakeSampler(unittest.TestCase):
             xtc_probability=1.0,
             xtc_threshold=0.1,
         )
-        args = type("obj", (object,), {"sampling": sampling})
+        args = type("obj", (object,), {"sampling": sampling, "seed": None})
         sampler = _make_sampler(args, FakeTokenizer())
         logits = mx.log(
             mx.array([[0.4, 0.2, 0.1, 0.1, 0.05, 0.05, 0.03, 0.03, 0.02, 0.02]])

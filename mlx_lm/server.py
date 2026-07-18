@@ -387,6 +387,7 @@ def _make_sampler(args, tokenizer):
         xtc_probability=args.sampling.xtc_probability,
         xtc_threshold=args.sampling.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+        seed=args.seed,
     )
 
 
@@ -896,10 +897,6 @@ class ResponseGenerator:
                 prompt=prompt,
             )
             rqueue.put(ctx)
-
-            # Seed if requested
-            if args.seed is not None:
-                mx.random.seed(args.seed)
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)

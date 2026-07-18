@@ -16,6 +16,7 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: List[int] = [],
+    seed: Optional[int] = None,
 ) -> Callable[[mx.array], mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
@@ -37,6 +38,10 @@ def make_sampler(
             for being sampled.
         xtc_special_tokens (list(int), optional): List of special tokens IDs to
             be excluded from XTC sampling.
+        seed (int, optional): If given, the sampler draws from an explicit
+            PRNG key chain derived from this seed (split on every call)
+            instead of the global ``mx.random`` state, so the sampled token
+            stream is fully determined by the seed. Default: ``None``.
 
 
     Returns:
@@ -45,6 +50,19 @@ def make_sampler(
     """
     if temp == 0:
         return lambda x: mx.argmax(x, axis=-1)
+
+    if seed is not None:
+        return _make_keyed_sampler(
+            temp,
+            top_p,
+            min_p,
+            min_tokens_to_keep,
+            top_k,
+            xtc_probability,
+            xtc_threshold,
+            xtc_special_tokens,
+            seed,
+        )
 
     # Create sampler chain
     sampling_methods = []
@@ -65,6 +83,51 @@ def make_sampler(
             logprobs = method(logprobs)
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
+
+    return sampler
+
+
+def _make_keyed_sampler(
+    temp: float,
+    top_p: float,
+    min_p: float,
+    min_tokens_to_keep: int,
+    top_k: int,
+    xtc_probability: float,
+    xtc_threshold: float,
+    xtc_special_tokens: List[int],
+    seed: int,
+) -> Callable[[mx.array], mx.array]:
+    """
+    Make a sampler driven by an explicit PRNG key chain instead of the
+    global ``mx.random`` state.
+
+    The closure holds ``key = mx.random.key(seed)`` and splits it on every
+    call, sampling with the split-off sub-key. Consecutive calls therefore
+    draw a deterministic, seed-defined stream, unaffected by (and not
+    affecting) global random state or concurrent requests.
+    """
+    key = mx.random.key(seed)
+
+    def sampler(logprobs):
+        nonlocal key
+        key, sub = mx.random.split(key)
+        if top_p > 0 and top_p < 1.0:
+            logprobs = apply_top_p(logprobs, top_p)
+        if min_p != 0.0:
+            logprobs = apply_min_p(logprobs, min_p, min_tokens_to_keep)
+        if xtc_probability > 0.0:
+            sub, xtc_key = mx.random.split(sub)
+            logprobs = apply_xtc_keyed(
+                logprobs,
+                xtc_probability,
+                xtc_threshold,
+                xtc_special_tokens,
+                xtc_key,
+            )
+        if top_k > 0:
+            logprobs = apply_top_k(logprobs, top_k)
+        return categorical_sampling_keyed(logprobs, temp, sub)
 
     return sampler
 
@@ -274,9 +337,53 @@ def apply_xtc(
     )
 
 
+def apply_xtc_keyed(
+    logits: mx.array,
+    xtc_probability: float,
+    xtc_threshold: float,
+    xtc_special_tokens: List[int],
+    key: mx.array,
+) -> mx.array:
+    """
+    Apply XTC sampling to the logits using an explicit PRNG key.
+
+    Same as ``apply_xtc`` but draws from ``key`` instead of the global
+    random state. Deliberately not compiled: the
+    ``mx.compile(inputs=mx.random.state, ...)`` decoration ties the result
+    to global RNG state, which would break per-request determinism.
+    """
+    if not (0 <= xtc_threshold <= 0.5):
+        raise ValueError(
+            f"`threshold` has to be a float in the [0, 0.5] interval, but is {xtc_threshold}"
+        )
+    if not (0 <= xtc_probability <= 1.0):
+        raise ValueError(
+            f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
+        )
+
+    probs = mx.softmax(logits, -1)
+    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
+    if xtc_special_tokens:
+        mask[..., xtc_special_tokens] = False
+
+    return mx.where(
+        mx.random.uniform(0, 1, key=key) > xtc_probability,
+        logits,
+        mx.where(mask, -mx.inf, logits),
+    )
+
+
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def categorical_sampling(logits, temp):
     return mx.random.categorical(logits * (1 / temp))
+
+
+def categorical_sampling_keyed(logits, temp, key):
+    """
+    ``categorical_sampling`` with an explicit PRNG key. Deliberately not
+    compiled — see ``apply_xtc_keyed``.
+    """
+    return mx.random.categorical(logits * (1 / temp), key=key)
 
 
 def make_repetition_penalty(penalty: float, context_size: int = 20):
