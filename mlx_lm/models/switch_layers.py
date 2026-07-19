@@ -171,6 +171,13 @@ def _offload_enable(module, resident_slots: int, fetch_fn, quantized: bool, max_
 
     module._offload_hits = 0
     module._offload_misses = 0
+    # Decode-only split of the same counters. The blended hit-rate is dragged
+    # down by the diverse cold prefill (routes to ~all experts, no cache fits
+    # it); decode steady-state is the number a residency/policy change actually
+    # moves, so expose it separately. Phase is inferred per call from indices
+    # size (see _offload_chunked_gather).
+    module._offload_hits_decode = 0
+    module._offload_misses_decode = 0
 
 
 def _offload_touch(module, expert_id):
@@ -220,6 +227,11 @@ def _offload_chunked_gather(module, x, indices, gather_fn, sorted_indices=False)
     there is no next group to bound against — see the guard at the eval below.
     """
     flat = indices.reshape(-1).tolist()
+    # Phase heuristic for the split decode-only hit-rate stat: decode drives one
+    # token (top_k experts, size well under 64) while a diverse prefill drives
+    # many. This is the same size threshold SwitchGLU/SwitchMLP use to decide
+    # sorting, so it stays consistent with the dispatch path.
+    is_decode = indices.size < 64
     unique = list(dict.fromkeys(flat))
     max_stack = module._offload_max_stack_size
     groups = [unique[i : i + max_stack] for i in range(0, len(unique), max_stack)]
@@ -239,8 +251,12 @@ def _offload_chunked_gather(module, x, indices, gather_fn, sorted_indices=False)
         differ ONLY in how they combine group outputs, never in fetch/eviction
         accounting (a hit is a hit regardless of which path computes it)."""
         missing = [e for e in group if e not in cache]
-        module._offload_hits += len(group) - len(missing)
+        n_hit = len(group) - len(missing)
+        module._offload_hits += n_hit
         module._offload_misses += len(missing)
+        if is_decode:
+            module._offload_hits_decode += n_hit
+            module._offload_misses_decode += len(missing)
         if missing:
             # Concurrent, not sequential: each fetch is a blocking disk
             # read (~0.3-0.6ms measured against the real Qwen3.6 shards),
