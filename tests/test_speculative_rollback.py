@@ -135,9 +135,13 @@ class TestSpeculativeRollback(unittest.TestCase):
         ]
         model_cache = c[: len(model.layers)]
         self.assertFalse(cache.can_trim_prompt_cache(model_cache))
-        for x in model_cache:
+        # The whole cache list must come back clean, draft caches included:
+        # they start speculating alongside the model cache and record during
+        # draft steps, so a dangling speculating flag would make a reused
+        # draft cache trim through stale rollback records.
+        for x in c:
+            self.assertFalse(getattr(x, "speculating", False))
             if isinstance(x, cache.ArraysCache):
-                self.assertFalse(x.speculating)
                 self.assertEqual(len(x._rollbacks), 0)
 
         # continue decoding on the same cache with plain steps
@@ -196,13 +200,21 @@ class TestSpeculativeRollback(unittest.TestCase):
         n = 24
 
         vanilla = [int(tok) for tok, _ in generate_step(prompt, model, max_tokens=n)]
+        c = cache.make_prompt_cache(model) + cache.make_prompt_cache(draft)
         spec = [
             int(tok)
             for tok, _, _ in speculative_generate_step(
-                prompt, model, draft, num_draft_tokens=3, max_tokens=n
+                prompt, model, draft, num_draft_tokens=3, max_tokens=n, prompt_cache=c
             )
         ]
         self.assertEqual(vanilla, spec)
+        # Draft caches record too (T=1 records per draft step), so they must
+        # be stopped alongside the model caches: a dangling speculating flag
+        # would make a reused draft cache trim through stale rollback records.
+        for x in c:
+            self.assertFalse(getattr(x, "speculating", False))
+            if isinstance(x, cache.ArraysCache):
+                self.assertEqual(len(x._rollbacks), 0)
 
     def test_draft_exception_not_masked(self):
         # An exception raised mid-round (e.g. inside the draft model) must
