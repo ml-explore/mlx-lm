@@ -215,7 +215,9 @@ def _offload_chunked_gather(module, x, indices, gather_fn, sorted_indices=False)
     An `mx.eval()` after each group's combine forces MLX to actually release
     the previous group's temporary stack before the next one is built —
     without it, laziness re-batches every group into one deferred graph
-    anyway and the memory bound is fiction.
+    anyway and the memory bound is fiction. That eval is skipped when there is
+    only ONE group (the decode case: top_k experts fit a single stack), where
+    there is no next group to bound against — see the guard at the eval below.
     """
     flat = indices.reshape(-1).tolist()
     unique = list(dict.fromkeys(flat))
@@ -329,7 +331,17 @@ def _offload_chunked_gather(module, x, indices, gather_fn, sorted_indices=False)
             while mask.ndim < group_output.ndim:
                 mask = mx.expand_dims(mask, -1)
             result = group_output if result is None else mx.where(mask, group_output, result)
-        mx.eval(result)
+        # The per-group eval bounds transient memory by materializing this
+        # group's contribution before the next group's gather allocates. With a
+        # single group (always the case at decode: top_k experts < max_stack, so
+        # every selection fits one group) there is no next group to bound
+        # against, and the eval only forces a per-layer GPU sync with no memory
+        # benefit — it defers the token's gather graph to the caller's next eval
+        # boundary (the sampler evals each token anyway). Bit-identical either
+        # way; measured +13% decode (7.15->8.09 t/s) at identical 12.73GB peak on
+        # Qwen3.6-35B-A3B-8bit over-DRAM offload.
+        if len(groups) > 1:
+            mx.eval(result)
         _evict()
 
     return result
