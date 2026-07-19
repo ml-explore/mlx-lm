@@ -189,7 +189,7 @@ def _offload_stack_rows(rows, quantized):
     return mx.stack(rows)
 
 
-def _offload_chunked_gather(module, x, indices, gather_fn):
+def _offload_chunked_gather(module, x, indices, gather_fn, sorted_indices=False):
     """Compute the same output as gathering against every needed expert at
     once, but never materialize more than `module._offload_max_stack_size`
     experts' weights in a single temporary stack.
@@ -230,8 +230,12 @@ def _offload_chunked_gather(module, x, indices, gather_fn):
             local_pos_of[e] = li
 
     cache = module._offload_cache
-    result = None
-    for gi, group in enumerate(groups):
+
+    def _resolve_group(group):
+        """Fetch+stack this group's experts, updating hit/miss counters and
+        LRU recency. Shared by both the mask and compact paths so the two
+        differ ONLY in how they combine group outputs, never in fetch/eviction
+        accounting (a hit is a hit regardless of which path computes it)."""
         missing = [e for e in group if e not in cache]
         module._offload_hits += len(group) - len(missing)
         module._offload_misses += len(missing)
@@ -255,7 +259,59 @@ def _offload_chunked_gather(module, x, indices, gather_fn):
         for e in group:
             rows.append(cache[e])
             _offload_touch(module, e)
-        stacked = _offload_stack_rows(rows, module._offload_quantized)
+        return _offload_stack_rows(rows, module._offload_quantized)
+
+    def _evict():
+        while len(module._offload_lru) > module._offload_capacity:
+            victim = module._offload_lru.pop(0)
+            cache.pop(victim, None)
+
+    # --- Compact path -------------------------------------------------------
+    # The mask path below runs EVERY group's gather over ALL positions and
+    # discards the out-of-group ones with mx.where: G groups x full-width
+    # matmul (the "G-fold" prefill tax). But when the caller has pre-sorted the
+    # routing (SwitchGLU/SwitchMLP call _gather_sort before dispatch whenever
+    # indices.size >= 64, i.e. exactly the multi-group prefill case), `flat` is
+    # monotonic non-decreasing, so each group's positions form ONE contiguous
+    # slice of `flat`. We can then slice x to that segment, gather once over
+    # just those positions, and concatenate the segments back — each position
+    # computed exactly once, no mx.where. Guarded by an actual monotonicity
+    # check (not just the caller's flag) so a mislabelled `sorted_indices` can
+    # never silently scatter output to the wrong positions: if the guarantee
+    # doesn't hold we fall through to the always-correct mask path.
+    use_compact = (
+        sorted_indices
+        and len(groups) > 1
+        and indices.ndim == 1
+        and all(flat[i] <= flat[i + 1] for i in range(len(flat) - 1))
+    )
+    if use_compact:
+        # Contiguous per-group position counts (monotonic flat => group ids
+        # appear in non-decreasing order, so cumulative counts are the segment
+        # boundaries).
+        counts = [0] * len(groups)
+        for e in flat:
+            counts[group_of[e]] += 1
+        outputs = []
+        pos = 0
+        for gi, group in enumerate(groups):
+            cnt = counts[gi]
+            stacked = _resolve_group(group)
+            seg = flat[pos : pos + cnt]
+            local_indices = mx.array(
+                [local_pos_of[e] for e in seg], dtype=indices.dtype
+            ).reshape((cnt,) + tuple(indices.shape[1:]))
+            seg_output = gather_fn(x[pos : pos + cnt], stacked, local_indices)
+            outputs.append(seg_output)
+            mx.eval(seg_output)
+            _evict()
+            pos += cnt
+        return mx.concatenate(outputs, axis=0)
+
+    # --- Mask path (always correct, any call shape) -------------------------
+    result = None
+    for gi, group in enumerate(groups):
+        stacked = _resolve_group(group)
 
         local_flat = [local_pos_of[e] if group_of[e] == gi else 0 for e in flat]
         local_indices = mx.array(local_flat, dtype=indices.dtype).reshape(indices.shape)
@@ -274,10 +330,7 @@ def _offload_chunked_gather(module, x, indices, gather_fn):
                 mask = mx.expand_dims(mask, -1)
             result = group_output if result is None else mx.where(mask, group_output, result)
         mx.eval(result)
-
-        while len(module._offload_lru) > module._offload_capacity:
-            victim = module._offload_lru.pop(0)
-            cache.pop(victim, None)
+        _evict()
 
     return result
 
@@ -354,7 +407,7 @@ class QuantizedSwitchLinear(nn.Module):
                     sorted_indices=False,
                 )
 
-            x = _offload_chunked_gather(self, x, indices, gather_fn)
+            x = _offload_chunked_gather(self, x, indices, gather_fn, sorted_indices=sorted_indices)
         else:
             x = mx.gather_qmm(
                 x,
@@ -416,7 +469,7 @@ class SwitchLinear(nn.Module):
                     sorted_indices=False,
                 )
 
-            x = _offload_chunked_gather(self, x, indices, gather_fn)
+            x = _offload_chunked_gather(self, x, indices, gather_fn, sorted_indices=sorted_indices)
         else:
             x = mx.gather_mm(
                 x,
