@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -263,6 +265,45 @@ class TestTrustRemoteCode(unittest.TestCase):
         model, loaded_config = utils.load_model(self.model_path, strict=False)
         self.assertIsInstance(model, nn.Module)
         self.assertEqual(loaded_config["model_type"], "llama")
+
+
+class TestOpenFileLimit(unittest.TestCase):
+    def test_import_does_not_lower_nofile_limit(self):
+        """Importing mlx_lm must never reduce the process descriptor limits."""
+        # Raise to a finite value first: an infinite soft limit would exercise
+        # only the early-out branch, and degenerates any code that iterates
+        # over range(soft).
+        script = (
+            "import resource\n"
+            "soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)\n"
+            "raised = 8192 if hard == resource.RLIM_INFINITY else min(hard, 8192)\n"
+            "resource.setrlimit(resource.RLIMIT_NOFILE, (raised, hard))\n"
+            "before = resource.getrlimit(resource.RLIMIT_NOFILE)\n"
+            "import mlx_lm.utils\n"
+            "after = resource.getrlimit(resource.RLIMIT_NOFILE)\n"
+            "print(before[0], before[1], after[0], after[1])\n"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, check=True
+        )
+        before_soft, before_hard, after_soft, after_hard = map(int, out.stdout.split())
+        self.assertGreaterEqual(after_soft, before_soft)
+        self.assertEqual(after_hard, before_hard)
+
+    def test_import_survives_low_hard_limit(self):
+        """A hard limit below 4096 must not make the import fail."""
+        script = (
+            "import resource\n"
+            "resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))\n"
+            "import mlx_lm.utils\n"
+            "print(*resource.getrlimit(resource.RLIMIT_NOFILE))\n"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, check=True
+        )
+        soft, hard = map(int, out.stdout.split())
+        self.assertLessEqual(soft, hard)
+        self.assertEqual(hard, 1024)
 
 
 if __name__ == "__main__":
