@@ -601,7 +601,10 @@ def speculative_generate_step(
     n = 0
     try:
         while True:
-            num_draft = min(max_tokens - ntoks, num_draft_tokens)
+            if max_tokens < 0:
+                num_draft = num_draft_tokens
+            else:
+                num_draft = min(max_tokens - ntoks, num_draft_tokens)
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
@@ -620,7 +623,7 @@ def speculative_generate_step(
                 yield tn, lpn, True
                 if ntoks == max_tokens:
                     break
-            if ntoks < max_tokens:
+            if ntoks != max_tokens:
                 ntoks += 1
                 yield tokens[n], logprobs[n], False
 
