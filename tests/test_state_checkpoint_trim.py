@@ -117,6 +117,15 @@ def greedy(model, cache, last_logits, n):
     return ids
 
 
+def replay(model, cache, ids):
+    """Feed known token ids one step at a time (decode path)."""
+    logits = None
+    for t in ids:
+        logits = model(mx.array([[t]]), cache=cache)
+    mx.eval(logits, [c.state for c in cache])
+    return logits
+
+
 class TestStateCheckpointTrim(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -420,6 +429,115 @@ class TestStateCheckpointTrim(unittest.TestCase):
         cache, rest = lru.fetch_nearest_cache("model-key", prompt)
         self.assertIsNotNone(cache)
         self.assertEqual(rest, prompt[80:])
+
+
+    # ------- state-level audit + through-decode round trip -------
+
+    def _assert_state_trees_equal(self, a, b):
+        if isinstance(a, mx.array):
+            self.assertTrue(mx.array_equal(a, b).item())
+        elif isinstance(a, (list, tuple)):
+            self.assertEqual(len(a), len(b))
+            for x, y in zip(a, b):
+                self._assert_state_trees_equal(x, y)
+        else:
+            self.assertEqual(a, b)
+
+    def _checkpoint_state_audit(self, config):
+        """Every recorded checkpoint must restore to a state bit-identical
+        to a fresh prefill of the same prefix. Output-level checks alone
+        can hide a wrong-state restore (downstream generations may look
+        plausible and even benchmark-clean), so compare the cache state
+        itself at every landing."""
+        mx.random.seed(3)
+        model = make_model(config)
+        chunk = 32
+        tokens = mx.random.randint(0, config["vocab_size"], (113,)).tolist()
+        cache = make_prompt_cache(model)
+        prefill(model, cache, tokens, chunk)
+        size = max(c.size() for c in cache)
+        self.assertEqual(size, 113)
+
+        for p in (32, 64, 96):
+            landing = achievable_trim(cache, size - p)
+            self.assertIsNotNone(landing)
+            self.assertEqual(landing[0], p)
+
+            trimmed = copy.deepcopy(cache)
+            actual = trim_prompt_cache(trimmed, size - p, allow_partial=True)
+            self.assertEqual(actual, size - p)
+
+            fresh = make_prompt_cache(model)
+            prefill(model, fresh, tokens[:p], chunk)
+            for ct, cf in zip(trimmed, fresh):
+                self.assertEqual(ct.size(), cf.size())
+                self._assert_state_trees_equal(ct.state, cf.state)
+
+    def test_checkpoint_state_audit_qwen3_next(self):
+        self._checkpoint_state_audit(QWEN3_NEXT_CONFIG)
+
+    def test_checkpoint_state_audit_kimi_linear(self):
+        self._checkpoint_state_audit(KIMI_LINEAR_CONFIG)
+
+    def _generation_roundtrip(self, config):
+        """Serving round trip THROUGH decode: prefill -> greedy decode ->
+        store (forced end checkpoint) -> follow-up request reuses the
+        generated prefix -> re-extend -> continue. Guards the
+        wrong-position class of bugs where state committed during decode
+        displaces or contaminates the checkpoint a later request restores.
+        The reference arm replicates the identical computation path
+        (chunked prefill + per-token replay) with no store/fetch/trim, so
+        the reuse machinery must be numerically a no-op: the continuation
+        is required to be token-exact."""
+        mx.random.seed(2)
+        model = make_model(config)
+        chunk = 32
+        vocab = config["vocab_size"]
+        prompt = mx.random.randint(0, vocab, (96,)).tolist()
+        extra = mx.random.randint(0, vocab, (7,)).tolist()
+
+        # Serving pass: prefill, decode 24 tokens, store prompt+generated.
+        cache = make_prompt_cache(model)
+        logits = prefill(model, cache, prompt, chunk)
+        generated = greedy(model, cache, logits, 24)
+        record_state_checkpoints(
+            cache, [max(c.size() for c in cache)], force=True
+        )
+        stored_key = prompt + generated
+        lru = LRUPromptCache()
+        lru.insert_cache("model-key", stored_key, cache)
+
+        # Follow-up: the conversation continues past the generated tail.
+        # The landing must be the forced end-of-generation checkpoint at
+        # 120 — i.e. the decode-produced state is what gets reused.
+        request = stored_key + extra
+        reused, rest = lru.fetch_nearest_cache("model-key", request)
+        self.assertIsNotNone(reused)
+        self.assertEqual(len(request) - len(rest), 120)
+        self.assertEqual(rest, extra)
+
+        logits_reused = prefill(model, reused, rest, chunk)
+        cont_reused = greedy(model, reused, logits_reused, 32)
+
+        # Reference arm: identical computation, no reuse machinery.
+        fresh = make_prompt_cache(model)
+        prefill(model, fresh, prompt, chunk)
+        replay(model, fresh, generated)
+        logits_fresh = prefill(model, fresh, extra, chunk)
+        cont_fresh = greedy(model, fresh, logits_fresh, 32)
+
+        self.assertTrue(
+            mx.allclose(
+                logits_reused[:, -1, :], logits_fresh[:, -1, :], atol=1e-5
+            ).item()
+        )
+        self.assertEqual(cont_reused, cont_fresh)
+
+    def test_generation_roundtrip_token_exact_qwen3_next(self):
+        self._generation_roundtrip(QWEN3_NEXT_CONFIG)
+
+    def test_generation_roundtrip_token_exact_kimi_linear(self):
+        self._generation_roundtrip(KIMI_LINEAR_CONFIG)
 
 
 if __name__ == "__main__":
