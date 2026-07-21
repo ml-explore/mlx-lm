@@ -727,20 +727,53 @@ class RotatingKVCache(_BaseCache):
     @property
     def state(self):
         if self.offset < self.keys.shape[2]:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+            live = [self.keys[..., : self.offset, :], self.values[..., : self.offset, :]]
         else:
-            return self.keys, self.values
+            live = [self.keys, self.values]
+        if self._checkpoints:
+            snaps = []
+            for _, k, v in self._checkpoints:
+                snaps.extend([k, v])
+            return [live, snaps]
+        return live[0], live[1]
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
+        # New-format state is [[keys, values], [ck_k, ck_v, ...]] (nested
+        # lists); legacy state is the flat (keys, values) pair. Checkpoint
+        # positions arrive in meta_state, whose setter runs after this one.
+        if len(v) == 2 and isinstance(v[0], list) and isinstance(v[1], list):
+            self.keys, self.values = v[0]
+            self._pending_checkpoint_snapshots = list(v[1])
+        else:
+            self.keys, self.values = v
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        base = tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        if self._checkpoints:
+            return base + tuple(
+                ["ckptv1"] + [str(p) for p, _, _ in self._checkpoints]
+            )
+        return base
 
     @meta_state.setter
     def meta_state(self, v):
+        pending = getattr(self, "_pending_checkpoint_snapshots", None)
+        self._pending_checkpoint_snapshots = None
+        v = list(v)
+        if "ckptv1" in v:
+            i = v.index("ckptv1")
+            positions = [int(p) for p in v[i + 1 :]]
+            v = v[:i]
+            if pending is None or len(pending) != 2 * len(positions):
+                raise ValueError(
+                    "RotatingKVCache checkpoint state/metadata mismatch"
+                )
+            self._checkpoints = [
+                (p, pending[2 * j], pending[2 * j + 1])
+                for j, p in enumerate(positions)
+            ]
         self.keep, self.max_size, self.offset, self._idx = map(
             int,
             v,
@@ -899,13 +932,59 @@ class ArraysCache(_BaseCache):
     def __getitem__(self, idx):
         return self.cache[idx]
 
+    def _persistable_checkpoints(self):
+        """Single-lane checkpoints whose snapshots are fully materialized.
+
+        Snapshots containing ``None`` entries cannot round-trip through
+        ``save_prompt_cache`` (safetensors holds arrays only), so they are
+        skipped. Batched histories are never persisted (snapshot files hold
+        per-request caches).
+        """
+        if len(self._checkpoints) != 1:
+            return []
+        return [
+            (p, snapshot)
+            for p, snapshot in self._checkpoints[0]
+            if all(a is not None for a in snapshot)
+        ]
+
     @property
     def state(self):
+        checkpoints = self._persistable_checkpoints()
+        if checkpoints:
+            return [list(self.cache), [list(s) for _, s in checkpoints]]
         return self.cache
 
     @state.setter
     def state(self, v):
-        self.cache = v
+        # New-format state is [live_entries, [snapshot, ...]] (nested lists);
+        # legacy state is a flat list of arrays. The positions arrive in
+        # meta_state, whose setter runs after this one.
+        if len(v) == 2 and isinstance(v[0], list) and isinstance(v[1], list):
+            self.cache = list(v[0])
+            self._pending_checkpoint_snapshots = [list(s) for s in v[1]]
+        else:
+            self.cache = v
+
+    @property
+    def meta_state(self):
+        checkpoints = self._persistable_checkpoints()
+        if checkpoints:
+            return tuple(["ckptv1"] + [str(p) for p, _ in checkpoints])
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        pending = getattr(self, "_pending_checkpoint_snapshots", None)
+        self._pending_checkpoint_snapshots = None
+        if not v:
+            return
+        if v[0] != "ckptv1":
+            raise ValueError(f"Unknown ArraysCache metadata version: {v[0]}")
+        positions = [int(p) for p in v[1:]]
+        if pending is None or len(pending) != len(positions):
+            raise ValueError("ArraysCache checkpoint state/metadata mismatch")
+        self._checkpoints = [list(zip(positions, pending))]
 
     def filter(self, batch_indices):
         """

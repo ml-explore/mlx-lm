@@ -11,6 +11,7 @@ LRUPromptCache reuse path the server drives.
 import copy
 import importlib
 import os
+import tempfile
 import unittest
 
 # Keep fp32 GEMMs off the TF32 path so the checkpoint-restore
@@ -26,8 +27,10 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     achievable_trim,
     can_trim_prompt_cache,
+    load_prompt_cache,
     make_prompt_cache,
     record_state_checkpoints,
+    save_prompt_cache,
     trim_prompt_cache,
 )
 
@@ -538,6 +541,91 @@ class TestStateCheckpointTrim(unittest.TestCase):
 
     def test_generation_roundtrip_token_exact_kimi_linear(self):
         self._generation_roundtrip(KIMI_LINEAR_CONFIG)
+
+    # ------- persistence: checkpoints must survive save/load -------
+
+    def _full_hybrid(self, boundaries, window=64):
+        """KVCache + ArraysCache + wrapped RotatingKVCache advanced through
+        the given chunk boundaries, checkpoints recorded at each."""
+        kv, ar = KVCache(), ArraysCache(size=2)
+        rot = RotatingKVCache(max_size=window, keep=4)
+        cache = [kv, ar, rot]
+        snaps = {}
+        pos = 0
+        for b in boundaries:
+            n = b - pos
+            k = mx.random.normal((1, 2, n, 4))
+            kv.update_and_fetch(k, k)
+            rot.update_and_fetch(k, k)
+            ar[0] = mx.random.normal((1, 3))
+            ar[1] = mx.random.normal((1, 5))
+            pos = b
+            record_state_checkpoints(cache, [pos])
+            snaps[pos] = [mx.array(ar[0]), mx.array(ar[1])]
+        record_state_checkpoints(cache, [pos], force=True)
+        return cache, snaps
+
+    def test_persistence_roundtrip_preserves_checkpoints(self):
+        """A restored cache must land where the in-memory cache lands.
+        Losing checkpoints on save/load makes every restore silently
+        reprocess from zero (a wrapped rotating cache alone drags the
+        whole hybrid's landing to 0)."""
+        mx.random.seed(4)
+        cache, snaps = self._full_hybrid([32, 64, 96, 113])
+        size = max(c.size() for c in cache)
+        self.assertEqual(achievable_trim(cache, size - 96), (96, 17))
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hybrid.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+
+        self.assertEqual(
+            [type(c).__name__ for c in loaded],
+            ["KVCache", "ArraysCache", "RotatingKVCache"],
+        )
+        lsize = max(c.size() for c in loaded)
+        self.assertEqual(lsize, size)
+        self.assertEqual(achievable_trim(loaded, lsize - 96), (96, 17))
+
+        actual = trim_prompt_cache(loaded, lsize - 96, allow_partial=True)
+        self.assertEqual(actual, 17)
+        for a, b in zip(loaded[1].cache, snaps[96]):
+            self.assertTrue(mx.array_equal(a, b).item())
+
+        # Parity contract: restore-from-disk then trim must equal the pure
+        # in-memory trim of the original cache — every cache, full state
+        # tree, including the rotating window contents.
+        actual_mem = trim_prompt_cache(cache, size - 96, allow_partial=True)
+        self.assertEqual(actual_mem, 17)
+        for cl, cm in zip(loaded, cache):
+            self.assertEqual(cl.size(), cm.size())
+            self._assert_state_trees_equal(cl.state, cm.state)
+
+    def test_persistence_without_checkpoints_stays_legacy(self):
+        """No checkpoints -> the on-disk format is unchanged (legacy state
+        and meta_state shapes), and old files keep loading."""
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            mx.random.seed(5)
+            cache, _ = self._full_hybrid([32, 64])
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+        ar, rot = cache[1], cache[2]
+        self.assertEqual(ar.meta_state, "")
+        self.assertEqual(len(rot.meta_state), 4)
+        self.assertIsInstance(ar.state, list)
+        self.assertTrue(all(isinstance(a, mx.array) for a in ar.state))
+        k, v = rot.state
+        self.assertIsInstance(k, mx.array)
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "legacy.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+        self.assertEqual(max(c.size() for c in loaded), 64)
+        for a, b in zip(loaded[1].cache, cache[1].cache):
+            self.assertTrue(mx.array_equal(a, b).item())
 
 
 if __name__ == "__main__":
