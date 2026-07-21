@@ -57,6 +57,7 @@ class DummyModelProvider:
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
+                "generation_stall_timeout": 0,
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
@@ -629,6 +630,42 @@ class TestResponseGeneratorResilience(unittest.TestCase):
             # The generation thread must survive and keep serving
             self.assertTrue(response_generator._generation_thread.is_alive())
 
+            request, args = self._make_request()
+            _, responses = response_generator.generate(request, args)
+            responses = list(responses)
+            self.assertTrue(len(responses) > 0)
+            self.assertEqual(responses[-1].finish_reason, "length")
+        finally:
+            response_generator.stop_and_join()
+
+    def test_generation_thread_survives_delivery_stall(self):
+        # Regression test for the livelock failure mode reported in
+        # mlx-lm#1493: the batch loop keeps calling BatchGenerator.next()
+        # (real iterations, thread stays alive) but never delivers a
+        # token, prompt-progress update, or anything else to any request's
+        # queue. Neither _generation_thread.is_alive() nor a naive
+        # per-iteration heartbeat would catch this; only "nothing
+        # delivered in N seconds" does.
+        response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+        response_generator.model_provider.cli_args.generation_stall_timeout = 0.05
+        try:
+            request, args = self._make_request()
+
+            with mock.patch.object(BatchGenerator, "next", return_value=([], [])):
+                _, responses = response_generator.generate(request, args)
+                with self.assertRaisesRegex(RuntimeError, "generation stalled"):
+                    for _ in responses:
+                        pass
+
+            # The generation thread must survive and keep serving, with no
+            # process restart required.
+            self.assertTrue(response_generator._generation_thread.is_alive())
+
+            # Disable the stall watchdog for the recovery check itself: a
+            # freshly (re)created real BatchGenerator's first prefill/decode
+            # step can legitimately take longer than the tiny timeout used
+            # above to force a stall quickly.
+            response_generator.model_provider.cli_args.generation_stall_timeout = 0
             request, args = self._make_request()
             _, responses = response_generator.generate(request, args)
             responses = list(responses)

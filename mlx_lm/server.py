@@ -638,6 +638,14 @@ class ResponseGenerator:
         drain_batch = False
         batch_results = {}
 
+        # Wall-clock time a token, prompt-progress update, or admission ack
+        # was last actually handed to a consumer queue. A batch loop can
+        # keep iterating (and burning real CPU/GPU) while never delivering
+        # anything to any request -- a livelock. Thread liveness and a
+        # naive per-iteration heartbeat both miss this; only delivery
+        # staleness catches it.
+        last_delivery = time.monotonic()
+
         unprocessed_requests = []
 
         def get_next_request(timeout=None):
@@ -645,6 +653,30 @@ class ResponseGenerator:
                 return unprocessed_requests.pop()
             else:
                 return self._next_request(timeout)
+
+        def _reset_batch(exc):
+            # Shared recovery for both an outright exception in the batch
+            # loop and a detected delivery stall: fail every in-flight
+            # request with an explicit error, drop the batch generator, and
+            # let the loop start fresh. Queued-but-not-yet-admitted
+            # requests are retried against a new batch generator.
+            nonlocal batch_results, batch_generator, current_model
+            nonlocal current_sampling, current_tokenizer, current_model_key
+            nonlocal drain_batch, last_delivery
+            for result in batch_results.values():
+                result["rqueue"].put(exc)
+            batch_results = {}
+            try:
+                batch_generator.close()
+            except Exception:
+                logging.exception("Failed to close the batch generator.")
+            batch_generator = None
+            current_model = None
+            current_sampling = None
+            current_tokenizer = None
+            current_model_key = None
+            drain_batch = False
+            last_delivery = time.monotonic()
 
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
@@ -719,6 +751,7 @@ class ResponseGenerator:
                         continue
 
                     rqueue.put(ctx)
+                    last_delivery = time.monotonic()
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
@@ -786,6 +819,27 @@ class ResponseGenerator:
                             drain_batch = False
                         continue
 
+                    # Detect a livelocked batch: the loop below can keep
+                    # calling batch_generator.next() and doing real work
+                    # (forward pass, eval sync) indefinitely without ever
+                    # putting anything on a request's queue -- reported as
+                    # a real-world failure mode in #1493. is_alive() and a
+                    # per-iteration heartbeat both stay green through this;
+                    # only "nothing delivered in N seconds" catches it.
+                    stall_timeout = self.cli_args.generation_stall_timeout
+                    if (
+                        stall_timeout > 0
+                        and time.monotonic() - last_delivery > stall_timeout
+                    ):
+                        stall_exc = RuntimeError(
+                            "generation stalled: no output delivered for "
+                            f"{stall_timeout:.0f}s; failing in-flight "
+                            "requests and resetting the batch"
+                        )
+                        logging.warning(str(stall_exc))
+                        _reset_batch(stall_exc)
+                        continue
+
                     uids_to_remove = []
                     for _ in self._time_budget:
                         prompt_responses, gen_responses = batch_generator.next()
@@ -796,6 +850,7 @@ class ResponseGenerator:
                         for r in prompt_responses:
                             result = batch_results[r.uid]
                             result["rqueue"].put(r.progress)
+                            last_delivery = time.monotonic()
                             if result["ctx"]._should_stop:
                                 uids_to_remove.append(r.uid)
 
@@ -845,9 +900,11 @@ class ResponseGenerator:
                                     ),
                                 )
                             )
+                            last_delivery = time.monotonic()
 
                             if r.finish_reason is not None:
                                 result["rqueue"].put(None)
+                                last_delivery = time.monotonic()
                                 self.prompt_cache.insert_cache(
                                     current_model_key,
                                     r.all_tokens[:],
@@ -876,19 +933,7 @@ class ResponseGenerator:
                         "Generation batch failed. Failing the in-flight "
                         "requests and continuing to serve."
                     )
-                    for result in batch_results.values():
-                        result["rqueue"].put(e)
-                    batch_results = {}
-                    try:
-                        batch_generator.close()
-                    except Exception:
-                        logging.exception("Failed to close the batch generator.")
-                    batch_generator = None
-                    current_model = None
-                    current_sampling = None
-                    current_tokenizer = None
-                    current_model_key = None
-                    drain_batch = False
+                    _reset_batch(e)
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -1863,6 +1908,18 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--generation-stall-timeout",
+        type=float,
+        default=60.0,
+        help=(
+            "Seconds without any output delivered to a request before the "
+            "batch generation loop is treated as stalled (livelocked) and "
+            "reset: in-flight requests fail with an explicit error and the "
+            "server keeps serving without a restart. Set to 0 to disable. "
+            "(default: 60.0)"
+        ),
     )
     parser.add_argument(
         "--prompt-cache-size",
