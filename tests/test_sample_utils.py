@@ -1,8 +1,15 @@
+import threading
 import unittest
 
 import mlx.core as mx
 
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, apply_xtc
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    apply_xtc,
+    make_sampler,
+)
 
 
 class TestSampleUtils(unittest.TestCase):
@@ -173,6 +180,38 @@ class TestSampleUtils(unittest.TestCase):
         self.assertAlmostEqual(logits[0, 1].item(), -0.6667, places=4)
         self.assertAlmostEqual(logits[0, 2].item(), 0.0, places=4)
         self.assertAlmostEqual(logits[0, 3].item(), -0.5, places=4)
+
+    def test_sampler_seed(self):
+        def sample_with_seeds(out: list[list[int]]) -> None:
+            sampler = make_sampler(temp=1.0)
+            logits = mx.zeros((1024,))  # uniform, so the seed drives the pick
+            tokens = []
+            for seed in [1, 2, 1, 2, 3, 3]:
+                mx.random.seed(seed)
+                token = sampler(logits)
+                mx.eval(token)
+                tokens.append(token.item())
+            out.append(tokens)
+
+        def run_threaded() -> list[int]:
+            out = []
+            t = threading.Thread(target=sample_with_seeds, args=(out,))
+            t.start()
+            t.join()
+            assert len(out) == 1, out
+            return out[0]
+
+        tokens = run_threaded()
+
+        # seeds are [1, 2, 1, 2, 3]
+        self.assertEqual(tokens[0], tokens[2])
+        self.assertEqual(tokens[1], tokens[3])
+        self.assertEqual(tokens[4], tokens[5])
+        self.assertNotEqual(tokens[1], tokens[2])
+        self.assertNotEqual(tokens[1], tokens[5])
+        self.assertNotEqual(tokens[2], tokens[5])
+        # reproducibility
+        self.assertEqual(tokens, run_threaded())
 
 
 if __name__ == "__main__":
