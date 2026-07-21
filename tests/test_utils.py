@@ -79,6 +79,23 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(config["quantization"]["group_size"], 64)
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_compressed_tensors_config_uses_weight_group_size(self):
+        quantization = utils._compressed_tensors_config(
+            {
+                "format": "pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "weights": {
+                            "type": "int",
+                            "num_bits": 4,
+                            "group_size": 128,
+                        }
+                    }
+                },
+            }
+        )
+        self.assertEqual(quantization, {"group_size": 128, "bits": 4, "mode": "affine"})
+
     def test_convert(self):
         mlx_path = os.path.join(self.test_dir, "mlx_model")
 
