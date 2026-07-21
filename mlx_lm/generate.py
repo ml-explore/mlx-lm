@@ -28,6 +28,7 @@ from .models.cache import (
     RotatingKVCache,
     TokenBuffer,
     load_prompt_cache,
+    record_state_checkpoints,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -417,6 +418,9 @@ def generate_step(
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
+        checkpoint_base = max(
+            (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
+        )
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
@@ -432,6 +436,9 @@ def generate_step(
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             prompt_processed_tokens += n_to_process
+            record_state_checkpoints(
+                prompt_cache, [checkpoint_base + prompt_processed_tokens]
+            )
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
             input_embeddings = (
@@ -440,6 +447,15 @@ def generate_step(
                 else input_embeddings
             )
             mx.clear_cache()
+
+        # The end-of-prefill boundary is the position a regenerate-style
+        # prompt-cache trim lands on, so always record it.
+        if prompt_processed_tokens > 0:
+            record_state_checkpoints(
+                prompt_cache,
+                [checkpoint_base + prompt_processed_tokens],
+                force=True,
+            )
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
@@ -568,13 +584,19 @@ def speculative_generate_step(
                 return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
+        base = max((c.size() for c in cache if hasattr(c, "size")), default=0)
+        processed = 0
         while y.size > 1:
             n_to_process = min(prefill_step_size, y.size - 1)
             model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
             mx.eval([c.state for c in cache])
+            processed += n_to_process
+            record_state_checkpoints(cache, [base + processed])
             y = y[n_to_process:]
             mx.clear_cache()
+        if processed > 0:
+            record_state_checkpoints(cache, [base + processed], force=True)
         return y
 
     def _rewind_cache(num_draft, num_accept):
@@ -1229,6 +1251,12 @@ class PromptProcessingBatch:
         padding = [max_length - l for l in lengths]
         max_padding = max(padding)
 
+        # Absolute per-lane positions for recurrent-state checkpoints. A lane
+        # that exhausts its (right-padded) prompt mid-chunk holds a frozen,
+        # exact state at its own total, so clamp per lane.
+        totals = [len(st) for st in self.tokens]
+        bases = [t - l for t, l in zip(totals, lengths)]
+
         # Prepare the caches and inputs. Right pad if needed otherwise just
         # cast to array.
         if max_padding > 0:
@@ -1239,10 +1267,16 @@ class PromptProcessingBatch:
             tokens = mx.array(tokens)
 
         # Actual prompt processing loop
+        processed = 0
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
             mx.eval([c.state for c in self.prompt_cache])
+            processed += n_to_process
+            record_state_checkpoints(
+                self.prompt_cache,
+                [b + min(processed, l) for b, l in zip(bases, lengths)],
+            )
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
 
@@ -1252,6 +1286,10 @@ class PromptProcessingBatch:
                 c.finalize()
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
+
+        # The end of each prompt segment is exactly the position the server
+        # keys prompt-cache entries on; always record it.
+        record_state_checkpoints(self.prompt_cache, totals, force=True)
 
     def generate(self, tokens: List[List[int]]):
         """
