@@ -203,7 +203,6 @@ class TestSampleUtils(unittest.TestCase):
 
         tokens = run_threaded()
 
-        # seeds are [1, 2, 1, 2, 3]
         self.assertEqual(tokens[0], tokens[2])
         self.assertEqual(tokens[1], tokens[3])
         self.assertEqual(tokens[4], tokens[5])
