@@ -354,8 +354,9 @@ class TokenizerWrapper:
 
         self._eos_token_ids.add(token_id)
 
-    def _find(self, tokens, sequence, start=None, end=None, reverse=False):
-        start = start or 0
+    @staticmethod
+    def _find(tokens, sequence, start=None, end=None, reverse=False):
+        start = max(start or 0, 0)
         end = end or len(tokens)
         outer_loop = (
             range(end - len(sequence), start - 1, -1)
@@ -499,7 +500,7 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
         return [self._postprocess_text(d) for d in decoded]
 
 
-AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+AutoTokenizer.register(NewlineTokenizer, fast_tokenizer_class=NewlineTokenizer)
 
 
 def _match(a, b):
