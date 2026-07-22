@@ -60,7 +60,9 @@ class ModelArgs(BaseModelArgs):
             )
 
 
-def _resolve_rope_config(rope_parameters: Dict[str, Any], attention_type: str) -> Dict[str, Any]:
+def _resolve_rope_config(
+    rope_parameters: Dict[str, Any], attention_type: str
+) -> Dict[str, Any]:
     """Laguna nests RoPE config by layer type when the model mixes full and
     sliding attention: ``{"full_attention": {...}, "sliding_attention": {...}}``.
     A flat (non-nested) config applies to every layer as-is."""
@@ -169,7 +171,9 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
-        inter = args.intermediate_size if intermediate_size is None else intermediate_size
+        inter = (
+            args.intermediate_size if intermediate_size is None else intermediate_size
+        )
         self.gate_proj = nn.Linear(args.hidden_size, inter, bias=False)
         self.up_proj = nn.Linear(args.hidden_size, inter, bias=False)
         self.down_proj = nn.Linear(inter, args.hidden_size, bias=False)
@@ -215,7 +219,9 @@ class MoEBlock(nn.Module):
         self.switch_mlp = SwitchGLU(
             args.hidden_size, args.moe_intermediate_size, args.num_experts
         )
-        self.shared_expert = MLP(args, intermediate_size=args.shared_expert_intermediate_size)
+        self.shared_expert = MLP(
+            args, intermediate_size=args.shared_expert_intermediate_size
+        )
         self.routed_scaling_factor = args.moe_routed_scaling_factor
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -241,7 +247,9 @@ class DecoderLayer(nn.Module):
         self.mlp = MoEBlock(args) if is_moe_layer else MLP(args)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
     def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
         h = x + self.self_attn(self.input_layernorm(x), mask, cache)
@@ -274,9 +282,13 @@ class LanguageModel(nn.Module):
             else None
         )
 
-        full_mask = create_attention_mask(h, cache[full_idx]) if full_idx is not None else None
+        full_mask = (
+            create_attention_mask(h, cache[full_idx]) if full_idx is not None else None
+        )
         sliding_mask = (
-            create_attention_mask(h, cache[sliding_idx], window_size=self.sliding_window)
+            create_attention_mask(
+                h, cache[sliding_idx], window_size=self.sliding_window
+            )
             if sliding_idx is not None
             else None
         )
@@ -320,7 +332,9 @@ class Model(nn.Module):
             prefix = f"model.layers.{l}.mlp"
             bias_key = f"{prefix}.experts.e_score_correction_bias"
             if bias_key in weights:
-                weights[f"{prefix}.gate.e_score_correction_bias"] = weights.pop(bias_key)
+                weights[f"{prefix}.gate.e_score_correction_bias"] = weights.pop(
+                    bias_key
+                )
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:
                 continue  # dense (mlp_only) layer — nothing to stack
             for name in ("gate_proj", "up_proj", "down_proj"):
