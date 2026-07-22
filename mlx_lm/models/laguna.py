@@ -225,3 +225,24 @@ class MoEBlock(nn.Module):
         if self.routed_scaling_factor != 1.0:
             y = y * self.routed_scaling_factor
         return y + self.shared_expert(x)
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.attention_type = args.layer_types[layer_idx]
+        self.self_attn = Attention(args, layer_idx)
+
+        is_moe_layer = (
+            layer_idx not in args.mlp_only_layers
+            and args.num_experts > 0
+            and (layer_idx + 1) % args.decoder_sparse_step == 0
+        )
+        self.mlp = MoEBlock(args) if is_moe_layer else MLP(args)
+
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
+        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        return h + self.mlp(self.post_attention_layernorm(h))
