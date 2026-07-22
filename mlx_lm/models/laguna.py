@@ -164,3 +164,64 @@ class Attention(nn.Module):
                 out = out * gate
 
         return self.o_proj(out)
+
+
+class MLP(nn.Module):
+    def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
+        super().__init__()
+        inter = args.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(args.hidden_size, inter, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, inter, bias=False)
+        self.down_proj = nn.Linear(inter, args.hidden_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Router(nn.Module):
+    """Sigmoid-scored router (not softmax) with an auxiliary-loss-free
+    correction bias (arXiv:2408.15664): the bias shifts which experts are
+    *selected* but the returned routing weights stay unbiased (gathered from
+    the un-shifted sigmoid scores, matching the reference)."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.top_k = args.num_experts_per_tok
+        self.num_experts = args.num_experts
+        self.norm_topk_prob = args.norm_topk_prob
+        self.softcapping = args.moe_router_logit_softcapping
+        self.weight = mx.zeros((self.num_experts, args.hidden_size))
+        self.e_score_correction_bias = mx.zeros((self.num_experts,))
+
+    def __call__(self, x: mx.array):
+        logits = (x @ self.weight.T).astype(mx.float32)
+        if self.softcapping > 0.0:
+            logits = mx.tanh(logits / self.softcapping) * self.softcapping
+        scores = mx.sigmoid(logits)
+        scores_for_selection = scores + self.e_score_correction_bias
+
+        k = self.top_k
+        inds = mx.argpartition(-scores_for_selection, kth=k - 1, axis=-1)[..., :k]
+        weights = mx.take_along_axis(scores, inds, axis=-1)
+        if self.norm_topk_prob:
+            weights = weights / weights.sum(axis=-1, keepdims=True)
+        return inds, weights.astype(x.dtype)
+
+
+class MoEBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate = Router(args)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size, args.moe_intermediate_size, args.num_experts
+        )
+        self.shared_expert = MLP(args, intermediate_size=args.shared_expert_intermediate_size)
+        self.routed_scaling_factor = args.moe_routed_scaling_factor
+
+    def __call__(self, x: mx.array) -> mx.array:
+        inds, weights = self.gate(x)
+        y = self.switch_mlp(x, inds)
+        y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
+        if self.routed_scaling_factor != 1.0:
+            y = y * self.routed_scaling_factor
+        return y + self.shared_expert(x)
