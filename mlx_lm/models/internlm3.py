@@ -175,7 +175,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class InternLM2Model(nn.Module):
+class InternLM3Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         assert args.vocab_size > 0
@@ -207,7 +207,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = InternLM2Model(args)
+        self.model = InternLM3Model(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
