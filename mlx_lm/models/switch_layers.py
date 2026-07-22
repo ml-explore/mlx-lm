@@ -61,6 +61,15 @@ def _offload_fetched_to_data(raw, quantized: bool):
     return _offload_to_mx(raw)
 
 
+def _offload_data_nbytes(data):
+    """Resident byte size of one cache entry, for byte-budgeted residency. A
+    quantized entry is a (weight, scales, biases) tuple whose biases may be
+    None; a dense entry is a single array."""
+    if isinstance(data, tuple):
+        return sum(a.nbytes for a in data if a is not None)
+    return data.nbytes
+
+
 def _gather_sort(x, indices):
     *_, M = indices.shape
     indices = indices.flatten()
@@ -76,7 +85,7 @@ def _scatter_unsort(x, inv_order, shape=None):
     return x
 
 
-def _offload_enable(module, resident_slots: int, fetch_fn, quantized: bool, max_stack_size=None):
+def _offload_enable(module, resident_slots, fetch_fn, quantized: bool, max_stack_size=None, resident_bytes=None):
     """Switch a SwitchLinear/QuantizedSwitchLinear to a disk-backed,
     dict-keyed LRU expert cache (`expert_id -> weight data`) instead of
     keeping every expert's weights resident, fetching cold experts via
@@ -116,8 +125,32 @@ def _offload_enable(module, resident_slots: int, fetch_fn, quantized: bool, max_
     independent of how generous the residency setting is, not shrink or
     grow with it. `_OFFLOAD_DEFAULT_MAX_STACK` is a fixed cap instead;
     callers that know their own headroom can still override it explicitly.
+
+    `resident_bytes` is an optional byte budget offered as an alternative to
+    the `resident_slots` count. `resident_slots` is the wrong unit when experts
+    are not all the same size — heterogeneous or mixed-precision tables — where
+    bytes, not a slot count, are the real memory budget. When given, the slot
+    count is derived from it by measuring one expert through the same fetch
+    path a cold miss uses and floor-dividing; passing both keeps the tighter of
+    the two, so a byte budget can only ever lower a slot count, never raise it.
     """
     n_experts = module.num_experts
+    if fetch_fn is None:
+        raise ValueError("enable_offload requires a fetch_fn")
+
+    # Derive the slot count from a byte budget when the caller gives one. Probe
+    # a single expert through the real fetch path so the per-expert figure is
+    # the true resident footprint of a cache entry (quantized: weight + scales
+    # + biases), not an estimate off the on-disk layout. The probe expert seeds
+    # slot 0 in the loop below regardless, so this is one extra fetch total, not
+    # one per slot.
+    if resident_bytes is not None:
+        per_expert = _offload_data_nbytes(_offload_fetched_to_data(fetch_fn(0), quantized))
+        derived = max(1, int(resident_bytes // per_expert))
+        resident_slots = derived if resident_slots is None else min(resident_slots, derived)
+    if resident_slots is None:
+        raise ValueError("enable_offload requires resident_slots or resident_bytes")
+
     if resident_slots >= n_experts:
         return
     module._offload_fetch = fetch_fn
@@ -415,8 +448,15 @@ class QuantizedSwitchLinear(nn.Module):
         n = getattr(self, "_offload_num_experts", None)
         return n if n is not None else self.weight.shape[0]
 
-    def enable_offload(self, resident_slots: int, fetch_fn, max_stack_size=None):
-        _offload_enable(self, resident_slots, fetch_fn, quantized=True, max_stack_size=max_stack_size)
+    def enable_offload(self, resident_slots=None, fetch_fn=None, max_stack_size=None, resident_bytes=None):
+        _offload_enable(
+            self,
+            resident_slots,
+            fetch_fn,
+            quantized=True,
+            max_stack_size=max_stack_size,
+            resident_bytes=resident_bytes,
+        )
 
     def __call__(self, x, indices, sorted_indices=False):
         if hasattr(self, "_offload_fetch"):
@@ -484,8 +524,15 @@ class SwitchLinear(nn.Module):
         n = getattr(self, "_offload_num_experts", None)
         return n if n is not None else self.weight.shape[0]
 
-    def enable_offload(self, resident_slots: int, fetch_fn, max_stack_size=None):
-        _offload_enable(self, resident_slots, fetch_fn, quantized=False, max_stack_size=max_stack_size)
+    def enable_offload(self, resident_slots=None, fetch_fn=None, max_stack_size=None, resident_bytes=None):
+        _offload_enable(
+            self,
+            resident_slots,
+            fetch_fn,
+            quantized=False,
+            max_stack_size=max_stack_size,
+            resident_bytes=resident_bytes,
+        )
 
     def __call__(self, x, indices, sorted_indices=False):
         if hasattr(self, "_offload_fetch"):
