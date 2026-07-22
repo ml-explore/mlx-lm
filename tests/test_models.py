@@ -3263,46 +3263,57 @@ class TestModels(unittest.TestCase):
         # broadcastable. B > 1 so a full-rank mask can't pass by accident.
         from mlx_lm.models.base import quantized_scaled_dot_product_attention
 
-        B, n_q, n_kv, L, S, D = 2, 8, 2, 4, 64, 64
         group_size, bits = 64, 8
-        n_repeats = n_q // n_kv
-        mx.random.seed(0)
-        q = mx.random.normal((B, n_q, L, D))
-        k = mx.random.normal((B, n_kv, S, D))
-        v = mx.random.normal((B, n_kv, S, D))
-        q_k = mx.quantize(k, group_size=group_size, bits=bits)
-        q_v = mx.quantize(v, group_size=group_size, bits=bits)
+        # A plain GQA shape, then the absorbed-MLA decode shape: one kv head,
+        # so every query head is a repeat.
+        shapes = ((2, 8, 2, 4, 64, 64), (2, 64, 1, 1, 512, 64))
+        for B, n_q, n_kv, L, S, D in shapes:
+            n_repeats = n_q // n_kv
+            mx.random.seed(0)
+            q = mx.random.normal((B, n_q, L, D))
+            k = mx.random.normal((B, n_kv, S, D))
+            v = mx.random.normal((B, n_kv, S, D))
+            q_k = mx.quantize(k, group_size=group_size, bits=bits)
+            q_v = mx.quantize(v, group_size=group_size, bits=bits)
 
-        kd = mx.repeat(
-            mx.dequantize(*q_k, group_size=group_size, bits=bits), n_repeats, axis=1
-        )
-        vd = mx.repeat(
-            mx.dequantize(*q_v, group_size=group_size, bits=bits), n_repeats, axis=1
-        )
+            kd = mx.repeat(
+                mx.dequantize(*q_k, group_size=group_size, bits=bits), n_repeats, axis=1
+            )
+            vd = mx.repeat(
+                mx.dequantize(*q_v, group_size=group_size, bits=bits), n_repeats, axis=1
+            )
 
-        per_q = 0.1 * mx.random.normal((B, n_q, L, S))
-        masks = {
-            "per query head": per_q,
-            "per kv head": 0.1 * mx.random.normal((B, n_kv, L, S)),
-            "broadcast": 0.1 * mx.random.normal((B, 1, L, S)),
-            "full rank": per_q.reshape(B, n_kv, n_repeats, L, S),
-            "no heads": 0.1 * mx.random.normal((L, S)),
-        }
-        for name, mask in masks.items():
-            with self.subTest(mask=name):
-                out = quantized_scaled_dot_product_attention(
-                    q, q_k, q_v, scale=1.0, mask=mask, group_size=group_size, bits=bits
-                )
-                self.assertEqual(out.shape, (B, n_q, L, D))
+            per_q = 0.1 * mx.random.normal((B, n_q, L, S))
+            masks = {
+                "per query head": per_q,
+                "per kv head": 0.1 * mx.random.normal((B, n_kv, L, S)),
+                "broadcast": 0.1 * mx.random.normal((B, 1, L, S)),
+                "full rank": per_q.reshape(B, n_kv, n_repeats, L, S),
+                "no heads": 0.1 * mx.random.normal((L, S)),
+            }
+            for name, mask in masks.items():
+                with self.subTest(heads=(n_q, n_kv), mask=name):
+                    out = quantized_scaled_dot_product_attention(
+                        q,
+                        q_k,
+                        q_v,
+                        scale=1.0,
+                        mask=mask,
+                        group_size=group_size,
+                        bits=bits,
+                    )
+                    self.assertEqual(out.shape, (B, n_q, L, D))
 
-                ref_mask = mask
-                if ref_mask.ndim == 5:
-                    ref_mask = ref_mask.reshape(B, n_q, L, S)
-                elif ref_mask.ndim == 4 and 1 < ref_mask.shape[-3] < n_q:
-                    ref_mask = mx.repeat(ref_mask, n_q // ref_mask.shape[-3], axis=-3)
-                scores = q @ kd.swapaxes(-1, -2) + ref_mask
-                ref = mx.softmax(scores, axis=-1, precise=True) @ vd
-                self.assertTrue(mx.allclose(out, ref, rtol=1e-2, atol=1e-2))
+                    ref_mask = mask
+                    if ref_mask.ndim == 5:
+                        ref_mask = ref_mask.reshape(B, n_q, L, S)
+                    elif ref_mask.ndim == 4 and 1 < ref_mask.shape[-3] < n_q:
+                        ref_mask = mx.repeat(
+                            ref_mask, n_q // ref_mask.shape[-3], axis=-3
+                        )
+                    scores = q @ kd.swapaxes(-1, -2) + ref_mask
+                    ref = mx.softmax(scores, axis=-1, precise=True) @ vd
+                    self.assertTrue(mx.allclose(out, ref, rtol=1e-2, atol=1e-2))
 
     def test_mla_quantized_cache(self):
         # Absorbed-MLA attention fetches (packed, scales, biases) tuples from a
