@@ -2064,9 +2064,30 @@ class LRUPromptCache:
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
-        if result.exact is not None:
+        if result.exact is not None and len(tokens) == 0:
             cache_entry = self._trie.get(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
+        if result.exact is not None:
+            cache_entry = self._trie.get(result.model, result.exact)
+            # Never hand back an empty remainder: the caller re-processes
+            # ``rest`` to obtain last-token logits, so an exact hit (e.g. a
+            # client retrying an identical prompt) must land at or before
+            # len(tokens) - 1. Trimmable caches give back the last token;
+            # hybrids land on their deepest interior checkpoint.
+            if can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                trim_prompt_cache(cache, 1)
+                return cache, tokens[-1:]
+            landing = achievable_trim(cache_entry.prompt_cache, 1)
+            if landing is not None and landing[1] < len(tokens):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                trimmed = trim_prompt_cache(cache, 1, allow_partial=True)
+                landed = len(tokens) - trimmed
+                if 0 < landed <= len(tokens) - 1:
+                    return cache, tokens[landed:]
+            # No usable landing (e.g. checkpointing disabled): fall through
+            # to the shorter/longer candidates rather than return an
+            # unusable full cache.
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
