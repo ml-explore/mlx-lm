@@ -23,8 +23,10 @@ class DummyModule:
 
 
 class TestLagunaQuantPredicate(unittest.TestCase):
-    def _check_paths(self, expert_bits: int):
-        predicate = build_laguna_quant_predicate(expert_bits=expert_bits)
+    def _check_paths(self, expert_bits: int, attention_bits: int = 8):
+        predicate = build_laguna_quant_predicate(
+            expert_bits=expert_bits, attention_bits=attention_bits
+        )
         module = DummyModule()
 
         switch_mlp_paths = [
@@ -47,7 +49,7 @@ class TestLagunaQuantPredicate(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(
                     predicate(path, module),
-                    {"group_size": 64, "bits": 8, "mode": "affine"},
+                    {"group_size": 64, "bits": attention_bits, "mode": "affine"},
                 )
 
     def test_expert_bits_4(self):
@@ -55,6 +57,13 @@ class TestLagunaQuantPredicate(unittest.TestCase):
 
     def test_expert_bits_6(self):
         self._check_paths(expert_bits=6)
+
+    def test_expert_bits_2_with_4bit_attention(self):
+        # The compatibility report's `4bit-Att-2bit-Ex` recipe: routed
+        # experts dominate Laguna's footprint (~116B of ~117.6B stored
+        # parameters), so this is the variant that actually shrinks a
+        # 118B model down to a 64 GB-Mac-friendly size.
+        self._check_paths(expert_bits=2, attention_bits=4)
 
     def test_invalid_expert_bits_raises(self):
         with self.assertRaises(ValueError):
