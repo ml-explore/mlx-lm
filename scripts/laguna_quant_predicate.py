@@ -1,8 +1,21 @@
 """Custom per-module quantization predicate for Laguna's requested mixed
-variants: attention/router/embeddings/output at one bit width, with routed
-experts at a lower one (2, 4, or 6). The three uniform variants
+variants: attention/embeddings/output at one bit width, with routed experts
+at a lower one (2, 4, or 6). The three uniform variants
 (4bit/6bit/8bit-everything) need no custom predicate — use
 `mlx_lm.convert(..., quantize=True, q_bits=4|6|8)` directly.
+
+Note on the router: `Router.weight` (`mlx_lm/models/laguna.py`) is a raw
+array, not an `nn.Linear`, so it has no `to_quantized`.
+`mlx_lm.utils.quantize_model`'s wrapper checks `hasattr(module,
+"to_quantized")` before ever calling a custom `quant_predicate`, so the
+router (and the model's RMSNorm layers) are always left at full precision
+regardless of what a predicate here returns for their paths -- there is no
+way to quantize the router via this mechanism today, and no need to
+special-case it above. Concretely, this means a "protect the router, shrink
+everything else" recipe needs no custom predicate at all: plain
+`mlx_lm.convert(..., quantize=True, q_bits=6)` already leaves the router at
+full precision (stricter than 8-bit) while quantizing attention and routed
+experts uniformly to 6-bit.
 
 Usage:
     from mlx_lm.convert import convert
@@ -49,11 +62,9 @@ def build_laguna_quant_predicate(
     def predicate(path: str, module: nn.Module) -> Union[bool, dict]:
         # Routed experts (SwitchGLU's three projections) get the lower bit
         # width poolside requested; everything else quantizable (attention
-        # projections, the router's `weight` matmul, embeddings, lm_head,
-        # the shared expert) stays at attention_bits. The router's
-        # `e_score_correction_bias` is excluded from casting entirely via
-        # `Model.cast_predicate`, and `mx.quantize` only touches weight
-        # matrices, not that bias vector, so it needs no special-casing here.
+        # projections, embeddings, lm_head, the shared expert) stays at
+        # attention_bits. The router never reaches this predicate at all --
+        # see the module docstring -- so it needs no special-casing here.
         if "switch_mlp" in path:
             return {"group_size": group_size, "bits": expert_bits, "mode": "affine"}
         return {"group_size": group_size, "bits": attention_bits, "mode": "affine"}

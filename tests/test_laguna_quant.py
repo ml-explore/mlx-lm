@@ -70,5 +70,79 @@ class TestLagunaQuantPredicate(unittest.TestCase):
             build_laguna_quant_predicate(expert_bits=5)
 
 
+class TestLagunaQuantPredicateAgainstRealModel(unittest.TestCase):
+    """`build_laguna_quant_predicate`'s own unit tests above call the
+    returned predicate directly, in isolation, which only proves what the
+    predicate *would* return for a path -- not what `mlx_lm.convert`
+    actually does with that return value. `mlx_lm.utils.quantize_model`
+    wraps any custom predicate with its own `hasattr(module,
+    "to_quantized")` check, so paths for modules that can't be quantized
+    (like Laguna's `Router`, which stores `weight` as a raw array, and
+    every `RMSNorm`) never reach our predicate at all, regardless of what
+    it would have returned for them. This test exercises the real
+    `quantize_model` entry point against an actual (tiny) `Model` instance
+    to confirm that end-to-end behavior, not just the predicate's isolated
+    return values.
+    """
+
+    def test_router_and_norms_stay_full_precision_through_quantize_model(self):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        from mlx_lm.models import laguna
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_lm.utils import quantize_model
+
+        args = laguna.ModelArgs(
+            model_type="laguna",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=16,
+            rope_parameters={
+                "full_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+            },
+            sliding_window=8,
+            layer_types=["full_attention", "sliding_attention"],
+            num_attention_heads_per_layer=[8, 8],
+            gating="per-head",
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            mlp_only_layers=[],
+            decoder_sparse_step=1,
+            moe_routed_scaling_factor=2.5,
+        )
+        model = laguna.Model(args)
+        mx.eval(model.parameters())
+
+        predicate = build_laguna_quant_predicate(expert_bits=4, attention_bits=8)
+        quantized_model, _ = quantize_model(
+            model,
+            config={"model_type": "laguna"},
+            group_size=64,
+            bits=8,
+            quant_predicate=predicate,
+        )
+
+        router = quantized_model.model.layers[0].mlp.gate
+        self.assertIsInstance(router, laguna.Router)
+        self.assertEqual(router.weight.dtype, mx.float32)
+
+        norm = quantized_model.model.layers[0].input_layernorm
+        self.assertIsInstance(norm, nn.RMSNorm)
+
+        expert_proj = quantized_model.model.layers[0].mlp.switch_mlp.gate_proj
+        self.assertIsInstance(expert_proj, QuantizedSwitchLinear)
+
+        attn_proj = quantized_model.model.layers[0].self_attn.q_proj
+        self.assertIsInstance(attn_proj, nn.QuantizedLinear)
+
+
 if __name__ == "__main__":
     unittest.main()
