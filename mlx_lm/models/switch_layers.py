@@ -449,6 +449,21 @@ class QuantizedSwitchLinear(nn.Module):
         return n if n is not None else self.weight.shape[0]
 
     def enable_offload(self, resident_slots=None, fetch_fn=None, max_stack_size=None, resident_bytes=None):
+        """Page experts from disk instead of keeping the whole table resident.
+
+        Keeps a bounded working set resident and fetches cold experts via
+        ``fetch_fn`` on a router miss, so a model whose expert table exceeds
+        unified memory can run with just the resident set plus activations live.
+        Size the resident set with either ``resident_slots`` (a count) or
+        ``resident_bytes`` (a byte budget, preferred when experts differ in size,
+        e.g. a mixed-precision table); the byte budget is turned into a slot
+        count by measuring one expert through ``fetch_fn``, and giving both keeps
+        the tighter. Off unless enabled -- offload trades throughput for memory,
+        so only reach for it when the table does not fit. When budgeting bytes,
+        leave page-cache headroom rather than sizing the resident set up to free
+        RAM: the buffered reads a miss issues go through the page cache, and
+        squeezing it slows every miss.
+        """
         _offload_enable(
             self,
             resident_slots,
@@ -525,6 +540,21 @@ class SwitchLinear(nn.Module):
         return n if n is not None else self.weight.shape[0]
 
     def enable_offload(self, resident_slots=None, fetch_fn=None, max_stack_size=None, resident_bytes=None):
+        """Page experts from disk instead of keeping the whole table resident.
+
+        Keeps a bounded working set resident and fetches cold experts via
+        ``fetch_fn`` on a router miss, so a model whose expert table exceeds
+        unified memory can run with just the resident set plus activations live.
+        Size the resident set with either ``resident_slots`` (a count) or
+        ``resident_bytes`` (a byte budget, preferred when experts differ in size,
+        e.g. a mixed-precision table); the byte budget is turned into a slot
+        count by measuring one expert through ``fetch_fn``, and giving both keeps
+        the tighter. Off unless enabled -- offload trades throughput for memory,
+        so only reach for it when the table does not fit. When budgeting bytes,
+        leave page-cache headroom rather than sizing the resident set up to free
+        RAM: the buffered reads a miss issues go through the page cache, and
+        squeezing it slows every miss.
+        """
         _offload_enable(
             self,
             resident_slots,
