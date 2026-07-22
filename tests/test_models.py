@@ -472,6 +472,40 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_granitemoe_swa(self):
+        from mlx_lm.models import granitemoe_swa
+
+        args = granitemoe_swa.ModelArgs(
+            model_type="granitemoe_swa",
+            vocab_size=10_000,
+            hidden_size=512,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            shared_intermediate_size=512,
+            max_position_embeddings=1000,
+            rms_norm_eps=1e-5,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.5,
+            residual_multiplier=0.26,
+            logits_scaling=5.0,
+            sliding_window=8,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_theta=10000,
+        )
+        model = granitemoe_swa.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_bitnet(self):
         from mlx_lm.models import bitnet
 
