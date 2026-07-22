@@ -674,7 +674,10 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
     finally:
         _rewind_cache(num_draft, n)
-        for c in model_cache:
+        # Symmetric with start_speculation above: draft caches must stop
+        # recording too, or a reused draft prompt cache keeps reporting
+        # is_trimmable() with stale rollback records.
+        for c in model_cache + draft_cache:
             c.stop_speculation()
 
 
