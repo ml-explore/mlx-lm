@@ -305,10 +305,22 @@ class Model(nn.Module):
         fused ``mlp.switch_mlp.*`` layout ``SwitchGLU`` expects. Verified
         against the real ``poolside/Laguna-S-2.1`` safetensors index — this
         checkpoint ships experts unfused, one tensor per expert per
-        projection (unlike gpt_oss's fused-then-interleaved layout)."""
+        projection (unlike gpt_oss's fused-then-interleaved layout).
+
+        Also remaps the aux-loss-free routing correction bias. vLLM-trained
+        Laguna checkpoints (including ``poolside/Laguna-S-2.1``) store it at
+        ``mlp.experts.e_score_correction_bias``, but our ``Router`` module
+        holds the parameter at ``mlp.gate.e_score_correction_bias`` (mirrors
+        the reference HF implementation's own
+        ``_checkpoint_conversion_mapping``). Guarded with a presence check
+        since not every checkpoint variant ships the bias — matching the
+        reference's zero-init no-op behavior for those."""
         num_experts = self.args.num_experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}.mlp"
+            bias_key = f"{prefix}.experts.e_score_correction_bias"
+            if bias_key in weights:
+                weights[f"{prefix}.gate.e_score_correction_bias"] = weights.pop(bias_key)
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:
                 continue  # dense (mlp_only) layer — nothing to stack
             for name in ("gate_proj", "up_proj", "down_proj"):
