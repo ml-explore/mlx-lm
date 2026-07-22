@@ -246,3 +246,100 @@ class DecoderLayer(nn.Module):
     def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
         h = x + self.self_attn(self.input_layernorm(x), mask, cache)
         return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class LanguageModel(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.layer_types = args.layer_types
+        self.sliding_window = args.sliding_window
+
+    def __call__(self, inputs: mx.array, cache=None) -> mx.array:
+        h = self.embed_tokens(inputs)
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        full_idx = (
+            self.layer_types.index("full_attention")
+            if "full_attention" in self.layer_types
+            else None
+        )
+        sliding_idx = (
+            self.layer_types.index("sliding_attention")
+            if "sliding_attention" in self.layer_types
+            else None
+        )
+
+        full_mask = create_attention_mask(h, cache[full_idx]) if full_idx is not None else None
+        sliding_mask = (
+            create_attention_mask(h, cache[sliding_idx], window_size=self.sliding_window)
+            if sliding_idx is not None
+            else None
+        )
+
+        for layer, c, lt in zip(self.layers, cache, self.layer_types):
+            mask = full_mask if lt == "full_attention" else sliding_mask
+            h = layer(h, mask, c)
+
+        return self.norm(h)
+
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.model = LanguageModel(args)
+        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(self, inputs: mx.array, cache=None) -> mx.array:
+        return self.lm_head(self.model(inputs, cache))
+
+    def sanitize(self, weights: dict) -> dict:
+        """Stack the checkpoint's per-expert tensors
+        (``mlp.experts.{i}.{gate_proj,up_proj,down_proj}.weight``) into the
+        fused ``mlp.switch_mlp.*`` layout ``SwitchGLU`` expects. Verified
+        against the real ``poolside/Laguna-S-2.1`` safetensors index — this
+        checkpoint ships experts unfused, one tensor per expert per
+        projection (unlike gpt_oss's fused-then-interleaved layout)."""
+        num_experts = self.args.num_experts
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.mlp"
+            if f"{prefix}.experts.0.gate_proj.weight" not in weights:
+                continue  # dense (mlp_only) layer — nothing to stack
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stacked = mx.stack(
+                    [
+                        weights.pop(f"{prefix}.experts.{e}.{name}.weight")
+                        for e in range(num_experts)
+                    ]
+                )
+                weights[f"{prefix}.switch_mlp.{name}.weight"] = stacked
+        return weights
+
+    def make_cache(self):
+        caches = []
+        for lt in self.args.layer_types:
+            if lt == "full_attention":
+                caches.append(KVCache())
+            else:
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+        return caches
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            # Router correction bias must stay in its native precision when
+            # the rest of the model is cast (matches glm4_moe's convention) —
+            # it is a small additive term, not a matmul weight.
+            return "e_score_correction_bias" not in k
+
+        return predicate
