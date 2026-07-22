@@ -37,7 +37,6 @@ class ModelArgs(BaseModelArgs):
     residual_multiplier: float
     layer_types: List[str]
     rms_norm_eps: float
-    rope_theta: float
 
     # Optional fields (with defaults)
     # MoE parameters (optional for dense mode)
@@ -61,6 +60,16 @@ class ModelArgs(BaseModelArgs):
     position_embedding_type: str = "rope"
     tie_word_embeddings: bool = True
     time_step_limit: Tuple[float, float] = (0.001, 100.0)
+
+    # rope_theta may arrive as a flat field (older configs) or nested under
+    # rope_parameters (newer transformers releases, e.g. Granite 4.0 Hybrid
+    # checkpoints). Accept both and normalize to a flat rope_theta.
+    rope_theta: float = 10000.0
+    rope_parameters: Optional[dict] = None
+
+    def __post_init__(self):
+        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
+            self.rope_theta = self.rope_parameters["rope_theta"]
 
     # Mode flags - inferred from num_local_experts
     @property
@@ -546,6 +555,11 @@ class Model(nn.Module):
                 weights[f"model.layers.{l}.mlp.down_proj.weight"] = weights.pop(
                     f"{prefix}.output_linear.weight"
                 )
+
+        # Some checkpoints ship a redundant lm_head.weight even though
+        # embeddings are tied and this model never instantiates lm_head.
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
 
         return weights
 

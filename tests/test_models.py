@@ -1997,6 +1997,54 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_granitemoehybrid_rope_parameters(self):
+        # Regression test: some checkpoints (e.g. Granite 4.0 Hybrid) only
+        # provide rope_theta nested under rope_parameters, with no flat
+        # rope_theta field, and ship a redundant lm_head.weight even though
+        # tie_word_embeddings is True.
+        from mlx_lm.models import granitemoehybrid
+
+        config = {
+            "model_type": "granitemoehybrid",
+            "vocab_size": 1000,
+            "hidden_size": 128,
+            "intermediate_size": 128,
+            "num_hidden_layers": 4,
+            "max_position_embeddings": 1000,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "attention_bias": False,
+            "embedding_multiplier": 1.0,
+            "attention_multiplier": 1.0,
+            "logits_scaling": 1.0,
+            "residual_multiplier": 1.0,
+            "mamba_n_heads": 8,
+            "mamba_d_head": 16,
+            "mamba_proj_bias": False,
+            "mamba_d_state": 128,
+            "mamba_d_conv": 4,
+            "mamba_n_groups": 1,
+            "mamba_conv_bias": False,
+            "layer_types": ["mamba", "attention", "mamba", "attention"],
+            "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": True,
+            "rope_parameters": {"rope_theta": 1000.0, "rope_type": "default"},
+        }
+        args = granitemoehybrid.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 1000.0)
+
+        model = granitemoehybrid.Model(args)
+        self.model_test_runner(
+            model, args.model_type, config["vocab_size"], config["num_hidden_layers"]
+        )
+
+        weights = dict(tree_flatten(model.parameters()))
+        weights["lm_head.weight"] = mx.zeros(
+            (config["vocab_size"], config["hidden_size"])
+        )
+        sanitized = model.sanitize(weights)
+        self.assertNotIn("lm_head.weight", sanitized)
+
     def test_all_models(self):
         test_configs = [
             {
