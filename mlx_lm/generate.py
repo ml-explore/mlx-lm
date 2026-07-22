@@ -510,18 +510,31 @@ def speculative_generate_step(
     prev_tokens = None
 
     # Create the KV cache for generation
-    if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
-    else:
-        model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+    model_cache = cache.make_prompt_cache(model)
+    draft_cache = cache.make_prompt_cache(draft_model)
+    if prompt_cache is not None:
+        model_cache_size = len(model_cache)
+        expected_cache_size = model_cache_size + len(draft_cache)
+        if len(prompt_cache) != expected_cache_size:
+            raise ValueError(
+                "Speculative decoding requires "
+                f"{expected_cache_size} prompt cache entries, got {len(prompt_cache)}."
+            )
+        model_cache = prompt_cache[:model_cache_size]
+        draft_cache = prompt_cache[model_cache_size:]
 
-    if not cache.can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
-        raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
-        )
+    for cache_name, prompt_model_cache in (
+        ("target", model_cache),
+        ("draft", draft_cache),
+    ):
+        if not cache.can_trim_prompt_cache(prompt_model_cache):
+            types = {
+                type(c).__name__ for c in prompt_model_cache if not c.is_trimmable()
+            }
+            raise ValueError(
+                "Speculative decoding requires a trimmable "
+                f"{cache_name} prompt cache (got {types})."
+            )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -2063,6 +2076,12 @@ def batch_generate(
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+
+    if args.prompt_cache_file is not None and args.draft_model is not None:
+        raise ValueError(
+            "--prompt-cache-file cannot be combined with --draft-model because "
+            "saved prompt caches contain only the target model cache."
+        )
 
     if args.seed is not None:
         mx.random.seed(args.seed)
