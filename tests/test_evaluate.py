@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_lm.evaluate import MLXLM
 
@@ -53,6 +54,72 @@ class TestMLXLM(unittest.TestCase):
         self.assertEqual(len(call_args_list[0][0][0]), 2)  # First batch: 2 items
         self.assertEqual(len(call_args_list[1][0][0]), 2)  # Second batch: 2 items
         self.assertEqual(len(call_args_list[2][0][0]), 1)  # Third batch: 1 item
+
+
+class TestMLXLMLoglikelihood(unittest.TestCase):
+    """End-to-end tests for loglikelihood scoring with a real model."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lm = MLXLM("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        base = (
+            "The city council met on Tuesday to discuss the new transit "
+            "plan, which includes additional bus routes and longer service "
+            "hours for the northern districts. "
+        )
+        ids = cls.lm.tokenizer.encode(base * 60, add_special_tokens=False)[:700]
+        cls.long_context = cls.lm.tokenizer.decode(ids)
+
+    def _reference(self, context, continuation):
+        """Score a continuation with a single forward pass over the full
+        sequence."""
+        prefix = self.lm._tokenize([context])[0]
+        full = self.lm._tokenize([context + continuation])[0]
+        logits = self.lm._model(mx.array(full[:-1])[None])
+        logprobs = nn.log_softmax(logits[0].astype(mx.float32), axis=-1)
+        score = 0.0
+        greedy = True
+        for pos in range(len(prefix) - 1, len(full) - 1):
+            target = full[pos + 1]
+            score += logprobs[pos, target].item()
+            greedy &= mx.argmax(logprobs[pos]).item() == target
+        return score, greedy
+
+    def test_loglikelihood_matches_full_forward(self):
+        cases = [
+            ("The capital of France is", " Paris"),
+            ("The capital of France is", " the city of Paris, which is known"),
+            ("The capital of France is", " Berlin"),
+            # A long context exercises the split prefill path
+            (self.long_context, " The council approved the plan."),
+        ]
+        requests = [MagicMock(args=case) for case in cases]
+        results = self.lm.loglikelihood(requests)
+        self.assertEqual(len(results), len(cases))
+        for (score, greedy), case in zip(results, cases):
+            ref_score, ref_greedy = self._reference(*case)
+            self.assertLess(abs(score - ref_score), 2e-1)
+            self.assertEqual(greedy, ref_greedy)
+
+    def test_loglikelihood_continuation_order_invariance(self):
+        # Continuations of different lengths after a common long prefix.
+        # Scoring them in either order must give the same results, which
+        # checks that scoring one continuation does not contaminate the
+        # cached prefix state used by the others.
+        context = self.long_context
+        continuations = [
+            " the lazy dog. " * 20,
+            " The fence.",
+            " A log lies on the other side of the river.",
+        ]
+        requests = [MagicMock(args=(context, c)) for c in continuations]
+        forward = self.lm.loglikelihood(requests)
+        backward = self.lm.loglikelihood(list(reversed(requests)))
+        for (score_f, greedy_f), (score_b, greedy_b) in zip(
+            forward, reversed(backward)
+        ):
+            self.assertAlmostEqual(score_f, score_b, places=3)
+            self.assertEqual(greedy_f, greedy_b)
 
 
 if __name__ == "__main__":
