@@ -29,6 +29,12 @@ class TestToolParsing(unittest.TestCase):
                 "multiply<arg_key>a</arg_key><arg_value>12234585</arg_value><arg_key>b</arg_key><arg_value>48838483920</arg_value>",
                 glm47,
             ),
+            # GLM-4.5/4.6 chat templates emit a newline between the function
+            # name and the first <arg_key>; the name must come back clean.
+            (
+                "multiply\n<arg_key>a</arg_key><arg_value>12234585</arg_value><arg_key>b</arg_key><arg_value>48838483920</arg_value>",
+                glm47,
+            ),
             (
                 '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
                 json_tools,
