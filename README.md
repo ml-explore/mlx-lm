@@ -206,6 +206,18 @@ To use the rotating key-value cache pass the argument `--max-kv-size n` where
 result in worse quality. Larger values like `4096` or higher will use more RAM
 but have better quality.
 
+KV-cache quantization (`--kv-bits`) trades memory for a small quality/latency
+cost, but on long prompts it can transiently use *more* peak memory than an
+unquantized cache during prefill, since the current quantized-attention path
+doesn't tile the attention-score matrix the way the fused fp16 attention
+kernel does. If you hit an out-of-memory error while prefilling a long prompt
+with `--kv-bits` set, reducing `prefill_step_size` (the `--prefill-step-size`
+flag for `mlx_lm.server`, or the `prefill_step_size` argument to `generate()`
+/ `stream_generate()`; default `2048`) trades some prefill latency for a
+smaller memory spike. See
+[issue #1587](https://github.com/ml-explore/mlx-lm/issues/1587) for the full
+investigation.
+
 Caching prompts can substantially speedup reusing the same long context with
 different queries. To cache a prompt use `mlx_lm.cache_prompt`. For example:
 
