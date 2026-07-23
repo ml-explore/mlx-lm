@@ -398,6 +398,45 @@ class TestPromptCache(unittest.TestCase):
             next_toks.append(tok)
         self.assertEqual(len(next_toks), 3)
 
+    def test_rotating_cache_to_quantized_matches_unquantized(self):
+        """The rotating-quantized path must stay numerically faithful, not just
+        non-NaN: after rotation, a quantized rotating cache should track the
+        unquantized rotating reference within the same tolerance QuantizedKVCache
+        gets in test_cache_to_quantized (rtol=4e-2). Guards against a silent
+        numerical regression in the (packed, scales, biases) bookkeeping."""
+        model, tokenizer = self.model, self.tokenizer
+        prompt = tokenizer.encode(
+            "Once upon a time in a small town", return_tensors="mlx"
+        )[0]
+
+        # Two identical warmups (argmax is deterministic, so the KV state is the
+        # same in both) run long enough to force rotation past max_size.
+        def warm():
+            c = [RotatingKVCache(max_size=8) for _ in model.layers]
+            last = None
+            for _, (tok, _) in zip(
+                range(12), generate_step(prompt, model, prompt_cache=c)
+            ):
+                last = tok
+            return c, last
+
+        ref_cache, last_ref = warm()
+        base_cache, last_base = warm()
+        self.assertEqual(last_ref, last_base)  # warmups agree
+        self.assertGreater(ref_cache[0].offset, ref_cache[0].max_size)  # rotated
+
+        # Keep one continuation unquantized (reference), quantize the other, then
+        # feed both the same next token and compare the resulting logits.
+        quant_cache = [c.to_quantized(bits=8, group_size=32) for c in base_cache]
+        for c in quant_cache:
+            self.assertIsInstance(c, RotatingQuantizedKVCache)
+
+        x = mx.array([last_ref])
+        ref_logits = next(generate_step(x, model, prompt_cache=ref_cache))[1]
+        quant_logits = next(generate_step(x, model, prompt_cache=quant_cache))[1]
+        self.assertFalse(bool(mx.any(mx.isnan(quant_logits))))
+        self.assertTrue(mx.allclose(ref_logits, quant_logits, rtol=4e-2))
+
     def test_rotating_quantized_cache_save_load(self):
         cache = [
             RotatingKVCache(max_size=4).to_quantized(bits=8, group_size=32)
