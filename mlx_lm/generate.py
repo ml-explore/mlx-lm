@@ -124,7 +124,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--xtc-threshold",
         type=float,
-        default=0.0,
+        default=0.1,
         help="Thresold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
