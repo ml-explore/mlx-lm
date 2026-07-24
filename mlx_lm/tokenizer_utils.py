@@ -297,6 +297,8 @@ class TokenizerWrapper:
         tool_call_start=None,
         tool_call_end=None,
         tool_parser=None,
+        tool_call_start_alt=None,
+        tool_call_end_alt=None,
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
@@ -328,6 +330,12 @@ class TokenizerWrapper:
             self._tool_call_end_tokens = tuple(
                 tokenizer.encode(tool_call_end, add_special_tokens=False)
             )
+        # Optional alternate (unwrapped) tool-call delimiters, e.g. a bare
+        # "<function=...>...</function>" block emitted without <tool_call>
+        # tags. Matched on decoded text by the state machine, so no encoded
+        # token tuples are needed.
+        self._tool_call_start_alt = tool_call_start_alt
+        self._tool_call_end_alt = tool_call_end_alt
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if "enable_thinking" not in kwargs:
@@ -440,6 +448,14 @@ class TokenizerWrapper:
     @property
     def tool_call_end_tokens(self):
         return self._tool_call_end_tokens
+
+    @property
+    def tool_call_start_alt(self):
+        return self._tool_call_start_alt
+
+    @property
+    def tool_call_end_alt(self):
+        return self._tool_call_end_alt
 
     @property
     def tool_parser(self):
@@ -624,11 +640,16 @@ def load(
         "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
     )
 
+    tool_call_start_alt = None
+    tool_call_end_alt = None
     if tool_parser_type is not None:
         tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
         tool_parser = tool_module.parse_tool_call
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end
+        # Optional: a parser may advertise alternate (unwrapped) delimiters.
+        tool_call_start_alt = getattr(tool_module, "tool_call_start_alt", None)
+        tool_call_end_alt = getattr(tool_module, "tool_call_end_alt", None)
         tokenizer_config["tool_parser_type"] = tool_parser_type
     else:
         tool_parser = None
@@ -643,6 +664,8 @@ def load(
         tool_parser=tool_parser,
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
+        tool_call_start_alt=tool_call_start_alt,
+        tool_call_end_alt=tool_call_end_alt,
     )
 
 

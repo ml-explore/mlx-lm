@@ -1425,11 +1425,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Collect the clean text by state: reasoning, tool, or normal
                 if current_state == "reasoning":
                     reasoning_text += clean_text
-                elif current_state == "tool":
+                elif current_state in ("tool", "tool_unwrapped"):
                     tool_text += clean_text
                 elif current_state == "normal":
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
+                        tool_text = ""
+                        made_tool_call = True
+                    elif prev_state == "tool_unwrapped":
+                        # Reconstruct the wrapped form the parser expects, since
+                        # the "<function=" / "</function>" delimiters were
+                        # stripped on the state transitions.
+                        tool_calls.append("<function=" + tool_text + "</function>")
                         tool_text = ""
                         made_tool_call = True
                     text += clean_text
@@ -1443,7 +1450,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if (
                     self.stream
-                    and current_state != "tool"
+                    and current_state not in ("tool", "tool_unwrapped")
                     and (text or tool_calls or reasoning_text)
                 ):
                     resp = self.generate_response(
@@ -1465,6 +1472,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
+                made_tool_call = True
+            elif prev_state == "tool_unwrapped" and tool_text:
+                # An EOS ended generation mid-call (no closing "</function>");
+                # flush the reconstructed wrapped form.
+                tool_calls.append("<function=" + tool_text + "</function>")
                 made_tool_call = True
 
             if finish_reason == "stop" and made_tool_call:

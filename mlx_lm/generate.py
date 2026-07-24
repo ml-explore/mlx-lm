@@ -1077,6 +1077,21 @@ def make_text_state_machine(tokenizer, stop_words=None):
             [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
         )
 
+        # Optional: recognize a bare "<function=...>...</function>" block emitted
+        # WITHOUT the <tool_call> wrapper (a common failure mode for some models
+        # under a heavy system prompt). Handled as a separate "tool_unwrapped"
+        # state so the well-formed <tool_call> path above is unchanged. The
+        # server reconstructs the wrapped form before parsing.
+        tool_call_start_alt = getattr(tokenizer, "tool_call_start_alt", None)
+        if tool_call_start_alt:
+            transitions["normal"].append((tool_call_start_alt, "tool_unwrapped"))
+            if tokenizer.has_thinking:
+                transitions["reasoning"].append((tool_call_start_alt, "tool_unwrapped"))
+            tool_call_end_alt = getattr(tokenizer, "tool_call_end_alt", None)
+            transitions["tool_unwrapped"] = (
+                [(tool_call_end_alt, "normal")] if tool_call_end_alt else []
+            )
+
     if stop_words:
         for state_name in set(transitions) | {"normal"}:
             for w in stop_words:

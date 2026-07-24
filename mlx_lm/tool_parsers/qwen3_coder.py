@@ -104,6 +104,16 @@ tool_call_start = "<tool_call>"
 
 tool_call_end = "</tool_call>"
 
+# Some models (especially under a heavy system prompt) emit the inner
+# <function=...> block WITHOUT the enclosing <tool_call></tool_call> wrapper.
+# These optional "alt" delimiters let the server recognize a bare function
+# block as a tool call. The server reconstructs "<function=" + captured +
+# "</function>" before calling parse_tool_call, so no change to the parser
+# logic below is needed.
+tool_call_start_alt = "<function="
+
+tool_call_end_alt = "</function>"
+
 
 def parse_tool_call(
     model_output: str,

@@ -355,6 +355,122 @@ class TestServer(unittest.TestCase):
         stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
         self.assertTrue(matched)
 
+    def test_make_state_machine_unwrapped_tool_call(self):
+        # Qwen3-Coder (esp. under a heavy system prompt) sometimes emits a bare
+        # "<function=...>...</function>" block WITHOUT the "<tool_call>" wrapper.
+        # The state machine must recognize it via a separate "tool_unwrapped"
+        # state so the server can reconstruct the wrapped form and still produce
+        # a structured tool call.
+        from mlx_lm.tool_parsers import qwen3_coder
+
+        class FakeTokenizer:
+            has_thinking = False
+            has_tool_calling = True
+            tool_call_start = "<tool_call>"
+            tool_call_end = "</tool_call>"
+            tool_call_start_alt = "<function="
+            tool_call_end_alt = "</function>"
+            tool_call_start_tokens = (100,)
+            tool_call_end_tokens = (101,)
+            eos_token_ids = [2]
+
+            def convert_ids_to_tokens(self, t):
+                return f"<eos{t}>"
+
+            def encode(self, text, add_special_tokens=False):
+                return []
+
+        _, text_sm = self.response_generator._make_state_machine(
+            ("fake-unwrapped", None, None),
+            FakeTokenizer(),
+            stop_words=[],
+        )
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "multiply",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "number"},
+                            "b": {"type": "number"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        def collect(model_output):
+            # Drive the state machine one character at a time (mimicking
+            # token-by-token streaming) and collect text by state exactly the
+            # way the server response loop does, reconstructing the wrapped
+            # form on the "tool_unwrapped" -> "normal" transition.
+            state = text_sm.make_state()
+            prev = "normal"
+            normal_text = ""
+            tool_text = ""
+            tool_calls = []
+            for ch in model_output:
+                state, clean, cur = text_sm.step(state, ch)
+                if cur in ("tool", "tool_unwrapped"):
+                    tool_text += clean
+                elif cur == "normal":
+                    if prev == "tool":
+                        tool_calls.append(tool_text)
+                        tool_text = ""
+                    elif prev == "tool_unwrapped":
+                        tool_calls.append("<function=" + tool_text + "</function>")
+                        tool_text = ""
+                    normal_text += clean
+                prev = cur
+            # A trailing EOS ends generation via discard (mid-call flush).
+            _, prev_after = text_sm.discard(state)
+            if prev == "tool_unwrapped" and tool_text:
+                tool_calls.append("<function=" + tool_text + "</function>")
+            return normal_text, tool_calls
+
+        inner = (
+            "<function=multiply>\n"
+            "<parameter=a>\n12234585\n</parameter>\n"
+            "<parameter=b>\n48838483920\n</parameter>\n"
+            "</function>"
+        )
+        expected = {
+            "name": "multiply",
+            "arguments": {"a": 12234585, "b": 48838483920},
+        }
+
+        # 1. Bare function block, nothing around it.
+        _, tool_calls = collect(inner)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(qwen3_coder.parse_tool_call(tool_calls[0], tools), expected)
+
+        # 2. Leading prose sentence before the bare block.
+        normal_text, tool_calls = collect("Sure, let me do that.\n" + inner)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(qwen3_coder.parse_tool_call(tool_calls[0], tools), expected)
+        self.assertIn("Sure, let me do that.", normal_text)
+
+        # 3. Trailing stray "</tool_call>" after the bare block.
+        _, tool_calls = collect(inner + "</tool_call>")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(qwen3_coder.parse_tool_call(tool_calls[0], tools), expected)
+
+        # 4. EOS ends generation before the closing "</function>": the partial
+        #    call must still be flushed and parse correctly.
+        truncated = inner[: -len("</function>")]
+        _, tool_calls = collect(truncated)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(qwen3_coder.parse_tool_call(tool_calls[0], tools), expected)
+
+        # Regression: a well-formed "<tool_call>...</tool_call>" block still
+        # takes the unchanged "tool" path and yields exactly one tool call.
+        _, tool_calls = collect("<tool_call>" + inner + "</tool_call>")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(qwen3_coder.parse_tool_call(tool_calls[0], tools), expected)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)
