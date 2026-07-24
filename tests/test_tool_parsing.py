@@ -197,6 +197,58 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_unparseable_numeric_params_fall_back_to_strings(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "count": {"type": "int"},
+                            "ratio": {"type": "float"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        # non-numeric int/float params fall back to the raw string
+        test_case = (
+            "<function=search>"
+            "<parameter=count>not_a_number</parameter>"
+            "<parameter=ratio>not_a_float</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(
+            tool_call["arguments"],
+            {"count": "not_a_number", "ratio": "not_a_float"},
+        )
+
+        # valid numeric input still converts as before
+        test_case = (
+            "<function=search>"
+            "<parameter=count>7</parameter>"
+            "<parameter=ratio>2.5</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"], {"count": 7, "ratio": 2.5})
+
+        # "nan" parses as a float but crashes int() with ValueError
+        test_case = "<function=search>" "<parameter=ratio>nan</parameter>" "</function>"
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"], {"ratio": "nan"})
+
+        # "-inf" parses as a float but crashes int() with OverflowError
+        test_case = (
+            "<function=search>" "<parameter=ratio>-inf</parameter>" "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"], {"ratio": "-inf"})
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
