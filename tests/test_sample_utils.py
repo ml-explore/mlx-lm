@@ -116,6 +116,13 @@ class TestSampleUtils(unittest.TestCase):
         new_probs = mx.softmax(apply_xtc(mx.log(probs), 0, 0.1, [0]), -1)
         self.assertTrue(mx.allclose(new_probs, probs))
 
+        # Test that the threshold is computed per row in a batch
+        probs = mx.array([[0.6, 0.25, 0.1, 0.05], [0.9, 0.05, 0.03, 0.02]])
+        batched = mx.softmax(apply_xtc(mx.log(probs), 1, 0.2, []), -1)
+        for i in range(probs.shape[0]):
+            alone = mx.softmax(apply_xtc(mx.log(probs[i : i + 1]), 1, 0.2, []), -1)
+            self.assertTrue(mx.allclose(batched[i : i + 1], alone))
+
     def test_presence_penalty(self):
         from mlx_lm.sample_utils import make_presence_penalty
 
