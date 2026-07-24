@@ -19,6 +19,14 @@ _bool_types = {"boolean", "bool", "binary"}
 _obj_types = {"object", "array", "arr"}
 
 
+def _literal_eval_or_raw(param_value: str) -> Any:
+    """Parse a Python literal, falling back to the model's raw output."""
+    try:
+        return ast.literal_eval(param_value)
+    except (SyntaxError, ValueError):
+        return param_value
+
+
 def _get_arguments_config(func_name: str, tools: Optional[Any]) -> dict:
     """Extract argument configuration for a function."""
     if tools is None:
@@ -74,9 +82,9 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             try:
                 return json.loads(param_value)
             except json.JSONDecodeError:
-                return ast.literal_eval(param_value)
+                return _literal_eval_or_raw(param_value)
 
-        return ast.literal_eval(param_value)
+        return _literal_eval_or_raw(param_value)
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):

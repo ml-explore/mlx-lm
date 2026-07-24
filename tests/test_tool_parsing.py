@@ -197,6 +197,36 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_unparseable_params_fall_back_to_strings(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filters": {"type": "object"},
+                            "mode": {"type": "custom"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=search>"
+            "<parameter=filters>{invalid: true</parameter>"
+            "<parameter=mode>not a literal</parameter>"
+            "</function>"
+        )
+
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+
+        self.assertEqual(
+            tool_call["arguments"],
+            {"filters": "{invalid: true", "mode": "not a literal"},
+        )
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
