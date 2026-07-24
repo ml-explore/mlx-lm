@@ -197,6 +197,49 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_non_literal_object_array_params(self):
+        # An object/array parameter whose value is multi-line code (unbalanced
+        # quotes / brackets) is neither valid JSON nor a valid Python literal.
+        # ast.literal_eval would raise SyntaxError; the parser must fall back to
+        # the raw string rather than crashing the whole request.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "edits": {"type": "array"},
+                            "config": {"type": "object"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        # e.g. an editor tool asked to write flask config.py: unterminated
+        # string literal + unbalanced bracket.
+        code = 'SECRET_KEY = os.environ.get("SECRET_KEY", "dev\nDEBUG = [True'
+        test_case = (
+            "<function=edit>" f"<parameter=edits>{code}</parameter>" "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "edit")
+        # Best-effort raw string, no exception raised.
+        self.assertEqual(tool_call["arguments"]["edits"], code)
+
+        # Valid JSON for an object/array param must still be parsed as-is.
+        test_case = (
+            "<function=edit>"
+            '<parameter=edits>["a", "b"]</parameter>'
+            '<parameter=config>{"x": 1}</parameter>'
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["edits"], ["a", "b"])
+        self.assertEqual(tool_call["arguments"]["config"], {"x": 1})
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'

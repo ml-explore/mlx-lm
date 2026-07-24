@@ -73,10 +73,16 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
         ):
             try:
                 return json.loads(param_value)
-            except json.JSONDecodeError:
-                return ast.literal_eval(param_value)
-
-        return ast.literal_eval(param_value)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Fall back to the raw string rather than crashing the whole request:
+        # models often emit multi-line code (unbalanced quotes/brackets) inside
+        # an object/array parameter that is neither valid JSON nor a valid
+        # Python literal. A best-effort string is far better than a 500.
+        try:
+            return ast.literal_eval(param_value)
+        except (ValueError, SyntaxError):
+            return param_value
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
