@@ -72,13 +72,14 @@ _ssm_kernel = make_ssm_kernel()
 # block (+1 pad keeps column reads bank-conflict-free). All accumulation is
 # fp32. Long sequences run in SSD_SEGMENT slices to bound the U buffer.
 
-SSD_CHUNK = 64
+SSD_CHUNK = 32
+SSD_NTA = None  # kernel-A threadgroup size; None -> min(1024, 4 * SSD_CHUNK)
 SSD_DH_BLOCK = 16
 SSD_SEGMENT = 8192
 
 _SSD_KERNEL_A_SRC = """
-    constexpr int C  = 64;                  // chunk length (internal tile)
-    constexpr int NT = 256;                 // threads per threadgroup
+    constexpr int C  = CK;                  // chunk length (internal tile)
+    constexpr int NT = NTA;                 // threads per threadgroup
     constexpr int JL = NT / C;              // lanes sharing a score row
     constexpr int JW = C / JL;              // j-slice width per lane
     constexpr int UL = NT / Dh;             // lanes sharing a U d-row
@@ -214,7 +215,7 @@ _SSD_KERNEL_A_SRC = """
 """
 
 _SSD_KERNEL_B_SRC = """
-    constexpr int C  = 64;
+    constexpr int C  = CK;
     constexpr int NT = 256;                             // threads per tg
     constexpr int DB = 16;                              // Dh block width
     const int tid  = thread_position_in_threadgroup.x;  // 0..NT-1
@@ -330,12 +331,14 @@ def _ssd_seg(dtx, Bm, Cm, dtA, state):
     g, ds = Bm.shape[2:]
     n_chunks = (T + SSD_CHUNK - 1) // SSD_CHUNK
     in_dtype = dtx.dtype
-    tmpl = [("InT", in_dtype), ("H", h), ("G", g), ("Dh", dh), ("Ds", ds)]
+    nta = SSD_NTA or min(1024, 4 * SSD_CHUNK)
+    tmpl = [("InT", in_dtype), ("H", h), ("G", g), ("Dh", dh), ("Ds", ds),
+            ("CK", SSD_CHUNK)]
     Y0, U, LCG = _ssd_kernel_a(
         inputs=[dtx, Bm, Cm, dtA, T],
-        template=tmpl,
-        grid=(256 * n_chunks, h, b),
-        threadgroup=(256, 1, 1),
+        template=tmpl + [("NTA", nta)],
+        grid=(nta * n_chunks, h, b),
+        threadgroup=(nta, 1, 1),
         output_shapes=[
             (b, T, h, dh),
             (b, h, n_chunks, dh, ds),
