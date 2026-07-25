@@ -587,8 +587,18 @@ def speculative_generate_step(
         return y
 
     def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        # trim_prompt_cache is all-or-none: if any cache reports untrimmable
+        # (e.g. a layer that declared rollback support but never armed it),
+        # it trims nothing and returns 0. Continuing would leave ghost tokens
+        # in every layer, silently. Fail loudly instead.
+        for c, n in ((model_cache, num_draft - num_accept),
+                     (draft_cache, max(num_draft - num_accept - 1, 0))):
+            if n > 0 and cache.trim_prompt_cache(c, n) != n:
+                raise RuntimeError(
+                    "Speculative rewind failed: cache refused to trim "
+                    f"{n} tokens. A cache in the model reports untrimmable "
+                    "mid-speculation; its layer likely never recorded a rollback."
+                )
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:

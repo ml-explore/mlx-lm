@@ -246,6 +246,34 @@ class TestSpeculativeRollback(unittest.TestCase):
                 pass
         self.assertIs(ctx.exception, boom)
 
+    def test_rewind_refusal_raises_not_silent(self):
+        # A cache can pass the support gate (record_rollback attr + the model
+        # declaring support) while never actually arming: its layer never calls
+        # record_rollback, so is_trimmable() stays False mid-speculation. Since
+        # trim_prompt_cache is all-or-none, that would silently rewind NOTHING
+        # in ANY layer and generation would continue over ghost tokens. The
+        # rewind must fail loudly instead.
+        class UnarmedArraysCache(cache.ArraysCache):
+            def start_speculation(self):  # gate passes, recording never arms
+                pass
+
+        model = make_hybrid(seed=0)
+        draft = make_hybrid(seed=7)
+        prompt = mx.random.randint(0, 1000, (16,), dtype=mx.uint32)
+        c = cache.make_prompt_cache(model) + cache.make_prompt_cache(draft)
+        for i, x in enumerate(c):
+            if isinstance(x, cache.ArraysCache):
+                bad = UnarmedArraysCache(len(x.cache) if hasattr(x, "cache") else 2)
+                bad.__dict__.update(x.__dict__)
+                c[i] = bad
+                break
+        with self.assertRaises(RuntimeError):
+            for _ in speculative_generate_step(
+                prompt, model, draft, num_draft_tokens=3, max_tokens=24,
+                prompt_cache=c,
+            ):
+                pass
+
     def test_trim_beyond_window_raises(self):
         # Trimming more than the recorded rollback window must fail loudly and
         # consistently rather than silently clamping (which would desync the
