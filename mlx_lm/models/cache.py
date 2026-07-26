@@ -1996,7 +1996,10 @@ class BatchRotatingQuantizedKVCache(_BaseCache):
     @meta_state.setter
     def meta_state(self, v):
         self.max_size, self._offset, self._idx = map(int, v[:3])
-        self.rotated = bool(v[3])
+        # meta_state stringifies, so v[3] is "True"/"False" and bool() would
+        # make both truthy. Compare instead. Same slip as BatchRotatingKVCache
+        # (see ml-explore/mlx-lm#1250).
+        self.rotated = v[3] == "True"
         self.group_size, self.bits = map(int, v[4:6])
 
     def is_trimmable(self):

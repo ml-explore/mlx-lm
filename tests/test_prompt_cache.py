@@ -182,6 +182,28 @@ class TestPromptCache(unittest.TestCase):
         # Try to make a mask
         mask = loaded[0].make_mask(4)
 
+    def test_batch_rotating_quantized_meta_state_rotated_round_trip(self):
+        """meta_state stringifies every field, so `rotated` comes back as
+        "True"/"False". Reading it with bool() makes both truthy, which silently
+        marks an unrotated cache as rotated on reload. Same slip as
+        BatchRotatingKVCache (ml-explore/mlx-lm#1250)."""
+        for rotated in (False, True):
+            cache = BatchRotatingQuantizedKVCache(
+                max_size=8, left_padding=[0], group_size=32, bits=8
+            )
+            cache.rotated = rotated
+
+            restored = BatchRotatingQuantizedKVCache(
+                max_size=1, left_padding=[0], group_size=32, bits=8
+            )
+            restored.meta_state = cache.meta_state
+
+            self.assertEqual(restored.rotated, rotated)
+            self.assertIsInstance(restored.rotated, bool)
+            self.assertEqual(restored.max_size, cache.max_size)
+            self.assertEqual(restored.group_size, cache.group_size)
+            self.assertEqual(restored.bits, cache.bits)
+
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
