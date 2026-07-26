@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -46,9 +45,7 @@ class ModelArgs(BaseModelArgs):
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         if self.mlp_layer_types is None:
-            self.mlp_layer_types = ["dense"] + ["sparse"] * (
-                self.num_hidden_layers - 1
-            )
+            self.mlp_layer_types = ["dense"] + ["sparse"] * (self.num_hidden_layers - 1)
         if self.num_attention_heads_per_layer is None:
             self.num_attention_heads_per_layer = [
                 self.num_attention_heads
@@ -199,9 +196,7 @@ class MoE(nn.Module):
             args.moe_intermediate_size,
             args.num_experts,
         )
-        self.shared_expert = MLP(
-            args.hidden_size, args.shared_expert_intermediate_size
-        )
+        self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
 
     def __call__(self, x):
         shared_out = self.shared_expert(x)
@@ -323,4 +318,3 @@ class Model(nn.Module):
             )
             for layer in self.layers
         ]
-
