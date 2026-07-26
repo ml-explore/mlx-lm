@@ -4,26 +4,33 @@ import http
 import io
 import json
 import threading
+import types
 import unittest
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.generate import TextStateMachine
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
     Response,
     ResponseGenerator,
     SamplingArguments,
+    _check_kv_cache_quantizable,
     _make_sampler,
 )
 from mlx_lm.utils import load
 
 
 class DummyModelProvider:
-    def __init__(self, with_draft=False):
+    def __init__(self, with_draft=False, kv_bits=None, max_kv_size=None):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
@@ -56,6 +63,10 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "kv_bits": kv_bits,
+                "kv_group_size": 64,
+                "quantized_kv_start": 0,
+                "max_kv_size": max_kv_size,
             },
         )
 
@@ -514,6 +525,73 @@ class TestServerWithDraftModel(unittest.TestCase):
         # Ensure both generated content
         self.assertIsNotNone(first_response_body["choices"][0]["message"]["content"])
         self.assertIsNotNone(second_response_body["choices"][0]["message"]["content"])
+
+
+class TestKVCacheQuantizable(unittest.TestCase):
+    def test_rejects_unquantizable_layers(self):
+        cache = [KVCache(), RotatingKVCache(max_size=8, keep=4)]
+        with self.assertRaises(ValueError) as ctx:
+            _check_kv_cache_quantizable(cache, 64, 8)
+        message = str(ctx.exception)
+        self.assertIn("RotatingKVCache", message)
+        self.assertIn("1 of 2", message)
+
+    def test_accepts_kv_cache(self):
+        _check_kv_cache_quantizable([KVCache() for _ in range(4)], 64, 8)
+
+    def test_ignores_non_kv_state(self):
+        _check_kv_cache_quantizable([KVCache(), ArraysCache(size=2)], 64, 8)
+
+    def test_rejects_max_kv_size_cache(self):
+        # make_prompt_cache builds RotatingKVCache(keep=4) for max_kv_size,
+        # and sink tokens have no quantized variant.
+        model = types.SimpleNamespace(layers=[None] * 3)
+        cache = make_prompt_cache(model, max_kv_size=32)
+        with self.assertRaises(ValueError):
+            _check_kv_cache_quantizable(cache, 64, 8)
+
+
+class TestServerWithKVCacheQuantization(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(kv_bits=8), LRUPromptCache()
+        )
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def test_not_batchable_with_kv_bits(self):
+        args = types.SimpleNamespace(seed=None)
+        self.assertFalse(self.response_generator._is_batchable(args))
+
+    def test_handle_completions_with_kv_bits(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(
+            url,
+            json={
+                "model": "default_model",
+                "prompt": "Once upon a time",
+                "max_tokens": 10,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertIn("choices", response_body)
+        self.assertTrue(response_body["choices"][0]["text"])
 
 
 class TestKeepalive(unittest.TestCase):

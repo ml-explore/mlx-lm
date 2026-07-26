@@ -9,6 +9,7 @@ import socket
 import time
 import uuid
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +34,7 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     StopSequenceMatcher,
     TextStateMachine,
@@ -271,6 +273,36 @@ class TimeBudget:
         raise StopIteration()
 
 
+def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits):
+    """
+    Raise if any KV cache entry cannot honor a KV cache quantization request.
+
+    Converting an empty cache is free, so this probes the real conversion
+    rather than guessing from the cache class.
+    """
+    unsupported = Counter()
+    for c in cache:
+        if not hasattr(c, "to_quantized"):
+            # Recurrent or otherwise non-KV state, e.g. the ArraysCache used
+            # by Mamba and gated-delta-net layers, is not affected by
+            # --kv-bits and is not counted as a failure.
+            continue
+        try:
+            c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+        except NotImplementedError:
+            unsupported[type(c).__name__] += 1
+
+    if unsupported:
+        summary = ", ".join(f"{n} x {name}" for name, n in sorted(unsupported.items()))
+        raise ValueError(
+            f"--kv-bits {kv_bits} was requested but {sum(unsupported.values())} of "
+            f"{len(cache)} cache layers cannot be quantized ({summary}). Serving "
+            "with only the remaining layers quantized would ignore most of the "
+            "request without reporting it. Drop --kv-bits, or drop --max-kv-size "
+            "if it is set, since it builds a RotatingKVCache with sink tokens."
+        )
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -354,6 +386,22 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+
+        # Fail before serving rather than part-way through a request, and
+        # rather than quantizing only the layers that happen to support it.
+        if self.cli_args.kv_bits is not None:
+            probe_cache = make_prompt_cache(
+                model, max_kv_size=self.cli_args.max_kv_size
+            )
+            if draft_model is not None:
+                probe_cache += make_prompt_cache(
+                    draft_model, max_kv_size=self.cli_args.max_kv_size
+                )
+            _check_kv_cache_quantizable(
+                probe_cache,
+                self.cli_args.kv_group_size,
+                self.cli_args.kv_bits,
+            )
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -619,9 +667,11 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
-        # The batched generator uses BatchKVCache, which has no quantized
-        # variant yet, so route through the single-sequence path (which does
-        # support KV quantization) whenever --kv-bits is requested.
+        # BatchGenerator takes no kv_bits, so the batched path cannot honor a
+        # quantization request at all: route through the single-sequence path,
+        # which can. Once BatchGenerator accepts kv_bits this can narrow to
+        # only the cases whose caches still cannot be quantized, instead of
+        # serializing every request.
         if self.cli_args.kv_bits is not None:
             return False
         return self.model_provider.is_batchable and args.seed is None
@@ -1881,9 +1931,9 @@ def main():
     parser.add_argument(
         "--quantized-kv-start",
         type=int,
-        default=5000,
+        default=DEFAULT_QUANTIZED_KV_START,
         help="When --kv-bits is set, begin quantizing the KV cache after "
-        "this many tokens (default: 5000).",
+        f"this many tokens (default: {DEFAULT_QUANTIZED_KV_START}).",
     )
     parser.add_argument(
         "--max-kv-size",
