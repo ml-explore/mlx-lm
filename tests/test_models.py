@@ -3294,6 +3294,5 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
-
 if __name__ == "__main__":
     unittest.main()
