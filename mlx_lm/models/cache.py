@@ -92,6 +92,16 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
     return all(c.is_trimmable() for c in cache)
 
 
+def can_quantize_prompt_cache(cache: List[Any]) -> bool:
+    """
+    Check if every KV-cache entry supports quantization.
+
+    Non-KV state entries are not affected by a KV-cache quantization request,
+    and already-quantized entries count as supported.
+    """
+    return all(not c.is_quantization_applicable() or c.is_quantizable() for c in cache)
+
+
 def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     """
     Trim the model's cache by the given number of tokens.
@@ -145,6 +155,18 @@ class _BaseCache:
 
     def is_trimmable(self):
         return False
+
+    def is_quantization_applicable(self):
+        return True
+
+    def is_quantizable(self):
+        return False
+
+    def is_quantized(self):
+        return False
+
+    def quantization_unsupported_reason(self):
+        return "KV-cache quantization is not implemented"
 
     def size(self):
         """
@@ -319,6 +341,12 @@ class QuantizedKVCache(_BaseCache):
     def is_trimmable(self):
         return True
 
+    def is_quantizable(self):
+        return True
+
+    def is_quantized(self):
+        return True
+
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
@@ -386,6 +414,9 @@ class KVCache(_BaseCache):
         self.offset = self.keys.shape[2]
 
     def is_trimmable(self):
+        return True
+
+    def is_quantizable(self):
         return True
 
     def trim(self, n):
@@ -554,6 +585,14 @@ class RotatingKVCache(_BaseCache):
 
     def is_trimmable(self):
         return self.offset < self.max_size
+
+    def is_quantizable(self):
+        return self.keep == 0
+
+    def quantization_unsupported_reason(self):
+        if self.keep > 0:
+            return f"keep={self.keep} sink tokens are not supported"
+        return super().quantization_unsupported_reason()
 
     def trim(self, n):
         n = min(self.offset, n)
@@ -802,6 +841,12 @@ class RotatingQuantizedKVCache(_BaseCache):
     def is_trimmable(self):
         return self.offset < self.max_size
 
+    def is_quantizable(self):
+        return True
+
+    def is_quantized(self):
+        return True
+
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
@@ -859,6 +904,9 @@ class ArraysCache(_BaseCache):
         self.cache = [None] * size
         if left_padding:
             self.left_padding = mx.array(left_padding)
+
+    def is_quantization_applicable(self):
+        return False
 
     @property
     def batch_size(self):
@@ -1574,6 +1622,9 @@ class BatchRotatingKVCache(_BaseCache):
     def is_trimmable(self):
         return self._offset < self.max_size
 
+    def is_quantizable(self):
+        return True
+
     def trim(self, n):
         n = min(self._offset, n)
         self._offset -= n
@@ -2001,6 +2052,12 @@ class BatchRotatingQuantizedKVCache(_BaseCache):
 
     def is_trimmable(self):
         return self._offset < self.max_size
+
+    def is_quantizable(self):
+        return True
+
+    def is_quantized(self):
+        return True
 
     def trim(self, n):
         n = min(self._offset, n)

@@ -287,11 +287,59 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
+def _validate_prompt_cache_quantization(
+    prompt_cache,
+    *,
+    cache_name,
+    kv_group_size,
+    kv_bits,
+):
+    if kv_bits is None:
+        return
+
+    errors = []
+    if not cache.can_quantize_prompt_cache(prompt_cache):
+        for layer, entry in enumerate(prompt_cache):
+            if entry.is_quantization_applicable() and not entry.is_quantizable():
+                errors.append(
+                    f"{cache_name} layer {layer} ({type(entry).__name__}: "
+                    f"{entry.quantization_unsupported_reason()})"
+                )
+
+    for layer, entry in enumerate(prompt_cache):
+        if entry.is_quantized() and (
+            entry.bits != kv_bits or entry.group_size != kv_group_size
+        ):
+            errors.append(
+                f"{cache_name} layer {layer} ({type(entry).__name__}: already "
+                f"quantized with bits={entry.bits}, group_size={entry.group_size}; "
+                f"requested bits={kv_bits}, group_size={kv_group_size})"
+            )
+
+    if errors:
+        raise ValueError(
+            "KV-cache quantization cannot be applied to every cache entry: "
+            + "; ".join(errors)
+            + "."
+        )
+
+
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
+
+    _validate_prompt_cache_quantization(
+        prompt_cache,
+        cache_name="prompt cache",
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+        if (
+            c.is_quantization_applicable()
+            and not c.is_quantized()
+            and c.offset >= quantized_kv_start
+        ):
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
@@ -364,6 +412,13 @@ def generate_step(
             model,
             max_kv_size=max_kv_size,
         )
+
+    _validate_prompt_cache_quantization(
+        prompt_cache,
+        cache_name="model prompt cache",
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
@@ -516,6 +571,19 @@ def speculative_generate_step(
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
+
+    _validate_prompt_cache_quantization(
+        model_cache,
+        cache_name="model prompt cache",
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+    _validate_prompt_cache_quantization(
+        draft_cache,
+        cache_name="draft model prompt cache",
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
 
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
@@ -1731,6 +1799,19 @@ class BatchGenerator:
         for i in range(len(segments)):
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
+            elif self.kv_bits is not None:
+                _validate_prompt_cache_quantization(
+                    caches[i],
+                    cache_name=f"batch request {i} prompt cache",
+                    kv_group_size=self.kv_group_size,
+                    kv_bits=self.kv_bits,
+                )
+                maybe_quantize_kv_cache(
+                    caches[i],
+                    self.quantized_kv_start,
+                    self.kv_group_size,
+                    self.kv_bits,
+                )
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
@@ -1767,6 +1848,12 @@ class BatchGenerator:
             ]
 
         if self.kv_bits is not None:
+            _validate_prompt_cache_quantization(
+                new_cache,
+                cache_name="batch model prompt cache",
+                kv_group_size=self.kv_group_size,
+                kv_bits=self.kv_bits,
+            )
             # quantized_kv_start is always 0 here (enforced in __init__), so this
             # quantizes every layer immediately — the cache is empty (offset=0),
             # so there's no precision to lose. All subsequent update_and_fetch
