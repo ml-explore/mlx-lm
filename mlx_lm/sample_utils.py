@@ -16,6 +16,7 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.1,
     xtc_special_tokens: List[int] = [],
+    seed: Optional[int] = None,
 ) -> Callable[[mx.array], mx.array]:
     """
     Make a sampler function for use with ``generate_step``.
@@ -37,6 +38,13 @@ def make_sampler(
             for being sampled.
         xtc_special_tokens (list(int), optional): List of special tokens IDs to
             be excluded from XTC sampling.
+        seed (int, optional): Seed for this sampler's own PRNG stream. The sampler
+            draws from an explicit key chain rather than the implicit global
+            ``mx.random.state``, so the same seed reproduces the same tokens and
+            concurrent samplers cannot perturb one another. When ``None`` a seed is
+            derived from the global RNG, giving each sampler an independent stream
+            while still honouring an ``mx.random.seed(...)`` set beforehand.
+            Default: ``None``.
 
 
     Returns:
@@ -44,27 +52,52 @@ def make_sampler(
             A sampler which takes log-probabilities and returns tokens.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        return lambda x, key=None: mx.argmax(x, axis=-1)
 
-    # Create sampler chain
+    # Create sampler chain. Every method takes (logprobs, key); only the ones that
+    # actually draw randomness consume it.
     sampling_methods = []
     if top_p > 0 and top_p < 1.0:
-        sampling_methods.append(lambda x: apply_top_p(x, top_p))
+        sampling_methods.append(lambda x, key: apply_top_p(x, top_p))
     if min_p != 0.0:
-        sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
+        sampling_methods.append(lambda x, key: apply_min_p(x, min_p, min_tokens_to_keep))
     if xtc_probability > 0.0:
         sampling_methods.append(
-            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
+            lambda x, key: apply_xtc(
+                x, xtc_probability, xtc_threshold, xtc_special_tokens, key=key
+            )
         )
     if top_k > 0:
-        sampling_methods.append(lambda x: apply_top_k(x, top_k))
+        sampling_methods.append(lambda x, key: apply_top_k(x, top_k))
+
+    # This sampler's OWN PRNG stream. Held here rather than read from the implicit
+    # global mx.random.state so that (a) a seed actually determines the output and
+    # (b) concurrent generations can't perturb each other by interleaving draws.
+    # A sampler is built per request (server) and per sequence (BatchGenerator), so
+    # per-sampler state == per-request isolation, with no call-site changes.
+    #
+    # With no explicit seed we DERIVE one from the global RNG rather than leaving the
+    # key as None. Two reasons: every sampler still gets an independent stream, and
+    # the key handed to the mx.compile'd sampling functions is always a real array —
+    # we never rely on a compiled function accepting a None argument.
+    # mx.random.seed(...) set by the caller before construction still pins the result,
+    # because the derivation itself draws from the global state.
+    if seed is None:
+        seed = int(mx.random.randint(0, 2**30).item())
+    stream_key = mx.random.key(seed)
 
     # Apply the sampling methods
-    def sampler(logprobs):
-        for method in sampling_methods:
-            logprobs = method(logprobs)
+    def sampler(logprobs, key=None):
+        nonlocal stream_key
+        if key is None:
+            stream_key, key = mx.random.split(stream_key)
+        # One independent subkey per randomness consumer (each method, plus the
+        # final draw).
+        keys = mx.random.split(key, len(sampling_methods) + 1)
+        for method, subkey in zip(sampling_methods, keys):
+            logprobs = method(logprobs, subkey)
         # Return the sampled token
-        return categorical_sampling(logprobs, temp)
+        return categorical_sampling(logprobs, temp, key=keys[-1])
 
     return sampler
 
@@ -243,6 +276,7 @@ def apply_xtc(
     xtc_probability: float,
     xtc_threshold: float,
     xtc_special_tokens: List[int],
+    key: Optional[mx.array] = None,
 ) -> mx.array:
     """
     Apply XTC sampling to the logits.
@@ -252,6 +286,8 @@ def apply_xtc(
         xtc_probability (float): Probability of XTC sampling to happen for each token
         xtc_threshold (float): The threshold the probs need to reach for being sampled.
         special_tokens_ids (list(int)): List of special tokens IDs to be excluded from XTC sampling.
+        key (mx.array, optional): PRNG key. If ``None`` the implicit global random
+          state is used (legacy behaviour).
     """
     if not (0 <= xtc_threshold <= 0.5):
         raise ValueError(
@@ -270,15 +306,15 @@ def apply_xtc(
         mask[..., xtc_special_tokens] = False
 
     return mx.where(
-        mx.random.uniform(0, 1) > xtc_probability,
+        mx.random.uniform(0, 1, key=key) > xtc_probability,
         logits,
         mx.where(mask, -mx.inf, logits),
     )
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
-def categorical_sampling(logits, temp):
-    return mx.random.categorical(logits * (1 / temp))
+def categorical_sampling(logits, temp, key=None):
+    return mx.random.categorical(logits * (1 / temp), key=key)
 
 
 def make_repetition_penalty(penalty: float, context_size: int = 20):

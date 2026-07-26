@@ -5,6 +5,7 @@ import json
 import logging
 import pickle
 import platform
+import secrets
 import socket
 import time
 import uuid
@@ -387,6 +388,11 @@ def _make_sampler(args, tokenizer):
         xtc_probability=args.sampling.xtc_probability,
         xtc_threshold=args.sampling.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+        # Give every sampler its OWN PRNG stream. An explicit request seed makes the
+        # generation reproducible; without one we draw fresh entropy per request so
+        # that identical requests do NOT return identical tokens (the previous
+        # behaviour, since every sampler read the same implicit global state).
+        seed=args.seed if args.seed is not None else secrets.randbits(32),
     )
 
 
@@ -897,9 +903,10 @@ class ResponseGenerator:
             )
             rqueue.put(ctx)
 
-            # Seed if requested
-            if args.seed is not None:
-                mx.random.seed(args.seed)
+            # NOTE: the request seed is applied per-sampler in _make_sampler (an
+            # explicit key stream), not by stomping the global mx.random state here.
+            # Seeding globally would also reset the RNG for any concurrently
+            # generating request.
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
