@@ -11,7 +11,14 @@ import requests
 
 from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, Response, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+    SamplingArguments,
+    _make_sampler,
+)
 from mlx_lm.utils import load
 
 
@@ -725,6 +732,32 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class TestMakeSampler(unittest.TestCase):
+    def test_xtc_special_tokens(self):
+        class FakeTokenizer:
+            eos_token_ids = [0, 1, 9]
+
+            def encode(self, text, add_special_tokens=False):
+                return [3]
+
+        sampling = SamplingArguments(
+            temperature=0.6,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            xtc_probability=1.0,
+            xtc_threshold=0.1,
+        )
+        args = type("obj", (object,), {"sampling": sampling})
+        sampler = _make_sampler(args, FakeTokenizer())
+        logits = mx.log(
+            mx.array([[0.4, 0.2, 0.1, 0.1, 0.05, 0.05, 0.03, 0.03, 0.02, 0.02]])
+        )
+        token = sampler(logits)
+        mx.eval(token)
+        self.assertEqual(token.shape, (1,))
 
 
 if __name__ == "__main__":
