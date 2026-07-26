@@ -1731,6 +1731,21 @@ class BatchGenerator:
         for i in range(len(segments)):
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
+            elif self.kv_bits is not None:
+                # Externally supplied caches skip _make_new_cache(), which is
+                # where quantization is normally applied, so kv_bits would
+                # otherwise be silently ignored for them. Quantize in place,
+                # like generate_step does, so the setting is honoured no matter
+                # who built the cache. Unlike the empty cache _make_new_cache()
+                # returns, a supplied cache may already hold tokens, so this
+                # conversion can be lossy. Entries that are already quantized
+                # have no to_quantized() and are skipped.
+                maybe_quantize_kv_cache(
+                    caches[i],
+                    self.quantized_kv_start,
+                    self.kv_group_size,
+                    self.kv_bits,
+                )
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,

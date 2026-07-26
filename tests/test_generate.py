@@ -15,7 +15,13 @@ from mlx_lm.generate import (
     generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    RotatingQuantizedKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -419,6 +425,140 @@ class TestGenerate(unittest.TestCase):
                 kv_bits=8,
                 quantized_kv_start=4,
             )
+
+    def test_batch_insert_external_cache_is_quantized(self):
+        """A caller-supplied cache bypasses _make_new_cache(), which is where
+        quantization is applied, so kv_bits used to be silently ignored for it:
+        the caller asked for a quantized cache and got a full-precision one with
+        no error. insert() must quantize supplied caches too."""
+        prompt = self.tokenizer.encode("Hello")
+        external = make_prompt_cache(self.model)
+        self.assertTrue(
+            all(isinstance(c, KVCache) for c in external),
+            "precondition: a fresh cache for this model should be unquantized",
+        )
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        batch_gen.insert([prompt], caches=[external])
+
+        # maybe_quantize_kv_cache rewrites the list in place, same as
+        # generate_step, so the caller's list reflects the conversion.
+        self.assertTrue(
+            all(isinstance(c, QuantizedKVCache) for c in external),
+            f"supplied cache not quantized: {[type(c).__name__ for c in external]}",
+        )
+
+    def test_batch_insert_external_cache_untouched_without_kv_bits(self):
+        """Control for the above: with no kv_bits the supplied cache must be
+        left exactly as the caller built it."""
+        prompt = self.tokenizer.encode("Hello")
+        external = make_prompt_cache(self.model)
+        before = [type(c) for c in external]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+        )
+        batch_gen.insert([prompt], caches=[external])
+
+        self.assertEqual(before, [type(c) for c in external])
+
+    def test_batch_insert_external_cache_already_quantized(self):
+        """An already-quantized supplied cache must not be re-quantized. The
+        quantized classes define no to_quantized(), so maybe_quantize_kv_cache
+        skips them; this pins that behaviour."""
+        prompt = self.tokenizer.encode("Hello")
+        external = make_prompt_cache(self.model)
+        external = [c.to_quantized(group_size=32, bits=8) for c in external]
+        ids_before = [id(c) for c in external]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        batch_gen.insert([prompt], caches=[external])
+
+        self.assertEqual(ids_before, [id(c) for c in external])
+
+    def test_batch_continued_generation_quantized(self):
+        """Round trip in the shape a real caller uses: generate, harvest the
+        per-job caches off the responses, then re-insert them with kv_bits set.
+        The existing test_batch_continued_generation* tests cover this path with
+        quantization off, so this is the quantized counterpart.
+
+        max_kv_size is required here, and not incidental: continued generation
+        merges the per-job caches, and only the rotating quantized class
+        implements merge(). Plain QuantizedKVCache does not (pre-existing in
+        mlx-lm, unrelated to this PR), so kv_bits without max_kv_size cannot do
+        batching-with-history at all."""
+        prompts_a = [self.tokenizer.encode(p) for p in ("Hello", "What time is it?")]
+        prompts_b = [self.tokenizer.encode(p) for p in ("And then?", "Why?")]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+            max_kv_size=32,
+            kv_bits=8,
+            kv_group_size=32,
+            prefill_batch_size=2,
+            completion_batch_size=2,
+        )
+
+        uids = batch_gen.insert(prompts_a)
+        caches = {uid: None for uid in uids}
+        while responses := batch_gen.next_generated():
+            for r in responses:
+                if r.finish_reason is not None:
+                    caches[r.uid] = r.prompt_cache
+        caches = [caches[uid] for uid in uids]
+
+        for c in caches:
+            self.assertIsNotNone(c, "no cache harvested from a finished job")
+
+        uids = batch_gen.insert(prompts_b, caches=caches)
+        batch_responses = {uid: [] for uid in uids}
+        while responses := batch_gen.next_generated():
+            for r in responses:
+                batch_responses[r.uid].append(r.token)
+
+        for uid in uids:
+            self.assertGreater(
+                len(batch_responses[uid]),
+                0,
+                "continued quantized job produced no tokens",
+            )
+            for tok in batch_responses[uid]:
+                self.assertFalse(mx.isnan(mx.array(float(tok))))
+
+    def test_batch_insert_external_rotating_cache_with_keep_raises(self):
+        """keep>0 is the one RotatingKVCache shape quantization does not
+        support. It must fail loudly at insert() rather than part-way through
+        decoding, and it must not be silently skipped."""
+        prompt = self.tokenizer.encode("Hello")
+        external = [
+            RotatingKVCache(max_size=8, keep=4) for _ in range(len(self.model.layers))
+        ]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        with self.assertRaises(NotImplementedError):
+            batch_gen.insert([prompt], caches=[external])
 
     def test_batch_generate_with_logits_processors(self):
         """Test that batch_generate with logits_processors produces correct results."""
