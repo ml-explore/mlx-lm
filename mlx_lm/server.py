@@ -273,12 +273,13 @@ class TimeBudget:
         raise StopIteration()
 
 
-def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits):
+def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits, max_kv_size=None):
     """
     Raise if any KV cache entry cannot honor a KV cache quantization request.
 
     Converting an empty cache is free, so this probes the real conversion
-    rather than guessing from the cache class.
+    rather than guessing from the cache class, and reports the reason the
+    cache itself gave rather than a guess about which flag caused it.
     """
     unsupported = Counter()
     for c in cache:
@@ -289,18 +290,24 @@ def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits):
             continue
         try:
             c.to_quantized(group_size=kv_group_size, bits=kv_bits)
-        except NotImplementedError:
-            unsupported[type(c).__name__] += 1
+        except NotImplementedError as e:
+            unsupported[(type(c).__name__, str(e))] += 1
 
-    if unsupported:
-        summary = ", ".join(f"{n} x {name}" for name, n in sorted(unsupported.items()))
-        raise ValueError(
-            f"--kv-bits {kv_bits} was requested but {sum(unsupported.values())} of "
-            f"{len(cache)} cache layers cannot be quantized ({summary}). Serving "
-            "with only the remaining layers quantized would ignore most of the "
-            "request without reporting it. Drop --kv-bits, or drop --max-kv-size "
-            "if it is set, since it builds a RotatingKVCache with sink tokens."
-        )
+    if not unsupported:
+        return
+
+    summary = ", ".join(
+        f"{n} x {name} ({reason})" for (name, reason), n in sorted(unsupported.items())
+    )
+    hint = "Serve without --kv-bits"
+    if max_kv_size is not None:
+        hint += ", or without --max-kv-size, which builds a RotatingKVCache"
+    raise ValueError(
+        f"--kv-bits {kv_bits} was requested but {sum(unsupported.values())} of "
+        f"{len(cache)} cache layers cannot be quantized: {summary}. Serving with "
+        "only the remaining layers quantized would ignore most of the request "
+        f"without reporting it. {hint}."
+    )
 
 
 class ModelProvider:
@@ -401,6 +408,7 @@ class ModelProvider:
                 probe_cache,
                 self.cli_args.kv_group_size,
                 self.cli_args.kv_bits,
+                max_kv_size=self.cli_args.max_kv_size,
             )
 
         # Update the member variables

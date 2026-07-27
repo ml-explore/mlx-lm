@@ -535,6 +535,9 @@ class TestKVCacheQuantizable(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("RotatingKVCache", message)
         self.assertIn("1 of 2", message)
+        # The reason comes from the cache, not from a guess about which flag
+        # was responsible, so it stays accurate as cache support changes.
+        self.assertNotIn("--max-kv-size", message)
 
     def test_accepts_kv_cache(self):
         _check_kv_cache_quantizable([KVCache() for _ in range(4)], 64, 8)
@@ -547,8 +550,9 @@ class TestKVCacheQuantizable(unittest.TestCase):
         # and sink tokens have no quantized variant.
         model = types.SimpleNamespace(layers=[None] * 3)
         cache = make_prompt_cache(model, max_kv_size=32)
-        with self.assertRaises(ValueError):
-            _check_kv_cache_quantizable(cache, 64, 8)
+        with self.assertRaises(ValueError) as ctx:
+            _check_kv_cache_quantizable(cache, 64, 8, max_kv_size=32)
+        self.assertIn("--max-kv-size", str(ctx.exception))
 
 
 class TestServerWithKVCacheQuantization(unittest.TestCase):
