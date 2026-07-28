@@ -688,6 +688,15 @@ class ArraysCache(_BaseCache):
         if self.left_padding is not None:
             self.left_padding -= N
 
+        metadata = tuple(
+            value for value in (self.lengths, self.left_padding) if value is not None
+        )
+        if metadata:
+            for index, value in enumerate(self.cache):
+                if value is not None:
+                    self.cache[index] = mx.depends(value, metadata)
+                    break
+
     def make_mask(self, N: int):
         if self.left_padding is not None:
             pos = mx.arange(N)
