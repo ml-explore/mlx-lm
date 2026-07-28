@@ -1,6 +1,8 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import operator
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -591,11 +593,121 @@ class RotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+def _try_schedule(*arrays):
+    """Schedule an async evaluation unless it is disallowed: inside a
+    graph transformation (``mx.compile`` traces captured state by
+    temporarily swapping tracers into the captured containers, e.g.
+    ``inputs=vars(cache)``) ``async_eval`` on a tracer raises, and a
+    metadata access must instead behave like stock's plain attribute
+    read -- return the tracer, schedule nothing, and leave any pending
+    fold for the next eager access. Returns False in that case."""
+    try:
+        mx.async_eval(*arrays)
+        return True
+    except ValueError as e:
+        if "graph transformation" not in str(e):
+            raise
+        return False
+
+
 class ArraysCache(_BaseCache):
+    # ``left_padding`` and ``lengths`` are logically decremented by
+    # ``advance()`` on every layer call during decode. Doing that decrement
+    # with mx.array arithmetic (``self.left_padding -= N``) builds one
+    # unevaluated graph node per layer per token. The model only ever
+    # rebuilds a mask from ONE of these caches (``cache[ssm_idx]``), so for
+    # every other layer the chain is dead: it is never evaluated, it grows
+    # without bound, and every link pins the small constant array (and its
+    # live Metal buffer object) that was subtracted. The process then dies
+    # with ``[metal::malloc] Resource limit (499000) exceeded`` -- a count
+    # limit, not bytes -- after a few tens of thousands of decode tokens
+    # (see ml-explore/mlx-lm#1185, #1332; ml-explore/mlx#3564, #3539).
+    #
+    # Fix: track the cumulative decrement as a plain python int per field
+    # (``_lp_advance``/``_len_advance``; nonzero only while the matching
+    # array exists) and fold it into the stored array when that field is
+    # read (property access or ``make_mask``), replaced, or finalized.
+    # ``advance()`` itself creates no graph nodes and never evaluates
+    # anything; folding one field never touches the other. Folds are
+    # applied in place (``-=``, preserving the array object) on the
+    # metadata side and scheduled with ``mx.async_eval``, so no public
+    # operation sequence accumulates unevaluated graph on metadata
+    # nothing consumes.
+    #
+    # Deliberate deviations from the eager decrement (nothing in this
+    # repo relies on them): a decrement becomes visible to aliases of a
+    # metadata array at the next fold of that field, not at ``advance()``
+    # time -- alias reads/writes before that fold interleave accordingly,
+    # and storing the same array object in both fields applies each
+    # field's decrement at its own fold; ``copy.copy`` folds first, so a
+    # shallow copy cannot re-apply pending decrements to the shared
+    # arrays. Deferred totals fold as the dtype-congruent scalar (MLX
+    # converts python int scalars through int64, so uint64 uses the
+    # signed representative modulo 2**64), which lands integer metadata
+    # exactly where stock's per-step subtractions did -- including
+    # totals that overflow the dtype. Offsets outside the scalar range
+    # MLX accepts for the dtype raise a uniform ValueError at
+    # ``advance()``, where stock's eager subtraction rejected them (as
+    # ValueError, or an opaque std::bad_cast at the int64 gate).
+    # Floating totals beyond the int64 gate fold in gate-sized chunks,
+    # each scheduled as it is applied; per-step float *rounding* is not
+    # reproduced. ``operator.index`` normalizes integral offsets
+    # (python bool and numpy integer scalars become python ints, value
+    # preserved) -- stock instead converted exotic offset types through
+    # array promotion, whose dtype side effects (a bool offset keeping
+    # bool metadata bool, numpy scalar offsets promoting the metadata
+    # dtype) are not reproduced. bool metadata arithmetic is reproduced
+    # at int32 precision (stock's promotion): the dtype stays bool
+    # through zero-net advance histories, and after the first advance()
+    # on the field -- even a zero or cancelling one, and through a bool
+    # array shared by both fields -- later offsets validate against
+    # int32 exactly as stock's already-promoted array would. A read that encounters a *tracer*
+    # -- metadata swapped into a trace by
+    # ``mx.compile(..., inputs=vars(cache))`` -- is pure: no fold, no
+    # scheduling, like stock's attribute access, and the pending
+    # decrement folds at the next eager access; a closure-captured
+    # cache holds concrete arrays, so reads inside a trace fold eagerly
+    # with stock-identical values. Compiling a function that *calls*
+    # ``advance()`` is not supported: the decrement is host-side
+    # bookkeeping and runs at trace time only (stock incidentally
+    # recorded it as graph arithmetic -- the same arithmetic that
+    # leaks), so call advance() outside compiled functions. Likewise,
+    # mutating metadata (assignment, ``finalize``, ``filter``,
+    # ``extend``) while a pending decrement cannot fold -- the field is
+    # captured as a tracer -- raises rather than silently discarding
+    # the decrement (``copy.copy`` and ``copy.deepcopy`` guard the same
+    # way -- a copy taken mid-trace would escape holding the transient
+    # tracer); mutate outside compiled functions. In-place item
+    # assignment through a captured tracer read cannot be intercepted
+    # (``__setitem__`` on the returned array bypasses the property
+    # machinery): the write lands before the deferred decrement -- the
+    # alias-write window above -- where stock's eager decrement landed
+    # first. Reads are serialized per cache: a reentrant lock guards the
+    # advance bookkeeping, folds, scheduling, and copies, because
+    # stock's pure attribute reads were trivially thread-safe while
+    # unserialized concurrent folds of one array deadlock on their
+    # thread-local streams. Cross-thread *mutation* (filter/extend/
+    # finalize racing anything) remains unsupported, as in stock.
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
-        instance.left_padding = None
-        instance.lengths = None
+        instance._left_padding = None
+        instance._lengths = None
+        instance._lp_advance = 0
+        instance._len_advance = 0
+        # bool-metadata promotion trackers: stock's eager subtraction
+        # promoted a bool field to int32 on the FIRST advance() -- even a
+        # zero or cancelling one -- so validation must remember that
+        # independently of the pending total (see _logical_dtype)
+        instance._lp_promoted = False
+        instance._len_promoted = False
+        # Serializes the deferred-decrement machinery (advance
+        # bookkeeping, folds, scheduling, copies). Stock's pure
+        # attribute reads were trivially thread-safe; deferred folding
+        # makes reads mutate, and two unserialized folds of the same
+        # array from different threads deadlock on their thread-local
+        # streams. Reentrant: mutators call _sync/_fold under it.
+        instance._fold_lock = threading.RLock()
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -603,15 +715,255 @@ class ArraysCache(_BaseCache):
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
+    # Integer metadata dtypes as (bits, signed): used to mirror stock's
+    # eager per-call scalar range check in advance() and to wrap the
+    # accumulated total to the dtype's modular range at fold time.
+    _INT_DTYPES = {
+        "int8": (8, True),
+        "int16": (16, True),
+        "int32": (32, True),
+        "int64": (64, True),
+        "uint8": (8, False),
+        "uint16": (16, False),
+        "uint32": (32, False),
+        "uint64": (64, False),
+    }
+
+    @classmethod
+    def _int_spec(cls, dtype):
+        return cls._INT_DTYPES.get(str(dtype).split(".")[-1])
+
+    @classmethod
+    def _wrap_advance(cls, total, dtype):
+        """Wrap an accumulated advance() total to the congruent scalar
+        MLX converts exactly like stock's per-step decrements did.
+        Sequential wrapping subtractions equal one subtraction of the
+        sum modulo 2**bits, so the wrapped fold lands on stock's value
+        even when the raw total overflows the dtype. Python int scalars
+        convert through int64 (mlx python/src/utils.cpp), so uint64
+        takes the *signed* int64 representative -- congruent modulo
+        2**64 and accepted by the conversion. Non-integer dtypes pass
+        through (the fold subtracts them in gate-sized chunks). bool
+        metadata wraps at int32: stock's subtraction promoted it, and
+        int32 wrapping matches the promoted arithmetic (including the
+        two's-complement truncation MLX's C++ cast applies to
+        out-of-range scalars)."""
+        if dtype == mx.bool_:
+            spec = (32, True)
+        else:
+            spec = cls._int_spec(dtype)
+        if spec is None:
+            return total
+        bits, signed = spec
+        total %= 1 << bits
+        if (signed or bits == 64) and total >= 1 << (bits - 1):
+            total -= 1 << bits
+        return total
+
+    @classmethod
+    def _check_advance(cls, N, dtype):
+        """Mirror stock's eager scalar conversion: python ints convert
+        through int64, so every dtype rejects offsets outside int64's
+        range, and integer dtypes narrower than 64 bits are additionally
+        range-checked (uint64 is not: negatives wrap modulo 2**64).
+        Runs per armed field, in stock's field order, because that is
+        where stock's ``-= N`` raised (ValueError, or std::bad_cast at
+        the int64 gate; here it is uniformly ValueError)."""
+        lo, hi = -(1 << 63), (1 << 63) - 1
+        spec = cls._int_spec(dtype)
+        if spec is not None and spec[0] < 64:
+            bits, signed = spec
+            lo = -(1 << (bits - 1)) if signed else 0
+            hi = ((1 << (bits - 1)) if signed else (1 << bits)) - 1
+        if not lo <= N <= hi:
+            raise ValueError(
+                f"ArraysCache.advance offset {N} is out of range "
+                f"for {dtype} metadata"
+            )
+
+    def _fold(self, arr_attr, adv_attr):
+        """Fold the pending decrement into the backing array -- in place,
+        so aliases observe it -- and schedule the evaluation. A no-op on
+        tracers (see _try_schedule): the fold stays pending, the counter
+        untouched. Integer totals fold as one pre-wrapped exact scalar;
+        other dtypes subtract in int64-gate-sized chunks (an accumulated
+        floating total can exceed the scalar range even when every
+        offset was valid), each chunk scheduled as it is applied so a
+        many-chunk fold cannot itself build an unbounded chain. The
+        counter commits chunk-by-chunk, BEFORE each subtraction: a
+        decrement is never applied twice, and a failure mid-fold leaves
+        the unapplied remainder pending except for at most the single
+        in-flight chunk (an asynchronous interrupt or failed subtraction
+        between the counter commit and the subtraction drops it)."""
+        with self._fold_lock:
+            total = getattr(self, adv_attr)
+            if not total:
+                return
+            arr = getattr(self, arr_attr)
+            if not _try_schedule(arr):
+                return
+            total = self._wrap_advance(total, arr.dtype)
+            setattr(self, adv_attr, total)
+            lo, hi = -(1 << 63), (1 << 63) - 1
+            while True:
+                chunk = min(max(total, lo), hi)
+                total -= chunk
+                setattr(self, adv_attr, total)
+                arr -= chunk
+                setattr(self, arr_attr, arr)
+                if not total:
+                    break
+                mx.async_eval(arr)
+            mx.async_eval(arr)
+
+    def _fold_lp(self):
+        self._fold("_left_padding", "_lp_advance")
+
+    def _fold_len(self):
+        self._fold("_lengths", "_len_advance")
+
+    @property
+    def left_padding(self):
+        if self._left_padding is None:
+            return None
+        with self._fold_lock:
+            if self._lp_advance:
+                self._fold_lp()
+            else:
+                # Schedule on every access: external in-place writes
+                # through the returned array are otherwise never
+                # evaluated for metadata nothing consumes (a property
+                # access is not an evaluation).
+                _try_schedule(self._left_padding)
+            return self._left_padding
+
+    @left_padding.setter
+    def left_padding(self, v):
+        # Fold the outgoing array first so earlier aliases still observe
+        # the decrement; otherwise replacement would discard it forever.
+        with self._fold_lock:
+            if self._left_padding is not None:
+                self._fold_lp()
+                if self._lp_advance:
+                    # The fold declined: the outgoing array is a tracer
+                    # (captured by a graph transformation). Proceeding
+                    # would silently discard the decrement.
+                    raise RuntimeError(
+                        "ArraysCache metadata cannot be replaced inside "
+                        "a graph transformation while an advance() "
+                        "decrement is pending"
+                    )
+            same = v is self._left_padding
+            if v is not None:
+                # Bound chains from repeatedly assigning lazy expressions
+                _try_schedule(v)
+            self._left_padding = v
+            self._lp_advance = 0
+            if not same:
+                # Only a genuinely new array resets the bool-promotion
+                # record; re-assigning the backing array is not a reset
+                self._lp_promoted = False
+
+    @property
+    def lengths(self):
+        if self._lengths is None:
+            return None
+        with self._fold_lock:
+            if self._len_advance:
+                self._fold_len()
+            else:
+                _try_schedule(self._lengths)
+            return self._lengths
+
+    @lengths.setter
+    def lengths(self, v):
+        with self._fold_lock:
+            if self._lengths is not None:
+                self._fold_len()
+                if self._len_advance:
+                    raise RuntimeError(
+                        "ArraysCache metadata cannot be replaced inside "
+                        "a graph transformation while an advance() "
+                        "decrement is pending"
+                    )
+            same = v is self._lengths
+            if v is not None:
+                _try_schedule(v)
+            self._lengths = v
+            self._len_advance = 0
+            if not same:
+                self._len_promoted = False
+
+    def _sync(self):
+        """Fold both pending integer decrements into the stored arrays."""
+        self._fold_lp()
+        self._fold_len()
+
+    def _require_folded(self, op):
+        """Guard for mutators: a pending counter after _sync() means the
+        backing array is a tracer (captured by a graph transformation),
+        and rebinding or clearing the field now would silently discard
+        the decrement. Reads stay supported under capture; mutations
+        must run eagerly. Never fires on eager paths, where folds
+        always land."""
+        if self._lp_advance or self._len_advance:
+            raise RuntimeError(
+                f"ArraysCache.{op}: metadata is captured by a graph "
+                "transformation with an advance() decrement pending; "
+                "apply cache mutations outside compiled functions"
+            )
+
+    def __copy__(self):
+        # A shallow copy shares the backing arrays (as stock's did) --
+        # and the fold lock, so folds on the shared arrays stay
+        # serialized across both objects. Fold first: otherwise the
+        # copied pending counters would apply this cache's decrement
+        # once per object to the shared array. If the fold cannot land
+        # (captured tracer), a copy would escape the trace holding the
+        # transient tracer -- raise like the other guarded mutations.
+        with self._fold_lock:
+            self._sync()
+            self._require_folded("__copy__")
+            new = self.__class__.__new__(self.__class__)
+            new.__dict__.update(self.__dict__)
+            return new
+
+    def __deepcopy__(self, memo):
+        # Same guard as __copy__: python's default deepcopy would copy
+        # __dict__ directly, letting a deep copy taken mid-trace escape
+        # with the transient tracer and the pending counter. The copy
+        # gets its own fold lock (its arrays are independent).
+        with self._fold_lock:
+            self._sync()
+            self._require_folded("__deepcopy__")
+            new = self.__class__.__new__(self.__class__)
+            memo[id(self)] = new
+            for k, v in self.__dict__.items():
+                if k != "_fold_lock":
+                    new.__dict__[k] = copy.deepcopy(v, memo)
+            return new
+
+    def _materialize(self):
+        """Schedule evaluation of the metadata arrays. filter/extend run
+        once per batch change, but only one layer's metadata is ever
+        consumed downstream, so batch churn on a long-lived server would
+        otherwise grow an unevaluated chain for every other layer (the
+        same dead-graph pattern as advance(), at per-request rate).
+        async_eval, not eval: a synchronous eval here would block behind
+        whatever the generation loop already queued on the stream."""
+        arrs = [a for a in (self._left_padding, self._lengths) if a is not None]
+        if arrs:
+            _try_schedule(arrs)
+
     @property
     def batch_size(self):
         for c in self.cache:
             if c is not None:
                 return c.shape[0]
-        if self.left_padding is not None:
-            return self.left_padding.size
-        elif self.lengths is not None:
-            return self.lengths.size
+        if self._left_padding is not None:
+            return self._left_padding.size
+        elif self._lengths is not None:
+            return self._lengths.size
         else:
             return 1
 
@@ -634,10 +986,13 @@ class ArraysCache(_BaseCache):
         In-place filter to keep just the given indices in the cache.
         """
         self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
-        if self.left_padding is not None:
-            self.left_padding = self.left_padding[batch_indices]
-        if self.lengths is not None:
-            self.lengths = self.lengths[batch_indices]
+        self._sync()
+        self._require_folded("filter")
+        if self._left_padding is not None:
+            self._left_padding = self._left_padding[batch_indices]
+        if self._lengths is not None:
+            self._lengths = self._lengths[batch_indices]
+        self._materialize()
 
     def extend(self, other):
         """
@@ -666,9 +1021,16 @@ class ArraysCache(_BaseCache):
 
             return mx.concatenate([a, b])
 
+        self._sync()
+        other._sync()
+        self._require_folded("extend")
+        other._require_folded("extend")
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
-        self.left_padding = cat(self.left_padding, other.left_padding)
-        self.lengths = cat(self.lengths, other.lengths)
+        self._left_padding = cat(self._left_padding, other._left_padding)
+        self._lengths = cat(self._lengths, other._lengths)
+        self._lp_promoted = self._lp_promoted or other._lp_promoted
+        self._len_promoted = self._len_promoted or other._len_promoted
+        self._materialize()
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -679,24 +1041,76 @@ class ArraysCache(_BaseCache):
         self.lengths = mx.array(lengths)
 
     def finalize(self):
-        self.lengths = None
-        self.left_padding = None
+        # Fold before clearing so aliases held by callers still observe
+        # the decrements that happened while the fields were live
+        self._sync()
+        self._require_folded("finalize")
+        self._lengths = None
+        self._left_padding = None
+        self._lp_promoted = False
+        self._len_promoted = False
 
     def advance(self, N):
-        if self.lengths is not None:
-            self.lengths -= N
-        if self.left_padding is not None:
-            self.left_padding -= N
+        # Integer bookkeeping only: building this with mx.array arithmetic
+        # leaks one live buffer object per layer per token (see class note).
+        # mx.array offsets are rejected loudly rather than coerced --
+        # coercion would force an eval here, truncate floats, and accept
+        # non-scalars that silently corrupt the deferred arithmetic.
+        # operator.index accepts any integral python scalar and rejects
+        # floats. Type validation runs regardless of whether any metadata
+        # is set, so that contract does not depend on cache state; the
+        # dtype range check below is per armed field, in stock's field
+        # order, because that is exactly where stock's eager subtraction
+        # would have rejected the offset.
+        if isinstance(N, mx.array):
+            raise TypeError("ArraysCache.advance requires a python int, not mx.array")
+        N = operator.index(N)
+        with self._fold_lock:
+            if self._lengths is not None:
+                promoted = self._len_promoted or (
+                    self._lengths is self._left_padding and self._lp_promoted
+                )
+                self._check_advance(N, self._logical_dtype(self._lengths, promoted))
+                self._len_advance += N
+                if self._lengths.dtype == mx.bool_:
+                    self._len_promoted = True
+            if self._left_padding is not None:
+                promoted = self._lp_promoted or (
+                    self._left_padding is self._lengths and self._len_promoted
+                )
+                self._check_advance(
+                    N, self._logical_dtype(self._left_padding, promoted)
+                )
+                self._lp_advance += N
+                if self._left_padding.dtype == mx.bool_:
+                    self._lp_promoted = True
+
+    @staticmethod
+    def _logical_dtype(arr, promoted):
+        # Stock's eager subtraction promoted bool metadata to int32 on
+        # the FIRST advance() -- even a zero or cancelling one, and in
+        # place, so a bool array shared between both fields promoted
+        # both (hence the identity checks at the call sites). With the
+        # fold deferred, the stored dtype stays bool, so later offsets
+        # must validate against the promoted dtype exactly as stock's
+        # stored array would have.
+        if promoted and arr.dtype == mx.bool_:
+            return mx.int32
+        return arr.dtype
 
     def make_mask(self, N: int):
-        if self.left_padding is not None:
-            pos = mx.arange(N)
-            return pos >= self.left_padding[:, None]
-        elif self.lengths is not None:
-            pos = mx.arange(N)
-            return pos < self.lengths[:, None]
-        else:
+        if self._left_padding is None and self._lengths is None:
             return None
+        pos = mx.arange(N)
+        if self._left_padding is not None:
+            # Fold (and schedule) only the field the mask uses; the other
+            # field's counter is untouched. Scheduling matters even here:
+            # a caller that discards the mask would otherwise leave the
+            # fold unevaluated, one node per call.
+            self._fold_lp()
+            return pos >= self._left_padding[:, None]
+        self._fold_len()
+        return pos < self._lengths[:, None]
 
     @classmethod
     def merge(cls, caches):
