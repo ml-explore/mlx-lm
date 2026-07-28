@@ -644,6 +644,26 @@ class ResponseGenerator:
         # anything to any request -- a livelock. Thread liveness and a
         # naive per-iteration heartbeat both miss this; only delivery
         # staleness catches it.
+        #
+        # Two deliberate scoping choices, worth calling out explicitly:
+        #
+        # 1. This is one timestamp for the whole generator, not one per
+        #    request. It is refreshed by delivery to *any* uid, so ongoing
+        #    admissions or progress on other requests postpone recovery for
+        #    a single wedged request in the same batch. That is intentional:
+        #    the goal is to bound an engine-wide livelock (the batch loop
+        #    itself makes no forward progress for anyone -- the #1493
+        #    failure mode), not to guarantee a per-request delivery SLA. A
+        #    per-request stall inside an otherwise-healthy batch is a
+        #    different problem and is out of scope here.
+        #
+        # 2. "Delivered" means put onto this process's internal per-request
+        #    queue, i.e. handed off to the HTTP handler thread that owns
+        #    that request. It does not mean the bytes reached the client
+        #    (SSE flush, socket write, etc.); that layer is downstream of
+        #    this thread and isn't observable from here. This is the
+        #    correct boundary for detecting a stalled *generation engine*,
+        #    but it does not, by itself, prove client-visible progress.
         last_delivery = time.monotonic()
 
         unprocessed_requests = []
@@ -663,10 +683,26 @@ class ResponseGenerator:
             nonlocal batch_results, batch_generator, current_model
             nonlocal current_sampling, current_tokenizer, current_model_key
             nonlocal drain_batch, last_delivery
+            # Fail every in-flight request's queue first, before touching
+            # the batch generator at all: if close() below ends up blocking
+            # (see note there), the requests we already know about are
+            # still unblocked on their own error rather than waiting on a
+            # recovery step that may itself be stuck.
             for result in batch_results.values():
                 result["rqueue"].put(exc)
             batch_results = {}
             try:
+                # BatchGenerator.close() calls mx.synchronize(self._stream)
+                # when a wired memory limit was set (the Metal path). If
+                # the generation stream itself is what's wedged, that
+                # synchronize could block here too, on this same thread,
+                # with no timeout -- which would turn "detected and reset
+                # the batch" into "the generation thread is now stuck in
+                # recovery instead." This has not been observed in
+                # practice (the reproduced #1493 failure is an *iterating*
+                # livelock, where the stream keeps completing steps, just
+                # without delivering output); it is a documented risk for
+                # a stream-level hang specifically, not a confirmed one.
                 batch_generator.close()
             except Exception:
                 logging.exception("Failed to close the batch generator.")
@@ -826,6 +862,20 @@ class ResponseGenerator:
                     # a real-world failure mode in #1493. is_alive() and a
                     # per-iteration heartbeat both stay green through this;
                     # only "nothing delivered in N seconds" catches it.
+                    #
+                    # This check runs on the generation thread itself,
+                    # between calls to batch_generator.next(), not
+                    # concurrently with them: it is checked here, before
+                    # entering the inner loop below, and again on the next
+                    # trip through this outer while loop once next()
+                    # returns. There is no separate supervisor thread that
+                    # could interrupt a next() call from the outside. That
+                    # means this bounds an *iterating* livelock (next()
+                    # keeps returning, just without ever delivering
+                    # anything) but cannot recover from a single next()
+                    # call that blocks and never returns at all -- the
+                    # generation thread is inside that call and can't run
+                    # this check again until it comes back.
                     stall_timeout = self.cli_args.generation_stall_timeout
                     if (
                         stall_timeout > 0

@@ -4,13 +4,15 @@ import http
 import io
 import json
 import threading
+import time
 import unittest
+from queue import Empty, Queue
 from unittest import mock
 
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import BatchGenerator, TextStateMachine
+from mlx_lm.generate import BatchGenerator, GenerationBatch, TextStateMachine
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
@@ -665,6 +667,164 @@ class TestResponseGeneratorResilience(unittest.TestCase):
             # freshly (re)created real BatchGenerator's first prefill/decode
             # step can legitimately take longer than the tiny timeout used
             # above to force a stall quickly.
+            response_generator.model_provider.cli_args.generation_stall_timeout = 0
+            request, args = self._make_request()
+            _, responses = response_generator.generate(request, args)
+            responses = list(responses)
+            self.assertTrue(len(responses) > 0)
+            self.assertEqual(responses[-1].finish_reason, "length")
+        finally:
+            response_generator.stop_and_join()
+
+    def test_stall_watchdog_is_generator_wide_not_per_request(self):
+        # Documents/locks in the scope of `last_delivery`: it is a single
+        # timestamp for the whole generator, refreshed by delivery to *any*
+        # uid. Continued delivery on request A must therefore postpone
+        # recovery for a different, wedged request B in the same batch --
+        # this is the intentional bound (an engine-wide livelock detector),
+        # not a per-request delivery guarantee.
+        response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+        # Wide enough that ordinary thread-scheduling jitter around request
+        # admission (observed up to ~0.1s between an admission and the next
+        # loop iteration under test load) can't itself read as a stall --
+        # the assertions below rely on distinguishing "before" and "after"
+        # states in time, unlike the tighter 0.05s used where every path
+        # is expected to stall regardless of exact timing.
+        stall_timeout = 0.5
+        response_generator.model_provider.cli_args.generation_stall_timeout = (
+            stall_timeout
+        )
+        keep_delivering_to_a = threading.Event()
+        keep_delivering_to_a.set()
+
+        def fake_next(self):
+            time.sleep(0.02)
+            if keep_delivering_to_a.is_set():
+                # uid 0 is request A (admitted first below); it never
+                # finishes, so it stays in batch_results and keeps
+                # refreshing last_delivery every call.
+                return [], [
+                    GenerationBatch.Response(
+                        uid=0,
+                        token=0,
+                        logprobs=mx.array([0.0]),
+                        finish_reason=None,
+                        prompt_cache=None,
+                        all_tokens=None,
+                    )
+                ]
+            return [], []
+
+        try:
+            request_a, args_a = self._make_request()
+            request_b, args_b = self._make_request()
+
+            with mock.patch.object(BatchGenerator, "next", fake_next):
+                queue_a = Queue()
+                response_generator.requests.put((queue_a, request_a, args_a))
+                ctx_a = queue_a.get(timeout=30)
+                self.assertNotIsInstance(ctx_a, Exception)
+
+                queue_b = Queue()
+                response_generator.requests.put((queue_b, request_b, args_b))
+                ctx_b = queue_b.get(timeout=30)
+                self.assertNotIsInstance(ctx_b, Exception)
+
+                # Let A keep "generating" for several multiples of the
+                # stall timeout. If the watchdog were per-request, B would
+                # already have been failed by now.
+                time.sleep(stall_timeout * 3)
+
+                self.assertTrue(response_generator._generation_thread.is_alive())
+                # A is receiving real deliveries.
+                self.assertGreater(queue_a.qsize(), 0)
+                # B has received nothing at all since admission -- no
+                # token, no error, no reset.
+                with self.assertRaises(Empty):
+                    queue_b.get_nowait()
+
+                # Now stop delivering to A too: with no uid delivering
+                # anything, the shared timestamp finally goes stale and
+                # the watchdog must fire for both in-flight requests.
+                keep_delivering_to_a.clear()
+
+                def drain_for_stall_error(q):
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        try:
+                            item = q.get(timeout=0.5)
+                        except Empty:
+                            continue
+                        if isinstance(item, Exception):
+                            return item
+                    return None
+
+                exc_b = drain_for_stall_error(queue_b)
+                self.assertIsInstance(exc_b, RuntimeError)
+                self.assertIn("generation stalled", str(exc_b))
+
+                exc_a = drain_for_stall_error(queue_a)
+                self.assertIsInstance(exc_a, RuntimeError)
+                self.assertIn("generation stalled", str(exc_a))
+
+            self.assertTrue(response_generator._generation_thread.is_alive())
+        finally:
+            response_generator.stop_and_join()
+
+    def test_stall_watchdog_cannot_interrupt_a_blocking_next_call(self):
+        # Documents/locks in a boundary of the watchdog: the stall_timeout
+        # check runs on the generation thread itself, between calls to
+        # BatchGenerator.next(), not concurrently with them. A next() call
+        # that blocks (rather than returning quickly with nothing) cannot
+        # be interrupted -- a consumer waiting on that request's queue
+        # stays blocked for the full duration of the call, and recovery
+        # only happens once next() actually returns.
+        response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+        # See the wide-margin note in
+        # test_stall_watchdog_is_generator_wide_not_per_request: ordinary
+        # scheduling jitter around admission (observed up to ~0.1s) can
+        # itself exceed a too-tight timeout before the mocked next() is
+        # even called once, so this needs real headroom, not the 0.05s
+        # used where every path is expected to stall regardless of timing.
+        stall_timeout = 0.3
+        response_generator.model_provider.cli_args.generation_stall_timeout = (
+            stall_timeout
+        )
+        # Comfortably longer than the timeout so the ordering below has
+        # slack even under CI scheduling noise.
+        hold_seconds = stall_timeout * 5
+        call_started = threading.Event()
+
+        def fake_next(self):
+            call_started.set()
+            time.sleep(hold_seconds)
+            return [], []
+
+        try:
+            request, args = self._make_request()
+            with mock.patch.object(BatchGenerator, "next", fake_next):
+                response_queue = Queue()
+                response_generator.requests.put((response_queue, request, args))
+                ctx = response_queue.get(timeout=30)
+                self.assertNotIsInstance(ctx, Exception)
+
+                self.assertTrue(call_started.wait(timeout=30))
+                # We're now partway through the single blocking next()
+                # call (well past the stall timeout, well before the call
+                # releases). The watchdog cannot have run yet.
+                time.sleep(stall_timeout * 2)
+                with self.assertRaises(Empty):
+                    response_queue.get_nowait()
+
+                # Once the blocking call finally releases, the very next
+                # trip through the outer loop sees a stale last_delivery
+                # and resets immediately.
+                item = response_queue.get(timeout=hold_seconds + 10)
+                self.assertIsInstance(item, RuntimeError)
+                self.assertIn("generation stalled", str(item))
+
+            self.assertTrue(response_generator._generation_thread.is_alive())
+
             response_generator.model_provider.cli_args.generation_stall_timeout = 0
             request, args = self._make_request()
             _, responses = response_generator.generate(request, args)
