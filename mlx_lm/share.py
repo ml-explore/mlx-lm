@@ -44,14 +44,17 @@ class DirectoryEntry:
 
     @classmethod
     def from_path(cls, root, path):
-        entry_type = {
-            (True, False): "directory",
-            (False, True): "symlink",
-            (False, False): "file",
-        }[path.is_dir(), path.is_symlink()]
-        dst = path.readlink() if path.is_symlink() else None
+        if path.is_symlink():
+            entry_type = "symlink"
+            dst = str(path.readlink())
+        elif path.is_dir():
+            entry_type = "directory"
+            dst = None
+        else:
+            entry_type = "file"
+            dst = None
 
-        return cls(entry_type, str(path.relative_to(root)), str(dst))
+        return cls(entry_type, str(path.relative_to(root)), dst)
 
 
 def error(*args, **kwargs):
