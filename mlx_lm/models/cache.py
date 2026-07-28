@@ -981,6 +981,76 @@ class ArraysCache(_BaseCache):
     def state(self, v):
         self.cache = v
 
+    # dtypes the metadata codec accepts, with the value parser for each.
+    # Deliberately numeric-only: metadata holds padding/length counts.
+    _META_DTYPES = {
+        "int8": int,
+        "int16": int,
+        "int32": int,
+        "int64": int,
+        "uint8": int,
+        "uint16": int,
+        "uint32": int,
+        "uint64": int,
+        "float16": float,
+        "float32": float,
+        "float64": float,
+        "bfloat16": float,
+    }
+
+    @property
+    def meta_state(self):
+        # Metadata is not part of ``state`` (its fields are optional and
+        # ``state`` slots may not be None), so serialize it as strings:
+        # "" for an absent field, "<dtype>:<comma-joined values>"
+        # otherwise (an empty array stays distinct from None and dtype
+        # survives the round trip).
+        if self._left_padding is None and self._lengths is None:
+            return ""
+        self._sync()
+
+        def encode(a):
+            if a is None:
+                return ""
+            if a.ndim != 1:
+                # The encoding is 1-D only -- the shape make_mask/merge/
+                # filter arithmetic assumes. Fail loudly instead of
+                # emitting an entry the decoder cannot parse.
+                raise ValueError(
+                    f"ArraysCache metadata must be 1-D to serialize, "
+                    f"got shape {a.shape}"
+                )
+            dtype = str(a.dtype).split(".")[-1]
+            if dtype not in self._META_DTYPES:
+                raise TypeError(
+                    f"ArraysCache metadata with dtype {a.dtype} cannot be serialized"
+                )
+            return dtype + ":" + ",".join(str(x) for x in a.tolist())
+
+        return (encode(self._left_padding), encode(self._lengths))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        # Files written before metadata serialization carry an empty entry
+        if not v:
+            return
+
+        def decode(s):
+            if not s:
+                return None
+            dtype_name, sep, vals = s.partition(":")
+            cast = self._META_DTYPES.get(dtype_name)
+            if not sep or cast is None:
+                raise ValueError(f"Malformed ArraysCache metadata entry: {s!r}")
+            return mx.array(
+                [cast(x) for x in vals.split(",")] if vals else [],
+                dtype=getattr(mx, dtype_name),
+            )
+
+        lp, ln = v
+        self.left_padding = decode(lp)
+        self.lengths = decode(ln)
+
     def filter(self, batch_indices):
         """
         In-place filter to keep just the given indices in the cache.
