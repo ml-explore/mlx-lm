@@ -3,9 +3,11 @@
 import copy
 import os
 import tempfile
+import threading
 import unittest
 
 import mlx.core as mx
+import numpy as np
 
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
@@ -624,6 +626,8 @@ class TestPromptCache(unittest.TestCase):
         left_padding = mx.array([1, 2])
         for c, lc in zip(cache, loaded_cache):
             self.assertTrue(mx.array_equal(c.left_padding, left_padding))
+            # the loaded cache, not just the source, must carry the padding
+            self.assertTrue(mx.array_equal(lc.left_padding, left_padding))
 
     def test_rotating_cache_updates(self):
         cache = RotatingKVCache(max_size=8)
@@ -661,6 +665,758 @@ class TestPromptCache(unittest.TestCase):
         c2.update_and_fetch(kv, kv)
         c_out = KVCache.merge((c1, c2))
         self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
+
+    def test_arrays_cache_advance(self):
+        """advance() runs once per layer per decode token and must not
+        accumulate per-call graph state; these checks pin the arithmetic it
+        performs on left_padding/lengths and its interplay with the other
+        ArraysCache operations."""
+        cache = ArraysCache(size=1, left_padding=[2, 0])
+        cache[0] = mx.zeros((2, 4))
+        cache.advance(1)
+        self.assertEqual(cache.left_padding.tolist(), [1, -1])
+        mask = cache.make_mask(4)
+        expected = mx.arange(4)[None] >= mx.array([1, -1])[:, None]
+        self.assertTrue(mx.array_equal(mask, expected))
+        cache.advance(1)
+        cache.advance(1)
+        self.assertEqual(cache.left_padding.tolist(), [-1, -3])
+
+        # lengths-based mask after advancing
+        cache = ArraysCache(size=1)
+        cache.prepare(lengths=[5, 3])
+        cache.advance(2)
+        self.assertEqual(cache.lengths.tolist(), [3, 1])
+        mask = cache.make_mask(4)
+        expected = mx.arange(4)[None] < mx.array([3, 1])[:, None]
+        self.assertTrue(mx.array_equal(mask, expected))
+
+        # in-place item assignment through the properties must reach the
+        # real backing arrays even with a pending advance
+        cache = ArraysCache(size=1, left_padding=[2, 0])
+        cache.advance(1)
+        cache.left_padding[0] = 7
+        self.assertEqual(cache.left_padding.tolist(), [7, -1])
+        cache = ArraysCache(size=1)
+        cache.prepare(lengths=[5, 3])
+        cache.advance(2)
+        cache.lengths[1] = 9
+        self.assertEqual(cache.lengths.tolist(), [3, 9])
+
+        # the batch path arms left_padding even for all-empty merges
+        merged = ArraysCache.merge((ArraysCache(1), ArraysCache(1)))
+        self.assertEqual(merged.left_padding.tolist(), [0, 0])
+        merged[0] = mx.zeros((2, 4))
+        merged.advance(1)
+        merged.filter(mx.array([1]))
+        self.assertEqual(merged.left_padding.tolist(), [-1])
+
+        # extend after both sides have advanced by different amounts
+        a = ArraysCache(size=1, left_padding=[1])
+        b = ArraysCache(size=1, left_padding=[3])
+        a[0] = mx.zeros((1, 4))
+        b[0] = mx.zeros((1, 4))
+        a.advance(1)
+        b.advance(2)
+        a.extend(b)
+        self.assertEqual(a.left_padding.tolist(), [0, 1])
+
+        # repeated filter/extend churn with no intermediate reads (the
+        # continuous-batching pattern) must stay correct; the mutation
+        # methods materialize the metadata so batch churn also cannot
+        # accumulate an unevaluated graph
+        cache = ArraysCache(size=1, left_padding=[1, 2])
+        cache[0] = mx.zeros((2, 4))
+        for _ in range(50):
+            cache.advance(1)
+            other = ArraysCache(size=1, left_padding=[3])
+            other[0] = mx.zeros((1, 4))
+            cache.extend(other)
+            cache.filter(mx.array([0, 1]))
+        self.assertEqual(cache.left_padding.tolist(), [-49, -48])
+
+        # assigning one field must not lose the other's pending decrement
+        cache = ArraysCache(size=1, left_padding=[4])
+        cache.lengths = mx.array([6])
+        cache.advance(2)
+        cache.left_padding = mx.array([9])
+        self.assertEqual(cache.lengths.tolist(), [4])
+        self.assertEqual(cache.left_padding.tolist(), [9])
+
+        # finalize clears the state and advance becomes a no-op
+        cache.finalize()
+        self.assertIsNone(cache.left_padding)
+        self.assertIsNone(cache.lengths)
+        cache.advance(3)
+        self.assertIsNone(cache.left_padding)
+        self.assertIsNone(cache.make_mask(4))
+
+        # deferred visibility (documented deviation from the eager
+        # decrement): an alias shows the pre-advance value until the next
+        # read of that field folds it, then observes it -- same object
+        cache = ArraysCache(size=1, left_padding=[3])
+        alias = cache.left_padding
+        cache.advance(1)
+        self.assertEqual(alias.tolist(), [3])
+        self.assertEqual(cache.left_padding.tolist(), [2])
+        self.assertIs(cache.left_padding, alias)
+        self.assertEqual(alias.tolist(), [2])
+
+        # make_mask() also folds the field it uses, so aliases observe
+        # decrements after mask building too
+        cache = ArraysCache(size=1, left_padding=[3])
+        alias = cache.left_padding
+        cache.advance(1)
+        cache.make_mask(4)
+        self.assertEqual(alias.tolist(), [2])
+
+        # replacing a field with a pending decrement folds the outgoing
+        # array first, so earlier aliases still observe the decrement
+        cache = ArraysCache(size=1, left_padding=[3])
+        alias = cache.left_padding
+        cache.advance(1)
+        cache.left_padding = mx.array([9])
+        self.assertEqual(alias.tolist(), [2])
+        self.assertEqual(cache.left_padding.tolist(), [9])
+
+        # finalize() folds before clearing, with the same guarantee
+        cache = ArraysCache(size=1, left_padding=[3])
+        alias = cache.left_padding
+        cache.advance(1)
+        cache.finalize()
+        self.assertIsNone(cache.left_padding)
+        self.assertEqual(alias.tolist(), [2])
+
+        # storing one array object in both fields: each field applies its
+        # decrement at its own fold (documented deviation from stock's
+        # eager double decrement at advance() time)
+        shared = mx.array([5])
+        cache = ArraysCache(size=1)
+        cache.left_padding = shared
+        cache.lengths = shared
+        cache.advance(1)
+        self.assertEqual(cache.lengths.tolist(), [4])
+        self.assertEqual(cache.left_padding.tolist(), [3])
+
+        # White-box guards for the leak fix itself: advance() rejects
+        # mx.array and float offsets loudly (coercion would eval a lazy
+        # scalar, truncate floats, and accept non-scalars), and it must
+        # never rebind the stored arrays -- the per-call lazy rebind was
+        # the leak.
+        cache = ArraysCache(size=1, left_padding=[2, 0])
+        stored = cache._left_padding
+        for bad in (mx.array(1), mx.array([1]), mx.array([[1]]), 1.5):
+            with self.assertRaises(TypeError):
+                cache.advance(bad)
+        cache.advance(1)
+        cache.advance(1)
+        self.assertIsInstance(cache._lp_advance, int)
+        self.assertEqual(cache._lp_advance, 2)
+        self.assertIs(cache._left_padding, stored)
+        self.assertEqual(cache.left_padding.tolist(), [0, -2])
+
+        # validation is state-independent: unarmed and finalized caches
+        # reject the same arguments
+        for bad in (mx.array(1), mx.array([1]), 1.5):
+            with self.assertRaises(TypeError):
+                ArraysCache(size=1).advance(bad)
+        finalized = ArraysCache(size=1, left_padding=[1])
+        finalized.finalize()
+        with self.assertRaises(TypeError):
+            finalized.advance(mx.array(1))
+
+        # numpy integer scalars normalize through operator.index --
+        # value preserved (documented: stock's array-promotion dtype
+        # side effects for numpy offsets are not reproduced)
+        cache = ArraysCache(size=1, left_padding=[5])
+        cache.advance(np.int64(2))
+        cache.advance(np.uint8(1))
+        self.assertEqual(cache.left_padding.tolist(), [2])
+        self.assertIsInstance(cache._lp_advance, int)
+
+        # a discarded metadata read must not accumulate unevaluated folds:
+        # each fold is applied in place and scheduled for evaluation
+        # (regression: fold-on-read chained one 4-byte scalar per read)
+        cache = ArraysCache(size=1)
+        cache.prepare(lengths=[1])
+        cache.lengths
+        mx.synchronize()
+        base_mem = mx.get_active_memory()
+        for _ in range(2048):
+            cache.advance(1)
+            cache.lengths
+        mx.synchronize()
+        self.assertLess(mx.get_active_memory() - base_mem, 4096)
+
+        # discarded make_mask() results must not accumulate unevaluated
+        # folds either
+        cache = ArraysCache(size=1, left_padding=[0])
+        cache.make_mask(1)
+        mx.synchronize()
+        base_mem = mx.get_active_memory()
+        for _ in range(2048):
+            cache.advance(1)
+            cache.make_mask(1)
+        mx.synchronize()
+        self.assertLess(mx.get_active_memory() - base_mem, 4096)
+
+        # repeated public mutations must not accumulate unevaluated graph
+        # either: item assignment through the property and reassignment of
+        # lazy expressions are both scheduled for evaluation
+        cache = ArraysCache(size=1, left_padding=[0])
+        mx.synchronize()
+        base_mem = mx.get_active_memory()
+        for i in range(2048):
+            cache.left_padding[0] = i
+        mx.synchronize()
+        self.assertLess(mx.get_active_memory() - base_mem, 4096)
+        self.assertEqual(cache.left_padding.tolist(), [2047])
+
+        cache = ArraysCache(size=1, left_padding=[0])
+        mx.synchronize()
+        base_mem = mx.get_active_memory()
+        for _ in range(2048):
+            cache.left_padding = cache.left_padding - 1
+        mx.synchronize()
+        self.assertLess(mx.get_active_memory() - base_mem, 4096)
+        self.assertEqual(cache.left_padding.tolist(), [-2048])
+
+        # with both fields populated, consuming only one must not rebind
+        # the other's backing array (a rebind per read is an unbounded
+        # lazy chain when that field is never read)
+        cache = ArraysCache(size=1, left_padding=[2, 1])
+        cache.prepare(lengths=[5, 3])
+        stored = cache._left_padding
+        for _ in range(5):
+            cache.advance(1)
+            cache.lengths
+        self.assertIs(cache._left_padding, stored)
+        self.assertEqual(cache._lp_advance, 5)
+        self.assertEqual(cache.lengths.tolist(), [0, -2])
+        self.assertEqual(cache.left_padding.tolist(), [-3, -4])
+
+        # make_mask() straight after advance() (no property read in
+        # between) must apply the pending offset; it folds the field it
+        # uses in place (metadata-side subtraction, identical overflow
+        # behavior to stock) and leaves the other field's counter alone
+        cache = ArraysCache(size=1, left_padding=[2, 0])
+        stored = cache._left_padding
+        cache.advance(1)
+        mask = cache.make_mask(4)
+        self.assertEqual(cache._lp_advance, 0)
+        self.assertIs(cache._left_padding, stored)
+        expected = mx.arange(4)[None] >= mx.array([1, -1])[:, None]
+        self.assertTrue(mx.array_equal(mask, expected))
+
+        cache = ArraysCache(size=1)
+        cache.prepare(lengths=[5, 3])
+        cache.advance(2)
+        mask = cache.make_mask(4)
+        self.assertEqual(cache._len_advance, 0)
+        expected = mx.arange(4)[None] < mx.array([3, 1])[:, None]
+        self.assertTrue(mx.array_equal(mask, expected))
+
+        # integer totals that overflow the dtype fold to stock's modular
+        # result: sequential in-range subtractions wrap, and the deferred
+        # fold must land on the same value (regression: the raw coalesced
+        # total was rejected by MLX's scalar conversion)
+        cache = ArraysCache(size=1)
+        cache.left_padding = mx.array([0], dtype=mx.int32)
+        cache.advance(2**31 - 1)
+        cache.advance(1)
+        self.assertEqual(cache.left_padding.tolist(), [-(2**31)])
+
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0], dtype=mx.int64)
+        cache.advance(2**62)
+        cache.advance(2**62)
+        self.assertEqual(cache.lengths.tolist(), [-(2**63)])
+
+        # sub-32-bit metadata wraps by the same modular rule
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0], dtype=mx.int8)
+        for _ in range(3):
+            cache.advance(100)
+        self.assertEqual(cache.lengths.tolist(), [-44])
+
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5], dtype=mx.uint8)
+        cache.advance(200)
+        cache.advance(200)
+        self.assertEqual(cache.lengths.tolist(), [117])
+
+        # uint64 metadata: MLX converts python int scalars through
+        # int64, so stock accepts negatives (wrapping modulo 2**64) and
+        # rejects >= 2**63; the fold uses the congruent *signed*
+        # representative so accumulated totals stay convertible
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0], dtype=mx.uint64)
+        cache.advance(2**62)
+        cache.advance(2**62)
+        self.assertEqual(cache.lengths.tolist(), [2**63])
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([1], dtype=mx.uint64)
+        cache.advance(-1)
+        self.assertEqual(cache.lengths.tolist(), [2])
+
+        # the int64 scalar gate applies to floating metadata too (stock
+        # rejects the python int before looking at the array dtype);
+        # accumulated floating totals beyond the gate fold in gate-sized
+        # chunks instead of failing the scalar conversion
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0.0], dtype=mx.float32)
+        cache.advance(2**62)
+        cache.advance(2**62)
+        self.assertEqual(cache.lengths.tolist(), [float(-(2**63))])
+
+        # a floating total spanning several gate-sized chunks folds to
+        # the deterministic chunked value
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0.0], dtype=mx.float32)
+        cache.advance(2**63 - 1)
+        cache.advance(2**63 - 1)
+        self.assertEqual(cache.lengths.tolist(), [float(-(2**64))])
+
+        # a many-chunk fold schedules each chunk as it applies -- the
+        # fold itself must not rebuild an unbounded unevaluated chain
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0.0], dtype=mx.float32)
+        cache.lengths
+        mx.synchronize()
+        base_mem = mx.get_active_memory()
+        for _ in range(2048):
+            cache.advance(2**63 - 1)
+        cache.lengths
+        mx.synchronize()
+        self.assertLess(mx.get_active_memory() - base_mem, 4096)
+
+        # offsets outside the dtype's scalar range raise at the
+        # advance() call, where stock's eager subtraction rejected them
+        # (uniformly ValueError here; stock's int64-gate rejection
+        # surfaced as an opaque std::bad_cast)
+        cache = ArraysCache(size=1)
+        cache.left_padding = mx.array([0], dtype=mx.int32)
+        with self.assertRaises(ValueError):
+            cache.advance(2**31)
+        with self.assertRaises(ValueError):
+            cache.advance(-(2**31) - 1)
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0], dtype=mx.uint16)
+        with self.assertRaises(ValueError):
+            cache.advance(-1)
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0], dtype=mx.uint64)
+        with self.assertRaises(ValueError):
+            cache.advance(2**63)
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0.0], dtype=mx.float32)
+        with self.assertRaises(ValueError):
+            cache.advance(2**63)
+
+        # the range check is per armed field in stock's field order: an
+        # offset valid for lengths but not for left_padding leaves the
+        # lengths decrement applied, exactly like stock's sequential
+        # eager subtractions did
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0], dtype=mx.int64)
+        cache.left_padding = mx.array([0], dtype=mx.int32)
+        with self.assertRaises(ValueError):
+            cache.advance(2**31)
+        self.assertEqual(cache.lengths.tolist(), [-(2**31)])
+        self.assertEqual(cache.left_padding.tolist(), [0])
+
+        # a shallow copy shares the backing arrays (as stock's does);
+        # folding before copying prevents the pending decrement from
+        # being applied once per object to the shared array
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5])
+        cache.advance(1)
+        cloned = copy.copy(cache)
+        self.assertEqual(cache.lengths.tolist(), [4])
+        self.assertEqual(cloned.lengths.tolist(), [4])
+        self.assertIs(cloned._lengths, cache._lengths)
+        # post-copy advances fold into the shared array at each object's
+        # own fold, so both eventually observe them (stock applied them
+        # eagerly to the same shared array)
+        cloned.advance(2)
+        self.assertEqual(cloned.lengths.tolist(), [2])
+        self.assertEqual(cache.lengths.tolist(), [2])
+
+        # deepcopy also folds first; the copy is an independent object
+        # with its own counters
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5])
+        cache.advance(1)
+        deep = copy.deepcopy(cache)
+        self.assertEqual(deep.lengths.tolist(), [4])
+        self.assertEqual(deep._len_advance, 0)
+        self.assertIsNot(deep._lengths, cache._lengths)
+        deep.advance(2)
+        self.assertEqual(deep.lengths.tolist(), [2])
+        self.assertEqual(cache.lengths.tolist(), [4])
+
+        # bool metadata -- which stock's arithmetic silently promotes to
+        # int32 -- keeps its dtype through zero-net advance histories
+        # (documented deviation); a nonzero net decrement promotes on
+        # fold at int32 precision with stock's values
+        cache = ArraysCache(size=1)
+        cache.left_padding = mx.array([True], dtype=mx.bool_)
+        cache.advance(0)
+        self.assertEqual(cache.left_padding.dtype, mx.bool_)
+        self.assertEqual(cache.left_padding.tolist(), [True])
+        cache.advance(2)
+        cache.advance(-1)
+        self.assertEqual(cache.left_padding.dtype, mx.int32)
+        self.assertEqual(cache.left_padding.tolist(), [0])
+
+        # bool offsets are normalized by operator.index (documented:
+        # stock's bool-scalar subtraction kept bool metadata bool)
+        cache = ArraysCache(size=1)
+        cache.left_padding = mx.array([False], dtype=mx.bool_)
+        cache.advance(True)
+        self.assertEqual(cache.left_padding.dtype, mx.int32)
+        self.assertEqual(cache.left_padding.tolist(), [-1])
+
+        # after the first advance() on bool metadata, later offsets
+        # validate against the promoted int32 dtype, exactly as stock's
+        # already-promoted stored array would
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        cache.advance(1)
+        with self.assertRaises(ValueError):
+            cache.advance(2**31)
+        self.assertEqual(cache.lengths.tolist(), [0])
+
+        # ... including zero and cancelling histories: stock promoted
+        # the stored array on the first subtraction regardless of the
+        # offset's value
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        cache.advance(1)
+        cache.advance(-1)
+        with self.assertRaises(ValueError):
+            cache.advance(2**31)
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        cache.advance(0)
+        with self.assertRaises(ValueError):
+            cache.advance(2**31)
+
+        # assigning a fresh bool array resets the promotion (stock's new
+        # array had not been subtracted from yet); the first offset then
+        # passes only the int64 gate, as stock's bool conversion did
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        cache.advance(2**31)
+        self.assertEqual(cache.lengths.tolist(), [-2147483647])
+
+        # re-assigning the SAME backing array is not a reset: the flag is
+        # the only record of stock's physical promotion
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        cache.advance(0)
+        cache.lengths = cache.lengths
+        with self.assertRaises(ValueError):
+            cache.advance(2**31)
+
+        # a bool array shared by both fields promotes both: stock's
+        # in-place promotion of the shared object made the second
+        # field's subtraction range-check as int32
+        shared = mx.array([True], dtype=mx.bool_)
+        cache = ArraysCache(size=1)
+        cache.left_padding = shared
+        cache.lengths = shared
+        with self.assertRaises(ValueError):
+            cache.advance(2**31)
+        self.assertEqual(cache._len_advance, 2**31)
+        self.assertEqual(cache._lp_advance, 0)
+
+        # batch churn with the metadata never read must not accumulate
+        # unevaluated gathers: filter/extend materialize the metadata.
+        # The state slots are consumed every forward pass (mx.eval below)
+        # but most layers' metadata never is
+        cache = ArraysCache(size=1, left_padding=[1, 2])
+        cache.prepare(lengths=[5, 6])
+        cache[0] = mx.zeros((2, 4))
+        mx.eval(cache[0], cache._left_padding, cache._lengths)
+        mx.synchronize()
+        base_mem = mx.get_active_memory()
+        for _ in range(1024):
+            cache.filter(mx.array([0, 1]))
+            mx.eval(cache[0])
+        mx.synchronize()
+        self.assertLess(mx.get_active_memory() - base_mem, 4096)
+
+    def test_arrays_cache_compile_captured_reads(self):
+        """mx.compile captures state by temporarily swapping tracers into
+        the captured containers; a metadata read during tracing must stay
+        pure -- no fold, no async_eval (disallowed on tracers), counters
+        intact -- exactly like stock's plain attribute access. The
+        captured array observes a pending decrement at the next eager
+        fold of the field (the documented deferred-visibility window)."""
+        cache = ArraysCache(size=1, left_padding=[4])
+        cache.advance(1)
+
+        def read(x):
+            return x + cache.left_padding
+
+        compiled = mx.compile(read, inputs=vars(cache))
+        out = compiled(mx.array([0]))
+        # the traced read did not fold: pending decrement intact, the
+        # pre-advance value used
+        self.assertEqual(out.tolist(), [4])
+        self.assertEqual(cache._lp_advance, 1)
+        # an eager fold lands the decrement in place; the compiled
+        # function reads the captured array's current value from then on
+        self.assertEqual(cache.left_padding.tolist(), [3])
+        self.assertEqual(compiled(mx.array([0])).tolist(), [3])
+
+        # make_mask inside a trace behaves the same way
+        cache = ArraysCache(size=1, left_padding=[1])
+        cache.advance(1)
+
+        def mask(x):
+            return cache.make_mask(x.shape[-1])
+
+        compiled = mx.compile(mask, inputs=vars(cache))
+        m = compiled(mx.zeros((1, 2)))
+        self.assertEqual(m.tolist(), [[False, True]])
+        self.assertEqual(cache._lp_advance, 1)
+        self.assertEqual(cache.left_padding.tolist(), [0])
+
+    def test_arrays_cache_closure_captured_reads(self):
+        """Purity during tracing applies only when the read encounters a
+        tracer (metadata swapped in by mx.compile(..., inputs=...)). A
+        closure-captured cache holds concrete arrays, so a read inside a
+        trace folds eagerly -- producing exactly the values stock's
+        eager decrement produced."""
+        cache = ArraysCache(size=1, left_padding=[4])
+        cache.advance(1)
+        out = mx.compile(lambda x: x + cache.left_padding)(mx.array([0]))
+        self.assertEqual(out.tolist(), [3])
+        self.assertEqual(cache._lp_advance, 0)
+        self.assertEqual(cache.left_padding.tolist(), [3])
+
+        cache = ArraysCache(size=1, left_padding=[4])
+        cache.advance(1)
+        out = mx.vmap(lambda x: x + cache.left_padding)(mx.zeros((2, 1)))
+        self.assertEqual(out.tolist(), [[3.0], [3.0]])
+        self.assertEqual(cache._lp_advance, 0)
+        self.assertEqual(cache.left_padding.tolist(), [3])
+
+    def test_arrays_cache_compiled_advance_not_recorded(self):
+        """Documented limitation: advance() is host-side bookkeeping and
+        runs at trace time only, so a compiled function that calls it
+        does not record the decrement in the traced graph -- call
+        advance() outside compiled functions. (Stock incidentally
+        recorded it as lazy graph arithmetic; that arithmetic is the
+        leak this class exists to avoid.) The trace-time call itself is
+        not lost: it stays pending and folds at the next eager read."""
+        cache = ArraysCache(size=1, left_padding=[5])
+
+        def step(x):
+            cache.advance(1)
+            return x + cache.left_padding
+
+        compiled = mx.compile(step, inputs=vars(cache), outputs=vars(cache))
+        outs = [compiled(mx.array([0])).item() for _ in range(3)]
+        self.assertEqual(outs, [5, 5, 5])
+        self.assertEqual(cache._lp_advance, 1)
+        self.assertEqual(cache.left_padding.tolist(), [4])
+
+    def test_arrays_cache_captured_mutation_guard(self):
+        """Replacing metadata inside a graph transformation while a
+        decrement is pending raises instead of silently discarding the
+        decrement (the fold cannot land in a tracer). Only the raise and
+        the preserved counter are asserted: an exception inside a traced
+        function leaves the captured containers mid-swap -- an MLX-level
+        property of compile, not specific to this class -- so the cache
+        is not usable afterwards."""
+        cache = ArraysCache(size=1, left_padding=[3])
+        cache.advance(1)
+
+        def replace(x):
+            cache.left_padding = x
+            return x
+
+        compiled = mx.compile(replace, inputs=vars(cache))
+        with self.assertRaises(RuntimeError):
+            compiled(mx.array([9]))
+        self.assertEqual(cache._lp_advance, 1)
+
+        # copy.copy and copy.deepcopy guard the same way: a copy taken
+        # mid-trace would escape holding the transient tracer
+        for copier in (copy.copy, copy.deepcopy):
+            cache = ArraysCache(size=1, left_padding=[3])
+            cache.advance(1)
+
+            def clone(x):
+                copier(cache)
+                return x
+
+            compiled = mx.compile(clone, inputs=vars(cache))
+            with self.assertRaises(RuntimeError):
+                compiled(mx.array([0]))
+            self.assertEqual(cache._lp_advance, 1)
+
+    def test_arrays_cache_captured_item_assignment(self):
+        """Documented window: in-place item assignment through a captured
+        tracer read cannot fold first (__setitem__ on the returned array
+        bypasses the property machinery and the mutation guard), so the
+        write lands before the deferred decrement -- the alias-write
+        window. Stock applied the decrement eagerly, so its assignment
+        landed after it."""
+        cache = ArraysCache(size=1, left_padding=[3])
+        cache.advance(1)
+
+        def mutate(x):
+            cache.left_padding[0] = x[0]
+            return cache.left_padding
+
+        compiled = mx.compile(mutate, inputs=vars(cache), outputs=vars(cache))
+        out = compiled(mx.array([9]))
+        self.assertEqual(out.tolist(), [9])
+        self.assertEqual(cache._lp_advance, 1)
+        self.assertEqual(cache.left_padding.tolist(), [8])  # stock: [9]
+
+    def test_arrays_cache_fold_failure_keeps_remainder(self):
+        """The fold counter commits chunk-by-chunk: a failure mid-fold
+        (injected into the intermediate scheduling call) leaves exactly
+        the unapplied remainder pending -- never double-applied, never
+        lost -- and a later fold completes it."""
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([0.0], dtype=mx.float32)
+        for _ in range(3):
+            cache.advance(2**63 - 1)
+
+        real_async_eval = mx.async_eval
+        calls = [0]
+
+        def fail_second(*args):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise RuntimeError("injected scheduling failure")
+            return real_async_eval(*args)
+
+        mx.async_eval = fail_second
+        try:
+            with self.assertRaises(RuntimeError):
+                cache.lengths
+        finally:
+            mx.async_eval = real_async_eval
+        # one chunk committed, two remain pending
+        self.assertEqual(cache._len_advance, 2 * (2**63 - 1))
+        # the next fold applies exactly the remainder
+        self.assertEqual(cache.lengths.tolist(), [float(-(3 * 2**63))])
+        self.assertEqual(cache._len_advance, 0)
+
+    def test_arrays_cache_concurrent_reads(self):
+        """Stock reads were pure attribute access and therefore trivially
+        safe from multiple threads; deferred folding makes reads mutate,
+        so the fold machinery is serialized per cache (unserialized
+        concurrent folds of one array deadlock on their thread-local
+        streams). Two concurrent readers racing one pending decrement
+        must both complete and observe the folded value exactly once."""
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5])
+        mx.eval(cache.lengths)
+        cache.advance(1)
+
+        results = []
+        gate = threading.Barrier(3)
+
+        def read():
+            gate.wait()
+            results.append(cache.lengths.tolist())
+
+        threads = [threading.Thread(target=read, daemon=True) for _ in range(2)]
+        for t in threads:
+            t.start()
+        gate.wait()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertTrue(all(not t.is_alive() for t in threads))
+        self.assertEqual(results, [[4], [4]])
+        self.assertEqual(cache._len_advance, 0)
+
+    def test_arrays_cache_metadata_serialization(self):
+        cache_file = os.path.join(self.test_dir, "arrays_cache_meta.safetensors")
+
+        # metadata round-trips, folding pending advances at save time
+        cache = ArraysCache(size=1, left_padding=[3, 1])
+        cache[0] = mx.zeros((2, 2))
+        cache.prepare(lengths=[5, 4])
+        cache.advance(2)
+        save_prompt_cache(cache_file, [cache])
+        loaded = load_prompt_cache(cache_file)[0]
+        self.assertEqual(loaded.left_padding.tolist(), [1, -1])
+        self.assertEqual(loaded.lengths.tolist(), [3, 2])
+        mask = loaded.make_mask(4)
+        expected = mx.arange(4)[None] >= mx.array([1, -1])[:, None]
+        self.assertTrue(mx.array_equal(mask, expected))
+
+        # absent fields stay absent through a round trip
+        cache = ArraysCache(size=1)
+        cache[0] = mx.zeros((1, 2))
+        save_prompt_cache(cache_file, [cache])
+        loaded = load_prompt_cache(cache_file)[0]
+        self.assertIsNone(loaded.left_padding)
+        self.assertIsNone(loaded.lengths)
+
+        # dtype survives the round trip
+        cache = ArraysCache(size=1)
+        cache[0] = mx.zeros((1, 2))
+        cache.lengths = mx.array([5], dtype=mx.int64)
+        save_prompt_cache(cache_file, [cache])
+        loaded = load_prompt_cache(cache_file)[0]
+        self.assertEqual(loaded.lengths.dtype, mx.int64)
+        self.assertEqual(loaded.lengths.tolist(), [5])
+
+        # the codec keeps an empty metadata array distinct from an absent
+        # field (zero-row caches cannot go through save_prompt_cache --
+        # safetensors rejects empty state arrays -- so this is pinned at
+        # the meta_state level)
+        cache = ArraysCache(size=1, left_padding=[1])
+        cache[0] = mx.zeros((1, 2))
+        cache.filter(mx.array([], dtype=mx.int32))
+        restored = ArraysCache(size=1)
+        restored.meta_state = cache.meta_state
+        self.assertIsNotNone(restored.left_padding)
+        self.assertEqual(restored.left_padding.size, 0)
+        self.assertIsNone(restored.lengths)
+
+        # float metadata round-trips through the codec
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([2.5], dtype=mx.float32)
+        restored = ArraysCache(size=1)
+        restored.meta_state = cache.meta_state
+        self.assertEqual(restored.lengths.dtype, mx.float32)
+        self.assertEqual(restored.lengths.tolist(), [2.5])
+
+        # malformed or truncated entries raise instead of loading as
+        # empty metadata; dtype names are whitelisted
+        restored = ArraysCache(size=1)
+        for bad in (("int32", ""), ("nosuchdtype:1", ""), ("eval:1", "")):
+            with self.assertRaises(ValueError):
+                restored.meta_state = bad
+
+        # non-numeric metadata dtypes fail loudly at save time
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        with self.assertRaises(TypeError):
+            cache.meta_state
+
+        # non-1-D metadata fails loudly at save time too, rather than
+        # emitting an entry the decoder cannot parse (a 0-d filter index
+        # is the public route to scalar metadata)
+        cache = ArraysCache(size=1, left_padding=[1])
+        cache[0] = mx.zeros((1, 2))
+        cache.filter(mx.array(0))
+        with self.assertRaises(ValueError):
+            cache.meta_state
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([[1, 2]])
+        with self.assertRaises(ValueError):
+            cache.meta_state
 
     def test_extend_with_empty_and_nonempty_batch_caches(self):
         """Extending a batch cache when one side has keys=None should use the
