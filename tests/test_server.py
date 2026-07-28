@@ -355,6 +355,39 @@ class TestServer(unittest.TestCase):
         stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
         self.assertTrue(matched)
 
+    def test_streaming_logprobs_match_non_streaming(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "logprobs": True,
+            "top_logprobs": 3,
+            "messages": [{"role": "user", "content": "Hello!"}],
+        }
+
+        expected = requests.post(url, json=post_data).json()
+        expected = expected["choices"][0]["logprobs"]["content"]
+        self.assertTrue(expected)
+
+        # The same request streamed used to return no logprobs at all: they
+        # were collected per token and then never passed to generate_response.
+        response = requests.post(url, json={**post_data, "stream": True}, stream=True)
+        self.assertEqual(response.status_code, 200)
+
+        streamed = []
+        for line in response.iter_lines():
+            if not line:
+                continue
+            chunk = line.decode("utf-8")
+            if not chunk.startswith("data: ") or chunk == "data: [DONE]":
+                continue
+            logprobs = json.loads(chunk[6:])["choices"][0].get("logprobs")
+            if logprobs:
+                streamed.extend(logprobs["content"])
+
+        self.assertEqual(streamed, expected)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)

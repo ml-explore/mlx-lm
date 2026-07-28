@@ -1402,6 +1402,10 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        # Tokens whose logprobs have already gone out in a stream chunk. The
+        # logprob lists grow in lockstep with `tokens` (or stay empty), so one
+        # offset slices all three.
+        streamed = 0
 
         try:
             for gen in response:
@@ -1449,6 +1453,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     resp = self.generate_response(
                         text,
                         None,
+                        token_logprobs=token_logprobs[streamed:],
+                        top_tokens=top_tokens[streamed:],
+                        tokens=tokens[streamed:],
                         tool_calls=tool_formatter(tool_calls),
                         reasoning_text=reasoning_text,
                     )
@@ -1457,6 +1464,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_text = ""
                     text = ""
                     tool_calls = []
+                    streamed = len(tokens)
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
@@ -1474,11 +1482,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 resp = self.generate_response(
                     text,
                     finish_reason,
+                    token_logprobs=token_logprobs[streamed:],
+                    top_tokens=top_tokens[streamed:],
+                    tokens=tokens[streamed:],
                     tool_calls=tool_formatter(tool_calls),
                     reasoning_text=reasoning_text,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
+                streamed = len(tokens)
                 if (
                     self.stream_options is not None
                     and self.stream_options["include_usage"]
