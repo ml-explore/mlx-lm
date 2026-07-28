@@ -1,4 +1,5 @@
 import unittest
+from random import Random
 from pathlib import Path
 
 from mlx_lm.tool_parsers import (
@@ -274,6 +275,64 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["name"], "skill_manage")
         self.assertEqual(tool_call["arguments"]["action"], "create")
         self.assertIn("{", tool_call["arguments"]["content"])
+
+    def test_function_gemma_preserves_escaped_source_and_multiple_calls(self):
+        source = '''scene:
+  objects: [{id: red-square, style: {fill: "#ff0000"}}]
+  note: "braces { and } remain source text"'''
+        test_case = (
+            "call:artifact-submit{language:<escape>visman<escape>,"
+            "outputSlot:<escape>scene.red<escape>,source:<escape>"
+            f"{source}<escape>}}"
+            "call:mark-ready{ready:true}"
+        )
+
+        tool_calls = function_gemma.parse_tool_call(test_case, None)
+
+        self.assertEqual(
+            tool_calls,
+            [
+                {
+                    "name": "artifact-submit",
+                    "arguments": {
+                        "language": "visman",
+                        "outputSlot": "scene.red",
+                        "source": source,
+                    },
+                },
+                {"name": "mark-ready", "arguments": {"ready": True}},
+            ],
+        )
+
+    def test_function_gemma_parses_ten_thousand_fixed_source_variants(self):
+        random = Random(42)
+        fragments = [
+            "{", "}", "[", "]", ":", ",", "'", '\"', "\\n", " ",
+            "canvas", "rectangle", "#ff0000", "scene.red", "multiline\\ntext",
+        ]
+        for index in range(10_000):
+            source = "".join(random.choice(fragments) for _ in range(24))
+            test_case = (
+                "call:artifact_submit{language:<escape>visman<escape>,"
+                f"outputSlot:<escape>scene.{index}<escape>,"
+                f"source:<escape>{source}<escape>,"
+                f"metadata:{{attempt:{index},enabled:true}}}}"
+            )
+            with self.subTest(index=index):
+                tool_call = function_gemma.parse_tool_call(test_case, None)
+                self.assertEqual(tool_call["name"], "artifact_submit")
+                self.assertEqual(tool_call["arguments"]["source"], source)
+                self.assertEqual(
+                    tool_call["arguments"]["metadata"],
+                    {"attempt": index, "enabled": True},
+                )
+
+    def test_function_gemma_rejects_truncated_calls(self):
+        with self.assertRaisesRegex(ValueError, "complete function call"):
+            function_gemma.parse_tool_call(
+                "call:artifact_submit{source:<escape>scene: {broken}<escape>",
+                None,
+            )
 
     def test_kimi_k2(self):
         # Single tool call
